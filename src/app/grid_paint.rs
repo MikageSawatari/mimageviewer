@@ -264,6 +264,7 @@ pub(crate) fn layout_cell_overlays(
     video_indicator: VideoThumbnailIndicator,
     is_checked: bool,
     filter_match_count: Option<u32>,
+    media_duration: Option<&str>,
 ) -> ThumbnailOverlayLayout {
     let inner = rect.shrink(4.0);
     let item_name = match item {
@@ -319,6 +320,7 @@ pub(crate) fn layout_cell_overlays(
                 _ => None,
             },
             filter_match_count: filter_match_count.filter(|_| item.is_container_ratable()),
+            media_duration,
             bookmark_time,
             upscaled_video,
             edit_badges,
@@ -846,6 +848,9 @@ pub(crate) fn draw_cell(
         );
     }
 
+    if let Some(placement) = overlay_layout.media_duration.as_ref() {
+        crate::ui_helpers::draw_overlay_media_duration_badge(painter, placement);
+    }
     if let Some(placement) = overlay_layout.filter_match_count.as_ref() {
         draw_filter_match_badge(painter, placement);
     }
@@ -1257,6 +1262,7 @@ fn draw_video_indicator_snapshot_cell(
         false,
         indicator,
         false,
+        None,
         None,
     );
     draw_cell(

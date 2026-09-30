@@ -1618,6 +1618,12 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
     );
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut settings.thumb_show_media_duration,
+        "動画・音声の長さをサムネイルに表示する",
+    );
+    ui.small("右下に分:秒、1 時間以上は時:分:秒で表示します。フィルタ一致数や他の表示と重なる場合は上へ移し、収まらない場合は表示しません。");
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {

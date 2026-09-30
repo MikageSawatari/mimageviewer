@@ -5704,6 +5704,7 @@ fn install_snapshot_details_pending(
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -63218,6 +63219,7 @@ mod still_window_mode_key_tests {
         let (_event_tx, event_rx) = mpsc::channel();
         let (priority_tx, _priority_rx) = mpsc::channel();
         app.details_meta_pending = Some(DetailsMetaPending {
+            scan_scope: DetailsMetaScanScope::AllRequirements,
             visible_revision: app.details_lazy_visible_revision,
             selection_target_key: None,
             normal_target_keys: Default::default(),
@@ -90203,6 +90205,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     .unwrap();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -90459,6 +90462,7 @@ fn replacing_items_discards_incomplete_details_target_plan() {
 #[test]
 fn thumbnail_selection_info_keeps_single_target_fast_path() {
     let mut app = phase_c_support::setup_app();
+    app.settings.thumb_show_media_duration = false;
     app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
     app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
     app.settings.thumb_tooltip_show_created = false;
@@ -90607,6 +90611,7 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -90696,6 +90701,7 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
     .expect("queue old Finished event");
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -90972,7 +90978,11 @@ fn details_cell_content_revisions_follow_only_changed_cache_columns() {
         DetailsLazyMeta {
             source_mtime: 1,
             source_size: 2,
-            video_codec: Some("AV1".to_string()),
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: None,
+                dims: None,
+                codec: Some("AV1".to_string()),
+            }),
             ..Default::default()
         },
         DetailsLazyFieldFlags {
@@ -94537,5 +94547,855 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         );
         assert_eq!(state.fixed_bar_gap_px, 6);
         assert_eq!(state.seek_strip_height_values.maximum, 240);
+    }
+}
+
+fn setup_media_duration_thumbnail_app() -> phase_c_support::AppTestEnv {
+    let mut app = phase_c_support::setup_app();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.thumb_show_media_duration = true;
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::Hidden;
+    app.install_new_items(
+        vec![
+            GridItem::Video(PathBuf::from(r"C:\clips\short.mp4")),
+            GridItem::Audio(PathBuf::from(r"D:\songs\long.flac")),
+            GridItem::Image(PathBuf::from(r"C:\photos\still.jpg")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\pages.pdf")),
+            GridItem::Video(PathBuf::from(r"C:\clips\offscreen.mp4")),
+        ],
+        vec![Some((100, 2048)); 5],
+    );
+    app.selected = None;
+    app
+}
+
+#[test]
+fn media_duration_thumbnail_targets_only_near_video_and_audio() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let near = HashSet::from([0, 1, 2, 3]);
+    assert!(app.details_lazy_columns_visible());
+    assert!(!app.selection_info_only_lazy_load());
+    for idx in 0..5 {
+        let target = app.details_meta_target_for_idx(idx, &near, true);
+        if idx < 2 {
+            let target = target.expect("near media must request metadata");
+            assert!(target.load_video_meta);
+            assert!(!target.load_page_count);
+            assert!(!target.load_image_dims);
+            assert!(!target.load_created_at);
+        } else {
+            assert!(target.is_none(), "nonmedia and offscreen media remain lazy");
+        }
+    }
+    app.settings.thumb_show_media_duration = false;
+    assert!(!app.details_lazy_columns_visible());
+    for idx in 0..5 {
+        assert!(app.details_meta_target_for_idx(idx, &near, true).is_none());
+    }
+}
+
+#[test]
+fn media_duration_catalog_uses_physical_source_in_aggregate_views() {
+    let mut app = setup_media_duration_thumbnail_app();
+    for current_folder in [None, Some(PathBuf::from(r"Z:\aggregate"))] {
+        app.current_folder = current_folder;
+        app.items_are_rating_view = true;
+        for (idx, folder, key) in [(0, r"C:\clips", "short.mp4"), (1, r"D:\songs", "long.flac")] {
+            let (actual_folder, actual_key) = app.details_catalog_lookup_for_item(&app.items[idx]);
+            assert_eq!(actual_folder, Some(PathBuf::from(folder)));
+            assert_eq!(actual_key.as_deref(), Some(key));
+        }
+    }
+}
+
+fn install_fake_media_duration_pending(app: &mut App) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_tx, rx) = mpsc::channel();
+    let (priority_tx, _priority_rx) = mpsc::channel();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: app.selection_info_lazy_target_key(),
+        normal_target_keys: HashSet::new(),
+        cancel: Arc::clone(&cancel),
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
+    });
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 2 };
+    cancel
+}
+
+#[test]
+fn media_duration_thumbnail_range_change_preserves_idle_gate_and_cancels_old_stage() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.keep_set = HashSet::from([0, 1]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    app.keep_set = HashSet::from([4]);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    let ctx = egui::Context::default();
+    app.refresh_thumbnail_details_stage(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert_eq!(app.details_tag_prewarm_indices, vec![0, 1]);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
+    app.refresh_thumbnail_details_stage(&ctx);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_tag_prewarm_indices, vec![4]);
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn media_duration_thumbnail_selected_nonmedia_stays_prompt_outside_stage() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::Tooltip;
+    app.keep_set = HashSet::from([0, 1]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    app.selected = Some(2);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    app.refresh_thumbnail_details_stage(&egui::Context::default());
+    assert!(cancel.load(Ordering::Relaxed));
+    assert_eq!(app.details_tag_prewarm_indices, vec![0, 1, 2]);
+    let target = app
+        .details_meta_target_for_idx(2, &HashSet::from([0, 1]), true)
+        .expect("selected image tooltip still requests dimensions");
+    assert!(target.load_image_dims);
+    assert!(!target.load_video_meta);
+}
+
+#[test]
+fn media_duration_badge_reads_memory_without_changing_details_format() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(3723.0),
+                dims: Some((1920, 1080)),
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.thumbnail_media_duration_text(0).as_deref(),
+        Some("1:02:03")
+    );
+    assert_eq!(
+        app.details_video_duration_text(0),
+        format_details_duration(3723.0)
+    );
+    assert_eq!(app.details_video_dims_text(0), "1920x1080");
+    assert_eq!(app.details_video_codec_text(0), "h264");
+    assert!(app.thumbnail_media_duration_text(2).is_none());
+    app.settings.thumb_show_media_duration = false;
+    assert!(app.thumbnail_media_duration_text(0).is_none());
+    assert_eq!(
+        app.details_video_duration_text(0),
+        format_details_duration(3723.0)
+    );
+}
+
+#[test]
+fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_ai() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    app.keep_set = HashSet::from([4]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
+    let key = app.details_lazy_cache_key(2).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            ai_metadata_checked: true,
+            image_dims: Some((640, 480)),
+            ..Default::default()
+        },
+    );
+    app.refresh_thumbnail_details_stage(&egui::Context::default());
+    assert!(app.details_lazy_uses_visible_stages());
+    assert!(app.details_visible_stage_needs_load());
+    let near = HashSet::from([4]);
+    assert!(
+        app.details_meta_target_for_idx(4, &near, true)
+            .unwrap()
+            .load_video_meta
+    );
+    assert!(app.details_meta_target_for_idx(2, &near, true).is_none());
+}
+
+#[test]
+fn media_duration_thumbnail_completed_ai_scan_followup_is_bounded() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 64;
+    let mut items: Vec<GridItem> = (0..count)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("C:/photos/{idx}.png"))))
+        .collect();
+    let media_idx = items.len();
+    items.push(GridItem::Video(PathBuf::from("C:/clips/new-near.mp4")));
+    app.install_new_items(items, vec![Some((100, 2048)); count + 1]);
+    app.selected = None;
+    app.ai_model_facet_requested = true;
+    for idx in 0..count {
+        let key = app.details_lazy_cache_key(idx).unwrap();
+        app.details_lazy_meta.insert(
+            key,
+            DetailsLazyMeta {
+                source_mtime: 100,
+                source_size: 2048,
+                ai_metadata_checked: true,
+                image_dims: Some((640, 480)),
+                ..Default::default()
+            },
+        );
+    }
+    app.keep_set = HashSet::from([media_idx]);
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
+    let ctx = egui::Context::default();
+    app.refresh_thumbnail_details_stage(&ctx);
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("new visible media stage");
+    assert_eq!(pending.scan_scope, DetailsMetaScanScope::VisibleStage);
+    assert!(
+        matches!(pending.phase, DetailsMetaPendingPhase::Loading { .. }),
+        "bounded stage must launch without planning thousands of cached AI items"
+    );
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { done: 0, total: 1 }
+    );
+    app.cancel_details_meta_loading();
+}
+
+#[test]
+fn media_duration_preference_off_cancels_ai_pending_and_preserves_other_requirements() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    app.settings.thumb_tooltip_show_video_duration = false;
+    app.settings.thumb_tooltip_show_video_dimensions = false;
+    app.settings.thumb_tooltip_show_video_codec = false;
+    app.keep_set = HashSet::from([0, 1]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let mut edited = app.settings.clone();
+    edited.thumb_show_media_duration = false;
+    app.install_preferences_settings(edited);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    let near = HashSet::from([0, 1]);
+    assert!(app.details_meta_target_for_idx(0, &near, true).is_none());
+    assert!(app.details_meta_target_for_idx(1, &near, true).is_none());
+    let image = app
+        .details_meta_target_for_idx(2, &near, true)
+        .expect("AI scan remains needed");
+    assert!(image.load_ai_metadata);
+}
+
+#[test]
+fn media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    let _cancel = install_fake_media_duration_pending(&mut app);
+    app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    app.facet_ai_model_counts_cache = Some(std::collections::BTreeMap::from([("Model".into(), 3)]));
+    app.facet_ai_tool_counts_cache = Some(std::collections::BTreeMap::from([("Tool".into(), 3)]));
+    assert!(app.ai_model_facet_ready());
+    assert!(!app.details_lazy_sort_ready());
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.apply_details_lazy_meta_patch(
+        key.clone(),
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(65.0),
+                dims: None,
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.facet_ai_model_counts_cache
+            .as_ref()
+            .unwrap()
+            .get("Model"),
+        Some(&3)
+    );
+    assert_eq!(
+        app.facet_ai_tool_counts_cache.as_ref().unwrap().get("Tool"),
+        Some(&3)
+    );
+    app.details_meta_pending = None;
+    app.details_image_dims_state = LazyColumnState::Reconciling {
+        done: 1,
+        total: 1,
+        failed: 0,
+    };
+    assert!(app.ai_model_facet_ready());
+    // A genuinely replaced source invalidates cached AI facts at their patch owner.
+    app.apply_details_lazy_meta_patch(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 101,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(70.0),
+                dims: None,
+                codec: None,
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert!(app.facet_ai_model_counts_cache.is_none());
+    assert!(app.facet_ai_tool_counts_cache.is_none());
+}
+
+#[test]
+fn media_duration_running_stage_yields_to_first_all_item_ai_request() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let cancel = install_fake_media_duration_pending(&mut app);
+    app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    assert!(!app.ai_model_facet_requested);
+    app.request_ai_model_facet_load();
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert!(!app.ai_model_facet_ready());
+}
+
+#[test]
+fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all_rows() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let items = (0..DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 2)
+        .map(|idx| GridItem::Video(PathBuf::from(format!(r"C:\clips\{idx}.mp4"))))
+        .collect::<Vec<_>>();
+    let len = items.len();
+    app.install_new_items(items, vec![Some((100, 2048)); len]);
+    app.rebuild_visible_indices();
+    assert_eq!(app.visible_indices.len(), len);
+    app.selected = None;
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    app.settings.details_show_video_duration = true;
+    app.settings.details_show_video_dimensions = true;
+    app.settings.details_show_video_codec = true;
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let (old_tx, old_rx) = mpsc::channel();
+    if let Some(pending) = app.details_meta_pending.as_mut() {
+        pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+        let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
+            panic!("expected worker receiver");
+        };
+        *rx = old_rx;
+    }
+    old_tx
+        .send(DetailsMetaEvent::Finished {
+            generation: app.items_generation,
+            failed: 0,
+        })
+        .unwrap();
+    let revision = app.details_lazy_visible_revision;
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_ne!(revision, app.details_lazy_visible_revision);
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert!(
+        old_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: app.items_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+
+    // Poll the real replacement planner, stopping before it launches a worker.
+    app.poll_details_meta_load(&egui::Context::default());
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("full fetch pending");
+    assert_eq!(pending.scan_scope, DetailsMetaScanScope::AllRequirements);
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        panic!("full fetch must still have offscreen rows to scan");
+    };
+    assert!(
+        matches!(plan.order, DetailsMetaScanOrder::CurrentGrid { len: actual, .. } if actual == len)
+    );
+    assert!(
+        plan.background_targets
+            .iter()
+            .any(|target| target.idx == 4 && target.load_video_meta)
+    );
+    assert!(!app.details_lazy_sort_ready());
+    assert_eq!(app.details_video_duration_text(len - 1), "...");
+
+    let details_cancel = Arc::clone(&pending.cancel);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Thumbnail);
+    assert!(details_cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn media_duration_timeout_retries_after_other_folder_and_reopen() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let source = GridItem::Video(PathBuf::from(r"C:\clips\short.mp4"));
+    app.install_new_items(vec![source.clone()], vec![Some((100, 2048))]);
+    app.selected = None;
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    let generation = app.items_generation;
+    let key = app.details_lazy_cache_key(0).unwrap();
+    let _cancel = install_fake_media_duration_pending(&mut app);
+    let (tx, rx) = mpsc::channel();
+    let pending = app.details_meta_pending.as_mut().unwrap();
+    pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.normal_target_keys = HashSet::from([key.clone()]);
+    let DetailsMetaPendingPhase::Loading { rx: receiver, .. } = &mut pending.phase else {
+        panic!("expected worker receiver");
+    };
+    *receiver = rx;
+    tx.send(DetailsMetaEvent::Item {
+        generation,
+        key: key.clone(),
+        meta: DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::RetryLater { generation },
+            ..Default::default()
+        },
+        loaded: DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    tx.send(DetailsMetaEvent::Finished {
+        generation,
+        failed: 1,
+    })
+    .unwrap();
+    let ctx = egui::Context::default();
+    app.poll_details_meta_load(&ctx);
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { failed: 1 }
+    );
+    assert_eq!(app.details_video_duration_text(0), "-");
+    assert!(
+        app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .is_none()
+    );
+
+    app.install_new_items(
+        vec![GridItem::Image(PathBuf::from(r"D:\other\still.jpg"))],
+        vec![Some((200, 4000))],
+    );
+    assert!(
+        app.details_lazy_meta.contains_key(&key),
+        "cache is retained across folders"
+    );
+    app.install_new_items(vec![source], vec![Some((100, 2048))]);
+    app.selected = None;
+    assert_ne!(generation, app.items_generation);
+    assert_eq!(
+        app.details_lazy_meta_for_idx(0).unwrap().media,
+        DetailsMediaMeta::RetryLater { generation }
+    );
+    let target = app
+        .details_meta_target_for_idx(0, &HashSet::from([0]), true)
+        .expect("reopening retries interrupted media");
+    assert!(target.load_video_meta);
+    assert!(!app.details_lazy_meta_satisfies_idx(0, app.details_lazy_meta_for_idx(0).unwrap()));
+    assert_eq!(app.details_video_duration_text(0), "...");
+
+    app.apply_details_lazy_meta_patch(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(5.0),
+                dims: Some((640, 360)),
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.thumbnail_media_duration_text(0).as_deref(),
+        Some("0:05")
+    );
+    assert!(
+        app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .is_none()
+    );
+}
+
+#[test]
+fn media_duration_target_preserves_known_zero_identity_and_unknown_identity() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.image_metas[0] = Some((0, 0));
+    app.image_metas[1] = None;
+    let near = HashSet::from([0, 1]);
+    assert_eq!(
+        app.details_meta_target_for_idx(0, &near, true)
+            .unwrap()
+            .source_identity,
+        Some((0, 0))
+    );
+    assert_eq!(
+        app.details_meta_target_for_idx(1, &near, true)
+            .unwrap()
+            .source_identity,
+        None
+    );
+}
+
+fn configure_dedicated_lazy_selection_info(app: &mut App) {
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
+    app.settings.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::Dedicated;
+    app.settings.details_selection_bar_show_created = false;
+    app.settings.details_selection_bar_show_page_count = false;
+    app.settings.details_selection_bar_show_image_dimensions = false;
+    app.settings.details_selection_bar_show_video_duration = false;
+    app.settings.details_selection_bar_show_video_dimensions = false;
+    app.settings.details_selection_bar_show_video_codec = false;
+    app.settings.thumb_tooltip_show_created = false;
+    app.settings.thumb_tooltip_show_page_count = false;
+    app.settings.thumb_tooltip_show_image_dimensions = false;
+    app.settings.thumb_tooltip_show_video_duration = false;
+    app.settings.thumb_tooltip_show_video_dimensions = false;
+    app.settings.thumb_tooltip_show_video_codec = false;
+}
+
+#[test]
+fn selection_info_lazy_dedicated_columns_are_independent_of_grid_columns() {
+    use crate::ui_main::DetailsColumn;
+    let mut app = phase_c_support::setup_app();
+    for column in [
+        DetailsColumn::Created,
+        DetailsColumn::PageCount,
+        DetailsColumn::ImageDimensions,
+        DetailsColumn::VideoDuration,
+        DetailsColumn::VideoDimensions,
+        DetailsColumn::VideoCodec,
+    ] {
+        configure_dedicated_lazy_selection_info(&mut app);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_created = false;
+        app.settings.details_show_page_count = column != DetailsColumn::PageCount;
+        app.settings.details_show_image_dimensions = false;
+        app.settings.details_show_video_duration = false;
+        app.settings.details_show_video_dimensions = false;
+        app.settings.details_show_video_codec = false;
+        // An unrelated lazy column ensures this is not the selection-only fast path.
+        if column == DetailsColumn::PageCount {
+            app.settings.details_show_created = true;
+        }
+        match column {
+            DetailsColumn::Created => app.settings.details_selection_bar_show_created = true,
+            DetailsColumn::PageCount => app.settings.details_selection_bar_show_page_count = true,
+            DetailsColumn::ImageDimensions => {
+                app.settings.details_selection_bar_show_image_dimensions = true
+            }
+            DetailsColumn::VideoDuration => {
+                app.settings.details_selection_bar_show_video_duration = true
+            }
+            DetailsColumn::VideoDimensions => {
+                app.settings.details_selection_bar_show_video_dimensions = true
+            }
+            DetailsColumn::VideoCodec => app.settings.details_selection_bar_show_video_codec = true,
+            _ => unreachable!(),
+        }
+        let item = match column {
+            DetailsColumn::PageCount => GridItem::PdfFile(PathBuf::from(r"C:\books\one.pdf")),
+            DetailsColumn::Created | DetailsColumn::ImageDimensions => {
+                GridItem::Image(PathBuf::from(r"C:\photos\one.jpg"))
+            }
+            _ => GridItem::Video(PathBuf::from(r"C:\clips\one.mp4")),
+        };
+        app.install_new_items(vec![item.clone(), item], vec![Some((100, 2048)); 2]);
+        app.selected = Some(0);
+        assert!(!app.selection_info_only_lazy_load());
+        assert!(app.selection_info_item_requires_lazy_meta(0));
+        let target = app
+            .details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .unwrap();
+        let requested = |target: &DetailsMetaTarget| match column {
+            DetailsColumn::Created => target.load_created_at,
+            DetailsColumn::PageCount => target.load_page_count,
+            DetailsColumn::ImageDimensions => target.load_image_dims,
+            _ => target.load_video_meta,
+        };
+        assert!(requested(&target), "dedicated column {column:?}");
+        assert!(
+            app.details_meta_target_for_idx(1, &HashSet::from([1]), true)
+                .is_none_or(|t| !requested(&t))
+        );
+        app.settings.selection_info_display_mode =
+            crate::settings::SelectionInfoDisplayMode::Hidden;
+        assert!(!app.selection_info_item_requires_lazy_meta(0));
+        assert!(
+            app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+                .is_none_or(|t| !requested(&t))
+        );
+    }
+}
+
+#[test]
+fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_only() {
+    let mut app = phase_c_support::setup_app();
+    let sources = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["selected.mp4", "next.mp4"]
+        .iter()
+        .map(|name| sources.path().join(name))
+        .collect();
+    let db = crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), sources.path())
+        .unwrap();
+    let mut stamps = Vec::new();
+    for (position, path) in paths.iter().enumerate() {
+        std::fs::write(path, b"warm catalog fixture").unwrap();
+        let stamp = crate::catalog::media_source_identity(path).unwrap();
+        assert!(
+            db.set_video_meta(
+                path,
+                path.file_name().unwrap().to_str().unwrap(),
+                stamp.0,
+                stamp.1,
+                &crate::catalog::VideoMeta::Read {
+                    duration_secs: Some(65.0 + position as f64),
+                    dims: None,
+                    codec: Some("h264".into())
+                },
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        stamps.push(Some(stamp));
+    }
+    app.install_new_items(
+        vec![
+            GridItem::Image(sources.path().join("near.jpg")),
+            GridItem::Video(paths[0].clone()),
+            GridItem::Video(paths[1].clone()),
+        ],
+        vec![Some((1, 1)), stamps[0], stamps[1]],
+    );
+    app.rebuild_visible_indices();
+    configure_dedicated_lazy_selection_info(&mut app);
+    app.settings.details_selection_bar_show_video_duration = true;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = false;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.selected = Some(1);
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let (old_tx, old_rx) = mpsc::channel();
+    let pending = app.details_meta_pending.as_mut().unwrap();
+    pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
+        unreachable!()
+    };
+    *rx = old_rx;
+    old_tx
+        .send(DetailsMetaEvent::Finished {
+            generation: app.items_generation,
+            failed: 0,
+        })
+        .unwrap();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(!app.selection_info_only_lazy_load());
+    assert!(
+        old_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: app.items_generation,
+                failed: 0
+            })
+            .is_err()
+    );
+    let ctx = egui::Context::default();
+    app.poll_details_meta_load(&ctx);
+    assert_eq!(
+        app.details_meta_pending
+            .as_ref()
+            .unwrap()
+            .selection_target_key,
+        app.details_lazy_cache_key(1)
+    );
+    let await_ready = |app: &mut App| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.details_image_dims_state.is_ready() && std::time::Instant::now() < deadline {
+            app.poll_details_meta_load(&ctx);
+            app.reconcile_details_lazy_session_after_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.details_image_dims_state.is_ready());
+    };
+    await_ready(&mut app);
+    assert_eq!(app.details_video_duration_sort_value(1), Some(65000));
+    // A selected-only follow-up after full completion is bounded and keeps ready AI facets.
+    app.ai_model_facet_requested = true;
+    app.selected = Some(2);
+    app.poll_details_meta_load(&ctx);
+    assert_eq!(
+        app.details_meta_pending.as_ref().unwrap().scan_scope,
+        DetailsMetaScanScope::VisibleStage
+    );
+    assert!(app.ai_model_facet_ready());
+    await_ready(&mut app);
+    assert_eq!(app.details_video_duration_sort_value(2), Some(66000));
+}
+
+#[test]
+fn selection_info_lazy_planning_merges_passed_pdf_target_without_restarting_ai_scan() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 4 + 17;
+    install_large_details_created_list(&mut app, count);
+    let pdf_path = PathBuf::from(r"C:\books\selected.pdf");
+    app.items[0] = GridItem::PdfFile(pdf_path.clone());
+    app.items[1] = GridItem::PdfFile(PathBuf::from(r"C:\books\background.pdf"));
+    configure_dedicated_lazy_selection_info(&mut app);
+    app.settings.details_selection_bar_show_page_count = true;
+    app.ai_model_facet_requested = true;
+    app.selected = None;
+    app.details_tag_prewarm_indices = vec![0];
+    let ctx = egui::Context::default();
+    app.start_details_meta_load(&ctx);
+    let pending = app.details_meta_pending.as_ref().unwrap();
+    let revision = pending.visible_revision;
+    let cancel = Arc::clone(&pending.cancel);
+    assert_eq!(
+        details_meta_plan_progress(&app).0,
+        DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME
+    );
+    app.selected = Some(0);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    app.poll_details_meta_load(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    let pending = app.details_meta_pending.as_ref().unwrap();
+    assert_eq!(pending.visible_revision, revision);
+    assert_eq!(
+        details_meta_plan_progress(&app).0,
+        DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2
+    );
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        unreachable!()
+    };
+    let selected: Vec<_> = plan
+        .visible_targets
+        .iter()
+        .filter(|target| target.idx == 0)
+        .collect();
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].load_created_at && selected[0].load_page_count);
+    assert_eq!(
+        selected[0].pdf_password_revision,
+        Some(app.pdf_passwords.credential_revision(&pdf_path))
+    );
+    app.selected = Some(1);
+    app.poll_details_meta_load(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert_eq!(
+        details_meta_plan_progress(&app).0,
+        DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 3
+    );
+    let DetailsMetaPendingPhase::Planning(plan) = &app.details_meta_pending.as_ref().unwrap().phase
+    else {
+        unreachable!()
+    };
+    assert!(
+        plan.background_targets
+            .iter()
+            .any(|target| target.idx == 1 && target.load_created_at)
+    );
+    assert!(
+        plan.visible_targets
+            .iter()
+            .any(|target| target.idx == 1 && target.load_created_at && target.load_page_count)
+    );
+    app.cancel_details_meta_loading();
+}
+
+#[test]
+fn selection_info_lazy_loading_prioritizes_new_selection_during_full_or_ai_fetch() {
+    let mut app = setup_media_duration_thumbnail_app();
+    for (mode, badge) in [
+        (crate::settings::GridViewMode::Details, false),
+        (crate::settings::GridViewMode::Thumbnail, false),
+        (crate::settings::GridViewMode::Thumbnail, true),
+    ] {
+        configure_dedicated_lazy_selection_info(&mut app);
+        app.settings.details_selection_bar_show_video_duration = true;
+        app.settings.grid_view_mode = mode;
+        app.settings.details_show_page_count = true;
+        // Thumbnail's bottom bar uses the shared grid columns; Dedicated is Details-only.
+        app.settings.details_show_video_duration = mode == crate::settings::GridViewMode::Thumbnail;
+        app.settings.details_show_video_dimensions = false;
+        app.settings.details_show_video_codec = false;
+        app.settings.thumb_show_media_duration = badge;
+        app.ai_model_facet_requested = true;
+        app.selected = Some(0);
+        app.details_tag_prewarm_indices = vec![0];
+        let cancel = install_fake_media_duration_pending(&mut app);
+        let (events_tx, events_rx) = mpsc::channel();
+        let (priority_tx, priority_rx) = mpsc::channel();
+        app.details_meta_pending.as_mut().unwrap().phase = DetailsMetaPendingPhase::Loading {
+            rx: events_rx,
+            priority_tx,
+        };
+        let revision = app.details_lazy_visible_revision;
+        app.selected = Some(4);
+        app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+        app.poll_details_meta_load(&egui::Context::default());
+        assert!(!cancel.load(Ordering::Relaxed));
+        let pending = app.details_meta_pending.as_ref().unwrap();
+        assert_eq!(pending.visible_revision, revision);
+        assert_eq!(pending.selection_target_key, app.details_lazy_cache_key(4));
+        let targets = priority_rx
+            .try_recv()
+            .expect("selection must bypass scroll idle gate");
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.idx == 4 && target.load_video_meta)
+        );
+        app.cancel_details_meta_loading();
+        drop(events_tx);
     }
 }

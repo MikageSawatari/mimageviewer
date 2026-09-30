@@ -135,6 +135,36 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、本ロック内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。別の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
+### サムネイルの動画・音声長さ取得
+
+`poll_details_meta_load` の既存 details-meta worker に統合する。Thumbnail モードの
+`thumb_show_media_duration` が ON なら、現在 viewer の `keep_set_sorted()` (可視 + 先読み) と
+選択情報の対象 1 件から bounded stage を作る。範囲変更は既存 scroll idle gate 後に snapshot を
+差し替え、`invalidate_details_meta_requirements` で旧 worker / revision を無効化する。
+Thumbnail / Details の切替も同じ取消・revision 更新を通す。Thumbnail の範囲限定ジョブの
+完了通知が、Details の全件取得を完了させることはない。
+専用選択情報バー・ツールチップの要求は一覧の列とは独立して同じ計画に合流し、モード切替後も
+選択項目を取得する。選択変更は画面外・画像等でも待たずに同じ stage へ反映する。
+全件計画中は既存 target の要求項目を合流し、worker 実行中は既存優先キューへ追加する。
+完了後の不足分は選択項目を含む bounded stage とし、全件走査の cursor を巻き戻さない。
+AI ファセットの全件取得は維持し、
+メディア取得だけ可視近傍に絞る。AI 全件取得後も新しい範囲を同じ staged reconciliation で取得する。
+既存 pending request の `DetailsMetaScanScope::{AllRequirements, VisibleStage}` が走査範囲を所有し、
+完了済み AI scan の後続は可視近傍だけを計画する。初回 AI 要求は進行中の長さ stage を取り消して
+全件要求へ戻す。長さだけの後続 stage は取得済み AI 候補を非準備状態へ戻さず、AI 集計 cache も
+AI 値または source identity が変わった patch だけで無効化する。
+
+worker は既存有界 catalog LRU / semaphore で `video_meta` を照会し、miss 時だけ FFmpeg probe を
+行う。`DetailsMediaProbeOutcome::{Read, Unreadable, Interrupted}` が読取結果の所有者で、
+`Read` / `Unreadable` だけ DB に保存する。FFmpeg のエラーを保持し、内容不正・利用可能な
+stream 不在・非対応 codec / container だけを `Unreadable` とする。アクセス拒否・共有違反・
+ファイル不在・一般 I/O エラー、取消、10 秒 timeout は `Interrupted` であり永続化しない。
+メモリ内は `DetailsMediaMeta::{NotFetched, Read, Unreadable, RetryLater}` が状態と値を所有する。
+`RetryLater` は試行時の既存 `items_generation` だけで取得済みと扱うため、同じ一覧で連続 probe
+せず、フォルダの再 open では世代が変わって再取得できる。取消は既存 worker 取消終端へ進む。
+UI は既存 `DetailsLazyMeta` を読むだけ。古い source identity の読取結果は公開前に破棄する。
+catalog の詳細・aggregate lookup・簡素化判断は [catalog-design.md](catalog-design.md) を参照。
+
 ## 2. スレッド間通信
 
 ### 2.1 共有アトミック
