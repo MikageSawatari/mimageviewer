@@ -12,6 +12,8 @@
 - **S2b 完了 (2026-10-01、`14f96aea3`)**: Remote の RAW (表示ページだけ同期現像、先読みは skip、最後の 1 枚、
   サムネイルは half 現像なし)、protocol v62。独立レビュー (別セッション) が 6 回で受け入れ判定、`test-full.ps1` PASS。
   次は master の取り込み (利用者指示)、その後 S2c
+- **S2c 完了 (2026-10-01、`749c9b612`)**: Remote の表示位置からの RAW 先読み (ブラウザの窓宣言 + core の突き合わせ)、
+  protocol 65。設計レビュー 4 回・独立レビュー 3 回で受け入れ、`test-full.ps1` PASS。次は S3
 - 作業場所: worktree `C:\home\mimageviewer-raw` / branch `raw-libraw` (master `edbac5f37` から分岐)
 - 引き継ぎ元: [raw-libraw-handoff.md](raw-libraw-handoff.md)。本書が完成したら handoff の内容は本書へ吸収済みとして削除してよい
 - 実装: Codex GPT-6 Sol / xhigh に段ごとに委任。独立レビュー: 実装者とは別の GPT-6 Sol / xhigh
