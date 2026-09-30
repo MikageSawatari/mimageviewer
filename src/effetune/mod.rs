@@ -14,6 +14,25 @@ use serde_json::Value;
 use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 
 pub mod composition;
+pub(crate) mod gui_gate;
+mod window;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GuiButtonAction {
+    Show,
+    Activate,
+    Hide,
+}
+
+pub(crate) fn gui_button_action(visible: bool, in_front: bool) -> GuiButtonAction {
+    if !visible {
+        GuiButtonAction::Show
+    } else if in_front {
+        GuiButtonAction::Hide
+    } else {
+        GuiButtonAction::Activate
+    }
+}
 
 const BUNDLE_NAME: &str = "EffeTune Mixwright.vst3";
 const INITIAL_CAPTURE_WAIT: Duration = Duration::from_secs(6);
@@ -93,7 +112,7 @@ pub enum EffetuneRuntime {
     Idle,
     Loading {
         origin: LoadOrigin,
-        open_gui_when_ready: bool,
+        open_gui_when_ready: Option<ShowPermit>,
     },
     Running {
         generation: u64,
@@ -249,7 +268,13 @@ pub struct ExitCaptureFence {
 }
 
 enum HostCommand {
+    RegisterBridge(std::sync::Weak<DspBridge>),
+    ReconcileVisibility,
     Disable(Arc<DspBridge>),
+    Show {
+        bridge: Arc<DspBridge>,
+        permit: ShowPermit,
+    },
     Gui {
         bridge: Arc<crate::video::dsp::bridge::Bridge>,
         value: Value,
@@ -591,11 +616,56 @@ fn resolve_bundle() -> Result<PathBuf, UnavailableReason> {
     Ok(bundle)
 }
 
+fn remote_playback_snapshot(
+    source: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
+) -> (bool, Option<u64>) {
+    let handle = source.lock().unwrap().clone();
+    handle.map_or((false, None), |handle| {
+        let snapshot = handle.snapshot();
+        (
+            snapshot.phase.blocks_local_control(),
+            Some(snapshot.acquisition_sequence),
+        )
+    })
+}
+
+fn remote_playback_active(
+    source: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
+) -> bool {
+    remote_playback_snapshot(source).0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShowPermit {
+    minimize_sequence: u64,
+    remote_acquisition: Option<u64>,
+}
+
+impl ShowPermit {
+    fn allows(self, current: Self, remote: bool, minimized: bool) -> bool {
+        self == current && !remote && !minimized
+    }
+}
+
+fn show_permit(
+    window: &window::MainWindowObserver,
+    remote: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
+) -> ShowPermit {
+    ShowPermit {
+        minimize_sequence: window.minimize_sequence(),
+        remote_acquisition: remote_playback_snapshot(remote).1,
+    }
+}
+
 struct LoadDone {
     bridge: Arc<DspBridge>,
 }
 
 pub struct EffetuneController {
+    main_window: Arc<window::MainWindowObserver>,
+    remote_session: Arc<Mutex<Option<crate::remote_ipc::session::SessionHandle>>>,
+    // Edge notification only. Worker presentation reads the canonical handle.
+    remote_session_notified: bool,
     pub runtime: EffetuneRuntime,
     pub slot: Arc<EffetuneAudioSlot>,
     bridge: Option<Arc<DspBridge>>,
@@ -628,16 +698,55 @@ impl EffetuneController {
         let (gui_failure_tx, gui_failure_rx) = mpsc::channel();
         let (host_tx, host_rx) = mpsc::channel::<HostCommand>();
         let repaint_context = Arc::new(Mutex::new(None));
+        let remote_session = Arc::new(Mutex::new(None));
+        let main_window = Arc::new(window::MainWindowObserver::new(host_tx.clone()));
+        let host_main_window = Arc::downgrade(&main_window);
+        let host_remote_session = Arc::downgrade(&remote_session);
         let host_repaint = Arc::clone(&repaint_context);
         let host_failure_tx = failure_tx.clone();
         std::thread::Builder::new()
             .name("effetune-host-control".into())
             .spawn(move || {
+                let mut presentation_bridge = std::sync::Weak::<DspBridge>::new();
                 while let Ok(command) = host_rx.recv() {
                     match command {
-                        HostCommand::Disable(bridge) => bridge.disable(),
+                        HostCommand::RegisterBridge(bridge) => presentation_bridge = bridge,
+                        HostCommand::ReconcileVisibility => {
+                            if let Some(bridge) = presentation_bridge.upgrade() { bridge.sync_main_window_visibility(); }
+                        }
+                        HostCommand::Disable(bridge) => { presentation_bridge = std::sync::Weak::new(); bridge.disable(); },
+                        HostCommand::Show { bridge, permit } => {
+                            let Some(host_main_window) = host_main_window.upgrade() else { continue; };
+                            let Some(host_remote_session) = host_remote_session.upgrade() else { continue; };
+                            let result = (|| {
+                                if !permit.allows(show_permit(&host_main_window, &host_remote_session), remote_playback_active(&host_remote_session), bridge.main_window_is_minimized()) { return Ok(()); }
+                                bridge.attach_slot_gui_hidden(0)?;
+                                let remote = remote_playback_active(&host_remote_session);
+                                bridge.set_slot_gui_remote_session_checked(0, remote)?;
+                                // An editor attached while Remote acquired control remains hidden.
+                                // It was never visible, so release must not open it later.
+                                if permit.allows(show_permit(&host_main_window, &host_remote_session), remote, bridge.main_window_is_minimized()) {
+                                    bridge.show_slot_gui_checked(0, permit.minimize_sequence, gui_gate::GuiGate::remote_token(permit.remote_acquisition))?;
+                                }
+                                Ok::<_, String>(())
+                            })();
+                            if let Err(error) = result {
+                                let _ = host_failure_tx.send(EffetuneFailure::GuiFailed(error));
+                            }
+                            wake_ui(&host_repaint);
+                        }
                         HostCommand::Gui { bridge, value } => {
-                            if let Err(error) = bridge.send_value(&value) {
+                            let result = (|| {
+                                if matches!(value["cmd"].as_str(), Some("sync_gui_main_visibility" | "activate_gui")) {
+                                    bridge.send_value(&serde_json::json!({
+                                        "cmd": "set_gui_remote_session",
+                                        "slot_id": value["slot_id"],
+                                        "active": u32::from(host_remote_session.upgrade().is_some_and(|source| remote_playback_active(&source))),
+                                    }))?;
+                                }
+                                bridge.send_value(&value)
+                            })();
+                            if let Err(error) = result {
                                 let _ = host_failure_tx.send(EffetuneFailure::GuiFailed(format!(
                                     "GUI command failed: {error}"
                                 )));
@@ -657,6 +766,9 @@ impl EffetuneController {
             Err(reason) => EffetuneRuntime::Unavailable(reason.clone()),
         };
         Self {
+            main_window,
+            remote_session,
+            remote_session_notified: false,
             runtime,
             slot: Arc::new(EffetuneAudioSlot {
                 current: Mutex::new(None),
@@ -680,6 +792,61 @@ impl EffetuneController {
             pending_hide: None,
             repaint_context,
         }
+    }
+
+    pub fn set_main_hwnd(&self, hwnd: u64) {
+        self.main_window.install(hwnd);
+    }
+
+    pub(crate) fn set_remote_session_source(
+        &self,
+        handle: Option<crate::remote_ipc::session::SessionHandle>,
+    ) {
+        let mut source = self.remote_session.lock().unwrap();
+        if let Some(previous) = source.take() {
+            previous.set_gui_gate(None);
+        }
+        if let Some(handle) = &handle {
+            if let Ok(gate) = self.main_window.gate() {
+                handle.set_gui_gate(Some(gate));
+            }
+        }
+        *source = handle;
+    }
+
+    pub fn set_remote_session(&mut self, active: bool) {
+        if std::mem::replace(&mut self.remote_session_notified, active) == active {
+            return;
+        }
+        if active
+            && let EffetuneRuntime::Loading {
+                open_gui_when_ready,
+                ..
+            } = &mut self.runtime
+        {
+            *open_gui_when_ready = None;
+        }
+        let _ = self.host_tx.send(HostCommand::ReconcileVisibility);
+    }
+
+    pub fn request_show_gui(&self) {
+        self.request_show_gui_with_permit(show_permit(&self.main_window, &self.remote_session));
+    }
+
+    pub fn request_show_gui_with_permit(&self, permit: ShowPermit) {
+        if remote_playback_active(&self.remote_session) {
+            return;
+        }
+        if let Some(bridge) = self.bridge.as_ref() {
+            let _ = self.host_tx.send(HostCommand::Show {
+                bridge: Arc::clone(bridge),
+                permit,
+            });
+        }
+    }
+
+    pub fn click_foreground(&self, pointer_click: bool) -> u64 {
+        self.main_window.click_foreground(pointer_click)
     }
 
     pub fn set_repaint_context(&self, ctx: &egui::Context) {
@@ -709,12 +876,19 @@ impl EffetuneController {
         if !matches!(self.runtime, EffetuneRuntime::Idle) {
             return;
         }
+        if let Err(error) = self.main_window.gate() {
+            self.fail(EffetuneFailure::GuiFailed(format!(
+                "presentation gate: {error}"
+            )));
+            return;
+        }
         let Some(bundle) = self.bundle_path.clone() else {
             return;
         };
         self.runtime = EffetuneRuntime::Loading {
             origin,
-            open_gui_when_ready,
+            open_gui_when_ready: open_gui_when_ready
+                .then(|| show_permit(&self.main_window, &self.remote_session)),
         };
         let captures = Arc::clone(&self.captures);
         let gui_failure_tx = self.gui_failure_tx.clone();
@@ -877,6 +1051,12 @@ impl EffetuneController {
     }
 
     fn publish_running(&mut self, bridge: Arc<DspBridge>) {
+        if let Ok(gate) = self.main_window.gate() {
+            bridge.set_gui_gate(gate);
+        }
+        let _ = self
+            .host_tx
+            .send(HostCommand::RegisterBridge(Arc::downgrade(&bridge)));
         #[cfg(windows)]
         {
             let weak = Arc::downgrade(&bridge);
@@ -958,6 +1138,15 @@ impl EffetuneController {
     }
 }
 
+pub(crate) fn new_bridge() -> Arc<DspBridge> {
+    DspBridge::new_with_gui_chrome(
+        GuiOwnerPolicy::Unowned,
+        LatencyPolicy::ReportOnly,
+        true,
+        false,
+    )
+}
+
 fn load_worker(
     bundle: &Path,
     path: &Path,
@@ -982,12 +1171,7 @@ fn load_worker(
             "saved state is empty".into(),
         ));
     }
-    let bridge = DspBridge::new_with_gui_chrome(
-        GuiOwnerPolicy::FixedMain,
-        LatencyPolicy::ReportOnly,
-        true,
-        false,
-    );
+    let bridge = new_bridge();
     bridge.set_gui_failure_sink(gui_failure_tx.clone());
     let gui_repaint = Arc::clone(&repaint_context);
     bridge.set_gui_result_wake(Arc::new(move || wake_ui(&gui_repaint)));
@@ -1064,6 +1248,141 @@ fn startup_state_requires_load(saved: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_button_decides_hidden_front_and_behind() {
+        assert_eq!(gui_button_action(false, false), GuiButtonAction::Show);
+        assert_eq!(gui_button_action(false, true), GuiButtonAction::Show);
+        assert_eq!(gui_button_action(true, true), GuiButtonAction::Hide);
+        assert_eq!(gui_button_action(true, false), GuiButtonAction::Activate);
+    }
+
+    #[test]
+    fn pending_show_is_revoked_by_current_or_completed_suppression() {
+        let permit = ShowPermit {
+            minimize_sequence: 1,
+            remote_acquisition: Some(2),
+        };
+        assert!(permit.allows(permit, false, false));
+        assert!(!permit.allows(permit, true, false));
+        assert!(!permit.allows(permit, false, true));
+        // A complete hide/restore interval during attach still revokes this open.
+        assert!(!permit.allows(
+            ShowPermit {
+                minimize_sequence: 2,
+                ..permit
+            },
+            false,
+            false
+        ));
+        assert!(!permit.allows(
+            ShowPermit {
+                remote_acquisition: Some(3),
+                ..permit
+            },
+            false,
+            false
+        ));
+        assert!(!permit.allows(
+            ShowPermit {
+                remote_acquisition: None,
+                ..permit
+            },
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn remote_acquisition_cancels_pending_open_and_blocks_show() {
+        let mut controller = EffetuneController::new();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        controller.set_remote_session_source(Some(handle.clone()));
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        let (tx, rx) = mpsc::channel();
+        controller.host_tx = tx;
+        controller.bridge = Some(DspBridge::new());
+        controller.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::UserButton,
+            open_gui_when_ready: Some(show_permit(
+                &controller.main_window,
+                &controller.remote_session,
+            )),
+        };
+        controller.set_remote_session(true);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::ReconcileVisibility)
+        ));
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Loading {
+                open_gui_when_ready: None,
+                ..
+            }
+        ));
+        controller.request_show_gui();
+        assert!(rx.try_recv().is_err());
+        let generation = handle.snapshot().generation;
+        assert!(handle.abort_acquire_barrier(generation));
+        controller.request_show_gui();
+        assert!(rx.try_recv().is_err()); // Drain still holds playback.
+        assert!(handle.complete_app_drain(generation));
+        controller.set_remote_session(false);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::ReconcileVisibility)
+        ));
+        // Release itself never requests a previously hidden editor to open.
+        assert!(rx.try_recv().is_err());
+        controller.request_show_gui();
+        assert!(matches!(rx.try_recv(), Ok(HostCommand::Show { .. })));
+    }
+
+    #[test]
+    fn worker_remote_reader_observes_acquisition_before_ui_notification() {
+        let mut controller = EffetuneController::new();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        controller.set_remote_session_source(Some(handle.clone()));
+        assert!(!remote_playback_active(&controller.remote_session));
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert!(!controller.remote_session_notified);
+        assert!(remote_playback_active(&controller.remote_session));
+        let gate = controller.main_window.gate().unwrap();
+        assert_eq!(gate.remote() & 1, 1);
+        let issued = gui_gate::GuiGate::remote_token(Some(0));
+        let generation = handle.snapshot().generation;
+        assert!(handle.abort_acquire_barrier(generation));
+        assert!(handle.complete_app_drain(generation));
+        // The GUI task sees the completed acquisition despite no UI notification.
+        assert_ne!(gate.remote(), issued);
+        assert_eq!(gate.remote() & 1, 0);
+        controller.set_remote_session_source(None);
+        assert_eq!(gate.remote(), 0);
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "old-detached-source".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert_eq!(gate.remote(), 0); // Old source cannot publish into a later binding.
+        assert!(!remote_playback_active(&controller.remote_session));
+        // A detached source cannot keep suppression latched on another session.
+        controller.set_remote_session(false);
+    }
 
     // Fixture shape: Frieve-A/effetune-mixwright v0.11.1,
     // src/bridge/state_codec.cpp, StateCodec::encode. Confirmed against bytes
@@ -1144,7 +1463,7 @@ mod tests {
             let mut controller = EffetuneController::new();
             controller.runtime = EffetuneRuntime::Loading {
                 origin: LoadOrigin::Startup,
-                open_gui_when_ready: false,
+                open_gui_when_ready: None,
             };
             controller.publish_running(DspBridge::new());
             assert!(controller.slot.snapshot().is_some());
@@ -1260,6 +1579,10 @@ mod tests {
             EffetuneRuntime::Failed(EffetuneFailure::GuiFailed("fixture attach error".into()))
         );
         assert!(controller.slot.snapshot().is_none());
+        assert!(matches!(
+            host_rx.try_recv(),
+            Ok(HostCommand::RegisterBridge(_))
+        ));
         assert!(matches!(host_rx.try_recv(), Ok(HostCommand::Disable(_))));
     }
 

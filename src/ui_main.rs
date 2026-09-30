@@ -9642,7 +9642,7 @@ impl App {
                             self.effetune.effective_state(),
                             Some(crate::effetune::EffectiveState::Effective)
                         );
-                        let available = matches!(
+                        let available = !self.remote_session_blocks_local_control() && matches!(
                             self.effetune.runtime,
                             crate::effetune::EffetuneRuntime::Idle
                                 | crate::effetune::EffetuneRuntime::Running { .. }
@@ -9658,9 +9658,10 @@ impl App {
                                     },
                                 ),
                             )
-                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
+                            .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
                         if resp.clicked() {
-                            self.effetune_toolbar_click();
+                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
                         }
                         self.finish_toolbar_section_lead(
                             ui,

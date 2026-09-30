@@ -506,7 +506,8 @@ BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& op
                         (options.resizable ? WS_THICKFRAME : 0) |
                         WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
     const DWORD ex_style = WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE;
-    UINT dpi = owner_hwnd ? GetDpiForWindow(owner_hwnd) : GetDpiForSystem();
+    HWND dpi_reference = options.unowned ? reinterpret_cast<HWND>(options.main_hwnd) : owner_hwnd;
+    UINT dpi = dpi_reference ? GetDpiForWindow(dpi_reference) : GetDpiForSystem();
     if (dpi == 0) dpi = 96;
     const int title_h = std::max(28, MulDiv(34, static_cast<int>(dpi), 96));
     int width = 0;
@@ -1461,6 +1462,14 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         blog("show_gui: already attached, hiding first");
         hide_gui();
     }
+    if (options.unowned) {
+        auto gate = std::make_unique<GuiGateReader>();
+        if (!gate->open(utf8_to_wide(options.gui_gate_name))) {
+            error_out = "invalid or missing EffeTune presentation gate";
+            return false;
+        }
+        gui_gate_ = std::move(gate);
+    }
     if (!view_) {
         blog("show_gui: createView(kEditor)");
         view_ = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
@@ -1488,9 +1497,9 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     Steinberg::FUnknownPtr<Steinberg::IPlugViewContentScaleSupport> css(view_);
     if (css) {
         UINT dpi = 0;
-        HWND owner_hwnd = reinterpret_cast<HWND>(options.owner_hwnd);
-        if (owner_hwnd) {
-            dpi = GetDpiForWindow(owner_hwnd);
+        HWND dpi_reference = reinterpret_cast<HWND>(options.unowned ? options.main_hwnd : options.owner_hwnd);
+        if (dpi_reference) {
+            dpi = GetDpiForWindow(dpi_reference);
         }
         if (dpi == 0) dpi = GetDpiForSystem();
         if (dpi == 0) dpi = 96;
@@ -1534,6 +1543,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     }
     view_attached_ = true;
     view_host_hwnd_ = options.owner_hwnd;
+    view_main_hwnd_ = options.unowned ? options.main_hwnd : nullptr;
     view_container_hwnd_ = frame_hwnd;
     view_plugin_host_hwnd_ = attach_hwnd;
     editor_slot_id_ = options.slot_id;
@@ -1589,12 +1599,13 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         blog("show_gui: host resizeView re-enabled after fixed-size restore plugin=\"%s\"",
              plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str());
     }
-    gui_surface_visible_ = visible;
+    gui_visibility_.request(visible);
     gui_app_active_ = true;
     if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
         container_hwnd && IsWindow(container_hwnd)) {
-        ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNOACTIVATE : SW_HIDE);
-        if (visible && gui_app_active_) {
+        const bool should_show = gui_surface_should_show();
+        ShowWindow(container_hwnd, should_show ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (should_show) {
             refresh_gui_surface(container_hwnd);
         }
     }
@@ -1662,7 +1673,7 @@ void PluginLoader::set_gui_surface_visible_state(bool visible) {
         return;
     }
 
-    gui_surface_visible_ = visible;
+    gui_visibility_.request(visible);
 }
 
 bool PluginLoader::gui_surface_should_show() {
@@ -1679,7 +1690,13 @@ bool PluginLoader::gui_surface_should_show() {
         return result.value_or(false);
     }
 
-    return gui_surface_visible_ && gui_app_active_;
+    HWND main = reinterpret_cast<HWND>(view_main_hwnd_);
+    // Re-read OS state on the GUI thread, including after a long attached().
+    // Missing main is suppressed during teardown rather than resurrected.
+    const bool minimized = main && (!IsWindow(main) || IsIconic(main));
+    gui_visibility_.suppress(GuiSuppression::Minimized, minimized);
+    if (gui_gate_) gui_visibility_.suppress(GuiSuppression::RemoteSession, (gui_gate_->snapshot().remote & 1) != 0);
+    return gui_visibility_.should_show(main != nullptr, gui_app_active_);
 }
 
 bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
@@ -1736,6 +1753,99 @@ void* PluginLoader::gui_container_hwnd() const {
     return view_container_hwnd_snapshot_.load(std::memory_order_acquire);
 }
 
+void PluginLoader::set_gui_remote_session(bool active) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) return;
+    if (!is_gui_thread()) {
+        if (gui_thread_) gui_thread().post_async([this, active]() { set_gui_remote_session(active); });
+        return;
+    }
+    if (!view_main_hwnd_) return; // User VST policy is unchanged.
+    gui_visibility_.suppress(GuiSuppression::RemoteSession, active);
+    sync_gui_main_visibility();
+}
+
+void PluginLoader::sync_gui_main_visibility() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) return;
+    if (!is_gui_thread()) {
+        if (gui_thread_) gui_thread().post_async([this]() { sync_gui_main_visibility(); });
+        return;
+    }
+    if (!view_main_hwnd_) return;
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!container || !IsWindow(container)) return;
+    const bool show = gui_surface_should_show();
+    if (!!IsWindowVisible(container) != show) {
+        ShowWindow(container, show ? SW_SHOWNA : SW_HIDE);
+        if (show) refresh_gui_surface(container);
+    }
+}
+
+void PluginLoader::activate_gui() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) return;
+    if (!is_gui_thread()) {
+        if (gui_thread_) gui_thread().post_async([this]() { activate_gui(); });
+        return;
+    }
+    // Only explicit user actions request activation, never minimize/restore.
+    if (!gui_surface_should_show()) return;
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!container || !IsWindow(container)) return;
+    ShowWindow(container, SW_SHOW);
+    if (SetForegroundWindow(container)) {
+        HWND child = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
+        if (child && IsWindow(child)) SetFocus(child);
+    }
+}
+
+void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot permit,
+                                              std::function<void(const char*)> reply) {
+    if (!is_gui_thread()) {
+        if (editor_quarantined_.load(std::memory_order_acquire) || !gui_thread_) { reply("error"); return; }
+        gui_thread().post_async([this, visible, permit, reply = std::move(reply)]() mutable {
+            set_gui_visibility_checked(visible, permit, std::move(reply));
+        });
+        return;
+    }
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    HWND main = reinterpret_cast<HWND>(view_main_hwnd_);
+    if (!gui_gate_ || !main || !IsWindow(main) || !container || !IsWindow(container)) { reply("error"); return; }
+    if (!visible) {
+        gui_visibility_.request(false);
+        ShowWindow(container, SW_HIDE);
+        reply("hidden");
+        return;
+    }
+    const bool previously_requested = gui_visibility_.requested();
+    if (!gui_visibility_.accept_show(permit, gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+        sync_gui_main_visibility();
+        reply("cancelled");
+        return;
+    }
+    ShowWindow(container, SW_SHOWNA);
+    // ShowWindow can call plugin/window code reentrantly. Recheck before
+    // accepting the first show and before activation, without a queued raise.
+    if (!permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+        if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
+        sync_gui_main_visibility();
+        reply("cancelled");
+        return;
+    }
+    if (!IsWindowVisible(container) || !gui_visibility_.requested()) {
+        if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
+        reply("cancelled");
+        return;
+    }
+    refresh_gui_surface(container);
+    if (!permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+        if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
+        sync_gui_main_visibility();
+        reply("cancelled");
+        return;
+    }
+    activate_gui();
+    reply(gui_visibility_.requested() && IsWindowVisible(container) ? "shown" : "cancelled");
+}
+
 void PluginLoader::set_gui_visible(bool visible) {
     if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
         return;
@@ -1750,11 +1860,13 @@ void PluginLoader::set_gui_visible(bool visible) {
         return;
     }
 
-    gui_surface_visible_ = visible;
+    if (view_main_hwnd_ && visible) return; // EffeTune requires checked visibility.
+    gui_visibility_.request(visible);
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
-        ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNA : SW_HIDE);
-        if (visible && gui_app_active_) {
+        const bool should_show = gui_surface_should_show();
+        ShowWindow(container_hwnd, should_show ? SW_SHOWNA : SW_HIDE);
+        if (should_show) {
             refresh_gui_surface(container_hwnd);
         }
         blog("set_gui_visible: bridge surface hwnd=0x%llx visible=%d",
@@ -1811,6 +1923,7 @@ void PluginLoader::set_gui_owner(void* owner_hwnd) {
     }
 
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (view_main_hwnd_) return; // Unowned is immutable for this editor lifetime.
     HWND new_owner = reinterpret_cast<HWND>(owner_hwnd);
     if (!container_hwnd || !IsWindow(container_hwnd) || !new_owner || !IsWindow(new_owner)) {
         blog("set_gui_owner: skipped surface=0x%llx owner=0x%llx",
@@ -1851,13 +1964,19 @@ void PluginLoader::set_gui_app_active(bool active) {
         return;
     }
 
+    if (view_main_hwnd_) {
+        // Ordinary unowned tool window: app deactivation does not hide or
+        // re-raise it. Main minimization alone suppresses presentation.
+        sync_gui_main_visibility();
+        return;
+    }
     gui_app_active_ = active;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
-        if (gui_surface_visible_ && gui_app_active_) {
+        if (gui_visibility_.requested() && gui_app_active_) {
             ShowWindow(container_hwnd, SW_SHOWNA);
             refresh_gui_surface(container_hwnd);
-        } else if (gui_surface_visible_) {
+        } else if (gui_visibility_.requested()) {
             // Do not hide here: several D3D-backed plugin editors repaint as a
             // blank surface after repeated ShowWindow(SW_HIDE/SW_SHOWNA). It is
             // enough to leave the topmost band. Do not send it to HWND_BOTTOM:
@@ -1878,7 +1997,7 @@ void PluginLoader::set_gui_app_active(bool active) {
         blog("set_gui_app_active: bridge surface hwnd=0x%llx active=%d visible=%d",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
              active ? 1 : 0,
-             gui_surface_visible_ ? 1 : 0);
+             gui_visibility_.requested() ? 1 : 0);
         return;
     }
     blog("set_gui_app_active: no bridge surface active=%d", active ? 1 : 0);
@@ -2182,10 +2301,12 @@ void PluginLoader::hide_gui() {
         if (editor_quarantined_.load(std::memory_order_acquire)) {
             abandon_gui_thread("hide_gui quarantined");
             view_host_hwnd_ = nullptr;
+            view_main_hwnd_ = nullptr;
+    gui_gate_.reset();
             view_container_hwnd_ = nullptr;
             view_plugin_host_hwnd_ = nullptr;
             view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
-            gui_surface_visible_ = false;
+            gui_visibility_.request(false);
             gui_app_active_ = true;
             last_gui_width_ = 0;
             last_gui_height_ = 0;
@@ -2213,10 +2334,12 @@ void PluginLoader::hide_gui() {
     }
     view_attached_ = false;
     view_host_hwnd_ = nullptr;
+    view_main_hwnd_ = nullptr;
+    gui_gate_.reset();
     view_container_hwnd_ = nullptr;
     view_plugin_host_hwnd_ = nullptr;
     view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
-    gui_surface_visible_ = false;
+    gui_visibility_.request(false);
     gui_app_active_ = true;
     last_gui_width_ = 0;
     last_gui_height_ = 0;

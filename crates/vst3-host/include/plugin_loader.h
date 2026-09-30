@@ -16,6 +16,7 @@
 #include <vector>
 #include <windows.h>
 
+#include "gui_visibility.h"
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -50,6 +51,9 @@ struct PluginProbeInfo {
 struct GuiWindowOptions {
     uint64_t slot_id = 0;
     void* owner_hwnd = nullptr;
+    bool unowned = false;
+    void* main_hwnd = nullptr; // DPI/minimize reference, never an owner
+    std::string gui_gate_name;
     uint32_t width = 0;
     uint32_t height = 0;
     bool resizable = true;
@@ -148,6 +152,11 @@ public:
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
+    void set_gui_visibility_checked(bool visible, GuiGateSnapshot permit,
+                                    std::function<void(const char*)> reply);
+    void sync_gui_main_visibility();
+    void set_gui_remote_session(bool active);
+    void activate_gui();
     /// Toggle topmost state for the bridge-owned plugin surface. The Rust side
     /// applies the same state to the host HWND so the two windows stay together.
     void set_gui_topmost(bool topmost);
@@ -249,13 +258,16 @@ private:
     std::string plugin_name_;
     bool view_attached_ = false;
     void* view_host_hwnd_ = nullptr;
+    // Non-null only for the explicitly unowned EffeTune editor.
+    void* view_main_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
     void* view_plugin_host_hwnd_ = nullptr;
     uint64_t editor_slot_id_ = 0;
     std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
     std::atomic<bool> editor_bypassed_{false};
     std::atomic<bool> editor_show_bypass_button_{true};
-    bool gui_surface_visible_ = false;
+    GuiVisibility gui_visibility_;
+    std::unique_ptr<GuiGateReader> gui_gate_;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;

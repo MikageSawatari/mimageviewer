@@ -25826,7 +25826,11 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn effetune_toolbar_click(&mut self) {
+    pub(crate) fn effetune_toolbar_click(&mut self, pointer_click: bool) {
+        let foreground = self.effetune.click_foreground(pointer_click);
+        if self.remote_session_blocks_local_control() {
+            return;
+        }
         match self.effetune.runtime.clone() {
             crate::effetune::EffetuneRuntime::Idle => self.effetune.click_idle(
                 self.settings.effetune_gui_pos,
@@ -25836,14 +25840,20 @@ impl App {
                 let Some(bridge) = self.effetune.bridge().cloned() else {
                     return;
                 };
-                if bridge.slot(0).is_some_and(|slot| slot.gui_visible) {
-                    self.save_effetune_gui_rect();
-                    self.effetune.request_hide_gui();
-                } else {
-                    if let Some(hwnd) = self.main_hwnd {
-                        bridge.set_main_hwnd(hwnd as u64);
+                use crate::effetune::{GuiButtonAction, gui_button_action};
+                let visible = bridge.slot(0).is_some_and(|slot| slot.gui_visible);
+                match gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground)) {
+                    GuiButtonAction::Hide => {
+                        self.save_effetune_gui_rect();
+                        self.effetune.request_hide_gui();
                     }
-                    bridge.show_slot_gui_async(0);
+                    GuiButtonAction::Activate => self.effetune.request_show_gui(),
+                    GuiButtonAction::Show => {
+                        if let Some(hwnd) = self.main_hwnd {
+                            bridge.set_main_hwnd(hwnd as u64);
+                        }
+                        self.effetune.request_show_gui();
+                    }
                 }
             }
             _ => {}
@@ -25852,6 +25862,9 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn effetune_toolbar_tooltip(&self) -> String {
+        if self.remote_session_blocks_local_control() {
+            return "リモート接続中は音響調整の窓を表示できません。接続が終了すると、表示していた窓が戻ります".into();
+        }
         use crate::effetune::{EffectiveState, EffetuneRuntime};
         match &self.effetune.runtime {
             EffetuneRuntime::Unavailable(reason) => {
@@ -25879,20 +25892,20 @@ impl App {
     pub(crate) fn poll_effetune(&mut self, ctx: &egui::Context) {
         self.effetune.set_repaint_context(ctx);
         let startup_pending = self.effetune.startup_pending();
-        let open_gui_when_ready = matches!(
-            self.effetune.runtime,
+        let open_gui_when_ready = match self.effetune.runtime {
             crate::effetune::EffetuneRuntime::Loading {
-                open_gui_when_ready: true,
+                open_gui_when_ready,
                 ..
-            }
-        );
+            } => open_gui_when_ready,
+            _ => None,
+        };
         if !self.sidecar_restore_active() && self.effetune.poll() {
             if let Some(bridge) = self.effetune.bridge() {
                 if let Some(hwnd) = self.main_hwnd {
                     bridge.set_main_hwnd(hwnd as u64);
                 }
-                if open_gui_when_ready {
-                    std::sync::Arc::clone(bridge).show_slot_gui_async(0);
+                if let Some(permit) = open_gui_when_ready {
+                    self.effetune.request_show_gui_with_permit(permit);
                 }
             }
             if startup_pending
@@ -83446,6 +83459,7 @@ impl App {
                     // main.rs の `install_mouse_nav_hook` のコメント参照。
                     crate::install_mouse_nav_hook();
                     crate::key_input::install_main_window_subclass(hwnd_raw as u64);
+                    self.effetune.set_main_hwnd(hwnd_raw as u64);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
                     #[cfg(windows)]

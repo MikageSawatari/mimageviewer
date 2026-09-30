@@ -6219,7 +6219,7 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
         });
         app.effetune.runtime = EffetuneRuntime::Loading {
             origin: LoadOrigin::Startup,
-            open_gui_when_ready: false,
+            open_gui_when_ready: None,
         };
         assert!(app.media_startup_load_pending());
 
@@ -6257,7 +6257,7 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
     app.settings.vst3_enabled = false;
     app.effetune.runtime = EffetuneRuntime::Loading {
         origin: LoadOrigin::Startup,
-        open_gui_when_ready: false,
+        open_gui_when_ready: None,
     };
     assert!(app.media_startup_load_pending());
     app.effetune.set_test_startup_completion(Ok(()));

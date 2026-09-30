@@ -167,15 +167,58 @@ enum EffetuneFailure {
 
 - ツールバーに `ToolbarSectionId::EffeTune` を追加 (既存 `FolderTree` の toggle に倣う)。既定で表示。
   - ランプ (selectable の active) = `Running` かつ 最新の判定が `Effective`。
-  - クリック: `Idle` → `Loading { UserButton, open_gui_when_ready: true }` /
-    `Running` → GUI の表示・非表示 / `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。
+  - クリック: `Idle` → `Loading { UserButton, open_gui_when_ready: Some(ShowPermit) }` /
+    `Running` → 非表示なら表示・アクティブ化、表示中で手前なら非表示、背面なら手前へ出してアクティブ化 /
+    `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。
   - ツールチップに状態と理由 (Failed の理由、判定が古い可能性、Unparseable の理由) を出す。
   - 実装事実 (2026-09-28): 利用不可・失敗・判定不能のツールチップには短い日本語の理由を出し、
     enum 名、host の詳細エラー、bundle の絶対パスは表示しない。診断詳細は log に残す。
-- **GUI の owner はメインウィンドウに固定**。`DspBridge` に GUI owner 方針
-  (`GuiOwnerPolicy::FixedMain` / 既存の `Auto`) を持たせ、EffeTune の bridge は `FixedMain`。
-  attach と再表示のたびに main HWND が有効か確認し、無効なら表示しない (理由を log)。
-  fullscreen owner は設定しない。TOPMOST にもしない。
+- **GUI は owner のない tool window** (`GuiOwnerPolicy::Unowned`、利用者決定 2026-09-30)。
+  `FixedMain` の owned popup は Windows の規則でメインより常に手前になり、メインをクリックしても
+  裏へ回せないため変更した。owner HWND は常に 0、タスクバーのボタンは増やさない。ユーザー VST は
+  既存の `Auto`。fullscreen owner は設定しない。TOPMOST にもしない。
+  main HWND は owner と分けた参照として DPI と最小化の確認にだけ使う。初期位置・保存済み rect は
+  従来どおり。host の `set_owner` とドラッグ終了による owner 復元で再所有させない。
+- **「手前」の判定は foreground window のルートから owner chain を辿ると、当該 editor に到達するか**
+  の 1 つにする。editor 自身とその popup を含め、別のユーザー VST は含めない。
+  メインへの primary click は `WM_MOUSEACTIVATE` → `WM_LBUTTONDOWN` の組で、メインが手前になる前の
+  foreground を採取する。次のクリックで置き換え、キーボードによるボタン操作は現在の foreground を使う。
+  タッチ／ペンも `WM_POINTERACTIVATE` と primary `WM_POINTERDOWN`、legacy `WM_TOUCH` の primary down
+  から同じ入力状態を通す。非 client・別ボタン・取消し・非アクティブ化で未完了の activation を破棄する。
+  明示的な表示／背面からの復帰だけで foreground を許可し、host GUI thread でアクティブ化する。
+- **mIV による一時非表示は host の `GuiVisibility` が単独で所有**する。表示希望と非表示理由の集合
+  (`Minimized` / `RemoteSession`) を持ち、理由がすべて解除され、表示希望が残るときだけ非アクティブで戻す。
+  最小化や Remote による hide で `user_hidden`、設定保存、state capture、音声の実行状態を変えない。
+  最小化はメインの `WM_SIZE` で共有 atomic の連番を更新し、worker に通知する。
+  WndProc は bridge を参照せず、`DspBridge.inner` のロック・列挙・IPC は worker 側だけで行う。
+  実際の表示直前にも現在の `IsIconic(main)` を確認する。
+  アプリの非アクティブ化では窓を隠したり手前へ戻したりしない。mIV 終了時は既存の bridge teardown で消す。
+- **Remote が操作権を持つ間は窓を隠す** (利用者決定 2026-10-01)。音の look-ahead による反映遅延と
+  端末より先行するビジュアライザーで PC 上の編集が紛らわしいため。
+  正本は `remote_session_blocks_local_control()` (取得中・所有中・drain 中を含む、音声トラック計画 §9B)。
+  「音響調整」は無効表示し、ツールチップで理由と復帰を説明する。取得時に未完了の自動 GUI open 意図を取消す。
+  初回 attach は非表示で行い、専用 host-control worker が完了時の Remote 状態を確認してから表示する。
+  Remote または最小化中に attach が完了した窓は隠したままで、解除時に新しく開かない。
+  worker はイベントに載った古い Remote 値を再生せず、現在の `SessionHandle` の phase を読む。
+  UI 側の直前通知値は重複通知の抑制だけに使い、最小化から復帰したときに UI frame より前でも
+  新しい Remote 取得を検出する。handle の登録・切り離しと同じ境界で参照を更新する。
+  未表示の open 要求は `ShowPermit` (native 最小化イベント連番と既存 Remote 取得連番) を利用者の
+  open 要求時 (Loading 中の要求を含む) に採取し、attach 前後で照合する。
+  attach 中に最小化／Remote の開始と終了が両方済んだ場合も取消し、
+  まだ表示していなかった窓を「復帰」として開かない。時間窓や独自 Remote revision は使わない。
+  **配送後の取消しも host の GUI thread で確定する** (2026-10-01 review fix1)。
+  32 byte の専用共有 mapping は native 最小化連番と Remote の取得連番・phase の read-only projection
+  だけを運ぶ。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
+  worker に復帰判定を通知する。worker は source を weak に参照し、通知 sender の循環で残留しない。
+  `set_gui_visibility_checked` は request ID と発行時の連番を運び、GUI thread が共有値と最小化を
+  表示・アクティブ化の直前に照合する。取消しは未表示の窓の表示希望を作らず、既に表示希望のある
+  窓の希望は保存する。判定後に始まる最小化／Remote は通常の一時非表示として扱う。
+  `Shown` / `Hidden` / `Cancelled` / `Error` を返し、Rust は pipe 書き込みだけで表示を公開しない。
+  ACK と native close は 1 本の FIFO signal を通り、`pump_gui_signals` が Rust の表示情報を更新する。
+  5 秒の ACK 待ち・mapping 作成／検証失敗は GUI failure として扱い、未検査の表示へ代替しない。
+  背面からの明示的な前面化も同じ検査と GUI task を通る。自動復帰は従来どおり非アクティブ。
+  単純化として GUI 操作を既存 worker に直列化し、初回 hidden attach と理由集合を使う。
+  モーダル化や editor の破棄・再生成は、再生・ビジュアライザー・設定画面の通常操作を妨げるため採らない。
 - 既存のフルスクリーン関連の VST GUI 操作 (owner 付け替え、全 GUI 表示／非表示、TOPMOST、HUD の
   allowlist、フォーカスの受け渡し) は `self.dsp_bridge` のみを対象のまま変えない。
 - **EffeTune の窓には、host の container が付けるタイトルバーの電源 (bypass) ボタンを出さない**。
@@ -372,6 +415,17 @@ enum EffectiveState {
   切れでは host を終了しない、見張りの上限超過でだけ専用 host が終了し `HostLost` になる、終了処理との交錯。
 - settings: 新フィールドが `overwrite_non_preferences_from` で保持される。
 - GUI signal: `vst3_enabled=false` でも EffeTune の `GuiUserHidden` が処理される。
+- owner / ボタン: 実際の EffeTune bridge は main / fullscreen HWND があっても owner 0、ユーザー VST は
+  `Auto` のまま。非表示・表示中かつ手前・表示中かつ背面の 3 分岐、editor の popup owner chain、
+  マウス／タッチの activation と次の press、キーボードによる古い snapshot の破棄を単体で固定する。
+- 一時非表示: `crates/vst3-host/tests/gui_visibility.cpp` の compile-time テストで、理由を両順序で
+  解除して最後だけ復帰する、非表示だった窓は開かない、同じ理由の重複通知は集合として扱う、
+  owned の従来動作を固定する。Rust 側では Remote 取得〜drain 完了まで表示要求を拒否し、
+  UI 通知前の正本の取得と、Loading / attach 中に完了した最小化・Remote 区間でも open が取消されることを確認する。
+- 配送後: Rust の最終検査後〜GUI task 実行前の最小化／Remote と、その区間が既に終了した場合を
+  host の permit 判定で検査する。取消し後の復帰で未表示の窓が開かない、取消した raise で前の
+  表示希望を消さない、ACK／native close の FIFO 順序、request ID の照合と EOF／shutdown、
+  native size の通知経路が bridge のロックを取得しないことを回帰テストで固定する。
 - 共有メモリ: 同時に 2 本 `open_audio_pipe` しても名前が衝突しない。既存オブジェクトを開いた場合
   (`ERROR_ALREADY_EXISTS`) は失敗として扱う。
 
@@ -430,10 +484,12 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 共有メモリ・イベント名に process 内の atomic 連番を足す。`CreateFileMappingW` /
   `CreateEventW` で `ERROR_ALREADY_EXISTS` を失敗として扱う (bridge.rs)。
 - host の `query_state_concurrent` と `strict_state` (§5.2、§5.4)。
-- `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain`) と latency (`AutoBypass` / `ReportOnly`)。
+- `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain` / `Unowned`) と latency (`AutoBypass` / `ReportOnly`)。
   既存の bridge は既定値で従来どおり動く。
 
 ## 10. サンプル版の範囲外 (配布版で決める)
+
+- 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
 
 - release / portable / インストーラへの同梱方法、Mixwright の署名、THIRD-PARTY-NOTICES の転載、商標注記
 - マニュアル・製品ページ・privacy (Mixwright の WebView データの保存先が mIV の data_dir の外になる点)
