@@ -1528,8 +1528,12 @@ body から始まった drag は control 上を横切っても同じ gesture own
 閲覧中は下部バー右端のフィルムボタンから、列の表示 / 非表示と5段階を同じ menu popup で
 選べる。各行は環境設定に保存済みの現在値を表示し、選択は既存の Settings setter / save と
 `StillSeekGeometry` へ合流するため、main / F12 と本・通常画像で同じ設定を使う。popup の開閉は
-viewport ごとの egui memory が所有し、新しい App state は持たない。popup 表示中は下部バーを維持し、
-Escape・矢印・Enter、pointer・touch は popup を優先して背面のページ移動や fullscreen close に流さない。
+viewport ごとの egui memory が所有し、新しい App state は持たない。
+高さとシーク位置プレビューの大きさの 5 段階は、動画 HUD と同じ見出し・段階表記・行寸法の 2 列に並べる。
+狭い画面では共通の短縮表記と行高を使い、非常に低い画面だけスクロールする。egui の floating scrollbar
+には幅を予約し、右列の文字や操作面へ重ねない。
+popup 表示中は下部バーを維持し、Escape・矢印・Enter、pointer・touch は popup を優先して
+背面のページ移動や fullscreen close に流さない。
 動画・音声のシークストリップも専用の `SeekStripHeight` と独立した5段階値を持ち、同じ既定値と
 36～320の解決時clampを使う。旧4段階の保存名と既定の大は保ち、静止画の値とは共有しない。
 動画側は `NativeBarLockState` が段階と値をsource切替・main/F12間へ運ぶ。実効下部バー、strip、

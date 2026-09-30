@@ -3,6 +3,7 @@ use super::*;
 struct MenuFrame {
     toggle: egui::Response,
     shapes: Vec<egui::epaint::ClippedShape>,
+    wheel_remaining: bool,
 }
 
 fn menu_frame(
@@ -32,6 +33,14 @@ fn menu_frame(
     MenuFrame {
         toggle: toggle.expect("still seek strip menu button response"),
         shapes: output.shapes,
+        wheel_remaining: ctx.input(|input| {
+            input.raw_scroll_delta != egui::Vec2::ZERO
+                || input.smooth_scroll_delta != egui::Vec2::ZERO
+                || input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+        }),
     }
 }
 
@@ -61,6 +70,7 @@ fn touch_toggle_frame(
     MenuFrame {
         toggle: toggle.expect("touch-only still seek menu button response"),
         shapes: output.shapes,
+        wheel_remaining: false,
     }
 }
 
@@ -170,13 +180,12 @@ fn real_still_seek_popup_selects_visibility_and_all_five_configured_heights() {
         for listed in StillSeekStripHeight::ALL {
             let points = app.settings.still_seek_strip_height_values.points(listed);
             assert!(
-                text_center(&open, &format!("高さ: {} ({points:.0} px)", listed.label()))
-                    .is_finite(),
+                text_center(&open, &format!("{} ({points:.0} px)", listed.label())).is_finite(),
                 "all configured presets must remain reachable"
             );
         }
         let points = app.settings.still_seek_strip_height_values.points(preset);
-        let row = text_center(&open, &format!("高さ: {} ({points:.0} px)", preset.label()));
+        let row = text_center(&open, &format!("{} ({points:.0} px)", preset.label()));
         let _ = menu_frame(&mut app, &ctx, size, click_events(row));
         assert_eq!(app.settings.still_seek_strip_height, preset);
         assert!(!fs_still_seek_strip_popup_open(&ctx));
@@ -315,11 +324,147 @@ fn still_seek_popup_owns_keyboard_before_fullscreen_shortcuts() {
 }
 
 #[test]
+fn still_seek_popup_pairs_height_and_preview_rows_at_normal_and_compact_sizes() {
+    for size in [
+        egui::vec2(1280.0, 720.0),
+        egui::vec2(640.0, 360.0),
+        egui::vec2(280.0, 360.0),
+    ] {
+        let mut app = still_seek_edge_test_app();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let frame = open_menu(&mut app, &ctx, size);
+        let labels = crate::seek_strip_menu::SeekStripMenuLabels::for_viewport(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+        );
+        let heading_left = text_center(&frame, labels.headings()[0]);
+        let heading_right = text_center(&frame, labels.headings()[1]);
+        assert!(heading_left.x < heading_right.x);
+        // Ink bounds can differ by half a pixel between CJK and Latin glyphs.
+        assert!((heading_left.y - heading_right.y).abs() <= 1.0);
+        let mut previous_y = heading_left.y;
+        for (height, preview) in crate::settings::StillSeekStripHeight::ALL
+            .into_iter()
+            .zip(crate::settings::StillSeekPreviewSize::ALL)
+        {
+            let left_label = labels.preset(
+                height.label(),
+                app.settings.still_seek_strip_height_values.points(height),
+            );
+            let right_label = labels.preset(
+                preview.label(),
+                app.settings.still_seek_preview_size_values.points(preview),
+            );
+            let left = text_center(&frame, &left_label);
+            let right = text_center(&frame, &right_label);
+            assert!(left.x < right.x);
+            assert_eq!(left.y, right.y, "height and preview must share a row");
+            assert!(left.y > previous_y);
+            previous_y = left.y;
+            for label in [&left_label, &right_label] {
+                let (clipped, text) = frame
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| match &clipped.shape {
+                        egui::Shape::Text(text) if text.galley.text() == *label => {
+                            Some((clipped, text))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let text_rect = text.galley.rect.translate(text.pos.to_vec2());
+                assert!(
+                    clipped.clip_rect.contains_rect(text_rect),
+                    "{size:?}: {label} must fit without scrolling or clipping"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn still_seek_popup_short_window_scrolls_both_columns_and_consumes_wheel() {
+    let mut app = still_seek_edge_test_app();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let size = egui::vec2(320.0, 120.0);
+    let mut frame = open_menu(&mut app, &ctx, size);
+    let label = format!(
+        "最小 {:.0}",
+        app.settings
+            .still_seek_preview_size_values
+            .points(crate::settings::StillSeekPreviewSize::Smallest)
+    );
+    let initial_bottom = text_center(&frame, &label);
+    assert!(
+        initial_bottom.y > size.y,
+        "short windows must scroll instead of losing choices"
+    );
+    let pointer = text_center(&frame, "表示");
+    for _ in 0..12 {
+        frame = menu_frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -5.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !frame.wheel_remaining,
+            "popup wheel must never reach background navigation, including at its scroll limit"
+        );
+    }
+    let mut bottom = None;
+    for (clipped, text) in frame
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some((clipped, text)),
+            _ => None,
+        })
+    {
+        let text_rect = text.galley.rect.translate(text.pos.to_vec2());
+        assert!(
+            text_rect.min.x >= clipped.clip_rect.min.x
+                && text_rect.max.x <= clipped.clip_rect.max.x,
+            "the entire right-column label must fit before the scrollbar"
+        );
+        let ink = clipped.shape.visual_bounding_rect();
+        assert!(
+            clipped.clip_rect.contains_rect(ink),
+            "the last preview's painted glyphs must be fully visible after scrolling"
+        );
+        bottom = Some(ink.center());
+    }
+    let bottom = bottom.expect("last preview preset");
+    assert!(bottom.y < initial_bottom.y);
+    assert_eq!(text_center(&frame, "最小 36").y, bottom.y);
+    let _ = menu_frame(&mut app, &ctx, size, click_events(bottom));
+    assert_eq!(
+        app.settings.still_seek_preview_size,
+        crate::settings::StillSeekPreviewSize::Smallest
+    );
+    assert_eq!(
+        app.settings.still_seek_strip_height,
+        crate::settings::StillSeekStripHeight::Large
+    );
+}
+
+#[test]
 fn still_seek_popup_regular_and_narrow_snapshots() {
     let mut snapshots = egui_kittest::SnapshotResults::new();
     for (name, size) in [
         ("still_seek_strip_menu_regular", egui::vec2(640.0, 360.0)),
         ("still_seek_strip_menu_narrow", egui::vec2(280.0, 360.0)),
+        ("still_seek_strip_menu_normal", egui::vec2(1280.0, 720.0)),
+        ("still_seek_strip_menu_short", egui::vec2(320.0, 120.0)),
+        ("still_seek_strip_menu_tiny", egui::vec2(200.0, 240.0)),
     ] {
         let mut app = still_seek_edge_test_app();
         app.settings.still_seek_strip_height_values.maximum = 288;

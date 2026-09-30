@@ -220,6 +220,7 @@ pub mod search_query;
 pub mod search_walker;
 pub mod search_watcher;
 mod seek_ruler;
+mod seek_strip_menu;
 pub mod settings;
 pub mod settings_db;
 pub mod settings_restore;
