@@ -1,0 +1,42 @@
+[
+  {
+    "operation": "insert_note",
+    "heading_id": "room-eq",
+    "note": "mImageViewer の EffeTune 画面には、マイクを使う周波数応答の測定機能はありません。デスクトップ版 EffeTune で測定し、インパルス応答を含めて書き出した測定JSONを、Room EQ の測定選択欄にある Import ボタンで取り込んで使用してください。",
+    "reason": "Measurement settings hidden; bootstrap.js:550-565 adds Room EQ JSON import."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "測定データは端末内の参照です。URLやプリセットには選択した測定の名前と識別子だけが保存され、測定データ自体は含まれません。別の端末で使うには、測定画面で **測定JSONのエクスポートにインパルス応答を含める** を有効にしてエクスポートし、別の端末でインポートしてから選択してください。このオプションは初期状態ではオフで、インパルス応答を含めるとファイルが数十MB大きくなる場合があります。測定が見つからない場合は警告が表示され、Room EQは古い補正データを使わず時間を合わせたバイパスになります。",
+    "replacement": "測定データは端末内の参照です。URLやプリセットには選択した測定の名前と識別子だけが保存され、測定データ自体は含まれません。デスクトップ版 EffeTune の測定画面で **測定JSONのエクスポートにインパルス応答を含める** を有効にして書き出し、mImageViewer の Room EQ で取り込んでから選択してください。このオプションは初期状態ではオフで、インパルス応答を含めるとファイルが数十MB大きくなる場合があります。測定が見つからない場合は警告が表示され、Room EQは古い補正データを使わず時間を合わせたバイパスになります。",
+    "reason": "Clarify external measurement/export versus bundled import path."
+  },
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "5band-fir-peq",
+    "anchor": "使用にはWASM DSPエンジンが必要で、利用できない場合は信号が変更されずに通過します。",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  },
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "group-delay-eq",
+    "anchor": "使用にはWASM DSPエンジンが必要で、利用できない場合は信号が変更されずに通過します。",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  },
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "group-delay-peq",
+    "anchor": "使用にはWASM DSPエンジンが必要で、利用できない場合は信号が変更されずに通過します。",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  },
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "room-eq",
+    "anchor": "Room EQにはWASM DSPエンジンが必要です。利用できない場合、信号は変更されずに通過します。",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  }
+]

@@ -1,0 +1,27 @@
+[
+  {
+    "operation": "replace_paragraph",
+    "anchor": "PCではヘッダーの **Effect Pipeline**、**Music Library** の隣にある **Visualizer** を選びます。モバイルでは **プレーヤー** タブ内の **Visualizer** を選びます。デスクトップアプリでは **表示 > Visualizer** からも開けます。**設定 > 環境設定...** で起動時の表示にも指定できます。",
+    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンを選びます。mImageViewer には、デスクトップ版 EffeTune の「表示」メニューやミニプレーヤーはありません。",
+    "reason": "Bundled effetune.html visualizerButton; standalone menu absent."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "表示領域にポインターを重ねるかタップすると **⛶** が現れます。押すと、指定した縦横比を保ったままアプリの表示領域いっぱいに拡大します。端が切り取られることがあります。再度 **⛶** を押すか、**Esc** またはモバイルの戻る操作で元に戻ります。デスクトップアプリでVisualizerの表示中にミニプレーヤーへ切り替えると、再生操作の上に表示が付きます。",
+    "replacement": "表示領域にポインターを重ねると **⛶** が現れます。押すと、指定した縦横比を保ったまま EffeTune の表示領域いっぱいに拡大します。端が切り取られることがあります。再度 **⛶** を押すか、**Esc** で元に戻ります。",
+    "reason": "Remove mobile back/mini player instructions; this expands inside EffeTune, not mIV fullscreen."
+  },
+  {
+    "operation": "insert_note",
+    "heading_id": "visualizer",
+    "note": "mImageViewer で再生している曲のジャケット画像・曲名・アルバム名・アーティスト名は、この表示には渡されません。Artwork、Title、Album、Artist は通常表示では空になります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像は使用できます。",
+    "reason": "ui-manager.js:103,2080 has no audioPlayer; visualizer-view.js:199-202 uses its metadata, renderer skips absent metadata."
+  },
+  {
+    "operation": "remove_section",
+    "heading_id": "プリセットバックアップ音声との同期",
+    "keep_heading": true,
+    "note": "プリセットダイアログでは、現在のレイアウトを名前を付けて保存し、読み込み、改名、削除できます。組み込みプリセットはそのまま残ります。**設定 > バックアップ / 復元** には、名前を付けたVisualizerプリセットとその背景画像が含まれます。編集中の現在のレイアウトはバックアップに含まれません。Effect Pipelineの共有リンクにもVisualizerのレイアウトは含まれません。mImageViewer の EffeTune 画面には、デスクトップ版のオーディオ設定やハードウェア アクセラレーションの切り替えはありません。リモート配信中の表示は、端末で聞こえる音より先に進みます。",
+    "reason": "Remove absent config controls and unsupported visual sync claims; retain native backup support (vst-bootstrap.js:190-224) and Remote limitation plan:494-495."
+  }
+]

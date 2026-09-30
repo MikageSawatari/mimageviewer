@@ -1233,6 +1233,11 @@
         <p>設定・動画や音声の再生位置・選んだ音声トラック・サムネイルキャッシュ（動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）・タグ・★評価・閲覧履歴・コレクションの名前と登録先・別バージョンを探すための索引は、PC に保存されます。リモート閲覧では端末から届いた動画の再生位置と音声トラックの選択も PC に記録されます。
           アンインストール時にまとめて削除できます。</p>
         <p style="margin-top:0.5rem;">EPUB を変換した PDF も通常は PC 内に保存されます。元の EPUB と同じ場所に PDF を書き出すのは、利用者が PDF ファイルへの保存・変換を選んだときだけです。</p>
+        <p style="margin-top:0.5rem;">音響調整 (EffeTune) のプリセット・設定は、mImageViewer のデータフォルダーとは別に
+          <code>%APPDATA%\effetune\</code> または <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。
+          取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に保存され、mImageViewer のデータフォルダーを変更しても保存先は変わりません。
+          EffeTune 自身の保存データは、mImageViewer のアンインストール時にも残ります。ポータブル版では音響調整を利用できません。
+          詳しくは<a href="manual/effetune.html">音響調整の説明</a>をご覧ください。</p>
         <p style="margin-top:0.5rem;">外部ツールへ渡すために書き出した画像は、Windows の一時フォルダー内の
           本アプリ専用の場所に置き、<strong>終了時に削除します</strong>。</p>
       </div>

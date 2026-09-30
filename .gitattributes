@@ -17,3 +17,6 @@ htdocs/mimageviewer/.htaccess text eol=lf
 # core.autocrlf=true rewrites it to CRLF on checkout and --check then reports the
 # file as out of date on every run.
 htdocs/sitemap.xml text eol=lf
+
+# The EffeTune snapshot converter checks generated HTML byte-for-byte.
+htdocs/mimageviewer/manual/effetune/**/*.html text eol=lf

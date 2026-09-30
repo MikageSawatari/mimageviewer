@@ -136,6 +136,7 @@
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
+      <li>音響調整 (EffeTune) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
       <li>サムネイルキャッシュ（動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）</li>
       <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面でその場で削除できます。表示中など使用中の本は削除されず、理由が表示されます）</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
@@ -147,9 +148,18 @@
       <li>外部ツールへ渡すために一時的に書き出した画像（本アプリの終了時に削除します）</li>
     </ul>
     <div class="info-box">
-      保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
+      mImageViewer 自身のデータの保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
       またはポータブル版では実行ファイルと同じ場所の <code>data</code> フォルダです。
       アンインストール時に削除できます。
+    </div>
+    <div class="info-box">
+      音響調整 (EffeTune) のプリセット・設定は、別の <code>%APPDATA%\effetune\</code> または
+      <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
+      mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。
+      EffeTune 自身の保存データは mImageViewer のアンインストール時にも残ります。
+      ポータブル版では音響調整を利用できません。
+      次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。
     </div>
     <div class="info-box">
       EPUB の閲覧用変換では、Windows の一時フォルダ内に本アプリ専用の作業場所を作り、
@@ -281,6 +291,7 @@
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
+      <li>EffeTune adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
@@ -292,9 +303,16 @@
       <li>Images temporarily exported for external tools (removed when the App exits)</li>
     </ul>
     <div class="info-box">
-      Data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
+      mImageViewer's own data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
       or in a <code>data</code> folder next to the executable (portable edition). It can be
       removed when you uninstall the App.
+    </div>
+    <div class="info-box">
+      EffeTune stores its presets and configuration separately in <code>%APPDATA%\effetune\</code> or
+      <code>%APPDATA%\Frieve\EffeTunePlugin\</code>. Imported IR files, measurements, and visualizer layouts and background images are stored in
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code>, regardless of mImageViewer's data folder. EffeTune's own data remains when
+      mImageViewer is uninstalled. The portable edition does not provide EffeTune.
+      The state that lets the next launch start with the same adjustment is saved in mImageViewer's own data folder.
     </div>
     <div class="info-box">
       When converting an EPUB for reading, the App creates a dedicated work folder inside the

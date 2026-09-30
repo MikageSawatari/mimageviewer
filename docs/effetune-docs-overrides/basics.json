@@ -1,0 +1,36 @@
+[
+  {
+    "operation": "insert_note",
+    "heading_id": "基本オーディオプラグイン",
+    "repeat_on_plugins": true,
+    "note": "mImageViewer の音響調整はステレオ（2チャンネル）で処理します。このページにある3チャンネル以上の構成例や追加出力への振り分けは、mImageViewer では使えません。Matrix や MultiChannel Panel は、利用できる左右2チャンネルの範囲で使用してください。",
+    "reason": "src/video/dsp/bridge.rs:1048,1058 fixes the audio pipe to stereo."
+  },
+  {
+    "operation": "insert_note",
+    "heading_id": "bass-management",
+    "note": "mImageViewer では出力チャンネルを追加できません。以下のサブウーファー用の追加出力やサラウンドの例は、デスクトップ版 EffeTune 向けの説明です。",
+    "reason": "Stereo-only mIV pipe; preserve effect reference while identifying unsupported examples."
+  },
+  {
+    "operation": "remove_section",
+    "heading_id": "channel-divider",
+    "keep_heading": true,
+    "note": "このエフェクトは4チャンネル以上の出力が必要なため、ステレオで処理する mImageViewer では使用できません。",
+    "reason": "Remove standalone audio-config instructions and unusable multichannel output workflow."
+  },
+  {
+    "operation": "remove_section",
+    "heading_id": "fir-crossover",
+    "keep_heading": true,
+    "note": "このエフェクトは4チャンネル以上の出力が必要なため、ステレオで処理する mImageViewer では使用できません。",
+    "reason": "Remove standalone audio-config instructions and unusable multichannel output workflow."
+  },
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "bass-management",
+    "anchor": "使用にはWASM DSPエンジンが必要です。",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  }
+]

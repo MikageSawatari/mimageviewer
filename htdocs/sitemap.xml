@@ -7,7 +7,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>1.0</priority>
   </url>
   <url>
@@ -27,142 +27,777 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/adjustment.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/analysis.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/annotation.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/books.html</loc>
-    <lastmod>2026-09-22</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/changelog.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/collections.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/conceal.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-chroma-spiral.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-level-meter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-note-spectrogram.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-oscilloscope.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-pitch-meter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-spectrogram.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-spectrum-analyzer.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer-stereo-meter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-bass-management.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-channel-divider.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-dc-offset.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-fir-crossover.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-matrix.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-multichannel-panel.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-mute.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-polarity-inversion.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-stereo-balance.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics-volume.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/bus-function.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/control-section.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/control.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/delay-delay.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/delay-time-alignment.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/delay.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-attack-tonal-balance.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-auto-leveler.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-brickwall-limiter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-compressor.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-expander.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-gate.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-multiband-compressor.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-multiband-expander.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-multiband-transient.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-power-amp-sag.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics-transient-shaper.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-15band-geq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-15band-peq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-5band-dynamic-eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-5band-fir-peq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-5band-peq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-band-pass-filter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-comb-filter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-earphone-cable-sim.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-group-delay-eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-group-delay-peq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-hi-pass-filter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-lo-pass-filter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-loudness-equalizer.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-narrow-range.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-room-eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-tilt-eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq-tone-control.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/index.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/license.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-am-radio-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-bit-crusher.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-cassette-artifacts.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-digital-error-emulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-dsd64-imd-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-fm-radio-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-g726-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-gsm-fr-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-hum-generator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-md-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-mp3-codec-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-noise-blender.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-sbc-codec-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-simple-jitter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-sw-radio-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-tape-artifacts.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-tv-audio-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-vinyl-artifacts.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi-vinyl-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-auto-filter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-auto-pan.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-chorus.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-doppler-distortion.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-frequency-shifter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-phaser.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-pitch-shifter-hq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-pitch-shifter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-rotary-speaker.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-tremolo.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation-wow-flutter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/others-oscillator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/others.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/resonator-horn-resonator-plus.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/resonator-horn-resonator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/resonator-modal-resonator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/resonator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/restoration-click-remover.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/restoration-clip-restorer.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/restoration-hum-remover.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/restoration-noise-reduction.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/restoration.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/reverb-dattorro-plate-reverb.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/reverb-fdn-reverb.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/reverb-ir-reverb.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/reverb-rs-reverb.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/reverb.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-bandwidth-extender.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-bass-extender.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-dynamic-saturation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-exciter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-hard-clipping.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-harmonic-distortion.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-multiband-saturation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-saturation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-sub-synth.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation-tube-simulator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-crossfeed-filter.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-crosstalk-cancellation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-ms-matrix.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-multiband-balance.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-phase-select-eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-spatial-mapper.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial-stereo-blend.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/visualizer.html</loc>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/erase.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/export.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/external-tools.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/faq.html</loc>
-    <lastmod>2026-09-28</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/formats.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/fullscreen.html</loc>
-    <lastmod>2026-09-25</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/gamepad.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/getting-started.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/grid.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/index.html</loc>
-    <lastmod>2026-09-22</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/known-issues.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/local-adjustment.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/metadata-transfer.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/music.html</loc>
-    <lastmod>2026-09-25</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/remote.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/search.html</loc>
-    <lastmod>2026-09-26</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/settings.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/shortcuts.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/stack.html</loc>
-    <lastmod>2026-09-24</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tags.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/troubleshooting.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -337,12 +972,12 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tutorial.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/video.html</loc>
-    <lastmod>2026-09-25</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -382,7 +1017,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/privacy.html</loc>
-    <lastmod>2026-09-28</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
 </urlset>
