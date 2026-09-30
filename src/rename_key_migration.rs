@@ -1162,6 +1162,8 @@ impl StoreCopyPathMapping {
 #[derive(Debug, Default)]
 pub(crate) struct StoreCopyReport {
     pub(crate) rows: usize,
+    /// Only rows from successfully committed pin-store transactions.
+    pub(crate) committed_thumbnail_pins: usize,
     pub(crate) database_opens: usize,
     pub(crate) errors: Vec<String>,
 }
@@ -2039,7 +2041,12 @@ fn copy_store(
     });
 
     match result {
-        Ok(rows) => report.rows += rows,
+        Ok(rows) => {
+            report.rows += rows;
+            if matches!(descriptor.table, "folder_thumb_pins" | "video_pins") {
+                report.committed_thumbnail_pins += rows;
+            }
+        }
         Err(error) => report.errors.push(format!(
             "{}: {}.{}: {error}",
             descriptor.file, descriptor.table, descriptor.column
@@ -2634,6 +2641,7 @@ mod tests {
         );
         assert_eq!(covered, 25);
         assert_eq!(report.rows, covered * 2);
+        assert_eq!(report.committed_thumbnail_pins, 4);
 
         for descriptor in STORES {
             let connection = open(dir.path(), descriptor.file);
@@ -2694,6 +2702,68 @@ mod tests {
                     .unwrap();
                 assert_eq!(destination_rows, 0, "unique=false は v1 copy 対象外");
             }
+        }
+    }
+
+    #[test]
+    fn copy_thumbnail_pin_counts_require_committed_rows() {
+        for table in ["folder_thumb_pins", "video_pins"] {
+            let dir = tempfile::tempdir().unwrap();
+            let descriptor = STORES.iter().find(|store| store.table == table).unwrap();
+            let column = descriptor.column;
+            let old = Path::new("C:/books/source.zip");
+            let new = Path::new("C:/books/copied.zip");
+            let failed = Path::new("C:/books/failed.zip");
+            let conn = open(dir.path(), descriptor.file);
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table} ({column} TEXT PRIMARY KEY, payload TEXT)"
+            ))
+            .unwrap();
+            let old_key = descriptor.normalize_path(old);
+            for key in [old_key.clone(), format!("{old_key}::001.jpg")] {
+                conn.execute(
+                    &format!("INSERT INTO {table}({column}, payload) VALUES (?1, 'pin')"),
+                    [key],
+                )
+                .unwrap();
+            }
+            let mappings = [
+                StoreCopyPathMapping::exact(old, new),
+                StoreCopyPathMapping::virtual_prefix(old, new),
+            ];
+            let copied = copy_stores_at(dir.path(), &mappings);
+            assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+            assert_eq!(copied.committed_thumbnail_pins, 2);
+            let unchanged = copy_stores_at(dir.path(), &mappings);
+            assert!(unchanged.errors.is_empty(), "{:?}", unchanged.errors);
+            assert_eq!(unchanged.committed_thumbnail_pins, 0);
+
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER reject_page BEFORE INSERT ON {table}
+                 WHEN NEW.{column} = 'c:/books/failed.zip::001.jpg'
+                 BEGIN SELECT RAISE(ABORT, 'rollback pin copy'); END;"
+            ))
+            .unwrap();
+            let rolled_back = copy_stores_at(
+                dir.path(),
+                &[
+                    StoreCopyPathMapping::exact(old, failed),
+                    StoreCopyPathMapping::virtual_prefix(old, failed),
+                ],
+            );
+            assert_eq!(rolled_back.errors.len(), 1);
+            assert_eq!(rolled_back.committed_thumbnail_pins, 0);
+            let rows: usize = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [descriptor.normalize_path(failed)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                rows, 0,
+                "the first insert must roll back with the page insert"
+            );
         }
     }
 

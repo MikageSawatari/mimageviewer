@@ -2161,32 +2161,37 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 - 詳細表示で、長さ・解像度・コーデックの 3 つとも DB から出る (probe が走らない)。
 - 規模 / 優先度: Small〜Medium / P3 (利用者提案)。
 
-### 1.307 コレクションの一覧で、フォルダ・ZIP・PDF の代表サムネ固定が反映されない — 利用者報告、原因特定済み (2026-09-30)
 
-- 出典: 利用者メール (2026-09-30、§1.280 と同じ報告者、v4.2.0)。「コレクションに登録されているアイテムのサムネイルが、
-  代表サムネ固定しているサムネイルにならない」。**開発者本人も同じ症状を確認** (2026-09-30)。
-- 原因 (コード調査): 代表サムネ固定は、一覧を入れ替えるときに `folder_pin_map` (項目ごとの固定内容) を
-  固定 DB から引いておき、サムネイル要求 (`make_load_request`) がそれを見て固定の画像を使う仕組み。
-  - 通常フォルダ・レーティング一覧などは `install_new_items` → `refresh_folder_pin_map`、検索・スマートフォルダ・
-    サブフォルダ展開は準備 worker が `folder_pin_map` を作って渡す。
-  - コレクションの一覧は `install_collection_grid_items_with_thumbnail_sources`
-    (`src/app/collection_grid.rs` 3030 付近) が `install_prepared_aggregate_items` (固定を引かない側) を使い、
-    その後 `self.folder_pin_map.clear()` で明示的に空にしている。**コレクションの準備 worker も固定を引かない**ので、
-    どこからも入らない。`4fd374ba2` (v4.0.0) で入ったもの。
-  - コレクション設計 ([collection-implementation-plan.md](collection-implementation-plan.md)) の「ピン」は
-    **動画の代表フレーム** (video pin) だけを扱っていて、フォルダ・ZIP・PDF の代表サムネ固定は設計に出てこない。
-    意図して外したのではなく、抜けていたものと判断する。
-- 方針候補: 検索と同じく、コレクションの準備 worker が項目の固定内容を一括で引き、`folder_pin_map` として
-  一覧と一緒に渡す (UI スレッドで固定 DB を引かない)。cache key はコレクションでも full-path (`use_full_path_cache_keys`
-  は Collection を含む) なので、検索結果と同じ key 規則で合うはず (未確認)。
-  - 同じ一覧を再利用する経路 (`CollectionPrepareReuseKey`、child から root へ戻る再設置) でも固定内容を保持するか、
-    再利用の条件に固定 DB の変更世代を含める。表示中にアプリ内で固定を変えたときの反映 (再 prepare の契機) も確かめる。
-  - 入れ子の固定 (フォルダ→フォルダ→動画) と、動画の代表フレーム固定の既存経路 (`seed_folder_video_pin_thumbs`) が
-    コレクションでも同じ結果になるか。
-  - mIV Remote のコレクション一覧で固定が効くかは未確認。修正時に一緒に見る。
-- 回帰確認: 固定したフォルダ / ZIP / PDF / 変換済み書庫をコレクションに入れて一覧の表示、通常フォルダと同じ画像になること、
-  コレクションを開いたまま固定を変更・解除したときの反映、child から戻ったとき、別ウィンドウ。
-- 規模 / 優先度: Small〜Medium / P2 (リリース済み機能の不具合。利用者報告あり)。
+### 1.309 共通の代表サムネ pin resolver が UI スレッドで metadata・入れ子 pin・動画 WebP を読む — 独立レビュー (2026-09-30)
+
+- 出典: §1.307 の実装中の Codex 独立レビュー。コード上の I/O 経路を確認した発見で、実測した停止時間や新しい利用者報告はない。
+- 通常フォルダ・検索・スマートフォルダ・サブフォルダ展開・Collection は、UI の `make_load_request` から同じ
+  `apply_folder_thumb_pin` を呼ぶ。通常 enqueue は `src/app.rs:45651`、優先要求は `src/app.rs:45185`、品質更新は
+  `src/app.rs:46248`。共通の pin 適用・cascade 解決は `src/app.rs:87243` / `src/app.rs:87252`。
+- Auto aspect の初期 seed は `src/app.rs:18971`、色 scan の要求構築は `src/app/color_filter.rs:617` でも同じ
+  `make_load_request` を使う。これらも将来の worker 移行対象に含める。
+- cascade resolver は `src/folder_thumb_pins.rs:845` で `std::fs::metadata`、`src/folder_thumb_pins.rs:919` 付近の
+  子コンテナ lookup から `src/app.rs:87147` の closure を通して nested pin DB を参照する。
+  Video leaf は `src/app.rs:87322` の `VideoPinDb::lookup` で WebP を UI へ読み出す。
+  代表 pin が適用される各要求でこの同期参照が発生する。worker の `lookup_many` / video-folder seed を用意しても、
+  要求構築で resolver をもう一度呼ぶコストは残る。
+- §1.307 は「他一覧と同じ仕組み」の最小修正を優先し、この既存コストを Collection にも許容する設計判断。
+  この項目は別変更で、共通解決を thumbnail worker へ移す。通常・優先・詳細／seek・SourceOnly 品質更新が同じ境界を使い、
+  cascade identity、full-path key、seed availability、コンテナ変換、generation / cancel / viewer-context 所有を保持する。
+- 規模 / 優先度: Medium / P3。全一覧に共通の変更なので独立設計レビューと回帰を行う。今回の §1.307 では実装しない。
+
+### 1.307 コレクションの一覧で、フォルダ・ZIP・PDF の代表サムネ固定が反映されない — 修正済み (2026-09-30)
+
+- 出典: 利用者メール (2026-09-30、§1.280 と同じ報告者、v4.2.0)。開発者本人も同じ症状を確認。
+- Collection prepare がコンテナ pin を取得せず install が map を消していた原因を修正。検索・スマートフォルダの
+  一括取得と動画 leaf seed を共有し、Folder / ZIP / PDF / 変換書庫 / EPUB、入れ子固定、child→root の保持資産へ適用する。
+- コンテナ pin 成功書込 stamp と代表 sort / depth を再利用条件へ追加。表示 root は既存 prepare retry で変更・解除を反映し、
+  メタ情報 import は確定commitの既存 thumbnail-source epoch 通知で失効する。各 context の map 所有と full-path cache key を維持。
+- 別接続の同一内容ファイル編集復元も、成功した pin COMMIT を既存 epoch 通知へ渡す。変更なし / rollback は失効させない。
+- Remote は既存の Folder Image / Folder leaf 固定だけに対応する別経路で、本件では IPC / protocol とその制限を変更しない。
+- 共通 resolver の既存 UI 同期参照は他の集約一覧と同じ入力で使うことを設計担当が許容。worker 化は P3 §1.309 へ分離する。
+- 回帰テスト・検証記録: [collection-implementation-plan.md §23.17](collection-implementation-plan.md)。
+  実アプリ確認は未実施（利用者指定により起動なし）。
 
 ### 1.297 一覧の先頭に親フォルダへ戻る「..」を任意表示する — >>475 (2026-09-27)
 

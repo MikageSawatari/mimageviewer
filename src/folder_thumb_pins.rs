@@ -31,6 +31,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_FOLDER_PIN_DB_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// UI-owned handle identity and successful writes, without reading SQLite on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FolderPinMutationStamp {
+    instance: u64,
+    revision: u64,
+}
 
 /// ピン対象のうち通常ファイル / フォルダ系の種別。
 /// (ZipImage / PdfPage は `FolderPinSource::ZipEntry` / `PdfPage` に分離している)
@@ -286,6 +296,8 @@ impl From<rusqlite::Error> for FolderPinError {
 /// (= cascade lookups 数件程度 / フォルダロード)。
 pub struct FolderThumbPinDb {
     conn: Mutex<Connection>,
+    instance: u64,
+    mutation_revision: AtomicU64,
 }
 
 impl FolderThumbPinDb {
@@ -312,16 +324,38 @@ impl FolderThumbPinDb {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let migration_ran = Self::init_schema(&conn)?;
-        Ok((
-            Self {
-                conn: Mutex::new(conn),
-            },
-            migration_ran,
-        ))
+        Ok((Self::from_connection(conn), migration_ran))
     }
 
-    fn db_path() -> PathBuf {
+    pub(crate) fn db_path() -> PathBuf {
         crate::data_dir::get().join("folder_thumb_pins.db")
+    }
+
+    /// Prepare workers read an already initialized store; never create or migrate it here.
+    pub(crate) fn open_readonly(path: &Path) -> SqlResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self::from_connection(conn))
+    }
+
+    fn from_connection(conn: Connection) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            instance: NEXT_FOLDER_PIN_DB_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            mutation_revision: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn mutation_stamp(&self) -> FolderPinMutationStamp {
+        FolderPinMutationStamp {
+            instance: self.instance,
+            revision: self.mutation_revision.load(Ordering::Acquire),
+        }
     }
 
     fn init_schema(conn: &Connection) -> SqlResult<bool> {
@@ -568,6 +602,7 @@ impl FolderThumbPinDb {
                 source_page  = excluded.source_page",
             params![key, source.db_kind(), rel_norm, entry.as_deref(), page],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -582,6 +617,7 @@ impl FolderThumbPinDb {
             "DELETE FROM folder_thumb_pins WHERE container_key = ?1",
             [&key],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 }
@@ -1166,9 +1202,39 @@ mod tests {
     fn open_in_memory() -> FolderThumbPinDb {
         let conn = Connection::open_in_memory().expect("memory db");
         FolderThumbPinDb::init_schema(&conn).expect("schema");
-        FolderThumbPinDb {
-            conn: Mutex::new(conn),
-        }
+        FolderThumbPinDb::from_connection(conn)
+    }
+
+    #[test]
+    fn mutation_stamp_advances_only_for_successful_handle_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        let initial = db.mutation_stamp();
+        let source = FolderPinSource::File {
+            rel: "cover.png".into(),
+            kind: FileKind::Image,
+        };
+        let folder = Path::new("C:/album");
+        let readonly = FolderThumbPinDb::open_readonly(&path).unwrap();
+        assert_eq!(db.mutation_stamp(), initial);
+        assert!(readonly.set(folder, &source).is_err());
+        assert_eq!(db.mutation_stamp(), initial);
+        let invalid = FolderPinSource::File {
+            rel: "../bad.png".into(),
+            kind: FileKind::Image,
+        };
+        assert!(db.set(folder, &invalid).is_err());
+        assert_eq!(db.mutation_stamp(), initial);
+        db.set(folder, &source).unwrap();
+        let written = db.mutation_stamp();
+        assert_ne!(written, initial);
+        assert_eq!(readonly.lookup(folder), Some(source));
+        db.remove(folder).unwrap();
+        assert_ne!(db.mutation_stamp(), written);
+        let missing = temp.path().join("missing.db");
+        assert!(FolderThumbPinDb::open_readonly(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]

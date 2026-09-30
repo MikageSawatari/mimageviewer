@@ -5546,17 +5546,20 @@ fn prepared_converted_archive_path(
         .unwrap_or(ConvertedArchiveSourceState::Unavailable)
 }
 
-struct PreparedVideoFolderPinSeed {
-    cache_key: String,
-    video_path: PathBuf,
-    mtime: i64,
-    file_size: i64,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct PreparedVideoFolderPinSeed {
+    pub(in crate::app) cache_key: String,
+    pub(in crate::app) video_path: PathBuf,
+    pub(in crate::app) mtime: i64,
+    pub(in crate::app) file_size: i64,
 }
 
-fn prepare_video_folder_pin_seeds(
+pub(in crate::app) fn prepare_video_folder_pin_seeds(
     items: &[GridItem],
     folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    resources: &SmartFolderPrepareResources,
+    folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    folder_thumb_sort: crate::settings::SortOrder,
+    folder_thumb_depth: u32,
     video_pin_db: Option<&crate::video_pins::VideoPinDb>,
     cancel: &AtomicBool,
 ) -> Vec<(PreparedVideoFolderPinSeed, Option<Vec<u8>>)> {
@@ -5578,8 +5581,8 @@ fn prepare_video_folder_pin_seeds(
         let Some(resolved) = super::resolve_pin_target_cascaded(
             container_path,
             source,
-            resources.folder_pin_db.as_deref(),
-            resources.folder_thumb_depth as usize,
+            folder_pin_db,
+            folder_thumb_depth as usize,
         ) else {
             continue;
         };
@@ -5589,8 +5592,8 @@ fn prepare_video_folder_pin_seeds(
         let Some(base_key) = crate::thumb_loader::folder_thumb_cache_key_for_path(
             container_path,
             true,
-            resources.folder_thumb_sort,
-            resources.folder_thumb_depth,
+            folder_thumb_sort,
+            folder_thumb_depth,
             crate::catalog::FolderThumbProvenance::Seeded,
         ) else {
             continue;
@@ -5613,12 +5616,16 @@ fn prepare_video_folder_pin_seeds(
     let Some(db) = video_pin_db else {
         return Vec::new();
     };
-    let webps = db.lookup_webps_many(resolved_seeds.iter().map(|seed| &seed.video_path));
+    let webps = db
+        .lookup_webps_many(resolved_seeds.iter().map(|seed| &seed.video_path))
+        .into_iter()
+        .map(|(path, bytes)| (crate::path_key::normalize_keep_drive(&path), bytes))
+        .collect::<HashMap<_, _>>();
     resolved_seeds
         .into_iter()
         .map(|seed| {
             let webp = webps
-                .get(&seed.video_path)
+                .get(&crate::path_key::normalize_keep_drive(&seed.video_path))
                 .filter(|bytes| !bytes.is_empty())
                 .cloned();
             (seed, webp)
@@ -6330,7 +6337,9 @@ fn prepare_smart_folder(
     let video_folder_pin_seeds = prepare_video_folder_pin_seeds(
         &items,
         &folder_pin_map,
-        &resources,
+        resources.folder_pin_db.as_deref(),
+        resources.folder_thumb_sort,
+        resources.folder_thumb_depth,
         video_pin_db.as_ref(),
         cancel,
     );

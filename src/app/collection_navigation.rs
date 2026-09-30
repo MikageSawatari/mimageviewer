@@ -1976,6 +1976,10 @@ impl App {
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
         let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
+        let folder_pin_stamp = self
+            .folder_thumb_pin_db
+            .as_ref()
+            .map(|db| db.mutation_stamp());
         let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
         let page_edit_availability = super::page_edit_snapshot::PageEditAvailability::for_app(self);
         let page_edit_revision = self.page_edit_revision;
@@ -2000,6 +2004,7 @@ impl App {
                     &worker_cancel,
                     None,
                     pin_stamp,
+                    folder_pin_stamp,
                     thumbnail_source_epoch,
                     page_edit_availability,
                     page_edit_revision,
@@ -2152,7 +2157,11 @@ impl App {
                 if let Some((owner, retained)) = warm_live_delivery
                     && !worker_cancel.load(Ordering::Acquire)
                 {
-                    owner.publish_live(retained.payload.clone());
+                    let live = match super::collection_grid::prepare_collection_grid_live_thumbnail_sources(retained.payload.clone(), &worker_cancel) {
+                        Ok(live) => live,
+                        Err(error) => { let _ = sender.send(Err(error)); return; }
+                    };
+                    owner.publish_live(live);
                 }
                 if let Some((owner, snapshot, prepared)) = warm_page_edits
                     && !worker_cancel.load(Ordering::Acquire)
@@ -4388,6 +4397,17 @@ mod tests {
             "test requires a live pin DB stamp"
         );
         mismatches.push(("pin stamp", pin_stamp));
+        let mut folder_pin_stamp = installed.reuse_key.clone();
+        folder_pin_stamp.folder_pin_stamp = None;
+        assert_ne!(folder_pin_stamp, installed.reuse_key);
+        mismatches.push(("folder pin stamp", folder_pin_stamp));
+        let mut folder_depth = installed.reuse_key.clone();
+        folder_depth.folder_thumb_depth += 1;
+        mismatches.push(("folder thumb depth", folder_depth));
+        let mut folder_sort = installed.reuse_key.clone();
+        folder_sort.folder_thumb_sort = crate::settings::SortOrder::DateDesc;
+        assert_ne!(folder_sort, installed.reuse_key);
+        mismatches.push(("folder thumb sort", folder_sort));
         let mut thumbnail_source_epoch = installed.reuse_key.clone();
         thumbnail_source_epoch.thumbnail_source_epoch = thumbnail_source_epoch
             .thumbnail_source_epoch
@@ -4759,7 +4779,30 @@ mod tests {
             video.clone(),
             vec![1, 2, 3, 4],
         )]));
+        let seed_key = "retained-folder#pin:video".to_owned();
+        let mut seed_webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut seed_webp)
+            .encode(&[0, 255, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let seeds = Arc::new(vec![(
+            super::super::smart_folder::PreparedVideoFolderPinSeed {
+                cache_key: seed_key.clone(),
+                video_path: video.clone(),
+                mtime: 7,
+                file_size: 8,
+            },
+            Some(seed_webp.clone()),
+        )]);
+        let folder_pins = std::collections::HashMap::from([(
+            "retained-container".into(),
+            crate::folder_thumb_pins::FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 3,
+            },
+        )]);
         let sources = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            folder_pin_map: folder_pins.clone(),
+            video_folder_pin_seeds: Arc::clone(&seeds),
             video_sidecars: std::collections::HashMap::from([(
                 "video-key".into(),
                 sidecar.clone(),
@@ -4896,7 +4939,13 @@ mod tests {
                 CollectionGridPresentationSources::Retained(
                     child_presentation.sources.retained().unwrap().clone(),
                 ),
-                Some(returned_live_sources),
+                Some(
+                    super::super::collection_grid::prepare_collection_grid_live_thumbnail_sources(
+                        returned_live_sources,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap(),
+                ),
             )));
         let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Folder);
         assert!(
@@ -4909,6 +4958,25 @@ mod tests {
             .is_some()
         );
         assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar));
+        assert_eq!(app.folder_pin_map, folder_pins);
+        assert_eq!(
+            app.current_color_cache_map
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()[&seed_key]
+                .jpeg_data,
+            seed_webp
+        );
+        assert_eq!(
+            app.current_color_cache_map
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()[&seed_key]
+                .folder_provenance,
+            Some(crate::catalog::FolderThumbProvenance::Seeded)
+        );
         let root_presentation = app
             .top_level_grid_view
             .collection_session()
@@ -4949,6 +5017,8 @@ mod tests {
             vec![7; MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES + 1],
         )]));
         let delivery = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            folder_pin_map: Default::default(),
+            video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::new(),
             video_pin_blobs: Arc::clone(&complete_blobs),
         });
@@ -4956,10 +5026,14 @@ mod tests {
             delivery.presentation,
             CollectionGridPresentationSources::Oversized(_)
         ));
-        assert!(Arc::ptr_eq(&delivery.live.video_pin_blobs, &complete_blobs));
+        assert!(Arc::ptr_eq(
+            &delivery.live.sources.video_pin_blobs,
+            &complete_blobs
+        ));
         assert_eq!(
             delivery
                 .live
+                .sources
                 .video_pin_blobs
                 .get(&PathBuf::from("oversized.mp4"))
                 .map(Vec::len),
@@ -5374,6 +5448,8 @@ mod tests {
             &app,
             &prepared,
             prepared_thumbnail_sources(CollectionGridThumbnailSources {
+                folder_pin_map: Default::default(),
+                video_folder_pin_seeds: Default::default(),
                 video_sidecars: std::collections::HashMap::from([(
                     "full-video-key".into(),
                     sidecar.clone(),
@@ -5631,6 +5707,8 @@ mod tests {
         );
         let prepared = prepare_snapshot(&added.snapshot);
         let sources_a = CollectionGridThumbnailSources {
+            folder_pin_map: Default::default(),
+            video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
                 "video-key".into(),
                 sidecar_a.clone(),
@@ -5704,6 +5782,8 @@ mod tests {
 
         std::fs::write(&sidecar_a, b"same-path-sidecar-updated").unwrap();
         let sidecar_changed = CollectionGridThumbnailSources {
+            folder_pin_map: Default::default(),
+            video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
                 "video-key".into(),
                 sidecar_a.clone(),
@@ -5735,6 +5815,8 @@ mod tests {
         assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar_a));
 
         let pin_changed = CollectionGridThumbnailSources {
+            folder_pin_map: Default::default(),
+            video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
                 "video-key".into(),
                 sidecar_a.clone(),

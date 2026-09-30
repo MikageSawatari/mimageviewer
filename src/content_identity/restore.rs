@@ -38,6 +38,7 @@ pub(crate) struct ContentRestoreReport {
     pub(crate) requested_restores: usize,
     pub(crate) requested_declines: usize,
     pub(crate) rows: usize,
+    pub(crate) committed_thumbnail_pins: usize,
     pub(crate) database_opens: usize,
     pub(crate) errors: Vec<String>,
     pub(crate) sidecar_mirrors: Vec<RestoreSidecarMirror>,
@@ -186,6 +187,7 @@ pub(crate) fn restore_candidates_at_with_progress(
         requested_restores: selected.len(),
         requested_declines: declined.len(),
         rows: copied.rows,
+        committed_thumbnail_pins: copied.committed_thumbnail_pins,
         database_opens: copied.database_opens,
         errors: copied.errors,
         ..ContentRestoreReport::default()
@@ -250,6 +252,8 @@ pub(crate) fn restore_candidates_at_with_progress(
                             on_progress("epub", processed_before + processed, epub_total)
                         },
                     );
+                // A later store/promotion may fail after a pin store committed.
+                report.committed_thumbnail_pins += copied.committed_thumbnail_pins;
                 if !copied.errors.is_empty() {
                     return Err(copied.errors.join("; "));
                 }
@@ -1926,6 +1930,34 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn restore_reports_pin_commits_even_when_ledger_promotion_fails() {
+        let data = tempfile::tempdir().unwrap();
+        let source_path = data.path().join("source.zip");
+        let target_path = data.path().join("target.zip");
+        std::fs::write(&target_path, b"book").unwrap();
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(
+            &data.path().join("folder_thumb_pins.db"),
+        )
+        .unwrap();
+        let source_pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "cover.jpg".into(),
+        };
+        pins.set(&source_path, &source_pin).unwrap();
+        let (candidate, source) =
+            candidate(source_path, target_path.clone(), ContentKind::Zip, "full");
+        let selected = [SelectedRestore { candidate, source }];
+
+        // No source ledger row: the pin store commits before promotion fails.
+        let report = restore_candidates_at(data.path(), &selected, &[], false);
+        assert!(!report.errors.is_empty());
+        assert_eq!(report.committed_thumbnail_pins, 1);
+        assert_eq!(pins.lookup(&target_path), Some(source_pin));
+        let repeated = restore_candidates_at(data.path(), &selected, &[], false);
+        assert_eq!(repeated.committed_thumbnail_pins, 0);
     }
 
     #[test]

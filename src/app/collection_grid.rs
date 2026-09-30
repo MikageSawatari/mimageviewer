@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::top_level_grid_view::{
-    CollectionGridIdentity, CollectionGridInstalledPresentation, CollectionGridLoadState,
-    CollectionGridPhysicalLoadIntent, CollectionGridPhysicalLoadOrigin,
-    CollectionGridPhysicalLoadOwner, CollectionGridPhysicalRestore, CollectionGridPosition,
-    CollectionGridPrepareReuseKey, CollectionGridPreparedInstall,
-    CollectionGridPreparedThumbnailDelivery, CollectionGridPreparedThumbnailSources,
-    CollectionGridPresentationSources, CollectionGridRequestStamp, CollectionGridRestore,
-    CollectionGridSession, CollectionGridSourceOpenOwner, CollectionGridThumbnailSourceIdentity,
+    CollectionGridIdentity, CollectionGridInstalledPresentation,
+    CollectionGridLiveThumbnailSources, CollectionGridLoadState, CollectionGridPhysicalLoadIntent,
+    CollectionGridPhysicalLoadOrigin, CollectionGridPhysicalLoadOwner,
+    CollectionGridPhysicalRestore, CollectionGridPosition, CollectionGridPrepareReuseKey,
+    CollectionGridPreparedInstall, CollectionGridPreparedThumbnailDelivery,
+    CollectionGridPreparedThumbnailSources, CollectionGridPresentationSources,
+    CollectionGridRequestStamp, CollectionGridRestore, CollectionGridSession,
+    CollectionGridSourceOpenOwner, CollectionGridThumbnailSourceIdentity,
     CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
     TopLevelGridSurface,
 };
@@ -209,11 +210,15 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
 ) -> Result<CollectionGridPreparedThumbnailDelivery, CollectionPrepareError> {
     use sha2::Digest as _;
 
-    if sources.video_sidecars.is_empty() && sources.video_pin_blobs.is_empty() {
+    if sources.video_sidecars.is_empty()
+        && sources.video_pin_blobs.is_empty()
+        && sources.folder_pin_map.is_empty()
+        && sources.video_folder_pin_seeds.is_empty()
+    {
         return Ok(CollectionGridPreparedThumbnailDelivery::default());
     }
     let mut digest = sha2::Sha256::new();
-    digest.update(b"miv.collection-thumbnail-sources.v1\0");
+    digest.update(b"miv.collection-thumbnail-sources.v2\0");
 
     let mut sidecars = sources.video_sidecars.iter().collect::<Vec<_>>();
     sidecars.sort_unstable_by(|left, right| left.0.cmp(right.0));
@@ -260,9 +265,58 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
         digest.update(sha2::Sha256::digest(webp));
     }
 
+    let mut container_pins = sources.folder_pin_map.iter().collect::<Vec<_>>();
+    container_pins.sort_unstable_by_key(|(key, _)| *key);
+    digest.update((container_pins.len() as u64).to_le_bytes());
+    for (key, source) in container_pins {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CollectionPrepareError::Cancelled);
+        }
+        digest.update(b"container-pin\0");
+        hash_collection_thumbnail_identity_part(&mut digest, key.as_bytes());
+        hash_collection_thumbnail_identity_part(&mut digest, source.db_kind().as_bytes());
+        hash_collection_thumbnail_identity_part(&mut digest, source.rel().as_bytes());
+        use crate::folder_thumb_pins::FolderPinSource;
+        match source {
+            FolderPinSource::ZipEntry { entry, .. } => {
+                hash_collection_thumbnail_identity_part(&mut digest, entry.as_bytes())
+            }
+            FolderPinSource::ZipDir { dir_prefix, .. } => {
+                hash_collection_thumbnail_identity_part(&mut digest, dir_prefix.as_bytes())
+            }
+            FolderPinSource::PdfPage { page, .. } => digest.update(page.to_le_bytes()),
+            FolderPinSource::File { .. } => {}
+        }
+    }
+    digest.update((sources.video_folder_pin_seeds.len() as u64).to_le_bytes());
+    for (seed, webp) in sources.video_folder_pin_seeds.iter() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CollectionPrepareError::Cancelled);
+        }
+        digest.update(b"container-video-seed\0");
+        hash_collection_thumbnail_identity_part(&mut digest, seed.cache_key.as_bytes());
+        hash_collection_thumbnail_identity_part(
+            &mut digest,
+            crate::path_key::normalize_keep_drive(&seed.video_path).as_bytes(),
+        );
+        digest.update(seed.mtime.to_le_bytes());
+        digest.update(seed.file_size.to_le_bytes());
+        match webp {
+            Some(webp) => {
+                digest.update([1]);
+                digest.update(sha2::Sha256::digest(webp));
+            }
+            None => digest.update([0]),
+        }
+    }
     let identity = CollectionGridThumbnailSourceIdentity(digest.finalize().into());
     let presentation = if super::top_level_grid_view::collection_pin_blob_sizes_fit_retention_budget(
-        sources.video_pin_blobs.values().map(Vec::len),
+        sources.video_pin_blobs.values().map(Vec::len).chain(
+            sources
+                .video_folder_pin_seeds
+                .iter()
+                .filter_map(|(_, webp)| webp.as_ref().map(Vec::len)),
+        ),
     ) {
         CollectionGridPresentationSources::Retained(Arc::new(
             CollectionGridPreparedThumbnailSources {
@@ -275,7 +329,40 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
     };
     Ok(CollectionGridPreparedThumbnailDelivery {
         presentation,
-        live: sources,
+        live: prepare_collection_grid_live_thumbnail_sources(sources, cancel)?,
+    })
+}
+
+/// Both cold prepare and retained-source preflight build the install map off the UI thread.
+pub(in crate::app) fn prepare_collection_grid_live_thumbnail_sources(
+    mut sources: CollectionGridThumbnailSources,
+    cancel: &AtomicBool,
+) -> Result<CollectionGridLiveThumbnailSources, CollectionPrepareError> {
+    let mut folder_pin_cache = std::collections::HashMap::new();
+    for (seed, webp) in sources.video_folder_pin_seeds.iter() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CollectionPrepareError::Cancelled);
+        }
+        let Some(webp) = webp else { continue };
+        folder_pin_cache.insert(
+            seed.cache_key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: seed.mtime,
+                file_size: seed.file_size,
+                jpeg_data: webp.clone(),
+                source_dims: None,
+                layout_dims: None,
+                folder_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
+                selection_proof: None,
+            },
+        );
+    }
+    // The UI installs only the derived map. Drop the live raw seeds on this worker; retained
+    // presentations keep their own Arc, while oversized blobs must not be freed on the UI.
+    sources.video_folder_pin_seeds = Arc::new(Vec::new());
+    Ok(CollectionGridLiveThumbnailSources {
+        sources,
+        folder_pin_cache,
     })
 }
 
@@ -286,6 +373,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     cancel: &AtomicBool,
     auto_aspect_client: Option<&crate::auto_aspect_cache::CollectionAutoAspectCacheClient>,
     pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    folder_pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
     thumbnail_source_epoch: u64,
     page_edit_availability: super::page_edit_snapshot::PageEditAvailability,
     page_edit_revision: u64,
@@ -360,6 +448,32 @@ pub(in crate::app) fn prepare_collection_grid_install(
     let pin_start = crate::perf::is_enabled().then(Instant::now);
     let pin_db =
         crate::video_pins::VideoPinDb::open_readonly(&crate::video_pins::VideoPinDb::db_path());
+    let folder_pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open_readonly(
+        &crate::folder_thumb_pins::FolderThumbPinDb::db_path(),
+    )
+    .ok();
+    let folder_pin_map = folder_pin_db
+        .as_ref()
+        .map(|db| db.lookup_many(edit_items.iter().filter_map(GridItem::container_path)))
+        .unwrap_or_default();
+    let mut video_folder_pin_seeds = super::smart_folder::prepare_video_folder_pin_seeds(
+        &edit_items,
+        &folder_pin_map,
+        folder_pin_db.as_ref(),
+        settings.folder_thumb_sort,
+        settings.folder_thumb_depth,
+        pin_db.as_ref().ok(),
+        cancel,
+    );
+    // Match the aggregate catalog writer: invalid WebP must never become a cache hit.
+    for (_, webp) in &mut video_folder_pin_seeds {
+        if webp
+            .as_ref()
+            .is_some_and(|bytes| crate::catalog::decode_thumb_dims(bytes).is_none())
+        {
+            *webp = None;
+        }
+    }
     let pin_db_available = pin_db.is_ok();
     let video_pin_blobs = pin_db
         .ok()
@@ -398,6 +512,8 @@ pub(in crate::app) fn prepare_collection_grid_install(
         CollectionGridThumbnailSources {
             video_sidecars: sidecars.by_video_path,
             video_pin_blobs: Arc::new(video_pin_blobs),
+            folder_pin_map,
+            video_folder_pin_seeds: Arc::new(video_folder_pin_seeds),
         },
         cancel,
     );
@@ -454,6 +570,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
             snapshot.revision(),
             settings,
             pin_stamp,
+            folder_pin_stamp,
             thumbnail_source_epoch,
         ),
     })
@@ -796,16 +913,17 @@ impl App {
             .invalidate_thumbnail_presentation()
     }
 
-    /// A metadata import writes through its own attached SQLite connection, so
-    /// the UI-owned `VideoPinDb` mutation stamp cannot observe the commit.  Move
+    /// Import and content restore write through separate SQLite connections, so
+    /// the UI-owned pin DB mutation stamps cannot observe the commit.  Move
     /// every context to a presentation-only retry and bind future preparation to
     /// this app-global epoch.  Item bindings, root/child position and navigation
     /// ownership stay intact.
-    pub(crate) fn advance_collection_thumbnail_source_epoch_for_metadata_import(
+    pub(crate) fn advance_collection_thumbnail_source_epoch_for_pin_commit(
         &mut self,
-        committed_video_pin_changes: usize,
+        committed_thumbnail_pin_changes: usize,
+        source: &str,
     ) {
-        if committed_video_pin_changes == 0 {
+        if committed_thumbnail_pin_changes == 0 {
             return;
         }
         self.collection_thumbnail_source_epoch =
@@ -830,19 +948,19 @@ impl App {
         }
         self.retire_smart_folder_payloads(retired);
         crate::logger::log(format!(
-            "metadata import: collection thumbnail sources invalidated changes={} epoch={} contexts={invalidated_contexts}",
-            committed_video_pin_changes, self.collection_thumbnail_source_epoch,
+            "{source}: collection thumbnail sources invalidated changes={} epoch={} contexts={invalidated_contexts}",
+            committed_thumbnail_pin_changes, self.collection_thumbnail_source_epoch,
         ));
         if crate::perf::is_enabled() {
             crate::perf::event(
-                "metadata_import",
+                source,
                 "collection_thumbnail_sources_invalidated",
                 None,
                 0,
                 &[
                     (
                         "changes",
-                        serde_json::Value::from(committed_video_pin_changes as u64),
+                        serde_json::Value::from(committed_thumbnail_pin_changes as u64),
                     ),
                     (
                         "epoch",
@@ -1698,6 +1816,10 @@ impl App {
                     let display_order = self.settings.grid_display_order.clone();
                     let settings = self.settings.clone();
                     let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
+                    let folder_pin_stamp = self
+                        .folder_thumb_pin_db
+                        .as_ref()
+                        .map(|db| db.mutation_stamp());
                     let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
                     let page_edit_availability =
                         super::page_edit_snapshot::PageEditAvailability::for_app(self);
@@ -1724,6 +1846,7 @@ impl App {
                                 &worker_cancel,
                                 auto_aspect_client.as_ref(),
                                 pin_stamp,
+                                folder_pin_stamp,
                                 thumbnail_source_epoch,
                                 page_edit_availability,
                                 page_edit_revision,
@@ -2108,6 +2231,33 @@ impl App {
         if !self.collection_grid_root_materialize_active() {
             return;
         }
+
+        // Pin writes may originate in a physical child or another mounted context. Observe
+        // shared stamps lazily here, but replace only this context's presentation. Existing
+        // root/fullscreen admission and receive/landing checks own the asynchronous retry.
+        let stale_thumbnail_sources = self
+            .top_level_grid_view
+            .collection_session()
+            .filter(|session| {
+                matches!(
+                    session.load,
+                    CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_)
+                )
+            })
+            .and_then(CollectionGridSession::installed_presentation)
+            .is_some_and(|installed| {
+                installed.reuse_key
+                    != self.collection_grid_prepare_reuse_key(
+                        installed.prepared.collection_id,
+                        installed.prepared.collection_revision,
+                    )
+            });
+        if stale_thumbnail_sources
+            && let Some(retired) = self.invalidate_current_collection_thumbnail_presentation()
+        {
+            let retired: super::smart_folder::RetiredSmartFolderPayload = Box::new(retired);
+            self.retire_smart_folder_payloads(vec![retired]);
+        }
         let Some(stamp) = self.collection_grid_stamp() else {
             return;
         };
@@ -2216,6 +2366,10 @@ impl App {
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
         let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
+        let folder_pin_stamp = self
+            .folder_thumb_pin_db
+            .as_ref()
+            .map(|db| db.mutation_stamp());
         let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
         let page_edit_availability = super::page_edit_snapshot::PageEditAvailability::for_app(self);
         let page_edit_revision = self.page_edit_revision;
@@ -2241,6 +2395,7 @@ impl App {
                     &worker_cancel,
                     auto_aspect_client.as_ref(),
                     pin_stamp,
+                    folder_pin_stamp,
                     thumbnail_source_epoch,
                     page_edit_availability,
                     page_edit_revision,
@@ -2750,6 +2905,9 @@ impl App {
             revision,
             &self.settings,
             self.video_pin_db.as_ref().map(|db| db.mutation_stamp()),
+            self.folder_thumb_pin_db
+                .as_ref()
+                .map(|db| db.mutation_stamp()),
             self.collection_thumbnail_source_epoch,
         )
     }
@@ -2772,9 +2930,15 @@ impl App {
         let CollectionGridPreparedThumbnailDelivery {
             presentation: presentation_sources,
             live:
-                CollectionGridThumbnailSources {
-                    video_sidecars,
-                    video_pin_blobs,
+                CollectionGridLiveThumbnailSources {
+                    sources:
+                        CollectionGridThumbnailSources {
+                            video_sidecars,
+                            video_pin_blobs,
+                            folder_pin_map,
+                            ..
+                        },
+                    folder_pin_cache,
                 },
         } = thumbnail_sources;
         let prepared = Arc::new(prepared);
@@ -2878,6 +3042,8 @@ impl App {
             selected,
             video_sidecars,
             video_pin_blobs,
+            folder_pin_map,
+            folder_pin_cache,
             collection_seed,
             prepared.auto_aspect_eligible_total,
             page_edits,
@@ -3022,6 +3188,8 @@ impl App {
             selected,
             std::collections::HashMap::new(),
             Arc::new(std::collections::HashMap::new()),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             collection_seed,
             auto_aspect_eligible_total,
             None,
@@ -3035,6 +3203,11 @@ impl App {
         selected: Option<usize>,
         video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
         video_pin_blobs: Arc<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+        folder_pin_map: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        >,
+        folder_pin_cache: std::collections::HashMap<String, crate::catalog::CacheEntry>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         auto_aspect_eligible_total: usize,
         page_edits: Option<(
@@ -3090,8 +3263,8 @@ impl App {
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
-        self.folder_pin_map.clear();
-        self.converted_archive_cache_paths.clear();
+        self.folder_pin_map = folder_pin_map;
+        self.initialize_converted_archive_cache_paths();
         self.video_thumb_overrides = video_sidecars;
         self.search_filter = None;
         self.search_query.clear();
@@ -3104,7 +3277,9 @@ impl App {
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();
 
-        let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        // Prepared WebP uses the same full-path Seeded#pin key as search/smart-folder rows.
+        // No catalog open/write or image decoding is performed during UI installation.
+        let cache_map = Arc::new(std::sync::RwLock::new(folder_pin_cache));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = None;
         self.reset_and_seed_auto_aspect_with_collection_seed(
@@ -4248,6 +4423,428 @@ mod tests {
         .snapshot
     }
 
+    fn collection_pin_request(app: &App, index: usize) -> crate::thumb_loader::LoadRequest {
+        let (mtime, size) = app.image_metas[index].unwrap_or_default();
+        super::super::make_load_request(
+            &app.items[index],
+            index,
+            mtime,
+            size,
+            false,
+            None,
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            None,
+            app.current_folder.as_deref(),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            app.use_full_path_cache_keys(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn collection_container_pins_prepare_and_install_folder_zip_pdf_archive_epub() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        let _scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("cover.png"), b"image").unwrap();
+        let zip = temp.path().join("book.zip");
+        let pdf = temp.path().join("book.pdf");
+        let archive = temp.path().join("book.7z");
+        let epub = temp.path().join("book.epub");
+        for path in [&zip, &pdf, &archive, &epub] {
+            std::fs::write(path, b"container").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.folder_thumb_pin_db = Some(Arc::new(
+            FolderThumbPinDb::open_at(&FolderThumbPinDb::db_path()).unwrap(),
+        ));
+        let expected = std::collections::HashMap::from([
+            (
+                crate::path_key::normalize_keep_drive(&folder),
+                FolderPinSource::File {
+                    rel: "cover.png".into(),
+                    kind: FileKind::Image,
+                },
+            ),
+            (
+                crate::path_key::normalize_keep_drive(&zip),
+                FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "chosen.png".into(),
+                },
+            ),
+            (
+                crate::path_key::normalize_keep_drive(&pdf),
+                FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 4,
+                },
+            ),
+            (
+                crate::path_key::normalize_keep_drive(&archive),
+                FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "chosen.png".into(),
+                },
+            ),
+            (
+                crate::path_key::normalize_keep_drive(&epub),
+                FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 2,
+                },
+            ),
+        ]);
+        for path in [&folder, &zip, &pdf, &archive, &epub] {
+            app.folder_thumb_pin_db
+                .as_ref()
+                .unwrap()
+                .set(
+                    path,
+                    &expected[&crate::path_key::normalize_keep_drive(path)],
+                )
+                .unwrap();
+        }
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (folder.clone(), CollectionResolvedKind::Folder),
+                (zip.clone(), CollectionResolvedKind::Zip),
+                (pdf.clone(), CollectionResolvedKind::Pdf),
+                (archive.clone(), CollectionResolvedKind::ConvertibleArchive),
+                (epub.clone(), CollectionResolvedKind::Pdf),
+            ],
+        );
+        let install = prepare_collection_grid_install(
+            &snapshot,
+            &app.settings.grid_display_order,
+            &app.settings,
+            &AtomicBool::new(false),
+            None,
+            app.video_pin_db.as_ref().map(|db| db.mutation_stamp()),
+            app.folder_thumb_pin_db
+                .as_ref()
+                .map(|db| db.mutation_stamp()),
+            app.collection_thumbnail_source_epoch,
+            super::super::page_edit_snapshot::PageEditAvailability::for_app(&app),
+            app.page_edit_revision,
+        )
+        .unwrap();
+        assert_eq!(
+            install.thumbnail_sources.live.sources.folder_pin_map,
+            expected
+        );
+        assert_eq!(
+            install
+                .thumbnail_sources
+                .presentation
+                .retained()
+                .unwrap()
+                .payload
+                .folder_pin_map,
+            expected
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.folder_pin_map, expected);
+        assert!(app.use_full_path_cache_keys());
+        for (index, item) in app.items.iter().enumerate() {
+            let request = collection_pin_request(&app, index);
+            let key = request.cache_key_override.as_ref().unwrap();
+            assert!(
+                key.contains(crate::thumb_loader::CACHE_KEY_PIN_SUFFIX),
+                "{item:?}: {key}"
+            );
+            match item {
+                GridItem::Folder(_) => assert_eq!(request.path, folder.join("cover.png")),
+                GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } => {
+                    assert_eq!(request.zip_entry.as_deref(), Some("chosen.png"))
+                }
+                GridItem::PdfFile(path) => {
+                    assert_eq!(request.pdf_page, Some(if path == &pdf { 4 } else { 2 }))
+                }
+                _ => panic!("unexpected item {item:?}"),
+            }
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_nested_video_pin_seeds_match_requests_and_preserve_sibling_map() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        let _scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("Outer");
+        let inner = outer.join("Inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let video = inner.join("Clip.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.folder_thumb_pin_db = Some(Arc::new(
+            FolderThumbPinDb::open_at(&FolderThumbPinDb::db_path()).unwrap(),
+        ));
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &outer,
+                &FolderPinSource::File {
+                    rel: "Inner".into(),
+                    kind: FileKind::Folder,
+                },
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &inner,
+                &FolderPinSource::File {
+                    rel: "Clip.mp4".into(),
+                    kind: FileKind::Video,
+                },
+            )
+            .unwrap();
+        app.video_pin_db = Some(
+            crate::video_pins::VideoPinDb::open_at(&crate::video_pins::VideoPinDb::db_path())
+                .unwrap(),
+        );
+        let mut webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+            .encode(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        app.video_pin_db
+            .as_ref()
+            .unwrap()
+            .set_pin(&video, 1.0, &webp)
+            .unwrap();
+        let sibling_map = std::collections::HashMap::from([(
+            "sibling".into(),
+            FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 7,
+            },
+        )]);
+        let expected_sibling = sibling_map.clone();
+        let sibling = app.build_window_context_for_test(1307, move |context| {
+            context.folder_pin_map = sibling_map;
+        });
+        // Distinct spelling reaches the same normalized video key through both containers.
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (outer.clone(), CollectionResolvedKind::Folder),
+                (
+                    PathBuf::from(inner.to_string_lossy().to_lowercase()),
+                    CollectionResolvedKind::Folder,
+                ),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let retained = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .installed_presentation()
+            .unwrap()
+            .sources
+            .retained()
+            .unwrap();
+        assert_eq!(retained.payload.video_folder_pin_seeds.len(), 2);
+        assert!(
+            retained
+                .payload
+                .video_folder_pin_seeds
+                .iter()
+                .all(|(_, bytes)| bytes.as_ref() == Some(&webp))
+        );
+        for index in 0..2 {
+            let request = collection_pin_request(&app, index);
+            let key = request.cache_key_override.unwrap();
+            let cache = app
+                .current_color_cache_map
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(cache[&key].jpeg_data, webp);
+            assert_eq!(
+                cache[&key].folder_provenance,
+                Some(crate::catalog::FolderThumbProvenance::Seeded)
+            );
+            assert_eq!(cache[&key].mtime, request.mtime);
+            assert_eq!(cache[&key].file_size, request.file_size);
+        }
+        app.with_viewer_context(sibling, |context| {
+            assert_eq!(context.folder_pin_map, expected_sibling)
+        })
+        .unwrap();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_container_pin_mutation_refreshes_root_and_rejects_stale_delivery() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        let _scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["old.png", "new.png"] {
+            std::fs::write(folder.join(name), b"image").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.folder_thumb_pin_db = Some(Arc::new(
+            FolderThumbPinDb::open_at(&FolderThumbPinDb::db_path()).unwrap(),
+        ));
+        let pin = |name: &str| FolderPinSource::File {
+            rel: name.into(),
+            kind: FileKind::Image,
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&folder, &pin("old.png"))
+            .unwrap();
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .installed_presentation()
+            .unwrap()
+            .clone();
+        let old_key = installed.reuse_key.clone();
+        let stale_install = prepare_collection_grid_install(
+            &snapshot,
+            &app.settings.grid_display_order,
+            &app.settings,
+            &AtomicBool::new(false),
+            None,
+            app.video_pin_db.as_ref().map(|db| db.mutation_stamp()),
+            app.folder_thumb_pin_db
+                .as_ref()
+                .map(|db| db.mutation_stamp()),
+            app.collection_thumbnail_source_epoch,
+            super::super::page_edit_snapshot::PageEditAvailability::for_app(&app),
+            app.page_edit_revision,
+        )
+        .unwrap();
+        assert!(
+            stale_install
+                .page_edits
+                .as_ref()
+                .unwrap()
+                .0
+                .stamp
+                .is_some_and(|stamp| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp))
+        );
+        assert!(app.set_folder_thumb_pin(&folder, pin("new.png")));
+        assert_ne!(
+            old_key,
+            app.collection_grid_prepare_reuse_key(snapshot.collection_id(), snapshot.revision())
+        );
+        // A completion racing a pin write must not be installed under the old stamp.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok(stale_install)).unwrap();
+        let stamp = app.collection_grid_stamp().unwrap();
+        let generation = app.items_generation;
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision: snapshot.revision(),
+            installed: Some(Arc::clone(&installed.prepared)),
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                Instant::now(),
+                "prepare",
+            ),
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+        };
+        app.poll_collection_grid(&egui::Context::default());
+        assert_eq!(app.items_generation, generation);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(collection_pin_request(&app, 0).path, folder.join("new.png"));
+        assert!(app.remove_folder_thumb_pin(&folder));
+        app.consume_folder_thumb_pin_dirty();
+        app.poll_collection_grid(&egui::Context::default());
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert!(app.folder_pin_map.is_empty());
+        assert!(
+            !collection_pin_request(&app, 0)
+                .cache_key_override
+                .unwrap()
+                .contains(crate::thumb_loader::CACHE_KEY_PIN_SUFFIX)
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_container_pin_identity_and_seed_retention_cover_all_sources() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        let prepare = |sources| {
+            prepare_collection_grid_thumbnail_sources(sources, &AtomicBool::new(false)).unwrap()
+        };
+        let empty = prepare(CollectionGridThumbnailSources::default())
+            .presentation
+            .identity();
+        let mut sources = CollectionGridThumbnailSources::default();
+        sources.folder_pin_map.insert(
+            "container".into(),
+            FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 1,
+            },
+        );
+        let pinned = prepare(sources.clone()).presentation.identity();
+        assert_ne!(pinned, empty);
+        sources.folder_pin_map.insert(
+            "container".into(),
+            FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 2,
+            },
+        );
+        assert_ne!(prepare(sources.clone()).presentation.identity(), pinned);
+        let seed = super::super::smart_folder::PreparedVideoFolderPinSeed {
+            cache_key: "seed#pin:key".into(),
+            video_path: PathBuf::from("clip.mp4"),
+            mtime: 1,
+            file_size: 5,
+        };
+        sources.video_folder_pin_seeds = Arc::new(vec![(seed.clone(), None)]);
+        let missing = prepare(sources.clone()).presentation.identity();
+        sources.video_folder_pin_seeds = Arc::new(vec![(
+            seed,
+            Some(vec![
+                1;
+                super::super::top_level_grid_view::MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES
+                    + 1
+            ]),
+        )]);
+        let oversized = prepare(sources);
+        assert!(matches!(
+            oversized.presentation,
+            CollectionGridPresentationSources::Oversized(_)
+        ));
+        assert_ne!(oversized.presentation.identity(), missing);
+        assert!(oversized.live.folder_pin_cache.contains_key("seed#pin:key"));
+        assert!(oversized.live.sources.video_folder_pin_seeds.is_empty());
+    }
+
     #[test]
     fn phase_a_collection_mask_is_projected_for_accepted_revision() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
@@ -4315,6 +4912,8 @@ mod tests {
             None,
             std::collections::HashMap::new(),
             Arc::new(std::collections::HashMap::new()),
+            Default::default(),
+            Default::default(),
             None,
             0,
             Some(prepared),
@@ -7909,7 +8508,7 @@ mod tests {
             .unwrap()
             .video_worker_cancel = Some(Arc::clone(&video_worker_cancel));
 
-        app.advance_collection_thumbnail_source_epoch_for_metadata_import(0);
+        app.advance_collection_thumbnail_source_epoch_for_pin_commit(0, "metadata_import");
         assert_eq!(app.collection_thumbnail_source_epoch, old_epoch);
         assert!(matches!(
             app.top_level_grid_view.collection_session().unwrap().load,
@@ -7917,7 +8516,7 @@ mod tests {
         ));
         assert!(!video_worker_cancel.load(Ordering::Acquire));
 
-        app.advance_collection_thumbnail_source_epoch_for_metadata_import(1);
+        app.advance_collection_thumbnail_source_epoch_for_pin_commit(1, "metadata_import");
 
         assert_eq!(
             app.collection_thumbnail_source_epoch,
