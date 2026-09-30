@@ -1018,7 +1018,7 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   AI の高精度 mtime の差し替え / 認証・generation の通らない 204
 - 既存の page / admission / coordinator / thumbnail のテストが通ること
 
-#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第4版 2026-10-01、設計レビュー待ち)
+#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第5版 2026-10-01、設計レビューで着手可)
 
 写真のスライドショーのようにゆっくりめくる用途を快適にするため、Remote でも RAW の先読み現像を行う
 (利用者の提案 2026-09-29。なるべく早く実装する方針)。PC と同じく **先 2 枚・前 1 枚** (決定 3)。
@@ -1086,11 +1086,12 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
      waiter ID で完了を照合し、古い waiter の完了や後片付けが新しい waiter を消さない
    - `Retiring` の thread も終わるまで数える。thread の総数の上限は **窓 3 + retiring 3 = 6**。上限に達している間は新しい
      開始を `Pending` にとどめ、thread が終わった通知で (まだ望まれていれば) 始める
-   - capacity (5.) の待ち: `RemoteRawFlights` に **capacity の epoch** (outstanding が減るたびに +1) を持たせる。worker は
-     `Pending` があるとき、**上限付きの wait (50ms) で待ち、起きるたびに (a) capacity の epoch が記録値より進んだか、
-     (b) 受け箱に新しい宣言があるか、(c) 取消・終端が来たか** を確かめる (既存の flight の待ちと同じ形、
-     `src/remote_ipc/raw_flights.rs:682`)。通知を取りこぼしても最大 50ms で拾い直すので、Capacity を受けてから
-     Pending を記録するまでに空いた分を失わない。受け箱への投入・取消・終端は worker を起こす (notify)
+   - capacity (5.) の待ち: worker は `Pending` があるとき上限付きの wait (50ms) で待ち、**起きるたびに `Pending` の各 entry に
+     ついて実際の admission (flight の開始 / join) をもう一度試す**。capacity の変化 (epoch) を記録して比べる方式は取らない
+     (Capacity の判定から Pending の記録までの間に空いた分を、epoch の取り方しだいで見逃すため。設計レビュー第4版の指摘)。
+     あわせて起きるたびに受け箱の新しい宣言と取消・終端を確かめる (既存の flight の待ちと同じ上限付き wait の形、
+     `src/remote_ipc/raw_flights.rs:682`)。受け箱への投入・取消・終端は worker を起こす (notify)。試行は Pending の件数
+     (最大 3) だけなので負荷は小さい
    - thread の slot は spawn の前に予約する。spawn に失敗したら予約を戻して `Pending` のまま (次の epoch か次の宣言で
      再試行)。早い完了・取消・次の宣言による置き換え (古い waiter が `Retiring` の間に同じ identity が再び望まれた場合は、
      新しい waiter として始める。古い waiter の完了は waiter ID で無視する) をテストで固定する
@@ -1135,7 +1136,7 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
      何も取消さない、同じ flight の前景 waiter が残る
    - 第4版の追加: worker が処理する前に generation 11 → 10 の順で届いても 11 が残る、重複の ack、session の期限切れ中の
      backoff 中止、送信中に session を取り直したとき古い本文を再送せず作り直す、同じ表示単位へ戻って方向が変わったら
-     宣言が出る、Capacity を受けた直後に空いた場合を 50ms 以内に拾う
+     宣言が出る、Capacity を受けた直後 (Pending の記録より前) に空き、その後に完了が 1 件も無くても 50ms 以内に始まる
    - 第3版の追加: viewer を開き直しても generation が続く、キャッシュ済みの初回表示でも宣言が出る、宣言の送信失敗の
      再送と最新値の合流、受け箱の上書き、遅い特定が後の空の宣言を上書きしない、foreground / AI の flight に window が
      join して前景が離れても現像が続く、capacity を受けてから Pending を記録する前に空いた場合の再開、spawn 失敗、
@@ -1424,3 +1425,8 @@ generation を session 単位の 1 本の counter にし表示の共通確定点
 接続断を window の出来事として扱わない (再接続の合図・窓の再構築が不要になる) (P2)、再送は一時的な失敗・有効な session の
 間だけで session を取り直したら作り直す (P2)、capacity の待ちを既存 flight と同じ上限付き wait で拾い直す (P2)、
 宣言の印に方向と窓の並びを含める (P3)。
+
+### 20.14 S2c の設計レビュー (2026-10-01、第4版)
+
+前回 5 件のうち 4 件解決。残る P2 (capacity の epoch の取り方しだいで空きを見逃す) は、起きるたびに実際の admission を
+試し直す規則に改め (第5版)、「この 1 点を明記すれば着手してよい。構造の作り直しは不要」の判定に沿って着手する。
