@@ -1018,16 +1018,56 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   AI の高精度 mtime の差し替え / 認証・generation の通らない 204
 - 既存の page / admission / coordinator / thumbnail のテストが通ること
 
-#### 10.2.3 表示位置からの先読み現像 (S2c、S2b の直後に実施)
+#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第1版 2026-10-01、設計レビュー待ち)
 
-写真のスライドショーのようにゆっくりめくる用途を快適にするため、次を足す (利用者の提案 2026-09-29。なるべく早く実装する方針)。S2b は (2) の flight と (3) の cache をこの拡張で再利用できる形で作る。
+写真のスライドショーのようにゆっくりめくる用途を快適にするため、Remote でも RAW の先読み現像を行う
+(利用者の提案 2026-09-29。なるべく早く実装する方針)。PC と同じく **先 2 枚・前 1 枚** (決定 3)。
 
-- 本体が「Remote で最後に前景で表示された RAW ページ」の表示順の前後 (**先 2・前 1**、PC と同じ) を
-  自分で先に現像し、cache に置く (cache の上限は件数と合計サイズの固定値)
-- 需要の管理は「最新の前景位置」1 つだけ: 次の前景要求が来たら、窓の外になった現像を取り消す。
-  第2案で問題になった要求ごとの需要追跡・再要求は要らない
-- 期待できる効果 (S1 の実測からの見込み、未確認): 1 ページを見ている時間が現像時間 (一般的な機種で約 0.5〜2.5 秒、
-  X-T4 は約 13 秒) より長ければ、めくった瞬間に表示される。速くめくると追いつかない
+**事実 (2026-10-01 の調査、HEAD `680968e2a`)**
+
+- 本体は Remote のページの並び順を持たない。ページ要求は 1 件ずつ独立で、並び順・現在位置はブラウザだけが持つ
+  (`crates/remote-web/web/app.js` の `state.images` / `state.pageGroups`)。本体側の読書位置の記録は 30 秒ごとで
+  追跡には使えない (`READING_PROGRESS_INTERVAL_MS`)
+- ブラウザは表示のたびに先読み計画を作り、前後の画像について Prefetch の page 要求を出す
+  (`pagePrefetchPlan`、`crates/remote-web/web/command-core.mjs:2709-2738`)。単位は **画像 (entry) の位置**で、
+  進行方向の端から先 (`ahead`)、反対の端から後ろ (`behind`) の順に並び、近い順に要求される。見開きの相方も
+  同じ group として要求される。S2b ではこの RAW の要求に `RawPrefetchSkipped` を返している
+- `RemoteRawFlights` には S2c 用の口がある: `develop_with_priority` (優先度指定の submit)、policy
+  (`max_outstanding` / `max_cached_entries` / `max_cached_bytes`)。結果が cache に入るのは、完了時に waiter が
+  残っている flight だけ (`src/remote_ipc/raw_flights.rs:878-892`)
+
+**設計**
+
+1. **wire**: `PageRequest` に `prefetch_distance: Option<i16>` を足す (protocol 65)。ブラウザが Prefetch 要求にだけ付ける、
+   表示中の group の端から数えた **画像単位の符号付き距離** (先へ +1, +2, …、後ろへ -1, -2, …)。`pagePrefetchPlan` が
+   既に持っている位置から計算する。見開きの相方として要求される画像は、その画像自身の距離を付ける
+2. **窓**: 距離が **+1, +2, -1** の RAW の Prefetch 要求だけを先読み現像の対象にする (決定 3。進行方向を「先」とする
+   のはブラウザの計画と同じ)。それ以外の距離の RAW は従来どおり `RawPrefetchSkipped` を返すだけ
+3. **現像の起動と応答**: 窓の中の RAW で cache に無い依存があれば、core は **`RemoteRawPrefetchWindow` の detached waiter**
+   (専用 thread。`develop_with_priority` を Normal で呼び、flight の waiter として結果を cache へ入れさせる) を起動し、
+   要求には **その場で `RawPrefetchSkipped` を返す** (heavy worker と HTTP worker を待たせない。S2b と同じ応答なので
+   Web の変更は距離の付与だけ)。後で前景の要求が来たら、cache に当たるか、進行中の flight に合流して High へ昇格する
+   (S2b の既存の規則)
+4. **所有者と取消 (`RemoteRawPrefetchWindow`、Remote session ごとに 1 つ)**:
+   - detached waiter を **最大 4 本** 持つ (窓 3 + 余裕 1)。各 waiter は識別子 (`RemoteRawIdentity`) と「どの前景
+     世代で要求されたか」を持つ
+   - 前景の page 要求 (新しい表示) が来るたびに **前景世代** を 1 進める。新しい世代の窓の要求が既存の waiter と同じ
+     識別子なら、その waiter の世代を新しい世代へ付け替える (現像をやり直さない)
+   - 新しい waiter を起動するとき上限 4 に達していれば、**最も古い世代の waiter** を cancel する (同じ世代なら古い順)
+   - 前景世代が 2 つ進んでも付け替えられなかった waiter は cancel する (窓から外れたもの)
+   - session の drain / 接続断 / service stop で全 waiter を cancel する
+   - 判定はすべて owner の lock の中で決め、cancel は lock の外 (S2b の規則と同じ)
+5. **予算**: 先読み現像の outstanding は S2b の上限 (6) とは **別枠で 3** (`REMOTE_RAW_PREFETCH_LIMIT`)。cache は
+   `max_cached_entries = 4` (表示中 1 + 窓 3)、`max_cached_bytes = 1 GiB` の固定値。PC のフルスクリーンからは使わない。
+   決定 13 の「最後の 1 枚」を S2c でこの窓の分まで広げる (利用者の提案に基づく拡張)
+6. **優先度**: 先読み現像は Normal。前景 (High) が合流すれば昇格する。executor の並列数 (既定 3) は PC と共有
+7. **テスト**: 距離の付与 (Web node テスト)、窓外の距離は現像しない、窓内は即 skip 応答 + detached 現像で cache に入る、
+   その後の前景要求が cache に当たる / 進行中に合流して昇格する、前景世代での付け替え (1 枚進めても現像をやり直さない)、
+   上限 4 で最古を cancel、2 世代で窓外を cancel、drain / 接続断 / stop、別枠 3 と S2b の 6 が互いを食わない、
+   cache の件数・バイト上限
+
+**期待できる効果** (S1 の実測からの見込み、未確認): 1 ページを見ている時間が現像時間 (一般的な機種で約 0.5〜2.5 秒、
+X-T4 は約 13 秒) より長ければ、めくった瞬間に表示される。速くめくると追いつかない
 
 ### 10.3 remote-web の旧経路 (D10)
 
