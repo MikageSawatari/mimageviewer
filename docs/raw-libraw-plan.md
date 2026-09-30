@@ -808,6 +808,16 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
 - 実効優先度は、`page_inner` に page job の優先度 accessor (registry から現在値を読む関数) を渡して、上の決定の
   直前に読む (`src/remote_ipc/pipe.rs:1108-1119` の dispatch 時の値ではなく)
 
+**(1b) 書庫の代表の選び方 (S2b 実装中に確定、2026-10-01)**
+
+- 代表の **特定** (identification) は、ZIP の中央ディレクトリの情報だけで行う: 代表の順序 (名前順)、画像の拡張子、
+  暗号化の有無、対応する圧縮方式。入れ子 ZIP の器は、既存の上限付き・取消可能な入れ子 ZIP の cache で展開してよい
+  (S2b 以前から JPEG の書庫でも行っていた処理)。**RAW entry の中身 (payload) は、先読みの skip 判定と AI の capacity
+  確保より前には読まない・展開しない**
+- payload の読み込みは、前景なら (2) の flight の中で、AI なら capacity 確保の後で行う。読めなかった場合
+  (破損など) は、**同じ要求の中で代表の順序の次の候補へ進む** (既存の loader が「読めない entry を飛ばして次を
+  表示する」のと同じ結果にする)。次の候補が RAW なら同じ規則を繰り返す
+
 **(2) RAW single-flight (`RemoteRawFlights`、App-global、Remote のページと Remote AI が共有)**
 
 - key (`RemoteRawIdentity`): 正規化 path + **高精度 mtime (100ns 単位の FILETIME をそのまま)** + file size +
@@ -1249,3 +1259,8 @@ source bytes を読む前に capacity を取る ((9))、テストと telemetry �
 
 残り 5 件のうち 3 件解決。P1 (既存の core `Busy` の上限付き再試行を残す)、P2×2 (表示需要が消えたら coordinator が
 即座に cancel / release、participant lease で `Done` の pin を必ず外す)、P3 (古いテストの削除) を採用した。
+
+### 20.8 S2b 実装の独立レビュー (2026-10-01、3 回目)
+
+JPEG だけの入れ子書庫の先読みと AI の待ちは解決。代表を選ぶ処理が「読めるか」の確認で RAW の payload を
+丸ごと読んでいた (skip / capacity の前) 点を P2 として採用し、§10.2.2 (1b) を定めた。
