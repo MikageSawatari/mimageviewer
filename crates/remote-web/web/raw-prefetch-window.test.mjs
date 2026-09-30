@@ -175,8 +175,8 @@ test("commit without a session retains its snapshot; leaving clears it", async (
   assert.equal(calls.length, 1);
 });
 
-for (const error of ["ipc_busy", "admission_busy", "raw_busy"]) {
-  test(`named congestion ${error} retries`, async () => {
+for (const error of ["ipc_timeout", "ipc_busy", "admission_busy", "raw_busy", "miv_media_error"]) {
+  test(`transient HTTP error ${error} retries`, async () => {
     let count = 0;
     const { publisher, delays } = harness({ send: async () => {
       count += 1;
@@ -186,6 +186,40 @@ for (const error of ["ipc_busy", "admission_busy", "raw_busy"]) {
     await tick();
     assert.equal(count, 2);
     assert.equal(delays.length, 1);
+  });
+}
+
+test("network failure reading a 503 body retries the same captured declaration", async () => {
+  const calls = [];
+  const { publisher, delays } = harness({ send: async (body, session) => {
+    calls.push({ body, session });
+    if (calls.length !== 1) return new Response("{}", { status: 200 });
+    const stream = new ReadableStream({
+      start(controller) { controller.error(new TypeError("connection lost during response body")); },
+    });
+    return new Response(stream, { status: 503, headers: { "Retry-After": "1" } });
+  } });
+  publisher.commit(display());
+  publisher.commit(display()); // The stamp cannot repair a lost declaration.
+  await tick();
+  assert.equal(calls.length, 2);
+  assert.equal(delays.length, 1);
+  assert.equal(delays[0].ms, 1000);
+  assert(calls.every(({ session, body }) => session === "session-a" && body.window_generation === 1));
+  assert.deepEqual(calls[1].body.entries, display().entries);
+});
+
+for (const body of ["invalid JSON", "null"]) {
+  test(`unusable 503 JSON (${body}) is terminal rather than a network failure`, async () => {
+    let count = 0;
+    const { publisher, delays } = harness({ send: async () => {
+      count += 1;
+      return new Response(count === 1 ? body : "{}", { status: count === 1 ? 503 : 200 });
+    } });
+    publisher.commit(display());
+    await tick();
+    assert.equal(count, 1);
+    assert.equal(delays.length, 0);
   });
 }
 

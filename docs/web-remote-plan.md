@@ -2775,8 +2775,9 @@ Web は共通の presentation commit から、表示単位・進行方向・窓�
 追加しない。viewer を閉じても session の generation counter は継続し、離れると空の窓を送る。
 宣言 module は実際に presentation commit した表示単位・方向・窓の snapshot を保持する。
 位置 owner の open による初期 displayed は宣言に使わず、session を取得し直しても初回 commit までは送らない。
-送信は最新値だけを保持し、通信失敗と 503 の named congestion (`ipc_busy` / `admission_busy` / `raw_busy`) だけを
-既存の backoff で再試行する。`protocol_version_mismatch` などの恒久エラーは再送しない。
+送信は最新値だけを保持し、本文読み取り中を含む通信失敗と、HTTP mapper が一時的とする 503
+(`ipc_timeout` / `ipc_busy` / `admission_busy` / `raw_busy` / Busy の `miv_media_error`) を既存の backoff で再試行する。
+`protocol_version_mismatch`、検証・認証エラーや不正な JSON などの恒久エラーは再送しない。
 session 失効で fetch / backoff を abort、取得し直した session では counter を振り直し最後に commit した snapshot から
 新しい宣言を作る。古い本文の replay は行わない。表示を離れると snapshot も破棄する。
 409 / 428 の本文を読んだ後にも captured session と abort を照合し、旧要求のエラーで新しい session を失効させない。

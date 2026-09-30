@@ -1,4 +1,11 @@
-import { pagePrefetchPlan, pageAdmissionRetryDelayMs, pageRequestIsDemandCongestion } from "./command-core.mjs";
+import { pagePrefetchPlan, pageAdmissionRetryDelayMs } from "./command-core.mjs";
+
+// api_raw_prefetch_window uses media_admission_busy_response and
+// media_ipc_error_response. A 503 miv_media_error denotes MediaErrorCode::Busy;
+// permanent media errors have other HTTP statuses. Keep page request policy separate.
+const TRANSIENT_HTTP_ERRORS = new Set([
+  "ipc_timeout", "ipc_busy", "admission_busy", "raw_busy", "miv_media_error",
+]);
 
 // Entries are image positions, not expanded presentation groups. A partner or
 // cover therefore enters only at its own position, regardless of cached bytes.
@@ -73,9 +80,11 @@ export class RawPrefetchWindowPublisher {
           try {
             const response = await this.send(declaration.body, declaration.session, controller.signal);
             if (response.status !== 503) break;
-            const detail = await response.clone().json().catch(() => ({}));
-            if (!pageRequestIsDemandCongestion(response.status, detail.error)) break;
             retryAfterMs = Number(response.headers?.get("Retry-After")) * 1000;
+            // Preserve body-read network failures for the same retry handler as
+            // fetch failures. Invalid JSON is a SyntaxError and remains terminal.
+            const detail = await response.clone().json();
+            if (!TRANSIENT_HTTP_ERRORS.has(detail?.error)) break;
           } catch (error) {
             // fetch reports network failures as TypeError; programming errors,
             // attestation failures and permanent HTTP failures must not retry.
