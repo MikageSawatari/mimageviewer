@@ -1,0 +1,14 @@
+[
+  {
+    "operation": "insert_note",
+    "heading_id": "空間オーディオプラグイン",
+    "note": "mImageViewer の音響調整は左右2チャンネルで処理します。Spatial Mapper の Center Extract、5.1 Upmix、7.1.4 Upmix など、3チャンネル以上のバスを必要とする操作や構成例は使用できません。以下の説明では、ステレオで使用できる設定を選んでください。",
+    "reason": "bridge.rs stereo format; contextualize upstream multichannel examples without implying additional outputs."
+  },
+  {
+    "operation": "insert_note",
+    "heading_id": "crosstalk-cancellation",
+    "note": "以下のマイク測定はデスクトップ版 EffeTune で行います。mImageViewer の EffeTune 画面には測定機能がありません。測定JSONの取り込みは Room EQ の Import ボタンで行い、保存した測定をここで選択します。",
+    "reason": "Measurement UI hidden; shared measurement-store IndexedDB and Room EQ importer."
+  }
+]

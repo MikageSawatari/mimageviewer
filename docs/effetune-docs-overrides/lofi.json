@@ -1,0 +1,22 @@
+[
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**このエフェクトは88.2kHz以上のサンプルレートが必要です** (88.2 / 96 / 176.4 / 192 kHz)。44.1 / 48 kHzでは動作できないためバイパスされ、ドライ信号がそのまま通過し、警告が表示されます。このエフェクトを使うには、アプリのオーディオ設定でサンプルレートを88.2kHz以上にしてください。",
+    "replacement": "**このエフェクトは88.2kHz以上のサンプルレートが必要です** (88.2 / 96 / 176.4 / 192 kHz)。44.1 / 48 kHzでは動作できないためバイパスされ、ドライ信号がそのまま通過し、警告が表示されます。EffeTune 画面のヘッダーにある **Upsampling Factor** を **2×** にすると、44.1 / 48 kHzを88.2 / 96 kHzに上げて処理できます。画面に表示される実効サンプルレートを確認してください。倍率を上げると処理負荷も増えるため、音切れする場合はエフェクトの数や設定を見直してください。mImageViewer の EffeTune 画面には、デスクトップ版のオーディオ設定はありません。",
+    "reason": "vst-bootstrap.js:676-714 exposes upsampling and refreshes host engineSampleRate; base audio configuration remains hidden."
+  },
+  {
+    "operation": "replace_html",
+    "scope_heading_id": "fm-radio-simulator",
+    "anchor": "<li><p><strong>WASM</strong>エンジンを利用できない場合は、HUDに通知が表示され、音声は変わらずそのまま素通しされます。</p></li>",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  },
+  {
+    "operation": "replace_html",
+    "scope_heading_id": "sw-radio-simulator",
+    "anchor": "<li><p><strong>WASM</strong>エンジンを利用できない場合は、HUDに通知が表示され、音声は変わらずそのまま素通しされます。</p></li>",
+    "replacement": "",
+    "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  }
+]

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>音響調整 (EffeTune) — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="EffeTune の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/effetune.html">
+  <meta property="og:title" content="音響調整 (EffeTune)｜mImageViewer">
+  <meta property="og:description" content="EffeTune の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="音響調整 (EffeTune)｜mImageViewer">
+  <meta name="twitter:description" content="EffeTune の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>音響調整 (EffeTune)</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="effetune.html" class="active">音響調整 (EffeTune)</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">音響調整 (EffeTune)</h1>
+    <p class="page-desc">EffeTune は、Frieve-A 氏が開発する音響調整ツールです。MIT License で公開されています。
+    イコライザーやエフェクトで音を整え、ビジュアライザーで音の様子を見ることができます。</p>
+
+    <h2 id="about">EffeTune について</h2>
+    <ul>
+      <li><a href="https://effetune.frieve.com/">EffeTune 公式サイト</a></li>
+      <li><a href="https://github.com/Frieve-A/effetune">EffeTune の GitHub</a></li>
+      <li><a href="https://github.com/Frieve-A/effetune-mixwright">EffeTune Mixwright の GitHub</a>（mImageViewer が使用する EffeTune）</li>
+      <li><a href="https://www.youtube.com/@frieveamusic">作者による使い方の動画があります</a></li>
+    </ul>
+    <p>エフェクトごとの説明は、<a href="effetune/v0.11.1/index.html">同梱 EffeTune の説明書</a>をご覧ください。
+    以下では、mImageViewer から使うときの操作と注意点を説明します。</p>
+
+    <h2 id="open">mImageViewer で開く</h2>
+    <p>メイン画面のツールバーにある<strong>音響調整ボタン</strong>から開きます。
+    もう一度押すか、EffeTune の窓の × を押すと窓を閉じます。窓を閉じても音響調整は続きます。</p>
+    <p>音の加工を止めるときは、EffeTune 画面内の<strong>全体バイパス</strong>を使います。
+    音響調整ボタンにポインターを重ねると、音響調整が効いているかどうかが表示されます。
+    この表示は EffeTune の窓を閉じたときの設定で判定するため、窓を開いたまま変えた内容は、窓を閉じるまで表示に反映されません。</p>
+    <p>音響調整ボタンが使えない場合は、ボタンにポインターを重ねると理由が表示されます。
+    <strong>ポータブル版では音響調整を利用できません。</strong></p>
+
+    <h2 id="scope">調整が適用される音</h2>
+    <p>mImageViewer で再生する動画・音声に適用します。音響調整はステレオ（左右2チャンネル）で処理します。
+    ほかのアプリの再生音を調整するものではありません。</p>
+    <p>複数の窓で同時に再生している場合は、<strong>最後に再生を始めた音だけ</strong>に音響調整が適用されます。
+    一時停止から再開した場合も、その再生が対象になります。ほかの再生音は音響調整を通さずに鳴ります。</p>
+
+    <h2 id="storage">設定の保存先とプリセット</h2>
+    <p>次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。</p>
+    <p>EffeTune 自身が保存するプリセットや設定は、mImageViewer のデータフォルダーとは別に、
+    <code>%APPDATA%\effetune\</code> または <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。
+    取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像などは
+    <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
+    <strong>mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。</strong></p>
+    <p>エフェクトの組み合わせを保存するプリセットは、デスクトップ版 EffeTune と共有されます。
+    mImageViewer のデータフォルダーだけを持ち運んでも、EffeTune 自身の保存データは含まれません。</p>
+
+    <h2 id="remote">リモート配信で使う</h2>
+    <p><a href="remote.html">リモート閲覧</a>で配信する動画・音声にも音響調整を適用します。
+    配信前に音響調整を起動してください。配信を始めてから初めて起動した場合は、次の配信から適用されます。</p>
+    <p>PC 側の EffeTune の窓で変えた設定は、配信中の音にも反映されます。
+    ビジュアライザーにも配信中の音が表示されますが、先読みして処理するため、<strong>端末で聞こえる音より先に進みます。</strong></p>
+
+    <h2 id="external-sites">EffeTune から外部サイトを開く操作</h2>
+    <p>EffeTune のヘルプや GitHub は外部サイトを開きます。「AI に質問」を使うと、入力した質問とエフェクト名を含む URL で
+    ChatGPT または Perplexity を開きます。質問の扱いは、そのサービスの規約・プライバシーポリシーに従います。</p>
+    <p>保存先と通信については、<a href="../privacy.html">プライバシーポリシー</a>もご覧ください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -136,6 +136,7 @@
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
+      <li>音響調整 (EffeTune) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
       <li>サムネイルキャッシュ（動画の場面と音声波形の解析結果を含みます）</li>
       <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面でその場で削除できます。表示中など使用中の本は削除されず、理由が表示されます）</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
@@ -147,9 +148,18 @@
       <li>外部ツールへ渡すために一時的に書き出した画像（本アプリの終了時に削除します）</li>
     </ul>
     <div class="info-box">
-      保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
+      mImageViewer 自身のデータの保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
       またはポータブル版では実行ファイルと同じ場所の <code>data</code> フォルダです。
       アンインストール時に削除できます。
+    </div>
+    <div class="info-box">
+      音響調整 (EffeTune) のプリセット・設定は、別の <code>%APPDATA%\effetune\</code> または
+      <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
+      mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。
+      EffeTune 自身の保存データは mImageViewer のアンインストール時にも残ります。
+      ポータブル版では音響調整を利用できません。
+      次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。
     </div>
     <div class="info-box">
       EPUB の閲覧用変換では、Windows の一時フォルダ内に本アプリ専用の作業場所を作り、
@@ -181,10 +191,15 @@
 
   <section>
     <h2>ネットワーク通信</h2>
-    <p>本アプリが外部と通信するのは、次の場合に限られます。</p>
+    <p>本アプリの通信と、操作によって外部サイトを開く場面は次のとおりです。</p>
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
+      <li><strong>音響調整 (EffeTune) から外部サイトを開く操作</strong>: ヘルプや GitHub は外部サイトを開きます。
+        「AI に質問」を選ぶと、入力した質問とエフェクト名を含む URL で ChatGPT または Perplexity を開きます。
+        質問の扱いは、そのサービスの規約・プライバシーポリシーに従います。
+        共有リンクを作る操作はエフェクトの設定を含む URL をクリップボードにコピーします。
+        リンクを他者へ送ったり開いたりすると、その設定が共有先へ伝わります。</li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
         PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像・動画・音声を送ります。
         複数の音声トラックがある動画では、トラックの番号と表示名の一覧、および選んだトラックの音声が端末へ渡ります。
@@ -199,7 +214,7 @@
     </ul>
     <p>EPUB の変換も通信を増やしません。本の外部サイトへの要求はすべて遮断し、PC 内で PDF に変換します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
-      これらの通信先（GitHub / mikage.to、リモート閲覧を使う場合の Tailscale 等）は、各社のプライバシーポリシーに従って
+      これらの通信先や開いた外部サイト（GitHub / mikage.to / EffeTune 公式サイト / ChatGPT / Perplexity、リモート閲覧を使う場合の Tailscale 等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
       <strong>開発者がそれらの情報を取得・利用することはありません。</strong>
     </p>
@@ -281,6 +296,7 @@
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
+      <li>EffeTune adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
@@ -292,9 +308,16 @@
       <li>Images temporarily exported for external tools (removed when the App exits)</li>
     </ul>
     <div class="info-box">
-      Data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
+      mImageViewer's own data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
       or in a <code>data</code> folder next to the executable (portable edition). It can be
       removed when you uninstall the App.
+    </div>
+    <div class="info-box">
+      EffeTune stores its presets and configuration separately in <code>%APPDATA%\effetune\</code> or
+      <code>%APPDATA%\Frieve\EffeTunePlugin\</code>. Imported IR files, measurements, and visualizer layouts and background images are stored in
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code>, regardless of mImageViewer's data folder. EffeTune's own data remains when
+      mImageViewer is uninstalled. The portable edition does not provide EffeTune.
+      The state that lets the next launch start with the same adjustment is saved in mImageViewer's own data folder.
     </div>
     <div class="info-box">
       When converting an EPUB for reading, the App creates a dedicated work folder inside the
@@ -324,10 +347,15 @@
 
   <section>
     <h2>Network communication</h2>
-    <p>The App connects to the internet only in the following cases:</p>
+    <p>The App's network communication and actions that open external websites are described below:</p>
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
+      <li><strong>Opening websites from EffeTune</strong>: Help and GitHub open external websites.
+        Ask AI opens ChatGPT or Perplexity with your question and the effect name in the URL.
+        The service's terms and privacy policy apply to your question.
+        Creating a share link copies a URL containing the effect settings to the clipboard.
+        Sending or opening the link discloses those settings to the recipient.</li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
         starts listening inside your PC and sends images, video, and audio to a browser on your own phone or
         tablet. For videos with multiple audio tracks, the device receives a list of track numbers and display names,
@@ -341,7 +369,7 @@
     </ul>
     <p>EPUB conversion is not another network case. The App blocks every request the book makes to an external site and converts the book to PDF on your PC. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
-      These endpoints (GitHub / mikage.to, etc.) may record standard access logs (such as IP
+      These endpoints and external websites (GitHub / mikage.to / EffeTune / ChatGPT / Perplexity, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
       use that information.</strong>
     </p>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>mImageViewer｜Windows の高速画像ビューア（ZIP・PDF・動画も一覧）</title>
-  <meta name="description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま閲覧。長い動画はタイル表示で全体を見渡し、見たい場面から再生できます。RAW・HEIC も表示できる Windows 用の無料画像ビューアです。AI 処理はすべて PC 内で完結します。">
+  <meta name="description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま閲覧。長い動画はタイル表示で全体を見渡し、見たい場面から再生できます。RAW・HEIC も表示できる Windows 用の無料画像ビューアです。画像の AI 処理はすべて PC 内で完結します。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/">
 
   <meta property="og:type" content="website">
@@ -34,7 +34,7 @@
     "softwareVersion": "4.2.0",
     "dateModified": "2026-09-29",
     "inLanguage": "ja",
-    "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。AI 処理はすべて利用者の PC 内で完結します。",
+    "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。画像の AI 処理はすべて利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
     "downloadUrl": "https://mikage.to/mimageviewer/#download",
     "softwareHelp": "https://mikage.to/mimageviewer/manual/",
@@ -1200,16 +1200,18 @@
     <h2>安心して使えます</h2>
     <div class="trust-grid">
       <div class="trust-item">
-        <h3>🔒 AI 処理はすべて PC の中で</h3>
+        <h3>🔒 画像の AI 処理は PC の中で</h3>
         <p>AI アップスケール・ノイズ除去・消しゴムの補完・画像タイプの自動判別は、
           <strong>すべてお使いの PC の GPU で実行</strong>されます。AI 処理のために画像を
           外部のサーバーへアップロードすることはありません。</p>
       </div>
       <div class="trust-item">
-        <h3>🌐 通信するのは 3 つの場面だけ</h3>
+        <h3>🌐 通信する場面を説明します</h3>
         <p>①新しいバージョンの有無を確認するとき（<strong>設定でオフにできます</strong>）②AI を高速化する
           追加コンポーネントを、ご自分で選んでダウンロードするとき③外出先から見るリモート閲覧を、
-          ご自分で有効にしたとき。この 3 つ以外に通信しません。</p>
+          ご自分で有効にしたときに通信します。</p>
+        <p style="margin-top:0.5rem;">音響調整 (EffeTune) のヘルプ・GitHub や「AI に質問」は、操作したときに外部サイトを開きます。
+          「AI に質問」では、入力した質問とエフェクト名を ChatGPT または Perplexity に渡します。</p>
         <p style="margin-top:0.5rem;">EPUB の変換も PC の中だけで行い、通信は増えません。</p>
         <p style="margin-top:0.5rem;">リモート閲覧は<strong>初期状態ではオフ</strong>で、接続には
           <strong>PIN が必須</strong>です。外出先との通信は暗号化され、接続状況によっては暗号化されたまま
@@ -1232,6 +1234,11 @@
         <p>設定・動画や音声の再生位置・選んだ音声トラック・サムネイルキャッシュ（動画の場面と音声波形の解析結果を含みます）・タグ・★評価・閲覧履歴・コレクションの名前と登録先・別バージョンを探すための索引は、PC に保存されます。リモート閲覧では端末から届いた動画の再生位置と音声トラックの選択も PC に記録されます。
           アンインストール時にまとめて削除できます。</p>
         <p style="margin-top:0.5rem;">EPUB を変換した PDF も通常は PC 内に保存されます。元の EPUB と同じ場所に PDF を書き出すのは、利用者が PDF ファイルへの保存・変換を選んだときだけです。</p>
+        <p style="margin-top:0.5rem;">音響調整 (EffeTune) のプリセット・設定は、mImageViewer のデータフォルダーとは別に
+          <code>%APPDATA%\effetune\</code> または <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。
+          取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に保存され、mImageViewer のデータフォルダーを変更しても保存先は変わりません。
+          EffeTune 自身の保存データは、mImageViewer のアンインストール時にも残ります。ポータブル版では音響調整を利用できません。
+          詳しくは<a href="manual/effetune.html">音響調整の説明</a>をご覧ください。</p>
         <p style="margin-top:0.5rem;">外部ツールへ渡すために書き出した画像は、Windows の一時フォルダー内の
           本アプリ専用の場所に置き、<strong>終了時に削除します</strong>。</p>
       </div>

@@ -7,7 +7,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>1.0</priority>
   </url>
   <url>
@@ -27,142 +27,237 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/adjustment.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/analysis.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/annotation.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/books.html</loc>
-    <lastmod>2026-09-22</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/changelog.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/collections.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/conceal.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/analyzer.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/basics.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/bus-function.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/control.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/delay.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/dynamics.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/eq.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/index.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/license.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/lofi.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/modulation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/others.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/resonator.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/restoration.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/reverb.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/saturation.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/spatial.html</loc>
+    <lastmod>2026-10-01</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/effetune/v0.11.1/visualizer.html</loc>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/erase.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/export.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/external-tools.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/faq.html</loc>
-    <lastmod>2026-09-28</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/formats.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/fullscreen.html</loc>
-    <lastmod>2026-09-25</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/gamepad.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/getting-started.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/grid.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/index.html</loc>
-    <lastmod>2026-09-22</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/known-issues.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/local-adjustment.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/metadata-transfer.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/music.html</loc>
-    <lastmod>2026-09-25</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/remote.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/search.html</loc>
-    <lastmod>2026-09-26</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/settings.html</loc>
-    <lastmod>2026-09-29</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/shortcuts.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/stack.html</loc>
-    <lastmod>2026-09-24</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tags.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/troubleshooting.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -337,12 +432,12 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tutorial.html</loc>
-    <lastmod>2026-09-21</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/video.html</loc>
-    <lastmod>2026-09-25</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -382,7 +477,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/privacy.html</loc>
-    <lastmod>2026-09-28</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
   </url>
 </urlset>
