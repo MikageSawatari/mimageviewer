@@ -5,6 +5,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::seek_strip_menu::{
+    SEEK_STRIP_MENU_ROW_HEIGHT, SEEK_STRIP_MENU_SEPARATOR_HEIGHT, SEEK_STRIP_MENU_TEXT_LEFT,
+    SEEK_STRIP_MENU_VERTICAL_PADDING, SeekStripMenuLabels,
+    seek_strip_menu_row_rect as native_seek_strip_menu_row_rect,
+};
+
 use serde_json::Value;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, RECT, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::{
@@ -1653,8 +1659,9 @@ fn draw_native_seek_strip_menu(
         return;
     }
 
-    let compact = full_rect.width() < 400.0 || full_rect.height() < 340.0;
-    let tiny = full_rect.width() < 240.0;
+    let labels = SeekStripMenuLabels::for_viewport(full_rect);
+    let compact = labels.compact;
+    let tiny = labels.tiny;
     let view_rows: Vec<(String, bool, NativeOverlayCommand)> = std::iter::once((
         "非表示".to_owned(),
         !view.is_visible(),
@@ -1684,17 +1691,7 @@ fn draw_native_seek_strip_menu(
         .iter()
         .map(|preset| {
             (
-                if tiny {
-                    preset.label().to_owned()
-                } else if compact {
-                    format!("{} {:.0}", preset.label(), height_values.points(*preset))
-                } else {
-                    format!(
-                        "{} ({:.0} px)",
-                        preset.label(),
-                        height_values.points(*preset)
-                    )
-                },
+                labels.preset(preset.label(), height_values.points(*preset)),
                 height == *preset,
                 NativeOverlayCommand::SetSeekStripHeight {
                     height: *preset,
@@ -1707,21 +1704,7 @@ fn draw_native_seek_strip_menu(
         .iter()
         .map(|preset| {
             (
-                if tiny {
-                    preset.label().to_owned()
-                } else if compact {
-                    format!(
-                        "{} {:.0}",
-                        preset.label(),
-                        preview_size_values.points(*preset)
-                    )
-                } else {
-                    format!(
-                        "{} ({:.0} px)",
-                        preset.label(),
-                        preview_size_values.points(*preset)
-                    )
-                },
+                labels.preset(preset.label(), preview_size_values.points(*preset)),
                 preview_size == *preset,
                 NativeOverlayCommand::SetSeekPreviewSize {
                     size: *preset,
@@ -1752,7 +1735,7 @@ fn draw_native_seek_strip_menu(
         SEEK_STRIP_MENU_ROW_HEIGHT
     };
 
-    let label_font = egui::FontId::proportional(if tiny { 10.0 } else { 13.0 });
+    let label_font = labels.font();
     let (view_width, height_width, preview_width) = ctx.fonts_mut(|fonts| {
         let mut width = |label: &str| {
             fonts
@@ -1764,23 +1747,11 @@ fn draw_native_seek_strip_menu(
         for row in &view_rows {
             view_width = view_width.max(width(&row.0));
         }
-        let mut height_width = width(if tiny {
-            "高さ"
-        } else if compact {
-            "列の高さ (px)"
-        } else {
-            "列の高さ"
-        });
+        let mut height_width = width(labels.headings()[0]);
         for row in &height_rows {
             height_width = height_width.max(width(&row.0));
         }
-        let mut preview_width = width(if tiny {
-            "プレビュー"
-        } else if compact {
-            "プレビュー (px)"
-        } else {
-            "シーク位置プレビューの大きさ"
-        });
+        let mut preview_width = width(labels.headings()[1]);
         for row in &preview_rows {
             preview_width = preview_width.max(width(&row.0));
         }
@@ -1923,28 +1894,7 @@ fn draw_native_seek_strip_menu(
                 ],
                 egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
             );
-            for (heading_column, label) in [
-                (
-                    0,
-                    if tiny {
-                        "高さ"
-                    } else if compact {
-                        "列の高さ (px)"
-                    } else {
-                        "列の高さ"
-                    },
-                ),
-                (
-                    1,
-                    if tiny {
-                        "プレビュー"
-                    } else if compact {
-                        "プレビュー (px)"
-                    } else {
-                        "シーク位置プレビューの大きさ"
-                    },
-                ),
-            ] {
+            for (heading_column, label) in labels.headings().into_iter().enumerate() {
                 let column_rect = if heading_column == 0 {
                     egui::Rect::from_min_max(
                         heading_rect.min,
@@ -2212,11 +2162,6 @@ fn audio_track_menu_size(full_rect: egui::Rect, widest: f32, rows: usize) -> (eg
     (size, visible_rows)
 }
 
-const SEEK_STRIP_MENU_ROW_HEIGHT: f32 = 26.0;
-const SEEK_STRIP_MENU_TEXT_LEFT: f32 = 14.0;
-const SEEK_STRIP_MENU_VERTICAL_PADDING: f32 = 6.0;
-const SEEK_STRIP_MENU_SEPARATOR_HEIGHT: f32 = 7.0;
-
 /// メニューはボタンの**上**へ吊るす。下 HUD の中にあるので、下へ開くと画面外に出る。
 fn native_seek_strip_menu_rect(
     full_rect: egui::Rect,
@@ -2230,29 +2175,6 @@ fn native_seek_strip_menu_rect(
     let min_y = full_rect.min.y + margin;
     let y = (button_rect.min.y - 6.0 - size.y).max(min_y);
     egui::Rect::from_min_size(egui::pos2(x, y), size)
-}
-
-fn native_seek_strip_menu_row_rect(
-    menu_rect: egui::Rect,
-    row_index: usize,
-    separator_before: usize,
-    row_height: f32,
-) -> egui::Rect {
-    let separator = if row_index >= separator_before {
-        SEEK_STRIP_MENU_SEPARATOR_HEIGHT
-    } else {
-        0.0
-    };
-    egui::Rect::from_min_size(
-        egui::pos2(
-            menu_rect.min.x + 4.0,
-            menu_rect.min.y
-                + SEEK_STRIP_MENU_VERTICAL_PADDING
-                + separator
-                + row_index as f32 * row_height,
-        ),
-        egui::vec2(menu_rect.width() - 8.0, row_height - 2.0),
-    )
 }
 
 /// メニューが開いているあいだ、その矩形も HUD の当たり判定に含める。

@@ -6316,76 +6316,288 @@ fn draw_still_seek_strip_popup(
     preview_size_values: crate::settings::StillSeekPreviewSizeValues,
 ) -> Option<StillSeekStripMenuChoice> {
     let mut selected = None;
-    let _ = crate::os_theme::dark_menu_popup(response)
+    let popup = crate::os_theme::dark_menu_popup(response)
         // Popup::menu only observes the raw egui Response. Override that command with the
         // bar button's combined mouse/touch logical click so either producer toggles once.
         .open_memory(response.clicked().then_some(egui::SetOpenCommand::Toggle))
         .align(egui::RectAlign::TOP_END)
         .gap(6.0)
+        .frame(crate::os_theme::dark_popup_frame(&response.ctx).inner_margin(0.0))
         .show(|ui| {
             crate::os_theme::apply_dark_ui(ui);
-            let viewport = ui.ctx().content_rect();
-            let tiny = viewport.width() < 240.0;
-            ui.set_min_width(168.0_f32.min((viewport.width() - 16.0).max(120.0)));
+            selected = draw_still_seek_strip_menu(
+                ui,
+                visible,
+                current_height,
+                height_values,
+                current_preview_size,
+                preview_size_values,
+            );
+            if selected.is_some() {
+                ui.close();
+            }
+        });
+    if popup.is_some() {
+        // Let the popup scroll first, then consume even unused wheel input at an edge.
+        response.ctx.input_mut(|input| {
+            input.raw_scroll_delta = egui::Vec2::ZERO;
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+        });
+    }
+    selected
+}
+
+fn draw_still_seek_strip_menu(
+    ui: &mut egui::Ui,
+    visible: bool,
+    current_height: crate::settings::StillSeekStripHeight,
+    height_values: crate::settings::StillSeekStripHeightValues,
+    current_preview_size: crate::settings::StillSeekPreviewSize,
+    preview_size_values: crate::settings::StillSeekPreviewSizeValues,
+) -> Option<StillSeekStripMenuChoice> {
+    use crate::seek_strip_menu::{
+        SEEK_STRIP_MENU_ROW_HEIGHT, SEEK_STRIP_MENU_SEPARATOR_HEIGHT, SEEK_STRIP_MENU_TEXT_LEFT,
+        SEEK_STRIP_MENU_VERTICAL_PADDING, SeekStripMenuLabels, seek_strip_menu_row_rect,
+    };
+
+    let viewport = ui.ctx().content_rect();
+    let labels = SeekStripMenuLabels::for_viewport(viewport);
+    let font = labels.font();
+    let headings = labels.headings();
+    let heights = crate::settings::StillSeekStripHeight::ALL;
+    let previews = crate::settings::StillSeekPreviewSize::ALL;
+    let height_labels =
+        heights.map(|preset| labels.preset(preset.label(), height_values.points(preset)));
+    let preview_labels =
+        previews.map(|preset| labels.preset(preset.label(), preview_size_values.points(preset)));
+    let (height_width, preview_width) = ui.fonts_mut(|fonts| {
+        let mut width = |label: &str| {
+            fonts
+                .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+                .rect
+                .width()
+        };
+        let height_heading_width = width(headings[0]);
+        let preview_heading_width = width(headings[1]);
+        (
+            height_labels
+                .iter()
+                .map(|label| width(label))
+                .fold(height_heading_width, f32::max),
+            preview_labels
+                .iter()
+                .map(|label| width(label))
+                .fold(preview_heading_width, f32::max),
+        )
+    });
+    let left_column_width = height_width + SEEK_STRIP_MENU_TEXT_LEFT + 10.0;
+    let separator_before = if labels.compact { 1 } else { 2 };
+    let preset_start = separator_before + 1;
+    let total_rows = preset_start + heights.len();
+    let row_height = if labels.compact {
+        SEEK_STRIP_MENU_ROW_HEIGHT.min(
+            ((viewport.height()
+                - 16.0
+                - SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
+                - SEEK_STRIP_MENU_SEPARATOR_HEIGHT)
+                / total_rows as f32)
+                .max(18.0),
+        )
+    } else {
+        SEEK_STRIP_MENU_ROW_HEIGHT
+    };
+    let content_height = total_rows as f32 * row_height
+        + SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
+        + SEEK_STRIP_MENU_SEPARATOR_HEIGHT;
+    let menu_height = content_height.min((viewport.height() - 16.0).max(40.0));
+    // Floating bars normally reserve no width in our theme. Reserve their entire gutter
+    // here so the right-hand labels and their hit targets cannot run beneath the bar.
+    let scroll = &mut ui.style_mut().spacing.scroll;
+    scroll.floating_allocated_width = scroll
+        .floating_allocated_width
+        .max(scroll.bar_inner_margin + scroll.bar_width);
+    let bar_width = if content_height > menu_height {
+        scroll.floating_allocated_width
+    } else {
+        0.0
+    };
+    let menu_width =
+        (left_column_width + preview_width + SEEK_STRIP_MENU_TEXT_LEFT + 12.0 + bar_width)
+            .min((viewport.width() - 16.0).max(80.0));
+    ui.set_width(menu_width);
+    let mut selected = None;
+    ui.allocate_ui_with_layout(
+        egui::vec2(menu_width, menu_height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
             egui::ScrollArea::vertical()
-                .max_height((viewport.height() - 32.0).max(60.0))
+                .max_height(menu_height)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for (label, selected_now, choice) in [
-                        (
-                            "非表示".to_owned(),
-                            !visible,
-                            StillSeekStripMenuChoice::Visible(false),
-                        ),
-                        (
-                            "表示".to_owned(),
-                            visible,
-                            StillSeekStripMenuChoice::Visible(true),
-                        ),
-                    ] {
-                        if ui.selectable_label(selected_now, label).clicked() {
-                            selected = Some(choice);
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    for preset in crate::settings::StillSeekStripHeight::ALL {
-                        let points = height_values.points(preset);
-                        let label = if tiny {
-                            format!("高さ: {}", preset.label())
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), content_height),
+                        egui::Sense::hover(),
+                    );
+                    let column_split = left_column_width.min((rect.width() - 8.0) * 0.55);
+                    let text_left = if labels.tiny {
+                        6.0
+                    } else {
+                        SEEK_STRIP_MENU_TEXT_LEFT
+                    };
+                    let mut choice = |ui: &mut egui::Ui,
+                                      item_rect: egui::Rect,
+                                      id,
+                                      label: &str,
+                                      current,
+                                      value| {
+                        let response =
+                            ui.interact(item_rect, ui.id().with(id), egui::Sense::click());
+                        response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::SelectableLabel,
+                                ui.is_enabled(),
+                                current,
+                                label,
+                            )
+                        });
+                        let background = if current {
+                            egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                        } else if response.hovered() || response.has_focus() {
+                            egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
                         } else {
-                            format!("高さ: {} ({points:.0} px)", preset.label())
+                            egui::Color32::TRANSPARENT
                         };
-                        if ui
-                            .selectable_label(current_height == preset, label)
-                            .on_hover_text(format!("高さ: {} ({points:.0} px)", preset.label()))
-                            .clicked()
-                        {
-                            selected = Some(StillSeekStripMenuChoice::Height(preset));
-                            ui.close();
+                        ui.painter().rect_filled(item_rect, 4.0, background);
+                        // Clip columns horizontally and let the scroll viewport own vertical
+                        // clipping, so Japanese glyph ink stays intact in compact rows.
+                        let text_clip = egui::Rect::from_min_max(
+                            egui::pos2(item_rect.min.x + 2.0, ui.clip_rect().min.y),
+                            egui::pos2(item_rect.max.x - 2.0, ui.clip_rect().max.y),
+                        );
+                        ui.painter()
+                            .with_clip_rect(ui.clip_rect().intersect(text_clip))
+                            .text(
+                                egui::pos2(item_rect.min.x + text_left, item_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                font.clone(),
+                                egui::Color32::from_gray(226),
+                            );
+                        if response.clicked() {
+                            selected = Some(value);
                         }
-                    }
-                    ui.separator();
-                    for preset in crate::settings::StillSeekPreviewSize::ALL {
-                        let points = preview_size_values.points(preset);
-                        let label = if tiny {
-                            format!("プレビュー: {}", preset.label())
+                        response
+                    };
+                    for (index, (label, current, value)) in [
+                        ("非表示", !visible, StillSeekStripMenuChoice::Visible(false)),
+                        ("表示", visible, StillSeekStripMenuChoice::Visible(true)),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let row = seek_strip_menu_row_rect(
+                            rect,
+                            if labels.compact { 0 } else { index },
+                            separator_before,
+                            row_height,
+                        );
+                        let item = if labels.compact {
+                            egui::Rect::from_min_size(
+                                row.min + egui::vec2(index as f32 * row.width() * 0.5, 0.0),
+                                egui::vec2(row.width() * 0.5, row.height()),
+                            )
                         } else {
-                            format!("プレビューの大きさ: {} ({points:.0} px)", preset.label())
+                            row
                         };
-                        if ui
-                            .selectable_label(current_preview_size == preset, label)
-                            .on_hover_text(format!(
-                                "プレビューの大きさ: {} ({points:.0} px)",
-                                preset.label()
-                            ))
-                            .clicked()
-                        {
-                            selected = Some(StillSeekStripMenuChoice::PreviewSize(preset));
-                            ui.close();
-                        }
+                        choice(ui, item, ("view", index), label, current, value);
+                    }
+                    let heading = seek_strip_menu_row_rect(
+                        rect,
+                        separator_before,
+                        separator_before,
+                        row_height,
+                    );
+                    let separator_y = heading.min.y - SEEK_STRIP_MENU_SEPARATOR_HEIGHT * 0.5;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(rect.min.x + 8.0, separator_y),
+                            egui::pos2(rect.max.x - 8.0, separator_y),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                    );
+                    for (index, label) in headings.into_iter().enumerate() {
+                        let column = if index == 0 {
+                            egui::Rect::from_min_max(
+                                heading.min,
+                                egui::pos2(heading.min.x + column_split, heading.max.y),
+                            )
+                        } else {
+                            egui::Rect::from_min_max(
+                                egui::pos2(heading.min.x + column_split, heading.min.y),
+                                heading.max,
+                            )
+                        };
+                        let text_clip = egui::Rect::from_min_max(
+                            egui::pos2(column.min.x + 2.0, ui.clip_rect().min.y),
+                            egui::pos2(column.max.x - 2.0, ui.clip_rect().max.y),
+                        );
+                        ui.painter()
+                            .with_clip_rect(ui.clip_rect().intersect(text_clip))
+                            .text(
+                                egui::pos2(column.min.x + text_left, column.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                font.clone(),
+                                egui::Color32::from_gray(180),
+                            );
+                    }
+                    for (index, (height, preview)) in heights.into_iter().zip(previews).enumerate()
+                    {
+                        let row = seek_strip_menu_row_rect(
+                            rect,
+                            preset_start + index,
+                            separator_before,
+                            row_height,
+                        );
+                        let left = egui::Rect::from_min_max(
+                            row.min,
+                            egui::pos2(row.min.x + column_split, row.max.y),
+                        );
+                        let right =
+                            egui::Rect::from_min_max(egui::pos2(left.max.x, row.min.y), row.max);
+                        choice(
+                            ui,
+                            left,
+                            ("height", index),
+                            &height_labels[index],
+                            current_height == height,
+                            StillSeekStripMenuChoice::Height(height),
+                        )
+                        .on_hover_text(format!(
+                            "高さ: {} ({:.0} px)",
+                            height.label(),
+                            height_values.points(height)
+                        ));
+                        choice(
+                            ui,
+                            right,
+                            ("preview", index),
+                            &preview_labels[index],
+                            current_preview_size == preview,
+                            StillSeekStripMenuChoice::PreviewSize(preview),
+                        )
+                        .on_hover_text(format!(
+                            "プレビューの大きさ: {} ({:.0} px)",
+                            preview.label(),
+                            preview_size_values.points(preview)
+                        ));
                     }
                 });
-        });
+        },
+    );
     selected
 }
 
@@ -67844,19 +68056,17 @@ mod tests {
         );
         assert!(fs_still_seek_strip_popup_open(ctx));
         let mut frame = still_seek_edge_frame(app, ctx, full, Vec::new());
-        let tiny = full.width() < 240.0;
-        let label = format!(
-            "{}",
-            if tiny {
-                format!("プレビュー: {}", size.label())
-            } else {
-                format!(
-                    "プレビューの大きさ: {} ({:.0} px)",
-                    size.label(),
-                    app.settings.still_seek_preview_size_values.points(size),
-                )
-            }
+        let label = crate::seek_strip_menu::SeekStripMenuLabels::for_viewport(full).preset(
+            size.label(),
+            app.settings.still_seek_preview_size_values.points(size),
         );
+        let preview_left = still_seek_overlay_text(
+            &frame,
+            crate::seek_strip_menu::SeekStripMenuLabels::for_viewport(full).headings()[1],
+        )
+        .1
+        .pos
+        .x;
         let scroll_pos = still_seek_overlay_text(&frame, "非表示")
             .0
             .clip_rect
@@ -67869,7 +68079,9 @@ mod tests {
                     .shapes
                     .iter()
                     .find_map(|clipped| match &clipped.shape {
-                        egui::Shape::Text(text) if text.galley.text() == label => {
+                        egui::Shape::Text(text)
+                            if text.galley.text() == label && text.pos.x >= preview_left =>
+                        {
                             Some((clipped, text))
                         }
                         _ => None,

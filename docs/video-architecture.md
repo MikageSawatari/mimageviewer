@@ -414,6 +414,10 @@ points を運ぶ。高さと5段階値の正本は overlay が持ち (`NativeBar
 独立した 5 段階から選べる。高さとプレビューの各段階は保存済みの px 値を表示し、プレビュー選択は
 `SetSeekPreviewSize` を `SetSeekStripHeight` と同じ source 世代・strip session 照合経路で App へ返す。
 App は設定を保存し、`NativeBarLockState` で現在の presenter へ新しいプレビュー値を送る。
+§1.277 の実機確認追補では、静止画の popup も動画と同じ表示行 → 高さ / プレビューの 2 列・5 行に揃えた。
+両メニューの段階表記、見出し、行寸法は `src/seek_strip_menu.rs` が所有する。狭い画面では
+共通の短縮表記を使い、非常に低い画面だけスクロールする。静止画の egui ScrollArea は
+floating scrollbar の幅を予約し、右列の文字と操作面への重なりを防ぐ。native の描画・入力経路は維持する。
 要求高さが viewport に収まらない場合は下部 controls、固定上部、strip、残余の固定 gap の順に
 実効量を解き、hover で同時表示される上部 54pt と下部バーの間に strip を収める。正の領域では
 notice と範囲文字も実寸に合わせて連続的に縮小・省略し、strip 本体の clip 内へ収める。0 領域では
