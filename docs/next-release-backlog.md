@@ -2316,7 +2316,31 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   終わった世代の準備完了規則を設ける。§1.251 の設計第 8 版の検討 (docs/audio-track-selection-plan.md §7.3) を参照。
 - 観測: 利用者・エージェントとも実機での観測は無い (コード上の判断)。該当する素材 (長さが大きく異なる A/V) の
   テスト素材は未作成。
+- **§1.310 の修正で逃げ道が 1 つ減った (2026-09-30、利用者判断で許容)**: これまでは準備完了待ちで止まった状態からSpace で 0 秒へ再生し直せた。これは `toggle_play` が demux の入力終端フラグを「再生終了」と取り違えていた副作用で、§1.310 で再生し直しの判定を engine の `Eof` に改めたため、この状態では Space で戻れなくなる (独立レビュー指摘、`tail-audio.mkv` で映像終端後へ seek)。シークバーで手前へ seek し直す・次の項目へ移る経路は残るとコード上は判断 (実行時は未確認)。
+  - 構造の所見 (§1.310 実装担当の調査、2026-09-30): seek 後に「このストリームからはもう出力が来ない」ことを示す経路が無い。映像 EOF は decoder が engine へ知らせずに消費し ([decoder.rs](../src/video/decoder.rs) の video EOF 処理)、target より前のフレームは捨てて最後のフレームを残さない。音声 EOF も drain するだけで完了を知らせない。readiness は `FirstFrameReady` / `BufferReady` だけを待ち、「出し切った」という結果を持たない。直すには seek 世代ごとの lane 結果 (待ち / 出力あり / 出し切り)、最後のフレームの提示、音声の出し切りと残る側の clock 選択、`Buffering` から `Eof` への解決、キューが詰まっても出し切りを確定できる進行保証が要り、demux・decoder・audio pump・presentation・pacing の所有をまたぐ。短い尻尾だけを先に直す部分修正も可能だが、長い尻尾は残る。利用者判断で v4.3.0 では行わず、次の版以降でまとめて設計する。
 - 規模 / 優先度: Medium-Large / P3。
+
+### 1.310 動画末尾付近の一時停止から再開すると先頭へ戻る — 修正済み (2026-09-30)
+
+- 観測者: **利用者 (user)**。v430-integration build、F12 別ウィンドウで
+  `C:\home\mimageviewer\testdata\audio-tracks\multi.mkv` (6 秒) を繰り返し pause / resume。
+  pause 中の音声トラック切り替えに依存せず、時々 0 秒から再生し直される。
+  v4.1.0 / v4.2.0 にも同条件があり、今回の退行ではない。
+- 利用者セッションの `%APPDATA%\mimageviewer\logs\mimageviewer.log` / `perf_events.jsonl`:
+  pause PTS 2.9 (154.569 s) → resume 時 UI thread が `seek_override_set target=0.0` (154.965 s)。
+  pause PTS 3.8 (161.215 s) → resume 時 seek 0 (161.633 s)。それ以前の PTS 2.4 は正常再開。
+  これらは利用者による実機観測であり、修正後の agent 実機検証ではない。
+- 原因 (コード確認): demux が入力を先読みし終えた flag と、出力の drain 後の engine `Eof` を
+  `toggle_play` が同一視。`!clock.is_playing() && clock.is_eof_reached()` は、入力終端後に pause
+  しただけでも成立し、誤って replay seek 0 を発行していた。`set_playing(true)` の replay 強制
+  dispatch も同じ誤判定で、DSP 再取得を Exact(0) に向け得た。
+- **修正済み**: 両 replay 判定は既存 `is_at_eof()` (engine published EOF) へ統一。
+  clock の入力終端は `demux_exhausted` / `is_demux_exhausted()` へ改名し、正当な drain、ready、
+  quiet、seek 終端回収の意味は維持。真の末尾からの replay、loop、次 item、音声モードの終端、
+  decoder 再生成なしの EOF 後 seek を保持。detached 固有経路の変更なし。
+- 回帰検証: 6 秒 stream の入力終端→2.9 / 3.8 秒で pause→resume (両 player command、映像 / 音声)、
+  実 `multi.mkv` demux 先読み、真の EOF からの replay 1 回、DSP 再取得位置を自動テストに追加。
+  製品起動 / UI smoke は行わず、修正後の利用者実機確認は未実施。
 
 ### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27)
 

@@ -401,14 +401,14 @@ pub struct VideoPlayer {
     /// シーク完了 (override が 1 度クリア) で None に戻す。
     seek_inflight_since: Option<std::time::Instant>,
     /// 「seek が EOF に達したまま完了しない」状態を最初に観測した壁時計時刻。
-    /// `is_seeking() && is_eof_reached()` が継続して true の間だけ `Some`。
+    /// `is_seeking() && is_demux_exhausted()` が継続して true の間だけ `Some`。
     /// `info.duration_secs` (コンテナ尺) が最終フレーム PTS より後ろのことが多く、
     /// その付近を target にした seek は backward seek 自体は成功する (= seek 失敗
     /// 経路の override clear が走らない) のに、video decoder が target 以降の
     /// フレームを 1 枚も返せず post-seek frame / 音声による override clear 経路も
     /// 発火しない。結果 `seek_target_override` が固着して「シーク中...」が出続ける。
     /// この時刻から一定時間 (`SEEK_STUCK_EOF_TIMEOUT`) 経過しても解除されなければ、
-    /// tick 側の保険として override を強制クリアする。`is_eof_reached()` は demux が
+    /// tick 側の保険として override を強制クリアする。`is_demux_exhausted()` は demux が
     /// ファイル全体を読み切ったときだけ true (request_seek で一旦クリア) なので、
     /// 進行中の通常 seek を誤検出しない。
     /// (詳細は [docs/video-architecture.md] の seek HUD 節を参照。)
@@ -8697,8 +8697,8 @@ impl VideoPlayer {
     }
 
     #[cfg(all(test, windows))]
-    pub(crate) fn notify_eof_for_test(&self) {
-        self.clock.notify_eof_reached();
+    pub(crate) fn notify_demux_exhausted_for_test(&self) {
+        self.clock.notify_demux_exhausted();
     }
 
     #[cfg(all(test, windows))]
@@ -9852,14 +9852,11 @@ impl VideoPlayer {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         //
-        // **EOF 判定** (2026-05-18 update): EofReached は engine に同期配線され、EOF 到達時に
-        // engine.state=Eof + AvClock playing=false + is_eof_reached=true が atomic に確定する。
-        // 「`!is_playing() && is_eof_reached()`」は engine_state==Eof と等価で、EOF 検出条件
-        // として有効。`apply_command(Play)` の Eof arm 経由でも replay できる
-        // (= `set_playing(true)` 経路) が、user の Space 入力は user seek 経路で
-        // epoch 競合なく扱いたいので、ここでは明示的に `request_seek(0)` + `handle_seek_request(0)`
-        // + `apply_command(Play)` を発行する。
-        if !self.clock.is_playing() && self.clock.is_eof_reached() {
+        // demux の先読み完了は再生終了ではない。pause で clock が停止していても
+        // 出力待ちの packet / frame / audio が残るため、再生終了の唯一の owner である
+        // engine の published Eof を使う。drain 後に tick が Eof を確定する。
+        // user の Space 入力は明示的な seek 経路で epoch を一度だけ進める。
+        if self.is_at_eof() {
             #[cfg(windows)]
             if self.begin_dsp_acquisition(LocalDspPosition::Exact(0.0)) {
                 return;
@@ -9941,7 +9938,7 @@ impl VideoPlayer {
         // play ボタンを押したときは replay (= 0 から再生) を期待する。EOF + p=true は
         // 強制 dispatch することで `handle_play` の Eof arm (= `handle_seek_request(0)` +
         // autoplay 強制) を発火させ replay する。
-        let force_dispatch = p && self.clock.is_eof_reached();
+        let force_dispatch = p && self.is_at_eof();
         #[cfg(windows)]
         if force_dispatch && self.begin_dsp_acquisition(LocalDspPosition::Exact(0.0)) {
             return;
@@ -10384,7 +10381,7 @@ impl VideoPlayer {
             self.request_user_seek(target);
             return RelativeSeekOutcome::Seeked;
         };
-        // 境界に達したときの pending / override クリアは **`is_eof_reached()` のときだけ**
+        // 境界に達したときの pending / override クリアは **`is_demux_exhausted()` のときだけ**
         // 行う (Codex P1 反映)。
         //
         // 末尾付近を target にした seek は decoder が target 以降のフレームを返せず、
@@ -10396,14 +10393,14 @@ impl VideoPlayer {
         // ここで無条件にクリアすると、その正当な in-flight seek の override と、
         // まだ発行されていない pending seek を巻き込んで潰してしまう。
         //
-        // `is_eof_reached()` は demux がファイル全体を読み切ったときだけ true になり、
+        // `is_demux_exhausted()` は demux がファイル全体を読み切ったときだけ true になり、
         // 「override がもう post-seek フレームを得られない = 固着」状態と一致する。
         // false のときは進行中 / pending の seek は正当なので touch しない —
         // 通常の override 解除経路、または tick 側の保険 (`seek_eof_stuck_since`,
         // 1200ms) に回収を任せる。
         // `current_seek_serial()` を completed_serial に渡すことで、直近のシーク
         // 世代の override だけを CAS で外す (新しいシークが割り込んでいたら何もしない)。
-        if self.clock.is_eof_reached() {
+        if self.clock.is_demux_exhausted() {
             self.clear_pending_user_seek();
             self.clock
                 .mark_seek_interrupted(self.clock.current_seek_serial());
@@ -11676,9 +11673,9 @@ impl VideoPlayer {
         //
         // `seek_relative` の境界判定でも回収するが、それは「次にもう一度 ←→ を
         // 押す」操作が前提。ここでは tick 側の最終保険として、`is_seeking()` のまま
-        // `is_eof_reached()` (= demux がファイル全体を読み切った) が継続して true で
+        // `is_demux_exhausted()` (= demux がファイル全体を読み切った) が継続して true で
         // ある状態が `SEEK_STUCK_EOF_TIMEOUT` 続いたら override を強制クリアする。
-        // - `is_eof_reached()` は `request_seek` で一旦クリアされ、demux が末尾まで
+        // - `is_demux_exhausted()` は `request_seek` で一旦クリアされ、demux が末尾まで
         //   読み切ったときだけ true になるので、進行中の通常 seek を誤検出しない。
         // - 通常の near-end seek は post-seek フレームが presenter / tick に届いた
         //   時点で override が clear され `is_seeking()` が false になるため、この
@@ -11686,7 +11683,7 @@ impl VideoPlayer {
         // override をクリアするだけに留め、playing / 位置の更新は後段の既存 EOF
         // 処理 (native: ループ block / 非 native: line 末尾の EOF block) に任せる。
         const SEEK_STUCK_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1200);
-        if self.clock.is_seeking() && self.clock.is_eof_reached() {
+        if self.clock.is_seeking() && self.clock.is_demux_exhausted() {
             let stuck_since = *self
                 .seek_eof_stuck_since
                 .get_or_insert_with(std::time::Instant::now);
@@ -11726,7 +11723,7 @@ impl VideoPlayer {
 
         #[cfg(windows)]
         if self.native_output.is_some() {
-            // EOF 処理: native presenter 経路でも `clock.is_eof_reached()` を見て、
+            // EOF 処理: native presenter 経路でも `clock.is_demux_exhausted()` を見て、
             // ループ ON ならループ seek、ループ OFF なら duration 位置で停止する。
             // native 経路はこの直後の early return で抜けるため非 native 経路の EOF
             // block (`set_position_at_eof` + `set_playing(false)`) には到達しない。
@@ -11734,7 +11731,7 @@ impl VideoPlayer {
             // duration を超えて進み続ける (= ユーザー報告 2026-05「動画末尾を超えて
             // 再生が進む」)。
             // ★末尾の音声 drain と最終フレーム表示を待つ★ (Codex P1 第10ラウンド +
-            // 第11ラウンド — demux EOF 時点で `is_eof_reached` が立つが、その直後に
+            // 第11ラウンド — demux EOF 時点で `is_demux_exhausted` が立つが、その直後に
             // audio worker が残フレームを drain しており、また pump 内には raw_pending /
             // processed / tx_queued の各 buffer が残っている。ここで即 seek すると
             // 末尾 ~10-100ms の音声 / 最終フレームが失われる)。
@@ -11765,7 +11762,7 @@ impl VideoPlayer {
             // `loop_enabled` は **発火条件には含めない** (ループ ON/OFF どちらでも EOF
             // drain 完了を待つ)。発火後のアクションだけ loop_enabled で分岐する。
             let loop_enabled = self.loop_enabled.load(std::sync::atomic::Ordering::Acquire);
-            let quiet_now = self.clock.is_eof_reached()
+            let quiet_now = self.clock.is_demux_exhausted()
                 && !self.clock.is_seeking()
                 && self.is_playing()
                 && channels_drained
@@ -11834,7 +11831,10 @@ impl VideoPlayer {
                     &mut next_semantic_wake,
                     Some(EOF_DRAIN_QUIET_DURATION.saturating_sub(elapsed)),
                 );
-            } else if self.clock.is_eof_reached() && !self.clock.is_seeking() && self.is_playing() {
+            } else if self.clock.is_demux_exhausted()
+                && !self.clock.is_seeking()
+                && self.is_playing()
+            {
                 merge_next_wake(
                     &mut next_semantic_wake,
                     eof_drain_observed_deadline(
@@ -11912,7 +11912,7 @@ impl VideoPlayer {
 
         // Step 1: video_rx を future_frames に drain (上限まで)
         // EOF 後は decoder が wait ループに入るため channel は disconnect しない。
-        // EOF 検出は clock.is_eof_reached() で行う (= decoder thread alive のまま
+        // EOF 検出は clock.is_demux_exhausted() で行う (= decoder thread alive のまま
         // post-EOF seek が可能)。
         while self.future_frames.len() < MAX_RENDER_QUEUE {
             match self.decode.video_rx.try_recv() {
@@ -11960,7 +11960,7 @@ impl VideoPlayer {
             break;
         }
 
-        // EOF 処理: clock.is_eof_reached() (= decoder が EOF wait に入った)
+        // EOF 処理: clock.is_demux_exhausted() (= decoder が EOF wait に入った)
         // + queue 空 + 今 tick 表示なし + 進行中の seek なし → 本当に最後と判定。
         // 「seek 進行中」は seek_target_override が立っている時。
         //
@@ -11981,7 +11981,7 @@ impl VideoPlayer {
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.audio_rx_len() == 0);
         let seek_in_flight = self.clock.is_seeking();
-        let eof_ready_now = self.clock.is_eof_reached()
+        let eof_ready_now = self.clock.is_demux_exhausted()
             && self.future_frames.is_empty()
             && latest_renderable.is_none()
             && !seek_in_flight
@@ -12357,7 +12357,7 @@ impl VideoPlayer {
     }
 
     /// EngineActor の published state が terminal EOF なら true。
-    /// AvClock の eof_reached は互換複製なので、resume ownership 判定ではこちらを使う。
+    /// demux の先読み完了とは異なり、出力の drain 後に再生が終了した状態。
     pub fn is_at_eof(&self) -> bool {
         self.engine_state_code() == engine::actor::state_code::EOF
     }
@@ -12538,6 +12538,175 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    // Deterministic six-second stream: the decoder has read ahead while output
+    // remains at 2.9/3.8 seconds. No native HWND or audio device is created.
+    fn short_stream_before_end(position: f64, audio_only: bool) -> super::VideoPlayer {
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("short-eof.mkv"),
+        );
+        let info = player.info.as_mut().unwrap();
+        info.duration_secs = 6.0;
+        info.has_video = !audio_only;
+        #[cfg(windows)]
+        if audio_only {
+            player.native_output = None;
+        }
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.begin_loading();
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 6.0,
+                has_audio: true,
+                has_video: !audio_only,
+            });
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 0,
+                pts: position,
+                wall_now: std::time::Instant::now(),
+            });
+            if !audio_only {
+                actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                    epoch: 0,
+                    pts: position,
+                });
+            }
+            actor.apply_command(super::engine::actor::TransportCommand::Play);
+        }
+        player.clock.set_audio_pts_jump(position);
+        player.clock.notify_demux_exhausted();
+        player
+    }
+
+    fn assert_resume_without_seek(player: &super::VideoPlayer, paused_position: f64) {
+        assert!(!player.is_at_eof());
+        assert!(player.is_playing());
+        assert!(player.clock.is_demux_exhausted());
+        assert_eq!(player.current_seek_serial(), 0);
+        assert!(player.clock.take_seek_request().is_none());
+        assert!((player.position() - paused_position).abs() < 0.1);
+    }
+
+    #[test]
+    fn toggle_play_after_demux_exhausted_resumes_before_end_without_seek() {
+        for audio_only in [false, true] {
+            for position in [2.4, 2.9, 3.8] {
+                let player = short_stream_before_end(position, audio_only);
+                player.toggle_play();
+                assert!(!player.is_playing());
+                assert!(!player.is_at_eof());
+                let paused = player.position();
+                player.toggle_play();
+                assert_resume_without_seek(&player, paused);
+            }
+        }
+    }
+
+    #[test]
+    fn set_playing_after_demux_exhausted_resumes_before_end_without_seek() {
+        for audio_only in [false, true] {
+            for position in [2.9, 3.8] {
+                let player = short_stream_before_end(position, audio_only);
+                player.set_playing(false);
+                let paused = player.position();
+                player.set_playing(true);
+                assert_resume_without_seek(&player, paused);
+                player.set_playing(true); // Idempotent while output still drains.
+                assert_resume_without_seek(&player, paused);
+            }
+        }
+    }
+
+    #[test]
+    fn play_after_true_eof_replays_once_through_both_player_commands() {
+        for audio_only in [false, true] {
+            for toggle in [false, true] {
+                let player = short_stream_before_end(3.8, audio_only);
+                player.mark_eof_for_test(6.0);
+                assert!(player.is_at_eof());
+                assert!(!player.is_playing());
+                assert!(player.intent_playing(), "EOF retains autoplay intent");
+                assert!((player.position() - 6.0).abs() < 1e-9);
+                if toggle {
+                    player.toggle_play();
+                } else {
+                    player.set_playing(true);
+                }
+                assert!(!player.is_at_eof());
+                assert_eq!(player.current_seek_serial(), 1);
+                assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 0.0);
+                assert!(!player.clock.is_demux_exhausted());
+                assert!(player.intent_playing());
+                assert_eq!(
+                    player.engine_state_code(),
+                    super::engine::actor::state_code::SEEKING
+                );
+                assert_eq!(player.position(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn play_after_true_eof_does_not_depend_on_demux_flag() {
+        for toggle in [false, true] {
+            let player = short_stream_before_end(3.8, false);
+            player.clock.clear_demux_exhausted();
+            player.mark_eof_for_test(6.0);
+            assert!(player.is_at_eof());
+            if toggle {
+                player.toggle_play();
+            } else {
+                player.set_playing(true);
+            }
+            assert_eq!(player.current_seek_serial(), 1);
+            assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 0.0);
+            assert!(player.intent_playing());
+        }
+    }
+
+    #[test]
+    fn real_short_stream_demux_exhausted_pause_resume_keeps_output_position() {
+        let player = selection_player_with_demux_at_eof();
+        for position in [2.9, 3.8] {
+            player.clock.set_audio_pts_jump(position);
+            player.toggle_play();
+            let paused = player.position();
+            player.toggle_play();
+            assert_resume_without_seek(&player, paused);
+            player.set_playing(false);
+            let paused = player.position();
+            player.set_playing(true);
+            assert_resume_without_seek(&player, paused);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_playing_dsp_after_demux_exhausted_acquires_at_paused_position() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+        let mut player = short_stream_before_end(3.8, false);
+        player.set_playing(false);
+        let paused = player.position();
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            true,
+        ));
+        player.set_playing(true);
+        let acquisition = player.dsp_handoff.lock().unwrap();
+        let super::LocalDspAcquisition::Waiting(pending) = &*acquisition else {
+            panic!("expected DSP acquisition");
+        };
+        assert!((pending.requested_position.resolve(0.0) - paused).abs() < 1e-9);
+        assert!((player.position() - paused).abs() < 1e-9);
+        assert_eq!(player.current_seek_serial(), 0);
+    }
+
     fn selection_player(playing: bool) -> super::VideoPlayer {
         use super::engine::state::{AudioEvent, DecoderEvent};
         let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
@@ -12679,7 +12848,7 @@ mod tests {
             .clock
             .set_audio_pts_jump(player.info.as_ref().unwrap().duration_secs);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !player.clock.is_eof_reached() && std::time::Instant::now() < deadline {
+        while !player.clock.is_demux_exhausted() && std::time::Instant::now() < deadline {
             let _ = player
                 .decode
                 .video_rx
@@ -12687,7 +12856,7 @@ mod tests {
             while player.decode.audio_rx.try_recv().is_ok() {}
         }
         assert!(
-            player.clock.is_eof_reached(),
+            player.clock.is_demux_exhausted(),
             "real demux did not reach EOF"
         );
         assert_eq!(
@@ -12893,7 +13062,7 @@ mod tests {
         player.set_last_displayed_pts_for_test(5.0);
         player.seek(29.9);
         let serial = player.clock.current_seek_serial();
-        player.clock.notify_eof_reached();
+        player.clock.notify_demux_exhausted();
         assert_eq!(player.seek_relative(1.0), RelativeSeekOutcome::AtEnd);
         assert!(player.clock.seek_was_interrupted(serial));
         assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
@@ -12910,7 +13079,7 @@ mod tests {
         player.set_last_displayed_pts_for_test(5.0);
         player.seek(29.9);
         let serial = player.clock.current_seek_serial();
-        player.clock.notify_eof_reached();
+        player.clock.notify_demux_exhausted();
         player.seek_eof_stuck_since =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         player.tick(&egui::Context::default());
@@ -13050,7 +13219,7 @@ mod tests {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player(true);
         player.set_last_displayed_pts_for_test(5.0);
-        player.clock.notify_eof_reached();
+        player.clock.notify_demux_exhausted();
         assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
         assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
         assert_eq!(
@@ -13060,7 +13229,7 @@ mod tests {
 
         let player = selection_player(false);
         player.set_last_displayed_pts_for_test(5.0);
-        player.clock.notify_eof_reached();
+        player.clock.notify_demux_exhausted();
         assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
         assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
 
@@ -13107,7 +13276,7 @@ mod tests {
     fn audio_select_after_demux_eof_switches_real_pcm_at_playback_start() {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player_with_demux_at_eof();
-        assert!(player.clock.is_eof_reached());
+        assert!(player.clock.is_demux_exhausted());
         assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
         assert_eq!(
             player.audio_track_display_state(),
@@ -13258,7 +13427,7 @@ mod tests {
             saw_playing,
             "selection stayed in Seeking/Buffering: readiness={:?} eof={} seeking={} now={:.3} displayed={:?} seq={} future={:?} raw={:.3} processed={:.3} video_rx={} audio_rx={} selection={:?}",
             player.engine.lock().unwrap().readiness_snapshot(),
-            player.clock.is_eof_reached(),
+            player.clock.is_demux_exhausted(),
             player.clock.is_seeking(),
             player.clock.now_secs(),
             player.last_displayed_pts_secs(),
@@ -15156,7 +15325,7 @@ mod tests {
             super::VideoPlayer::disconnected_for_test(std::path::PathBuf::from("stuck.mp4"), 29.0);
         player.configure_native_timing_for_test(29.0, 30.0, true, false);
         player.seek(29.9);
-        player.notify_eof_for_test();
+        player.notify_demux_exhausted_for_test();
 
         let due = player.tick(&egui::Context::default()).unwrap();
         assert!(due > std::time::Duration::from_millis(1190), "due={due:?}");
@@ -15186,7 +15355,7 @@ mod tests {
             super::VideoPlayer::disconnected_for_test(std::path::PathBuf::from("eof.mp4"), 30.0);
         player.configure_native_timing_for_test(30.0, 30.0, true, false);
         player.set_loop_enabled(true);
-        player.notify_eof_for_test();
+        player.notify_demux_exhausted_for_test();
 
         let first_due = player.tick(&egui::Context::default()).unwrap();
         assert!(first_due > std::time::Duration::from_millis(47));
@@ -15208,7 +15377,7 @@ mod tests {
         player.configure_native_timing_for_test(30.0, 30.0, true, false);
         player.set_playback_speed(0.5);
         player.set_audio_processed_secs_for_test(0.5);
-        player.notify_eof_for_test();
+        player.notify_demux_exhausted_for_test();
 
         let due = player.tick(&egui::Context::default()).unwrap();
         assert!(due > std::time::Duration::from_millis(490));

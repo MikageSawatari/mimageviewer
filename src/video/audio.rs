@@ -2567,10 +2567,12 @@ fn run_pump(
         // 音声実長が閾値未満のファイル (0.1 秒未満の SFX 等 / 極短音声トラックの動画) は
         // processed がこの閾値に永久に届かず、BufferReady が一度も emit されないまま
         // Buffering 固着する (再生開始不能)。demux がファイル全体を読み切っている
-        // (`is_eof_reached`) ならこれ以上 processed が増える見込みは無いので、残量に
+        // (`is_demux_exhausted`) ならこれ以上 processed が増える見込みは無いので、残量に
         // 関わらず readiness を通知する (review-v2.3.0 P2-6)。post-seek で末尾間際に
         // 到達した場合も同様 (残り実データが閾値未満でも開始してよい)。
-        if !pending_at_head && (processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached()) {
+        if !pending_at_head
+            && (processed_secs >= READY_THRESHOLD_SECS || clock.is_demux_exhausted())
+        {
             // T15 (Codex R-VENG-001): BufferReady を **engine が待っている state でのみ** 送る。
             // 旧コードは Playing 中も pump loop ごと (audio frame rate ≈ 100-200Hz) に
             // BufferReady を try_send していた。engine 側はそれを epoch < current 早期 return
@@ -4152,8 +4154,8 @@ mod tests {
         assert_eq!(clock.audio_tx_queued_secs(), 0.0);
         assert!(!clock.is_audio_active());
         actor.handle_audio_event(AudioEvent::AudioInactive);
-        clock.notify_eof_reached();
-        let quiet = clock.is_eof_reached()
+        clock.notify_demux_exhausted();
+        let quiet = clock.is_demux_exhausted()
             && clock.audio_processed_secs() < 0.020
             && clock.audio_raw_pending_secs() < 0.020
             && clock.audio_tx_queued_secs() < 0.020;
@@ -4264,7 +4266,7 @@ mod tests {
                 .stream_index,
             2
         );
-        clock.notify_eof_reached();
+        clock.notify_demux_exhausted();
         assert!(
             event_rx
                 .recv_timeout(std::time::Duration::from_millis(100))
