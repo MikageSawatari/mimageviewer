@@ -3798,7 +3798,7 @@ fn run_decoder(
             // EOF 確定。スレッドは終わらせず、cancel か新しい seek 要求が来るまで
             // idle ループで待つ。これで末尾停止後の re-seek / replay が
             // decoder 再生成なしで動作する。
-            clock.notify_eof_reached();
+            clock.notify_demux_exhausted();
             engine_event_tx.wake_ui();
             // Phase A: audio decode thread にも Eof を通知して残フレームを drain させる。
             // (= 末尾の音声を確実に出し切る。drain しないと数十 ms の音声が抜ける。)
@@ -3864,7 +3864,7 @@ fn run_decoder(
                     }
                 }
                 if clock.peek_seek_request_pending() {
-                    clock.clear_eof_reached();
+                    clock.clear_demux_exhausted();
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));

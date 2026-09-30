@@ -16,12 +16,15 @@
 //!
 //! Phase 2b 以降、`AvClock` は実装の大半を `engine::clock::MasterClock` (anchor 部分)
 //! および `engine::audio_bookkeeping::AudioBookkeeping` (バッファ会計) に委譲した
-//! **薄い facade**。残りの状態は所有関係が 2 種類に分かれている:
+//! **薄い facade**。残りの状態は以下の所有関係に分かれている:
 //!
 //! - **EngineActor と並列管理されている互換複製** (`playing` / `audio_active` /
-//!   `eof_reached` / `seek_request` / `seek_serial` / `seek_target_override`):
+//!   `seek_request` / `seek_serial` / `seek_target_override`):
 //!   `EngineActor` の `published_state` (`Arc<AtomicU8>`) + 内部 epoch が source of
 //!   truth。新規コードはこれらを `EngineActor` 経由で読むこと。
+//! - **demux 入力の終端** (`demux_exhausted`): demux が先読みを終えた状態。
+//!   packet / frame / audio の出力はまだ残り得る。再生終了の判定には使わず、
+//!   EngineActor の published `Eof` を読む。seek 要求でクリアする。
 //! - **AvClock 単独で source of truth を保持しているレガシー所有状態** (`volume` /
 //!   `muted`): `TransportCommand::SetVolume / SetMuted` は `EngineActor` 側では
 //!   no-op で、`audio.rs` が `clock.output_volume()` / `clock.pre_limiter_gain()` を
@@ -177,9 +180,9 @@ pub struct AvClock {
     /// 測定前の音量ノーマライズなど、再生開始前に audio-pump の処理済み先読みを一時停止する。
     /// true の間は audio-pump が raw→processed 変換を止め、解除後に現行 gain で preroll する。
     audio_preroll_suspended: AtomicBool,
-    /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
-    /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
-    eof_reached: AtomicBool,
+    /// demux が入力を読み切ったか。出力の drain 完了 / 再生終了とは異なる。
+    /// `notify_demux_exhausted` で立て、`request_seek` / `clear_demux_exhausted` で降ろす。
+    demux_exhausted: AtomicBool,
     /// 動画 decode thread が致命的なエラー (例: HW decode 初期化失敗、connect-stuck)
     /// で exit したか。`set_decode_failed(true)` で立てる。UI 側は `decode_failed()` を
     /// polling して「準備中…」表示の代わりに「再生に失敗しました」を出すなど
@@ -304,7 +307,7 @@ impl AvClock {
             audio_active: AtomicBool::new(false),
             audio_lane_lost: AtomicBool::new(false),
             audio_preroll_suspended: AtomicBool::new(false),
-            eof_reached: AtomicBool::new(false),
+            demux_exhausted: AtomicBool::new(false),
             decode_failed: AtomicBool::new(false),
             volume_bits: AtomicU64::new(
                 crate::settings::clamp_video_volume(initial_volume).to_bits(),
@@ -768,7 +771,7 @@ impl AvClock {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
-        self.eof_reached.store(false, Ordering::Release);
+        self.demux_exhausted.store(false, Ordering::Release);
         let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
         self.seek_override_serial
             .store(new_serial, Ordering::Release);
@@ -809,7 +812,7 @@ impl AvClock {
         let seek_start = seek_start_secs.max(0.0);
         let base = base_secs.max(0.0);
         let direction = direction.signum();
-        self.eof_reached.store(false, Ordering::Release);
+        self.demux_exhausted.store(false, Ordering::Release);
         let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
         self.seek_override_serial
             .store(new_serial, Ordering::Release);
@@ -847,14 +850,16 @@ impl AvClock {
         self.seek_target_override_bits.load(Ordering::Acquire) != SEEK_NONE
     }
 
-    pub fn notify_eof_reached(&self) {
-        self.eof_reached.store(true, Ordering::Release);
+    /// demux の先読み完了を通知する。再生 state / clock は停止しない。
+    pub fn notify_demux_exhausted(&self) {
+        self.demux_exhausted.store(true, Ordering::Release);
     }
-    pub fn clear_eof_reached(&self) {
-        self.eof_reached.store(false, Ordering::Release);
+    pub fn clear_demux_exhausted(&self) {
+        self.demux_exhausted.store(false, Ordering::Release);
     }
-    pub fn is_eof_reached(&self) -> bool {
-        self.eof_reached.load(Ordering::Acquire)
+    /// 入力終端。再生終了は EngineActor の published Eof が所有する。
+    pub fn is_demux_exhausted(&self) -> bool {
+        self.demux_exhausted.load(Ordering::Acquire)
     }
     /// video decode thread が致命的なエラーで exit したことを通知する。
     /// `set_decode_failed(true)` 後、`VideoPlayer::tick()` が `decode_failed()` を

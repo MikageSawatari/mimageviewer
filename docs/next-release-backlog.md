@@ -2186,6 +2186,28 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   テスト素材は未作成。
 - 規模 / 優先度: Medium-Large / P3。
 
+### 1.310 動画末尾付近の一時停止から再開すると先頭へ戻る — 修正済み (2026-09-30)
+
+- 観測者: **利用者 (user)**。v430-integration build、F12 別ウィンドウで
+  `C:\home\mimageviewer\testdata\audio-tracks\multi.mkv` (6 秒) を繰り返し pause / resume。
+  pause 中の音声トラック切り替えに依存せず、時々 0 秒から再生し直される。
+  v4.1.0 / v4.2.0 にも同条件があり、今回の退行ではない。
+- 利用者セッションの `%APPDATA%\mimageviewer\logs\mimageviewer.log` / `perf_events.jsonl`:
+  pause PTS 2.9 (154.569 s) → resume 時 UI thread が `seek_override_set target=0.0` (154.965 s)。
+  pause PTS 3.8 (161.215 s) → resume 時 seek 0 (161.633 s)。それ以前の PTS 2.4 は正常再開。
+  これらは利用者による実機観測であり、修正後の agent 実機検証ではない。
+- 原因 (コード確認): demux が入力を先読みし終えた flag と、出力の drain 後の engine `Eof` を
+  `toggle_play` が同一視。`!clock.is_playing() && clock.is_eof_reached()` は、入力終端後に pause
+  しただけでも成立し、誤って replay seek 0 を発行していた。`set_playing(true)` の replay 強制
+  dispatch も同じ誤判定で、DSP 再取得を Exact(0) に向け得た。
+- **修正済み**: 両 replay 判定は既存 `is_at_eof()` (engine published EOF) へ統一。
+  clock の入力終端は `demux_exhausted` / `is_demux_exhausted()` へ改名し、正当な drain、ready、
+  quiet、seek 終端回収の意味は維持。真の末尾からの replay、loop、次 item、音声モードの終端、
+  decoder 再生成なしの EOF 後 seek を保持。detached 固有経路の変更なし。
+- 回帰検証: 6 秒 stream の入力終端→2.9 / 3.8 秒で pause→resume (両 player command、映像 / 音声)、
+  実 `multi.mkv` demux 先読み、真の EOF からの replay 1 回、DSP 再取得位置を自動テストに追加。
+  製品起動 / UI smoke は行わず、修正後の利用者実機確認は未実施。
+
 ### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27)
 
 - 観測: 2026-09-27 の全ライブラリテスト (他 worktree のビルドと並行、高負荷) で各 1 回失敗。どちらも単独実行では 3 回とも成功。

@@ -7,6 +7,9 @@
 >   `TransportController` / command channel は未採用の将来候補。
 > - state schema: `Idle / Loading / Buffering / Playing / Paused /
 >   Seeking { target_secs } / Eof`。resume intent は state payload ではなく actor context が所有する。
+> - EOF semantics (2026-09-30、§1.310): clock の `demux_exhausted` は入力の先読み完了。
+>   出力 drain 後の再生終了は engine `Eof` だけが所有する。play / Space の replay は
+>   `VideoPlayer::is_at_eof()` を使う。下記 historical の旧 EOF メソッド名は当時の記録。
 > - readiness: `(NoVideo ∨ FirstFrameReady) ∧ (NoAudio ∨ BufferReady)`。映像・音声が
 >   どちらもない場合は never-ready。audio-only は `NoVideo` で ready になれる。
 > - anchor: `BufferReady` では PTS を latch するが、その event の wall は Playing anchor に
@@ -193,7 +196,7 @@ Playing ── pause() ──► Paused
 Paused ── resume_play() ──► Playing
 Playing ── seek(t) ──► Seeking{t} ── seek_completed ──► Buffering ── READY ──► Playing
 Paused ── seek(t) ──► Seeking{t} ── seek_completed ──► Buffering ── READY ──► Paused (※ paused 維持)
-Playing ── eof_reached ──► Eof
+Playing ── EofReached (出力 drain 完了) ──► Eof
 Eof ── seek(t) ──► Seeking{t} ── … ──► Playing
 Eof ── loop=true ──► Seeking{0} ── … ──► Playing
 ```
