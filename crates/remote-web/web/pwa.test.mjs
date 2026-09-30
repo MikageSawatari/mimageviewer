@@ -934,9 +934,16 @@ test("app.js runs its entry block after every top-level binding is initialized",
   const lines = source.split("\n");
   const entry = lines.indexOf("if (!RUNTIME_TEST_MODE) {");
   assert.notEqual(entry, -1, "entry block not found");
-  const laterDeclarations = lines
-    .slice(entry)
-    .map((line, offset) => ({ line, number: entry + offset + 1 }))
-    .filter(({ line }) => /^(const|let|var|class)\s/.test(line));
-  assert.deepEqual(laterDeclarations, []);
+  assert.equal(lines.indexOf("if (!RUNTIME_TEST_MODE) {", entry + 1), -1, "second entry block");
+  // 本文は字下げされているので、閉じ括弧は起動ブロックより後で最初の 0 桁目の "}"。
+  const close = lines.findIndex((line, index) => index > entry && line === "}");
+  assert.ok(close > entry, "entry block is not closed at column 0");
+  assert.match(lines.slice(entry, close).join("\n"), /\n  boot\(\);$/, "boot() is not the last call");
+  // 後ろに続いてよいのは空行だけ。const / let / export const / class / トップレベルの呼び出しなど、
+  // どの文も boot() より後に評価される。
+  const trailing = lines
+    .slice(close + 1)
+    .map((line, offset) => ({ line, number: close + offset + 2 }))
+    .filter(({ line }) => line.trim() !== "");
+  assert.deepEqual(trailing, [], "top-level code after the entry block");
 });
