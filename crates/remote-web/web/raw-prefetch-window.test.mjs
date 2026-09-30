@@ -10,7 +10,6 @@ function harness(options = {}) {
   const calls = [];
   const delays = [];
   const publisher = new RawPrefetchWindowPublisher({
-    current: () => null,
     send: async (body, session, signal) => { calls.push({ body, session, signal }); return { status: 200 }; },
     delay: async (ms, signal) => { delays.push({ ms, signal }); },
     ...options,
@@ -89,7 +88,7 @@ test("network failures and busy 503 retry with captured session and same generat
   const { publisher, delays } = harness({ send: async (body, session) => {
     calls.push({ body, session });
     if (calls.length === 1) throw new TypeError("offline");
-    return { status: calls.length === 2 ? 503 : 200 };
+    return new Response(JSON.stringify({ error: "ipc_busy" }), { status: calls.length === 2 ? 503 : 200 });
   } });
   publisher.commit(display()); await tick();
   assert.equal(calls.length, 3);
@@ -110,7 +109,7 @@ test("expiry during backoff aborts delay and discards body", async () => {
   let signal;
   let calls = 0;
   const { publisher } = harness({
-    send: async () => { calls += 1; return { status: 503 }; },
+    send: async () => { calls += 1; return new Response(JSON.stringify({ error: "ipc_busy" }), { status: 503 }); },
     delay: (_, captured) => { signal = captured; return new Promise((_, reject) => captured.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true })); },
   });
   publisher.commit(display()); await tick();
@@ -128,13 +127,14 @@ test("attestation or other validation errors are terminal, not network retries",
 test("reacquisition while sending rebuilds current window with counter reset, never old body", async () => {
   const calls = [];
   let resolve;
-  let current = display("initial");
-  const { publisher } = harness({ current: () => current, send: (body, session, signal) => {
+  const { publisher } = harness({ send: (body, session, signal) => {
     calls.push({ body, session, signal });
     if (calls.length === 1) return new Promise((done) => { resolve = done; });
     return Promise.resolve({ status: 200 });
   } });
-  current = display("new", -1);
+  publisher.commit(display("initial"));
+  const current = display("new", -1);
+  publisher.commit(current);
   publisher.setSession("session-b");
   resolve({ status: 503 }); await tick();
   assert(calls[0].signal.aborted);
@@ -142,4 +142,77 @@ test("reacquisition while sending rebuilds current window with counter reset, ne
   assert.equal(calls[1].session, "session-b");
   assert.equal(calls[1].body.window_generation, 1);
   assert.deepEqual(calls[1].body.entries, current.entries);
+});
+
+test("reacquisition before first presentation waits for the actual commit", async () => {
+  const { publisher, calls } = harness();
+  publisher.setSession("session-b");
+  await tick();
+  assert.equal(calls.length, 0);
+  publisher.commit(display());
+  publisher.commit(display());
+  await tick();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].session, "session-b");
+  assert.equal(calls[0].body.window_generation, 1);
+});
+
+test("commit without a session retains its snapshot; leaving clears it", async () => {
+  const { publisher, calls } = harness();
+  publisher.setSession("");
+  const presentation = structuredClone(display());
+  const expected = structuredClone(presentation.entries);
+  publisher.commit(presentation);
+  presentation.entries[0].path = "mutated-after-commit.dng";
+  assert.equal(calls.length, 0);
+  publisher.setSession("session-b");
+  await tick();
+  assert.deepEqual(calls[0].body.entries, expected);
+  publisher.setSession("");
+  publisher.leave();
+  publisher.setSession("session-c");
+  await tick();
+  assert.equal(calls.length, 1);
+});
+
+for (const error of ["ipc_busy", "admission_busy", "raw_busy"]) {
+  test(`named congestion ${error} retries`, async () => {
+    let count = 0;
+    const { publisher, delays } = harness({ send: async () => {
+      count += 1;
+      return new Response(JSON.stringify({ error }), { status: count === 1 ? 503 : 200 });
+    } });
+    publisher.commit(display());
+    await tick();
+    assert.equal(count, 2);
+    assert.equal(delays.length, 1);
+  });
+}
+
+for (const error of ["protocol_version_mismatch", "miv_not_running", "ipc_protocol_error", "unknown_error", undefined]) {
+  test(`permanent 503 ${error ?? "without an error kind"} stops`, async () => {
+    let count = 0;
+    const { publisher, delays } = harness({ send: async () => {
+      count += 1;
+      // A second success also bounds the regression on the old blanket retry.
+      return new Response(JSON.stringify({ error }), { status: count === 1 ? 503 : 200 });
+    } });
+    publisher.commit(display());
+    await tick();
+    assert.equal(count, 1);
+    assert.equal(delays.length, 0);
+  });
+}
+
+test("non-network sender errors do not retry", async () => {
+  let count = 0;
+  const { publisher, delays } = harness({ send: async () => {
+    count += 1;
+    if (count === 1) throw new Error("sender failed permanently");
+    return { status: 200 };
+  } });
+  publisher.commit(display());
+  await tick();
+  assert.equal(count, 1);
+  assert.equal(delays.length, 0);
 });

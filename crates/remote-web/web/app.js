@@ -1654,7 +1654,6 @@ export function persistentCollectionRouteOwnerTransition(
 
 let recentPointerSource = { source: "mouse", at: 0 };
 const rawPrefetchPublisher = new RawPrefetchWindowPublisher({
-  current: currentRawPrefetchPresentation,
   delay: abortableDelay,
   send: async (body, session, signal) => {
     const headers = remoteHeaders({ "Content-Type": "application/json" });
@@ -1669,6 +1668,7 @@ const rawPrefetchPublisher = new RawPrefetchWindowPublisher({
     if (response.status === 409 || response.status === 428) {
       const detail = await response.clone().json().catch(() => ({}));
       const status = remoteSessionFailureStatus({ sessionStatus: detail.status, httpStatus: response.status, errorCode: detail.error });
+      if (state.remoteSessionId !== session || signal.aborted) return response;
       if (status) setRemoteSessionStatus(status, detail.message || "操作権がありません。再接続してください。", { observer: "api_request", observedStatus: detail.status, httpStatus: response.status });
     }
     return response;
@@ -1913,7 +1913,7 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
   return state.remoteSessionAcquirePromise;
 }
 
-function currentRawPrefetchPresentation(snapshot = viewerPositionOwner.current().displayed) {
+function committedRawPrefetchPresentation(snapshot) {
   if (!state.viewer || !snapshot || snapshot.viewer !== state.viewer || snapshot.pageGroups !== state.pageGroups) return null;
   const visibleIndexes = pageGroupNavigationEntries(snapshot.group)
     .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
@@ -14630,7 +14630,7 @@ export class ImageViewer {
     if (livePositionSnapshot) {
       viewerPositionOwner.display(livePositionSnapshot);
     }
-    if (livePositionSnapshot && state.viewer === this) rawPrefetchPublisher.commit(currentRawPrefetchPresentation(livePositionSnapshot));
+    if (livePositionSnapshot && state.viewer === this) rawPrefetchPublisher.commit(committedRawPrefetchPresentation(livePositionSnapshot));
     this.displayedSeekState = { ...seekState };
     if (!this.requestedPagePresentation) {
       this.initializePagePresentation({

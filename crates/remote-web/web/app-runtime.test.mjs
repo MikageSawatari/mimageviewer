@@ -5225,17 +5225,24 @@ test("viewer cleanup starts final keepalive before destroy even when prior repor
   }
 });
 
-test("RAW window emits at actual presentation commit once for cached spread and sends empty on exit", async () => {
+const rawWindowTick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function withRawWindowRuntime(run, send) {
   const originalFetch = globalThis.fetch;
   const originalHistory = globalThis.history;
+  cleanupVideoViewerForTest(null);
+  await rawWindowTick();
   globalThis.history = { state: {}, replaceState() {}, pushState() {} };
   const calls = [];
   globalThis.fetch = async (url, options) => {
-    if (url === "/api/raw-prefetch-window") calls.push(JSON.parse(options.body));
-    return new Response("{}", { status: 200 });
+    if (url !== "/api/raw-prefetch-window") return new Response("{}", { status: 200 });
+    const call = { body: JSON.parse(options.body), session: options.headers.get("X-mIV-Remote-Session"), signal: options.signal };
+    calls.push(call);
+    if (send) return send(call, calls.length);
+    return new Response("{}", { status: 200, headers: { "X-mIV-Remote-Session": call.session } });
   };
+  const viewer = { destroy() {}, syncPagePositionFeedback() {}, requestedPagePresentation: {} };
   try {
-    retainVideoViewerForTest(null);
     applyRemoteSessionId("raw-window-owner", () => {});
     const entries = Array.from({ length: 8 }, (_, index) => ({
       name: `page${index}.dng`, kind: "image", address: { path: `C:/raw/page${index}.dng`, subresource: { kind: "file" } },
@@ -5245,27 +5252,87 @@ test("RAW window emits at actual presentation commit once for cached spread and 
       kind: "folder", title: "RAW", effective_address: address, entries, image_count: entries.length,
       page_groups: entries.filter((_, index) => index !== 4).map((entry) => ({ anchor: entry.address, pages: entry === entries[3] ? [entries[3].address, entries[4].address] : [entry.address], slice: "full" })),
     }, false);
-    const viewer = { destroy() {}, syncPagePositionFeedback() {}, requestedPagePresentation: {} };
     openViewerPagePositionForTest(viewer, 3);
-    const presentation = viewerPagePresentationForTest();
-    assert.equal(calls.length, 0); // Opening the position is not a display commit.
-    ImageViewer.prototype.commitPagePresentation.call(viewer, presentation);
-    ImageViewer.prototype.commitPagePresentation.call(viewer, presentation);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].entries, [entries[5].address, entries[6].address, entries[2].address]);
-    cleanupVideoViewerForTest(viewer);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(calls[1].entries, []);
-    assert.equal(calls[1].window_generation, 2);
-    openViewerPagePositionForTest(viewer, 3);
-    ImageViewer.prototype.commitPagePresentation.call(viewer, viewerPagePresentationForTest());
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(calls[2].window_generation, 3);
+    await run({ viewer, entries, calls });
   } finally {
-    retainVideoViewerForTest(null);
+    cleanupVideoViewerForTest(viewer);
+    await rawWindowTick();
     applyRemoteSessionId(TEST_SESSION_ID, () => {});
     globalThis.fetch = originalFetch;
     globalThis.history = originalHistory;
   }
+}
+
+function commitRawWindowPresentation(viewer) {
+  ImageViewer.prototype.commitPagePresentation.call(viewer, viewerPagePresentationForTest());
+}
+
+test("RAW window emits at actual presentation commit once for cached spread and sends empty on exit", async () => {
+  await withRawWindowRuntime(async ({ viewer, entries, calls }) => {
+    assert.equal(calls.length, 0); // Opening the position is not a display commit.
+    commitRawWindowPresentation(viewer);
+    commitRawWindowPresentation(viewer);
+    await rawWindowTick();
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].body.entries, [entries[5].address, entries[6].address, entries[2].address]);
+    cleanupVideoViewerForTest(viewer);
+    await rawWindowTick();
+    assert.deepEqual(calls[1].body.entries, []);
+    assert.equal(calls[1].body.window_generation, 2);
+    openViewerPagePositionForTest(viewer, 3);
+    commitRawWindowPresentation(viewer);
+    await rawWindowTick();
+    assert.equal(calls[2].body.window_generation, 3);
+  });
 });
+
+test("RAW reacquisition after position open waits for the first real presentation commit", async () => {
+  await withRawWindowRuntime(async ({ viewer, entries, calls }) => {
+    assert(containerRuntimeStateForTest().position.displayed); // open() initializes it.
+    applyRemoteSessionId("raw-window-owner-b", () => {});
+    await rawWindowTick();
+    assert.equal(calls.length, 0);
+    commitRawWindowPresentation(viewer);
+    commitRawWindowPresentation(viewer);
+    await rawWindowTick();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].session, "raw-window-owner-b");
+    assert.equal(calls[0].body.window_generation, 1);
+    assert.deepEqual(calls[0].body.entries, [entries[5].address, entries[6].address, entries[2].address]);
+  });
+});
+
+for (const status of [409, 428]) {
+  for (const reacquire of [true, false]) {
+    test(`RAW stale ${status} body cannot revoke ${reacquire ? "reacquired session B" : "session A after its request was aborted"}`, async () => {
+      let releaseBody;
+      let bodyStarted;
+      const bodyEntered = new Promise((resolve) => { bodyStarted = resolve; });
+      const body = new Promise((resolve) => { releaseBody = resolve; });
+      try {
+        await withRawWindowRuntime(async ({ viewer, calls }) => {
+          commitRawWindowPresentation(viewer);
+          await bodyEntered;
+          if (reacquire) applyRemoteSessionId("raw-window-owner-b", () => {});
+          else {
+            openViewerPagePositionForTest(viewer, 4);
+            commitRawWindowPresentation(viewer);
+          }
+          assert(calls[0].signal.aborted);
+          releaseBody({ status: "expired", error: "session_required", message: "stale owner A" });
+          await rawWindowTick();
+          assert.equal(calls.length, 2);
+          assert.equal(calls[1].session, reacquire ? "raw-window-owner-b" : "raw-window-owner");
+          assert.equal(calls[1].body.window_generation, reacquire ? 1 : 2);
+        }, (call, count) => {
+          if (count !== 1) return new Response("{}", { status: 200, headers: { "X-mIV-Remote-Session": call.session } });
+          const response = new Response("{}", { status });
+          response.clone = () => ({ json: () => { bodyStarted(); return body; } });
+          return response;
+        });
+      } finally {
+        releaseBody({ status: "expired", error: "session_required" });
+      }
+    });
+  }
+}

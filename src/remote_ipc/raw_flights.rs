@@ -1504,7 +1504,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn s2c_admission_classes_6_3_9_joins_free_and_cancelling_counted() {
+    fn s2c_admission_classes_6_3_9_joins_free_and_class_fixed() {
         let fake = Arc::new(FakeSubmitter::default());
         let flights = fake.s2c();
         {
@@ -1513,6 +1513,19 @@ pub(super) mod tests {
                 state.reserve(&identity(&format!("foreground-{index}")), RawPriority::High);
             }
         }
+        // Isolate the foreground class limit: the total still has three slots.
+        assert_eq!(flights.state.lock().unwrap().outstanding.len(), 6);
+        // An accidentally admitted seventh flight completes immediately, so
+        // removing the class guard fails the assertion rather than hanging.
+        fake.state.lock().unwrap().instant = Some(Ok(()));
+        let seventh = flights.develop_page(
+            identity("seventh-foreground"),
+            source,
+            &AtomicBool::new(false),
+        );
+        fake.state.lock().unwrap().instant = None;
+        assert!(matches!(seventh, Err(RemoteRawFlightError::Capacity)));
+        assert_eq!(fake.submits(), 0);
         let mut leases = Vec::new();
         for index in 0..3 {
             leases.push(
@@ -1552,18 +1565,55 @@ pub(super) mod tests {
         flights.complete(&key, id, Ok(output()));
         assert!(high.join().unwrap().is_ok());
         drop(leases);
-        let mut state = flights.state.lock().unwrap();
-        let key = identity("foreground-0");
-        let id = state.entries.get(&key).unwrap().id();
-        state.entries.insert(key, FlightState::Cancelling { id });
-        assert_eq!(
-            state
-                .outstanding
-                .values()
-                .filter(|work| work.class == AdmissionClass::Foreground)
-                .count(),
-            6
-        );
+    }
+
+    #[test]
+    fn s2c_cancelling_prefetch_blocks_admission_until_actual_completion() {
+        let fake = Arc::new(FakeSubmitter::default());
+        let flights = fake.s2c();
+        let mut leases = Vec::new();
+        for index in 0..3 {
+            let key = identity(&format!("prefetch-{index}"));
+            let mut lease = flights.try_prefetch(key.clone()).unwrap();
+            lease.start(source);
+            wait_for_inflight(&flights, &key);
+            leases.push(lease);
+        }
+        drop(leases.remove(0));
+        fake.wait_for_cancels(1);
+        {
+            let state = flights.state.lock().unwrap();
+            assert!(matches!(
+                state.entries.get(&identity("prefetch-0")),
+                Some(FlightState::Cancelling { .. })
+            ));
+            assert_eq!(state.outstanding.len(), 3);
+        }
+        // Neither the total limit nor a live waiter accounts for this denial.
+        assert!(matches!(
+            flights.try_prefetch(identity("replacement")),
+            Err(RemoteRawFlightError::Capacity)
+        ));
+        let cancelled = fake.cancellations()[0];
+        fake.finish(cancelled, Err(RawError::Cancelled));
+        assert_eq!(flights.state.lock().unwrap().outstanding.len(), 2);
+        let replacement = flights.try_prefetch(identity("replacement")).unwrap();
+        assert_eq!(flights.state.lock().unwrap().outstanding.len(), 3);
+        drop(replacement);
+
+        let remaining: Vec<_> = fake
+            .state
+            .lock()
+            .unwrap()
+            .completions
+            .keys()
+            .copied()
+            .collect();
+        for id in remaining {
+            fake.finish(id, Ok(output()));
+        }
+        drop(leases);
+        assert!(flights.state.lock().unwrap().outstanding.is_empty());
     }
 
     #[test]

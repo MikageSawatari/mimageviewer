@@ -1,4 +1,4 @@
-import { pagePrefetchPlan, pageAdmissionRetryDelayMs } from "./command-core.mjs";
+import { pagePrefetchPlan, pageAdmissionRetryDelayMs, pageRequestIsDemandCongestion } from "./command-core.mjs";
 
 // Entries are image positions, not expanded presentation groups. A partner or
 // cover therefore enters only at its own position, regardless of cached bytes.
@@ -8,10 +8,10 @@ export function rawPrefetchWindow({ images, visibleIndexes, direction, addressOf
 }
 
 export class RawPrefetchWindowPublisher {
-  constructor({ send, delay, current }) {
+  constructor({ send, delay }) {
     this.send = send;
     this.delay = delay;
-    this.current = current;
+    this.committed = null;
     this.session = "";
     this.generation = 0;
     this.stamp = null;
@@ -27,12 +27,20 @@ export class RawPrefetchWindowPublisher {
     this.generation = 0;
     this.stamp = null;
     this.pending = null;
-    // Recompute from the current display. Never replay an old request body.
-    if (session) this.commit(this.current());
+    // Only a presentation commit can supply this snapshot. Opening a viewer's
+    // position must not publish a display that has not actually been presented.
+    if (session && this.committed) this.publish(this.committed);
   }
 
   commit(presentation) {
-    if (!presentation || !this.session) return;
+    if (!presentation) return;
+    const { unit, direction, entries } = presentation;
+    this.committed = structuredClone({ unit, direction, entries });
+    this.publish(this.committed);
+  }
+
+  publish(presentation) {
+    if (!this.session) return;
     const { unit, direction, entries } = presentation;
     const stamp = JSON.stringify([unit, direction, entries]);
     if (stamp === this.stamp) return;
@@ -46,7 +54,8 @@ export class RawPrefetchWindowPublisher {
   }
 
   leave() {
-    if (this.stamp !== null) this.commit({ unit: null, direction: 0, entries: [] });
+    this.committed = null;
+    if (this.stamp !== null) this.publish({ unit: null, direction: 0, entries: [] });
   }
 
   async flush() {
@@ -63,10 +72,14 @@ export class RawPrefetchWindowPublisher {
           let retryAfterMs;
           try {
             const response = await this.send(declaration.body, declaration.session, controller.signal);
-            if (response.status !== 503) break; // validation and auth never retry
+            if (response.status !== 503) break;
+            const detail = await response.clone().json().catch(() => ({}));
+            if (!pageRequestIsDemandCongestion(response.status, detail.error)) break;
             retryAfterMs = Number(response.headers?.get("Retry-After")) * 1000;
           } catch (error) {
-            if (controller.signal.aborted || error?.name === "AbortError" || error?.retryable === false) break;
+            // fetch reports network failures as TypeError; programming errors,
+            // attestation failures and permanent HTTP failures must not retry.
+            if (controller.signal.aborted || !(error instanceof TypeError) || error?.retryable === false) break;
           }
           if (controller.signal.aborted || this.session !== declaration.session) break;
           try {

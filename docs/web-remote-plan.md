@@ -2773,8 +2773,13 @@ no-store とする。古い世代・重複・終端の宣言も成功 ack、構�
 Web は共通の presentation commit から、表示単位・進行方向・窓の address 順の印が変わったときだけ宣言する。
 画像の位置で先 2 枚・前 1 枚を数え、cache / SKIPPED の有無では除外しない。相方や補助表紙を group ごとに
 追加しない。viewer を閉じても session の generation counter は継続し、離れると空の窓を送る。
-送信は最新値だけを保持し、一時的な通信失敗・503 を既存の backoff で再試行する。session 失効で fetch /
-backoff を abort、取得し直した session では counter を振り直し現在の表示から再計算する。古い本文の replay は行わない。
+宣言 module は実際に presentation commit した表示単位・方向・窓の snapshot を保持する。
+位置 owner の open による初期 displayed は宣言に使わず、session を取得し直しても初回 commit までは送らない。
+送信は最新値だけを保持し、通信失敗と 503 の named congestion (`ipc_busy` / `admission_busy` / `raw_busy`) だけを
+既存の backoff で再試行する。`protocol_version_mismatch` などの恒久エラーは再送しない。
+session 失効で fetch / backoff を abort、取得し直した session では counter を振り直し最後に commit した snapshot から
+新しい宣言を作る。古い本文の replay は行わない。表示を離れると snapshot も破棄する。
+409 / 428 の本文を読んだ後にも captured session と abort を照合し、旧要求のエラーで新しい session を失効させない。
 
 core reader は owner lock 内で最大 generation より新しい宣言だけを最新値の受け箱へ置き、I/O 前に ack する。
 service に 1 本の worker が通常 RAW ファイル・直接 ZIP RAW entry の source だけを特定する。入れ子の器は展開せず、

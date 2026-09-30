@@ -880,6 +880,9 @@ mod tests {
         });
         wait_for_waiters(&flights, &identity("b"), 2);
         service.registry.terminate();
+        wait(&service.registry, |state| state.waiters.is_empty());
+        wait_for_waiters(&flights, &identity("b"), 1);
+        assert!(!fake.cancellations().contains(&2));
         fake.finish(2, Ok(output()));
         assert!(foreground.join().unwrap().is_ok());
     }
