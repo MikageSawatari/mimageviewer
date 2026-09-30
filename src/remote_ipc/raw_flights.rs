@@ -21,7 +21,7 @@ pub(super) const REMOTE_RAW_FLIGHT_LIMIT: usize = 6;
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 pub(super) type DevelopedRaw = RawDevelopOutput;
-type DevelopResult = Result<Arc<DevelopedRaw>, RawError>;
+type DevelopResult = Result<Arc<DevelopedRaw>, RemoteRawFlightError>;
 type Completion = Box<dyn FnOnce(Result<RawDevelopOutput, RawError>) + Send + 'static>;
 
 /// Exact source identity. Neither output quality nor requested pixel size
@@ -94,6 +94,8 @@ impl RemoteRawFlightPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum RemoteRawFlightError {
+    /// The owned source could not be read, before submitting to LibRaw.
+    Source(RawError),
     Raw(RawError),
     Capacity,
     Cancelled,
@@ -670,7 +672,7 @@ impl RemoteRawFlights {
         };
         drop(ai_wait);
         match join {
-            Join::Ready(result) => result.map_err(RemoteRawFlightError::Raw),
+            Join::Ready(result) => result,
             Join::Capacity => Err(RemoteRawFlightError::Capacity),
             Join::Participant { id, submit } => {
                 let lease = ParticipantLease {
@@ -737,14 +739,23 @@ impl RemoteRawFlights {
             )
         };
         // Capacity was reserved before this can read ZIP source bytes.
-        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let resolved = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             source_factory(&source_cancel)
-        }))
-        .unwrap_or_else(|_| Err(RawError::Io("RAW source worker panicked".to_owned())));
+        })) {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                self.complete(
+                    &identity,
+                    id,
+                    Err(RawError::Io("RAW source worker panicked".to_owned())),
+                );
+                return;
+            }
+        };
         let source = match resolved {
             Ok(source) => source,
             Err(error) => {
-                self.complete(&identity, id, Err(error));
+                self.complete_result(&identity, id, Err(RemoteRawFlightError::Source(error)));
                 return;
             }
         };
@@ -824,6 +835,14 @@ impl RemoteRawFlights {
         id: u64,
         result: Result<RawDevelopOutput, RawError>,
     ) {
+        self.complete_result(
+            identity,
+            id,
+            result.map(Arc::new).map_err(RemoteRawFlightError::Raw),
+        );
+    }
+
+    fn complete_result(&self, identity: &RemoteRawIdentity, id: u64, result: DevelopResult) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.outstanding.remove(&id).is_none() {
             return;
@@ -846,7 +865,6 @@ impl RemoteRawFlights {
             Some(FlightState::Submitting { waiters, .. })
             | Some(FlightState::InFlight { waiters, .. }) => {
                 if waiters > 0 {
-                    let result = result.map(Arc::new);
                     if let Ok(raster) = &result {
                         state.cache_insert(identity.clone(), Arc::clone(raster), self.policy);
                     }
@@ -890,7 +908,7 @@ impl RemoteRawFlights {
             }) = state.entries.get(identity)
                 && *current == id
             {
-                return result.clone().map_err(RemoteRawFlightError::Raw);
+                return result.clone();
             }
             let (next, _) = self
                 .changed
@@ -1208,7 +1226,7 @@ mod tests {
                 |_| Err(RawError::Io("read".into())),
                 &AtomicBool::new(false),
             ),
-            Err(RemoteRawFlightError::Raw(RawError::Io(message))) if message == "read"
+            Err(RemoteRawFlightError::Source(RawError::Io(message))) if message == "read"
         ));
         assert!(flights.state.lock().unwrap().outstanding.is_empty());
     }

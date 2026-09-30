@@ -2721,13 +2721,16 @@ protocol v62 の `RawPrefetchSkipped` を HTTP 204、`X-mIV-Page-Skip: raw-prefe
 cancel / release し、計画に残る場合は新しい有界の先読み job に戻す。混雑は job ごとに
 `page_congestion` 1 件へ集約して記録する。
 
-ZIP の先読みは実際の代表画像を選んでから RAW かどうかを判定する。外側の読み取り可能な
-先頭画像 (ZIP directory では直下画像) で代表が決まれば、入れ子 ZIP は展開しない。
-代表が入れ子 ZIP にあり得るときは従来どおり列挙し、JPEG 等なら先読みを続け、RAW で
+ZIP の代表は中央ディレクトリの情報 (名前順、画像拡張子、非暗号化、対応する圧縮方式) だけで
+特定する。外側の候補が先なら後続の入れ子 ZIP は展開しない。代表が入れ子 ZIP にあり得る
+ときは既存の上限付き cache へ取消可能な器の展開を行い、JPEG 等なら先読みを続け、RAW で
 現像済み cache が無ければ `RawPrefetchSkipped` とする。変換済み書庫の ZIP backing も同じ。
-選んだ代表は RAW preflight と読み込みで共有し、入れ子展開中も cancel を確認する。
-AI は代表を先に選び、RAW のときだけ現像枠で待つ。同一 owner の旧 AI job は新規 job で
-supersede / cancel されるため、枠確保前の代表選択は owner ごとに 1 件へ収束する。
+RAW entry の payload は先読みの skip 判定前も AI の現像枠確保前も読まない。前景 flight 内、
+または AI 枠確保後の payload 読み込みが破損等で失敗した場合は、同じ要求で次候補へ進み、
+RAW 候補には同じ規則を繰り返す。選んだ代表と要求内の raster / payload pin は共有する。
+AI は metadata で代表を先に特定し、RAW のときだけ最新要求優先の owner 別 capacity slot で待つ。
+同一 owner の旧 AI job は新規 job で supersede / cancel されるため、枠確保前の入れ子 ZIP の
+器の展開は owner あたり 1 個の live job に限定される。JPEG だけの書庫 AI は RAW 枠で待たない。
 
 Remote RAW サムネイルは half 現像を起こさず、埋め込みプレビューまたは既存 catalog の
 サムネイルを使う。どちらも無ければ protocol v62 の `NoThumbnail` を従来のサムネイル失敗
