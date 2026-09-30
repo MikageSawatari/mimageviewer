@@ -1622,58 +1622,6 @@ export function persistentCollectionRouteOwnerTransition(
 }
 
 let recentPointerSource = { source: "mouse", at: 0 };
-if (!RUNTIME_TEST_MODE) {
-  installDocumentDoubleTapOwner(document, {
-    onDecision: recordBrowserDoubleTapDecision,
-  });
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker
-      .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
-      .catch(() => {});
-  }
-  updateKeyboardAvailability();
-  window.addEventListener("popstate", () => {
-    if (remoteSessionControlOwner.snapshot.status === "active") {
-      dispatchRoute().catch(() => {});
-    }
-  });
-  window.addEventListener("keydown", onGlobalKeyDown);
-  window.addEventListener(
-    "pointerdown",
-    (event) => {
-      state.remoteSessionUserActive = true;
-      recentPointerSource = {
-        source: pointerInputSource(event.pointerType),
-        at: performance.now(),
-      };
-    },
-    true
-  );
-
-  if (TELEMETRY_ENABLED) {
-    installTelemetry();
-  } else {
-    updateHud();
-  }
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") {
-      reportVideoProgressBeforePageHide(state.viewer);
-      state.remoteSessionUserActive = false;
-      state.remoteAiController?.suspend();
-      state.archiveOpenController?.suspend();
-    } else if (state.authenticated) {
-      if (remoteSessionControlOwner.snapshot.status !== "active") return;
-      if (state.viewer?.isVideoStreamViewer) {
-        state.viewer.handleVisibilityResume().catch(() => {});
-      } else {
-        state.remoteAiController?.handleForegroundResume().catch(() => {});
-        state.archiveOpenController?.handleForegroundResume().catch(() => {});
-      }
-    }
-  });
-  recordRestoredFocusOnLoad();
-  boot();
-}
 
 /// 再読み込み直後のシークバーに青枠が出るという報告の切り分け用。
 /// 誰も focus を当てていないので、ブラウザが復元した focus が
@@ -16647,4 +16595,61 @@ function median(values) {
   return sorted.length % 2
     ? sorted[middle]
     : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+// Entry point. Keep this block the last top-level statement of the module: boot() runs
+// screen cleanup synchronously, which reads module-level `const` / `let` bindings declared
+// throughout this file. Running it earlier hits their temporal dead zone (ReferenceError)
+// before any request or telemetry is sent, and the page stays blank.
+if (!RUNTIME_TEST_MODE) {
+  installDocumentDoubleTapOwner(document, {
+    onDecision: recordBrowserDoubleTapDecision,
+  });
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker
+      .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
+      .catch(() => {});
+  }
+  updateKeyboardAvailability();
+  window.addEventListener("popstate", () => {
+    if (remoteSessionControlOwner.snapshot.status === "active") {
+      dispatchRoute().catch(() => {});
+    }
+  });
+  window.addEventListener("keydown", onGlobalKeyDown);
+  window.addEventListener(
+    "pointerdown",
+    (event) => {
+      state.remoteSessionUserActive = true;
+      recentPointerSource = {
+        source: pointerInputSource(event.pointerType),
+        at: performance.now(),
+      };
+    },
+    true
+  );
+
+  if (TELEMETRY_ENABLED) {
+    installTelemetry();
+  } else {
+    updateHud();
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") {
+      reportVideoProgressBeforePageHide(state.viewer);
+      state.remoteSessionUserActive = false;
+      state.remoteAiController?.suspend();
+      state.archiveOpenController?.suspend();
+    } else if (state.authenticated) {
+      if (remoteSessionControlOwner.snapshot.status !== "active") return;
+      if (state.viewer?.isVideoStreamViewer) {
+        state.viewer.handleVisibilityResume().catch(() => {});
+      } else {
+        state.remoteAiController?.handleForegroundResume().catch(() => {});
+        state.archiveOpenController?.handleForegroundResume().catch(() => {});
+      }
+    }
+  });
+  recordRestoredFocusOnLoad();
+  boot();
 }
