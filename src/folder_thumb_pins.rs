@@ -327,7 +327,10 @@ impl FolderThumbPinDb {
     fn init_schema(conn: &Connection) -> SqlResult<bool> {
         // Install the revision row and all triggers as one schema transaction.
         // A concurrent writer cannot change a pin in a gap between them.
-        let tx = conn.unchecked_transaction()?;
+        // Acquire the schema writer before no-op CREATEs read sqlite_master. Concurrent
+        // refresh workers must not deadlock while upgrading DEFERRED readers to writers.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS folder_thumb_pins (
                 container_key TEXT PRIMARY KEY,
@@ -2167,6 +2170,58 @@ mod tests {
             recreated.selection_revision().unwrap().instance_id,
             initial.instance_id
         );
+    }
+
+    #[test]
+    fn concurrent_refresh_opens_preserve_pin_rows_and_store_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.db");
+        let pin = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let mut original_revision = None;
+        for fresh in [true, false] {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+            let revisions = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        let path = &path;
+                        let pin = &pin;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let (db, migrated) =
+                                FolderThumbPinDb::open_at_with_migration_info(path)
+                                    .expect("concurrent refresh must acquire the schema writer");
+                            let revision = db.selection_revision().unwrap();
+                            if !fresh {
+                                assert_eq!(db.lookup(Path::new("C:/album")), Some(pin.clone()));
+                            }
+                            (revision, migrated)
+                        })
+                    })
+                    .collect();
+                barrier.wait();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                revisions.iter().filter(|(_, migrated)| *migrated).count(),
+                usize::from(fresh)
+            );
+            let revision = revisions[0].0.clone();
+            assert!(revisions.iter().all(|(other, _)| *other == revision));
+            if fresh {
+                let db = FolderThumbPinDb::open_at(&path).unwrap();
+                db.set(Path::new("C:/album"), &pin).unwrap();
+                original_revision = Some(db.selection_revision().unwrap());
+            } else {
+                assert_eq!(Some(revision), original_revision);
+            }
+        }
     }
 
     #[test]

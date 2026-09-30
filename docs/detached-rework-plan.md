@@ -1455,6 +1455,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-01 §1.313 RatingPhysical 子のソート再表示 owner 転送**
+
+RatingPhysical 子の Immediate ソートが Navigation owner に落ち、WorkerScan の `CurrentViewOrderRefresh` も Collection owner しか運べず、評価一覧の親 chain と back／forward を失う不具合を修正する。F5 と同じ `current_folder_reload_owner` が選んだ単一の `OpenRequestOwner` を request に Box で保持し、各 consumer から共通採用境界までそのまま渡す。Box は App の既存 stack footprint 上限を守るためで、別の状態や owner を加えるものではない。共通の owner 有効性検証は選択 hint の変更前に行い、同じ path／order でも旧 generation の完了が現在の選択へ作用しないようにする。
+
+detached 固有コードで触れた箇所は `App::poll_detached_physical_folder_open` の `CurrentViewOrderRefresh` arm だけ。payload の `collection_owner` を `reload_owner` へ置換して既存 `apply_current_view_order_refresh` に転送する機械的変更で、Applied／Failed の扱いは既存のまま。detached の述語、viewport、geometry、配置、focus、window lifecycle は変更しない。guard／遅延／再試行による症状パッチではなく、生成時に確定した typed owner を採用まで保持する構造修正である。共通検証は既存 owner 契約の適用であり、detached 専用の条件分岐・flag は加えない。簡素化として F5 の owner 選択と既存 scan／採用経路を再利用し、新しい待機状態やモーダルは設けない。
+
+ClaudeCode は利用者からの 2026-10-01 fix1 引き継ぎで、この機械的 owner 転送が症状パッチではないと合意済み。独立 Codex (Sol / xhigh) も実装前・完了レビューで同じ構造判断に合意し、完了差分に残存指摘なし。検証結果は [pin-reload-audit.md](pin-reload-audit.md) に記録した。
+
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 
 Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。

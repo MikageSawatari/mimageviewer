@@ -13,6 +13,7 @@ fn music_source_for_test(app: &App, path: PathBuf) -> MusicAnalysisSource {
     }
 }
 use crate::archive_converter::ArchiveFormat;
+use crate::settings::SortOrder;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -397,6 +398,218 @@ fn mutation_refresh_rating_child_and_backing_alias_keep_parent_chain_and_history
     );
 }
 
+fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
+    let mut app = setup_app_for_test();
+    let parent = app.tmp.path().join("rating-sort-parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    for name in ["a.png", "b.png"] {
+        std::fs::write(child.join(name), b"page").unwrap();
+    }
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.settings.sort_order = SortOrder::FileName;
+    app.active_quick_folder_slot = None;
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_rating_view = true;
+    app.rating_view_stars = 3;
+    app.rating_view_saved_folder = Some(app.tmp.path().to_path_buf());
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 });
+    for path in [parent, child] {
+        let owner = app.rating_view_physical_load_owner(&path).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            path,
+            None,
+            OpenRequestOwner::RatingPhysical(owner)
+        ));
+    }
+    let future = app.tmp.path().join("future");
+    app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(future)];
+    assert_eq!(app.rating_view_nav_stack.len(), 2);
+    assert_eq!(app.items[0].name(), "a.png");
+    app
+}
+
+fn mutation_refresh_wait_for_order_scan(app: &mut App) -> FolderPaneOpenReady {
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            return ready;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sort scan did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn mutation_refresh_resolve_order_scan(app: &mut App, ready: FolderPaneOpenReady) {
+    #[cfg(windows)]
+    assert!(
+        app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+            .is_none()
+    );
+    #[cfg(not(windows))]
+    {
+        let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+            order,
+            reload_owner,
+        } = ready.purpose
+        else {
+            panic!("unexpected scan purpose")
+        };
+        app.apply_current_view_order_refresh(ready.path, ready.scan.unwrap(), order, *reload_owner);
+    }
+}
+
+fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) {
+    let mut app = mutation_refresh_rating_sort_fixture();
+    let location = app.folder_nav_current_target();
+    let chain = app.rating_view_nav_stack.clone();
+    let saved = app.rating_view_saved_folder.clone();
+    let history = app.folder_nav_history_snapshot();
+    assert!(!history.back_stack.is_empty());
+    assert!(!history.forward_stack.is_empty());
+    #[cfg(windows)]
+    let (sibling, sibling_generation, sibling_cancel) = {
+        let mut generation = 0;
+        let mut cancel = None;
+        let id = app.build_window_context_for_test(9_904, |sibling| {
+            sibling.current_folder = Some(PathBuf::from("sibling"));
+            sibling.items = vec![GridItem::Folder(PathBuf::from("sibling-row"))];
+            sibling.selected = Some(0);
+            sibling.scroll_offset_y = 42.0;
+            generation = sibling.items_generation;
+            cancel = Some(sibling.cancel_token.clone());
+        });
+        (id, generation, cancel.unwrap())
+    };
+    app.settings.sort_order = SortOrder::FileNameDesc;
+    match physical_mode {
+        PhysicalFolderSortReload::Immediate => app.apply_sort_change_reload(),
+        PhysicalFolderSortReload::WorkerScan => {
+            app.apply_sort_change_reload_without_ui_io();
+            let ready = mutation_refresh_wait_for_order_scan(&mut app);
+            let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                ref reload_owner, ..
+            } = ready.purpose
+            else {
+                panic!("unexpected scan purpose")
+            };
+            assert!(matches!(
+                reload_owner.as_ref(),
+                OpenRequestOwner::RatingPhysical(_)
+            ));
+            mutation_refresh_resolve_order_scan(&mut app, ready);
+        }
+    }
+    assert_eq!(app.items[0].name(), "b.png", "changed order was adopted");
+    assert_eq!(app.items[1].name(), "a.png");
+    assert_eq!(app.folder_nav_current_target(), location);
+    assert_eq!(app.rating_view_nav_stack, chain);
+    assert_eq!(app.rating_view_saved_folder, saved);
+    assert!(matches!(
+        app.resolve_return_to_parent_nav(),
+        Some(crate::ui_main::AddressBarNav::RatingViewBack)
+    ));
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+    assert_eq!(
+        app.navigate_folder_history_back(),
+        history.back_stack.last().cloned()
+    );
+    app.restore_folder_nav_history(history.clone());
+    // History rollback defaults a legacy no-slot snapshot to A; this fixture uses the
+    // legacy stacks so both navigation directions must read those same stacks.
+    app.active_quick_folder_slot = None;
+    assert_eq!(
+        app.navigate_folder_history_forward(),
+        history.forward_stack.last().cloned()
+    );
+    app.restore_folder_nav_history(history);
+    app.active_quick_folder_slot = None;
+    #[cfg(windows)]
+    app.with_viewer_context(sibling, |sibling| {
+        assert_eq!(sibling.current_folder, Some(PathBuf::from("sibling")));
+        assert_eq!(
+            sibling.items,
+            vec![GridItem::Folder(PathBuf::from("sibling-row"))]
+        );
+        assert_eq!(sibling.items_generation, sibling_generation);
+        assert!(Arc::ptr_eq(&sibling.cancel_token, &sibling_cancel));
+        assert!(!sibling_cancel.load(Ordering::Relaxed));
+        assert_eq!(sibling.selected, Some(0));
+        assert_eq!(sibling.scroll_offset_y, 42.0);
+    })
+    .unwrap();
+}
+
+#[test]
+fn mutation_refresh_rating_child_sort_immediate_keeps_parent_and_back_forward() {
+    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::Immediate);
+}
+
+#[test]
+fn mutation_refresh_rating_child_sort_worker_keeps_parent_and_back_forward() {
+    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::WorkerScan);
+}
+
+#[test]
+fn mutation_refresh_rating_child_stale_sort_owner_keeps_selection_hint() {
+    let mut app = mutation_refresh_rating_sort_fixture();
+    app.settings.sort_order = SortOrder::FileNameDesc;
+    app.apply_sort_change_reload_without_ui_io();
+    let ready = mutation_refresh_wait_for_order_scan(&mut app);
+    let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+        ref order,
+        ref reload_owner,
+    } = ready.purpose
+    else {
+        panic!("unexpected scan purpose")
+    };
+    assert!(matches!(
+        reload_owner.as_ref(),
+        OpenRequestOwner::RatingPhysical(_)
+    ));
+    assert!(order.matches(&app.settings));
+    assert_eq!(Some(&ready.path), app.current_folder.as_ref());
+    // Replace the source generation while retaining the exact same path and order.
+    app.items_generation = app.items_generation.wrapping_add(1);
+    app.selected = Some(0);
+    app.select_after_load = None;
+    let generation = app.items_generation;
+    let rows = app.items.clone();
+    let location = app.folder_nav_current_target();
+    let history = app.folder_nav_history_snapshot();
+    assert!(!app.open_request_owner_is_current(&ready.path, reload_owner));
+    mutation_refresh_resolve_order_scan(&mut app, ready);
+    assert_eq!(
+        app.select_after_load, None,
+        "stale result must not publish a cursor hint"
+    );
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.items, rows);
+    assert_eq!(app.folder_nav_current_target(), location);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
@@ -426,6 +639,24 @@ fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
     });
     let sibling_cancel = app.current_view_pin_refreshes[&sibling].cancel.clone();
     assert!(app.current_view_pin_refreshes.contains_key(&main));
+    // Keep the exact worker results for the production consumer, while exposing DB
+    // read failures instead of reporting only the eventual thumbnail assertion.
+    for id in [main, sibling] {
+        let pending = app.current_view_pin_refreshes.get_mut(&id).unwrap();
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let terminal = result.as_ref().expect("pin worker was cancelled");
+        assert!(
+            terminal.errors.is_empty(),
+            "pin worker errors: {:?}",
+            terminal.errors
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        pending.rx = rx;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.current_view_pin_refreshes.contains_key(&main) {
         app.consume_folder_thumb_pin_dirty();

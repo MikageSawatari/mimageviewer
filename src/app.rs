@@ -5375,10 +5375,10 @@ pub(crate) enum FolderOpenScanPurpose {
         navigation_purpose: FsNavigationPurpose,
     },
     /// 現在の物理フォルダを、変更済みの表示順設定で再構築するための事前走査。
-    /// path と並び設定の snapshot が一致する owning context だけが完了を適用する。
+    /// path・並び設定の snapshot・typed reload owner が一致する context だけが完了を適用する。
     CurrentViewOrderRefresh {
         order: CurrentViewOrderSnapshot,
-        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        reload_owner: Box<OpenRequestOwner>,
     },
 }
 
@@ -22766,10 +22766,7 @@ impl App {
             let previous_history = self.folder_history.remove(&path);
             match physical_mode {
                 PhysicalFolderSortReload::Immediate => {
-                    let owner = self
-                        .collection_grid_physical_reload_owner(&path)
-                        .map(OpenRequestOwner::CollectionGridPhysical)
-                        .unwrap_or(OpenRequestOwner::Navigation);
+                    let owner = self.current_folder_reload_owner(&path);
                     let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                         path.clone(),
                         false,
@@ -22794,12 +22791,12 @@ impl App {
                         return;
                     }
                     let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
-                    let collection_owner = self.collection_grid_physical_reload_owner(&path);
+                    let reload_owner = Box::new(self.current_folder_reload_owner(&path));
                     self.start_folder_open_scan(
                         path,
                         FolderOpenScanPurpose::CurrentViewOrderRefresh {
                             order,
-                            collection_owner,
+                            reload_owner,
                         },
                     );
                 }
@@ -49123,9 +49120,9 @@ impl App {
             }
             FolderOpenScanPurpose::CurrentViewOrderRefresh {
                 order,
-                collection_owner,
+                reload_owner,
             } => {
-                self.apply_current_view_order_refresh(ready.path, scan, order, collection_owner);
+                self.apply_current_view_order_refresh(ready.path, scan, order, *reload_owner);
                 None
             }
         }
@@ -49136,20 +49133,18 @@ impl App {
         path: PathBuf,
         scan: ScannedDir,
         order: CurrentViewOrderSnapshot,
-        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        owner: OpenRequestOwner,
     ) -> bool {
         if !self
             .current_folder
             .as_deref()
             .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
             || !order.matches(&self.settings)
+            || !self.open_request_owner_is_current(&path, &owner)
         {
             return false;
         }
         self.preserve_cursor_hint_for_reload();
-        let owner = collection_owner
-            .map(OpenRequestOwner::CollectionGridPhysical)
-            .unwrap_or(OpenRequestOwner::Navigation);
         if self.epub_batch_convert.is_some() {
             // The batch modal owns this same-location listing refresh. It is a completion of
             // accepted work, not a new open, so it must bypass the new-open admission gate.
@@ -49290,10 +49285,9 @@ impl App {
             }
             FolderOpenScanPurpose::CurrentViewOrderRefresh {
                 order,
-                collection_owner,
+                reload_owner,
             } => {
-                if self.apply_current_view_order_refresh(ready.path, scan, order, collection_owner)
-                {
+                if self.apply_current_view_order_refresh(ready.path, scan, order, *reload_owner) {
                     DetachedPhysicalFolderOpenPoll::Applied
                 } else {
                     DetachedPhysicalFolderOpenPoll::Failed
@@ -85587,16 +85581,11 @@ impl App {
                         (
                             FolderOpenScanPurpose::CurrentViewOrderRefresh {
                                 order,
-                                collection_owner,
+                                reload_owner,
                             },
                             Ok(scan),
                         ) => {
-                            self.apply_current_view_order_refresh(
-                                path,
-                                scan,
-                                order,
-                                collection_owner,
-                            );
+                            self.apply_current_view_order_refresh(path, scan, order, *reload_owner);
                             None
                         }
                         (
@@ -88443,13 +88432,13 @@ mod favorite_view_state_tests {
                     match ready.purpose {
                         FolderOpenScanPurpose::CurrentViewOrderRefresh {
                             order,
-                            collection_owner,
+                            reload_owner,
                         } => {
                             assert!(app.apply_current_view_order_refresh(
                                 ready.path,
                                 scan,
                                 order,
-                                collection_owner,
+                                *reload_owner,
                             ));
                         }
                         _ => panic!("unexpected folder scan purpose"),
