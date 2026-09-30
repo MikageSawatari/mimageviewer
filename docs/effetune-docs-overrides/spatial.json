@@ -2,6 +2,7 @@
   {
     "operation": "insert_note",
     "heading_id": "空間オーディオプラグイン",
+    "repeat_on_plugins": true,
     "note": "mImageViewer の音響調整は左右2チャンネルで処理します。Spatial Mapper の Center Extract、5.1 Upmix、7.1.4 Upmix など、3チャンネル以上のバスを必要とする操作や構成例は使用できません。以下の説明では、ステレオで使用できる設定を選んでください。",
     "reason": "bridge.rs stereo format; contextualize upstream multichannel examples without implying additional outputs."
   },

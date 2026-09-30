@@ -1,0 +1,8 @@
+[
+  {
+    "operation": "insert_before_heading",
+    "heading_id": "section",
+    "content": "## プラグイン一覧\n\n- [Section](#section)",
+    "reason": "The upstream control category has only Section but no plugin list. Add an explicit, heading-anchored list so splitting never guesses plugin headings. Additional unlisted sections fail the same inventory check as every other category."
+  }
+]

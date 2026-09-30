@@ -141,7 +141,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
         output = docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1')
-        self.assertEqual(len(output), 22)
+        self.assertEqual(len(output), 130)  # 18 category/guide/index/license + 108 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
                 self.assertEqual((docs.MANUAL / 'effetune/v0.11.1' / name).read_bytes(), data)
@@ -157,6 +157,45 @@ class GenerationTests(unittest.TestCase):
         for path in (docs.DEFAULT_SOURCE / 'images').iterdir():
             self.assertEqual(output['images/' + path.name], path.read_bytes())
 
+    def test_snapshot_split_navigation_index_and_override_survival(self):
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1').items() if name.endswith('.html')}
+        eq = output['eq.html'].split('<main class="content">')[1]
+        self.assertIn('id="スペクトラムオーバーレイ"', eq)
+        self.assertIn('href="eq-15band-geq.html"', eq)
+        self.assertNotIn('id="15band-geq"', eq)
+        self.assertNotIn('id="room-eq"', eq)
+        geq = output['eq-15band-geq.html']
+        self.assertIn('<h1 id="15band-geq" class="page-title">15Band GEQ</h1>', geq)
+        self.assertIn('href="eq-15band-geq.html" class="sub active" aria-current="page"', geq)
+        self.assertIn('href="eq-15band-peq.html" class="sub"', geq)
+        self.assertNotIn('href="lofi-bit-crusher.html" class="sub"', geq)
+        self.assertIn('rel="next" href="eq-15band-peq.html"', geq)
+        self.assertNotIn('rel="prev"', geq)
+        self.assertIn('rel="prev" href="eq-tilt-eq.html"', output['eq-tone-control.html'])
+        self.assertNotIn('rel="next"', output['eq-tone-control.html'])
+        self.assertIn('<a href="index.html">EffeTune 説明書</a><span class="sep">›</span><a href="eq.html">イコライザープラグイン</a><span class="sep">›</span><span aria-current="page">15Band GEQ</span>', geq)
+        self.assertIn('href="eq-15band-geq.html"', output['index.html'])
+        self.assertIn('href="control-section.html"', output['control.html'])
+        self.assertNotIn('rel="next"', output['control-section.html'])
+        self.assertNotIn('rel="prev"', output['control-section.html'])
+        self.assertIn('mImageViewer の EffeTune 画面には、マイクを使う周波数応答の測定機能はありません', output['eq-room-eq.html'])
+        self.assertIn('4チャンネル以上の出力が必要', output['basics-channel-divider.html'])
+        self.assertNotIn('id="使用方法', output['basics-channel-divider.html'])
+        self.assertIn('mImageViewer の音響調整はステレオ', output['basics-volume.html'])
+        self.assertIn('mImageViewer の音響調整は左右2チャンネル', output['spatial-ms-matrix.html'])
+        self.assertIn('mImageViewer のデータフォルダ', output['reverb-ir-reverb.html'])
+        self.assertIn('bus-function.html', output)
+        self.assertIn('visualizer.html', output)
+
+    def test_entry_redirect(self):
+        text = docs.entry_page('v0.11.1').decode()
+        self.assertIn('<meta name="robots" content="noindex">', text)
+        self.assertIn('<meta http-equiv="refresh" content="0; url=v0.11.1/index.html">', text)
+        self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune/v0.11.1/index.html">', text)
+        self.assertIn('<a href="v0.11.1/index.html">', text)
+        self.assertNotEqual(docs.entry_page('v0.11.1'), docs.entry_page('v0.12.0'))
+        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.11.1'))
+
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
             root = Path(temporary)
@@ -168,7 +207,17 @@ class GenerationTests(unittest.TestCase):
                 self.assertFalse((root / 'manual').exists())
                 self.assertEqual(run('--version', 'v0.11.1'), 0)
                 output = root / 'manual/effetune/v0.11.1/index.html'
+                entry = root / 'manual/effetune/index.html'
                 self.assertEqual(run('--version', 'v0.11.1', '--check'), 0)
+                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.11.1'))
+                entry.unlink()
+                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
+                self.assertFalse(entry.exists())
+                self.assertEqual(run('--version', 'v0.11.1'), 0)
+                entry.write_bytes(b'stale entry')
+                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
+                self.assertEqual(entry.read_bytes(), b'stale entry')
+                self.assertEqual(run('--version', 'v0.11.1'), 0)
                 output.write_bytes(b'stale')
                 self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
                 self.assertEqual(output.read_bytes(), b'stale')
@@ -181,6 +230,107 @@ class GenerationTests(unittest.TestCase):
                 (vendor / 'VERSION').write_text('v0.12.0\n', encoding='utf-8')
                 self.assertEqual(run('--version', 'v0.11.1'), 0)
                 self.assertTrue((root / 'manual/effetune/v0.12.0/index.html').exists())
+                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.12.0'))
+                self.assertEqual(output.read_bytes(), b'current')  # Older version remains intact.
+
+
+class SplitTests(unittest.TestCase):
+    SOURCE = '''# EQ
+
+## 共通操作
+
+intro
+
+## プラグイン一覧
+
+- [A](#a) - first
+- [B](#b) - second
+
+## B
+
+### パラメータ
+
+[A](#a) [Own](#パラメータ) [Intro](#共通操作)
+
+## A
+
+### パラメータ
+
+[B](eq.md#b) [Subsection](eq.md#パラメータ) [Own](#パラメータ-1)
+'''
+
+    def fixture(self):
+        converter = docs.Converter('plugins/eq.md', {'plugins/eq.md'}, {'plugins/eq.md'})
+        return converter, converter.render(self.SOURCE)
+
+    def test_explicit_list_intro_order_and_globally_stable_ids(self):
+        _, body = self.fixture()
+        intro, plugins = docs.split_category(body, 'eq.html')
+        self.assertIn('id="共通操作"', intro)
+        self.assertNotIn('id="a"', intro)
+        self.assertEqual([p['filename'] for p in plugins], ['eq-a.html', 'eq-b.html'])
+        self.assertIn('id="パラメータ-1"', plugins[0]['body'])
+        self.assertIn('id="パラメータ"', plugins[1]['body'])
+        self.assertIn('<h2 id="パラメータ-1">', docs.plugin_body(plugins[0]['body']))
+
+    def test_missing_unlisted_duplicate_malformed_sections_fail(self):
+        _, body = self.fixture()
+        variants = [
+            body.replace('id="a"', 'id="missing"'),
+            body + '\n<h2 id="unlisted">Unlisted</h2>',
+            body.replace('<h2 id="b">B</h2>', '<h2 id="unlisted">Unknown</h2><h2 id="b">B</h2>'),
+            body.replace('href="#b">B', 'href="#a">B'),
+            body.replace('href="#b">B', 'href="eq.md#b">B'),
+            body.replace('id="プラグイン一覧"', 'id="not-a-list"'),
+            body.replace('<h2 id="a">A</h2>', '<h1 id="a">A</h1>'),
+            body.replace('<h2 id="a">A</h2>', '<h2 id="a">Wrong</h2>'),
+            body.replace('<li><p><a href="#a">', '<li><p>Not a link</p></li><li><p><a href="#a">'),
+        ]
+        for body in variants:
+            with self.subTest(body=body), self.assertRaises(docs.ConversionError):
+                docs.split_category(body, 'eq.html')
+
+    def test_cross_page_in_page_subsection_and_intro_mapping(self):
+        converter, body = self.fixture()
+        intro, plugins = docs.split_category(body, 'eq.html')
+        mapping = docs.split_link_map({'eq.html': ('EQ', '', body)}, {'eq.html': plugins})
+        self.assertEqual(docs.rewrite_split_links(converter.inline('[A](../plugins/eq.md#a)'), 'eq.html', mapping), '<a href="eq-a.html">A</a>')
+        self.assertEqual(docs.rewrite_split_links('<a href="eq.html#a">A</a>', 'bus-function.html', mapping), '<a href="eq-a.html">A</a>')
+        self.assertEqual(docs.rewrite_split_links(converter.inline('[Sub](eq.md?x=1#パラメータ-1)'), 'eq.html', mapping), '<a href="eq-a.html?x=1#パラメータ-1">Sub</a>')
+        rewritten = docs.rewrite_split_links(plugins[1]['body'], 'eq.html', mapping)
+        self.assertIn('href="eq-a.html"', rewritten)
+        self.assertIn('href="eq-b.html#パラメータ"', rewritten)
+        self.assertIn('href="eq.html#共通操作"', rewritten)
+        for origin, target in [('eq.html', '#missing'), ('eq.html', 'unknown.html#a')]:
+            with self.subTest(target=target), self.assertRaises(docs.ConversionError):
+                docs.rewrite_split_links(f'<a href="{target}">x</a>', origin, mapping)
+        self.assertEqual(docs.rewrite_split_links('<a href="https://example.com/#a">x</a>', 'eq.html', mapping), '<a href="https://example.com/#a">x</a>')
+        with self.assertRaises(docs.ConversionError):
+            docs.split_link_map({'eq.html': ('EQ', '', body + body)}, {'eq.html': plugins})
+
+    def test_override_survives_split_and_stale_anchor_fails(self):
+        converter, body = self.fixture()
+        rules = [{'operation': 'replace_inline', 'scope_heading_id': 'a', 'anchor': '[Own](#パラメータ-1)', 'replacement': 'Corrected'}]
+        fixed = docs.apply_overrides(body, rules, converter)
+        _, plugins = docs.split_category(fixed, 'eq.html')
+        self.assertIn('Corrected', plugins[0]['body'])
+        self.assertNotIn('Corrected', plugins[1]['body'])
+        with self.assertRaises(docs.ConversionError):
+            docs.apply_overrides(body.replace('id="a"', 'id="renamed"'), rules, converter)
+        with self.assertRaises(docs.ConversionError):
+            docs.apply_overrides(fixed, rules, converter)
+
+    def test_control_list_correction_is_explicit_and_anchored(self):
+        converter = docs.Converter('plugins/control.md', {'plugins/control.md'}, {'plugins/control.md'})
+        rule = {'operation': 'insert_before_heading', 'heading_id': 'section', 'content': '## プラグイン一覧\n\n- [Section](#section)'}
+        body = converter.render('# 制御\n\n## Section\n\n内容')
+        corrected = docs.apply_overrides(body, [rule], converter)
+        _, plugins = docs.split_category(corrected, 'control.html')
+        self.assertEqual([p['filename'] for p in plugins], ['control-section.html'])
+        with self.assertRaises(docs.ConversionError):
+            docs.apply_overrides(body.replace('id="section"', 'id="renamed"'), [rule], converter)
+        with self.assertRaises(docs.ConversionError):
+            docs.split_category(corrected + '<h2 id="unknown">Unknown</h2>', 'control.html')
 
 
 if __name__ == '__main__':

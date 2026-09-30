@@ -2,6 +2,7 @@
   {
     "operation": "insert_note",
     "heading_id": "基本オーディオプラグイン",
+    "repeat_on_plugins": true,
     "note": "mImageViewer の音響調整はステレオ（2チャンネル）で処理します。このページにある3チャンネル以上の構成例や追加出力への振り分けは、mImageViewer では使えません。Matrix や MultiChannel Panel は、利用できる左右2チャンネルの範囲で使用してください。",
     "reason": "src/video/dsp/bridge.rs:1048,1058 fixes the audio pipe to stereo."
   },

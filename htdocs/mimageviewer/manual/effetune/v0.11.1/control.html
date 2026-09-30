@@ -11,7 +11,7 @@
   <style>.content img { max-width:100%; height:auto; } .content pre { overflow-x:auto; } .content pre.license { white-space:pre-wrap; overflow-wrap:anywhere; } .content li p { margin-bottom:0; } .content ul ul, .content ol ul { margin:0; }</style>
 </head>
 <body>
-<header class="site-header"><span class="logo">mImageViewer</span><nav class="breadcrumb"><a href="../../../index.html">ホーム</a><span class="sep">›</span><a href="../../index.html">マニュアル</a><span class="sep">›</span><a href="../../effetune.html">音響調整</a></nav></header>
+<header class="site-header"><span class="logo">mImageViewer</span><nav class="breadcrumb"><a href="../../../index.html">ホーム</a><span class="sep">›</span><a href="../../index.html">マニュアル</a><span class="sep">›</span><a href="index.html">EffeTune 説明書</a><span class="sep">›</span><a href="control.html">制御プラグイン</a></nav></header>
 <div class="layout">
   <aside class="sidebar"><div class="sidebar-label">EffeTune</div><nav>
     <a href="../../effetune.html">音響調整 (EffeTune)</a>
@@ -21,6 +21,7 @@
 <a href="analyzer.html">アナライザープラグイン</a>
 <a href="basics.html">基本プラグイン</a>
 <a href="control.html" class="active">制御プラグイン</a>
+<a href="control-section.html" class="sub">Section</a>
 <a href="delay.html">ディレイプラグイン</a>
 <a href="dynamics.html">ダイナミクスプラグイン</a>
 <a href="eq.html">イコライザープラグイン</a>
@@ -39,30 +40,9 @@
     <div class="box info"><div class="box-body">この説明は EffeTune (作者: Frieve-A) の<a href="https://github.com/Frieve-A/effetune/tree/f3189f3d9c6a4d692c5709107131f3e1c50a710c/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を mImageViewer 同梱版 (v0.11.1) に合わせて転載・一部修正したものです。</div></div>
 <h1 id="制御エフェクト" class="page-title">制御エフェクト</h1>
 <p>制御エフェクトは、オーディオを直接処理するのではなく、他のエフェクトの動作を管理するための特殊なユーティリティです。複雑なエフェクトチェーンを整理し、扱いやすくするのに役立ちます。</p>
-<h2 id="section">Section</h2>
-<p>Section エフェクトは複数のエフェクトをグループ化し、その部分のチェーン全体を1つのON/OFFトグルでバイパスしたり元に戻したりできます。各エフェクト自身のON/OFF設定は保持されます。</p>
-<h3 id="概要">概要</h3>
+<h2 id="プラグイン一覧">プラグイン一覧</h2>
 <ul>
-<li><p><strong>名前</strong>: Section</p></li>
-<li><p><strong>カテゴリ</strong>: Control</p></li>
-<li><p><strong>説明</strong>: エフェクトをグループ化し、セクション全体をまとめてバイパスしたり元に戻したりします</p></li></ul>
-<h3 id="パラメータ">パラメータ</h3>
-<div class="table-wrap"><table><thead>
-<tr><th style="text-align:left">パラメータ</th><th style="text-align:left">説明</th></tr>
-</thead><tbody>
-<tr><td style="text-align:left">Comment</td><td style="text-align:left">セクションの目的を示す名前または説明</td></tr></tbody></table></div>
-<h3 id="使用方法">使用方法</h3>
-<ol>
-<li><p>まとめて制御したいエフェクトグループの先頭に Section エフェクトを配置します</p></li>
-<li><p>「Comment」フィールドに、セクションの目的が分かる名前を入力します</p></li>
-<li><p>Section エフェクトをOFFにすると、そのセクション内のエフェクトをバイパスします。ONに戻すと、各エフェクト自身のON/OFF状態を保ったままそのセクション内の処理を再び通します</p></li>
-<li><p>Section エフェクトの後に置かれたエフェクトは、次の Section エフェクトが現れるまで、そのセクションの対象になります</p></li></ol>
-<h3 id="応用例">応用例</h3>
-<ul>
-<li><p>関連するエフェクトをまとめる（例: 「EQ調整」「空間系エフェクト」）</p></li>
-<li><p>簡単に切り替えられる別の処理チェーンを作る</p></li>
-<li><p>複雑なエフェクトチェーンを分かりやすいまとまりに整理する</p></li>
-<li><p>エフェクトを削除せずに、一部のグループだけを一時的に無効化する</p></li></ul>
+<li><p><a href="control-section.html">Section</a></p></li></ul>
   </main>
 </div>
 <footer><p>原文: Frieve-A (MIT License) / mImageViewer 向け編集: Mikage Sawatari</p></footer>

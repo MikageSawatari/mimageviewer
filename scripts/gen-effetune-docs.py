@@ -5,6 +5,8 @@ Usage: python scripts/gen-effetune-docs.py [snapshot] [--version v0.11.1] [--che
 VERSION in vendor/effetune-mixwright takes precedence over --version.
 Selection and post-conversion corrections live in docs/effetune-docs-overrides.
 Unpublished Markdown links become plain text; root-relative links go upstream.
+Plugin lists define category/plugin splits; corrections precede link remapping.
+The version-independent effetune/index.html entry redirects to the bundle.
 Only the Markdown/HTML subset used by the published snapshot is accepted.
 """
 from __future__ import annotations
@@ -406,6 +408,10 @@ def apply_overrides(body, rules, converter):
                 anchor = body[match.start():end]
                 replacement = match[0] + '\n' if rule.get('keep_heading') else ''
                 replacement += note_box(converter.inline(rule['note'])) + '\n' if rule.get('note') else ''
+        elif op == 'insert_before_heading':
+            match, _ = section_span(body, rule['heading_id'])
+            anchor = match[0]
+            replacement = converter.render(rule['content']) + '\n' + anchor
         elif op == 'replace_html':
             anchor, replacement = rule['anchor'], rule['replacement']
         elif op == 'replace_inline':
@@ -419,12 +425,108 @@ def apply_overrides(body, rules, converter):
     return body
 
 
-def chrome(title, description, body, filename, pages, version, commit):
+def split_category(body, filename):
+    """Use the category's explicit list, retaining globally assigned heading ids.
+
+    Only sections before/including the list are introductory. Every subsequent
+    h2 must be listed, even if the source order differs from the list order.
+    Corrections run first, so removed subsections cannot acquire dangling links.
+    """
+    listing, end = section_span(body, 'プラグイン一覧')
+    if listing[1] != '2':
+        raise ConversionError(f'Plugin list must be h2: {filename}')
+    content = body[listing.end():end].strip()
+    if not content.startswith('<ul>') or not content.endswith('</ul>'):
+        raise ConversionError(f'Unsupported plugin list: {filename}')
+    entries = []
+    items = re.findall(r'<li>(.*?)</li>', content, re.S)
+    for item in items:
+        match = re.fullmatch(r'<p><a href="#([^"<>]+)">([^<>]+)</a>(?:[^<>]*)</p>', item, re.S)
+        if not match or not re.fullmatch(r'[\w-]+', match[1]):
+            raise ConversionError(f'Unsupported plugin list entry: {filename}: {item}')
+        entries.append((match[1], html.unescape(match[2])))
+    expected = '<ul>\n' + '\n'.join('<li>' + item + '</li>' for item in items) + '</ul>'
+    if not entries or re.sub(r'\s+', '', content) != re.sub(r'\s+', '', expected):
+        raise ConversionError(f'Unknown content in plugin list: {filename}')
+    anchors = [anchor for anchor, _ in entries]
+    if len(anchors) != len(set(anchors)):
+        raise ConversionError(f'Duplicate plugin list anchor: {filename}')
+    sections = list(re.finditer(r'<h([12]) id="([^"]+)"[^>]*>(.*?)</h\1>', body[end:], re.S))
+    if any(section[1] != '2' for section in sections) or {s[2] for s in sections} != set(anchors) or len(sections) != len(entries):
+        raise ConversionError(f'Plugin list/sections mismatch: {filename}: listed={anchors}, sections={[s[2] for s in sections]}')
+    by_anchor = {}
+    for i, section in enumerate(sections):
+        start = end + section.start()
+        finish = end + sections[i + 1].start() if i + 1 < len(sections) else len(body)
+        label = html.unescape(section[3])
+        by_anchor[section[2]] = (label, body[start:finish].strip())
+    plugins = []
+    for anchor, label in entries:
+        section_label, section_body = by_anchor[anchor]
+        if label != section_label:
+            raise ConversionError(f'Plugin list/heading label mismatch: {filename}#{anchor}')
+        plugins.append({'anchor': anchor, 'label': label, 'filename': filename[:-5] + '-' + anchor + '.html', 'body': section_body})
+    return body[:end].strip(), plugins
+
+
+def split_link_map(bodies, categories):
+    """Map original category fragments to their post-correction owner page."""
+    destinations = {}
+    for filename, (_, _, body) in bodies.items():
+        for ident in re.findall(r'\bid="([^"]+)"', body):
+            key = (filename, ident)
+            if key in destinations:
+                raise ConversionError(f'Duplicate generated id: {filename}#{ident}')
+            destinations[key] = (filename, ident)
+    for category, plugins in categories.items():
+        for plugin in plugins:
+            for ident in re.findall(r'\bid="([^"]+)"', plugin['body']):
+                destinations[(category, ident)] = (plugin['filename'], '' if ident == plugin['anchor'] else ident)
+    return destinations
+
+
+def rewrite_split_links(body, origin, destinations):
+    # Overrides see the original converted links. Remap only after validating
+    # their anchors, and resolve in-page links against the source category.
+    def replace(match):
+        parts = urlsplit(html.unescape(match[1]))
+        if parts.scheme or parts.path.startswith('../') or not parts.fragment:
+            return match[0]
+        key = (parts.path or origin, unquote(parts.fragment))
+        if key not in destinations:
+            raise ConversionError(f'Unknown split fragment: {origin} -> {match[1]}')
+        filename, fragment = destinations[key]
+        target = filename + ('?' + parts.query if parts.query else '') + ('#' + fragment if fragment else '')
+        return 'href="' + html.escape(target, quote=True) + '"'
+    return re.sub(r'href="([^"]+)"', replace, body)
+
+
+def plugin_body(body):
+    """Promote plugin h2 and its subsections while preserving fragment ids."""
+    def promote(match):
+        slash, level, attrs = match.groups()
+        level = int(level) - 1
+        cls = ' class="page-title"' if level == 1 and not slash else ''
+        return f'<{slash}h{level}{attrs}{cls}>'
+    return re.sub(r'<(/?)h([2-6])([^>]*)>', promote, body)
+
+
+def chrome(title, description, body, filename, pages, version, commit, categories, category=None):
     esc = html.escape
     nav = ['<a href="../../effetune.html">音響調整 (EffeTune)</a>', '<a href="../../index.html">マニュアル目次</a>']
     for name, label in [('index.html', 'EffeTune 説明書の目次'), *pages, ('license.html', 'MIT License')]:
         active = ' class="active"' if name == filename else ''
         nav.append(f'<a href="{name}"{active}>{esc(label)}</a>')
+        if name == category:
+            for plugin in categories[name]:
+                active = 'sub active' if plugin['filename'] == filename else 'sub'
+                current = ' aria-current="page"' if plugin['filename'] == filename else ''
+                nav.append(f'<a href="{plugin["filename"]}" class="{active}"{current}>{esc(plugin["label"])}</a>')
+    breadcrumb = '<a href="index.html">EffeTune 説明書</a>'
+    if category:
+        breadcrumb += f'<span class="sep">›</span><a href="{category}">{esc(dict(pages)[category])}</a>'
+    if filename not in {'index.html', category}:
+        breadcrumb += f'<span class="sep">›</span><span aria-current="page">{esc(re.sub(r" - EffeTune$", "", title))}</span>'
     url = f'https://mikage.to/mimageviewer/manual/effetune/{version}/{filename}'
     attribution = f'この説明は EffeTune (作者: Frieve-A) の<a href="https://github.com/Frieve-A/effetune/tree/{commit}/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を mImageViewer 同梱版 ({esc(version)}) に合わせて転載・一部修正したものです'
     return f'''<!DOCTYPE html>
@@ -440,7 +542,7 @@ def chrome(title, description, body, filename, pages, version, commit):
   <style>.content img {{ max-width:100%; height:auto; }} .content pre {{ overflow-x:auto; }} .content pre.license {{ white-space:pre-wrap; overflow-wrap:anywhere; }} .content li p {{ margin-bottom:0; }} .content ul ul, .content ol ul {{ margin:0; }}</style>
 </head>
 <body>
-<header class="site-header"><span class="logo">mImageViewer</span><nav class="breadcrumb"><a href="../../../index.html">ホーム</a><span class="sep">›</span><a href="../../index.html">マニュアル</a><span class="sep">›</span><a href="../../effetune.html">音響調整</a></nav></header>
+<header class="site-header"><span class="logo">mImageViewer</span><nav class="breadcrumb"><a href="../../../index.html">ホーム</a><span class="sep">›</span><a href="../../index.html">マニュアル</a><span class="sep">›</span>{breadcrumb}</nav></header>
 <div class="layout">
   <aside class="sidebar"><div class="sidebar-label">EffeTune</div><nav>
     {chr(10).join(nav)}
@@ -476,7 +578,7 @@ def generate(snapshot, version):
         raise ConversionError("SOURCE.md must identify the 40-character upstream commit")
     commit = match[1]
     images = {p.name for p in (snapshot / 'images').iterdir() if p.is_file()}
-    pages, bodies = [], {}
+    pages, bodies, categories, contexts = [], {}, {}, {}
     overrides = {p.stem: json.loads(p.read_text(encoding='utf-8')) for p in sorted(RULES.glob('*.json')) if p.name != 'selection.json'}
     if set(overrides) - set(stems):
         raise ConversionError("Override for an unpublished page")
@@ -492,11 +594,55 @@ def generate(snapshot, version):
         filename = path.stem + '.html'
         pages.append((filename, label))
         bodies[filename] = (title, meta.get('description', label), body)
-    listing = '\n'.join(f'<li><a href="{name}">{html.escape(label)}</a></li>' for name, label in pages)
+        if page.startswith('plugins/'):
+            _, categories[filename] = split_category(body, filename)
+            contexts[filename] = []
+            for rule in overrides.get(path.stem, []):
+                if rule.get('repeat_on_plugins'):
+                    heading, _ = section_span(body, rule['heading_id'])
+                    if rule['operation'] != 'insert_note' or heading[1] != '1' or rule.get('scope_heading_id'):
+                        raise ConversionError('Only category h1 notes may repeat on plugin pages')
+                    contexts[filename].append(note_box(converter.inline(rule['note'])))
+    destinations = split_link_map(bodies, categories)
+    owners = {}
+    for category, plugins in categories.items():
+        title, description, full_body = bodies[category]
+        intro, _ = split_category(full_body, category)
+        bodies[category] = (title, description, rewrite_split_links(intro, category, destinations))
+        owners[category] = category
+        for i, plugin in enumerate(plugins):
+            name = plugin['filename']
+            if name in bodies or name in {'index.html', 'license.html'}:
+                raise ConversionError(f'Split filename collision: {name}')
+            links = []
+            if i:
+                previous = plugins[i - 1]
+                links.append(f'<a rel="prev" href="{previous["filename"]}">前へ: {html.escape(previous["label"])}</a>')
+            if i + 1 < len(plugins):
+                following = plugins[i + 1]
+                links.append(f'<a rel="next" href="{following["filename"]}">次へ: {html.escape(following["label"])}</a>')
+            navigation = '<nav aria-label="カテゴリ内の前後のエフェクト">' + ' / '.join(links) + '</nav>' if links else ''
+            # Include a category introduction link so shared instructions (e.g.
+            # spectrum overlay) remain discoverable from direct plugin visits.
+            context = '\n'.join(contexts[category]) + f'\n<p><a href="{category}">カテゴリの説明とプラグイン一覧</a></p>'
+            body = plugin_body(plugin['body'])
+            heading_end = body.index('</h1>') + len('</h1>')
+            body = rewrite_split_links(body[:heading_end] + '\n' + context + body[heading_end:], category, destinations)
+            bodies[name] = (plugin['label'] + ' - EffeTune', plugin['label'] + ' の設定と使い方。', body + '\n' + navigation)
+            owners[name] = category
+    for name in set(bodies) - set(owners):
+        title, description, body = bodies[name]
+        bodies[name] = (title, description, rewrite_split_links(body, name, destinations))
+    listing = []
+    for name, label in pages:
+        plugins = categories.get(name, [])
+        sublist = '<ul>' + ''.join(f'<li><a href="{p["filename"]}">{html.escape(p["label"])}</a></li>' for p in plugins) + '</ul>' if plugins else ''
+        listing.append(f'<li><a href="{name}">{html.escape(label)}</a>{sublist}</li>')
+    listing = '\n'.join(listing)
     bodies['index.html'] = ('EffeTune 説明書', 'mImageViewer 同梱 EffeTune のエフェクトと操作の説明。', '<h1 class="page-title">EffeTune 説明書</h1>\n<p>mImageViewer での開き方、設定の保存先、リモート配信の注意点は<a href="../../effetune.html">音響調整 (EffeTune)</a>をご覧ください。エフェクトごとの設定と画面内の操作を以下にまとめています。</p>\n<ul>' + listing + '</ul>')
     license_text = (snapshot / 'LICENSE').read_text(encoding='utf-8')
     bodies['license.html'] = ('EffeTune — MIT License', '転載元 EffeTune の MIT License 全文。', '<h1 class="page-title">MIT License</h1>\n<pre class="license">' + html.escape(license_text) + '</pre>')
-    result = {name: chrome(title, description, body, name, pages, version, commit).encode('utf-8') for name, (title, description, body) in bodies.items()}
+    result = {name: chrome(title, description, body, name, pages, version, commit, categories, owners.get(name)).encode('utf-8') for name, (title, description, body) in bodies.items()}
     # Check all generated Markdown links after corrections (including fragments).
     ids = {name: set(re.findall(r'\bid="([^"]+)"', content.decode())) for name, content in result.items()}
     for name, content in result.items():
@@ -510,6 +656,24 @@ def generate(snapshot, version):
     for name in sorted(images):
         result['images/' + name] = (snapshot / 'images' / name).read_bytes()
     return result
+
+
+def entry_page(version):
+    target = version + '/index.html'
+    return f'''<!DOCTYPE html>
+<!-- Generated by scripts/gen-effetune-docs.py; edit the script, not this file. -->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <meta http-equiv="refresh" content="0; url={target}">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune/{target}">
+  <title>EffeTune 説明書｜mImageViewer</title>
+</head>
+<body><p><a href="{target}">EffeTune 説明書を開く</a></p></body>
+</html>
+'''.encode('utf-8')
 
 
 def main():
@@ -531,11 +695,14 @@ def main():
     existing = {p.relative_to(destination).as_posix() for p in destination.rglob('*') if p.is_file()}
     stale = sorted(name for name, data in output.items() if not (destination / name).is_file() or (destination / name).read_bytes() != data)
     extra = sorted(existing - set(output))
+    entry = MANUAL / 'effetune/index.html'
+    entry_data = entry_page(version)
+    entry_stale = not entry.is_file() or entry.read_bytes() != entry_data
     if args.check:
-        if stale or extra:
-            print(f'Stale EffeTune output: changed/missing={stale}, unexpected={extra}', file=sys.stderr)
+        if stale or extra or entry_stale:
+            print(f'Stale EffeTune output: changed/missing={stale}, unexpected={extra}, entry_stale={entry_stale}', file=sys.stderr)
             return 1
-        print(f'EffeTune output is current: {len(output)} files ({version})')
+        print(f'EffeTune output is current: {len(output)} version files + entry ({version})')
         return 0
     # Remove only known generated page/image files; refuse arbitrary extra files.
     if extra:
@@ -546,7 +713,9 @@ def main():
         path.parent.mkdir(parents=True, exist_ok=True)
         if name in stale:
             path.write_bytes(data)
-    print(f'Generated {len(output)} files ({version}); updated {len(stale)}')
+    if entry_stale:
+        entry.write_bytes(entry_data)
+    print(f'Generated {len(output)} version files + entry ({version}); updated {len(stale) + int(entry_stale)}')
     return 0
 
 
