@@ -1018,7 +1018,7 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   AI の高精度 mtime の差し替え / 認証・generation の通らない 204
 - 既存の page / admission / coordinator / thumbnail のテストが通ること
 
-#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第2版 2026-10-01、設計レビュー待ち)
+#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第3版 2026-10-01、設計レビュー待ち)
 
 写真のスライドショーのようにゆっくりめくる用途を快適にするため、Remote でも RAW の先読み現像を行う
 (利用者の提案 2026-09-29。なるべく早く実装する方針)。PC と同じく **先 2 枚・前 1 枚** (決定 3)。
@@ -1043,35 +1043,64 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
 第2版は **ブラウザが窓そのものを宣言し、本体はそれに合わせるだけ**にする。page 要求の経路は S2b のまま変えない。
 
 1. **wire: 窓の宣言 (`RawPrefetchWindowRequest`、protocol 65)**
-   - ブラウザは **表示の切り替わりごとに 1 回** (group の表示が確定した時点。見開きの各 slot や再試行では出さない)、
-     `POST /api/raw-prefetch-window` で `{ window_generation: u64, entries: [RemoteAddress] }` を送る。
-     `window_generation` はブラウザの viewer ごとに単調増加
+   - ブラウザは **表示の切り替わりごとに 1 回**、`POST /api/raw-prefetch-window` で
+     `{ window_generation: u64, entries: [RemoteAddress] }` を送る。出す場所は **表示の共通の確定点**
+     (`crates/remote-web/web/app.js:14584` の presentation commit) で、見開きの各 slot・再試行・キャッシュ済みの表示を
+     含めて「表示単位が確定したとき」に 1 回。`viewer-position.mjs:43` の初期位置の扱いには頼らず、宣言用の印
+     (直前に宣言した表示単位) を別に持つ
+   - `window_generation` は **Remote session (ブラウザの session 取得) ごとに単調増加**する 1 本の counter とし、
+     viewer を閉じて開き直しても続きから数える (viewer ごとに振り直さない)。session を取り直したら 0 から
+   - 送信は「最新値だけ」: 送信中に次の宣言ができたら古い方は捨てて最新だけを送る。失敗 (非 2xx・通信失敗) したら
+     最新の宣言を既存の backoff で再送する。session を取り直した後・再接続した後は、最新の宣言を送り直す
+   - 上限: `entries` は最大 8、address は既存の page 要求と同じ検証。remote-web では `IpcClass::Home` 相当の短い
+     control 経路として扱い、session の attestation を page 要求と同じく付ける
    - `entries` は、表示中の group の端から **先 1・先 2・前 1 枚** の位置にある画像の address (画像単位。進行方向は
      `state.pageDirection`、`pagePrefetchPlan` と同じ規則。`command-core.mjs:2709-2738`)。ブラウザが bytes を
      持っているかどうか、以前 SKIPPED になったかどうかに関係なく入れる。見開きの相方・表紙の補助 slot は、その画像
      自身の位置が窓に入るときだけ入れる (group の他 slot の距離を流用しない)。RAW かどうかはブラウザは判断しない
-   - 表示を閉じる / container を離れるときは空の `entries` を送る
+   - 表示を閉じる / container を離れるときは空の `entries` を送る (上と同じ最新値送信で、失敗すれば再送する)
 2. **core: `RemoteRawPrefetchWindow` (Remote session ごとに 1 つ) の突き合わせ**
-   - 受け取った `window_generation` が既知の値以下なら捨てる (遅れて届いた古い宣言)
-   - 各 entry について、§10.2.2 (1b) の規則で source を **特定だけ** する (中央ディレクトリの情報まで。RAW payload は
-     読まない)。RAW で、(3) の cache に無く、進行中の foreground / AI の flight にも無いものを **望まれる集合**とする。
-     entry 自身の source だけを対象にし、その entry の自動トリムの相方などの依存は起動しない
-   - 突き合わせ (lock の中で決め、flight の操作は lock の外): 望まれる集合にあって走っていないものは開始、両方にあるものは
-     そのまま (現像をやり直さない)、走っているが集合に無いものは取消。同じ宣言を 2 回受けても結果は同じ (冪等)
+   - **受付と処理を分ける**: IPC の reader thread (`src/remote_ipc/pipe.rs:2692` の PageDemand と同じ位置) では、宣言を
+     session ごとの **最新値の受け箱** に置いて即座に ack するだけにする (heavy lane に積まない。archive I/O をしない)。
+     受け箱は 1 session に 1 つで、置くたびに前の未処理の宣言を上書きする。処理は service に 1 本の専用 worker が行う
+   - worker は受け箱から取り出した宣言について、`window_generation` が既知の値以下なら捨てる
+   - 各 entry について source を **特定だけ** する。**S2c の対象は、通常ファイルの RAW と、ZIP に直接入っている RAW entry
+     (入れ子の ZIP の中ではないもの) に限る**。後者は外側 ZIP の中央ディレクトリの展開後サイズを見て、**256 MiB を超える
+     ものは対象にしない**。入れ子の ZIP の中の RAW、変換アーカイブの中の入れ子は先読みしない (前景で開けば S2b どおり
+     現像する)。これで特定は中央ディレクトリの読み取りだけになり、入れ子の器を展開しない
+   - RAW で (3) の cache に無いものを **望まれる集合** とする (進行中の flight があるかどうかは集合に関係しない。
+     下の「開始」で既存の flight に join する)。entry 自身の source だけを対象にし、自動トリムの相方などの依存は起動しない
+   - 特定の後、集合を反映する前に、**その宣言の generation がまだ最新で、owner が終端していないこと**を確かめる
+     (遅い特定が、後から来た空の宣言を上書きしない)
+   - 突き合わせ (lock の中で決め、flight の操作は lock の外): 望まれる集合にあって window の waiter が無いものは開始
+     (**既存の foreground / AI の flight があればそれに join して window 自身の lease を持つ**。無ければ新しい flight)、
+     両方にあるものはそのまま (現像をやり直さない)、waiter があるが集合に無いものは取消。同じ宣言を 2 回受けても結果は
+     同じ (冪等)。foreground / AI の waiter が離れても、window の lease がある限り flight は続く
    - 各先読みは **detached waiter** (専用 thread) が `develop_with_priority(Normal)` の waiter として保持し、結果を (3) の
      cache に入れさせる。waiter の状態は `Pending` (capacity 待ち) / `Running` / `Retiring` (取消後、thread の終了待ち)。
      waiter ID で完了を照合し、古い waiter の完了や後片付けが新しい waiter を消さない
    - `Retiring` の thread も終わるまで数える。thread の総数の上限は **窓 3 + retiring 3 = 6**。上限に達している間は新しい
      開始を `Pending` にとどめ、thread が終わった通知で (まだ望まれていれば) 始める
-   - capacity (5.) で断られたものも `Pending` に置き、capacity の空き通知で、まだ望まれていれば始める
+   - capacity (5.) の取りこぼし防止: `RemoteRawFlights` に **capacity の epoch** (outstanding が減るたびに +1) を持たせ、
+     prefetch の開始は「capacity があれば flight を作る、無ければその epoch を返す」を **flights の lock の中で 1 回で**
+     行う API にする。owner は返された epoch を `Pending` に記録し、epoch が進んだ通知 (Condvar) で再試行する。
+     判定と記録が同じ lock の中なので、Capacity を受けてから Pending を記録するまでの間に空いた分を取りこぼさない
+   - thread の slot は spawn の前に予約する。spawn に失敗したら予約を戻して `Pending` のまま (次の epoch か次の宣言で
+     再試行)。早い完了・取消・次の宣言による置き換え (古い waiter が `Retiring` の間に同じ identity が再び望まれた場合は、
+     新しい waiter として始める。古い waiter の完了は waiter ID で無視する) をテストで固定する
    - 取消した waiter は同じ宣言の中で「生き返らせない」。次の宣言で再び望まれれば新しい waiter として始める
 3. **flight: 優先度の引き上げを取りこぼさない**
    - flight の状態に「要求された最高の優先度」を持たせる。`Submitting` 中に High の waiter が join したら、その値を High に
      更新する。submit はその時点の値で行い、ticket が付いた後で値が submit 時より高ければ、lock の外で
      `promote_to_high` する (source を読んでいる最中に前景がめくった場合も High になる)
 4. **session / 接続の lifecycle**
-   - `RemoteRawPrefetchWindow` を session と接続の終了処理に登録する: drain (取得の交代・logout・timeout)、接続断、
-     service stop、起動失敗で、全 waiter を取消して **以後の宣言を受け付けない** (終端)。終端後に届いた宣言は捨てる
+   - owner は **Remote session に 1 つ**。session の終了 (共通の drain 経路 `src/remote_ipc/session.rs:1816`。取得の交代・
+     logout・liveness / idle の期限切れ `:1513`, `:1556` を含む) と service stop / 起動失敗で **終端** し、全 waiter を取消して
+     以後の宣言を捨てる。session を取り直したら新しい owner を作る (generation も 0 から)
+   - **接続断は終端ではない** (session は残り、remote-web は自動で再接続する、`src/remote_ipc/session.rs:1719`、
+     `crates/remote-web/src/ipc_client.rs:1762`)。接続断では owner の全 waiter を取消して窓を空にするだけで、owner は
+     残す。再接続後にブラウザが最新の宣言を送り直す (1.) ので、そこから窓が戻る
+   - `Retiring` の thread は owner の交代や終端をまたいで、終わるまで service 全体の上限に数える
    - 取消は先読みの waiter の lease だけを外す。同じ flight に join している foreground / AI の waiter は残る
 5. **予算 (flight に admission class を持たせる)**
    - `RemoteRawFlights` の outstanding を flight_id ごとに class 付きで数える: foreground 由来 ≤ 6、prefetch 由来 ≤ 3、
@@ -1079,11 +1108,12 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
      join して High に上がっても、数える枠は prefetch のまま。移し替えの競合を作らない)。既存の flight への join は枠を消費しない
 6. **cache**: `max_cached_entries = 4` (表示中 1 + 窓 3)、`max_cached_bytes = 1 GiB`。PC のフルスクリーンからは使わない。
    決定 13 の「最後の 1 枚」を S2c でこの窓の分まで広げる (利用者の提案に基づく拡張)
-7. **source bytes の上限 (ZIP 内の RAW)**: 通常ファイルの RAW は LibRaw が直接ファイルを開くので source bytes を持たない。
-   ZIP 内の RAW の先読みは、entry の展開後サイズが **256 MiB を超えるものは対象にしない** (先読みしないだけ。前景で
-   開けば従来どおり現像する)。先読み由来の source bytes は同時に最大 3 件 (prefetch の枠) なので最大 768 MiB。
-   peak の見積もり: executor の並列数 × 1 回の現像のメモリ + 先読みの source bytes (≤ 768 MiB) + 前景の source bytes
-   (≤ 6 件) + cache (≤ 1 GiB) + flight が保持中の結果と要求内の pin。すべて固定の値で決まる
+7. **source bytes の上限**: 通常ファイルの RAW は LibRaw が直接ファイルを開くので source bytes を持たない。先読みの対象の
+   ZIP entry は直接の entry だけで、中央ディレクトリの展開後サイズが 256 MiB 以下のもの (2.)。読み込みにもその長さを
+   上限として課し、超えたら読むのをやめて対象外にする (中央ディレクトリの値と実データが食い違う壊れた書庫への備え)。
+   `Arc<[u8]>` への変換で一時的に 2 倍になり得るので、先読み 1 件の source の peak は 512 MiB、同時に最大 3 件
+   (prefetch の枠) で 1.5 GiB。peak の見積もり: executor の並列数 × 1 回の現像のメモリ + 先読みの source (≤ 1.5 GiB) +
+   前景の source (S2b の規則) + cache (≤ 1 GiB) + flight が保持中の結果と要求内の pin。すべて固定の値で決まる
 8. **優先度**: 先読み現像は Normal。前景・AI が join すれば (3.) で High に上がる。executor の並列数 (既定 3) は PC と共有
 9. **テスト**
    - Web (node): 表示の切り替わりごとに宣言が 1 回だけ出る (見開き・再試行・キャッシュ済みページでも正しい窓)、
@@ -1093,8 +1123,12 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
      後片付け)、自動トリムの相方を起動しない、256 MiB 超の ZIP entry を対象にしない
    - flight: `Submitting` 中の High join、submit と ticket 付与の間の High join、admission class の 6 / 3 / 9、join が枠を
      消費しない、class が昇格で変わらない
-   - lifecycle: drain・logout・timeout・接続断・stop・起動失敗で全取消、終端後の宣言を捨てる、同じ flight の前景
-     waiter が残る
+   - lifecycle: drain・logout・liveness / idle 期限切れ・stop・起動失敗で終端して全取消、終端後の宣言を捨てる、接続断は
+     終端せず窓を空にするだけで再接続後の再宣言で戻る、同じ flight の前景 waiter が残る
+   - 第3版の追加: viewer を開き直しても generation が続く、キャッシュ済みの初回表示でも宣言が出る、宣言の送信失敗の
+     再送と最新値の合流、受け箱の上書き、遅い特定が後の空の宣言を上書きしない、foreground / AI の flight に window が
+     join して前景が離れても現像が続く、capacity を受けてから Pending を記録する前に空いた場合の再開、spawn 失敗、
+     入れ子の ZIP の RAW と 256 MiB 超を対象にしない、実データが中央ディレクトリより長い壊れた entry
 
 **期待できる効果** (S1 の実測からの見込み、未確認): 1 ページを見ている時間が現像時間 (一般的な機種で約 0.5〜2.5 秒、
 X-T4 は約 13 秒) より長ければ、めくった瞬間に表示される。速くめくると追いつかない
@@ -1363,3 +1397,11 @@ P1×2 / P2×5。第1版の「Prefetch の page 要求に距離を付けて窓を
 組み直した。ほか: `Submitting` 中の High join を記録して submit 後に昇格 (P1)、admission class で 6 / 3 / 9 (P2)、
 waiter の `Pending` / `Running` / `Retiring` と ID 照合・thread 上限・capacity 待ちの再開 (P2)、session / 接続の lifecycle への
 登録と終端 (P2)、依存の対象を entry 自身に限る (P2)、ZIP の source bytes の上限 (P2)。
+
+### 20.12 S2c の設計レビュー (2026-10-01、第2版)
+
+前回 7 件のうち 3 件解決 (Submitting 中の昇格、admission class、相方の位置)。新規・残り (P1×2 / P2×4) を採用:
+generation を session 単位の 1 本の counter にし表示の共通確定点から出す (P1)、望まれる集合を flight の有無と切り離し
+既存 flight へ join して window の lease を持つ (P1)、宣言の最新値送信と受け箱 + 専用 worker・特定後の世代確認 (P2)、
+接続断は終端しない・session 単位の owner (P2)、capacity epoch を lock の中で返す API と slot の事前予約 (P2)、
+先読みの対象を直接の ZIP entry に限り入れ子の展開をしない・実データの長さ上限と変換の peak (P2)。
