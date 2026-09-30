@@ -1018,7 +1018,7 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   AI の高精度 mtime の差し替え / 認証・generation の通らない 204
 - 既存の page / admission / coordinator / thumbnail のテストが通ること
 
-#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第3版 2026-10-01、設計レビュー待ち)
+#### 10.2.3 表示位置からの先読み現像 (S2c、詳細設計 第4版 2026-10-01、設計レビュー待ち)
 
 写真のスライドショーのようにゆっくりめくる用途を快適にするため、Remote でも RAW の先読み現像を行う
 (利用者の提案 2026-09-29。なるべく早く実装する方針)。PC と同じく **先 2 枚・前 1 枚** (決定 3)。
@@ -1046,12 +1046,16 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
    - ブラウザは **表示の切り替わりごとに 1 回**、`POST /api/raw-prefetch-window` で
      `{ window_generation: u64, entries: [RemoteAddress] }` を送る。出す場所は **表示の共通の確定点**
      (`crates/remote-web/web/app.js:14584` の presentation commit) で、見開きの各 slot・再試行・キャッシュ済みの表示を
-     含めて「表示単位が確定したとき」に 1 回。`viewer-position.mjs:43` の初期位置の扱いには頼らず、宣言用の印
-     (直前に宣言した表示単位) を別に持つ
+     含めて「表示単位が確定したとき」に 1 回。`viewer-position.mjs:43` の初期位置の扱いには頼らず、宣言用の印を
+     別に持つ。印は **(表示単位、進行方向、計算した窓の address の並び)** で、これが直前と同じなら出さない (同じ表示単位
+     へ戻っても方向が変われば窓が変わるので出す)
    - `window_generation` は **Remote session (ブラウザの session 取得) ごとに単調増加**する 1 本の counter とし、
      viewer を閉じて開き直しても続きから数える (viewer ごとに振り直さない)。session を取り直したら 0 から
-   - 送信は「最新値だけ」: 送信中に次の宣言ができたら古い方は捨てて最新だけを送る。失敗 (非 2xx・通信失敗) したら
-     最新の宣言を既存の backoff で再送する。session を取り直した後・再接続した後は、最新の宣言を送り直す
+   - 送信は「最新値だけ」: 送信中に次の宣言ができたら古い方は捨てて最新だけを送る。**再送は一時的な失敗 (通信失敗・
+     混雑の 503) のときだけ**、送信時に捕まえた session がまだ有効な間だけ既存の backoff で行う。検証・認証の失敗は
+     再送しない。session が無効になったら送信中の要求と backoff を中止する
+   - session を取り直したら、**古い宣言の中身は再送しない** (`observedFetch` の本文の再送 `app.js:16168` を使わない)。
+     新しい session の counter で、その時点の窓から宣言を作り直して送る
    - 上限: `entries` は最大 8、address は既存の page 要求と同じ検証。remote-web では `IpcClass::Home` 相当の短い
      control 経路として扱い、session の attestation を page 要求と同じく付ける
    - `entries` は、表示中の group の端から **先 1・先 2・前 1 枚** の位置にある画像の address (画像単位。進行方向は
@@ -1062,16 +1066,17 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
 2. **core: `RemoteRawPrefetchWindow` (Remote session ごとに 1 つ) の突き合わせ**
    - **受付と処理を分ける**: IPC の reader thread (`src/remote_ipc/pipe.rs:2692` の PageDemand と同じ位置) では、宣言を
      session ごとの **最新値の受け箱** に置いて即座に ack するだけにする (heavy lane に積まない。archive I/O をしない)。
-     受け箱は 1 session に 1 つで、置くたびに前の未処理の宣言を上書きする。処理は service に 1 本の専用 worker が行う
-   - worker は受け箱から取り出した宣言について、`window_generation` が既知の値以下なら捨てる
+     受け箱は 1 session に 1 つ。**owner の lock の中で、受け付け済みの最大 generation より大きいときだけ受け箱を差し替え、
+     受け付け済みの最大値を更新する**。それ以下 (遅れて届いた古い宣言・重複) は ack だけして受け箱を触らない。
+     処理は service に 1 本の専用 worker が行い、受け箱から取り出した宣言の generation を後の確認に使う
    - 各 entry について source を **特定だけ** する。**S2c の対象は、通常ファイルの RAW と、ZIP に直接入っている RAW entry
      (入れ子の ZIP の中ではないもの) に限る**。後者は外側 ZIP の中央ディレクトリの展開後サイズを見て、**256 MiB を超える
      ものは対象にしない**。入れ子の ZIP の中の RAW、変換アーカイブの中の入れ子は先読みしない (前景で開けば S2b どおり
      現像する)。これで特定は中央ディレクトリの読み取りだけになり、入れ子の器を展開しない
    - RAW で (3) の cache に無いものを **望まれる集合** とする (進行中の flight があるかどうかは集合に関係しない。
      下の「開始」で既存の flight に join する)。entry 自身の source だけを対象にし、自動トリムの相方などの依存は起動しない
-   - 特定の後、集合を反映する前に、**その宣言の generation がまだ最新で、owner が終端していないこと**を確かめる
-     (遅い特定が、後から来た空の宣言を上書きしない)
+   - 特定の後、集合を反映する前に、**その宣言の generation がまだ受け付け済みの最大値と等しく、owner が終端していないこと**
+     を確かめる (遅い特定が、後から来た空の宣言を上書きしない)
    - 突き合わせ (lock の中で決め、flight の操作は lock の外): 望まれる集合にあって window の waiter が無いものは開始
      (**既存の foreground / AI の flight があればそれに join して window 自身の lease を持つ**。無ければ新しい flight)、
      両方にあるものはそのまま (現像をやり直さない)、waiter があるが集合に無いものは取消。同じ宣言を 2 回受けても結果は
@@ -1081,10 +1086,11 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
      waiter ID で完了を照合し、古い waiter の完了や後片付けが新しい waiter を消さない
    - `Retiring` の thread も終わるまで数える。thread の総数の上限は **窓 3 + retiring 3 = 6**。上限に達している間は新しい
      開始を `Pending` にとどめ、thread が終わった通知で (まだ望まれていれば) 始める
-   - capacity (5.) の取りこぼし防止: `RemoteRawFlights` に **capacity の epoch** (outstanding が減るたびに +1) を持たせ、
-     prefetch の開始は「capacity があれば flight を作る、無ければその epoch を返す」を **flights の lock の中で 1 回で**
-     行う API にする。owner は返された epoch を `Pending` に記録し、epoch が進んだ通知 (Condvar) で再試行する。
-     判定と記録が同じ lock の中なので、Capacity を受けてから Pending を記録するまでの間に空いた分を取りこぼさない
+   - capacity (5.) の待ち: `RemoteRawFlights` に **capacity の epoch** (outstanding が減るたびに +1) を持たせる。worker は
+     `Pending` があるとき、**上限付きの wait (50ms) で待ち、起きるたびに (a) capacity の epoch が記録値より進んだか、
+     (b) 受け箱に新しい宣言があるか、(c) 取消・終端が来たか** を確かめる (既存の flight の待ちと同じ形、
+     `src/remote_ipc/raw_flights.rs:682`)。通知を取りこぼしても最大 50ms で拾い直すので、Capacity を受けてから
+     Pending を記録するまでに空いた分を失わない。受け箱への投入・取消・終端は worker を起こす (notify)
    - thread の slot は spawn の前に予約する。spawn に失敗したら予約を戻して `Pending` のまま (次の epoch か次の宣言で
      再試行)。早い完了・取消・次の宣言による置き換え (古い waiter が `Retiring` の間に同じ identity が再び望まれた場合は、
      新しい waiter として始める。古い waiter の完了は waiter ID で無視する) をテストで固定する
@@ -1097,9 +1103,11 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
    - owner は **Remote session に 1 つ**。session の終了 (共通の drain 経路 `src/remote_ipc/session.rs:1816`。取得の交代・
      logout・liveness / idle の期限切れ `:1513`, `:1556` を含む) と service stop / 起動失敗で **終端** し、全 waiter を取消して
      以後の宣言を捨てる。session を取り直したら新しい owner を作る (generation も 0 から)
-   - **接続断は終端ではない** (session は残り、remote-web は自動で再接続する、`src/remote_ipc/session.rs:1719`、
-     `crates/remote-web/src/ipc_client.rs:1762`)。接続断では owner の全 waiter を取消して窓を空にするだけで、owner は
-     残す。再接続後にブラウザが最新の宣言を送り直す (1.) ので、そこから窓が戻る
+   - **接続断は window の出来事として扱わない** (session は残り、remote-web は自動で再接続する、
+     `src/remote_ipc/session.rs:1719`、`crates/remote-web/src/ipc_client.rs:1762`)。接続断で waiter を取消さず、窓も空に
+     しない。ブラウザが本当にいなくなった場合は、session の liveness / idle の期限切れ (上の終端) で終わる。これで再接続の
+     合図・窓の再構築・古い接続の close が新しい窓を消す競合が生じない。再接続後の次の表示で、より大きい generation の
+     宣言が届けばそのまま突き合わせる
    - `Retiring` の thread は owner の交代や終端をまたいで、終わるまで service 全体の上限に数える
    - 取消は先読みの waiter の lease だけを外す。同じ flight に join している foreground / AI の waiter は残る
 5. **予算 (flight に admission class を持たせる)**
@@ -1123,8 +1131,11 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
      後片付け)、自動トリムの相方を起動しない、256 MiB 超の ZIP entry を対象にしない
    - flight: `Submitting` 中の High join、submit と ticket 付与の間の High join、admission class の 6 / 3 / 9、join が枠を
      消費しない、class が昇格で変わらない
-   - lifecycle: drain・logout・liveness / idle 期限切れ・stop・起動失敗で終端して全取消、終端後の宣言を捨てる、接続断は
-     終端せず窓を空にするだけで再接続後の再宣言で戻る、同じ flight の前景 waiter が残る
+   - lifecycle: drain・logout・liveness / idle 期限切れ・stop・起動失敗で終端して全取消、終端後の宣言を捨てる、接続断では
+     何も取消さない、同じ flight の前景 waiter が残る
+   - 第4版の追加: worker が処理する前に generation 11 → 10 の順で届いても 11 が残る、重複の ack、session の期限切れ中の
+     backoff 中止、送信中に session を取り直したとき古い本文を再送せず作り直す、同じ表示単位へ戻って方向が変わったら
+     宣言が出る、Capacity を受けた直後に空いた場合を 50ms 以内に拾う
    - 第3版の追加: viewer を開き直しても generation が続く、キャッシュ済みの初回表示でも宣言が出る、宣言の送信失敗の
      再送と最新値の合流、受け箱の上書き、遅い特定が後の空の宣言を上書きしない、foreground / AI の flight に window が
      join して前景が離れても現像が続く、capacity を受けてから Pending を記録する前に空いた場合の再開、spawn 失敗、
@@ -1405,3 +1416,11 @@ generation を session 単位の 1 本の counter にし表示の共通確定点
 既存 flight へ join して window の lease を持つ (P1)、宣言の最新値送信と受け箱 + 専用 worker・特定後の世代確認 (P2)、
 接続断は終端しない・session 単位の owner (P2)、capacity epoch を lock の中で返す API と slot の事前予約 (P2)、
 先読みの対象を直接の ZIP entry に限り入れ子の展開をしない・実データの長さ上限と変換の peak (P2)。
+
+### 20.13 S2c の設計レビュー (2026-10-01、第3版)
+
+前回 6 件のうち 3 件解決 (generation の単位と出す場所、flight の有無と望まれる集合の分離、入れ子の source の上限)。
+残り (P1×1 / P2×3 / P3×1) を採用: 受け箱は受け付け済みの最大 generation より大きいときだけ差し替える (P1)、
+接続断を window の出来事として扱わない (再接続の合図・窓の再構築が不要になる) (P2)、再送は一時的な失敗・有効な session の
+間だけで session を取り直したら作り直す (P2)、capacity の待ちを既存 flight と同じ上限付き wait で拾い直す (P2)、
+宣言の印に方向と窓の並びを含める (P3)。
