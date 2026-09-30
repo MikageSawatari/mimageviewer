@@ -1605,9 +1605,9 @@ impl crate::app::App {
             self.toggle_subfolder_stack_mode();
             return;
         }
-        let Some(folder) = self.current_folder.clone() else {
+        if self.current_folder.is_none() {
             return;
-        };
+        }
         // トグル前のカーソル画像 (代表パス) を捕まえ、トグル後も同じ被写体に留まるようにする。
         let target = self.current_selected_representative_path();
         // 通常フォルダでの選択は名前ベースの select_after_load で復元する (ON 時の計算中の
@@ -1626,7 +1626,7 @@ impl crate::app::App {
         } else {
             None
         };
-        self.load_folder(folder);
+        self.reload_current_folder_preserving_override();
         // スクリプトをワーカーで計算中 (async) のときは、ここではトーストしない。完了時に
         // poll_stack_script が採用ルール / 失敗 / 非該当のトーストを出す。
         if self.stack_mode_requested && self.stack_script_pending.is_none() {

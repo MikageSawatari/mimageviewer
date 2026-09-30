@@ -36,6 +36,16 @@
 - 実装時は [EffeTune 計画 §4](effetune-integration-plan.md#4-ウィンドウ) の一時非表示理由集合を使い、
   `Minimized` だけを設定で切り替える。`RemoteSession` による非表示と、元から隠していた窓を復帰させない規則を保つ。
 
+### 1.313 コレクションの実フォルダ子で代表サムネを固定すると親復帰先と履歴が変わる — 修正済み (2026-10-01)
+
+- 観測者: 利用者。2026-10-01、v430-integration のコレクションで登録実フォルダを開き、右クリック「📌 代表サムネに固定」を実行すると、BS が実フォルダの親へ移動し、戻る履歴に画像一覧が二重に現れる。固定しなければ collection root へ戻る。設計担当のコード調査では v4.2.0 にも同じ経路がある。
+- 原因: `consume_folder_thumb_pin_dirty` がスクロール復元用 `folder_history` を消して `load_folder(cur)` を通常 Navigation owner で実行し、CollectionPhysical の provenance を失う。可視場所の identity が変わるため navigation history にも別地点が追加される。
+- 修正: pin／unpin、video pin、遅延 export は現在ビューの共通 reload へ集約。外部再走査とスタック切替も同じ物理 reload owner を使う。Collection／Rating の物理子 owner に Refresh intent を持たせ、通常書庫の cache alias も論理 source identity で履歴を比較する。ZIP pin は階層と位置を保持する再 materialize、合成ビューは既存 metadata-pin worker／適用経路で資産だけを更新する。detached 固有述語・viewport 経路は変更しない。
+- 検証・同型経路の列挙: [pin-reload-audit.md](pin-reload-audit.md)。実アプリの起動・操作は行わず、利用者による修正後の実機確認は未実施。
+- 監査で別途判明した RatingPhysical 子のソート再表示も修正済み。Immediate／WorkerScan を F5 と同じ単一の `OpenRequestOwner` に揃え、親 chain と back／forward を保持する。古い owner の完了は選択 hint の変更前に共通採用境界で拒否する。detached consumer 内の変更は owner の機械的転送だけで、ClaudeCode と独立 Codex が構造修正に合意した。[detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録。
+- fix1 の自動検証で判明した、兄弟 context の pin worker が同時に DB を開く際のスキーマ初期化競合も修正。開始時に単一の schema writer を取得し、読取→書込 upgrade の deadlock をなくす。既存 timeout と revision／trigger の原子的導入を保持し、再試行・待機追加は行わない。
+- fix2: 独立 Codex レビューが検出した、合成ビュー pin 完了時の UI thread I/O（FS metadata、cascade DB、catalog DELETE、video pin read／seed write）を既存 pin／metadata worker へ移した。準備済み private cache と scalar identity だけを UI に渡し、世代／owner 検証後にメモリ適用する。共通 consumer を使う metadata import も同じ境界へ揃え、元の live map の不変・実 worker の保存完了・UI reader 不在での採用・変更済み cache owner の拒否を回帰で検査する。世代切替で旧 pin 永続化 owner を取消し、兄弟 context の要求は維持する。cancel と seed 失敗時の同一 key の旧 frame cleanup も catalog worker 境界で検査する。§11 は ClaudeCode と利用者指定独立レビューの合意日時／session を明記し、内部補助レビューと区別した。
+
 ### 1.288 多数のファイルをエクスプローラへドラッグしてコピーすると、コピーが終わるまで mIV が操作できない — コード調査 + 通常ログ (2026-09-27)
 
 - 出典: 利用者 (開発者本人) の報告。mIV で多数のファイルを選んでエクスプローラへドラッグ＆ドロップでコピーすると、
@@ -2362,7 +2372,7 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   実 `multi.mkv` demux 先読み、真の EOF からの replay 1 回、DSP 再取得位置を自動テストに追加。
   製品起動 / UI smoke は行わず、修正後の利用者実機確認は未実施。
 
-### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27)
+### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27) — content identity の隔離は修正済み (2026-10-01)
 
 - 観測: 2026-09-27 の全ライブラリテスト (他 worktree のビルドと並行、高負荷) で各 1 回失敗。どちらも単独実行では 3 回とも成功。
 - `content_identity::tests::an_origin_whose_edits_were_all_removed_stops_being_a_restore_source`
@@ -2370,11 +2380,12 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   プロセス共通の `record_sequence()` で判定する。並列の別テストが編集を記録すると掃除が見送られ、flag が下がらず失敗する。
   製品の挙動としては意図どおり (次のフォルダ訪問でやり直す)。テストの隔離の問題。EPUB 作業の S2c-2 検収で
   「RECORD_SEQUENCE 共有の不安定テスト」として別課題にされていたもの。
+- 追記 (2026-10-01、§1.313 fix3): 上記と同じ content identity test が pin reload fix2 の通常並列 full lib で2回連続して失敗した。モジュール内だけの既存 `lock_record_sequence` を、App fixture も保持する共通 `data_dir::test_override_lock` に揃え、standalone の sequence reader／writer 11テストをその lock で直列化した。直接 probe／失敗した recorder submit と、App の pin／rating／tag／undo／ページ編集等の間接 record が別テストの cleanup と重ならない。既に App fixture を持つテストと共通 detection helper では再取得しない。製品の sequence／掃除仕様と assertion は変更しない。通常並列の full lib 2回がともに 9915 pass／0 fail／51 ignored（528.65秒／545.20秒）。結果は [pin-reload-audit.md](pin-reload-audit.md) fix3 に記録。LUT 待機と下記 GL／wgpu crash は今回の修正対象ではなく、未解決のまま。
 - `app::tests::pipeline_cache_refactor_tests::colorize_display_gate_requires_final_effect_for_creative_lut`:
   非同期の LUT 読み込みを `yield_now` 1 万回だけ待つ。高負荷で待ち切れない。
 - 追記 (2026-09-27): 同日、並列の全ライブラリテストでテスト実行ファイル自体のアクセス違反 (`0xc0000005`、Windows のエラーダイアログ「wgpu Device Class ...: mimageviewer-<hash>」を**利用者が目撃**、スクリーンショットあり) が別 worktree で 2 回起きた。並列度を下げた再実行では完走。「wgpu Device Class」は GL の隠しウィンドウ名で、ui_snapshot で以前から見ている間欠クラッシュと同じ系統と推定 (未確認、ダンプなし)。エラーダイアログが出るとテストが止まったままになるので、無人実行では問題が大きい。
-- 方針: 共通 counter を注入可能にする、または観測の対象 key に限定する等、テスト側の隔離で直す。待ち回数を増やすだけの対処はしない
-  (完了通知を待つ形にする)。規模 / 優先度: Small / P3 (リリース判定のたびに単独再実行の手間がかかる)。
+- 方針: content identity は既存の共通 test lock による隔離を適用。残る LUT 待機は待ち回数を増やすだけの対処をせず、
+  完了通知を待つ形で直す。規模 / 優先度: Small / P3 (リリース判定のたびに単独再実行の手間がかかる)。
 
 ### 1.292 ソートを絞り込みバー右側にも表示できるようにする — >>470、>>473 (2026-09-27)
 

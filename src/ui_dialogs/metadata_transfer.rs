@@ -411,7 +411,14 @@ impl App {
             self.advance_metadata_import_terminal_refresh(root, *recursive)
         });
         if refresh_ready {
-            let requests = self.take_metadata_import_refresh_requests();
+            let changed = self
+                .metadata_transfer
+                .as_ref()
+                .and_then(|state| state.pending_import_result.as_ref())
+                .and_then(|result| result.as_ref().ok())
+                .map(|summary| summary.changed)
+                .unwrap_or_default();
+            let requests = self.take_metadata_import_refresh_requests(changed);
             if let Some(state) = self.metadata_transfer.as_mut() {
                 start_metadata_import_refresh_worker(state, requests);
             }

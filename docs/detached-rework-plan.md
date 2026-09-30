@@ -1471,6 +1471,14 @@ Collection の明示 Open、物理子から root への復帰、offscreen 履歴
 
 native キーのモーダル gate は dispatch と同じ優先順位で解決した Action を使う。既存の `viewer_session_is_detached` を読んで、別窓の Enter / Escape が固定のセッション終了操作として先に処理される順序も保つ。移動要求時の scan 取消をやめ、移動先の採用・元動画の所有者終了にある共通 cleanup で取消す。別窓の scan は context ID で分離する。detached 述語自体、viewport、host、配置、focus、window lifecycle は変更しない。入力 gate と所有者の確定境界を揃える構造的修正であり、時間窓や新しい detached 状態による症状パッチではない。設計担当の方針と Codex の実装判断は一致している。
 
+**2026-10-01 §1.313 RatingPhysical 子のソート再表示 owner 転送**
+
+RatingPhysical 子の Immediate ソートが Navigation owner に落ち、WorkerScan の `CurrentViewOrderRefresh` も Collection owner しか運べず、評価一覧の親 chain と back／forward を失う不具合を修正する。F5 と同じ `current_folder_reload_owner` が選んだ単一の `OpenRequestOwner` を request に Box で保持し、各 consumer から共通採用境界までそのまま渡す。Box は App の既存 stack footprint 上限を守るためで、別の状態や owner を加えるものではない。共通の owner 有効性検証は選択 hint の変更前に行い、同じ path／order でも旧 generation の完了が現在の選択へ作用しないようにする。
+
+detached 固有コードで触れた箇所は `App::poll_detached_physical_folder_open` の `CurrentViewOrderRefresh` arm だけ。payload の `collection_owner` を `reload_owner` へ置換して既存 `apply_current_view_order_refresh` に転送する機械的変更で、Applied／Failed の扱いは既存のまま。detached の述語、viewport、geometry、配置、focus、window lifecycle は変更しない。guard／遅延／再試行による症状パッチではなく、生成時に確定した typed owner を採用まで保持する構造修正である。共通検証は既存 owner 契約の適用であり、detached 専用の条件分岐・flag は加えない。簡素化として F5 の owner 選択と既存 scan／採用経路を再利用し、新しい待機状態やモーダルは設けない。
+
+ClaudeCode（設計担当）は 2026-10-01、この機械的 owner 転送が症状パッチではなく構造修正であることに合意した。独立 Codex レビュー（gpt-6.1-sol / xhigh、session `01a0f38f-1566-75e0-bfa7-4f1fdf06d28b`）も 2026-10-01、同じ構造判断に合意し、§11 の変更範囲と理由が差分に一致することを確認した。実装担当の補助レビューをこの独立レビューとして扱わない。同レビューの全体判定は、合成ビュー pin 完了の UI thread I/O に対する P2 により changes needed だった。この P2 は共通 pin／metadata worker 境界で fix2 として修正し、detached 固有コードへの変更は追加しない。検証結果は [pin-reload-audit.md](pin-reload-audit.md) に記録する。
+
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 
 Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。

@@ -916,6 +916,49 @@ impl CatalogDb {
         Ok(())
     }
 
+    /// Worker-owned pin refresh publication. Check cancellation inside the catalog write
+    /// boundary so a superseded waiter cannot overwrite a newer refresh's video seed.
+    pub(crate) fn commit_pin_materializations(
+        &self,
+        deletes: &[String],
+        seeds: &[(String, CacheEntry)],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> rusqlite::Result<bool> {
+        use std::sync::atomic::Ordering;
+        let conn = self.conn.lock().unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let tx = conn.unchecked_transaction()?;
+        for key in deletes {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            tx.execute("DELETE FROM thumbnails WHERE filename = ?1", params![key])?;
+        }
+        for (key, entry) in seeds {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let Some((width, height)) = decode_thumb_dims(&entry.jpeg_data) else {
+                continue;
+            };
+            tx.execute(
+                "INSERT OR REPLACE INTO thumbnails \
+                 (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
+                  layout_width, layout_height, folder_provenance, selection_proof) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
+                params![key, entry.mtime, entry.file_size, width, height, entry.jpeg_data,
+                    serde_json::to_string(&FolderThumbProvenance::Seeded).unwrap()],
+            )?;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
     pub fn delete_missing(&self, existing: &HashSet<String>) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1688,6 +1731,62 @@ mod tests {
             has_layout_dims_columns: true,
             has_folder_proof_columns: true,
         }
+    }
+
+    #[test]
+    fn pin_materialization_batch_rolls_back_delete_when_seed_fails() {
+        let db = open_in_memory();
+        db.save("old", 1, 1, 1, 1, None, b"old").unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_seed BEFORE INSERT ON thumbnails WHEN NEW.filename = 'seed' BEGIN SELECT RAISE(ABORT, 'rejected seed'); END;").unwrap();
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 0, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        let seed = CacheEntry {
+            mtime: 2,
+            file_size: 2,
+            jpeg_data: bytes,
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(FolderThumbProvenance::Seeded),
+            selection_proof: None,
+        };
+        assert!(
+            db.commit_pin_materializations(
+                &["old".into()],
+                &[("seed".into(), seed)],
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(db.load_one("old").unwrap().unwrap().jpeg_data, b"old");
+        assert!(db.load_one("seed").unwrap().is_none());
+    }
+
+    #[test]
+    fn pin_materialization_cancelled_owner_cannot_delete_newer_seed() {
+        let db = std::sync::Arc::new(open_in_memory());
+        db.save("newer", 2, 2, 1, 1, None, b"newer").unwrap();
+        let guard = db.conn.lock().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_db = db.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            worker_db
+                .commit_pin_materializations(&["newer".into()], &[], &worker_cancel)
+                .unwrap()
+        });
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(guard);
+        assert!(!worker.join().unwrap());
+        assert_eq!(db.load_one("newer").unwrap().unwrap().jpeg_data, b"newer");
     }
 
     fn revision(db: &CatalogDb) -> CatalogRevision {

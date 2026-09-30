@@ -452,6 +452,7 @@ pub(crate) struct CollectionGridPhysicalLoadOwner {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CollectionGridPhysicalLoadIntent {
+    Refresh,
     Explicit,
     Playback,
 }

@@ -733,6 +733,8 @@ viewer-context 境界へ collection surface を追加する。
 
 ### 16.3 open、戻り先、context menu
 
+- §1.313 (2026-10-01): 代表サムネ pin／unpin、動画 pin、遅延 export、外部再走査、スタック切替の同一地点更新も物理 reload owner を共有する。CollectionPhysical の root anchor と履歴を保持し、通常 Navigation として再採用しない。合成ビューの pin 資産更新は既存 metadata-pin worker に渡し、viewer context／items generation を照合する。詳細と同型経路一覧は [pin-reload-audit.md](pin-reload-audit.md)。
+
 - toolbarの明示Openとcollection間の明示切替は、folder Back/Forwardと共通のtyped history
   `FolderNavHistoryTarget`へ`CollectionGridRestore`を積む。履歴entryはPath / Rating / SmartFolder /
   Collection と、それぞれの親 provenance を持つ物理子地点のいずれか一つを所有し、collectionをfilesystem風のsynthetic pathへ変換しない。

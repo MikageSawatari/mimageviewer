@@ -46,6 +46,7 @@ impl ItemKey {
 
 #[derive(Debug)]
 pub(crate) struct ContextRequest {
+    pub(crate) pin_materialization: super::pin_materialization::Request,
     pub(crate) context_id: ViewerContextId,
     pub(crate) items_generation: u64,
     pub(crate) items: Vec<ItemKey>,
@@ -65,7 +66,7 @@ pub(crate) struct ContextResult {
     pub(crate) current_rating: Option<u8>,
     pub(crate) page_state: Option<PageStateResult>,
     pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
-    pub(crate) folder_pin_reset_indices: Option<Vec<usize>>,
+    pub(crate) folder_pin_materializations: Option<super::pin_materialization::Prepared>,
     pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
     pub(crate) container_state: Option<ContainerStateResult>,
@@ -586,6 +587,17 @@ fn build_context_result(
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+    let folder_pin_materializations = if let Some(pins) = &folder_pin_map {
+        Some(request.pin_materialization.prepare(
+            folder_pin_reset_indices.unwrap_or_default(),
+            pins,
+            folder_pin_db,
+            video_pin_db,
+            cancel,
+        )?)
+    } else {
+        None
+    };
     Some(ContextResult {
         context_id: request.context_id,
         items_generation: request.items_generation,
@@ -594,7 +606,7 @@ fn build_context_result(
         current_rating,
         page_state,
         folder_pin_map,
-        folder_pin_reset_indices,
+        folder_pin_materializations,
         video_pin_blobs,
         video_items,
         container_state,
@@ -673,6 +685,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 7,
                 items: vec![
@@ -761,6 +774,7 @@ mod tests {
         let result = run(
             temp.path().join("missing"),
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 1,
                 items: vec![ItemKey {
@@ -848,6 +862,7 @@ mod tests {
             run(
                 data_dir.clone(),
                 vec![ContextRequest {
+                    pin_materialization: Default::default(),
                     context_id: ViewerContextId::for_test(0),
                     items_generation: 1,
                     items: Vec::new(),
@@ -943,6 +958,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 4,
                 items: vec![
@@ -1017,6 +1033,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 9,
                 items: vec![ItemKey {
