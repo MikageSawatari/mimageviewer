@@ -35,6 +35,24 @@ try {
         [System.IO.File]::WriteAllText($path, "raw fixture $name`r`n")
     }
     $hash = Get-MivVst3HostSourceHash -SourceRoot $source
+    $lfSource = Join-Path $testRoot 'lf-source'
+    foreach ($file in @(Get-MivTreeFiles -Path $source)) {
+        $relative = $file.FullName.Substring($source.Length + 1)
+        $lfPath = Join-Path $lfSource $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $lfPath) -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($lfPath, [System.Text.Encoding]::UTF8.GetBytes("raw fixture $($relative.Replace('\', '/'))`n"))
+    }
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $lfSource) -eq $hash) 'LF and CRLF source trees differ'
+    $cliHash = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'vst3-host-identity.ps1') -HashSourceRoot $lfSource
+    Assert-True ($LASTEXITCODE -eq 0 -and $cliHash -eq $hash) 'CMake hash CLI differs from validator'
+    # Only CRLF changes: BOM, invalid UTF-8, NUL and standalone CR are preserved.
+    $byteFixture = Join-Path $testRoot 'bytes.bin'
+    [System.IO.File]::WriteAllBytes($byteFixture, [byte[]]@(239, 187, 191, 255, 0, 13, 65, 13, 10, 13))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $expected = ([BitConverter]::ToString($sha.ComputeHash([byte[]]@(239, 187, 191, 255, 0, 13, 65, 10, 13)))).Replace('-', '').ToLowerInvariant()
+        Assert-True ((Get-MivVst3NormalizedFileHash -Path $byteFixture) -eq $expected) 'Normalized bytes other than CRLF'
+    } finally { $sha.Dispose() }
     Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Vendor host is missing'
     Write-FakeHost $hostPath ''
     Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'

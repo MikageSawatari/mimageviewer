@@ -217,6 +217,8 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
     または `certutil -scinfo` に Reader Name が出ること。
   - 毎回避けたければ `Set-Service SCardSvr -StartupType Automatic` (管理者)。
 - **R2 host identity gate (2026-10-02)**: CMakeのsourcehash markerを現CMakeLists／include／src／testsと照合する。
+  計算は `scripts/vst3-host-identity.ps1` をCMake／validatorで共有し、CRLFだけをLFへbyte正規化する。
+  他byteは保持する。core.autocrlfによるcheckout差を無視し、実ソースの変更は検知する。
   `build-release`／`build-dist`の署名前・core埋込前・最終gateと非portable coreのbare cargo releaseでも必須。
   `-SkipVst3Bridge`／SDK欠落時は一致するvendor hostのみ再利用できる。APPDATA等からのcopy fallbackはない。
   一致しなければCMakeで再buildしSHA256／sizeを記録する。実host確認は承認済み手動検証へ分ける。

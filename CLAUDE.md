@@ -1165,8 +1165,12 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
 明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
-現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。SDK欠落時や
-`-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
+現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
+identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
+`-HashSourceRoot` を使う。対象ファイルのCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
+ordinal順のslash相対名と各正規化SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
+Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
+SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
 build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
 `dev-runtime` もrelease継承profileのためこのgate対象。host変更時は先にCMakeで再buildする。
 再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。

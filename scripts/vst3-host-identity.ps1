@@ -1,5 +1,5 @@
 # Source identity gate for the embedded VST3 host. No host is ever launched.
-param([string] $ValidateRepo)
+param([string] $ValidateRepo, [string] $HashSourceRoot)
 . (Join-Path $PSScriptRoot 'sign-files.ps1')
 
 function Assert-MivVst3IdentityAncestors {
@@ -12,6 +12,23 @@ function Assert-MivVst3IdentityAncestors {
         }
         $current = [System.IO.Path]::GetDirectoryName($current)
     }
+}
+
+# Byte normalization only: remove CR immediately followed by LF. Preserve every
+# other byte, including lone CR, BOM, NUL and non-UTF-8 bytes. CMake and the gate
+# both call this implementation; never decode/re-encode source text.
+function Get-MivVst3NormalizedFileHash {
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $normalized = New-Object System.IO.MemoryStream
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        for ($index = 0; $index -lt $bytes.Length; ++$index) {
+            if ($bytes[$index] -eq 13 -and $index + 1 -lt $bytes.Length -and $bytes[$index + 1] -eq 10) { continue }
+            $normalized.WriteByte($bytes[$index])
+        }
+        return ([BitConverter]::ToString($sha.ComputeHash($normalized.ToArray()))).Replace('-', '').ToLowerInvariant()
+    } finally { $sha.Dispose(); $normalized.Dispose() }
 }
 
 function Get-MivVst3HostSourceHash {
@@ -38,7 +55,7 @@ function Get-MivVst3HostSourceHash {
     $names.Sort([System.StringComparer]::Ordinal)
     $aggregate = New-Object System.Text.StringBuilder
     foreach ($name in $names) {
-        $hash = (Get-FileHash -LiteralPath (Join-Path $root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-MivVst3NormalizedFileHash -Path (Join-Path $root $name)
         [void]$aggregate.Append($name).Append(':').Append($hash).Append("`n")
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -69,7 +86,10 @@ function Assert-MivVst3HostIdentity {
     Write-Host "[vst3-identity] current vendor host verified: $expected"
 }
 
-if ($ValidateRepo) {
+if ($HashSourceRoot) {
+    $ErrorActionPreference = 'Stop'
+    Get-MivVst3HostSourceHash -SourceRoot $HashSourceRoot
+} elseif ($ValidateRepo) {
     $ErrorActionPreference = 'Stop'
     Assert-MivVst3HostIdentity -RepoRoot $ValidateRepo
 }

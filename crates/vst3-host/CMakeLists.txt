@@ -25,11 +25,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(mimageviewer-vst3-host CXX)
 
-# Canonical build identity, shared with scripts/vst3-host-identity.ps1.
-# Each sorted slash-relative name contributes name:lowercase-SHA256(raw-bytes)\n.
-# The aggregate UTF-8 (no BOM) text is SHA256 hashed. Generated headers, SDK
-# downloads and binaries are excluded. Current source paths are ASCII, so CMake's
-# case-sensitive lexicographic sorting is the same as ordinal sorting.
+# One shared identity implementation for both embedding and validation. Normalize
+# CRLF to LF byte-wise; preserve every other byte. Sorted slash-relative names
+# contribute name:lowercase-SHA256(normalized-bytes)\n, then hash that UTF-8 text.
+# Generated headers, SDK downloads and binaries are excluded.
 file(GLOB_RECURSE HOST_IDENTITY_FILES CONFIGURE_DEPENDS
     RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
@@ -37,16 +36,24 @@ file(GLOB_RECURSE HOST_IDENTITY_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
 list(APPEND HOST_IDENTITY_FILES "CMakeLists.txt")
-list(SORT HOST_IDENTITY_FILES)
-set(HOST_IDENTITY_TEXT "")
 foreach(HOST_IDENTITY_FILE IN LISTS HOST_IDENTITY_FILES)
-    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${HOST_IDENTITY_FILE}" HOST_FILE_SHA256)
-    string(TOLOWER "${HOST_FILE_SHA256}" HOST_FILE_SHA256)
-    string(APPEND HOST_IDENTITY_TEXT "${HOST_IDENTITY_FILE}:${HOST_FILE_SHA256}\n")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/${HOST_IDENTITY_FILE}")
 endforeach()
-string(SHA256 HOST_SOURCE_SHA256 "${HOST_IDENTITY_TEXT}")
+set(HOST_IDENTITY_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/vst3-host-identity.ps1")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${HOST_IDENTITY_SCRIPT}")
+execute_process(
+    COMMAND powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
+        -File "${HOST_IDENTITY_SCRIPT}" -HashSourceRoot "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE HOST_IDENTITY_RESULT
+    OUTPUT_VARIABLE HOST_SOURCE_SHA256
+    ERROR_VARIABLE HOST_IDENTITY_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(LENGTH "${HOST_SOURCE_SHA256}" HOST_IDENTITY_LENGTH)
+if(NOT HOST_IDENTITY_RESULT EQUAL 0 OR NOT HOST_IDENTITY_LENGTH EQUAL 64
+    OR NOT HOST_SOURCE_SHA256 MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "Cannot compute VST3 host source identity: ${HOST_IDENTITY_ERROR}")
+endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/build_identity.h"
     CONTENT "#pragma once\n#define MIV_VST3_HOST_SOURCE_MARKER \"MIV_VST3_HOST_SOURCE_SHA256:@HOST_SOURCE_SHA256@\"\n"
