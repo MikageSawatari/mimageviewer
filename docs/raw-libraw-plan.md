@@ -708,14 +708,15 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 
 **(A) フルスクリーンに出してよい画素 (決定 11 の徹底)**
 
-- `RawPageState` に **埋め込みプレビューの有無** `preview_availability: Unknown | Available | Absent` を持たせる
-  (`info()` の結果で決まる。§5.3.3 の「使えるプレビュー」)
-- RAW のページでサムネイル・色忠実 rendition を fullscreen に出してよいのは **`Available` が確定した後だけ**。
-  `Unknown` の間は「読込中」の表示だけにする (`info()` は数 ms なので短い)。catalog のサムネイルは half 現像由来の
+- RAW のページでサムネイル・色忠実 rendition を fullscreen に出してよいのは、**埋め込みプレビューを実際にデコードし、
+  向きの検査も通った (= `PreviewShown` になった) 後だけ**。`info()` の段階では JPEG のヘッダしか読まない
+  (`src/raw/raw_decoder.rs:430`) ので、そこで「有り」としない (デコードや向きで後から使えないと分かることがある、
+  `:564`, `:618`)。プレビューのデコードが終わるまでは「読込中」の表示だけにする。catalog のサムネイルは half 現像由来の
   ことがあり (`src/thumb_loader.rs:4105`)、`ThumbnailState` からは出所を判別できない (`src/grid_item.rs:523`) ため
 - この判定は 1 つの述語 `raw_fullscreen_fallback_allowed(idx)` に集め、直接の描画・ページ送りの強制 rendition
   (`src/app.rs:80806`)・見開き・連結読みのすべてから呼ぶ。テスト: half 現像のサムネイルが既にある RAW を開き、
-  プレビューの特定が遅れる場合に、その間サムネイルが提示されない
+  プレビューのデコードが遅れる場合・JPEG のデータが壊れていてデコードに失敗する場合・向きの検査で使えない場合に、
+  サムネイルが提示されない
 
 **(B) 配置の基準 (差し替えで跳ばない)**
 
@@ -729,6 +730,9 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 
 **(C) 保持範囲 (現像窓を keep range が削らない)**
 
+- **現像の要求**: 実際に表示中の RAW ページ (現在ページ・見開きの相方・表紙の補助・**連結読みで見えているすべてのページ**、
+  `src/ui_fullscreen.rs:37653`) は High で現像を要求する。先 2・前 1 の現像窓は、それに加える Normal の先読み。取消の判定は
+  この 2 つを合わせた需要の集合で行う。テスト: 現像窓の外にある連結読みの見えているページが現像される
 - RAW の `RawPageState` と `fs_cache` の entry を残す範囲は **「既存の keep range」と「現像窓 (先 2・前 1)」と「実際に表示中の
   ページ (見開きの相方・表紙の補助・連結読みで見えているページ)」の和**。`prefetch_forward` を 0 や 1 にしても
   (`src/ui_dialogs/preferences/pages.rs:6486`、既存の保持 `src/app.rs:67410`, `67443`)、現像窓の RAW を消さない
@@ -736,11 +740,27 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 
 **(D) 明るさの変更 = RAW の source 変更 (1 つの transaction)**
 
-- 設定 `raw_brightness` の変更は、**mounted と parked の全 context** に対して 1 つの「RAW source 変更」transaction で反映する:
-  RAW ページの現像要求と backlog を取消、`RawPageState` を `PreviewShown` / `PreviewAbsent` へ戻す (プレビューは残す)、
-  RAW ページの `input_generation` を進め、edit / final / 比較 / 360 度 / **retained final AI** を RAW ページについて失効させる
-  (通常の source 再読込は retained AI を残すが、`src/app.rs:72075`、その key に明るさが無い `:72794` ので、ここでは消す)
+- 設定 `raw_brightness` の変更は、**mounted と parked の全 context** に対して 1 つの「RAW source 変更」transaction で反映する。
+  RAW ページの現像要求と backlog を取消し、各 `RawPageState` を段階ごとに次のように移す:
+
+  | 変更前の段階 | 変更後 |
+  | --- | --- |
+  | `PreviewNotRequested` / `PreviewPending` | そのまま (プレビューは明るさに関係しない)。現像は `Idle` |
+  | `PreviewShown` | プレビューを残し、現像を `Idle` へ (窓の中なら新しい明るさで再要求) |
+  | `PreviewAbsent` | 現像を `Idle` へ (窓の中なら再要求)。表示は「現像中」 |
+  | `Developed` | 埋め込みプレビューは既に捨てている。**Static を処理の入力から外し** (`input_generation` を進める)、その texture は
+  新しいプレビューか現像結果が入るまでの **表示専用の holdover** としてだけ残す。プレビューを `NotRequested` に戻して取り直し、
+  現像を `Idle` へ |
+  | `Preparing` / `Submitted` | 取消して `Idle` へ (古い明るさの完了は下の identity で拒否) |
+  | `Blocked(Unsupported)` / `Terminal` | そのまま (明るさに関係しない) |
+  | `Blocked(Failed)` | そのまま (失敗は明るさに関係しない。次の source 変更か再訪で再試行) |
+
+- RAW ページの edit / final / 比較 / 360 度を失効させる。**retained final AI は RAW ページの分だけを失効させる**: RAW の source では
+  retained AI の key と完了時の検証に明るさを含め、明るさが違う entry は使わない・保存しない。App 全体の retained epoch
+  (`src/app.rs:74194`) は進めない (進めると RAW 以外のページの進行中の AI 完了まで保存に失敗する、`:73893`)。
+  テスト: transaction の最中に完了した JPEG の AI 結果が保持される
 - 現像要求の identity に明るさを含め、古い明るさの完了は `apply_result` が拒否する
+- テスト: 現像済みのページ・準備中のページ・park 中の context で明るさを変える
 - サムネイル (catalog / edit preview) と RAW 以外のページには触らない
 
 **(E) S2a の暫定構造からの置き換え**
@@ -761,9 +781,13 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 - snapshot の再構築は、表示中の entry を generation の差し替えの前に取り出し、後で戻す (`src/app/snapshot_ops.rs:446`, `184`)。
   RAW ではこれに合わせて **`fs_cache` の entry と `RawPageState` を一緒に移す原子的な操作**を用意する (source を確かめ、
   古い要求は取消し、generation と idx を付け直す)。`discard_fs_page` とは別の操作にする
-- worker 側でも source を確かめる: 現像要求は要求時の `RawSourceIdentity` (path・高精度 mtime・size) を持ち、worker は
-  ファイルを開く前と現像の後に stat して一致を確かめる。食い違えば typed な `Stale` で終える (queued の要求は後で
-  ファイルを開き直すため、`src/canonical_image_loader.rs:404`。外部変更の反映は閲覧中に遅れることがある、`src/app.rs:22632`)
+- worker 側でも source を確かめる: 現像要求・プレビュー要求・`info()` は要求時の `RawSourceIdentity` (path・高精度 mtime・size)
+  を持ち、worker はファイルを開く前と処理の後に stat して一致を確かめる。食い違えば typed な `Stale` で終える (queued の要求は
+  後でファイルを開き直す、`src/canonical_image_loader.rs:404`。寸法とプレビューは別々に開く、`:460`。外部変更の反映は閲覧中に
+  遅れることがある、`src/app.rs:22632`)
+- **`Stale` からの復帰**: 現在の要求の `Stale` は、その `RawPageState` を古い source のものとして破棄し、新しい `RawSourceIdentity`
+  で作り直す (`PreviewNotRequested` から。需要があれば worker 側で新しく info / プレビューを取り直す)。`Blocked` にはしない。
+  置き換え済みの古い要求の `Stale` は要求 ID で無視する。テスト: 現像中の上書きからの復帰、古い要求の遅れた `Stale` の無視
 
 **(G) ページ送り・フォルダ移動の分類を 1 か所に**
 
@@ -786,7 +810,10 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 - `RawTicket` に typed な状態 (`Queued` / `Running` / `Cancelling`) を足し、進捗表示はそれで「現像待ち」「読み込み中」
   「現像中 NN%」を分ける (進捗値だけでは待機と読み込み開始を区別できない、`src/raw/executor.rs:255`、
   `src/raw/raw_decoder.rs:642`)。現在ページが現像中の間の再描画は上限付きの間隔 (100ms) にする
-- `set_parallelism` の失敗 (`src/raw/executor.rs:427`) を設定 UI に返す
+- `set_parallelism` は transaction にする: worker の spawn に途中で失敗したら **以前の上限 (`desired`) に戻し**、
+  成功した分の余分な worker は通常の退出で減らし、設定値は成功した後だけ確定する。失敗は設定 UI に返す
+  (現行は spawn の前に `desired` を変え、途中で失敗するとそのまま残るため、High 用の 1 枠が失われ得る、
+  `src/raw/executor.rs:437`, `450`, `196`)。テスト: 途中での spawn 失敗
 - perf: `raw/preview_presented` / `raw/develop_presented` (context・要求 ID・所要時間) を足す
 - テストに、明るさの変更が現像中・park 中に起きた場合、古い AI / materializer の完了、RAW の終端でのページ送り、を加える
 - 設計文書: display-pipeline・async-architecture・settings の該当節を更新する。既存の名前は `RawBrightness` を使う
@@ -1531,3 +1558,10 @@ S2a の暫定実装と master 取り込みの後で §6〜§7・§13 を再レ�
 (フォールバックはプレビュー確定後だけ、RAW は全段で canonical 寸法を配置の基準、保持範囲は keep range と現像窓の和、
 明るさの変更は 1 つの source 変更 transaction、暫定構造の置き換えと `ContextAsyncOwner` への登録、generation 変更時の
 移送と worker 側の source 確認、分類関数の一本化と点検表の追加、外部ツールの明るさ、観測)。S2b / S2c の作り直しは不要。
+
+### 20.16 S3 の設計再レビュー (2026-10-01、§7.10 の 1 回目)
+
+前回 9 件のうち 4 件解決 (配置の基準、暫定構造の置き換えと登録、分類関数の一本化と点検表、外部ツールの明るさ)。
+残り P1×2 / P2×4 を §7.10 に反映: fallback はプレビューを実際にデコードできた後だけ (P1)、明るさ変更の段階別の遷移と
+`Developed` のプレビュー取り直し・表示専用 holdover (P1)、表示中の全 RAW を High で現像要求 (P2)、`Stale` からの復帰 (P2)、
+retained AI を RAW の分だけ失効させ全体 epoch を進めない (P2)、`set_parallelism` の transaction 化 (P2)。
