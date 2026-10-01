@@ -420,8 +420,11 @@ URL と ZIP 内の実名の境界を分離して修正する。新しい非同�
   外部参照の分類では従来の Unicode 空白 trim も維持し、先頭 NBSP 等付きの未使用
   manifest item を書籍全体の失敗にしない。この trim は分類だけに適用し、ローカル名の
   WHATWG 解決へは渡さない (ローカル実名の NBSP 等は保持する)。spine がその外部 item を
-  指す場合、および `cover-image` / EPUB 2 の `meta name="cover"` がその item を表紙として
-  指す場合は、識別子を含むエラーにする。未使用でもローカル href の越境・encoded separator・
+  指す場合は、識別子を含むエラーにする。変換ページは spine から構築するため、spine 外の
+  `cover-image` item が外部参照や未使用のローカルメンバーを指していても、また EPUB 2 の
+  `meta name="cover"` が存在しない id を指していても、表紙指定の必須検査は行わない。
+  表紙に指定された item も、spine に含まれる場合は通常の spine 検査を受ける。
+  未使用でもローカル href の越境・encoded separator・
   Windows 不正名等は従来の承認済み安全規則に従い拒否し、manifest の id と href をエラーに付ける。
 - URL の path をセグメントごとに一度だけ UTF-8 復号し、ZIP の実名で完全一致検索する。
   ローカル参照の encoded separator `%2F` / `%5C` は拒否する。query / fragment は実名から分離し、
@@ -464,6 +467,16 @@ Unicode 空白付きの未使用外部 manifest のスキップ、ローカル N
 clippy / diff --check 成功 (既存 clippy 警告 1 件)。独立 xhigh 完了レビューの要修正指摘はなし。
 この時点では FFmpeg の前提ファイルは揃ったが、`build-dev.ps1` が必要とする
 `vendor/effetune-mixwright/EffeTune Mixwright.vst3` がなく、確認用 core ビルドは未実施。
+
+2026-10-01 P2 再修正: 上記追補の表紙必須検査は、spine 外のメタデータからページを生成しない
+変換器に不要な条件だったため撤去した (設計担当が前回 brief を訂正)。未使用の外部
+`cover-image` item、ローカルの未存在 cover member、古い cover meta id は許容し、spine と
+ローカル href の安全検査は維持する。合成 EPUB の worker test は 62 件成功、fmt /
+fmt --check / clippy / diff --check 成功 (既存 clippy 警告 1 件)。独立 xhigh 完了レビューの
+要修正指摘はなし。
+同梱ファイルが揃ったため `build-dev.ps1 -PreserveRuntime` も実行したが、TurboJPEG の
+ネイティブビルドで MSBuild が exit 1 を返し、確認用 core バイナリの作成は未完了。
+worker の指定ゲートは成功しており、アプリ起動・実ユーザーデータを使う検証は行っていない。
 
 ### 4.6 同名スキップ設定 (D5)
 

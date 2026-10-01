@@ -523,7 +523,6 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
     let mut opf_viewport = None;
     let mut manifest = Vec::new();
     let mut refs = Vec::<(String, bool, Vec<String>)>::new();
-    let mut cover_refs = Vec::<String>::new();
     let mut direction = "default".to_string();
     let mut current_meta: Option<String> = None;
     let mut current_text: Option<String> = None;
@@ -548,9 +547,6 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                             .split_whitespace()
                             .map(str::to_string)
                             .collect::<Vec<_>>();
-                        if properties.iter().any(|p| p == "cover-image") {
-                            cover_refs.push(id.clone());
-                        }
                         // EPUB allows remote resources in the manifest; they are not in the
                         // archive, so they are skipped rather than treated as unsafe paths.
                         if !is_external_href(&href) {
@@ -589,9 +585,6 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                         }
                         if let Some(k) = attr(&a, "name") {
                             let v = attr(&a, "content").unwrap_or("");
-                            if k == "cover" {
-                                cover_refs.push(v.to_string());
-                            }
                             rendition_property(&mut rendition, k, v);
                             if k == "rendition:viewport" {
                                 opf_viewport = dimensions(v);
@@ -635,13 +628,6 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
     }
     if refs.is_empty() {
         return Err(invalid("empty EPUB spine"));
-    }
-    for idref in cover_refs {
-        if !manifest.iter().any(|item| item.id == idref) {
-            return Err(invalid(format!(
-                "cover idref missing or external in manifest: {idref}"
-            )));
-        }
     }
     let mut spine = Vec::new();
     for (idref, linear, props) in refs {
@@ -1286,7 +1272,7 @@ mod tests {
         assert_eq!(package.spine[0].path, "OPS/\u{a0}p.xhtml");
     }
     #[test]
-    fn unmappable_spine_and_cover_references_are_errors() {
+    fn unmappable_spine_references_are_errors() {
         for href in [
             "&#160;https://example.invalid/p.xhtml",
             "//host/p.xhtml",
@@ -1298,27 +1284,30 @@ mod tests {
             let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
             assert_eq!(error.kind, EpubErrorKind::Invalid);
             assert!(
-                error.message.contains("spine idref")
+                error
+                    .message
+                    .contains("spine idref missing or external in manifest: p")
                     || error.message.contains("manifest item p href"),
                 "{}",
                 error.message
             );
         }
+    }
+    #[test]
+    fn unused_cover_metadata_does_not_require_a_local_member() {
         for cover in [
+            r#"<metadata/><manifest><item id="c" href="https://example.invalid/cover.jpg" properties="cover-image" media-type="image/jpeg"/>"#,
             r#"<metadata/><manifest><item id="c" href="&#160;https://example.invalid/cover.jpg" properties="cover-image" media-type="image/jpeg"/>"#,
             r#"<metadata><meta name="cover" content="c"/></metadata><manifest><item id="c" href="&#160;//host/cover.jpg" media-type="image/jpeg"/>"#,
-            r#"<metadata/><manifest><item id="c" href="a%2Fb.jpg" properties="cover-image" media-type="image/jpeg"/>"#,
+            r#"<metadata/><manifest><item id="c" href="missing.jpg" properties="cover-image" media-type="image/jpeg"/>"#,
         ] {
             let opf = format!(
                 r#"<package>{cover}<item id="p" href="p.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="p"/></spine></package>"#
             );
-            let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
-            assert!(
-                error.message.contains("cover idref")
-                    || error.message.contains("manifest item c href"),
-                "{}",
-                error.message
-            );
+            let package = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap();
+            assert_eq!(package.spine.len(), 1);
+            assert_eq!(package.spine[0].idref, "p");
+            assert_eq!(package.spine[0].path, "OPS/p.xhtml");
         }
         // A non-spine cover remains valid when its reference maps to a local member.
         let opf = opf("ltr", "").replace("</manifest>", r#"<item id="c" href="cover.jpg" properties="cover-image" media-type="image/jpeg"/></manifest>"#);
@@ -1329,6 +1318,37 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+    #[test]
+    fn stale_cover_meta_id_does_not_invalidate_local_spine() {
+        let opf = opf("ltr", "").replace(
+            "</metadata>",
+            r#"<meta name="cover" content="obsolete-id"/></metadata>"#,
+        );
+        let package = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap();
+        assert!(!package.manifest.iter().any(|item| item.id == "obsolete-id"));
+        assert_eq!(package.spine.len(), 1);
+        assert_eq!(package.spine[0].path, "OPS/p.xhtml");
+    }
+    #[test]
+    fn external_cover_item_in_spine_still_fails() {
+        let opf = opf("ltr", "").replace(
+            r#"href="p.xhtml""#,
+            r#"href="https://example.invalid/cover.jpg" properties="cover-image""#,
+        );
+        let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
+        assert_eq!(error.kind, EpubErrorKind::Invalid);
+        assert_eq!(
+            error.message,
+            "spine idref missing or external in manifest: p"
+        );
+    }
+    #[test]
+    fn unsafe_local_cover_href_still_fails() {
+        let opf = opf("ltr", "").replace("</manifest>", r#"<item id="c" href="a%2Fb.jpg" properties="cover-image" media-type="image/jpeg"/></manifest>"#);
+        let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
+        assert!(error.message.contains("manifest item c href"));
+        assert!(error.message.contains("encoded separator"));
     }
     #[test]
     fn unsafe_unused_local_manifest_items_are_not_silently_skipped() {
