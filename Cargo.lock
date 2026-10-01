@@ -4042,6 +4042,7 @@ dependencies = [
 name = "mimageviewer-launcher"
 version = "4.3.0"
 dependencies = [
+ "fs4",
  "sha2",
  "tempfile",
  "windows 0.61.3",

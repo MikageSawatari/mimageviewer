@@ -26,6 +26,50 @@
 $script:MivSignDefaultSubject = 'Open Source Developer Taku Sano'
 $script:MivSignDefaultTimestamp = 'http://time.certum.pl'
 
+function Test-MivPeFile {
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    # Inspect the DOS/PE headers, not the extension: VST3 DLLs use .vst3.
+    $stream = [System.IO.File]::OpenRead($Path)
+    $reader = New-Object System.IO.BinaryReader($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5a4d) { return $false }
+        $stream.Position = 0x3c
+        $offset = $reader.ReadUInt32()
+        if ($offset -lt 64 -or $offset -gt ($stream.Length - 24)) { return $false }
+        $stream.Position = $offset
+        return $reader.ReadUInt32() -eq 0x00004550
+    } finally {
+        $reader.Dispose()
+    }
+}
+
+function Get-MivTreeFiles {
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    # Do not follow junctions/symlinks, including during staging cleanup.
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push([System.IO.Path]::GetFullPath($Path))
+    while ($pending.Count -gt 0) {
+        $item = Get-Item -LiteralPath $pending.Pop() -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "[pe] reparse point is not allowed in artifact tree: $($item.FullName)"
+        }
+        if ($item.PSIsContainer) {
+            foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force) {
+                $pending.Push($child.FullName)
+            }
+        } else {
+            $item
+        }
+    }
+}
+
+function Get-MivPeFiles {
+    param([Parameter(Mandatory = $true)] [string[]] $Paths)
+    foreach ($path in $Paths) {
+        Get-MivTreeFiles -Path $path | Where-Object { Test-MivPeFile -Path $_.FullName }
+    }
+}
+
 function Get-MivSignTool {
     if ($env:MIV_SIGNTOOL) {
         if (Test-Path $env:MIV_SIGNTOOL) { return $env:MIV_SIGNTOOL }
@@ -83,7 +127,8 @@ function Invoke-MivSign {
     $ts = if ($env:MIV_SIGN_TS) { $env:MIV_SIGN_TS } else { $script:MivSignDefaultTimestamp }
 
     foreach ($f in $Files) {
-        if (-not (Test-Path $f)) { throw "[sign] file to sign not found: $f" }
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "[sign] file to sign not found: $f" }
+        if (-not (Test-MivPeFile -Path $f)) { throw "[sign] refusing to sign a non-PE file: $f" }
         $signArgs = @('sign') + $selector + @('/fd', 'sha256', '/tr', $ts, '/td', 'sha256', $f)
         $ok = $false
         # Timestamping hits Certum's TSA over the network; a signed distribution

@@ -128,10 +128,23 @@ Windows の「設定」→「アプリ」→「インストールされている
 アンインストール時に「設定ファイルとキャッシュを削除しますか？」
 と尋ねられます。
 
-  - 「はい」を選ぶと、%APPDATA%\mimageviewer\ が完全に削除され、
-    完全な状態でアンインストールされます。
+  - 「はい」を選ぶと、%APPDATA%\mimageviewer\ の設定・キャッシュ等が
+    削除されます。
   - 「いいえ」を選ぶと、設定とキャッシュは保持されます。
     再インストール時に同じ設定で使い始められます。
+
+次のフォルダは、どちらを選んでも残ります。不要になった場合は、
+mImageViewer と関連するアプリを終了してから手動で削除できます。
+
+  - %APPDATA%\effetune\ または %APPDATA%\Frieve\EffeTunePlugin\
+    音響調整 (EffeTune) のプリセット・設定です。他の EffeTune 製品と
+    共有するため、自動では削除しません。他の製品でも使わなくなった
+    ことを確認してから削除してください。
+  - %APPDATA%\mimageviewer-vst3-host.exe\
+    EffeTune に取り込んだ IR ファイル・測定データ、ビジュアライザーの
+    レイアウト・背景画像です。
+  - %APPDATA%\mimageviewer-remote\
+    リモート閲覧用サービスの動作記録等です。
 
 
 ----------------------------------------------------------------
@@ -153,6 +166,15 @@ Windows の「設定」→「アプリ」→「インストールされている
   - runtime\<version>\mimageviewer-epub-pdf.exe
                      : EPUB 変換用プログラム（初回展開）
   - epub_cache\      : EPUB から変換した PDF（管理画面で削除予約）
+  - runtime\<version>\effetune\EffeTune Mixwright.vst3\
+                     : 音響調整用プラグインと関連ファイル（初回展開）
+  - effetune\        : 次回起動時に復元する音響調整の状態
+
+音響調整のプリセット・設定、取り込んだ IR ファイル・測定データ、
+ビジュアライザーのレイアウト・背景画像は、上記とは別のフォルダに
+保存されます。リモート閲覧用サービスも %APPDATA%\mimageviewer-remote\
+を利用します。これらの保存先と削除方法は「5. アンインストール方法」
+を参照してください。
 
 また、お気に入りに登録したフォルダの更新を検知するため、
 内部的に Windows API の ReadDirectoryChangesW による
@@ -192,6 +214,9 @@ https://mikage.to/mimageviewer/privacy.html
     Source and license notes: https://mikage.to/mimageviewer/
   - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB
     RAR 展開に使用します。ライセンス全文は UNRAR-LICENSE.txt を参照してください。
+  - EffeTune Mixwright (MIT): Copyright (c) 2025-2026 Yoshiyuki Kobayashi
+    同梱ライブラリを含むライセンス全文は、アプリの「バージョン情報」の
+    EffeTune THIRD-PARTY-NOTICES / DSP NOTICE で確認できます。
   - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）

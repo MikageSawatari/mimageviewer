@@ -151,6 +151,9 @@
       mImageViewer 自身のデータの保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
       またはポータブル版では実行ファイルと同じ場所の <code>data</code> フォルダです。
       アンインストール時に削除できます。
+      リモート閲覧用サービスの動作記録等は、通常版では別の <code>%APPDATA%\mimageviewer-remote\</code> に保存され、
+      アンインストール後も残ります。ポータブル版は <code>data</code> と同じ場所の <code>data-remote</code> を使います。
+      不要になった場合は、アプリを終了してから手動で削除できます。
     </div>
     <div class="info-box">
       音響調整 (EffeTune) のプリセット・設定は、別の <code>%APPDATA%\effetune\</code> または
@@ -158,6 +161,8 @@
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
       mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。
       EffeTune 自身の保存データは mImageViewer のアンインストール時にも残ります。
+      プリセット・設定は他の EffeTune 製品とも共有されるため、自動では削除しません。
+      他の製品でも不要になったことを確認し、関連するアプリを終了してから手動で削除できます。
       ポータブル版では音響調整を利用できません。
       次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。
     </div>
@@ -306,12 +311,18 @@
       mImageViewer's own data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
       or in a <code>data</code> folder next to the executable (portable edition). It can be
       removed when you uninstall the App.
+      In the installer and single-exe editions, the remote-viewing service stores operation records and related data separately in
+      <code>%APPDATA%\mimageviewer-remote\</code>. This folder remains after uninstalling. The portable edition
+      uses a <code>data-remote</code> folder alongside <code>data</code>.
+      If you no longer need it, close the App and delete the folder manually.
     </div>
     <div class="info-box">
       EffeTune stores its presets and configuration separately in <code>%APPDATA%\effetune\</code> or
       <code>%APPDATA%\Frieve\EffeTunePlugin\</code>. Imported IR files, measurements, and visualizer layouts and background images are stored in
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code>, regardless of mImageViewer's data folder. EffeTune's own data remains when
-      mImageViewer is uninstalled. The portable edition does not provide EffeTune.
+      mImageViewer is uninstalled. Presets and configuration are shared with other EffeTune products,
+      so they are not deleted automatically. Delete them manually only after checking that other products
+      no longer need them and closing the related apps. The portable edition does not provide EffeTune.
       The state that lets the next launch start with the same adjustment is saved in mImageViewer's own data folder.
     </div>
     <div class="info-box">

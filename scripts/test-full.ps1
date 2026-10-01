@@ -12,6 +12,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'vst3-host-vcrt.ps1')
+# Handler tests start the vendor host directly, before distribution CMake runs.
+# Fail with recovery instructions rather than importing/copying runtime caches.
+Assert-MivVst3HostVcrt -RepoRoot $repoRoot
 $restoreErrorMode = $false
 $modeBefore = [uint32]0
 $gateExit = 1

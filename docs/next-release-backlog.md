@@ -29,6 +29,14 @@
 
 ## 1. 優先候補
 
+### 1.316 EffeTune 公開済み旧世代の best-effort cleanup — 2026-10-02
+
+- R2配布修正は使用中のtreeを移動／削除せず、不変世代を追加してcurrent pointerだけを更新する。
+  修復のたびに約37 MiBが残るため、繰り返すとruntime cacheが増える。
+- 起動経路外で旧世代をbest-effort削除する設計を検討する。currentと実行中core／hostの世代を保持し、
+  使用中・権限不足などの削除失敗はlogだけで起動／EffeTuneを阻害しない。lock不在だけでは未使用と判断しない。
+- 正本: [EffeTune配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01)。
+
 ### 1.315 EPUB 変換のパス解決で残した 3 件 — コード調査 (2026-10-01)
 
 - 出典: v4.3.0 の「unsafe archive path: /titlepage.xhtml」修正 (5ch で別々の利用者 2 人が報告、ZIP 直下の OPF で相対参照に `/` を付けていた) の第二意見 (Codex xhigh) と実装担当の棚卸し。修正内容と解決規則は [EPUB 計画 §4.5.1](epub-pdf-integration-plan.md#451-ワーカーのパス解決-v430)。

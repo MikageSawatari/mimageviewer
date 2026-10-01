@@ -47,6 +47,13 @@ $scripts = Join-Path $repoRoot 'scripts'
 $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspaceTargetDir = Join-Path $repoRoot 'target'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
+. (Join-Path $scripts 'effetune-distribution.ps1')
+. (Join-Path $scripts 'vst3-host-identity.ps1')
+if ($SkipVst3Bridge) { Assert-MivVst3HostIdentity -RepoRoot $repoRoot }
+# Fail before tests/clean if the complete release bundle or tracked licenses are
+# missing. build-release stages a fresh copy and signs its PE(s) before embedding.
+$null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetune-mixwright') `
+    -NoticesRoot (Join-Path $repoRoot 'third_party\effetune-mixwright')
 
 if ($PreserveRuntime) {
     if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -78,7 +85,8 @@ if ($PreserveRuntime) {
 # Code signing is ON by default for distribution builds; pass -NoSign to skip it.
 # Assert the signing certificate up front (SimplySign Desktop must be running and
 # logged in) so a missing cert fails before the multi-minute clean+build, not
-# after. build-release.ps1 / build-portable.ps1 do the actual interleaved signing.
+# after. build-release.ps1 / build-portable.ps1 do the actual interleaved signing,
+# including EffeTune's .vst3 PE in a staged copy before launcher embeds it.
 $sign = -not $NoSign
 if ($sign) {
     . (Join-Path $scripts 'sign-files.ps1')
@@ -111,6 +119,8 @@ if ($running.Count -gt 0) {
 
 # Run the complete Rust gate before cleaning release outputs. The explicit skip
 # exists for retrying packaging/signing on an unchanged, already-tested tree.
+. (Join-Path $scripts 'vst3-host-vcrt.ps1')
+Assert-MivVst3HostVcrt -RepoRoot $repoRoot
 if ($SkipRustTests) {
     Write-Warning '[build-dist] (1/7) Rust test gate skipped; use only for an unchanged tested tree'
 } else {
@@ -128,6 +138,14 @@ if ($SkipRustTests) {
 Write-Host "[build-dist] (2/7) python scripts\test_analyze_perf.py"
 & python (Join-Path $scripts 'test_analyze_perf.py')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests failed (exit {0})" -f $LASTEXITCODE) }
+Write-Host '[build-dist]       EffeTune staging/signing-enumeration regression tests'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-effetune-distribution.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] EffeTune script tests failed (exit {0})" -f $LASTEXITCODE) }
+Write-Host '[build-dist]       VST3 host source-identity regression tests'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-identity.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-vcrt.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests failed (exit {0})" -f $LASTEXITCODE) }
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
@@ -198,9 +216,12 @@ $finalRuntimePe = @(
     (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-epub-pdf.exe'),
-    $portableDir
+    $portableDir,
+    (Join-Path $repoRoot 'target\effetune-dist-source\EffeTune Mixwright.vst3')
 )
 Write-Host '[build-dist] (7/7) final PE dependency closure'
+Assert-MivVst3HostIdentity -RepoRoot $repoRoot
+Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot (Join-Path $repoRoot 'target\effetune-dist-source')
 & (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
     -InputPaths $finalRuntimePe -RequireCompanionRuntime `
     -ReportPath 'target\vcrt-pe-reports\dist-runtime-portable.json'

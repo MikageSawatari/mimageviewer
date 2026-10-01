@@ -1725,6 +1725,24 @@ pub enum ToolbarSectionId {
 }
 
 impl ToolbarSectionId {
+    /// 配布形態で提供されるセクション。実行時のファイル欠落では表示を隠さない。
+    pub fn available_in_build(self) -> bool {
+        match self {
+            Self::EffeTune => !cfg!(feature = "portable"),
+            Self::Unknown => false,
+            _ => true,
+        }
+    }
+
+    /// 保存順は保持したまま、現在の配布形態の描画対象だけを取り出す。
+    /// 非対応セクションの改行・セパレータ・ドラッグ領域も生成しない。
+    pub fn render_order(saved: &[Self]) -> Vec<Self> {
+        Self::ordered_with_fallback(saved)
+            .into_iter()
+            .filter(|id| id.available_in_build())
+            .collect()
+    }
+
     /// 既定の並び順 (= v1.x までのハードコード順)。これを崩すと既存ユーザーの
     /// 見た目が変わるので、`toolbar_section_order` 未設定時は必ずこの順を使う。
     pub fn default_order() -> &'static [Self] {
@@ -11037,6 +11055,33 @@ mod tests {
     }
 
     // -- Toolbar section order (v2.0.0 Phase 1) --
+
+    #[test]
+    fn toolbar_section_render_order_matches_build_flavor_without_changing_saved_order() {
+        use ToolbarSectionId as TS;
+        // 通常版の設定持込み、重複、将来の既定順にも同じ表示制約を適用する。
+        let saved: Vec<TS> =
+            serde_json::from_str(r#"["Tags","EffeTune","Cols","EffeTune","Unknown"]"#).unwrap();
+        let original = saved.clone();
+        for order in [&saved[..], &[][..], TS::default_order()] {
+            let all = TS::ordered_with_fallback(order);
+            let rendered = TS::render_order(order);
+            assert_eq!(
+                rendered.contains(&TS::EffeTune),
+                !cfg!(feature = "portable")
+            );
+            let expected = all
+                .iter()
+                .copied()
+                .filter(|id| *id != TS::EffeTune || !cfg!(feature = "portable"))
+                .collect::<Vec<_>>();
+            assert_eq!(rendered, expected);
+            assert!(!rendered.contains(&TS::Unknown));
+            assert!(all.contains(&TS::EffeTune));
+        }
+        assert_eq!(saved, original);
+        assert_eq!(serde_json::to_value(TS::EffeTune).unwrap(), "EffeTune");
+    }
 
     #[test]
     fn toolbar_section_order_empty_is_default() {

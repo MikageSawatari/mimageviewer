@@ -28,6 +28,11 @@ fn main() {
     // 代わって復旧手順付きの明確なメッセージを出す。
     if target_is_windows {
         check_vendor_files();
+        if std::env::var("PROFILE").as_deref() == Ok("release")
+            && std::env::var_os("CARGO_FEATURE_PORTABLE").is_none()
+        {
+            check_release_vst3_host_identity();
+        }
     }
 
     // 絵文字スタンプ (Twemoji SVG) を exe に同梱するためのコード生成 (Inc 4c)。
@@ -86,6 +91,46 @@ fn main() {
             eprintln!("winresource compile error: {e}");
         }
     }
+}
+
+fn check_release_vst3_host_identity() {
+    for path in [
+        "scripts/vst3-host-identity.ps1",
+        "scripts/sign-files.ps1",
+        "crates/vst3-host/CMakeLists.txt",
+        "crates/vst3-host/include",
+        "crates/vst3-host/src",
+        "crates/vst3-host/tests",
+        "vendor/vst3-host/mimageviewer-vst3-host.exe",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "scripts/vst3-host-identity.ps1",
+            "-ValidateRepo",
+        ])
+        .arg(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command
+        .output()
+        .expect("VST3 host identity gate requires PowerShell");
+    assert!(
+        output.status.success(),
+        "Release VST3 host identity gate failed. Rebuild crates/vst3-host with CMake before embedding:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Convert the canonical WGSL NIS shader to Shader Model 5 HLSL, then to DXBC.

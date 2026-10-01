@@ -180,7 +180,7 @@ dual-window approach.
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
-- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
+- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service / EPUB converter / EffeTune Mixwright bundle とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (設定 3〜10、既定 5、1 つを Critical 予約)
 - **EPUB conversion**: `crates/epub-pdf-worker` が WebView2 で DRM のない EPUB を PDF 化する。配布ビルドでは `mimageviewer-epub-pdf.exe` を署名後に launcher へ内包し、core と同じ versioned runtime へ展開する。portable 版は core exe の隣に loose 同梱する
@@ -351,7 +351,9 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`**: VST3 SDK の DL が ~490 MB と
   大きいので bootstrap には含めていない。以下のいずれかで配置する:
   - **既存ビルド済み exe をコピー** (推奨): 別 worktree やバックアップに残っている
-    `mimageviewer-vst3-host.exe` を `vendor/vst3-host/` に置く。SDK 不要で即解決
+    `mimageviewer-vst3-host.exe` と必須の `vcrt/` (公式CRT4本) を
+    `vendor/vst3-host/` に実ファイルでコピーする。現ソースidentityが一致する成果物のみ再利用可。
+    SDK不要だが、exe単体のコピーではhostを直接起動できない
   - **CMake で再ビルド**:
     ```bash
     bash scripts/setup-vst3-sdk.sh
@@ -384,11 +386,12 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 ```
 C:\home\mimageviewer_vendor_backup\
   ├ models\        (*.onnx 一式)
-  └ vst3-host\     (mimageviewer-vst3-host.exe)
+  └ vst3-host\     (mimageviewer-vst3-host.exe と vcrt\ の公式CRT4本)
 ```
 
 - **定期ジョブは不要**。`vendor/` の中身は静的なので、モデル追加や vst3-host を
-  再ビルドした**ときだけ**バックアップを取り直す。
+  再ビルドした**ときだけ**バックアップを取り直す。hostはexeと `vcrt/` を含む
+  ディレクトリ全体を `C:\home\mimageviewer_vendor_backup\vst3-host` へ実ファイルでコピーする。
 - **復旧手順**: `vendor/` 消失時、`bootstrap-vendor.sh` を流した後に
   `cp -r C:/home/mimageviewer_vendor_backup/models vendor/` と
   `cp -r C:/home/mimageviewer_vendor_backup/vst3-host vendor/` で埋め戻す。
@@ -972,7 +975,7 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **launcher が core・remote service・EPUB converter・FFmpeg DLL を内包する構成**で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・EPUB converter・FFmpeg DLL・VC runtime・EffeTune Mixwright bundle を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
@@ -980,6 +983,8 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全407ファイル、v0.11.1。入力は別の VERSION と計408ファイル)
+│   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
 │   ├── avutil-59.dll
@@ -989,6 +994,8 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 └── 起動時の動作:
     1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 exe / DLL と app-local VC runtime を展開
        (版別 SHA-256 sidecar で照合し、不一致なら atomic replace)
+       EffeTune は同ディレクトリ下の不変世代へ全hash検証して公開し、atomic更新するのはcurrent pointerだけ。
+       一覧・サイズ・更新時刻・作成時刻とstampが一致すれば再hash／write lockなし。修復失敗もcore起動を継続。
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
     3. ランチャー即終了 (GUI なので exit code を待たない)
 ```
@@ -1008,7 +1015,7 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 2. `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
    → Web UI 資産を内包した remote service 生成
 3. `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` → EPUB converter 生成
-4. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
+4. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker + EffeTune bundle 等を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
 ラッパーは 4 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
@@ -1017,10 +1024,13 @@ release link 時に未解決になることがあるため、配布ビルドは�
 
 `cargo build --release` を直接打つ場合は ① → ② → ③ → ④ の順で 4 回打つこと。
 ランチャー側 build.rs が `target/release` の core / remote / EPUB worker の存在をチェックし、
-無ければ復旧手順付きで止まる。
+無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
+`EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
+配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
+(vendor 原本は変更しない)。
 
 **配布物**:
-- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + DLL を含む)
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + DLL + EffeTune bundle を含む)
 - インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
 - どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
 
@@ -1152,6 +1162,15 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 互換。bridge ビルド成果物は通常の `include_bytes!` で本体に内包する (PDFium / Susie ワーカーと
 同じパターン)。
 
+Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
+明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
+2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
+現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。SDK欠落時や
+`-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
+build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
+`dev-runtime` もrelease継承profileのためこのgate対象。host変更時は先にCMakeで再buildする。
+再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。
+
 ### セットアップ (メインビルド前に必須)
 
 ```bash
@@ -1161,14 +1180,23 @@ bash scripts/setup-vst3-sdk.sh
 # 2. CMake で C++ bridge をビルド
 cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 cmake --build crates/vst3-host/build --config Release
-# → vendor/vst3-host/mimageviewer-vst3-host.exe (~640 KB)
+# → vendor/vst3-host/mimageviewer-vst3-host.exe と vendor/vst3-host/vcrt/ の公式CRT4本
 ```
 
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
   - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
-- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` (.gitignore)。
+- CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
+  `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
+  hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。
+  コピーはMicrosoft署名を保持し、mIVとして再署名しない。CRTをhost直下には置かない。
+  testerと `test-full.ps1` 内の直接起動テストはこのvendor exeと隣の `vcrt/` を使うので、
+  full gateの前にこのCMake build（または現ソース一致のexe＋CRTセットの復元）を済ませる。
+  `test-full.ps1`／`build-dist.ps1` はテスト前に非起動preflightでCRT4本と正本の完全一致を検査し、
+  欠落／破損ならCMake buildまたはセット全体の復元を案内して停止する。
+  `build-dev.ps1` のcoreは公式CRTを埋め込み、通常の抽出経路で同じ `vcrt/` layoutを作る。
+- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` と `vcrt/` (.gitignore)。
   メイン exe のリリースビルド時に `include_bytes!` で内包される
 - 動作確認用: `crates/vst3-host-tester/` (Rust 単独 GUI exe)。本体に依存せずに
   プラグインのロード / GUI / 音声パススルーをテストできる。`cargo run -p vst3-host-tester`
@@ -1578,7 +1606,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + FFmpeg DLL + VC runtime + EffeTune Mixwright bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
 
@@ -1608,11 +1636,37 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
   remote service と EPUB converter をその隣へ同梱。
+  VST host と EffeTune bundle は利用者決定により非同梱。音響調整は bundle 不在で利用不可のまま。
+  `portable` build flavor では音響調整ボタン・カスタマイズ候補・v4.3.0の関連告知も表示しない。
+  保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.11.1 の VERSION と全407ファイルを
+  `third_party/effetune-mixwright/v0.11.1/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+  改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
+  指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
+  launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
+  検証済み世代を一度だけ公開する。既存・使用中treeの移動、置換、削除はしない。**atomicなのは
+  完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
+  正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
+  不一致は別世代を全hash検証して公開する。公開済み旧世代のcleanupは起動経路外に保留する。
+  hash12はcontent SHA256先頭12桁（stampはfull hashを比較）。公開前に最深fileのUTF-16長を確認し、
+  260以上なら明示理由で拒否する。publisher busyはworkerのOS lockを最大60秒待ってpointerを再確認する。
+  repair不能／timeoutでもcoreは起動し、理由と実際に拒否した世代をenvで渡してUnavailableにする。
+  音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
+  成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
+  メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.11.1/` に追跡し、`.gitattributes -text`で
+  checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
   するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。
+  EffeTune pluginも動的VC runtimeをimportする。hostは
+  `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe`、同梱CRTは非検索subdir `vcrt/`。
+  hostはCRTを一組で選ぶ。System32の全4本が存在・版数読取可能で各DLLのfile versionが
+  同梱版以上なら全4本System32、それ以外は全4本同梱。選択後に依存順で絶対pathからpreloadし、
+  途中のsource切替はしない。選択元と両版数をlogへ記録する。shared host直下に固定CRTを置かず、抽出は一致bytesを
+  書き換えず、成功だけcacheして失敗の再試行を許す。portableはこの抽出経路を使わない。
   `scripts/check-vcrt-pe-dependencies.ps1` が全配布 PE の machine / import closure と、CRT・ORT の
   Microsoft 署名、CRT の同一版・最低版・manifest hash を検査する。未知の `msvcp*` /
   `vcruntime*` / `concrt*` import は gate failure とし、追加 DLL を場当たり的に配布しない。
@@ -1978,9 +2032,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
-      core / remote / EPUB worker / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
+      core / remote / EPUB worker / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / EffeTune plugin (`.vst3` PE) / `mImageViewer_setup.exe` / portable の各 loose PE。
       **`include_bytes!` で埋め込む物は「埋め込み前」に署名する**
       (内側 vendor PE → core + remote + EPUB worker → launcher → setup.exe の順)。
+      EffeTune は vendor 原本ではなく target staging の全 PE を署名し、`MIMV_EFFETUNE_DIR` で
+      launcher 埋め込み元を切り替える。`.vst3` の拡張子でも PE なら署名対象とする。
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
       ([docs/release-operations.md](docs/release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
@@ -2016,7 +2072,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       検証チェックリスト全項目は [docs/portable-build-plan.md](docs/portable-build-plan.md) §8。
 12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
     `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / installer、
-    portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host を filesystem から
+    portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host / EffeTune plugin PE を filesystem から
     列挙し、artifact 別 machine、direct import closure、全 input SHA-256 を report に残す。
     4 CRT は Microsoft 署名、manifest exact hash、全4本同一版かつ最低 14.44 を必須とし、
     `onnxruntime*.dll` も Microsoft 署名を必須にする。未知の VC runtime import、companion CRT 欠落、

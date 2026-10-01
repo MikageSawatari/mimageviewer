@@ -2,7 +2,8 @@
 
 状態: 設計第 5 版 (2026-09-27)。第 1 版 (REVISE、P1×5 / P2×4 / P3×1) と第 2 版 (REVISE、P1×4 / P2×2) への
 Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 / P3×1) を第 4 版で、第 4 版への指摘 (REVISE、P1×2 / P3×1) を第 5 版で反映。第 5 版は ACCEPT WITH CHANGES (P3×1、テストの記述) で、その修正を反映済み。
-サンプル版 (試験用) の範囲を定める。配布版で決めることは §10。
+サンプル版 (試験用) の設計記録と、v4.3.0 配布版の決定をまとめる。配布の同梱・署名・通知と
+ポータブル版の範囲は §10 に確定。残る対象外事項も同節に記録する。
 
 ## 0. 目的と決定済み事項
 
@@ -169,7 +170,8 @@ enum EffetuneFailure {
   - ランプ (selectable の active) = `Running` かつ 最新の判定が `Effective`。
   - クリック: `Idle` → `Loading { UserButton, open_gui_when_ready: Some(ShowPermit) }` /
     `Running` → 非表示なら表示・アクティブ化、表示中で手前なら非表示、背面なら手前へ出してアクティブ化 /
-    `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。
+    `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。ただしR2の
+    `Unavailable(BundlePreparationFailed)`だけはクリックでworker再解決→ロードを試す。
   - ツールチップに状態と理由 (Failed の理由、判定が古い可能性、Unparseable の理由) を出す。
   - 実装事実 (2026-09-28): 利用不可・失敗・判定不能のツールチップには短い日本語の理由を出し、
     enum 名、host の詳細エラー、bundle の絶対パスは表示しない。診断詳細は log に残す。
@@ -366,19 +368,22 @@ enum EffectiveState {
   - 配信中に EffeTune の設定を変えても、そのセッションには反映しない (次のセッションの受け付け時に
     取り直す)。
 
-## 7. bundle の配置 (サンプル版)
+## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
 - `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
-- 実行時は **EffeTune モジュール自身の解決関数** で `<実行中 exe のディレクトリ>\effetune\EffeTune Mixwright.vst3`
-  を探す。`native_assets` は使わない (ポータブル版の DLL 解決専用に `#[cfg(feature = "portable")]` で
-  閉じられており、公開範囲を広げない。実装時に判明、2026-09-27)。通常版・ポータブル版で同じ規則。
-  `current_exe()` が失敗したら `.` に逃がさず `Unavailable(BundleMissing(理由))`。
-  bundle が無ければ `Unavailable(BundleMissing)`。
+- 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
+  `<exe_dir>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3` として一度だけ解決し、
+  controllerの生存中は固定する。launcher経由でない通常版はcurrent pointerから同じ規則で選ぶ。
+  修復不能時の専用envはUnavailableと詳細logへ反映し、別世代へ黙ってfallbackしない。
+- build-devのpointer不在時だけ従来の `<exe_dir>/effetune/EffeTune Mixwright.vst3` を使う。
+  portableはこの従来経路を維持しbundleを同梱しない。`native_assets` のportable専用公開範囲は広げない。
+  `current_exe()`失敗時も `.` へfallbackしない。bundle不在はUnavailable(BundleMissing)。
 - `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` が偽なら
   `Unavailable(CpuUnsupported)`。
-- release / portable / launcher への埋め込みはしない。build.rs の必須チェックにも入れない。
+- サンプル版では release / portable / launcher への埋め込みを行わず、build.rs の必須チェックにも
+  入れなかった。v4.3.0 配布版の launcher 対応は §10.2。
 
 ## 8. テスト
 
@@ -387,7 +392,8 @@ enum EffectiveState {
   fixture は Mixwright v0.11.1 の上流ソース (`src/bridge/state_codec.cpp` の encode) の出力形から作り、
   出典 (タグと関数) をテストに書く。実機の状態は §5.2 の log で後から集める。
 - controller の遷移: Idle→Loading→Running、Running から戻らない、各 `EffetuneFailure` が
-  `fail()` の 1 か所を通りスロットが空になる、Unavailable ではクリックで何も起きない、
+  `fail()` の 1 か所を通りスロットが空になる、Unavailableでは準備失敗だけworkerで再試行し、
+  拒否された同世代を使わず別の公開世代を固定する（他のUnavailableはクリック不可）、
   起動時条件 (Effective / Unparseable で起動、Inert・ファイルなしで起動しない)。
 - 起動時ゲート: 完了順 2 通り、ユーザー VST 無効、どちらかが失敗・worker 切断、遅延中の動画／音声の
   オープンが 1 回だけ再開される。
@@ -487,20 +493,27 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain` / `Unowned`) と latency (`AutoBypass` / `ReportOnly`)。
   既存の bridge は既定値で従来どおり動く。
 
-## 10. サンプル版の範囲外 (配布版で決める)
+## 10. 決定済みの配布方針と残る対象外事項
 
 - 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
 
-- release / portable / インストーラへの同梱方法、Mixwright の署名、THIRD-PARTY-NOTICES の転載、商標注記
-- マニュアル・製品ページ・privacy (Mixwright の WebView データの保存先が mIV の data_dir の外になる点)
+- v4.3.0 の同梱・署名・ライセンス通知は §10.2 に確定。商標注記の追加要否は別途確認する。
+- マニュアル・製品ページ・privacy には、Mixwright の WebView データの保存先が mIV の data_dir の
+  外になる点を記載済み。installer/readme.txt も共有データと Remote の残存フォルダを明記する。
 - フルスクリーン中の EffeTune ウィンドウの扱い・フォーカス受け渡し (detached リワークの手続きが必要)
 - 配信中の起動のリモート反映 (設定変更は第 6〜9 版の bridge 共有で配信中も反映される。配信中の
   起動は次の配信から、§12.4)
 - 作者への連絡
 
-### 10.1 ポータブル版 (利用者決定 2026-09-28)
+### 10.1 ポータブル版 (利用者決定 2026-09-28、UI方針追記 2026-10-01)
 
 - ポータブル版は **ユーザー VST も音響調整 (EffeTune) も無効のまま** (vst3-host.exe を同梱しない現状を維持)。
+- **利用者決定 2026-10-01**: portable は EffeTune のツールバーボタンとカスタマイズ候補を表示しない。
+  v4.3.0 の「重要な変更点」からも、同ボタン追加の必読告知と EffeTune 新機能の紹介を除く。
+  通常版の表示・告知は維持し、Remote 接続・音声トラック選択・長さ表示の告知は両版に残す。
+- 除外条件は `portable` build flavor とする。通常版で bundle が見つからない場合は配布／展開の
+  不具合として扱い、ボタンと「必要なファイルが見つかりません」の表示を維持する。
+  portable の保存済みツールバーレイアウトから EffeTune 項目を削除せず、表示と編集用の投影だけで除外する。
 - 理由: Mixwright は mIV の data_dir に関係なく `%APPDATA%` に書く (上流 v0.11.1 で確認:
   プリセット = `%APPDATA%\effetune\` か `%APPDATA%\Frieve\EffeTunePlugin\`、config.json も同所、
   WebView の保存領域 = CHOC `getUserDataFolder()` により `%APPDATA%\<ホスト exe 名>\`)。
@@ -508,7 +521,61 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 参考: 過去のポータブル版の誤検知の原因は未署名の vst3-host.exe そのもので、フォルダ走査 (core の
   `src/video/dsp/scanner.rs`) ではなかった。
 - Mixwright のパイプライン プリセットは DAW やデスクトップ版 EffeTune と共有される (作者の設計)。
-  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を追記する。
+  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を記載済み。
+
+### 10.2 v4.3.0 の配布同梱 (2026-10-01)
+
+- **単体exe版とインストーラ版に Mixwright v0.11.1 の bundle 全体を同梱する**。インストーラは
+  launcher をインストールする。portable は §10.1 の決定どおり bundle と VST host を同梱しない。
+- launcher の build.rs が `vendor/effetune-mixwright/` (または `MIMV_EFFETUNE_DIR` で指定した
+  staging) の VERSION と bundle を必須検証し、相対パス順に全ファイルを列挙して埋め込む。
+  v0.11.1 の bundle は 407 ファイル、38,491,437 bytes (約36.71 MiB)。bundle 外の VERSION を含む
+  入力は計408ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
+  無ければ取得・配置の復旧手順付きで build を停止する。
+- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋407ファイルの一覧とSHA-256を
+  固定し、vendor原本の欠落・追加・改変を署名前／埋め込み前に拒否する。署名stageも全非PEが一致、
+  PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
+- 起動時は `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/`
+  へ新しい世代を構築する。全ファイルのhashと一覧を検証してから、小さな `effetune/current`
+  pointerだけをatomicに更新する。公開済みtreeは使用中の読手から見えるため一切移動・削除しない。
+  旧世代のcleanupは起動経路では行わない。修復は別世代の公開でありin-placeの置換ではない。
+  正常stampの一覧・サイズ・更新時刻・作成時刻が一致するときは全量再hashもwrite lockも不要。
+  metadataを保持したままの内容改変は通常起動での検出対象外。書込不能／publisher busyなどで
+  repairできなくてもcoreは起動する。失敗理由と拒否世代を専用envからUnavailable UI／ログへ伝え、古いtreeを
+  黙って代用しない。成功時のgenerationもlauncherがenvで指定し、coreがそのpathを一度解決・固定する。
+- `build-dist.ps1` が呼ぶ `build-release.ps1 -Sign` は vendor 原本を変更せず target の staging に
+  bundle をコピーし、拡張子が
+  `.vst3` の plugin PE を含む全 PE を **launcher の埋め込み前に署名**する。
+  launcher build 時に `MIMV_EFFETUNE_DIR` を staging に向け、PE dependency gate も同じ
+  staging の bundle を明示的な検査入力にする。
+- VST hostは `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` へ展開し、
+  CRT4本は非検索subdir `vcrt/` に置く。System32の全4本が存在・版数読取可能で各DLLの
+  file versionが同梱セット以上なら全4本System32、他は全4本同梱。一度選び依存順でpreloadし、混在させない。
+  旧host／旧CRTを触らず、成功のみcacheして抽出失敗の再試行を許す。basenameは維持するので
+  WebViewの `%APPDATA%/mimageviewer-vst3-host.exe/` 保存先は変わらない。
+- SDK Windows hosting moduleはMIT原文を保持したtracked copyでUTF-8→UTF-16／wide APIを使う。
+  IPCのWindows backslash／Unicode escapeもdecodeする。pluginのANSI APIに影響する
+  activeCodePage manifestは使わない。stateはopaque IPC bytesで、hostにstate/preset path I/Oはない。
+- **R3補正 (2026-10-02、利用者決定)**: System32は4本それぞれが同梱版以上の場合だけ
+  選ぶ。1本でも古い／読取不能なら全4本同梱へ統一する。直接起動用vendor hostも必須CRTセットを
+  保持し、CMakeが公式正本を `vendor/vst3-host/vcrt/` に毎回配置する。必須条件の緩和はしない。
+- **R2簡素化 (2026-10-02、利用者決定)**: CRTはDLLごとの組み合わせを作らず一組で選ぶ。
+  publisher競合は最大60秒のOS lock待機で起動を直列化する（try_lock＋sleepループは使わない）。
+  timeout／修復失敗時は既存Loading／pending_loadに再解決とロードを統合し、新しい待機stateを追加しない。
+  準備失敗だけ音響調整ボタンを再試行可能にし、workerでcurrent pointerを再読する。整合性検査が拒否した
+  同じ世代は不可、別の公開済み世代だけを固定する。pointer不在時のdev fallbackはretryには使わない。
+  generationはcontent hash先頭12桁＋nonceに短縮するが、stampはfull manifestを比較する。最深file pathの
+  UTF-16長が260以上なら公開せず、UIにパスが長すぎる理由を示す。SDK directory checkのNotFound以外のerrorも
+  単体DLL pathへfallbackせず報告し、Win32にはnative backslash wide pathを渡す。
+  hostはCMakeで現trackedソースhash markerを埋め、署名前／core埋込前／bare cargo releaseのgateで照合する。
+  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは[バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)へ延期する。
+- 3種類の通知全文を `third_party/effetune-mixwright/v0.11.1/` に原文のまま追跡し、about の
+  EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
+  `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
+  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
+  一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+- EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
+  アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 

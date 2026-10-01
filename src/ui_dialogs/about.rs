@@ -6,6 +6,32 @@ use eframe::egui;
 const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT");
 const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
 
+// portable は EffeTune の bundle / notices を同梱しない。
+#[cfg(not(feature = "portable"))]
+const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
+    (
+        "EffeTune Mixwright THIRD-PARTY-NOTICES 全文",
+        "Contents/Resources/THIRD-PARTY-NOTICES.txt",
+        include_str!(
+            "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+        ),
+    ),
+    (
+        "EffeTune WebView THIRD-PARTY-NOTICES 全文",
+        "Contents/Resources/webview/THIRD-PARTY-NOTICES.txt",
+        include_str!(
+            "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
+        ),
+    ),
+    (
+        "EffeTune DSP NOTICE 全文",
+        "Contents/Resources/webview/plugins/dsp/NOTICE.txt",
+        include_str!(
+            "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
+        ),
+    ),
+];
+
 impl App {
     pub(crate) fn show_about_dialog_window(&mut self, ctx: &egui::Context) {
         if !self.show_about_dialog {
@@ -55,6 +81,17 @@ impl App {
                         ui.label("UnRAR");
                         ui.label("UnRAR license — Alexander Roshal / RARLAB");
                         ui.end_row();
+
+                        #[cfg(not(feature = "portable"))]
+                        {
+                            ui.label("EffeTune Mixwright");
+                            ui.label("MIT — © 2025-2026 Yoshiyuki Kobayashi");
+                            ui.end_row();
+
+                            ui.label("Steinberg VST3 SDK");
+                            ui.label("MIT — Steinberg Media Technologies GmbH");
+                            ui.end_row();
+                        }
 
                         ui.label("eframe / egui");
                         ui.label("MIT OR Apache-2.0 — Emil Ernerfeldt and contributors");
@@ -155,6 +192,25 @@ impl App {
                             });
                     });
 
+                #[cfg(not(feature = "portable"))]
+                for &(title, relative_path, text) in EFFETUNE_NOTICES {
+                    egui::CollapsingHeader::new(title)
+                        .id_salt(("about_effetune_notice", relative_path))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("about_effetune_notice_scroll", relative_path))
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(text).monospace().size(10.0),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                        });
+                }
+
                 // 編集用追加パック (導入済みのときだけ表示、spec §10)。
                 if let Some(pack) = &pack_about {
                     ui.add_space(10.0);
@@ -207,5 +263,34 @@ mod tests {
         assert!(EGUI_LICENSE_MIT.contains("Copyright (c) 2018-2021 Emil Ernerfeldt"));
         assert!(EGUI_LICENSE_APACHE.contains("Apache License"));
         assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
+    }
+
+    #[cfg(not(feature = "portable"))]
+    #[test]
+    fn effetune_notice_texts_include_attribution_and_match_vendor_when_present() {
+        use super::EFFETUNE_NOTICES;
+        let main_notice = EFFETUNE_NOTICES[0].2;
+        assert!(main_notice.contains("Copyright (c) 2025-2026, Yoshiyuki Kobayashi"));
+        assert!(main_notice.contains("Steinberg Media Technologies GmbH"));
+        assert!(main_notice.contains("MIT License"));
+        assert!(EFFETUNE_NOTICES[2].2.contains("PFFFT"));
+
+        let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/effetune-mixwright/EffeTune Mixwright.vst3");
+        if !vendor.exists() {
+            return;
+        }
+        let vendor_version = std::fs::read_to_string(vendor.parent().unwrap().join("VERSION"))
+            .expect("EffeTune vendor VERSION must be present");
+        assert_eq!(vendor_version.trim(), "v0.11.1");
+        for &(_, relative_path, embedded) in EFFETUNE_NOTICES {
+            let source = std::fs::read(vendor.join(relative_path))
+                .expect("EffeTune vendor notice must be present");
+            assert_eq!(
+                embedded.as_bytes(),
+                source,
+                "notice differs: {relative_path}"
+            );
+        }
     }
 }
