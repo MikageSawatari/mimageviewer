@@ -4,6 +4,7 @@
 //! claims. It does not mount a context, allocate a window identity, or advance a
 //! lifecycle transition.
 
+use super::raw_page_store::RawPageLoadState;
 use super::{App, ContextResidence, DetachedWindowState, FsCacheEntry, GridItem};
 use crate::test_script::TestScriptWindowPresentation;
 
@@ -340,10 +341,26 @@ impl App {
                 .map(GridItem::perf_key)
                 .unwrap_or_default();
             let media_kind = item.map(test_script_media_kind).unwrap_or("none");
-            let page_ready = page_index.is_some_and(|idx| {
-                matches!(
+            let raw_state = page_index
+                .filter(|&idx| match context.items().get(idx) {
+                    Some(GridItem::Image(path)) => crate::raw_format::is_raw_path(path),
+                    Some(GridItem::ZipImage { entry_name, .. }) => {
+                        crate::raw_format::is_raw_path(std::path::Path::new(entry_name))
+                    }
+                    _ => false,
+                })
+                .map(|idx| context.raw_pages().classify(idx));
+            let edit_ready = page_index.is_some_and(|idx| match raw_state {
+                Some(state) => state == RawPageLoadState::Developed,
+                None => matches!(
                     context.fs_cache().get(&idx),
                     Some(FsCacheEntry::Static { .. } | FsCacheEntry::Animated { .. })
+                ),
+            });
+            let page_ready = raw_state.map_or(edit_ready, |state| {
+                matches!(
+                    state,
+                    RawPageLoadState::PreviewShown | RawPageLoadState::Developed
                 )
             });
             crate::test_script::TestScriptWindowSnapshot {
@@ -365,6 +382,7 @@ impl App {
                 item_identity,
                 selected_item_identity,
                 page_ready,
+                edit_ready,
                 viewport_rendered: false,
                 viewport_revision: 0,
                 paint_matches_current_page: false,

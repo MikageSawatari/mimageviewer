@@ -73,12 +73,30 @@ fn latest_seek_during_raw_development_supersedes_waiting_pages_and_promotes_raw(
     ));
     let (_tx, rx) = std::sync::mpsc::channel();
     let pending = FsPendingValue::scheduled(fs_ticket, rx, 0, FsLoadPurpose::Prefetch);
-    pending
-        .raw_job
-        .lock()
-        .unwrap()
-        .publish(Arc::clone(&raw_ticket));
     app.fs_pending.insert(2, pending);
+    let source = RawSourceIdentity {
+        item_key: app.page_path_key(2).unwrap(),
+        path: PathBuf::from("page-2.dng"),
+        size: 1,
+        mtime_ticks: 1,
+    };
+    app.raw_pages.pages.insert(
+        2,
+        RawPageRecord::Page(RawPageState {
+            source,
+            developed_dims: Some([10, 10]),
+            stage: RawInstalledStage::PreviewAbsent,
+            preview: RawPreviewPhase::Absent,
+            develop: Arc::new(Mutex::new(RawDevelopPhase::Submitted {
+                request_id: 1,
+                ticket: Arc::clone(&raw_ticket),
+                brightness: crate::raw::RawBrightness::None,
+            })),
+            preview_started_at: std::time::Instant::now(),
+            develop_started_at: std::time::Instant::now(),
+            presented: RawPresentation::Nothing,
+        }),
+    );
 
     app.apply_fs_page_load_contract(2, FsPageLoadContract::LatestSeek);
     assert!(
@@ -91,7 +109,7 @@ fn latest_seek_during_raw_development_supersedes_waiting_pages_and_promotes_raw(
         Some(crate::raw::RawPriority::High)
     );
 
-    app.fs_pending.remove(&2).unwrap().cancel();
+    app.discard_fs_page(2);
     release_tx.send(()).unwrap();
     drop(blocker_permit);
 }
@@ -48622,6 +48640,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/scan.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -48676,6 +48695,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/old.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -48738,6 +48758,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/scan.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,

@@ -2,11 +2,11 @@ pub mod brightness;
 pub mod executor;
 pub mod raw_decoder;
 
-pub use executor::{RawDevelopExecutor, RawPriority, RawTicket};
+pub use executor::{RawDevelopExecutor, RawPriority, RawTicket, RawTicketState};
 pub use raw_decoder::{
     AppliedBrightness, RawBrightness, RawDevelopOutput, RawDevelopScale, RawDevelopSupport,
     RawError, RawInfo, RawOwnedSource, RawPreview, RawPreviewInfo, RawPreviewUnavailableReason,
-    RawSource, RawUnsupportedReason,
+    RawSource, RawSourceFingerprint, RawUnsupportedReason,
 };
 
 #[derive(Clone)]

@@ -214,6 +214,9 @@ impl App {
     /// のみで重い合成が無いため、post_filter バイパスや base cache 準備は行わない。
     pub(crate) fn enter_export_crop_mode(&mut self, fs_idx: usize) {
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
         if let Some(pivot) = pivot {
             self.export_crop_spread_ctx = Some(pivot);
             self.enter_page_edit_single_view(target_idx);

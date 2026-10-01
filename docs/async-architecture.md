@@ -547,6 +547,18 @@ worker は結果チャネルとは別の進捗チャネルで、モデル準備 
 diffusion fallback を UI へ通知する。UI は pending が存在する間だけ持続ステータスを描き、
 保存済みマスクの自動再生成を含めて、短時間トーストが消えた後も処理中であることを示す。
 
+### 3.3.1 RAW fullscreen の要求所有権 (S3)
+
+`RawPageStore` は viewer context ごとに preview / development の独立した型付き状態、items 世代、物理 source 指紋、要求 ID、結果 channel と需要集合を持つ。RAW の寸法・preview・development 結果はすべて `apply_result` で検証し、RAW の `fs_cache` はここだけが書く。物理 source がまだ worker で確定していない要求は `Resolving` として分離し、UI は stat / LibRaw / decode を実行しない。
+
+実際に表示する全ページ (見開き相方・表紙補助・連結読み可視ページを含む) は High、表示順の先 2 / 前 1 は Normal。両者の和で取消を判定し、保持は既存 keep range とこの需要集合の和にする。`Preparing` は source 解決の scheduler ticket と最高優先度を保持し、D1 permit を解放してから executor へ submit する。ticket 発行前の取消・昇格も同じ owner に届く。ページ送りの admission は producer と upload の両方に適用する。
+
+park は Requested preview を NotRequested に戻し Preparing / Submitted を取消すが、Done / Blocked は残す。mount / swap は結果 channel も交換し、drop / generation 更新は owning context の要求だけを取消す。idx 単位の破棄は `discard_fs_page`、snapshot 再構築は entry と owner の原子的 transfer を使う。
+
+worker は info / preview / develop の前後、および executor が queued source を開くときに高精度 mtime と size を検証する。現在要求の typed `Stale` は RAW source transaction に進み、source を取り直す。古い要求の Stale は要求 ID で拒否する。明るさ変更も同じページ単位の入力・派生結果失効を使うが、preview と寸法の要求・backlog は残す。mounted / parked の双方を処理し、retained final AI は source 指紋 + 明るさの key と完了検証で失効させる。App-global retained epoch は進めないので、無関係な JPEG の AI 完了は保存できる。
+
+現在ページの現像中だけ 100ms の repaint を要求し、queued / running / cancelling は `RawTicketState` で区別する。RAW source preparation と preview は既存の読み込み経路、完了は worker の repaint 通知で進む。
+
 ### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
 
 Source生成結果には、実寸と別に`ThumbLoadOrigin::SourceGenerated { evaluated_display_px }`

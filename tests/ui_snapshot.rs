@@ -27,6 +27,33 @@
 
 use egui_kittest::Harness;
 
+#[test]
+fn raw_settings_light() {
+    snapshot_with_theme(
+        "raw_settings_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_raw_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_settings_dark() {
+    snapshot_with_theme(
+        "raw_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_raw_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_progress_dark() {
+    snapshot_with_theme(
+        "raw_progress_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_raw_progress_snapshot_fixture,
+    );
+}
+
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
 /// 絵文字混じりテキストの実際のレイアウトを検証できない。

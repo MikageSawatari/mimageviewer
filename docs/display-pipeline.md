@@ -418,6 +418,18 @@ memo 化する。製本・synthetic 等の既存短絡条件を維持し、毎�
 
 ## 2. フルスクリーン表示パイプライン
 
+### 2.0 RAW の表示段 (S3)
+
+RAW は worker の info → 埋め込み preview → LibRaw フル現像の順で表示する。`RawPageStore` が context / items generation / 物理 source 指紋 / 要求 ID / 明るさを検証し、`RawPreview` を最終的に既存の Static へ置き換える。現像完了後は preview の追加保持をしない。preview より現像が先に完了した場合も、古い preview が表示段を戻さない。
+
+fullscreen に catalog サムネイルや色忠実 rendition を出せるのは、埋め込み preview の実デコードと向き検査を通った後だけ (`raw_fullscreen_fallback_allowed`)。preview 無し・壊れた JPEG・向き不一致では、half 現像由来のサムネイルが存在していても読み込み表示のまま待つ。現像も不可なら Terminal としてナビゲーションを終える。
+
+RAW の配置・fit・Original・Z・pan・回転・見開き・連結読み・座標変換の基準は全表示段で `developed_dims`。8192 clamp 後の Static や派生 final / AI texture の実寸を配置基準に戻さない。actual raster は canonical 枠へ contain し、ナビゲータ・ルーペ・capture の写像も共有 transform を使う。
+
+preview は生デコード段の表示専用で、編集・同期補正・AI・final composite の入力にしない。カラー化 / LUT の既存 gate は維持し、必要なページは検証済み preview の後だけ色忠実 rendition を表示する。PreviewShown はその提示でページ送り・フォルダ lock を終えられる。PreviewAbsent は developed / complete final の提示か Terminal まで待つ。両ナビゲーション経路は RAW の分類と同じ readiness 述語を使う。編集の全入口・見開き左右・ツール内ページ切替・ボタン状態は、実際の編集対象に対する `raw_edit_target_gate` を mode / page mutation の前に確認する。
+
+明るさ変更と worker の Stale はページ単位の source transaction。既存の `capture_final_effect_source_reload_holdover` だけで提示中のユニット / 連結読み transition を退避し、入力と派生 cache を失効させる。明るさ変更では preview / 寸法の要求を残す。retained AI の source 指紋 + 明るさ key を更新し、他ページの retained epoch は変更しない。
+
 ### 2.1 エントリポイント
 
 ```

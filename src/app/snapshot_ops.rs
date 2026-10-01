@@ -8,8 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::app::App;
-use crate::fs_animation::FsCacheEntry;
+use crate::app::{App, FsPageTransfer};
 use crate::grid_item::GridItem;
 use crate::snapshot::{
     FilterState, SnapshotEntry, SnapshotKey, SnapshotSourceLabel, SnapshotState, is_inside_fs,
@@ -25,7 +24,7 @@ struct SnapshotViewerIndexSwap {
     old_fullscreen_idx: usize,
     new_fullscreen_idx: usize,
     old_to_new: HashMap<usize, usize>,
-    preserved_fs_entry: Option<FsCacheEntry>,
+    preserved_fs_page: Option<FsPageTransfer>,
     opened_media_path: Option<PathBuf>,
     current_owns_global_media_indices: bool,
     restart_marker_thumb_decode: Option<PathBuf>,
@@ -180,8 +179,8 @@ impl App {
                 return;
             }
         }
-        if let Some(entry) = swap.preserved_fs_entry.take() {
-            self.fs_cache.insert(swap.new_fullscreen_idx, entry);
+        if let Some(transfer) = swap.preserved_fs_page.take() {
+            self.restore_fs_page_from_snapshot(swap.new_fullscreen_idx, transfer);
         }
         self.fullscreen_idx = Some(swap.new_fullscreen_idx);
         self.video_audio_mode = self.video_audio_mode.and_then(&remap);
@@ -443,13 +442,13 @@ impl App {
 
         // `bump_items_generation` immediately discards old-generation entries, so ownership
         // must leave the generation map before the caller bumps it.
-        let preserved_fs_entry = self.fs_cache.remove(&old_fullscreen_idx);
+        let preserved_fs_page = self.take_fs_page_for_snapshot(old_fullscreen_idx);
 
         Some(SnapshotViewerIndexSwap {
             old_fullscreen_idx,
             new_fullscreen_idx,
             old_to_new,
-            preserved_fs_entry,
+            preserved_fs_page: Some(preserved_fs_page),
             opened_media_path,
             current_owns_global_media_indices,
             restart_marker_thumb_decode,

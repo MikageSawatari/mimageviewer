@@ -10922,6 +10922,9 @@ impl App {
         // 切り替えも一切効かないモード**になる (2026-08-26 の利用者報告)。
         if let Some(fs_idx) = self.fullscreen_idx {
             let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+            if !self.raw_edit_target_entry_allowed(target_idx) {
+                return;
+            }
             if let Some(pivot) = pivot {
                 self.local_adjust_spread_ctx = Some(pivot);
                 self.enter_page_edit_single_view(target_idx);
@@ -14792,13 +14795,25 @@ impl App {
                                                 // 倒す前の見開き用の値が残ることがある)。
                                                 let is_left = fs_idx == left;
                                                 if ui
-                                                    .selectable_label(is_left, "左ページ")
+                                                    .add_enabled(
+                                                        self.raw_edit_target_gate(left),
+                                                        egui::Button::selectable(
+                                                            is_left,
+                                                            "左ページ",
+                                                        ),
+                                                    )
                                                     .clicked()
                                                 {
                                                     switch_target_to = Some(left);
                                                 }
                                                 if ui
-                                                    .selectable_label(!is_left, "右ページ")
+                                                    .add_enabled(
+                                                        self.raw_edit_target_gate(right),
+                                                        egui::Button::selectable(
+                                                            !is_left,
+                                                            "右ページ",
+                                                        ),
+                                                    )
                                                     .clicked()
                                                 {
                                                     switch_target_to = Some(right);
@@ -15045,6 +15060,9 @@ impl App {
     /// `local_adjust_edge_preview_cache` は `source_key` で keyed なので消さない。
     /// `local_adjust_selected_layers` はページごとの `HashMap` なので消さない。
     pub(crate) fn switch_local_adjust_target_in_spread(&mut self, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -15647,6 +15665,11 @@ impl App {
                 self.detached_viewer_image_edit_tools_disabled_reason(),
                 continuous_reading,
             );
+            let (raw_edit_target, _) = self.plan_page_edit_pivot(fs_root_idx);
+            let edit_tool_disabled_reason = edit_tool_disabled_reason.or_else(|| {
+                (!self.raw_edit_target_gate(raw_edit_target))
+                    .then_some("RAW の現像が終わると編集できます")
+            });
             let can_start_edit_tool = can_overlay_edit && edit_tool_disabled_reason.is_none();
             let sns_split_rotation = if can_overlay_edit {
                 let (sns_split_target_idx, _) = self.plan_page_edit_pivot(fs_root_idx);
@@ -15816,6 +15839,9 @@ impl App {
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
             // post_filter バイパスを行うので、ここでは owner を閉じるだけで十分。
             if activate_local_adjust {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
@@ -15824,6 +15850,9 @@ impl App {
                 return;
             }
             if activate_erase {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_erase",
@@ -15833,6 +15862,9 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_conceal {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
@@ -15842,6 +15874,9 @@ impl App {
                 return;
             }
             if activate_crop {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_crop",
@@ -15851,6 +15886,9 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_text {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_text",
@@ -15860,6 +15898,9 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_sns_split {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 match self.enter_sns_split_mode(fs_root_idx) {
                     Ok(()) => {
                         crate::ime_focus::record_side_panel_close(
@@ -16032,7 +16073,7 @@ impl App {
                             let same = self.effective_params(left) == self.effective_params(right);
                             ui.horizontal(|ui| {
                                 let is_left = self.adjust_spread_target == AdjustSpreadTarget::Left;
-                                if ui.selectable_label(is_left, "左ページ").clicked() {
+                                if ui.add_enabled(self.raw_edit_target_gate(left), egui::Button::selectable(is_left, "左ページ")).clicked() {
                                     self.adjust_spread_target = AdjustSpreadTarget::Left;
                                 }
                                 let copy_l = ui
@@ -16055,7 +16096,7 @@ impl App {
                                 if copy_r.clicked() {
                                     self.copy_spread_adjust(left, right);
                                 }
-                                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                                if ui.add_enabled(self.raw_edit_target_gate(right), egui::Button::selectable(!is_left, "右ページ")).clicked() {
                                     self.adjust_spread_target = AdjustSpreadTarget::Right;
                                 }
                             });

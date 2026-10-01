@@ -3836,7 +3836,7 @@ impl App {
             && let Some(origin_idx) = landing.remapped_origin_idx
             && self.fullscreen_idx != Some(origin_idx)
         {
-            self.fs_cache.remove(&origin_idx);
+            self.discard_fs_page(origin_idx);
         }
         ctx.request_repaint();
     }

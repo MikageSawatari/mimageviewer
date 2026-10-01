@@ -101,6 +101,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 - ZIP / PDF ページと Stack、動画の `CurrentFrame`、見開きの
   `Merged` / `BothPages` / `MainPageOnly` は materializer の実体化対象。
 - 環境設定は左ツリー上部の検索欄で項目名・関連語・ページ名・カテゴリ名を AND 部分一致検索でき、結果を選ぶと該当ページの項目へスクロールして一時的に強調表示する。
+- ファイル処理の並列設定に RAW の「同時現像数」(`raw_develop_parallelism`: 1〜10、既定 3) と「明るさ」(`raw_brightness: RawBrightness`: `MatchPreview` = プレビューに合わせる / `None` = 補正しない、既定 MatchPreview) を置く。現像数は executor の変更が成功したときだけ設定へ反映し、途中の worker 起動失敗では以前の上限を維持して画面へエラーを返す。明るさ変更は全 viewer context の RAW 入力を再現像し、サムネイルと非 RAW ページは保持する。未リリース設定なので migration は作らない。
 - v2.7.0では「メタ情報をエクスポート / インポート」を安定化のため一時非表示にしたが、
   v2.8.0の継続開発で再表示する。実フォルダ表示中だけ使用できる。既存の自動
   sidecar `mimageviewer.dat` とは別に、対象フォルダ直下の `mimageviewer.meta.miv`

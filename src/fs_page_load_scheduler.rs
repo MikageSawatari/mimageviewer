@@ -96,6 +96,27 @@ impl FsPageLoadScheduler {
         }
     }
 
+    /// RAW owns two source requests for one target page.
+    pub(crate) fn supersede_waiting_for_latest_seek_page(&self, owner_context: u64, idx: usize) {
+        let (superseded, stats) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let superseded = state.remove_waiting_superseded(owner_context, SeekRetain::Page(idx));
+            let stats = state.stats();
+            self.inner.changed.notify_all();
+            (superseded, stats)
+        };
+        for request in superseded {
+            emit_scheduler_event(
+                "scheduler_cancel_waiting",
+                &request.perf,
+                request.priority,
+                request.contract,
+                stats,
+                None,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn request_with_cancel(
         &self,
@@ -578,12 +599,26 @@ impl SchedulerState {
         owner_context: u64,
         except_request_id: Option<u64>,
     ) -> Vec<RequestRecord> {
+        self.remove_waiting_superseded(
+            owner_context,
+            except_request_id.map_or(SeekRetain::Nothing, SeekRetain::Request),
+        )
+    }
+
+    fn remove_waiting_superseded(
+        &mut self,
+        owner_context: u64,
+        retain: SeekRetain,
+    ) -> Vec<RequestRecord> {
         let superseded = self
             .requests
             .iter()
             .filter_map(|(&id, request)| {
-                (Some(id) != except_request_id
-                    && request.perf.owner_context == owner_context
+                (!match retain {
+                    SeekRetain::Nothing => false,
+                    SeekRetain::Request(keep) => id == keep,
+                    SeekRetain::Page(idx) => request.perf.idx == idx,
+                } && request.perf.owner_context == owner_context
                     && request.phase == RequestPhase::Waiting)
                     .then_some(id)
             })
@@ -599,8 +634,57 @@ impl SchedulerState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SeekRetain {
+    Nothing,
+    Request(u64),
+    Page(usize),
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latest_seek_page_keeps_both_raw_requests_and_other_contexts() {
+        let scheduler = FsPageLoadScheduler::with_limits(1, 0);
+        let preview = scheduler.request(
+            11,
+            4,
+            FsPageLoadPriority::High,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let preparation = scheduler.request(
+            11,
+            4,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let old = scheduler.request(
+            11,
+            3,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let sibling = scheduler.request(
+            12,
+            3,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        scheduler.supersede_waiting_for_latest_seek_page(11, 4);
+        assert!(old.cancel_token().load(Ordering::Relaxed));
+        for ticket in [&preview, &preparation, &sibling] {
+            assert!(!ticket.cancel_token().load(Ordering::Relaxed));
+        }
+        assert_eq!(scheduler.stats().waiting, 3);
+    }
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;

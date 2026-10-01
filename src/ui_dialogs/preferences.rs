@@ -2433,7 +2433,26 @@ impl App {
                 // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
                 // Settings に追加した場合はここにも追記が必要。
                 prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
+                let old_raw_brightness = self.settings.raw_brightness;
+                let requested_raw_parallelism = state.settings.raw_develop_parallelism.clamp(1, 10);
+                if requested_raw_parallelism != self.settings.raw_develop_parallelism {
+                    if let Err(error) = self
+                        .raw_develop_executor
+                        .set_parallelism(requested_raw_parallelism as usize)
+                    {
+                        state.settings.raw_develop_parallelism =
+                            self.settings.raw_develop_parallelism;
+                        self.show_feedback_toast(format!(
+                            "RAW の同時現像数を変更できませんでした: {error}"
+                        ));
+                    } else {
+                        state.settings.raw_develop_parallelism = requested_raw_parallelism;
+                    }
+                }
                 self.settings = state.settings;
+                if old_raw_brightness != self.settings.raw_brightness {
+                    self.raw_brightness_changed();
+                }
                 if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
                     #[cfg(windows)]
                     self.invalidate_final_cover_spread_display_in_parked_contexts();

@@ -479,6 +479,7 @@ impl App {
             .values()
             .filter(|entry| matches!(entry, crate::fs_animation::FsCacheEntry::Video { .. }))
             .count();
+        self.raw_pages.clear();
         if active_media_entries == 0 {
             self.fs_cache.clear();
         } else {

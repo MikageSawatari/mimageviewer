@@ -23,6 +23,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// probe が失敗した場合など)。UI 側はそれも普通に扱えるよう、drain ループで
 /// すべての受信メッセージを消化する。
 pub enum FsLoadResult {
+    RawSourceFailed {
+        context: u64,
+        generation: u64,
+        request_id: u64,
+        error: crate::raw::RawError,
+    },
+    /// Context and request validated RAW result; info is non-terminal.
+    Raw {
+        tag: crate::app::raw_page_store::RawResultTag,
+        result: crate::app::raw_page_store::RawPageResult,
+    },
     /// ヘッダ解析だけで取れた EXIF 後相当の表示向き寸法。終端ではない。
     DimsOnly { source_dims: [usize; 2] },
     /// GIF / APNG / Animated WebP と確認でき、全フレーム展開を始めた。終端ではない。
@@ -78,6 +89,11 @@ pub enum StaticAnimationState {
 }
 
 pub enum FsCacheEntry {
+    RawPreview {
+        preview: Option<RawPreviewTexture>,
+        developed_dims: [usize; 2],
+        load_seq: u64,
+    },
     /// 静止画。GPU テクスチャと CPU 側ピクセルデータ（分析パネル用）を保持する。
     Static {
         tex: egui::TextureHandle,
@@ -110,6 +126,11 @@ pub enum FsCacheEntry {
         player: Box<crate::video::VideoPlayer>,
         load_seq: u64,
     },
+}
+
+pub struct RawPreviewTexture {
+    pub tex: egui::TextureHandle,
+    pub pixels: std::sync::Arc<egui::ColorImage>,
 }
 
 impl FsCacheEntry {
@@ -193,6 +214,7 @@ impl FsCacheEntry {
     pub fn load_seq(&self) -> u64 {
         match self {
             FsCacheEntry::Static { load_seq, .. }
+            | FsCacheEntry::RawPreview { load_seq, .. }
             | FsCacheEntry::Animated { load_seq, .. }
             | FsCacheEntry::Video { load_seq, .. } => *load_seq,
             FsCacheEntry::Failed => 0,

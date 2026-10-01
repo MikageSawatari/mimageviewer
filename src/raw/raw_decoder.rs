@@ -16,6 +16,49 @@ pub enum RawSource<'a> {
 pub enum RawOwnedSource {
     Path(PathBuf),
     Bytes(Arc<[u8]>),
+    Validated {
+        source: Box<RawOwnedSource>,
+        fingerprint: RawSourceFingerprint,
+    },
+}
+
+/// Physical container identity. Read and validate only on workers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RawSourceFingerprint {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_ticks: u64,
+}
+
+impl RawSourceFingerprint {
+    pub fn read(path: PathBuf) -> Result<Self, RawError> {
+        let metadata = std::fs::metadata(&path).map_err(|e| RawError::Io(e.to_string()))?;
+        #[cfg(windows)]
+        let mtime_ticks = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.last_write_time()
+        };
+        #[cfg(not(windows))]
+        let mtime_ticks = metadata
+            .modified()
+            .map_err(|e| RawError::Io(e.to_string()))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| RawError::Io(e.to_string()))?
+            .as_nanos()
+            .div_euclid(100) as u64;
+        Ok(Self {
+            path,
+            size: metadata.len(),
+            mtime_ticks,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), RawError> {
+        match Self::read(self.path.clone()) {
+            Ok(current) if current == *self => Ok(()),
+            _ => Err(RawError::Stale),
+        }
+    }
 }
 
 impl RawOwnedSource {
@@ -23,6 +66,20 @@ impl RawOwnedSource {
         match self {
             Self::Path(path) => RawSource::Path(path),
             Self::Bytes(bytes) => RawSource::Bytes(bytes),
+            Self::Validated { source, .. } => source.as_source(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RawError> {
+        match self {
+            Self::Validated {
+                source,
+                fingerprint,
+            } => {
+                fingerprint.validate()?;
+                source.validate()
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -138,6 +195,8 @@ pub enum RawError {
     NoUsablePreview(RawPreviewUnavailableReason),
     OutOfMemory,
     Cancelled,
+    /// A worker's physical source no longer matches its request fingerprint.
+    Stale,
     TooLarge,
     Internal(i32),
 }

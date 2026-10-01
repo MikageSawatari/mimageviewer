@@ -1093,6 +1093,17 @@ impl App {
             return true;
         }
 
+        if pixels.is_none() && self.fullscreen_idx.is_some_and(|idx| self.is_raw_page(idx)) {
+            ui.painter().text(
+                egui::pos2(panel_rect.center().x, header_rect.max.y + 25.0),
+                egui::Align2::CENTER_CENTER,
+                "RAW の現像待ち",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_gray(180),
+            );
+            return false;
+        }
+
         // ── マウス色取得 ──
         let hover_pixel: Option<[u8; 4]> = ctx.input(|i| i.pointer.hover_pos()).and_then(|pos| {
             if !image_rect.contains(pos) {

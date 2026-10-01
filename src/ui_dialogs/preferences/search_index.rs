@@ -329,6 +329,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["自動", "スレッド", "CPU", "並列", "parallel"]
     ),
     entry!(
+        "parallelism/raw",
+        Parallelism,
+        "RAW の現像",
+        ["RAW", "同時現像数", "明るさ", "プレビュー", "メモリ"]
+    ),
+    entry!(
         "parallelism/pdf",
         Parallelism,
         "PDF の同時処理数",
@@ -1140,6 +1146,7 @@ mod tests {
 
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
+    const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1262,8 +1269,16 @@ mod tests {
                 entry.anchor
             );
             assert!(!entry.title.is_empty(), "title が空です: {}", entry.anchor);
+            let title_source = if entry.anchor == "parallelism/raw" {
+                assert!(
+                    PAGES_SOURCE.contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
+                );
+                RAW_SETTINGS_SOURCE
+            } else {
+                PAGES_SOURCE
+            };
             assert!(
-                PAGES_SOURCE.contains(entry.title),
+                title_source.contains(entry.title),
                 "title が pages.rs の表示文字列と一致しません: {} / {}",
                 entry.anchor,
                 entry.title

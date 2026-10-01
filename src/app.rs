@@ -189,8 +189,10 @@ mod sidecar_restore;
 pub(crate) use sidecar_restore::SidecarRestorePresentation;
 pub(crate) mod collection_grid;
 pub(crate) mod collection_navigation;
+pub(crate) mod raw_page_store;
 pub(crate) mod smart_folder;
 mod snapshot_ops;
+use raw_page_store::*;
 mod startup_ops;
 mod subfolder_expansion;
 pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
@@ -6886,10 +6888,13 @@ mod raw_fullscreen_permit_tests {
             None,
             0,
         );
-        let permit = fs_ticket.waiter().acquire_cancellable().unwrap();
-        drop(permit);
-        let (_tx, rx) = mpsc::channel();
-        let pending = FsPendingValue::scheduled(fs_ticket, rx, 0, FsLoadPurpose::for_page(true));
+        drop(fs_ticket.waiter().acquire_cancellable().unwrap());
+        let mut phase = RawDevelopPhase::Preparing {
+            request_id: 1,
+            cancel: Arc::new(Mutex::new(fs_ticket)),
+            highest_priority: crate::raw::RawPriority::Normal,
+            brightness: crate::raw::RawBrightness::None,
+        };
         let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -6901,34 +6906,38 @@ mod raw_fullscreen_permit_tests {
             crate::raw::RawPriority::Normal,
             result_tx,
         ));
-        pending
-            .raw_job
-            .lock()
-            .unwrap()
-            .publish(Arc::clone(&raw_ticket));
+        phase.publish(1, Arc::clone(&raw_ticket));
         assert_eq!(
             executor.queued_priority_for_test(&raw_ticket),
             Some(crate::raw::RawPriority::Normal)
         );
-        assert!(!pending.promote_to_high(FsPageLoadContract::Sequential));
+        phase.promote();
         assert_eq!(
             executor.queued_priority_for_test(&raw_ticket),
             Some(crate::raw::RawPriority::High)
         );
-        pending.cancel();
-
-        // Promotion can also precede submission while source resolution is active.
-        let (_tx, rx) = mpsc::channel();
-        let late = FsPendingValue::new(
-            Arc::new(AtomicBool::new(false)),
-            rx,
+        phase.cancel();
+        let fs_ticket = scheduler.request(
+            1,
             0,
-            FsLoadPurpose::for_page(true),
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
         );
-        late.promote_to_high(FsPageLoadContract::Sequential);
+        let mut late = RawDevelopPhase::Preparing {
+            request_id: 2,
+            cancel: Arc::new(Mutex::new(fs_ticket)),
+            highest_priority: crate::raw::RawPriority::Normal,
+            brightness: crate::raw::RawBrightness::None,
+        };
+        late.promote();
         assert!(matches!(
-            &*late.raw_job.lock().unwrap(),
-            FsRawJobState::Awaiting(crate::raw::RawPriority::High)
+            late,
+            RawDevelopPhase::Preparing {
+                highest_priority: crate::raw::RawPriority::High,
+                ..
+            }
         ));
         late.cancel();
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
@@ -6937,10 +6946,7 @@ mod raw_fullscreen_permit_tests {
             crate::raw::RawPriority::Normal,
             cancelled_tx,
         ));
-        late.raw_job
-            .lock()
-            .unwrap()
-            .publish(Arc::clone(&late_ticket));
+        late.publish(2, late_ticket);
         assert!(matches!(
             cancelled_rx.recv_timeout(Duration::from_secs(5)),
             Ok(Err(crate::raw::RawError::Cancelled))
@@ -7174,51 +7180,10 @@ pub(crate) struct FsPendingValue {
     #[cfg(test)]
     pub(crate) cancel: Arc<AtomicBool>,
     ticket: FsPageLoadTicket,
-    raw_job: Arc<Mutex<FsRawJobState>>,
     pub(crate) rx: mpsc::Receiver<FsLoadResult>,
     pub(crate) load_seq: u64,
     pub(crate) purpose: FsLoadPurpose,
     animation_expansion_started_at: Option<std::time::Instant>,
-}
-
-enum FsRawJobState {
-    Awaiting(crate::raw::RawPriority),
-    Submitted(Arc<crate::raw::RawTicket>),
-    Cancelled,
-}
-
-impl FsRawJobState {
-    fn publish(&mut self, ticket: Arc<crate::raw::RawTicket>) {
-        match self {
-            Self::Awaiting(priority) => {
-                if *priority == crate::raw::RawPriority::High {
-                    ticket.promote_to_high();
-                }
-                *self = Self::Submitted(ticket);
-            }
-            Self::Cancelled => ticket.cancel(),
-            Self::Submitted(_) => unreachable!("one RAW job per fullscreen request"),
-        }
-    }
-
-    fn promote_to_high(&mut self) {
-        match self {
-            Self::Awaiting(priority) => {
-                *priority = crate::raw::RawPriority::High;
-            }
-            Self::Submitted(ticket) => {
-                ticket.promote_to_high();
-            }
-            Self::Cancelled => {}
-        }
-    }
-
-    fn cancel(&mut self) {
-        if let Self::Submitted(ticket) = self {
-            ticket.cancel();
-        }
-        *self = Self::Cancelled;
-    }
 }
 
 impl FsPendingValue {
@@ -7232,9 +7197,6 @@ impl FsPendingValue {
             #[cfg(test)]
             cancel: ticket.cancel_token(),
             ticket,
-            raw_job: Arc::new(Mutex::new(FsRawJobState::Awaiting(
-                crate::raw::RawPriority::Normal,
-            ))),
             rx,
             load_seq,
             purpose,
@@ -7262,11 +7224,9 @@ impl FsPendingValue {
 
     pub(crate) fn cancel(&self) {
         self.ticket.cancel();
-        self.raw_job.lock().unwrap().cancel();
     }
 
     fn promote_to_high(&self, contract: FsPageLoadContract) -> bool {
-        self.raw_job.lock().unwrap().promote_to_high();
         // LatestSeek supersession depends solely on whether the fs scheduler
         // still has this request waiting. A RAW job may outlive its fs permit.
         self.ticket.promote_to_high(contract)
@@ -8667,6 +8627,7 @@ pub(crate) struct FinalAiKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RetainedFinalAiKey {
+    pub(crate) raw_source: Option<(RawSourceIdentity, crate::raw::RawBrightness)>,
     pub(crate) item_key: String,
     pub(crate) edit_size: [usize; 2],
     pub(crate) color_ai_hash: u64,
@@ -9463,6 +9424,16 @@ pub(crate) struct PassthroughRenditionCache {
 }
 
 impl PassthroughRenditionCache {
+    fn peek(
+        &self,
+        key: FinalCompositeKey,
+        source_pixels: &Arc<egui::ColorImage>,
+    ) -> Option<PassthroughRenditionEntry> {
+        self.entries
+            .get(&key)
+            .filter(|entry| Arc::ptr_eq(&entry.source_pixels, source_pixels))
+            .cloned()
+    }
     fn get(
         &mut self,
         key: FinalCompositeKey,
@@ -13895,6 +13866,7 @@ pub struct App {
     /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
     /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
+    pub(crate) raw_pages: RawPageStore,
     pub(crate) fs_pending: ItemsGenerationMap<FsPendingValue>,
 
     /// 現在表示単位の PDF pool 昇格 dedup / not_found retry。items / fullscreen_idx と
@@ -17770,6 +17742,7 @@ impl App {
             fs_page_load_scheduler,
             raw_develop_executor: Arc::clone(&raw_develop_executor),
             input_generation: std::collections::HashMap::new(),
+            raw_pages: RawPageStore::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
@@ -19051,6 +19024,9 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        if !self.raw_fullscreen_fallback_allowed(idx) {
+            return None;
+        }
         let crate::grid_item::ThumbnailState::Loaded { tex, .. } = self.thumbnails.get(idx)? else {
             return None;
         };
@@ -23359,6 +23335,7 @@ impl App {
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.fs_cache.clear();
+        self.raw_pages.clear();
         self.fs_lanczos_cache.clear();
         self.fs_upload_backlog.clear();
         self.fs_pending.clear();
@@ -35248,6 +35225,7 @@ impl App {
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
+        self.raw_pages.set_items_generation(items_generation);
         self.fs_early_dims.set_items_generation(items_generation);
         self.fs_upload_backlog
             .set_items_generation(items_generation);
@@ -37284,6 +37262,7 @@ impl App {
         self.cancel_all_comic_bakes();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
+        self.raw_pages.clear();
         self.fs_lanczos_cache.clear();
         self.fs_margin_bbox_cache.clear();
         self.fs_upload_backlog.clear();
@@ -41588,10 +41567,26 @@ impl App {
             return;
         }
 
+        if self.is_raw_page(source_idx) && !self.raw_edit_target_gate(source_idx) {
+            if self.raw_development_unavailable(source_idx) {
+                self.compare_pin_load_pending = None;
+                self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+            } else {
+                self.ensure_fs_page_load(source_idx);
+                self.start_raw_develop_for_compare(ctx, source_idx);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            return;
+        }
+
         match self.fs_cache.get(&source_idx) {
             Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. }) => {
                 self.compare_pin_load_pending = None;
                 self.start_compare_pin_single(ctx, source_idx);
+            }
+            Some(FsCacheEntry::RawPreview { .. }) => {
+                self.start_raw_develop_for_compare(ctx, source_idx);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Some(FsCacheEntry::Failed) => {
                 self.compare_pin_load_pending = None;
@@ -58408,12 +58403,8 @@ impl App {
         self.detached_viewer_no_activate_once = true;
         if self.fullscreen_idx == Some(selected) {
             if item_key_changed {
-                self.fs_cache.remove(&selected);
+                self.discard_fs_page(selected);
                 self.fs_margin_bbox_cache.remove(&selected);
-                if let Some(pending) = self.fs_pending.remove(&selected) {
-                    pending.cancel();
-                }
-                self.fs_upload_backlog.retain(|entry| entry.idx != selected);
             }
             let cursor_state = self.fullscreen_cursor_state();
             self.open_fullscreen(selected, crate::app::HistoryTrigger::UserChosen);
@@ -66521,6 +66512,10 @@ impl App {
             ),
             _ => return,
         };
+        if self.is_raw_page(idx) {
+            self.start_raw_preview(idx, path, zip_entry, purpose, contract);
+            return;
+        }
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         let pdf_display_request = if pdf_page.is_some() {
             // PDF は実際に描く viewport が確定するまで enqueue しない。専用 fullscreen、
@@ -66594,7 +66589,6 @@ impl App {
         let cancel = ticket.cancel_token();
         let waiter = ticket.waiter();
         let pending = FsPendingValue::scheduled(ticket, rx, perf_seq, purpose);
-        let raw_job = Arc::clone(&pending.raw_job);
         self.fs_pending.insert(idx, pending);
         // 360 度パノラマビュー Phase 2a: 通常画像 (= PDF / ZIP 除く) のみで
         // tee デコード判断を持ち込む (§3.6.2 / §4.6.0)。
@@ -66649,8 +66643,6 @@ impl App {
             );
         }
         let perf_key_worker = perf_key.clone();
-        let raw_executor = Arc::clone(&self.raw_develop_executor);
-        let raw_brightness = self.settings.raw_brightness;
 
         std::thread::spawn(move || {
             // スレッド出口で reason を記録する小ヘルパー (全 return 直前に呼ぶ)
@@ -66874,27 +66866,11 @@ impl App {
                     started_at: std::time::Instant::now(),
                 });
             };
-            // S2a interim (RAW plan §7 / S3): fullscreen waits for Full development.
-            // S3 replaces this with preview followed by development.
-            let raw_priority = if scheduler_priority == FsPageLoadPriority::High {
-                crate::raw::RawPriority::High
-            } else {
-                crate::raw::RawPriority::Normal
-            };
-            let publish_raw_ticket = |ticket: Arc<crate::raw::RawTicket>| {
-                raw_job.lock().unwrap().publish(ticket);
-            };
             let mut decode_options = CanonicalDecodeOptions::fullscreen_cancellable(
                 purpose.animation_policy(),
                 &cancel,
                 RawStage::Full,
-            )
-            .with_raw_runtime(RawDecodeRuntime {
-                executor: &raw_executor,
-                brightness: raw_brightness,
-                priority: raw_priority,
-                on_submitted: Some(&publish_raw_ticket),
-            });
+            );
             if matches!(purpose, FsLoadPurpose::Display) {
                 decode_options =
                     decode_options.with_animation_confirmation(&notify_animation_confirmed);
@@ -66915,9 +66891,7 @@ impl App {
 
             match canonical_decode {
                 Ok(CanonicalImageDecode::RawPreview { .. }) => {
-                    // S2a always requests Full for fullscreen (RAW plan §7 / S3).
-                    let _ = tx.send(FsLoadResult::Failed);
-                    emit_exit("raw_unexpected_preview");
+                    unreachable!("RAW uses its page owner")
                 }
                 Ok(CanonicalImageDecode::Animated { format, frames }) => {
                     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
@@ -67420,6 +67394,11 @@ impl App {
         // before trimming any source/GPU caches; navigation and page count remain unchanged.
         let displayed_partner = self.displayed_spread_partner(current_idx);
         keep_set.extend(displayed_partner);
+        let displayed_raw = [Some(current_idx), displayed_partner]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        keep_set.extend(self.reconcile_raw_demand(current_idx, &displayed_raw));
 
         let prefetch_targets: Vec<usize> =
             interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
@@ -67440,6 +67419,16 @@ impl App {
             }
         }
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
+        let raw_evicted = self
+            .raw_pages
+            .pages
+            .keys()
+            .copied()
+            .filter(|idx| !keep_set.contains(idx))
+            .collect::<Vec<_>>();
+        for idx in raw_evicted {
+            self.discard_fs_page(idx);
+        }
         self.fs_cache.retain(|k, _| keep_set.contains(k));
         self.fs_lanczos_cache.retain_page_indices(&keep_set);
         self.fs_margin_bbox_cache
@@ -67498,7 +67487,7 @@ impl App {
                 // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
                 // 昇格は表示中のページのぶんだけ生かす。ここを「current 以外は全部」に
                 // すると、見開きの相方が開始と同時にキャンセルされ続ける (§1.157)。
-                (current_loading
+                ((current_loading && !self.raw_pages.demand.contains_key(&k))
                     || !keep_set.contains(&k)
                     || (pending.purpose.promotion_started_at_for(k).is_some()
                         && !Self::page_is_displayed(k, current_idx, displayed_partner)))
@@ -68315,6 +68304,7 @@ impl App {
         let fc_drop_t0 = std::time::Instant::now();
         let fc_drop_count = self.fs_cache.len();
         self.fs_cache.clear();
+        self.raw_pages.clear();
         self.fs_lanczos_cache.clear();
         self.fs_margin_bbox_cache.clear();
         let fc_drop_ms = fc_drop_t0.elapsed().as_secs_f64() * 1000.0;
@@ -69192,6 +69182,7 @@ impl App {
             let mut keep = std::collections::HashSet::new();
             keep.insert(current_idx);
             keep.extend(self.displayed_spread_partner(current_idx));
+            keep.extend(self.raw_pages.demand.keys().copied());
             return keep;
         };
         let n = image_indices.len();
@@ -69203,6 +69194,7 @@ impl App {
         // Presentation-only roles consume the same source/edit/AI pipeline as navigation pages.
         // Keep the distant front-cover source while it is attached to the final singleton.
         keep.extend(self.displayed_spread_partner(current_idx));
+        keep.extend(self.raw_pages.demand.keys().copied());
         keep
     }
 
@@ -69240,6 +69232,9 @@ impl App {
         let pf_back = self.settings.ai_upscale_prefetch_back;
         let pf_forward = self.settings.ai_upscale_prefetch_forward;
         interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back)
+            .into_iter()
+            .filter(|idx| !self.is_raw_page(*idx) || self.raw_pages.demand.contains_key(idx))
+            .collect()
     }
 
     /// AI アップスケールの先読み（表示中画像の前後）。
@@ -69309,16 +69304,22 @@ impl App {
             .map(|key| key.edit_key.idx)
             .collect();
         let current_busy = active_indices.contains(&fs_idx);
-        let pages = target_positions.into_iter().map(|pos| {
-            let idx = image_indices[pos];
-            (
-                pos,
-                fs_prefetch_page_state(
-                    self.is_idx_final_ai_done_or_skipped(idx),
-                    active_indices.contains(&idx),
-                ),
-            )
-        });
+        let pages = target_positions
+            .into_iter()
+            .filter(|&pos| {
+                !self.is_raw_page(image_indices[pos])
+                    || self.raw_pages.demand.contains_key(&image_indices[pos])
+            })
+            .map(|pos| {
+                let idx = image_indices[pos];
+                (
+                    pos,
+                    fs_prefetch_page_state(
+                        self.is_idx_final_ai_done_or_skipped(idx),
+                        active_indices.contains(&idx),
+                    ),
+                )
+            });
         build_fs_prefetch_indicator(current_pos, current_busy, pages)
     }
 
@@ -72797,7 +72798,16 @@ impl App {
         key: FinalAiKey,
         edit_size: [usize; 2],
     ) -> Option<RetainedFinalAiKey> {
+        let raw_source = if self.is_raw_page(idx) {
+            Some((
+                self.raw_pages.page(idx)?.source.clone(),
+                self.settings.raw_brightness,
+            ))
+        } else {
+            None
+        };
         Some(RetainedFinalAiKey {
+            raw_source,
             item_key: self.metadata_cache_key(idx)?,
             edit_size,
             color_ai_hash: key.color_ai_hash,
@@ -73376,10 +73386,11 @@ impl App {
         {
             return false;
         }
-        let backlog_pos = self
-            .fs_upload_backlog
-            .iter()
-            .position(|entry| entry.idx == idx);
+        let backlog_pos = self.fs_upload_backlog.iter().position(|entry| {
+            entry.idx == idx
+                && !matches!(entry.result, FsLoadResult::Raw { .. })
+                && !matches!(result, FsLoadResult::Raw { .. })
+        });
         let mut entry = FsUploadResult::new(idx, result, load_seq, purpose);
         entry.animation_expansion_started_at = animation_expansion_started_at;
         if let Some(pos) = backlog_pos {
@@ -73544,6 +73555,18 @@ impl App {
     /// retained PDF final-AI は raw `fs_cache` が無くても同期的に表示 texture へ
     /// 復元できるため、live cache より先に `DisplayReady` として解決する。
     pub(crate) fn fs_page_load_state(&self, idx: usize) -> FsPageLoadState {
+        if let Some(state) = self.raw_page_load_state(idx) {
+            return match state {
+                RawPageLoadState::PreviewNotRequested => FsPageLoadState::NeedsLoad,
+                RawPageLoadState::PreviewPending | RawPageLoadState::PreviewAbsent => {
+                    FsPageLoadState::LoadPending
+                }
+                RawPageLoadState::PreviewShown | RawPageLoadState::Developed => {
+                    FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
+                }
+                RawPageLoadState::Terminal => FsPageLoadState::LoadFailed,
+            };
+        }
         if self.has_retained_pdf_final_ai_for_current_params(idx) {
             return FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi);
         }
@@ -73760,6 +73783,24 @@ impl App {
     }
 
     fn apply_fs_page_load_contract(&mut self, idx: usize, contract: FsPageLoadContract) {
+        if self.is_raw_page(idx) {
+            if self.page_is_displayed_now(idx) {
+                if let Some(page) = self.raw_pages.page(idx) {
+                    page.develop.lock().unwrap().promote();
+                }
+                if let Some(pending) = self.fs_pending.get(&idx) {
+                    pending.promote_to_high(FsPageLoadContract::Sequential);
+                }
+            }
+            if contract == FsPageLoadContract::LatestSeek {
+                self.fs_page_load_scheduler
+                    .supersede_waiting_for_latest_seek_page(
+                        self.fs_page_load_context_serial(),
+                        idx,
+                    );
+            }
+            return;
+        }
         let promoted_waiting = self.page_is_displayed_now(idx)
             && self
                 .fs_pending
@@ -73890,6 +73931,16 @@ impl App {
         used_upscale: bool,
     ) -> bool {
         let edit_size = retained_key.edit_size;
+        if let Some((source, brightness)) = &retained_key.raw_source {
+            if *brightness != self.settings.raw_brightness
+                || !self
+                    .raw_pages
+                    .page(idx)
+                    .is_some_and(|page| page.source == *source)
+            {
+                return false;
+            }
+        }
         if retained_epoch != self.retained_final_ai_epoch {
             crate::logger::log(format!(
                 "[AI] Retained final AI skip idx={idx} item={} source={}x{} output={}x{} \
@@ -75489,6 +75540,13 @@ impl App {
     /// デコード済みピクセル寸法を用いる (PDF/ZIP はレンダ済みページ寸法)。未ロード /
     /// アニメーション等で取れなければ `None`。
     pub(crate) fn source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
+        if self.is_raw_page(idx) {
+            return self
+                .raw_pages
+                .page(idx)?
+                .developed_dims
+                .map(|[w, h]| (w.max(1) as f32, h.max(1) as f32));
+        }
         match self.fs_cache.get(&idx) {
             Some(crate::fs_animation::FsCacheEntry::Static {
                 pixels,
@@ -80724,6 +80782,9 @@ impl App {
         idx: usize,
         mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
     ) -> Option<egui::TextureHandle> {
+        if !self.raw_fullscreen_fallback_allowed(idx) {
+            return None;
+        }
         let mut perf_call = perf
             .as_ref()
             .map(|_| PassthroughRenditionPerfCall::new(idx));
@@ -80802,6 +80863,9 @@ impl App {
         mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
         mut perf_call: Option<&mut PassthroughRenditionPerfCall>,
     ) -> Result<egui::TextureHandle, PassthroughUnavailable> {
+        if !self.raw_fullscreen_fallback_allowed(idx) {
+            return Err(PassthroughUnavailable::ThumbnailNotLoaded);
+        }
         let source_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
             Some(crate::grid_item::ThumbnailState::Loaded {
@@ -80996,6 +81060,21 @@ impl App {
             .contains_texture(texture.id())
     }
 
+    pub(crate) fn cached_passthrough_rendition(&self, idx: usize) -> Option<egui::TextureHandle> {
+        if !self.raw_fullscreen_fallback_allowed(idx) {
+            return None;
+        }
+        let pixels = self.thumb_pixels.get(&idx)?;
+        let key = self.final_composite_key_for_pixels(
+            self.current_edit_result_key(idx),
+            pixels.size,
+            self.effective_params(idx),
+        );
+        self.passthrough_rendition_cache
+            .peek(key, pixels)
+            .map(|entry| entry.texture)
+    }
+
     #[cfg(test)]
     pub(crate) fn passthrough_rendition_cache_len_for_test(&self) -> usize {
         self.passthrough_rendition_cache.len()
@@ -81064,6 +81143,7 @@ impl App {
             Option<std::time::Instant>,
         )> = Vec::new();
         let mut disconnected: Vec<(usize, FsLoadPurpose)> = Vec::new();
+        let mut raw_info_updates = Vec::new();
         let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
         let mut animation_expansion_updates: Vec<(usize, std::time::Instant, u64)> = Vec::new();
         mark_poll_prefetch_perf(
@@ -81074,6 +81154,13 @@ impl App {
             let mut animation_expansion_started_at = pending.animation_expansion_started_at;
             loop {
                 match pending.rx.try_recv() {
+                    Ok(FsLoadResult::Raw {
+                        tag,
+                        result: result @ RawPageResult::Info { .. },
+                    }) => {
+                        raw_info_updates.push((tag, result));
+                        continue;
+                    }
                     Ok(FsLoadResult::DimsOnly { source_dims }) => {
                         early_dims_updates.push((key, source_dims, items_generation));
                         continue;
@@ -81111,7 +81198,21 @@ impl App {
             }
         }
         mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::FsPendingDrain);
-        let early_dims_repaint = !early_dims_updates.is_empty();
+        let early_dims_repaint = !early_dims_updates.is_empty() || !raw_info_updates.is_empty();
+        for (tag, result) in raw_info_updates {
+            self.apply_raw_fs_result(ctx, tag, result, 0);
+        }
+        while let Ok(upload) = self.raw_pages.rx.try_recv() {
+            if let FsLoadResult::Raw { tag, .. } = &upload.result {
+                if self
+                    .raw_pages
+                    .accepts(tag, self.fs_page_load_context_serial())
+                {
+                    self.fs_upload_backlog
+                        .push_for_generation(tag.generation, upload);
+                }
+            }
+        }
         for (key, dims, items_generation) in early_dims_updates {
             self.fs_early_dims
                 .insert_for_generation(key, items_generation, dims);
@@ -81132,6 +81233,7 @@ impl App {
                 pending.disarm_ticket();
             }
             self.fs_early_dims.remove(&key);
+            self.raw_pages.preview_disconnected(key);
             if purpose.promotion_started_at_for(key).is_some() {
                 // **こちらが止めたものを「失敗」にしない。** `PromotionFailed` は再試行を
                 // しない終端状態なので、画面から外れて cancel した昇格をここへ落とすと、
@@ -81213,6 +81315,12 @@ impl App {
             };
             (decision, target_pages)
         });
+        let raw_context = self.fs_page_load_context_serial();
+        let raw_pages = &self.raw_pages;
+        self.fs_upload_backlog.retain(|entry| match &entry.result {
+            FsLoadResult::Raw { tag, .. } => raw_pages.accepts(tag, raw_context),
+            _ => true,
+        });
         let upload_is_admitted = |idx| match &page_turn_upload_gate {
             Some((decision, target_pages)) => {
                 decision.admits_backlog_upload(target_pages.contains(&idx))
@@ -81222,6 +81330,14 @@ impl App {
         let cur = self.fullscreen_idx;
         let (mut cur_pos, mut other_pos) = (None, None);
         for (i, entry) in self.fs_upload_backlog.iter().enumerate() {
+            if let FsLoadResult::Raw { tag, .. } = &entry.result {
+                if !self
+                    .raw_pages
+                    .accepts(tag, self.fs_page_load_context_serial())
+                {
+                    continue;
+                }
+            }
             if !upload_is_admitted(entry.idx) {
                 continue;
             }
@@ -81265,6 +81381,29 @@ impl App {
             if !self.fs_cache.accepts_generation(key, items_generation) {
                 continue;
             }
+            let result = match result {
+                FsLoadResult::Raw { tag, result } => {
+                    self.apply_raw_fs_result(ctx, tag, result, load_seq);
+                    continue;
+                }
+                FsLoadResult::RawSourceFailed {
+                    context,
+                    generation,
+                    request_id,
+                    error,
+                } => {
+                    if context == self.fs_page_load_context_serial()
+                        && generation == self.items_generation
+                    {
+                        if error == crate::raw::RawError::Stale && self.raw_pages.page(key).is_some_and(|page| matches!(page.preview, RawPreviewPhase::Requested { request_id: id } if id == request_id)) {
+                            self.invalidate_raw_source_for_idx(key);
+                            self.discard_fs_page(key);
+                        } else { self.raw_pages.source_failed(key, request_id, error); }
+                    }
+                    continue;
+                }
+                result => result,
+            };
             if purpose.promotion_started_at_for(key).is_some() {
                 // 見開きでは相方も表示中。ここで捨てると、昇格が完了しても
                 // 第 1 フレームのままになる (§1.157)。
@@ -81453,7 +81592,10 @@ impl App {
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
-                FsLoadResult::DimsOnly { .. } | FsLoadResult::AnimationExpansionStarted { .. } => {
+                FsLoadResult::Raw { .. }
+                | FsLoadResult::RawSourceFailed { .. }
+                | FsLoadResult::DimsOnly { .. }
+                | FsLoadResult::AnimationExpansionStarted { .. } => {
                     unreachable!("non-terminal fs load result reached completion match")
                 }
             };
@@ -81501,6 +81643,7 @@ impl App {
                 PollPrefetchPerfStage::OtherPostprocessing,
             );
         }
+        self.start_demanded_raw_development(ctx);
         if repaint {
             ctx.request_repaint();
         }

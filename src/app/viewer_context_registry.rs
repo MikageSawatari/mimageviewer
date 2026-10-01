@@ -905,6 +905,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
+    raw_pages: RawPageStore,
     fs_pending: ItemsGenerationMap<FsPendingValue>,
     fullscreen_pdf_promotion: FullscreenPdfPromotionState,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
@@ -1105,6 +1106,7 @@ pub(in crate::app) enum ContextAsyncOwner {
     EpubConversion,
     PdfPassword,
     FullscreenDecode,
+    RawPages,
     FinalAi,
     LocalAdjustment,
     ComicBake,
@@ -1121,7 +1123,7 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 18] = [
+    pub(in crate::app) const ALL: [Self; 19] = [
         Self::EpubConversion,
         Self::PdfPassword,
         Self::PathClassification,
@@ -1135,6 +1137,7 @@ impl ContextAsyncOwner {
         Self::PdfEnumeration,
         Self::ZipEnumeration,
         Self::FullscreenDecode,
+        Self::RawPages,
         Self::FinalAi,
         Self::LocalAdjustment,
         Self::ComicBake,
@@ -1176,6 +1179,7 @@ impl ContextAsyncOwner {
                     Self::EpubConversion => $owner.epub_convert.is_some(),
                     Self::PdfPassword => $owner.pdf_password_request.is_some(),
                     Self::FullscreenDecode => $owner.fs_pending.iter().next().is_some(),
+                    Self::RawPages => $owner.raw_pages.has_pending(),
                     Self::FinalAi => !$owner.final_ai_pending.is_empty(),
                     Self::LocalAdjustment => !$owner.local_adjust_pending.is_empty(),
                     Self::ComicBake => !$owner.comic_bake_pending.is_empty(),
@@ -1195,7 +1199,7 @@ impl ContextAsyncOwner {
     /// Collection/rating/bookmark polls also create or retire work from their visible surface.
     /// All other owners need a live request before a mounted frame calls their worker service.
     pub(in crate::app) fn needs_mounted_service(self, context: ContextRef<'_>) -> bool {
-        if self == Self::FullscreenDecode {
+        if matches!(self, Self::FullscreenDecode | Self::RawPages) {
             // Prefetch depends on the frame's freshly computed keep range. The frame calls
             // this variant's service at that exact point instead of the early open-owner poll.
             return false;
@@ -1252,7 +1256,9 @@ impl ContextAsyncOwner {
             Self::PdfEnumeration => app.poll_pdf_enumerate(),
             Self::ZipEnumeration => app.poll_zip_enumerate(),
             Self::EpubConversion | Self::PdfPassword => {}
-            Self::FullscreenDecode => app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel),
+            Self::FullscreenDecode | Self::RawPages => {
+                app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel)
+            }
             Self::FinalAi => app.poll_final_ai(ctx),
             Self::LocalAdjustment => app.poll_local_adjust_render(ctx),
             Self::ComicBake => {
@@ -1333,6 +1339,7 @@ impl ContextAsyncOwner {
             Self::PdfPassword => {
                 let _ = app.finish_pdf_password_request_in_mounted_context(PdfPasswordExit::Parked);
             }
+            Self::RawPages => app.raw_pages.park(),
             Self::FullscreenDecode => {
                 for (_, pending) in app.fs_pending.drain() {
                     pending.cancel();
@@ -1396,6 +1403,13 @@ impl<'a> ContextRef<'a> {
         match self.source {
             ContextRefSource::Mounted(app) => &app.fs_cache,
             ContextRefSource::AtRest(bundle) => &bundle.fs_cache,
+        }
+    }
+
+    pub(in crate::app) fn raw_pages(self) -> &'a RawPageStore {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.raw_pages,
+            ContextRefSource::AtRest(bundle) => &bundle.raw_pages,
         }
     }
 
@@ -1627,6 +1641,7 @@ impl ViewerContextBundle {
             pending.cancel.store(true, Ordering::Relaxed);
         }
 
+        self.raw_pages.cancel_development_all();
         for pending in self.fs_pending.values() {
             pending.cancel();
         }
@@ -1685,6 +1700,7 @@ impl ViewerContextBundle {
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
+        self.raw_pages.set_items_generation(items_generation);
         self.fs_early_dims.set_items_generation(items_generation);
         self.fs_upload_backlog
             .set_items_generation(items_generation);
@@ -1844,6 +1860,7 @@ impl ViewerContextBundle {
             ),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
+            raw_pages: RawPageStore::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
@@ -2207,6 +2224,7 @@ impl App {
             fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
+            raw_pages,
             fs_pending,
             fullscreen_pdf_promotion,
             fs_pdf_display_target,
@@ -2487,6 +2505,7 @@ impl App {
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
+        swap_field!(raw_pages);
         swap_field!(fullscreen_pdf_promotion);
         swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
@@ -2805,6 +2824,7 @@ impl App {
             fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
+            raw_pages,
             fs_pending,
             fullscreen_pdf_promotion,
             fs_pdf_display_target,
@@ -3044,6 +3064,7 @@ impl App {
             fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
+            raw_pages,
             fs_pending,
             fullscreen_pdf_promotion,
             fs_pdf_display_target,

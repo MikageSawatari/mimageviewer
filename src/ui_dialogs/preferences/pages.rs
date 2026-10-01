@@ -6427,6 +6427,11 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.separator();
     ui.add_space(8.0);
 
+    anchored(ui, state, "parallelism/raw", |ui, state| {
+        crate::ui_raw::draw_settings(ui, &mut state.settings);
+    });
+    ui.add_space(12.0);
+
     anchored(ui, state, "parallelism/pdf", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("PDF の同時処理数").strong());

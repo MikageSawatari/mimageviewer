@@ -259,7 +259,32 @@ pub struct RawTicket {
     progress: Arc<AtomicU8>,
 }
 
+/// Executor ownership, independent of LibRaw's progress value. `None` from
+/// `state()` means the slot has been released and completion is being delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawTicketState {
+    Queued,
+    Running,
+    Cancelling,
+}
+
 impl RawTicket {
+    pub fn state(&self) -> Option<RawTicketState> {
+        let shared = self.shared.upgrade()?;
+        let state = shared.state.lock().unwrap();
+        if let Some(job) = state.running.get(&self.id) {
+            return Some(if job.cancel.flag.load(Ordering::Acquire) {
+                RawTicketState::Cancelling
+            } else {
+                RawTicketState::Running
+            });
+        }
+        [&state.high, &state.normal, &state.background]
+            .into_iter()
+            .any(|queue| queue.iter().any(|job| job.id == self.id))
+            .then_some(RawTicketState::Queued)
+    }
+
     pub fn progress(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.progress)
     }
@@ -425,33 +450,43 @@ impl RawDevelopExecutor {
     }
 
     pub fn set_parallelism(&self, parallelism: usize) -> std::io::Result<()> {
+        self.set_parallelism_with(parallelism, |shared| {
+            std::thread::Builder::new()
+                .name("raw-develop".into())
+                .stack_size(1024 * 1024)
+                .spawn(move || worker(shared))
+                .map(|_| ())
+        })
+    }
+
+    fn set_parallelism_with(
+        &self,
+        parallelism: usize,
+        mut spawn: impl FnMut(Arc<Shared>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         assert!(
             (1..=10).contains(&parallelism),
             "RAW parallelism must be 1..=10"
         );
-        let spawn_count = {
-            let mut state = self.shared.state.lock().unwrap();
-            if state.closed {
-                return Err(std::io::Error::other("RAW executor closed"));
-            }
-            state.desired = parallelism;
-            let count = parallelism.saturating_sub(state.live);
-            state.live += count;
-            count
-        };
+        // Keep admission at the previous limit until every spawn succeeds. New
+        // workers cannot observe the reservation until this transaction unlocks.
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Err(std::io::Error::other("RAW executor closed"));
+        }
+        let spawn_count = parallelism.saturating_sub(state.live);
+        state.live += spawn_count;
         for index in 0..spawn_count {
             let shared = Arc::clone(&self.shared);
-            if let Err(error) = std::thread::Builder::new()
-                .name("raw-develop".into())
-                .stack_size(1024 * 1024)
-                .spawn(move || worker(shared))
-            {
-                let mut state = self.shared.state.lock().unwrap();
+            if let Err(error) = spawn(shared) {
                 state.live -= spawn_count - index;
+                drop(state);
                 self.shared.wake.notify_all();
                 return Err(error);
             }
         }
+        state.desired = parallelism;
+        drop(state);
         self.shared.wake.notify_all();
         Ok(())
     }
@@ -512,7 +547,10 @@ impl RawDevelopExecutor {
             JobAction::Product {
                 result,
                 work: Box::new(move |cancel, progress| {
-                    develop(source.as_source(), scale, brightness, cancel, progress)
+                    source.validate()?;
+                    let output = develop(source.as_source(), scale, brightness, cancel, progress);
+                    source.validate()?;
+                    output
                 }),
             },
             cancel_flag,
@@ -534,7 +572,10 @@ impl RawDevelopExecutor {
             JobAction::ProductCallback {
                 complete: Box::new(complete),
                 work: Box::new(move |cancel, progress| {
-                    develop(source.as_source(), scale, brightness, cancel, progress)
+                    source.validate()?;
+                    let output = develop(source.as_source(), scale, brightness, cancel, progress);
+                    source.validate()?;
+                    output
                 }),
             },
             None,
@@ -716,6 +757,39 @@ impl Drop for RawDevelopExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_product_revalidates_the_physical_source_before_libraw_opens_it() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("camera.dng");
+        std::fs::write(&path, [0u8; 3]).unwrap();
+        let fingerprint = super::super::RawSourceFingerprint::read(path.clone()).unwrap();
+        let executor = RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let _ticket = executor.submit(
+            RawOwnedSource::Validated {
+                source: Box::new(RawOwnedSource::Path(path.clone())),
+                fingerprint,
+            },
+            RawDevelopScale::Full,
+            RawBrightness::None,
+            RawPriority::High,
+            tx,
+        );
+        std::fs::write(path, [1u8; 4]).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Err(RawError::Stale)
+        ));
+        drop(blocker);
+    }
     use super::*;
 
     fn fake(
@@ -885,6 +959,42 @@ mod tests {
         );
         assert_eq!(started(&rx), "third");
         third.send(()).unwrap();
+    }
+
+    #[test]
+    fn partial_spawn_failure_preserves_admission_and_retires_surplus() {
+        let executor = RawDevelopExecutor::new(1).unwrap();
+        let (starts, started_rx) = mpsc::channel();
+        let (active, release, result) =
+            fake(&executor, RawPriority::High, "active", starts.clone());
+        assert_eq!(started(&started_rx), "active");
+        let mut spawns = 0;
+        let error = executor.set_parallelism_with(3, |shared| {
+            spawns += 1;
+            if spawns == 2 {
+                return Err(std::io::Error::other("injected second spawn failure"));
+            }
+            std::thread::spawn(move || worker(shared));
+            Ok(())
+        });
+        assert!(error.is_err());
+        let mut state = executor.shared.state.lock().unwrap();
+        assert_eq!(state.desired, 1);
+        while state.live > 1 {
+            state = executor.shared.wake.wait(state).unwrap();
+        }
+        assert_eq!(state.live, 1);
+        drop(state);
+        let (queued, queued_release, _) = fake(&executor, RawPriority::High, "next", starts);
+        assert_eq!(active.state(), Some(RawTicketState::Running));
+        assert_eq!(queued.state(), Some(RawTicketState::Queued));
+        active.cancel();
+        assert_eq!(active.state(), Some(RawTicketState::Cancelling));
+        still_waiting(&started_rx);
+        release.send(()).unwrap();
+        assert!(matches!(result.recv().unwrap(), Err(RawError::Cancelled)));
+        assert_eq!(started(&started_rx), "next");
+        queued_release.send(()).unwrap();
     }
 }
 

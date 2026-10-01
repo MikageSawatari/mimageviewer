@@ -320,6 +320,7 @@ pub struct CanonicalResolvedSource<'a> {
     bytes: Option<Cow<'a, [u8]>>,
     filename_hint: Cow<'a, str>,
     extension: String,
+    raw_fingerprint: Option<crate::raw::RawSourceFingerprint>,
 }
 
 impl<'a> CanonicalResolvedSource<'a> {
@@ -332,6 +333,7 @@ impl<'a> CanonicalResolvedSource<'a> {
                 path,
                 verified_bytes,
             } => Ok(Self {
+                raw_fingerprint: None,
                 path,
                 bytes: verified_bytes.map(Cow::Borrowed),
                 filename_hint: path
@@ -373,6 +375,7 @@ impl<'a> CanonicalResolvedSource<'a> {
                     .unwrap_or("")
                     .to_ascii_lowercase();
                 Ok(Self {
+                    raw_fingerprint: None,
                     path: archive_path,
                     bytes: Some(Cow::Owned(bytes)),
                     filename_hint: Cow::Borrowed(entry_name),
@@ -391,7 +394,21 @@ impl<'a> CanonicalResolvedSource<'a> {
     }
 
     pub fn raw_info(&self) -> Result<crate::raw::RawInfo, RawError> {
-        raw_decoder::info(self.raw_source())
+        self.validate_raw_source()?;
+        let info = raw_decoder::info(self.raw_source());
+        self.validate_raw_source()?;
+        info
+    }
+
+    pub fn with_raw_fingerprint(mut self, fingerprint: crate::raw::RawSourceFingerprint) -> Self {
+        self.raw_fingerprint = Some(fingerprint);
+        self
+    }
+
+    fn validate_raw_source(&self) -> Result<(), RawError> {
+        self.raw_fingerprint
+            .as_ref()
+            .map_or(Ok(()), |f| f.validate())
     }
 
     fn raw_source(&self) -> RawSource<'_> {
@@ -402,9 +419,16 @@ impl<'a> CanonicalResolvedSource<'a> {
     }
 
     fn raw_owned_source(&self) -> RawOwnedSource {
-        match self.bytes.as_deref() {
+        let source = match self.bytes.as_deref() {
             Some(bytes) => RawOwnedSource::Bytes(Arc::from(bytes)),
             None => RawOwnedSource::Path(self.path.to_owned()),
+        };
+        match &self.raw_fingerprint {
+            Some(fingerprint) => RawOwnedSource::Validated {
+                source: Box::new(source),
+                fingerprint: fingerprint.clone(),
+            },
+            None => source,
         }
     }
 }
@@ -457,9 +481,15 @@ fn decode_canonical_resolved_with_fallbacks(
     if crate::raw_format::is_raw_ext(&source.extension) {
         return match options.raw_stage {
             RawStage::Preview => {
-                let info =
-                    raw_decoder::info(source.raw_source()).map_err(CanonicalDecodeError::Raw)?;
-                let (preview, unavailable) = match raw_decoder::preview(source.raw_source()) {
+                let info = source.raw_info().map_err(CanonicalDecodeError::Raw)?;
+                source
+                    .validate_raw_source()
+                    .map_err(CanonicalDecodeError::Raw)?;
+                let decoded = raw_decoder::preview(source.raw_source());
+                source
+                    .validate_raw_source()
+                    .map_err(CanonicalDecodeError::Raw)?;
+                let (preview, unavailable) = match decoded {
                     Ok(preview) => (Some(preview), None),
                     Err(RawError::NoUsablePreview(reason)) => (None, Some(reason)),
                     Err(error) => return Err(CanonicalDecodeError::Raw(error)),

@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-01 RAW fullscreen page ownership (S3)**
+
+`RawPageStore` を `ContextAsyncOwner` と `ViewerContextBundle` に登録した。`fs_pending` と同じ context-owned resource で、preview / source preparation / development の要求 ID、物理 source 指紋、現像 ticket、結果 channel と需要集合を所有する。park は未完了要求を取消し、Done / Blocked を保持する。generation 差し替えと drop はその context だけを破棄し、snapshot 再構築は表示 entry と owner を原子的に移す。明るさ変更は mounted / parked の各 owner に同じ RAW source transaction を適用する。detached の述語・viewport・window lifecycle は変更しない。
+
 **2026-09-27 RAW thumbnail ticket ownership (S2a)**
 
 `raw_thumb_develop` は `requested` と同じ viewer context が所有する idx / items generation / submission ID 付き map として `ViewerContextBundle` に加えた。旧世代の完了は同じ idx の新しい ticket を外さない。keep range 離脱、一覧世代変更、folder 移動、mounted context の pause/park（`fs_pending` を drain する境界）、drop でその context の ticket を cancel し、既存の canceled `ThumbMsg` で requested を解放する。別の detached flag や viewport 分岐は追加しない。

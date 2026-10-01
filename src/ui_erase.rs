@@ -261,6 +261,9 @@ impl App {
         // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) ではピボットは要らない。
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
         // 消しゴム入力取得は state mutation より前にやる。ここで取れないと erase は始められず、
         // 取れる前に spread_mode / fullscreen_idx を弄ると見開きが解除されたまま
         // 編集も開始しない不整合状態になる (Codex P2 指摘)。
@@ -435,6 +438,9 @@ impl App {
     /// 移動して新たに編集モードへ入る ([E] 適用 → 移動 → [E] 開始 と等価)。Undo は
     /// ページごとに独立 (= 切替時にスタックは捨てる)、ズーム/パンは初期化する。
     pub(crate) fn switch_erase_target_in_spread(&mut self, ctx: &egui::Context, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         // 同ページなら no-op
         if self.fullscreen_idx == Some(new_idx) {
             return;
@@ -2372,13 +2378,13 @@ impl App {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 for &(label, target_idx) in pages.iter() {
                                     let is_active = self.fullscreen_idx == Some(target_idx);
-                                    if panel_toggle_button(
+                                    if ui.add_enabled_ui(self.raw_edit_target_gate(target_idx), |ui| panel_toggle_button(
                                         ui,
                                         label,
                                         is_active,
                                         Some(btn_size),
                                         None,
-                                    )
+                                    )).inner
                                     .clicked()
                                         && !is_active
                                     {
