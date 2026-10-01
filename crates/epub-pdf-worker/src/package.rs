@@ -168,6 +168,31 @@ pub fn safe_path(path: &str) -> Result<String, EpubError> {
     }
     Ok(path.to_string())
 }
+/// Directory entries create directories only: harmless aliases need not name a member.
+/// File entries always retain the strict raw-name validation above.
+fn safe_directory_path(path: &str) -> Result<String, EpubError> {
+    if path.starts_with('/') || path.contains('\\') {
+        return Err(invalid(format!("unsafe archive directory: {path}")));
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components
+                    .pop()
+                    .ok_or_else(|| invalid(format!("unsafe archive directory: {path}")))?;
+            }
+            _ => {
+                // Validate before normalization, so a drive/reserved/invalid component
+                // cannot disappear behind a later '..'. Raw '%' and '#' remain literal.
+                safe_path(component)?;
+                components.push(component);
+            }
+        }
+    }
+    Ok(components.join("/"))
+}
 /// Encode real member names segment by segment. '%' and '#' are literal name characters.
 pub fn member_url(path: &str) -> Url {
     let encoded = path
@@ -189,7 +214,9 @@ fn clean_href(href: &str) -> String {
 /// the parser skips them instead of rejecting the book (the renderer blocks the request).
 fn is_external_href(href: &str) -> bool {
     // Chromium treats backslashes as separators in special-scheme URLs.
-    let normalized = clean_href(href).replace('\\', "/");
+    // Classification keeps the historical Unicode-whitespace trim. It does not
+    // trim local member names or change WHATWG resolution of local references.
+    let normalized = clean_href(href).trim().replace('\\', "/");
     let href = normalized.as_str();
     if href.starts_with("//") {
         return true;
@@ -469,7 +496,11 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
         ZipArchive::new(Cursor::new(bytes)).map_err(|e| invalid(format!("invalid ZIP: {e}")))?;
     for i in 0..z.len() {
         let f = z.by_index(i).map_err(|e| invalid(e.to_string()))?;
-        safe_path(f.name())?;
+        if f.is_dir() {
+            safe_directory_path(f.name())?;
+        } else {
+            safe_path(f.name())?;
+        }
     }
     if maybe_member(&mut z, "META-INF/rights.xml").is_some() {
         return Err(drm("META-INF/rights.xml detected"));
@@ -492,6 +523,7 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
     let mut opf_viewport = None;
     let mut manifest = Vec::new();
     let mut refs = Vec::<(String, bool, Vec<String>)>::new();
+    let mut cover_refs = Vec::<String>::new();
     let mut direction = "default".to_string();
     let mut current_meta: Option<String> = None;
     let mut current_text: Option<String> = None;
@@ -511,21 +543,27 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                         let href = attr(&a, "href")
                             .ok_or_else(|| invalid("manifest item lacks href"))?
                             .to_string();
+                        let properties = attr(&a, "properties")
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        if properties.iter().any(|p| p == "cover-image") {
+                            cover_refs.push(id.clone());
+                        }
                         // EPUB allows remote resources in the manifest; they are not in the
                         // archive, so they are skipped rather than treated as unsafe paths.
                         if !is_external_href(&href) {
-                            let reference = resolve(&opf_path, &href)?;
+                            let reference = resolve(&opf_path, &href).map_err(|e| {
+                                invalid(format!("manifest item {id} href {href:?}: {e}"))
+                            })?;
                             manifest.push(ManifestItem {
                                 id,
                                 path: reference.path,
                                 url: reference.url,
                                 href,
                                 media_type: attr(&a, "media-type").unwrap_or("").into(),
-                                properties: attr(&a, "properties")
-                                    .unwrap_or("")
-                                    .split_whitespace()
-                                    .map(str::to_string)
-                                    .collect(),
+                                properties,
                             });
                         }
                     }
@@ -551,6 +589,9 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                         }
                         if let Some(k) = attr(&a, "name") {
                             let v = attr(&a, "content").unwrap_or("");
+                            if k == "cover" {
+                                cover_refs.push(v.to_string());
+                            }
                             rendition_property(&mut rendition, k, v);
                             if k == "rendition:viewport" {
                                 opf_viewport = dimensions(v);
@@ -595,12 +636,20 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
     if refs.is_empty() {
         return Err(invalid("empty EPUB spine"));
     }
+    for idref in cover_refs {
+        if !manifest.iter().any(|item| item.id == idref) {
+            return Err(invalid(format!(
+                "cover idref missing or external in manifest: {idref}"
+            )));
+        }
+    }
     let mut spine = Vec::new();
     for (idref, linear, props) in refs {
-        let item = manifest
-            .iter()
-            .find(|x| x.id == idref)
-            .ok_or_else(|| invalid(format!("spine idref missing from manifest: {idref}")))?;
+        let item = manifest.iter().find(|x| x.id == idref).ok_or_else(|| {
+            invalid(format!(
+                "spine idref missing or external in manifest: {idref}"
+            ))
+        })?;
         let mut applied = rendition.clone();
         let mut page_spread = None;
         for p in &props {
@@ -687,7 +736,11 @@ pub fn extract_file(input: &Path, dir: &Path) -> Result<(), EpubError> {
         .map_err(|e| invalid(e.to_string()))?;
     for i in 0..z.len() {
         let mut f = z.by_index(i).map_err(|e| invalid(e.to_string()))?;
-        let relative = safe_path(f.name())?;
+        let relative = if f.is_dir() {
+            safe_directory_path(f.name())?
+        } else {
+            safe_path(f.name())?
+        };
         let relative = Path::new(&relative);
         if relative.components().any(|c| {
             matches!(
@@ -987,6 +1040,86 @@ mod tests {
         assert!(!extracted.join("a").exists());
     }
     #[test]
+    fn redundant_directory_entries_are_safe_for_inspection_and_extraction() {
+        let opf = opf("ltr", "");
+        let bytes = synthetic_zip(&[
+            (
+                "META-INF/container.xml",
+                br#"<container><rootfile full-path="OPS/content.opf"/></container>"#,
+            ),
+            ("OPS/content.opf", opf.as_bytes()),
+            ("OPS/p.xhtml", PAGE),
+            ("OPS/./", b""),
+            ("OPS//", b""),
+            ("./OPS///./", b""),
+            ("OPS/unused/../", b""),
+            ("./", b""),
+            ("OPS/a%20#b//./", b""),
+            ("OPS/a%20#b/kept.txt", b"raw name"),
+        ]);
+        assert_eq!(inspect_bytes(&bytes).unwrap().spine[0].path, "OPS/p.xhtml");
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("synthetic.epub");
+        let out = dir.path().join("extracted");
+        fs::write(&input, bytes).unwrap();
+        extract_file(&input, &out).unwrap();
+        assert!(out.join("OPS").is_dir());
+        assert_eq!(fs::read(out.join("OPS/p.xhtml")).unwrap(), PAGE);
+        assert_eq!(
+            fs::read(out.join("OPS/a%20#b/kept.txt")).unwrap(),
+            b"raw name"
+        );
+        assert!(!out.join("OPS/a ").exists());
+        assert!(!out.join("OPS/unused").exists());
+    }
+    #[test]
+    fn directory_normalization_does_not_relax_files_or_unsafe_directories() {
+        for name in [
+            "/OPS/",
+            "//host/OPS/",
+            "C:/OPS/",
+            r"\\host\OPS/",
+            r"OPS\x/",
+            "../OPS/",
+            "OPS/../../x/",
+            "OPS/..//../x/",
+            "C:/../OPS/",
+            "NUL/../OPS/",
+        ] {
+            assert!(safe_directory_path(name).is_err(), "{name}");
+            let bytes = book(&opf("ltr", ""), &[("OPS/p.xhtml", PAGE), (name, b"")]);
+            assert!(inspect_bytes(&bytes).is_err(), "{name}");
+            let dir = tempfile::tempdir().unwrap();
+            let input = dir.path().join("synthetic.epub");
+            fs::write(&input, bytes).unwrap();
+            assert!(
+                extract_file(&input, &dir.path().join("out")).is_err(),
+                "{name}"
+            );
+        }
+        for name in ["OPS/./p.xhtml", "OPS//p.xhtml", "OPS/a/../p.xhtml"] {
+            assert!(safe_path(name).is_err(), "{name}");
+            let bytes = book(
+                &opf("ltr", ""),
+                &[("OPS/p.xhtml", PAGE), (name, b"replacement")],
+            );
+            assert!(inspect_bytes(&bytes).is_err(), "{name}");
+            let dir = tempfile::tempdir().unwrap();
+            let input = dir.path().join("synthetic.epub");
+            fs::write(&input, bytes).unwrap();
+            let out = dir.path().join("out");
+            assert!(extract_file(&input, &out).is_err(), "{name}");
+            assert_eq!(fs::read(out.join("OPS/p.xhtml")).unwrap(), PAGE);
+        }
+        // A directory alias cannot replace an existing file.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("synthetic.epub");
+        fs::write(&input, synthetic_zip(&[("OPS", b"keep"), ("OPS/./", b"")])).unwrap();
+        let out = dir.path().join("out");
+        assert!(extract_file(&input, &out).is_err());
+        assert_eq!(fs::read(out.join("OPS")).unwrap(), b"keep");
+    }
+    #[test]
     fn absolute_reference_selects_root_and_generated_html_keeps_that_member() {
         let root_image = png(10, 20);
         let ops_image = png(30, 40);
@@ -1119,6 +1252,104 @@ mod tests {
         let p = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", page)])).unwrap();
         assert_eq!(p.spine.len(), 1);
         assert_eq!(p.spine[0].direct_image, None);
+    }
+    #[test]
+    fn unicode_whitespace_external_manifest_items_stay_skipped() {
+        for href in [
+            "&#160;https://example.invalid/font.woff2",
+            "&#8195;http://example.invalid/font.woff2&#160;",
+            "&#12288;//example.invalid/font.woff2",
+            "&#160;\\\\host/font.woff2",
+            "&#160;C:/font.woff2",
+            "&#160;file:/font.woff2",
+            "&#160;data:font/woff2;base64,AA",
+        ] {
+            let opf = opf("ltr", "").replace(
+                "</manifest>",
+                &format!(r#"<item id="unused" href="{href}" media-type="font/woff2"/></manifest>"#),
+            );
+            let package = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap();
+            assert_eq!(package.manifest.len(), 1, "{href}");
+            assert_eq!(package.manifest[0].id, "p");
+            assert_eq!(package.spine[0].path, "OPS/p.xhtml");
+        }
+        // Unicode whitespace is significant in local member names. Classification
+        // must not feed its trimmed string back to the WHATWG resolver.
+        let href = "\u{a0}p.xhtml";
+        assert!(!is_external_href(href));
+        assert_eq!(
+            resolve("OPS/content.opf", href).unwrap().path,
+            "OPS/\u{a0}p.xhtml"
+        );
+        let opf = opf("ltr", "").replace("href=\"p.xhtml\"", "href=\"&#160;p.xhtml\"");
+        let package = inspect_bytes(&book(&opf, &[("OPS/\u{a0}p.xhtml", PAGE)])).unwrap();
+        assert_eq!(package.spine[0].path, "OPS/\u{a0}p.xhtml");
+    }
+    #[test]
+    fn unmappable_spine_and_cover_references_are_errors() {
+        for href in [
+            "&#160;https://example.invalid/p.xhtml",
+            "//host/p.xhtml",
+            "C:/p.xhtml",
+            "a%2Fp.xhtml",
+            "../..//p.xhtml",
+        ] {
+            let opf = opf("ltr", "").replace("href=\"p.xhtml\"", &format!("href=\"{href}\""));
+            let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
+            assert_eq!(error.kind, EpubErrorKind::Invalid);
+            assert!(
+                error.message.contains("spine idref")
+                    || error.message.contains("manifest item p href"),
+                "{}",
+                error.message
+            );
+        }
+        for cover in [
+            r#"<metadata/><manifest><item id="c" href="&#160;https://example.invalid/cover.jpg" properties="cover-image" media-type="image/jpeg"/>"#,
+            r#"<metadata><meta name="cover" content="c"/></metadata><manifest><item id="c" href="&#160;//host/cover.jpg" media-type="image/jpeg"/>"#,
+            r#"<metadata/><manifest><item id="c" href="a%2Fb.jpg" properties="cover-image" media-type="image/jpeg"/>"#,
+        ] {
+            let opf = format!(
+                r#"<package>{cover}<item id="p" href="p.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="p"/></spine></package>"#
+            );
+            let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
+            assert!(
+                error.message.contains("cover idref")
+                    || error.message.contains("manifest item c href"),
+                "{}",
+                error.message
+            );
+        }
+        // A non-spine cover remains valid when its reference maps to a local member.
+        let opf = opf("ltr", "").replace("</manifest>", r#"<item id="c" href="cover.jpg" properties="cover-image" media-type="image/jpeg"/></manifest>"#);
+        assert!(
+            inspect_bytes(&book(
+                &opf,
+                &[("OPS/p.xhtml", PAGE), ("OPS/cover.jpg", &png(10, 20))]
+            ))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn unsafe_unused_local_manifest_items_are_not_silently_skipped() {
+        for href in [
+            "a%2Fb.woff2",
+            "a%5Cb.woff2",
+            "../../font.woff2",
+            "a%3Ab.woff2",
+            "NUL.woff2",
+        ] {
+            let opf = opf("ltr", "").replace(
+                "</manifest>",
+                &format!(r#"<item id="unused" href="{href}" media-type="font/woff2"/></manifest>"#),
+            );
+            let error = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap_err();
+            assert!(
+                error.message.contains("manifest item unused href"),
+                "{href}: {}",
+                error.message
+            );
+        }
     }
     #[test]
     fn svg_viewbox() {
