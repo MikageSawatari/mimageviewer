@@ -835,7 +835,7 @@ pub(in crate::app) struct ViewerContextBundle {
     metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
-    current_folder_signature: Option<u64>,
+    current_folder_signature: Option<folder_scan::FolderScanSignature>,
     folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
     converted_archive_pin_root_states:

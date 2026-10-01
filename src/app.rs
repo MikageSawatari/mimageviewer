@@ -10710,7 +10710,8 @@ pub(crate) struct ExternalRescanPending {
     /// 走査の条件。隠しファイル表示などを変えて読み直したら、古い条件の結果は捨てる。
     pub(crate) scan_options: ExternalRescanOptions,
     pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) rx: mpsc::Receiver<Option<folder_scan::ScannedDir>>,
+    pub(crate) rx:
+        mpsc::Receiver<Option<(folder_scan::ScannedDir, folder_scan::FolderScanSignature)>>,
     /// 走査中に届いた次の変更。**通知を捨てず、完了後にもう一度走らせる。**
     ///
     /// 「いま走っているから要らない」と扱うと、走査が stamp を読んだ後の上書きを
@@ -16682,10 +16683,10 @@ pub struct App {
     /// トレイ復帰 / フォーカス復帰時に `std::fs::metadata` で新しい mtime を取り、値が
     /// 変わっていたら再ロードする。ZIP / PDF / 検索合成パスには使わないので None のまま。
     pub(crate) current_folder_last_mtime: Option<std::time::SystemTime>,
-    /// 直近ロードしたフォルダ内容のシグネチャ (path + mtime + size のハッシュ)。
-    /// mtime 変化を検知して再走査した結果が同一なら、items 差し替えをスキップして
+    /// 適用済みフォルダ内容のシグネチャ (path + mtime + size + 種別のハッシュ)。
+    /// 再走査が同一、または実 Folder の mtime だけの差分なら items 差し替えをスキップして
     /// 画面ちらつきを防ぐ。`current_folder_last_mtime` と同じくディレクトリ実体のみ。
-    pub(crate) current_folder_signature: Option<u64>,
+    pub(crate) current_folder_signature: Option<folder_scan::FolderScanSignature>,
     /// 前フレームの main viewport focus 状態。false → true 遷移で外部更新チェックを走らせる。
     /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
     pub(crate) last_main_focused: bool,
@@ -22127,7 +22128,7 @@ impl App {
     ///   (Windows Search / ウイルススキャン等が触っただけ → ちらつき抑止)
     ///
     /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
-    /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
+    /// UI は親の `metadata()` と適用可否の比較だけを行い、走査と signature 計算は worker で行う。
     pub(crate) fn check_external_folder_changes(
         &mut self,
         ctx: &egui::Context,
@@ -22229,7 +22230,11 @@ impl App {
                     include_epub,
                     show_hidden_files,
                 )
-                .ok();
+                .ok()
+                .map(|scan| {
+                    let signature = signature_from_scan(&scan);
+                    (scan, signature)
+                });
                 // 送ってから起こす。起きたフレームの poll が必ず受け取れる順序。
                 let _ = tx.send(scan);
                 repaint.request_repaint();
@@ -22316,8 +22321,8 @@ impl App {
             return;
         }
         let _ = scan_options;
-        let scan = scan.expect("checked above");
-        self.apply_external_rescan(folder.clone(), mtime, scan);
+        let (scan, signature) = scan.expect("checked above");
+        self.apply_external_rescan(folder.clone(), mtime, scan, signature);
         restart(self, ctx);
     }
 
@@ -22327,6 +22332,7 @@ impl App {
         folder: PathBuf,
         new_mtime: std::time::SystemTime,
         scan: folder_scan::ScannedDir,
+        new_sig: folder_scan::FolderScanSignature,
     ) {
         // 走査中に別のフォルダーへ移っていたら捨てる。
         if !self
@@ -22336,11 +22342,14 @@ impl App {
         {
             return;
         }
-        // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
-        // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
-        // ウイルススキャン等が触っただけで mtime が更新されるケースを救済する。
-        let new_sig = signature_from_scan(&scan);
-        if self.current_folder_signature == Some(new_sig) {
+        // 実 Folder の mtime だけの差分も一覧を維持する (§1.314)。表示 metadata と
+        // 代表サムネ要求 stamp は一覧を開いた時点のまま、比較用 stamp だけを進める。
+        // それ以外の差分や未適用の一覧は従来の reload / defer へ流す。
+        if self
+            .current_folder_signature
+            .is_some_and(|old| old.same_listing(new_sig))
+        {
+            self.current_folder_signature = Some(new_sig);
             self.current_folder_last_mtime = Some(new_mtime);
             return;
         }
@@ -33869,7 +33878,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     ) {
         self.start_loading_items_inner(
             source_path,
@@ -33894,7 +33903,7 @@ impl App {
         source_path: PathBuf,
         prepared: crate::filename_stack_ui::StackPreparedItems,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     ) {
         let crate::filename_stack_ui::StackPreparedItems {
@@ -33985,7 +33994,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
         prepared_page_edits: Option<(
             page_edit_snapshot::PageEditSnapshot,

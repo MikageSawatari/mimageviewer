@@ -8130,7 +8130,13 @@ mod tests {
             let scan =
                 super::super::folder_scan::scan_directory_with_settings(folder, &app.settings)
                     .unwrap();
-            app.apply_external_rescan(folder.to_path_buf(), std::time::SystemTime::now(), scan);
+            let signature = super::super::folder_scan::signature_from_scan(&scan);
+            app.apply_external_rescan(
+                folder.to_path_buf(),
+                std::time::SystemTime::now(),
+                scan,
+                signature,
+            );
             assert!(
                 app.items
                     .iter()
@@ -8789,7 +8795,13 @@ mod tests {
         let unchanged =
             super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
                 .unwrap();
-        app.apply_external_rescan(folder.clone(), std::time::SystemTime::now(), unchanged);
+        let signature = super::super::folder_scan::signature_from_scan(&unchanged);
+        app.apply_external_rescan(
+            folder.clone(),
+            std::time::SystemTime::now(),
+            unchanged,
+            signature,
+        );
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.context_menu_idx, Some(menu_owner));
 
@@ -8797,7 +8809,8 @@ mod tests {
         let changed =
             super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
                 .unwrap();
-        app.apply_external_rescan(folder, std::time::SystemTime::now(), changed);
+        let signature = super::super::folder_scan::signature_from_scan(&changed);
+        app.apply_external_rescan(folder, std::time::SystemTime::now(), changed, signature);
         assert_ne!(app.items_generation, generation);
         assert!(app.context_menu_idx.is_none());
     }

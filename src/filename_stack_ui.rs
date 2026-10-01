@@ -124,7 +124,7 @@ pub(crate) struct StackExtractPending {
     cancel: Arc<AtomicBool>,
     source: StackGroupingSource,
     existing_keys: std::collections::HashSet<String>,
-    folder_signature: Option<u64>,
+    folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     context_id: crate::app::ViewerContextId,
     items_generation: u64,
     item_count: usize,
@@ -140,7 +140,7 @@ pub(crate) struct StackScriptPending {
     item_count: usize,
     sequence: u64,
     existing_keys: std::collections::HashSet<String>,
-    folder_signature: Option<u64>,
+    folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     retry_attempt: u8,
 }
 
@@ -223,7 +223,7 @@ enum StackRetrySource {
     GroupFresh(
         Arc<StackGroupingSource>,
         std::collections::HashSet<String>,
-        Option<u64>,
+        Option<crate::app::folder_scan::FolderScanSignature>,
     ),
     GroupReady(
         Arc<StackGroupingSource>,
@@ -232,7 +232,7 @@ enum StackRetrySource {
         Option<String>,
         Option<String>,
         std::collections::HashSet<String>,
-        Option<u64>,
+        Option<crate::app::folder_scan::FolderScanSignature>,
     ),
     SwitchReady(
         Arc<StackView>,
@@ -577,7 +577,7 @@ impl crate::app::App {
         separator: char,
         order: crate::rating_sort::ListingOrderRequest,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         script_enabled: bool,
         group_per_parent: bool,
     ) {
@@ -624,7 +624,7 @@ impl crate::app::App {
         &mut self,
         source: Arc<StackGroupingSource>,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         retry_attempt: u8,
     ) {
         self.cancel_stack_script_pending();
@@ -821,7 +821,7 @@ impl crate::app::App {
         rule: Option<String>,
         error: Option<String>,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         retry_attempt: u8,
     ) {
         self.cancel_stack_script_pending();
@@ -966,7 +966,7 @@ impl crate::app::App {
         &mut self,
         source: &StackGroupingSource,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     ) {
         // Separator, script and display-order changes re-group the same listing. Its captured
         // sort request remains valid until an explicit listing preparation replaces it.
@@ -1108,7 +1108,7 @@ impl crate::app::App {
         &mut self,
         folder: PathBuf,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         view: Arc<StackView>,
         prepared: StackPreparedItems,
         rule: Option<String>,
