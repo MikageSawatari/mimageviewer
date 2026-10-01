@@ -2,7 +2,8 @@
 
 状態: 設計第 5 版 (2026-09-27)。第 1 版 (REVISE、P1×5 / P2×4 / P3×1) と第 2 版 (REVISE、P1×4 / P2×2) への
 Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 / P3×1) を第 4 版で、第 4 版への指摘 (REVISE、P1×2 / P3×1) を第 5 版で反映。第 5 版は ACCEPT WITH CHANGES (P3×1、テストの記述) で、その修正を反映済み。
-サンプル版 (試験用) の範囲を定める。配布版で決めることは §10。
+サンプル版 (試験用) の設計記録と、v4.3.0 配布版の決定をまとめる。配布の同梱・署名・通知と
+ポータブル版の範囲は §10 に確定。残る対象外事項も同節に記録する。
 
 ## 0. 目的と決定済み事項
 
@@ -488,7 +489,7 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain` / `Unowned`) と latency (`AutoBypass` / `ReportOnly`)。
   既存の bridge は既定値で従来どおり動く。
 
-## 10. 配布版の決定と残る範囲
+## 10. 決定済みの配布方針と残る対象外事項
 
 - 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
 
@@ -500,9 +501,15 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   起動は次の配信から、§12.4)
 - 作者への連絡
 
-### 10.1 ポータブル版 (利用者決定 2026-09-28)
+### 10.1 ポータブル版 (利用者決定 2026-09-28、UI方針追記 2026-10-01)
 
 - ポータブル版は **ユーザー VST も音響調整 (EffeTune) も無効のまま** (vst3-host.exe を同梱しない現状を維持)。
+- **利用者決定 2026-10-01**: portable は EffeTune のツールバーボタンとカスタマイズ候補を表示しない。
+  v4.3.0 の「重要な変更点」からも、同ボタン追加の必読告知と EffeTune 新機能の紹介を除く。
+  通常版の表示・告知は維持し、Remote 接続・音声トラック選択・長さ表示の告知は両版に残す。
+- 除外条件は `portable` build flavor とする。通常版で bundle が見つからない場合は配布／展開の
+  不具合として扱い、ボタンと「必要なファイルが見つかりません」の表示を維持する。
+  portable の保存済みツールバーレイアウトから EffeTune 項目を削除せず、表示と編集用の投影だけで除外する。
 - 理由: Mixwright は mIV の data_dir に関係なく `%APPDATA%` に書く (上流 v0.11.1 で確認:
   プリセット = `%APPDATA%\effetune\` か `%APPDATA%\Frieve\EffeTunePlugin\`、config.json も同所、
   WebView の保存領域 = CHOC `getUserDataFolder()` により `%APPDATA%\<ホスト exe 名>\`)。
@@ -539,7 +546,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   置換を行う。runtime root の CRT だけには頼らない。
 - 3種類の通知全文を `third_party/effetune-mixwright/v0.11.1/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
-  vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
+  `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
+  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
   一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
 - EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
   アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。

@@ -1616,6 +1616,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
   remote service と EPUB converter をその隣へ同梱。
   VST host と EffeTune bundle は利用者決定により非同梱。音響調整は bundle 不在で利用不可のまま。
+  `portable` build flavor では音響調整ボタン・カスタマイズ候補・v4.3.0の関連告知も表示しない。
+  保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
 - **EffeTune 配布境界**: 単体exe版／インストーラ版は launcher が bundle 全体を
@@ -1625,6 +1627,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   tree を置き換える。変更・欠落・余分なファイルや部分展開を修復し、別bundleの tree を混ぜない。
   メタデータを保持したままの内容破損は、既存asset shortcutと同様に通常起動時の検出範囲外。
   通知原文は `third_party/effetune-mixwright/v0.11.1/` に追跡し、about へ埋め込む。
+  `.gitattributes` の `-text` で checkout 時の改行変換を防ぎ、vendorとのバイト一致を保つ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
   するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。

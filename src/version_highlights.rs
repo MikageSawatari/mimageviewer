@@ -275,6 +275,7 @@ const V4_3_HIGHLIGHTS: &[HighlightItem] = &[
         title: "動画の音声トラックを選べます",
         body: "複数の音声トラックがある動画では、下部 HUD の「音声 N」ボタンから聴くトラックを選べます。選んだトラックはファイルごとに記憶し、mIV Remote でも選べます。",
     },
+    #[cfg(not(feature = "portable"))]
     HighlightItem {
         title: "音響調整 (EffeTune) で音を整えられます",
         body: "ツールバーの「音響調整」ボタンから、イコライザーやエフェクトで動画・音声の音を整えられます。一度設定すると、次からは起動時に自動で有効になります。",
@@ -969,12 +970,13 @@ const TABLE: &[VersionHighlights] = &[
     },
     VersionHighlights {
         version: "4.3.0",
-        // リモート接続時の PC 側の動きと、ツールバーの見え方が変わるので必読へ置く。
+        // リモート接続時の PC 側の動きを告知。通常版では音響調整ボタンの追加も必読へ置く。
         must_read: &[
             HighlightItem {
                 title: "リモート接続中は PC の閲覧ウィンドウを閉じます",
                 body: "mIV Remote の接続を受け付けると、フルスクリーンや別ウィンドウなど PC 側の閲覧ウィンドウを閉じ、「リモート接続中」の表示だけにします。切断すると一覧に戻ります。閉じた閲覧ウィンドウは元に戻りません。",
             },
+            #[cfg(not(feature = "portable"))]
             HighlightItem {
                 title: "ツールバーに「音響調整」ボタンが加わりました",
                 body: "同梱の音響調整 (EffeTune) を開くボタンです。不要な場合は、ツールバーの項目を右クリックして外せます。",
@@ -1427,6 +1429,46 @@ mod tests {
                 .contains("環境設定 → フォルダ・ファイル → 「代表画像の選択基準」")
         );
         assert!(notice.body.contains("番号（昇順）"));
+    }
+
+    #[test]
+    fn v4_3_notices_match_distribution_flavor() {
+        let entries = for_version("4.3.0", table());
+        assert_eq!(versions(&entries), ["4.3.0"]);
+        let entry = entries[0];
+        assert_eq!(
+            entry.must_read.len(),
+            if cfg!(feature = "portable") { 1 } else { 2 }
+        );
+        assert_eq!(
+            entry.highlights.len(),
+            if cfg!(feature = "portable") { 2 } else { 3 }
+        );
+        assert!(
+            entry
+                .must_read
+                .iter()
+                .any(|item| item.title.contains("リモート接続中"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("音声トラック"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("長さ"))
+        );
+
+        for items in [entry.must_read, entry.highlights] {
+            let announces_effetune = items
+                .iter()
+                .any(|item| item.title.contains("音響調整") || item.body.contains("EffeTune"));
+            assert_eq!(announces_effetune, !cfg!(feature = "portable"));
+        }
     }
 
     #[test]
