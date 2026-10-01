@@ -804,12 +804,16 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 - **`Stale` からの復帰**: 現在の要求の `Stale` は、そのページの **物理 source の無効化** として扱う。`RawPageState` を古い source の
   ものとして破棄し、新しい `RawSourceIdentity` で作り直す (`PreviewNotRequested` から。需要があれば worker 側で新しく info /
   プレビューを取り直す)。あわせて、入っている入力 (`fs_cache` の entry)・派生 cache (edit / final / 比較 / 360 度)・進行中の
-  完了を失効させる (`bump_input_generation`。同じ source の再読込用の `bump_input_generation_for_fs_cache_reload` は使わない)。
+  完了を失効させる。これには **RAW 専用の `invalidate_raw_source_for_idx`** を新設し、明るさの変更 (D) と共用する:
+  `bump_input_generation_for_fs_cache_reload` (`src/app.rs:72090`) と同じページ単位の後始末 (input generation の更新、比較準備・
+  Lanczos・消しゴム・ローカル調整・conceal・edit / final の失効) を行い、retained final AI は **消さずに** 下の source 指紋と
+  明るさの key で使えなくする。`bump_input_generation` は使わない (retained AI の消去が App 全体の epoch を進め、`src/app.rs:71149`,
+  `74194`、RAW 以外のページの進行中の AI 結果まで保存に失敗する)。
   holdover は (D) と同じ既存経路で退避する。`Blocked` にはしない。置き換え済みの古い要求の `Stale` は要求 ID で無視する
 - **retained final AI の identity に RAW の source 指紋を含める**: RAW の source では、retained AI の検索・保存の key に
   `RawSourceIdentity` の指紋 (高精度 mtime・size) と明るさを含める。現行の key は path・寸法・効果だけで source の印が無い
   (`src/app.rs:72794`) ため、同じ path・同じ寸法で上書きされたファイルに古い AI 結果を使ってしまう。古い指紋の完了は保存しない
-- テスト: 現像中の上書きからの復帰、古い要求の遅れた `Stale` の無視、retained AI が cache 済み・実行中のそれぞれで上書きした場合
+- テスト: 現像中の上書きからの復帰、古い要求の遅れた `Stale` の無視、retained AI が cache 済み・実行中のそれぞれで上書きした場合、RAW の上書き中に完了した無関係な JPEG の AI 結果が保持される
 
 **(G) ページ送り・フォルダ移動の分類を 1 か所に**
 
@@ -1595,3 +1599,9 @@ retained AI を RAW の分だけ失効させ全体 epoch を進めない (P2)、
 だけ (P1)、holdover は既存の `capture_final_effect_source_reload_holdover` だけを使い、外した Static を holdover にしない (P1)、
 `Stale` を物理 source の無効化として扱い retained AI の key に source 指紋を含める (P2)、`Blocked(Failed)` は現像の identity に
 結び付けて設定変更で `Idle` に戻す。状態の移し方はプレビューの軸と現像の軸を独立した 2 つの表にした (P2)。
+
+### 20.18 S3 の設計再レビュー (2026-10-01、§7.10 の 3 回目)
+
+前回 4 件のうち 3 件解決。残り 1 件 (P2): `Stale` の失効に `bump_input_generation` を使うと App 全体の retained epoch が進む。
+RAW 専用の `invalidate_raw_source_for_idx` (再読込用と同じページ単位の後始末 + retained AI は source 指紋・明るさの key で
+無効化) を新設し、明るさの変更と共用する形に直した。レビュー担当の判定は「この修正で S3 に着手してよい。構造の再設計は不要」。
