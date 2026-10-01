@@ -741,26 +741,42 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 **(D) 明るさの変更 = RAW の source 変更 (1 つの transaction)**
 
 - 設定 `raw_brightness` の変更は、**mounted と parked の全 context** に対して 1 つの「RAW source 変更」transaction で反映する。
-  RAW ページの現像要求と backlog を取消し、各 `RawPageState` を段階ごとに次のように移す:
+  **取消すのは現像の要求・結果 (backlog 中の現像結果を含む) だけ**。プレビューと `DimsOnly` の要求・backlog は明るさに
+  関係しないので残す (プレビューの完了が upload 待ちの間に取消すと、`PreviewPending` のまま要求が無くなり読込中から
+  抜けなくなる、`src/app.rs:81147`)。
 
-  | 変更前の段階 | 変更後 |
+  `RawPageState` はプレビューの軸と現像の軸を **別々に** 移す (2 つの表は独立。組み合わせの行は作らない):
+
+  | 表示段の軸 (`RawInstalledStage` と `RawPreviewPhase`、変更前) | 変更後 |
   | --- | --- |
-  | `PreviewNotRequested` / `PreviewPending` | そのまま (プレビューは明るさに関係しない)。現像は `Idle` |
-  | `PreviewShown` | プレビューを残し、現像を `Idle` へ (窓の中なら新しい明るさで再要求) |
-  | `PreviewAbsent` | 現像を `Idle` へ (窓の中なら再要求)。表示は「現像中」 |
-  | `Developed` | 埋め込みプレビューは既に捨てている。**Static を処理の入力から外し** (`input_generation` を進める)、その texture は
-  新しいプレビューか現像結果が入るまでの **表示専用の holdover** としてだけ残す。プレビューを `NotRequested` に戻して取り直し、
-  現像を `Idle` へ |
-  | `Preparing` / `Submitted` | 取消して `Idle` へ (古い明るさの完了は下の identity で拒否) |
-  | `Blocked(Unsupported)` / `Terminal` | そのまま (明るさに関係しない) |
-  | `Blocked(Failed)` | そのまま (失敗は明るさに関係しない。次の source 変更か再訪で再試行) |
+  | `Nothing` / `PreviewShown` / `PreviewAbsent` (プレビューの要求・完了はどの状態でも) | そのまま (明るさに関係しない) |
+  | `Developed` (現像結果を入れたため埋め込みプレビューは捨てている) | 表示段を `Nothing`、プレビューを `NotRequested` に戻す。窓の中なら取り直す |
+
+  表示段は単調増加 (§6.1) だが、**source 変更の transaction (明るさの変更と下の `Stale`) だけは `Nothing` へ戻してよい**。
+  戻すときに要求 ID を進めるので、戻す前の要求の遅れた完了は `apply_result` が拒否する。
+
+  | 現像の軸 (変更前) | 変更後 |
+  | --- | --- |
+  | `Idle` | そのまま (窓の中なら新しい明るさで要求) |
+  | `Preparing` / `Submitted` | 取消して `Idle` (古い明るさの完了は下の identity で拒否) |
+  | `Done` | Static を `fs_cache` と処理の入力から外し (`input_generation` を進める)、`Idle` |
+  | `Blocked(Unsupported)` | そのまま (形式の問題で、設定に関係しない) |
+  | `Blocked(Failed)` | `Idle` に戻す。失敗は現像の identity (明るさを含む) に結び付ける。`MatchPreview` だけがプレビュー取得で
+  `OutOfMemory` になり得る (`src/raw/raw_decoder.rs:761`) ので、設定を変えれば成功し得る |
+
+  **holdover は既存の経路だけを使う**: 現像結果を外す前に、`capture_final_effect_source_reload_holdover`
+  (`src/app.rs:72154`) で、その時点で **提示している** 表示ユニット (ページ単位表示) またはページ別 transition (連結読み) を
+  退避する。退避の可否も既存の条件 (カラー化・LUT が final を要求する場合など) に従う。外した Static をそのまま holdover に
+  しない (カラー化・LUT の有効時は未処理の画素になり、R2 に反する)。退避できない場合は、新しいプレビューか現像結果が
+  入るまで「読込中」の表示にする。テスト: カラー化・LUT 有効で、ページ単位・見開き・連結読みのそれぞれで明るさを変える
 
 - RAW ページの edit / final / 比較 / 360 度を失効させる。**retained final AI は RAW ページの分だけを失効させる**: RAW の source では
   retained AI の key と完了時の検証に明るさを含め、明るさが違う entry は使わない・保存しない。App 全体の retained epoch
   (`src/app.rs:74194`) は進めない (進めると RAW 以外のページの進行中の AI 完了まで保存に失敗する、`:73893`)。
   テスト: transaction の最中に完了した JPEG の AI 結果が保持される
 - 現像要求の identity に明るさを含め、古い明るさの完了は `apply_result` が拒否する
-- テスト: 現像済みのページ・準備中のページ・park 中の context で明るさを変える
+- テスト: 現像済みのページ・準備中のページ・park 中の context で明るさを変える。プレビューの完了から upload までの間に
+  明るさを変える (プレビューが読込中のまま残らない)。明るさに依存する失敗 (`MatchPreview` の `OutOfMemory`) の後に設定を変える
 - サムネイル (catalog / edit preview) と RAW 以外のページには触らない
 
 **(E) S2a の暫定構造からの置き換え**
@@ -785,9 +801,15 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
   を持ち、worker はファイルを開く前と処理の後に stat して一致を確かめる。食い違えば typed な `Stale` で終える (queued の要求は
   後でファイルを開き直す、`src/canonical_image_loader.rs:404`。寸法とプレビューは別々に開く、`:460`。外部変更の反映は閲覧中に
   遅れることがある、`src/app.rs:22632`)
-- **`Stale` からの復帰**: 現在の要求の `Stale` は、その `RawPageState` を古い source のものとして破棄し、新しい `RawSourceIdentity`
-  で作り直す (`PreviewNotRequested` から。需要があれば worker 側で新しく info / プレビューを取り直す)。`Blocked` にはしない。
-  置き換え済みの古い要求の `Stale` は要求 ID で無視する。テスト: 現像中の上書きからの復帰、古い要求の遅れた `Stale` の無視
+- **`Stale` からの復帰**: 現在の要求の `Stale` は、そのページの **物理 source の無効化** として扱う。`RawPageState` を古い source の
+  ものとして破棄し、新しい `RawSourceIdentity` で作り直す (`PreviewNotRequested` から。需要があれば worker 側で新しく info /
+  プレビューを取り直す)。あわせて、入っている入力 (`fs_cache` の entry)・派生 cache (edit / final / 比較 / 360 度)・進行中の
+  完了を失効させる (`bump_input_generation`。同じ source の再読込用の `bump_input_generation_for_fs_cache_reload` は使わない)。
+  holdover は (D) と同じ既存経路で退避する。`Blocked` にはしない。置き換え済みの古い要求の `Stale` は要求 ID で無視する
+- **retained final AI の identity に RAW の source 指紋を含める**: RAW の source では、retained AI の検索・保存の key に
+  `RawSourceIdentity` の指紋 (高精度 mtime・size) と明るさを含める。現行の key は path・寸法・効果だけで source の印が無い
+  (`src/app.rs:72794`) ため、同じ path・同じ寸法で上書きされたファイルに古い AI 結果を使ってしまう。古い指紋の完了は保存しない
+- テスト: 現像中の上書きからの復帰、古い要求の遅れた `Stale` の無視、retained AI が cache 済み・実行中のそれぞれで上書きした場合
 
 **(G) ページ送り・フォルダ移動の分類を 1 か所に**
 
@@ -1565,3 +1587,11 @@ S2a の暫定実装と master 取り込みの後で §6〜§7・§13 を再レ�
 残り P1×2 / P2×4 を §7.10 に反映: fallback はプレビューを実際にデコードできた後だけ (P1)、明るさ変更の段階別の遷移と
 `Developed` のプレビュー取り直し・表示専用 holdover (P1)、表示中の全 RAW を High で現像要求 (P2)、`Stale` からの復帰 (P2)、
 retained AI を RAW の分だけ失効させ全体 epoch を進めない (P2)、`set_parallelism` の transaction 化 (P2)。
+
+### 20.17 S3 の設計再レビュー (2026-10-01、§7.10 の 2 回目)
+
+前回 6 件のうち 4 件解決 (プレビューのデコード後だけ fallback、表示中の全 RAW を High、retained AI の RAW 単位の失効、
+`set_parallelism` の transaction)、2 件は部分。新たな P1×2 / P2×2 を §7.10 に反映: 明るさの変更で取消すのは現像の要求・結果
+だけ (P1)、holdover は既存の `capture_final_effect_source_reload_holdover` だけを使い、外した Static を holdover にしない (P1)、
+`Stale` を物理 source の無効化として扱い retained AI の key に source 指紋を含める (P2)、`Blocked(Failed)` は現像の identity に
+結び付けて設定変更で `Idle` に戻す。状態の移し方はプレビューの軸と現像の軸を独立した 2 つの表にした (P2)。
