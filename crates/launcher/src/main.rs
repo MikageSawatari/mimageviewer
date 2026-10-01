@@ -2,7 +2,8 @@
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
 //! process load time and starts `mimageviewer-remote.exe` and `mimageviewer-epub-pdf.exe`
-//! from its own directory. The launcher therefore extracts all three executables, FFmpeg DLLs, and the app-local VC runtime into
+//! from its own directory. The launcher extracts these executables, FFmpeg DLLs,
+//! app-local VC runtime and the complete EffeTune bundle into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
 
 #![windows_subsystem = "windows"]
@@ -13,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+
+mod bundle_paths;
+mod effetune_bundle;
+include!(concat!(env!("OUT_DIR"), "/effetune_files.rs"));
 
 #[cfg(test)]
 mod build_const_parser;
@@ -144,6 +149,14 @@ fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
     for asset in ASSETS {
         extract_asset(runtime_dir, asset)?;
     }
+    effetune_bundle::ensure_bundle(runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST).map_err(
+        |e| {
+            format!(
+                "extract EffeTune {EFFETUNE_VERSION} failed: {e}\n(runtime dir: {})",
+                runtime_dir.display()
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -575,6 +588,44 @@ fn show_error(msg: &str) {
 #[cfg(all(test, windows))]
 mod tests {
     use std::ffi::OsString;
+
+    #[test]
+    fn embedded_effetune_extracts_complete_bundle_beside_core() {
+        let temp = tempfile::tempdir().unwrap();
+        super::effetune_bundle::ensure_bundle(
+            temp.path(),
+            super::EFFETUNE_FILES,
+            super::EFFETUNE_MANIFEST,
+        )
+        .unwrap();
+        let root = temp.path().join("effetune");
+        let bundle = root.join("EffeTune Mixwright.vst3");
+        assert!(
+            bundle
+                .join("Contents/x86_64-win/EffeTune Mixwright.vst3")
+                .is_file()
+        );
+        assert!(
+            bundle
+                .join("Contents/Resources/webview/plugins/dsp/NOTICE.txt")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("VERSION"))
+                .unwrap()
+                .trim(),
+            super::EFFETUNE_VERSION
+        );
+        for file in super::EFFETUNE_FILES {
+            assert_eq!(
+                super::sha256_file_hex(&root.join(file.name)).unwrap(),
+                file.hash,
+                "{}",
+                file.name
+            );
+        }
+        assert!(super::EFFETUNE_FILES.len() > 400);
+    }
 
     #[test]
     fn data_dir_option_defers_single_instance_routing_to_core() {

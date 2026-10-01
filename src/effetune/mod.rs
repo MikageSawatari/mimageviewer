@@ -1439,6 +1439,19 @@ mod tests {
     }
 
     #[test]
+    fn bundle_resolution_requires_bundle_beside_the_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("mimageviewer-core.exe");
+        assert!(matches!(
+            resolve_bundle_from_exe(Ok(exe.clone())),
+            Err(UnavailableReason::BundleMissing(_))
+        ));
+        let bundle = temp.path().join("effetune").join(BUNDLE_NAME);
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(resolve_bundle_from_exe(Ok(exe)).unwrap(), bundle);
+    }
+
+    #[test]
     fn startup_state_load_rule_and_controller_failure_transitions() {
         assert!(!startup_state_requires_load(None));
         assert!(!startup_state_requires_load(Some(&fixture(

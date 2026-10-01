@@ -1238,6 +1238,9 @@
           取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に保存され、mImageViewer のデータフォルダーを変更しても保存先は変わりません。
           EffeTune 自身の保存データは、mImageViewer のアンインストール時にも残ります。ポータブル版では音響調整を利用できません。
           詳しくは<a href="manual/effetune.html">音響調整の説明</a>をご覧ください。</p>
+        <p style="margin-top:0.5rem;">リモート閲覧用サービスの動作記録等は、通常版では <code>%APPDATA%\mimageviewer-remote\</code> に保存され、
+          アンインストール後も残ります。ポータブル版は <code>data</code> と同じ場所の <code>data-remote</code> を使います。
+          不要になった場合は、アプリを終了してから手動で削除できます。</p>
         <p style="margin-top:0.5rem;">外部ツールへ渡すために書き出した画像は、Windows の一時フォルダー内の
           本アプリ専用の場所に置き、<strong>終了時に削除します</strong>。</p>
       </div>
@@ -1416,6 +1419,14 @@
       詳細はライセンス全文をご確認ください。
     </p>
 
+    <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（EffeTune / VST3 SDK）</h3>
+    <p style="font-size:0.9rem;">
+      単体exe版・インストーラ版の音響調整には EffeTune Mixwright（MIT License、
+      Copyright (c) 2025-2026 Yoshiyuki Kobayashi）を同梱しています。
+      VST3 対応には Steinberg VST3 SDK（MIT License、Steinberg Media Technologies GmbH）を使用しています。
+      EffeTune と同梱ライブラリの通知全文は、アプリの「バージョン情報」で確認できます。
+      ポータブル版は EffeTune と VST3 ホストを同梱しません。
+    </p>
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（FFmpeg / LGPL）</h3>
     <p style="font-size:0.9rem;">
       動画の再生機能は <a href="https://ffmpeg.org/">FFmpeg プロジェクト</a> のライブラリ

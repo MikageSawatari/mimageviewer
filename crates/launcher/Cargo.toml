@@ -11,7 +11,7 @@ rust-version.workspace = true
 # 配布する `mimageviewer.exe` を生成する小さなランチャークレート。
 #
 # 役割:
-#   - 本体 `mimageviewer-core.exe`、`mimageviewer-remote.exe` と FFmpeg LGPL shared DLL 6 ファイルを
+#   - core / remote / EPUB worker、FFmpeg DLL、VC runtime と EffeTune bundle 全体を
 #     `include_bytes!` で内包する (本クレートの src/main.rs 参照)
 #   - 初回起動時に `%APPDATA%\mimageviewer\runtime\<version>\` へ展開
 #   - core を `std::process::Command::spawn` で起動 → ランチャー即終了
@@ -20,9 +20,9 @@ rust-version.workspace = true
 # 本体クレート (`mimageviewer-core.exe`) は ffmpeg-the-third を import library
 # 経由で使うが、それは展開後の同じディレクトリに 6 DLL があれば確実に解決される。
 #
-# ビルド前提: 本パッケージは `target/release` の core と remote を
-# `include_bytes!` で参照するため、両方を先にビルドしておく必要がある。
-# `scripts/build-release.{sh,ps1}` が core -> remote -> launcher の 3 段階ビルドを行う。
+# ビルド前提: `target/release` の core / remote / EPUB worker を先にビルドする。
+# `scripts/build-release.{sh,ps1}` が core -> remote -> EPUB worker -> launcher の順でビルドする。
+# EffeTune は vendor/effetune-mixwright または MIMV_EFFETUNE_DIR の完全なbundleを参照する。
 
 [[bin]]
 name = "mimageviewer"
@@ -30,6 +30,7 @@ path = "src/main.rs"
 
 [dependencies]
 sha2 = "0.10"
+fs4 = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

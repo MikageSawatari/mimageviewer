@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'sign-files.ps1')
 $vcrtDir = Join-Path $repoRoot 'vendor\vcrt'
 $manifestPath = Join-Path $vcrtDir 'provenance.json'
 $allowedRuntime = @(
@@ -62,6 +63,23 @@ function Get-PeInfo {
 function Test-VcRuntimeImportName {
     param([string] $Name)
     return $Name -match '^(msvcp|vcruntime|concrt)[a-z0-9_]*\.dll$'
+}
+
+function Get-MivGatePeFiles {
+    param([string] $Path)
+    $inputItem = Get-Item -LiteralPath $Path -Force
+    if (-not $inputItem.PSIsContainer -and -not (Test-MivPeFile -Path $inputItem.FullName)) {
+        throw "[vcrt-pe] explicit artifact is not a valid PE: $($inputItem.FullName)"
+    }
+    foreach ($file in Get-MivTreeFiles -Path $Path) {
+        $isPe = Test-MivPeFile -Path $file.FullName
+        # Known PE artifacts must fail closed if corrupted. Header enumeration
+        # additionally includes valid .vst3/extensionless PEs among resources.
+        if (-not $isPe -and $file.Extension -in @('.exe', '.dll', '.vst3')) {
+            throw "[vcrt-pe] known PE artifact has an invalid header: $($file.FullName)"
+        }
+        if ($isPe) { $file }
+    }
 }
 
 function Get-ExpectedMachineForArtifact {
@@ -142,6 +160,45 @@ if ($SelfTest) {
     if ((Get-ExpectedMachineForArtifact 'mimageviewer-core.exe') -ne 'x64') {
         throw 'self-test widened the normal x64 machine expectation'
     }
+    $temp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\')
+    $testDir = Join-Path $temp ('miv-pe-gate-test-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testDir | Out-Null
+    try {
+        $bytes = New-Object byte[] 128
+        $bytes[0] = 0x4d; $bytes[1] = 0x5a; $bytes[0x3c] = 0x40
+        $bytes[64] = 0x50; $bytes[65] = 0x45
+        foreach ($name in @('plugin.vst3', 'extensionless')) {
+            [System.IO.File]::WriteAllBytes((Join-Path $testDir $name), $bytes)
+        }
+        [System.IO.File]::WriteAllText((Join-Path $testDir 'resource.txt'), 'resource')
+        if (@(Get-MivGatePeFiles $testDir).Count -ne 2) {
+            throw 'self-test missed header-based PE artifacts'
+        }
+        $rejected = $false
+        try { $null = @(Get-MivGatePeFiles (Join-Path $testDir 'resource.txt')) } catch {
+            if ($_.Exception.Message -notmatch 'explicit artifact is not a valid PE') { throw }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'self-test accepted an explicit non-PE with an unrecognized extension' }
+        foreach ($name in @('corrupt.exe', 'corrupt.dll', 'corrupt.vst3')) {
+            $corrupt = Join-Path $testDir $name
+            [System.IO.File]::WriteAllText($corrupt, 'MZ')
+            $rejected = $false
+            try { $null = @(Get-MivGatePeFiles $testDir) } catch {
+                if ($_.Exception.Message -notmatch 'known PE artifact has an invalid header') { throw }
+                $rejected = $true
+            }
+            if (-not $rejected) { throw "self-test skipped corrupted artifact $name" }
+            Remove-Item -LiteralPath $corrupt
+        }
+    } finally {
+        $resolved = [System.IO.Path]::GetFullPath($testDir).TrimEnd('\')
+        if (-not $resolved.StartsWith($temp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'self-test cleanup escaped temp'
+        }
+        $null = @(Get-MivTreeFiles -Path $resolved)
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
     Write-Host '[vcrt-pe] parser self-test passed'
     return
 }
@@ -186,12 +243,9 @@ foreach ($inputPath in $InputPaths) {
     if (-not (Test-Path -LiteralPath $resolvedInput)) {
         throw "[vcrt-pe] input path is missing: $resolvedInput"
     }
-    if (Test-Path -LiteralPath $resolvedInput -PathType Leaf) {
-        $inputFiles += Get-Item -LiteralPath $resolvedInput
-    } else {
-        $inputFiles += Get-ChildItem -LiteralPath $resolvedInput -Recurse -File |
-            Where-Object { $_.Extension -in @('.exe', '.dll') }
-    }
+    # Header-based enumeration includes plugin DLLs with a .vst3 extension and
+    # future extensionless PE artifacts; resources are not passed to dumpbin.
+    $inputFiles += Get-MivGatePeFiles -Path $resolvedInput
 }
 $inputFiles = @($inputFiles | Sort-Object FullName -Unique)
 $peReports = @()

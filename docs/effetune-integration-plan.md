@@ -366,7 +366,7 @@ enum EffectiveState {
   - 配信中に EffeTune の設定を変えても、そのセッションには反映しない (次のセッションの受け付け時に
     取り直す)。
 
-## 7. bundle の配置 (サンプル版)
+## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
 - `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
@@ -378,7 +378,8 @@ enum EffectiveState {
   bundle が無ければ `Unavailable(BundleMissing)`。
 - `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` が偽なら
   `Unavailable(CpuUnsupported)`。
-- release / portable / launcher への埋め込みはしない。build.rs の必須チェックにも入れない。
+- サンプル版では release / portable / launcher への埋め込みを行わず、build.rs の必須チェックにも
+  入れなかった。v4.3.0 配布版の launcher 対応は §10.2。
 
 ## 8. テスト
 
@@ -487,12 +488,13 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain` / `Unowned`) と latency (`AutoBypass` / `ReportOnly`)。
   既存の bridge は既定値で従来どおり動く。
 
-## 10. サンプル版の範囲外 (配布版で決める)
+## 10. 配布版の決定と残る範囲
 
 - 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
 
-- release / portable / インストーラへの同梱方法、Mixwright の署名、THIRD-PARTY-NOTICES の転載、商標注記
-- マニュアル・製品ページ・privacy (Mixwright の WebView データの保存先が mIV の data_dir の外になる点)
+- v4.3.0 の同梱・署名・ライセンス通知は §10.2 に確定。商標注記の追加要否は別途確認する。
+- マニュアル・製品ページ・privacy には、Mixwright の WebView データの保存先が mIV の data_dir の
+  外になる点を記載済み。installer/readme.txt も共有データと Remote の残存フォルダを明記する。
 - フルスクリーン中の EffeTune ウィンドウの扱い・フォーカス受け渡し (detached リワークの手続きが必要)
 - 配信中の起動のリモート反映 (設定変更は第 6〜9 版の bridge 共有で配信中も反映される。配信中の
   起動は次の配信から、§12.4)
@@ -508,7 +510,39 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 参考: 過去のポータブル版の誤検知の原因は未署名の vst3-host.exe そのもので、フォルダ走査 (core の
   `src/video/dsp/scanner.rs`) ではなかった。
 - Mixwright のパイプライン プリセットは DAW やデスクトップ版 EffeTune と共有される (作者の設計)。
-  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を追記する。
+  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を記載済み。
+
+### 10.2 v4.3.0 の配布同梱 (2026-10-01)
+
+- **単体exe版とインストーラ版に Mixwright v0.11.1 の bundle 全体を同梱する**。インストーラは
+  launcher をインストールする。portable は §10.1 の決定どおり bundle と VST host を同梱しない。
+- launcher の build.rs が `vendor/effetune-mixwright/` (または `MIMV_EFFETUNE_DIR` で指定した
+  staging) の VERSION と bundle を必須検証し、相対パス順に全ファイルを列挙して埋め込む。
+  v0.11.1 の bundle は 407 ファイル、38,491,437 bytes (約36.71 MiB)。bundle 外の VERSION を含む
+  入力は計408ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
+  無ければ取得・配置の復旧手順付きで build を停止する。
+- 起動時は `%APPDATA%\mimageviewer\runtime\<version>\effetune\EffeTune Mixwright.vst3\`
+  へ階層を保持して展開する。core の §7 の解決規則に一致する。一時ディレクトリで全ファイルの
+  hash を検証してから bundle 単位で置き換え、展開完了 stamp を保存する。既存のファイル一覧・
+  サイズ・更新時刻・作成時刻 (UNIX epoch からの nanoseconds) が stamp と一致するときは全量を
+  再hashしない。不一致なら bundle 全体を staging に再展開し、全ファイルの hash を検証して
+  tree を置き換える。欠落・変更・余分なファイル・部分展開を修復し、別bundleの残存を混ぜない。
+  メタデータを保持したままの内容破損は、既存asset shortcutと同様に通常起動時の検出範囲外。
+- `build-dist.ps1` が呼ぶ `build-release.ps1 -Sign` は vendor 原本を変更せず target の staging に
+  bundle をコピーし、拡張子が
+  `.vst3` の plugin PE を含む全 PE を **launcher の埋め込み前に署名**する。
+  launcher build 時に `MIMV_EFFETUNE_DIR` を staging に向け、PE dependency gate も同じ
+  staging の bundle を明示的な検査入力にする。
+- VST host は runtime の core の隣ではなく `data_dir/vst3/mimageviewer-vst3-host.exe` から動く。
+  plugin の動的 VC runtime imports をそこで解決するため、Microsoft 署名済み公式 CRT4本を
+  host の隣にも配置する。process ごとに1回、埋め込み bytes との照合と一時ファイルからの atomic
+  置換を行う。runtime root の CRT だけには頼らない。
+- 3種類の通知全文を `third_party/effetune-mixwright/v0.11.1/` に原文のまま追跡し、about の
+  EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
+  vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
+  一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+- EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
+  アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 

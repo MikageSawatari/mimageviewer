@@ -33,9 +33,70 @@ pub fn ensure_bridge_extracted() -> Result<&'static PathBuf, String> {
                     "mimageviewer-vst3-host.exe",
                 )
                 .map_err(|e| format!("vst3 bridge extract failed: {e}"))?;
+                ensure_host_vcrt(&dir)
+                    .map_err(|e| format!("vst3 VC runtime extract failed: {e}"))?;
                 Ok(exe)
             }
         })
         .as_ref()
         .map_err(|e| e.clone())
+}
+
+// The plugin imports dynamic VC runtime, while the host runs outside the launcher's
+// runtime directory. Windows resolves these imports beside the host executable.
+#[cfg(not(feature = "portable"))]
+const HOST_VCRT: &[(&str, &[u8])] = &[
+    (
+        "msvcp140.dll",
+        include_bytes!("../../../vendor/vcrt/msvcp140.dll"),
+    ),
+    (
+        "msvcp140_1.dll",
+        include_bytes!("../../../vendor/vcrt/msvcp140_1.dll"),
+    ),
+    (
+        "vcruntime140.dll",
+        include_bytes!("../../../vendor/vcrt/vcruntime140.dll"),
+    ),
+    (
+        "vcruntime140_1.dll",
+        include_bytes!("../../../vendor/vcrt/vcruntime140_1.dll"),
+    ),
+];
+
+#[cfg(not(feature = "portable"))]
+fn ensure_host_vcrt(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    for &(name, bytes) in HOST_VCRT {
+        let path = dir.join(name);
+        // Once per process, verify actual bytes, including same-length corruption.
+        if std::fs::read(&path).is_ok_and(|actual| actual == bytes) {
+            continue;
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+        staged.write_all(bytes)?;
+        staged.as_file().sync_all()?;
+        staged.persist(&path).map_err(|error| error.error)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, not(feature = "portable")))]
+mod tests {
+    #[test]
+    fn host_vcrt_is_complete_and_repairs_same_length_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        super::ensure_host_vcrt(temp.path()).unwrap();
+        for &(name, bytes) in super::HOST_VCRT {
+            let path = temp.path().join(name);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let mut corrupt = bytes.to_vec();
+            corrupt[0] ^= 0xff;
+            std::fs::write(&path, corrupt).unwrap();
+        }
+        super::ensure_host_vcrt(temp.path()).unwrap();
+        for &(name, bytes) in super::HOST_VCRT {
+            assert_eq!(std::fs::read(temp.path().join(name)).unwrap(), bytes);
+        }
+    }
 }
