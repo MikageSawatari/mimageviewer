@@ -270,6 +270,21 @@ const V4_2_HIGHLIGHTS: &[HighlightItem] = &[
     },
 ];
 
+const V4_3_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "動画の音声トラックを選べます",
+        body: "複数の音声トラックがある動画では、下部 HUD の「音声 N」ボタンから聴くトラックを選べます。選んだトラックはファイルごとに記憶し、mIV Remote でも選べます。",
+    },
+    HighlightItem {
+        title: "音響調整 (EffeTune) で音を整えられます",
+        body: "ツールバーの「音響調整」ボタンから、イコライザーやエフェクトで動画・音声の音を整えられます。一度設定すると、次からは起動時に自動で有効になります。",
+    },
+    HighlightItem {
+        title: "動画・音声のサムネイルに長さを表示します",
+        body: "サムネイルの右下に「分:秒」で長さを表示します。環境設定の「表示 → サムネイル」でオフにできます。",
+    },
+];
+
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "2.0.0",
@@ -951,6 +966,21 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
         highlights: V4_2_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.3.0",
+        // リモート接続時の PC 側の動きと、ツールバーの見え方が変わるので必読へ置く。
+        must_read: &[
+            HighlightItem {
+                title: "リモート接続中は PC の閲覧ウィンドウを閉じます",
+                body: "mIV Remote の接続を受け付けると、フルスクリーンや別ウィンドウなど PC 側の閲覧ウィンドウを閉じ、「リモート接続中」の表示だけにします。切断すると一覧に戻ります。閉じた閲覧ウィンドウは元に戻りません。",
+            },
+            HighlightItem {
+                title: "ツールバーに「音響調整」ボタンが加わりました",
+                body: "同梱の音響調整 (EffeTune) を開くボタンです。不要な場合は、ツールバーの項目を右クリックして外せます。",
+            },
+        ],
+        highlights: V4_3_HIGHLIGHTS,
     },
 ];
 
