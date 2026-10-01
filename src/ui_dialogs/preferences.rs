@@ -164,6 +164,7 @@ pub(crate) enum PreferencesPage {
     /// 履歴と復元 (閲覧履歴、読書/再生位置の復元)
     PlaybackResume,
     SusiePlugins,
+    RawDevelop,
     /// v0.8.0: 検索インデックスの速度プロファイル
     IndexerSpeed,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
@@ -251,6 +252,7 @@ impl PreferencesPage {
         Self::SpreadMode,
         Self::PlaybackResume,
         Self::SusiePlugins,
+        Self::RawDevelop,
         Self::IndexerSpeed,
         Self::TrayResidency,
         Self::Rating,
@@ -287,6 +289,7 @@ impl PreferencesPage {
             Self::SpreadMode => "閲覧表示",
             Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
+            Self::RawDevelop => "RAW 現像",
             Self::IndexerSpeed => "検索インデックス",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
@@ -542,6 +545,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::DuplicateFiles,
             PreferencesPage::ExifDisplay,
             PreferencesPage::SusiePlugins,
+            PreferencesPage::RawDevelop,
         ],
     },
     TreeCategory {
@@ -3515,6 +3519,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
+        PreferencesPage::RawDevelop => page_raw_develop(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
@@ -3527,6 +3532,21 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 }
 
 // 個別ページ実装は `preferences/pages.rs` に分離。
+
+pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.selected = PreferencesPage::RawDevelop;
+    draw_page(ui, &mut state, false);
+}
 
 #[cfg(test)]
 mod tests {
@@ -3571,7 +3591,7 @@ mod tests {
             if executor_closed {
                 app.raw_develop_executor.shutdown();
             }
-            app.open_preferences_page(PreferencesPage::Parallelism);
+            app.open_preferences_page(PreferencesPage::RawDevelop);
             let mut harness = Harness::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
@@ -3645,7 +3665,7 @@ mod tests {
             assert_eq!(saved.raw_develop_parallelism, expected_parallelism);
             harness
                 .state_mut()
-                .open_preferences_page(PreferencesPage::Parallelism);
+                .open_preferences_page(PreferencesPage::RawDevelop);
             harness.run();
             let reopened = &harness.state().pref_state.as_ref().unwrap().settings;
             assert_eq!(reopened.raw_brightness, saved.raw_brightness);
@@ -4803,6 +4823,42 @@ mod tests {
             ),
             Some(13)
         );
+    }
+
+    #[test]
+    fn raw_develop_page_follows_susie_in_file_processing() {
+        let (label, category_idx, raw_idx) = preference_category(PreferencesPage::RawDevelop);
+        assert_eq!(label, "ファイル処理");
+        let category = &TREE[category_idx];
+        assert_eq!(
+            category.children[raw_idx - 1],
+            PreferencesPage::SusiePlugins
+        );
+        assert!(PreferencesPage::ALL.contains(&PreferencesPage::RawDevelop));
+    }
+
+    #[test]
+    fn raw_controls_only_appear_on_dedicated_page() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.selected = PreferencesPage::Parallelism;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        assert!(harness.query_by_label("プレビューに合わせる").is_none());
+        assert!(harness.query_by_label("PDF の同時処理数").is_some());
+        harness.state_mut().selected = PreferencesPage::RawDevelop;
+        harness.run();
+        assert!(harness.query_by_label("RAW 現像").is_some());
+        assert!(harness.query_by_label("プレビューに合わせる").is_some());
+        assert!(harness.query_by_label("補正しない").is_some());
+        assert!(harness.query_by_label("PDF の同時処理数").is_none());
     }
 
     #[test]

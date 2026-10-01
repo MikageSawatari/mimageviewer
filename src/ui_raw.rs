@@ -28,7 +28,6 @@ impl RawLoadingStatus {
 }
 
 pub(crate) fn draw_settings(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) {
-    ui.label(egui::RichText::new("RAW の現像").strong());
     ui.horizontal(|ui| {
         ui.label("同時現像数:");
         ui.add(
@@ -91,7 +90,7 @@ pub fn draw_raw_blocked_preview_snapshot_fixture(ui: &mut egui::Ui) {
 
 #[doc(hidden)]
 pub fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
-    draw_settings(ui, &mut crate::settings::Settings::default());
+    crate::ui_dialogs::preferences::draw_raw_settings_snapshot_fixture(ui);
 }
 
 #[doc(hidden)]

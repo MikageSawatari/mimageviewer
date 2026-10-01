@@ -29,6 +29,7 @@ use egui_kittest::Harness;
 
 #[test]
 fn raw_settings_light() {
+    // Render the actual dedicated preferences page, including its heading.
     snapshot_with_theme(
         "raw_settings_light",
         mimageviewer::os_theme::ResolvedTheme::Light,

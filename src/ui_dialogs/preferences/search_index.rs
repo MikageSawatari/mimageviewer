@@ -329,10 +329,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["自動", "スレッド", "CPU", "並列", "parallel"]
     ),
     entry!(
-        "parallelism/raw",
-        Parallelism,
-        "RAW の現像",
-        ["RAW", "同時現像数", "明るさ", "プレビュー", "メモリ"]
+        "raw-develop/settings",
+        RawDevelop,
+        "同時現像数:",
+        [
+            "RAW",
+            "現像",
+            "明るさ",
+            "プレビュー",
+            "補正しない",
+            "LibRaw",
+            "メモリ"
+        ]
     ),
     entry!(
         "parallelism/pdf",
@@ -1269,7 +1277,7 @@ mod tests {
                 entry.anchor
             );
             assert!(!entry.title.is_empty(), "title が空です: {}", entry.anchor);
-            let title_source = if entry.anchor == "parallelism/raw" {
+            let title_source = if entry.anchor == "raw-develop/settings" {
                 assert!(
                     PAGES_SOURCE.contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                 );
@@ -1383,6 +1391,24 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn raw_settings_search_targets_dedicated_page() {
+        for query in [
+            "raw",
+            "RAW 現像",
+            "同時現像数",
+            "RAW 明るさ",
+            "LibRaw",
+            "補正しない",
+        ] {
+            let results = search_preferences(query, test_tree_position);
+            assert!(!results.is_empty(), "no RAW settings result for {query}");
+            assert!(results.iter().all(|entry| {
+                entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
+            }));
+        }
     }
 
     #[test]
