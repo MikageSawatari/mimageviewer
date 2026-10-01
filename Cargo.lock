@@ -2017,6 +2017,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "url",
  "walkdir",
  "webview2-com",
  "windows 0.62.2",

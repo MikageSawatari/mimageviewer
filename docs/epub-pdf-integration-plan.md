@@ -397,6 +397,87 @@ RAR/7z の `archive_cache` には相乗りせず、**専用の保存先と DB �
 - **終了コード → 本体のエラー**: 2 DRM / 3 不正 / 4 WebView2 Runtime なし / 5 描画失敗 / 6 タイムアウト / 8 WebView2 Runtime に必要な API (`ICoreWebView2_22` 等) が無い、を型付きエラーへ。7 は D11 で廃止した (欠番。受け取ったら想定外の終了コードとして扱う)。
 - **起動時の環境**: 本体は変換器を起動するとき `WEBVIEW2_*` の環境変数 (追加引数・ユーザーデータ先・ブラウザ実行ファイル先 等) を外して渡す (変換器側でも外す)。レジストリのポリシーは D11 により検出せず従う。ポリシーで一時データの保存先が変わった場合は、変換器がレポートに記録して続行し、自分で作ったフォルダ以外は消さない。
 
+### 4.5.1 ワーカーのパス解決 (v4.3.0)
+
+解析する参照先と WebView2 が `https://epub.invalid/` のフォルダ割当から取得する
+ファイルを一致させる。ルート直下の OPF で相対参照に余分な `/` を付けていた不具合を、
+URL と ZIP 内の実名の境界を分離して修正する。新しい非同期状態は必要なく、既存の変換モーダルは維持する。
+
+- OPF の href は OPF 自身、XHTML の画像 src / SVG href・xlink:href は XHTML 自身を基準とし、
+  container.xml の full-path はコンテナルートを基準とする。基準 URL は実名の各セグメントを
+  percent-encode して作り、WHATWG URL (`url::Url`) で解決する。解決済みの実名を再復号しない。
+- `/x` はルートの `x` に解決する。EPUB 3.3 の書籍記述としては不適合だが、ブラウザとの
+  一致を優先する互換動作として受け入れる。以前の `OPS/x` への解決や fallback は行わない。
+  `OPS/x` しかない本は、以前変換できていても失敗する場合がある。
+- HTTPS の WHATWG 規則に従い、リテラルの backslash は区切りとする (`a\b` は `a/b`、
+  `\x` はルートの `x`)。前後の C0 制御文字・空白と内部 TAB/LF/CR の前処理も外部判定・越境検査と揃える。
+- `..` のルート越境は join の clamp 前に拒否する。encoded dot segment (`%2e`、`.%2e`、
+  `%2e.`、`%2e%2e`) も検査する。query / fragment 中の `..` は数えない。
+  この検査はパーサが扱う参照に適用し、CSS 等を含む全参照の EPUB 適合検査ではない。
+- `http:`、`https:`、`data:`、`file:`、`//host`、UNC 相当の二重 backslash 等は従来どおり
+  ローカルメンバーへ対応させずスキップする。`C:/x` も scheme を持つ参照としてスキップする。
+  同一仮想ホストを明記した絶対 URL もメンバー参照へ変換しない。
+  外部参照の分類では従来の Unicode 空白 trim も維持し、先頭 NBSP 等付きの未使用
+  manifest item を書籍全体の失敗にしない。この trim は分類だけに適用し、ローカル名の
+  WHATWG 解決へは渡さない (ローカル実名の NBSP 等は保持する)。spine がその外部 item を
+  指す場合は、識別子を含むエラーにする。変換ページは spine から構築するため、spine 外の
+  `cover-image` item が外部参照や未使用のローカルメンバーを指していても、また EPUB 2 の
+  `meta name="cover"` が存在しない id を指していても、表紙指定の必須検査は行わない。
+  表紙に指定された item も、spine に含まれる場合は通常の spine 検査を受ける。
+  未使用でもローカル href の越境・encoded separator・
+  Windows 不正名等は従来の承認済み安全規則に従い拒否し、manifest の id と href をエラーに付ける。
+- URL の path をセグメントごとに一度だけ UTF-8 復号し、ZIP の実名で完全一致検索する。
+  ローカル参照の encoded separator `%2F` / `%5C` は拒否する。query / fragment は実名から分離し、
+  ブラウザ用 URL に保持する。`#id`、`?v=1`、空参照は参照元メンバーを維持する。
+- ZIP のファイルエントリの生の名前は別途検証する。percent-decode や `?` / `#` 除去、名前の置換はしない。
+  絶対パス・drive / UNC・実際の `.` / `..`・空セグメント・backslash、不正文字、末尾の点・空白、
+  Windows の予約名や長すぎる構成要素を拒否する。
+  `a%20b.png` と `a b.png` は別の実名のまま展開する。
+- ZIP のディレクトリエントリは、検査・展開とも専用の正規化を通す。`OPS/./`、`OPS//` 等の
+  `.` と空セグメントを除去し、ルート内の `..` は親へ戻す。正規化結果はディレクトリ作成だけに
+  使用し、ファイルの検索・展開名には適用しない。`./` や `OPS/../` は作業ルートの作成だけになる。
+  絶対パス・drive / UNC・backslash・ルートを越える `..` は拒否し、その他の実セグメントも
+  `..` で除去される前に Windows 名検証を通す。percent-decode はせず、既存ファイルとの
+  ディレクトリ作成の衝突はエラーとする。ファイルエントリの厳密検証は緩めない。
+- 生成する固定印刷 HTML の iframe / img src とリフローコピーへのトップレベル URL は、
+  共通の実名→URL エンコードを使う。HTML 属性ではその後 HTML escape する。
+  直接画像印刷でも SVG fragment 等を捨てず、レポートの direct_image は実名として維持する。
+- `CONVERTER_OUTPUT_VERSION` は上げない (1 のまま)。上げると、以前に変換した全ての本が同名 PDF 保存のたびに
+  再変換になる。出力が変わるのは `/x` を使う不適合な本や `%` / `#` を含む名前など一部に限られ、
+  それらも旧出力は閲覧できていたため、全件の再変換に見合わない (2026-10-01 設計担当判断。独立レビューは「両方に別内容の x がある本では旧出力を保存に再利用する」と指摘したが、利用者が据え置きを決定)。
+
+今回追加する未対応項目 (別途設計・実装する):
+
+1. `xhtml_info` における `<base href>` の effective base 反映。現状は XHTML メンバー自身を基準とする。
+2. Windows 展開時に大文字小文字だけが違う ZIP 名の衝突検出。
+3. 既存メンバーと `_miv_print_*` / `_miv_reflow_*` の生成名の衝突回避。
+
+回帰検証は合成 EPUB と一時展開先だけを使い、実ユーザーの本・設定には触れない。
+WebView2 の実描画と URL→Windows ファイル配送は別途承認された実機検証の対象とする。
+
+2026-10-01 自動検証: worker test 53 件成功、fmt / fmt --check / clippy / diff --check 成功
+(clippy は既存テストの警告 1 件)。独立 xhigh 完了レビューの要修正指摘はなし。
+本体の旧出力再変換テストは、この worktree に FFmpeg ヘッダー・ライブラリがなく
+build script が avcodec version `(0, 0)` で停止したため未実行。全体ゲートと確認用 core
+ビルドも前提不足で未完了。詳細なコマンド・環境・件数は `target/epub-paths-verification.txt`。
+
+2026-10-01 P2 追補: 安全なディレクトリ別名の検査・展開、厳密なファイル名検証と衝突保護、
+Unicode 空白付きの未使用外部 manifest のスキップ、ローカル NBSP 名の保持、spine / 明示された
+表紙の解決不能エラーを合成 EPUB で検証。worker test は 58 件成功、fmt / fmt --check /
+clippy / diff --check 成功 (既存 clippy 警告 1 件)。独立 xhigh 完了レビューの要修正指摘はなし。
+この時点では FFmpeg の前提ファイルは揃ったが、`build-dev.ps1` が必要とする
+`vendor/effetune-mixwright/EffeTune Mixwright.vst3` がなく、確認用 core ビルドは未実施。
+
+2026-10-01 P2 再修正: 上記追補の表紙必須検査は、spine 外のメタデータからページを生成しない
+変換器に不要な条件だったため撤去した (設計担当が前回 brief を訂正)。未使用の外部
+`cover-image` item、ローカルの未存在 cover member、古い cover meta id は許容し、spine と
+ローカル href の安全検査は維持する。合成 EPUB の worker test は 62 件成功、fmt /
+fmt --check / clippy / diff --check 成功 (既存 clippy 警告 1 件)。独立 xhigh 完了レビューの
+要修正指摘はなし。
+同梱ファイルが揃ったため `build-dev.ps1 -PreserveRuntime` も実行したが、TurboJPEG の
+ネイティブビルドで MSBuild が exit 1 を返し、確認用 core バイナリの作成は未完了。
+worker の指定ゲートは成功しており、アプリ起動・実ユーザーデータを使う検証は行っていない。
+
 ### 4.6 同名スキップ設定 (D5)
 
 `skip_epub_if_pdf_exists` (既定 true)。`skip_archive_if_zip_exists` と同じ箇所に並べる:
