@@ -477,7 +477,11 @@ impl Engine {
                 } else {
                     render::reflow_print_copy(&root, chunk[0], print_index).map_err(|e| (5, e))?
                 };
-                let url = render::virtual_url(&relative);
+                let url = if fixed {
+                    render::virtual_url(&relative)
+                } else {
+                    render::reflow_url(&relative, chunk[0])
+                };
                 host.navigate(&url).map_err(|e| (5, e))?;
                 host.wait_ready(&url, deadline)
                     .map_err(classify_webview_error)?;

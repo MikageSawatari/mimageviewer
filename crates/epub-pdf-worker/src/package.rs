@@ -11,6 +11,7 @@ use std::{
     io::{Cursor, Read, Seek},
     path::{Component, Path},
 };
+use url::Url;
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -55,6 +56,8 @@ pub struct ManifestItem {
     pub id: String,
     pub href: String,
     pub path: String,
+    #[serde(skip)]
+    pub url: Url,
     pub media_type: String,
     pub properties: Vec<String>,
 }
@@ -62,6 +65,8 @@ pub struct ManifestItem {
 pub struct SpineItem {
     pub idref: String,
     pub path: String,
+    #[serde(skip)]
+    pub url: Url,
     pub media_type: String,
     pub linear: bool,
     pub rendition: Rendition,
@@ -69,7 +74,25 @@ pub struct SpineItem {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub size_source: Option<String>,
-    pub direct_image: Option<String>,
+    pub direct_image: Option<MemberReference>,
+}
+/// A resolved local reference owns the exact member name and its browser URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberReference {
+    pub path: String,
+    pub url: Url,
+}
+impl std::ops::Deref for MemberReference {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.path
+    }
+}
+// Keep the conversion report's direct_image field as the raw member name.
+impl Serialize for MemberReference {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.path)
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Package {
@@ -107,41 +130,66 @@ fn attr<'a>(a: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     })
 }
 
-/// Normalize an archive member or resolved href; reject paths that escape the archive.
+/// Validate a raw ZIP name without interpreting it as a URL or renaming it.
 pub fn safe_path(path: &str) -> Result<String, EpubError> {
-    normalize_path(path, false)
-}
-fn normalize_path(path: &str, allow_parent: bool) -> Result<String, EpubError> {
-    let decoded = percent_decode_str(path.split(['#', '?']).next().unwrap_or(path))
-        .decode_utf8()
-        .map_err(|_| invalid("invalid href encoding"))?;
-    let decoded = decoded.replace('\\', "/");
-    if decoded.starts_with('/') || decoded.starts_with("//") || decoded.contains(':') {
+    let name = path.strip_suffix('/').unwrap_or(path);
+    if name.is_empty() || name.starts_with('/') || name.contains('\\') {
         return Err(invalid(format!("unsafe archive path: {path}")));
     }
-    let mut stack = Vec::new();
-    for c in decoded.split('/') {
-        match c {
-            "" | "." => {}
-            ".." if allow_parent => {
-                if stack.pop().is_none() {
-                    return Err(invalid(format!("unsafe archive path: {path}")));
-                }
-            }
-            ".." => return Err(invalid(format!("unsafe archive path: {path}"))),
-            _ => stack.push(c),
+    for component in name.split('/') {
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        let reserved = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+        if component.is_empty()
+            || matches!(component, "." | "..")
+            || component.ends_with(['.', ' '])
+            || component
+                .chars()
+                .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+            || component.encode_utf16().count() > 255
+            || reserved
+        {
+            return Err(invalid(format!("unsafe archive path: {path}")));
         }
     }
-    if stack.is_empty() {
-        return Err(invalid(format!("empty archive path: {path}")));
-    }
-    Ok(stack.join("/"))
+    Ok(path.to_string())
+}
+/// Encode real member names segment by segment. '%' and '#' are literal name characters.
+pub fn member_url(path: &str) -> Url {
+    let encoded = path
+        .split('/')
+        .map(|segment| {
+            percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC)
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    Url::parse(&format!("https://epub.invalid/{encoded}")).expect("encoded member URL")
+}
+// WHATWG preprocessing removes TAB/LF/CR anywhere and trims edge C0 controls/spaces.
+fn clean_href(href: &str) -> String {
+    href.trim_matches(|c| c <= '\u{20}')
+        .replace(['\t', '\n', '\r'], "")
 }
 /// `http:`, `data:`, `//host/...` etc. point outside the archive. They are not archive paths:
 /// the parser skips them instead of rejecting the book (the renderer blocks the request).
 fn is_external_href(href: &str) -> bool {
     // Chromium treats backslashes as separators in special-scheme URLs.
-    let normalized = href.trim().replace('\\', "/");
+    let normalized = clean_href(href).replace('\\', "/");
     let href = normalized.as_str();
     if href.starts_with("//") {
         return true;
@@ -162,9 +210,72 @@ fn is_external_href(href: &str) -> bool {
         None => false,
     }
 }
-fn resolve(base: &str, href: &str) -> Result<String, EpubError> {
-    let parent = base.rsplit_once('/').map(|x| x.0).unwrap_or("");
-    normalize_path(&format!("{parent}/{href}"), true)
+fn resolve(base: &str, href: &str) -> Result<MemberReference, EpubError> {
+    let href = clean_href(href);
+    // Explicit schemes (including C:/x and file:) and network paths never map to members,
+    // even when their host happens to be epub.invalid. Callers skip these resources.
+    if is_external_href(&href) {
+        return Err(invalid(format!("external EPUB reference: {href}")));
+    }
+    if !base.is_empty() {
+        safe_path(base)?;
+    }
+    let path = href
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .replace('\\', "/");
+    let mut depth = if path.starts_with('/') {
+        0
+    } else {
+        base.matches('/').count()
+    };
+    // Url::join clamps traversal at the root. Reject escape before that evidence is lost.
+    for (index, segment) in path.split('/').enumerate() {
+        if index == 0 && segment.is_empty() {
+            continue;
+        }
+        let decoded = percent_decode_str(segment)
+            .decode_utf8()
+            .map_err(|_| invalid("invalid href encoding"))?;
+        if decoded.contains(['/', '\\']) {
+            return Err(invalid(format!(
+                "encoded separator in EPUB reference: {href}"
+            )));
+        }
+        match decoded.as_ref() {
+            "." => {}
+            ".." => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid(format!("unsafe archive path: {href}")))?;
+            }
+            _ => depth += 1,
+        }
+    }
+    let url = member_url(base)
+        .join(&href)
+        .map_err(|e| invalid(format!("invalid EPUB reference: {e}")))?;
+    let member = url
+        .path_segments()
+        .ok_or_else(|| invalid("invalid local URL"))?
+        .map(|segment| {
+            percent_decode_str(segment)
+                .decode_utf8()
+                .map(|s| s.into_owned())
+                .map_err(|_| invalid("invalid href encoding"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    safe_path(&member)?;
+    // Rebuild using the same encoding as generated HTML, retaining query/fragment separately.
+    let mut browser_url = member_url(&member);
+    browser_url.set_query(url.query());
+    browser_url.set_fragment(url.fragment());
+    Ok(MemberReference {
+        path: member,
+        url: browser_url,
+    })
 }
 fn read_member<R: Read + Seek>(z: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>, EpubError> {
     let mut f = z
@@ -196,7 +307,7 @@ fn container_path(bytes: &[u8]) -> Result<String, EpubError> {
         {
             Event::Start(e) | Event::Empty(e) if local(e.name().as_ref()) == b"rootfile" => {
                 if let Some(p) = attr(&attrs(&e, &r)?, "full-path") {
-                    return safe_path(p);
+                    return Ok(resolve("", p)?.path);
                 }
             }
             Event::Eof => break,
@@ -285,7 +396,7 @@ fn svg_size(a: &HashMap<String, String>) -> Option<(u32, u32)> {
         size_attr(attr(a, "height")?)?,
     ))
 }
-type XhtmlInfo = (Option<(u32, u32, String)>, Option<String>);
+type XhtmlInfo = (Option<(u32, u32, String)>, Option<MemberReference>);
 fn xhtml_info(bytes: &[u8], path: &str) -> Result<XhtmlInfo, EpubError> {
     let mut r = xml(bytes);
     let mut b = Vec::new();
@@ -403,9 +514,11 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                         // EPUB allows remote resources in the manifest; they are not in the
                         // archive, so they are skipped rather than treated as unsafe paths.
                         if !is_external_href(&href) {
+                            let reference = resolve(&opf_path, &href)?;
                             manifest.push(ManifestItem {
                                 id,
-                                path: resolve(&opf_path, &href)?,
+                                path: reference.path,
+                                url: reference.url,
                                 href,
                                 media_type: attr(&a, "media-type").unwrap_or("").into(),
                                 properties: attr(&a, "properties")
@@ -517,7 +630,10 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
         } else if item.media_type.starts_with("image/") {
             (
                 image_size(&data).map(|(w, h)| (w, h, "image_intrinsic".into())),
-                Some(item.path.clone()),
+                Some(MemberReference {
+                    path: item.path.clone(),
+                    url: item.url.clone(),
+                }),
             )
         } else if item.media_type == "application/xhtml+xml" || item.media_type == "text/html" {
             xhtml_info(&data, &item.path)?
@@ -538,6 +654,7 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
         spine.push(SpineItem {
             idref,
             path: item.path.clone(),
+            url: item.url.clone(),
             media_type: item.media_type.clone(),
             linear,
             rendition: applied,
@@ -617,6 +734,328 @@ mod tests {
         )
     }
     const PAGE:&[u8]=br#"<html><head><meta name="viewport" content="width=1200,height=1700"/></head><body><img src="a.jpg"/></body></html>"#;
+    fn synthetic_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut out);
+            for (name, bytes) in files {
+                zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        out.into_inner()
+    }
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+    const ROOT_CONTAINER: &[u8] =
+        br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#;
+
+    #[test]
+    fn root_opf_and_subdirectory_opf_can_reference_root_cover_page() {
+        let image = png(30, 40);
+        for opf_path in ["content.opf", "OPS/content.opf"] {
+            let prefix = if opf_path.contains('/') { "../" } else { "" };
+            let opf = format!(
+                r#"<package><manifest><item id="cover" href="{prefix}titlepage.xhtml" media-type="application/xhtml+xml"/><item id="text" href="{prefix}text/part0000.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="cover"/><itemref idref="text"/></spine></package>"#
+            );
+            let container = format!(
+                r#"<container><rootfiles><rootfile full-path="{opf_path}"/></rootfiles></container>"#
+            );
+            let package = inspect_bytes(&synthetic_zip(&[
+                ("mimetype", b"application/epub+zip"),
+                ("META-INF/container.xml", container.as_bytes()),
+                (opf_path, opf.as_bytes()),
+                (
+                    "titlepage.xhtml",
+                    br#"<html><body><svg><image xlink:href="cover.jpeg"/></svg></body></html>"#,
+                ),
+                ("cover.jpeg", &image),
+                ("text/part0000.xhtml", b"<html><body>text</body></html>"),
+            ]))
+            .unwrap();
+            assert_eq!(package.opf_path, opf_path);
+            assert_eq!(
+                package
+                    .spine
+                    .iter()
+                    .map(|item| item.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["titlepage.xhtml", "text/part0000.xhtml"]
+            );
+            assert_eq!(package.spine[0].direct_image.as_deref(), Some("cover.jpeg"));
+            assert_eq!(
+                (package.spine[0].width, package.spine[0].height),
+                (Some(30), Some(40))
+            );
+        }
+    }
+    #[test]
+    fn root_page_img_svg_href_and_xlink_href() {
+        for element in [
+            r#"<img src="cover.jpg"/>"#,
+            r#"<svg><image href="cover.jpg"/></svg>"#,
+            r#"<svg><image xlink:href="cover.jpg"/></svg>"#,
+        ] {
+            let page = format!("<html><body>{element}</body></html>");
+            assert_eq!(
+                xhtml_info(page.as_bytes(), "titlepage.xhtml")
+                    .unwrap()
+                    .1
+                    .as_deref(),
+                Some("cover.jpg")
+            );
+        }
+    }
+    #[test]
+    fn local_url_resolution_matches_browser_paths() {
+        for (base, href, expected) in [
+            ("content.opf", "titlepage.xhtml", "titlepage.xhtml"),
+            ("OPS/content.opf", "p.xhtml", "OPS/p.xhtml"),
+            ("OPS/content.opf", "text/p.xhtml", "OPS/text/p.xhtml"),
+            ("OPS/content.opf", "./p.xhtml", "OPS/p.xhtml"),
+            ("OPS/content.opf", "../p.xhtml", "p.xhtml"),
+            ("OPS/content.opf", "/x", "x"),
+            ("OPS/p.xhtml", r"a\b", "OPS/a/b"),
+            ("OPS/p.xhtml", r"\x", "x"),
+            ("OPS/p.xhtml", r"\host/x", "host/x"),
+            ("p.xhtml", "a//../../x", "x"),
+            ("OPS/p.xhtml", "a.png?v=1#f", "OPS/a.png"),
+            ("OPS/p.xhtml", "a.png?../../x#../../x", "OPS/a.png"),
+            ("OPS/p.xhtml", "#id", "OPS/p.xhtml"),
+            ("OPS/p.xhtml", "?v=1", "OPS/p.xhtml"),
+            ("OPS/p.xhtml", "", "OPS/p.xhtml"),
+        ] {
+            let reference = resolve(base, href).unwrap();
+            assert_eq!(reference.path, expected, "{base} + {href}");
+            let browser = member_url(base).join(href).unwrap();
+            assert_eq!(
+                percent_decode_str(reference.url.path())
+                    .decode_utf8()
+                    .unwrap(),
+                percent_decode_str(browser.path()).decode_utf8().unwrap(),
+                "{base} + {href}"
+            );
+            assert_eq!(reference.url.query(), browser.query());
+            assert_eq!(reference.url.fragment(), browser.fragment());
+        }
+        assert_eq!(
+            container_path(br#"<container><rootfile full-path="OPS/a%23b.opf"/></container>"#)
+                .unwrap(),
+            "OPS/a#b.opf"
+        );
+    }
+    #[test]
+    fn above_root_paths_and_encoded_separators_are_rejected() {
+        for (base, href) in [
+            ("p.xhtml", "../x"),
+            ("OPS/p.xhtml", "../../x"),
+            ("p.xhtml", "a/../../x"),
+            ("p.xhtml", "%2e%2e/x"),
+            ("p.xhtml", ".%2E/x"),
+            ("p.xhtml", "%2E./x"),
+            ("OPS/p.xhtml", "%2e%2e/%2E%2e/x"),
+            ("p.xhtml", "..\t/x"),
+            ("p.xhtml", " \n../x\r "),
+            ("OPS/p.xhtml", "a%2fb"),
+            ("OPS/p.xhtml", "a%5Cb"),
+            ("OPS/p.xhtml", "a%2Fb?q=1"),
+        ] {
+            assert!(resolve(base, href).is_err(), "{base} + {href}");
+        }
+        let opf = br#"<package><manifest><item id="p" href="../evil" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="p"/></spine></package>"#;
+        let error = inspect_bytes(&synthetic_zip(&[
+            ("META-INF/container.xml", ROOT_CONTAINER),
+            ("content.opf", opf),
+            ("evil", b"<html/>"),
+        ]))
+        .unwrap_err();
+        assert!(error.message.contains("unsafe archive path"));
+    }
+    #[test]
+    fn encoding_is_once_only_and_base_is_a_real_name() {
+        for (href, name) in [
+            ("a%20b.png", "a b.png"),
+            ("日本語.png", "日本語.png"),
+            ("a%23b.png", "a#b.png"),
+            ("a%25b.png", "a%b.png"),
+            ("a%2520b.png", "a%20b.png"),
+        ] {
+            let reference = resolve("dir%20#日本語/p.xhtml", href).unwrap();
+            assert_eq!(reference.path, format!("dir%20#日本語/{name}"));
+            assert_eq!(
+                resolve("content.opf", reference.url.path()).unwrap().path,
+                reference.path
+            );
+        }
+        let space = png(10, 20);
+        let percent = png(30, 40);
+        for (href, expected, size) in [
+            ("a%20b.png", "OPS/a b.png", (10, 20)),
+            ("a%2520b.png", "OPS/a%20b.png", (30, 40)),
+        ] {
+            let opf = format!(
+                r#"<package><manifest><item id="p" href="{href}" media-type="image/png"/></manifest><spine><itemref idref="p"/></spine></package>"#
+            );
+            let package = inspect_bytes(&book(
+                &opf,
+                &[("OPS/a b.png", &space), ("OPS/a%20b.png", &percent)],
+            ))
+            .unwrap();
+            assert_eq!(package.spine[0].path, expected);
+            assert_eq!(
+                (package.spine[0].width, package.spine[0].height),
+                (Some(size.0), Some(size.1))
+            );
+        }
+    }
+    #[test]
+    fn encoded_container_opf_and_page_bases_keep_raw_names() {
+        let image = png(12, 34);
+        let package = inspect_bytes(&synthetic_zip(&[
+            ("META-INF/container.xml", br#"<container><rootfile full-path="dir%2520%23/content.opf"/></container>"#),
+            ("dir%20#/content.opf", br#"<package><manifest><item id="p" href="p%2520%23.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="p"/></spine></package>"#),
+            ("dir%20#/p%20#.xhtml", br#"<html><body><svg><image href="a%25%23%20b.png?v=1#view"/></svg></body></html>"#),
+            ("dir%20#/a%# b.png", &image),
+        ])).unwrap();
+        assert_eq!(package.opf_path, "dir%20#/content.opf");
+        let item = &package.spine[0];
+        assert_eq!(item.path, "dir%20#/p%20#.xhtml");
+        assert_eq!(item.direct_image.as_deref(), Some("dir%20#/a%# b.png"));
+        assert_eq!((item.width, item.height), (Some(12), Some(34)));
+        assert!(
+            crate::render::print_html(&[item], false)
+                .contains(r#"src="https://epub.invalid/dir%2520%23/a%25%23%20b%2Epng?v=1#view""#)
+        );
+    }
+    #[test]
+    fn raw_zip_names_are_preserved_and_windows_invalid_names_are_rejected() {
+        for name in ["a%20b.png", "a#b.png", "日本語/a b.png", "%2e%2e/x", "dir/"] {
+            assert_eq!(safe_path(name).unwrap(), name);
+        }
+        for name in [
+            "",
+            "/x",
+            "//host/x",
+            "C:/x",
+            r"a\b",
+            r"\\host\x",
+            "a/../x",
+            "a/./x",
+            "a//x",
+            "a?b",
+            "a:b",
+            "a*b",
+            "a|b",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a\0b",
+            "a.",
+            "a ",
+            "NUL",
+            "con.png",
+            "COM1.txt",
+            "lpt²",
+            "a//",
+        ] {
+            assert!(safe_path(name).is_err(), "{name}");
+        }
+        assert!(safe_path(&"a".repeat(256)).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("synthetic.epub");
+        let bytes = synthetic_zip(&[
+            ("a%20b.png", b"literal percent"),
+            ("a b.png", b"space"),
+            ("a#b.png", b"hash"),
+        ]);
+        fs::write(&input, bytes).unwrap();
+        let extracted = dir.path().join("extract");
+        extract_file(&input, &extracted).unwrap();
+        for (name, data) in [
+            ("a%20b.png", b"literal percent".as_slice()),
+            ("a b.png", b"space"),
+            ("a#b.png", b"hash"),
+        ] {
+            assert_eq!(fs::read(extracted.join(name)).unwrap(), data);
+        }
+        assert!(!extracted.join("a").exists());
+    }
+    #[test]
+    fn absolute_reference_selects_root_and_generated_html_keeps_that_member() {
+        let root_image = png(10, 20);
+        let ops_image = png(30, 40);
+        let opf = r#"<package><manifest><item id="p" href="/p.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="p"/></spine></package>"#;
+        let package = inspect_bytes(&book(
+            opf,
+            &[
+                (
+                    "p.xhtml",
+                    br#"<html><body><img src="/x.png?v=1&amp;b=2#view"/></body></html>"#,
+                ),
+                ("OPS/p.xhtml", b"<html><body>different page</body></html>"),
+                ("x.png", &root_image),
+                ("OPS/x.png", &ops_image),
+            ],
+        ))
+        .unwrap();
+        let item = &package.spine[0];
+        assert_eq!(item.path, "p.xhtml");
+        assert_eq!(item.direct_image.as_deref(), Some("x.png"));
+        assert_eq!((item.width, item.height), (Some(10), Some(20)));
+        assert!(
+            crate::render::print_html(&[item], false)
+                .contains(r#"src="https://epub.invalid/x%2Epng?v=1&amp;b=2#view""#)
+        );
+        assert!(
+            crate::render::print_html(&[item], true)
+                .contains(r#"src="https://epub.invalid/p%2Exhtml""#)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("p.xhtml"),
+            b"<html><head></head><body><img src=\"/x.png\"/></body></html>",
+        )
+        .unwrap();
+        let copy = crate::render::reflow_print_copy(dir.path(), item, 0).unwrap();
+        let content = fs::read_to_string(dir.path().join(&copy)).unwrap();
+        assert!(content.contains("src=\"/x.png\""));
+        assert_eq!(member_url(&copy).join("/x.png").unwrap().path(), "/x.png");
+    }
+    #[test]
+    fn external_schemes_and_unc_do_not_map_to_local_members() {
+        for href in [
+            "//host/x",
+            r"\\host/x",
+            r"\/host/x",
+            "C:/x",
+            r"C:\x",
+            "file:",
+            "https:",
+            "https://epub.invalid/x",
+            "data:image/png;base64,AA",
+            "a\t:foo",
+        ] {
+            assert!(is_external_href(href), "{href}");
+            assert!(resolve("OPS/p.xhtml", href).is_err(), "{href}");
+            // XML normalizes literal attribute TABs to spaces; a character reference
+            // preserves the TAB that the URL parser then removes.
+            let attribute = href.replace('\t', "&#9;");
+            let page = format!(r#"<html><body><img src="{attribute}"/></body></html>"#);
+            assert!(
+                xhtml_info(page.as_bytes(), "OPS/p.xhtml")
+                    .unwrap()
+                    .1
+                    .is_none(),
+                "{href}"
+            );
+        }
+    }
     #[test]
     fn package_metadata_uses_first_title_and_creator_for_pdf_info() {
         let opf = opf("ltr", "").replace(
