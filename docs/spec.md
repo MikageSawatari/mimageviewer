@@ -1366,6 +1366,18 @@ identity としたまま変換 cache ZIP の先頭画像または内部 pin を�
 | WebP | .webp |
 | BMP | .bmp |
 
+#### RAW（内蔵 LibRaw）
+
+対応拡張子（`src/raw_format.rs` の 23 種）: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS。
+追加の Store 拡張は不要。フルスクリーンは埋め込みプレビューを先に表示し、現像後に
+差し替える。使えるプレビューがなければ現像完了を待つ。編集は現像後に有効になる。
+Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応で、使える埋め込みプレビューのみ表示する。
+拡張子だけでは全カメラ・圧縮方式の現像対応を保証しない。Remote は PC 側でフル現像し、
+表示位置から先読みする。未編集 RAW の製本は元ファイルをそのまま格納し、編集時は焼き込む。
+設定は「ファイル処理 → RAW 現像」（同時現像数 1〜10、既定 3 / 明るさは
+「プレビューに合わせる」既定・「補正しない」）を使う。詳細は §1 の設定と
+[raw-libraw-plan.md](raw-libraw-plan.md) を参照。
+
 #### WIC 経由（Windows Imaging Component）
 
 | フォーマット | 拡張子 | 必要なコーデック |
@@ -1374,7 +1386,6 @@ identity としたまま変換 cache ZIP の先頭画像または内部 pin を�
 | AVIF | .avif | AV1 Video Extension |
 | JPEG XL | .jxl | JPEG XL Image Extension |
 | TIFF | .tiff, .tif | 標準搭載 |
-| RAW（各社カメラ） | .dng, .cr2, .cr3, .nef, .nrw, .arw, .srf, .sr2, .raf, .orf, .rw2, .pef, .ptx, .rwl, .iiq | Raw Image Extension |
 
 #### 動画（サムネイル表示 + フルスクリーンインライン再生）
 
@@ -2592,7 +2603,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - [x] 非ソリッド・入れ子なし・暗号化なし RAR / CBR を UnRAR で直接閲覧。ソリッド・入れ子あり・暗号化 RAR と 7z / LZH は無圧縮 ZIP キャッシュへ変換（分割 RAR は先頭パートのみ表示）
 - [x] 変換メニューから RAR / CBR / 7z / CB7 / LZH / LHA と同じフォルダへ同名 ZIP を明示作成
 - [x] ZIP/PDF ファイルのサムネイル＋バッジ表示（フォルダ一覧で 1 枚目/1 ページ目を表示、キャッシュ対応）
-- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF / RAW）
+- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF）と内蔵 LibRaw による RAW 表示・現像
 - [x] 動画サムネイル（Windows Shell API 経由）
 - [x] アニメーション再生（GIF / APNG / WebP）
 - [x] AppleDouble メタデータファイル自動除外
@@ -2841,6 +2852,7 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 ## 11. セキュリティ方針
 
 - 画像デコードは `image` クレート（純粋Rust・メモリ安全）を基本とする
-- HEIC / AVIF / JXL / TIFF / RAW は Windows の WIC (Windows Imaging Component) 経由でデコード。
+- RAW は他の decoder より先に LibRaw へ振り分け、FFI は `crates/libraw-sys` に局所化。
+- HEIC / AVIF / JXL / TIFF は Windows の WIC (Windows Imaging Component) 経由でデコード。
   WIC 呼び出しは `unsafe` ブロックに局所化（`src/wic_decoder.rs`）
 - NVIDIA NGX 呼び出し部分も `unsafe` ブロックに局所化（Phase 2、未実装）

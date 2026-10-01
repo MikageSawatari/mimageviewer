@@ -96,3 +96,6 @@ tests/snapshots/*.old.png
 # .sha256 は「何を公開したか」の記録なので追跡する (数十バイト)。
 /htdocs/mimageviewer/ffmpeg-*-source.tar.*
 !/htdocs/mimageviewer/ffmpeg-*-source.tar.*.sha256
+# LibRaw uses the same source-artifact policy; see docs/libraw-source-distribution.md.
+/htdocs/mimageviewer/libraw-*-source.tar.*
+!/htdocs/mimageviewer/libraw-*-source.tar.*.sha256

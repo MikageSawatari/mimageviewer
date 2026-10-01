@@ -28,6 +28,28 @@
 use egui_kittest::Harness;
 
 #[test]
+fn raw_license_information_light() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_license_information_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 180.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_license_information_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_license_information_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 180.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
 fn raw_settings_light() {
     // Render the actual dedicated preferences page, including its heading.
     snapshot_with_theme(

@@ -67,7 +67,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
-| `raw_format.rs` | 17 種の RAW 拡張子の単一リスト。フォルダ列挙はこれを含み、WIC はこの集合を拒否する |
+| `raw_format.rs` | 23 種の RAW 拡張子の単一リスト。フォルダ列挙はこれを含み、WIC はこの集合を拒否する |
 | `raw/{raw_decoder,executor,brightness}.rs` | LibRaw の安全な info / preview / Full・half 現像、固定明るさ処理、優先度と取消を持つ App 共有の現像 executor。RAW は各入口で他の画像デコーダより先に分岐する |
 | `crates/libraw-sys` | vendored LibRaw との Windows FFI 境界と native build。非 Windows は safe API の Unsupported を返す |
 | `cut_clipboard.rs` | Windows の現在の file clipboard を App 単位で観測し、実ファイル / 実フォルダの cut 表示 snapshot を所有する。message-only window の通知 thread と OLE reader threadを分離し、UI は正規化済み `Arc<HashSet>` を可視項目の実パスと照合するだけにする。mIV の cut data object は private token と Shell の完了 format を同じ reducer へ返し、古い通知・読取・callback が新しい clipboard を上書きしない。viewer context やファイル / DB には cut 状態を保存しない |

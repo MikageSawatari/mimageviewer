@@ -8,6 +8,8 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
+| [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |

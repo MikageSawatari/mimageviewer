@@ -6,6 +6,23 @@ use eframe::egui;
 const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT");
 const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
 
+/// The same bundled-version/source notice used by the dialog and headless snapshots.
+#[doc(hidden)]
+pub fn draw_raw_license_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("LibRaw (CDDL-1.0)").strong());
+    ui.label("本ソフトウェアは LibRaw を CDDL-1.0 で使用しています。");
+    ui.label(format!("同梱バージョン: {}", env!("MIV_LIBRAW_BUILD_ID")));
+    ui.hyperlink_to(
+        "対応するソースコード",
+        format!(
+            "https://mikage.to/mimageviewer/libraw-{}-source.tar.gz",
+            env!("MIV_LIBRAW_BUILD_ID")
+        ),
+    );
+    ui.hyperlink_to("LibRaw プロジェクト", "https://www.libraw.org/");
+    ui.label("ライセンス全文と著作権表記は同梱の LIBRAW-LICENSE.txt を参照してください。");
+}
+
 impl App {
     pub(crate) fn show_about_dialog_window(&mut self, ctx: &egui::Context) {
         if !self.show_about_dialog {
@@ -50,6 +67,18 @@ impl App {
 
                         ui.label("FFmpeg");
                         ui.label("LGPLv3-or-later — FFmpeg project");
+                        ui.end_row();
+
+                        ui.label("LibRaw");
+                        ui.label("CDDL-1.0 — LibRaw LLC");
+                        ui.end_row();
+
+                        ui.label("zlib 1.3.1");
+                        ui.label("zlib — Jean-loup Gailly and Mark Adler");
+                        ui.end_row();
+
+                        ui.label("libjpeg-turbo");
+                        ui.label("IJG / BSD-3-Clause / zlib");
                         ui.end_row();
 
                         ui.label("UnRAR");
@@ -118,6 +147,9 @@ impl App {
                     "LGPL-3.0 ライセンス全文",
                     "https://www.gnu.org/licenses/lgpl-3.0.html",
                 );
+
+                ui.add_space(8.0);
+                draw_raw_license_snapshot_fixture(ui);
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new("egui MIT License 全文")

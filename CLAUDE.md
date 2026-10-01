@@ -175,7 +175,7 @@ dual-window approach.
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
 - **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
-- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF, RAW)
+- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
 - **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](docs/dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
@@ -264,7 +264,7 @@ mimageviewer/
 │   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
 │   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード
-│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
+│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF。RAW は src/raw/）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
 │   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
@@ -335,15 +335,17 @@ bash scripts/bootstrap-vendor.sh           # 不足分のみ取得
 bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デバッグ用)
 ```
 
+上の bash はエージェント自身が実行するセットアップ手順であり、利用者へ渡すコマンドではない。
 このスクリプトは以下を順に実行する:
 
 1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
-2. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
-3. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
-4. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
-5. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
+2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.2 と zlib 1.3.1 のソース、`VERSION` を取得
+3. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
+4. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
+5. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
+6. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
-6. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+7. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
 
 ### bootstrap で取れないもの
@@ -369,7 +371,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 
 ### 消えると再取得できないもの — ツリー外バックアップ必須
 
-`bootstrap-vendor.sh` で再取得できる物 (pdfium / ort / ffmpeg / susie) と違い、
+`bootstrap-vendor.sh` で再取得できる物 (pdfium / libraw / ort / ffmpeg / susie) と違い、
 **以下は失うと復旧手段が限られる / 無い**:
 
 - **`vendor/models/*.onnx`** — DL スクリプトが**存在しない**。`%APPDATA%\mimageviewer\
@@ -557,7 +559,7 @@ egui::Window::new("...").show(ctx, |ui| {
 
 ### セキュリティ
 - `image` クレート（純粋Rust、メモリ安全）で画像デコード。
-- HEIC/AVIF/JXL/TIFF/RAW は WIC 経由（`unsafe` ブロックに局所化）。
+- HEIC/AVIF/JXL/TIFF は WIC 経由（`unsafe` ブロックに局所化）。RAW は LibRaw へ先に振り分け、FFI は `crates/libraw-sys` に局所化。
 - ONNX Runtime (ort crate) 経由の AI 推論は safe Rust API。DirectML EP で GPU アクセラレーション。
 
 ### 並行処理: try_lock + sleep は使わない ⚠️
@@ -805,7 +807,9 @@ print(c.most_common())
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
-- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF, DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ
+- **RAW（内蔵 LibRaw）**: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS
+  - Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応。使える埋め込みプレビューは表示可能。
+- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF
 - **動画（サムネイルのみ）**: MP4, AVI, MOV, MKV, WMV, MPG, MPEG
 
 ## Performance Notes
@@ -1141,6 +1145,23 @@ x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコー
 統合テスト (`tests/susie_integration.rs`) は `MIV_SUSIE_WORKER` 環境変数で
 ワーカー exe のパスを直接指定できる。`setup-susie-worker.sh` を走らせて
 `vendor/susie-worker/` に配置済みであれば、テストは自動でそれを拾う。
+
+## LibRaw ソース・ライセンス管理
+
+RAW は LibRaw 0.22.2 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
+libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加しない。
+エージェント用セットアップは `bash scripts/setup-libraw.sh`（bootstrap に含む）、
+更新確認は `bash scripts/setup-libraw.sh check`。この bash 手順は利用者には渡さない。
+`vendor/libraw/VERSION` はセットアップが生成し、`build.rs` が `MIV_LIBRAW_BUILD_ID` に
+焼き込んでアプリ内の同梱版と対応ソース URL を揃える。欠落・不正なら復旧手順付きで失敗する。
+
+- tracked notice はルートの `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` /
+  `LIBJPEG-TURBO-LICENSE.txt`。installer / portable の双方へ同梱する。
+- LibRaw 本体は無改変の公式 tarball、shim は本リポジトリの MIT コード。
+- 対応ソースは [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) に従って
+  SHA-256 を照合し、mikage.to へ配置する。tarball は git に入れず、`.sha256` を追跡する。
+- LibRaw 更新時はソース・checksum・notice・製品ページの同梱版とリンクを同時に更新し、
+  古い配布版の対応ソースも残す。
 
 ## VST3 host bridge 管理 (v0.9.0+)
 
@@ -1875,6 +1896,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     `vendor/ffmpeg/VERSION`・実 DLL の `ProductVersion`・対応ソースを同じ commit に揃え、
     `src/video/ffmpeg_loader.rs` の DLL 名も一致するか確認。LGPL 通知の更新も忘れずに
     (本ファイル「FFmpeg LGPL DLL 管理」節)
+10.1. LibRaw の更新確認（エージェント用 `bash scripts/setup-libraw.sh check`）。
+    リリース前に [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) の SHA-256 と
+    同梱版を照合し、LibRaw の対応ソースを mikage.to に配置する。installer / portable に
+    `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` / `LIBJPEG-TURBO-LICENSE.txt` が入ることも確認する。
 11. VST3 host bridge の確認 (v0.9.0+):
     - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
     - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み

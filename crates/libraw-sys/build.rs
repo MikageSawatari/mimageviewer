@@ -20,8 +20,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}", root.join("libraw").display());
     println!("cargo:rerun-if-changed={}", root.join("src").display());
     println!("cargo:rerun-if-changed={}", zlib.display());
-    let version = std::fs::read_to_string(root.join("VERSION")).expect("LibRaw VERSION");
-    assert_eq!(version.trim(), "0.22.2", "Unexpected LibRaw source version");
+    let recovery = "Recovery: bash scripts/setup-libraw.sh (or bash scripts/bootstrap-vendor.sh)";
+    let version = std::fs::read_to_string(root.join("VERSION"))
+        .unwrap_or_else(|error| panic!("Cannot read vendor/libraw/VERSION: {error}\n{recovery}"));
+    assert_eq!(
+        version.trim(),
+        "0.22.2",
+        "Unexpected LibRaw source version\n{recovery}"
+    );
 
     let mut z = cc::Build::new();
     z.include(&zlib);

@@ -96,8 +96,38 @@
       </table>
     </div>
 
-    <h2>静止画（WIC 経由）</h2>
-    <p>Windows イメージング コンポーネント（WIC）を使用して表示します。
+    <h2 id="raw">RAW（内蔵）</h2>
+    <p>カメラの RAW ファイルを追加インストールなしで表示・現像できます。対応する拡張子は次の 23 種類です。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>拡張子</th><th>フォーマット</th></tr></thead>
+        <tbody>
+          <tr><td><code>.dng</code></td><td>DNG</td></tr>
+          <tr><td><code>.cr2</code> / <code>.cr3</code> / <code>.crw</code></td><td>Canon RAW</td></tr>
+          <tr><td><code>.nef</code> / <code>.nrw</code></td><td>Nikon RAW</td></tr>
+          <tr><td><code>.arw</code> / <code>.srf</code> / <code>.sr2</code></td><td>Sony RAW</td></tr>
+          <tr><td><code>.raf</code></td><td>Fujifilm RAW</td></tr>
+          <tr><td><code>.orf</code></td><td>Olympus RAW</td></tr>
+          <tr><td><code>.rw2</code></td><td>Panasonic RAW</td></tr>
+          <tr><td><code>.pef</code> / <code>.ptx</code></td><td>Pentax RAW</td></tr>
+          <tr><td><code>.rwl</code></td><td>Leica RAW</td></tr>
+          <tr><td><code>.iiq</code></td><td>Phase One RAW</td></tr>
+          <tr><td><code>.srw</code></td><td>Samsung RAW</td></tr>
+          <tr><td><code>.3fr</code></td><td>Hasselblad RAW</td></tr>
+          <tr><td><code>.erf</code></td><td>Epson RAW</td></tr>
+          <tr><td><code>.kdc</code> / <code>.dcr</code></td><td>Kodak RAW</td></tr>
+          <tr><td><code>.mrw</code></td><td>Minolta RAW</td></tr>
+          <tr><td><code>.mos</code></td><td>Leaf RAW</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>一覧のサムネイルにはファイル内の埋め込みプレビューを使います。使えるプレビューがない場合は、現像してサムネイルを作ります。フルスクリーンではまず埋め込みプレビューを表示し、現像が終わると現像した画像に切り替わります。使えるプレビューがない場合は、現像した画像を待ちます。補正・AI 処理などの編集は、現像が終わってから使えます。</p>
+    <p>Nikon の高効率 RAW（HE / HE*）と JPEG XL 圧縮の DNG は現像に対応していません。現像できない形式でも、使える埋め込みプレビューがあればその画像を表示します。プレビューだけの画像は編集できません。拡張子が同じでも、カメラや圧縮方式によって現像できない場合があります。</p>
+    <p>製本では、編集していない RAW は元の RAW ファイルのまま本に入れます。編集した画像は編集結果を書き込みます。リモート閲覧では PC 側で現像した画像を表示します。</p>
+    <p>同時に現像する数と明るさは、<a href="settings.html#raw-develop">環境設定 → ファイル処理 → RAW 現像</a>で変更できます。</p>
+
+    <h2>静止画（Windows の表示機能）</h2>
+    <p>Windows の表示機能を使用して表示します。
     Windows 11 では標準で利用できますが、一部フォーマットは
     Microsoft Store からコーデックの追加が必要です。</p>
     <div class="table-wrap">
@@ -110,16 +140,6 @@
           <tr><td><code>.avif</code></td><td>AVIF</td><td>AV1 ビデオ拡張機能（Microsoft Store）</td></tr>
           <tr><td><code>.jxl</code></td><td>JPEG XL</td><td>JPEG XL Image Extensions（Microsoft Store）</td></tr>
           <tr><td><code>.tif</code> / <code>.tiff</code></td><td>TIFF</td><td>標準搭載</td></tr>
-          <tr><td><code>.dng</code></td><td>Adobe DNG（RAW）</td><td>標準搭載（Windows 11）</td></tr>
-          <tr><td><code>.cr2</code> / <code>.cr3</code></td><td>Canon RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.nef</code> / <code>.nrw</code></td><td>Nikon RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.arw</code> / <code>.srf</code> / <code>.sr2</code></td><td>Sony RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.raf</code></td><td>Fujifilm RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.orf</code></td><td>Olympus RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.rw2</code></td><td>Panasonic RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.pef</code> / <code>.ptx</code></td><td>Pentax RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.rwl</code></td><td>Leica RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.iiq</code></td><td>Phase One RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
         </tbody>
       </table>
     </div>
@@ -128,7 +148,7 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         <strong>Microsoft Store コーデックのインストール：</strong>
-        Microsoft Store で「HEIF 画像拡張機能」「Microsoft Raw 画像拡張機能」などを検索してインストールしてください。
+        Microsoft Store で「HEIF 画像拡張機能」「AV1 ビデオ拡張機能」「JPEG XL Image Extensions」などを検索してインストールしてください。
         無料で入手できます。インストール後、mImageViewer の再起動は不要です。
       </div>
     </div>

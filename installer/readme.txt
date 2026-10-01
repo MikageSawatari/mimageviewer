@@ -50,7 +50,7 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   - RAR / CBR / 7z / LZH の ZIP 変換閲覧（RAR / CBR はパスワード付きにも対応）
   - PDF 表示（PDF 表示エンジン内蔵、パスワード付き対応）
   - DRM のない EPUB を PDF に変換して閲覧（音声・動画は含まれません）
-  - RAW / HEIC / AVIF / JPEG XL 表示（Windows WIC 経由）
+  - RAW 表示・現像（内蔵）/ HEIC / AVIF / JPEG XL 表示（Windows の表示機能）
   - Susie 画像プラグイン（.spi、32bit）対応
   - 動画インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、
     GPU ハードウェアデコード対応、シーク / 倍速再生 / タイル モード /
@@ -93,7 +93,8 @@ AI 機能は DirectML（Microsoft 公式）を利用します。
 DirectML.dll は Windows 11 に標準で同梱
 されているため、対応 OS ならば追加インストールは不要です。
 
-HEIC / AVIF / JPEG XL / RAW を表示するには Windows Imaging
+RAW は追加インストールなしで表示・現像できます。
+HEIC / AVIF / JPEG XL を表示するには Windows Imaging
 Component（WIC）が必要ですが、Windows 11 には標準で
 含まれています。一部フォーマットは Microsoft Store から
 コーデックの追加インストールが必要な場合があります。
@@ -184,7 +185,14 @@ https://mikage.to/mimageviewer/privacy.html
   - PDFium (BSD-3-Clause): Google Chrome の PDF エンジン
   - ONNX Runtime (MIT): Microsoft
   - DirectML (Microsoft 独自ライセンス): Microsoft
-  - libjpeg-turbo (BSD-3-Clause / zlib)
+  - LibRaw (CDDL-1.0): LibRaw LLC
+    ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
+    対応ソース: https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz
+  - zlib 1.3.1 (zlib): Jean-loup Gailly and Mark Adler
+    ライセンス全文: ZLIB-LICENSE.txt
+  - libjpeg-turbo (IJG / BSD-3-Clause / zlib)
+    ライセンス全文: LIBJPEG-TURBO-LICENSE.txt
+    This software is based in part on the work of the Independent JPEG Group.
   - eframe / egui (MIT OR Apache-2.0): Emil Ernerfeldt and contributors
     ライセンス全文はインストール先の egui-LICENSE-MIT.txt /
     egui-LICENSE-APACHE.txt を参照してください。
