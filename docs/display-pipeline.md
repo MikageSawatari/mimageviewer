@@ -430,6 +430,8 @@ preview は生デコード段の表示専用で、編集・同期補正・AI・f
 
 明るさ変更と worker の Stale はページ単位の source transaction。既存の `capture_final_effect_source_reload_holdover` だけで提示中のユニット / 連結読み transition を退避し、入力と派生 cache を失効させる。明るさ変更では preview / 寸法の要求を残す。retained AI の source 指紋 + 明るさ key を更新し、他ページの retained epoch は変更しない。
 
+埋め込み preview texture 自体は現像軸の状態にかかわらず画面フィルターへ渡さない。paint resource の source texture と RawPreview の texture identity を照合するため、同じページの表示専用 rendition や前の通常画像の holdover は既存のフィルター処理を維持する。Full 完了時の同期補正は通常画像と同じく現在ページに限り、先読みや画面外の完了は既存の bounded final pipeline に処理を委ねる。
+
 ### 2.1 エントリポイント
 
 ```

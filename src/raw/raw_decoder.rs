@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+/// Progress below this boundary belongs to opening and unpacking the source.
+pub(crate) const RAW_PROCESSING_PROGRESS_START: u8 = 35;
+
 #[cfg(windows)]
 use std::sync::Mutex;
 
@@ -706,18 +709,22 @@ mod windows {
     ) -> i32 {
         let state = unsafe { &*(user as *const CallbackState<'_>) };
         let value = if stage == (1 << 3) {
-            if iteration <= 0 { 5 } else { 35 }
+            if iteration <= 0 {
+                5
+            } else {
+                RAW_PROCESSING_PROGRESS_START
+            }
         } else if stage == (1 << 11) {
             let fraction = if expected > 0 {
                 (iteration.max(0) as f32 / expected as f32).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            35 + (fraction * 50.0) as u8
+            RAW_PROCESSING_PROGRESS_START + (fraction * 50.0) as u8
         } else if stage < (1 << 3) {
             5
         } else if stage < (1 << 11) {
-            35
+            RAW_PROCESSING_PROGRESS_START
         } else {
             85
         };

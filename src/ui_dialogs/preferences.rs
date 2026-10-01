@@ -3532,6 +3532,101 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 mod tests {
     use super::*;
 
+    #[test]
+    fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPageLoadState};
+        use crate::raw::RawBrightness;
+        use egui_kittest::{Harness, kittest::Queryable};
+        for executor_closed in [false, true] {
+            let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+            let ctx = egui::Context::default();
+            let image = std::sync::Arc::new(egui::ColorImage::filled([3, 2], egui::Color32::GRAY));
+            let tex = ctx.load_texture(
+                "raw-settings-source",
+                image.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Static {
+                    tex,
+                    pixels: image,
+                    source_dims: Some([12000, 8000]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            let page = app.raw_pages.page_mut(0).unwrap();
+            page.stage = RawInstalledStage::Developed;
+            *page.develop.lock().unwrap() = RawDevelopPhase::Done;
+            let old_parallelism = app.settings.raw_develop_parallelism;
+            app.raw_develop_executor
+                .set_parallelism(old_parallelism as usize)
+                .unwrap();
+            let old_generation = app.input_generation.get(&0).copied().unwrap_or(0);
+            assert_eq!(
+                app.raw_develop_executor.desired_parallelism_for_test(),
+                old_parallelism as usize
+            );
+            if executor_closed {
+                app.raw_develop_executor.shutdown();
+            }
+            app.open_preferences_page(PreferencesPage::Parallelism);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1100.0, 850.0))
+                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            harness.run();
+            harness.get_by_label("補正しない").click();
+            harness.run();
+            harness
+                .state_mut()
+                .pref_state
+                .as_mut()
+                .unwrap()
+                .settings
+                .raw_develop_parallelism = 1;
+            harness.run();
+            assert_eq!(
+                harness.state().settings.raw_brightness,
+                RawBrightness::MatchPreview
+            );
+            assert_eq!(
+                harness.state().raw_pages.classify(0),
+                RawPageLoadState::Developed
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            let expected_parallelism = if executor_closed { old_parallelism } else { 1 };
+            let app = harness.state();
+            assert!(!app.show_preferences);
+            assert_eq!(app.settings.raw_develop_parallelism, expected_parallelism);
+            assert_eq!(
+                app.raw_develop_executor.desired_parallelism_for_test(),
+                expected_parallelism as usize
+            );
+            assert_eq!(app.settings.raw_brightness, RawBrightness::None);
+            assert_eq!(
+                app.raw_pages.classify(0),
+                RawPageLoadState::PreviewNotRequested
+            );
+            assert!(app.fs_cache.get(&0).is_none());
+            assert!(app.input_generation.get(&0).copied().unwrap_or(0) > old_generation);
+            let saved = crate::settings::Settings::load();
+            assert_eq!(saved.raw_brightness, RawBrightness::None);
+            assert_eq!(saved.raw_develop_parallelism, expected_parallelism);
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Parallelism);
+            harness.run();
+            let reopened = &harness.state().pref_state.as_ref().unwrap().settings;
+            assert_eq!(reopened.raw_brightness, saved.raw_brightness);
+            assert_eq!(
+                reopened.raw_develop_parallelism,
+                saved.raw_develop_parallelism
+            );
+        }
+    }
+
     fn disabled_trt_worker_snapshot() -> crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot {
         crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot()
     }

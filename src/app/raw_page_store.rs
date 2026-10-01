@@ -1093,6 +1093,192 @@ pub(crate) mod tests {
         app
     }
 
+    pub(crate) fn install_final_for_layout_test(
+        app: &mut App,
+        pixels: Arc<egui::ColorImage>,
+        texture: egui::TextureHandle,
+    ) {
+        let edit_key = app.current_edit_result_key(0);
+        let Some(FsCacheEntry::Static { pixels: source, .. }) = app.fs_cache.get(&0) else {
+            unreachable!()
+        };
+        let key =
+            app.final_composite_key_for_pixels(edit_key, source.size, app.effective_params(0));
+        app.final_composite_cache.insert(
+            key,
+            FinalCompositeEntry {
+                pixels,
+                texture,
+                complete: true,
+            },
+        );
+    }
+
+    #[test]
+    fn raw_review_offscreen_full_completion_does_not_upload_synchronous_adjustment() {
+        for current in [false, true] {
+            let mut app = app_with_raw_and_jpeg();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(if current { 0 } else { 1 });
+            app.settings.global_preset.brightness = 0.25;
+            app.settings.global_preset.post_filter = crate::adjustment::PostFilter::GameBoy;
+            let mut f = Fixture::new();
+            f.info(RawDevelopSupport::Supported);
+            f.preparing(RawBrightness::MatchPreview);
+            *app.raw_pages.page(0).unwrap().develop.lock().unwrap() = std::mem::replace(
+                &mut *f.store.page(0).unwrap().develop.lock().unwrap(),
+                RawDevelopPhase::Idle,
+            );
+            let tag = RawResultTag {
+                source: app.raw_pages.page(0).unwrap().source.clone(),
+                context: app.fs_page_load_context_serial(),
+                generation: app.items_generation,
+                ..f.tag
+            };
+            app.apply_raw_fs_result(
+                &ctx,
+                tag,
+                RawPageResult::Develop(Box::new(FsLoadResult::Static {
+                    ci: egui::ColorImage::filled([6, 4], egui::Color32::GRAY),
+                    source_dims: [12000, 8000],
+                    animation: StaticAnimationState::Still,
+                })),
+                1,
+            );
+            assert_eq!(app.raw_pages.classify(0), RawPageLoadState::Developed);
+            assert_eq!(app.adjustment_cache.contains_key(&0), current);
+        }
+    }
+
+    #[test]
+    fn raw_review_page_turn_deferral_retires_preview_owner_before_and_after_info() {
+        for info_received in [false, true] {
+            let mut app = app_with_raw_and_jpeg();
+            if !info_received {
+                app.raw_pages.discard(0);
+            }
+            let key = app.page_path_key(0).unwrap();
+            let old_id = app.raw_pages.begin_preview(0, key.clone());
+            let (tx, rx) = mpsc::channel();
+            app.fs_pending.insert(
+                0,
+                FsPendingValue::new(
+                    Arc::new(AtomicBool::new(false)),
+                    rx,
+                    old_id,
+                    FsLoadPurpose::Display,
+                ),
+            );
+            app.defer_page_turn_full_resolution_work();
+            assert!(app.fs_pending.is_empty());
+            assert_eq!(
+                app.raw_pages.classify(0),
+                RawPageLoadState::PreviewNotRequested
+            );
+            assert!(app.raw_pages.begin_preview(0, key) > old_id);
+            drop(tx);
+        }
+    }
+
+    #[test]
+    fn raw_review_running_unpack_displays_reading_until_processing_interval() {
+        let app = app_with_raw_and_jpeg();
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let ticket = Arc::new(executor.block_one_slot_for_test(started_tx, release_rx));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() = RawDevelopPhase::Submitted {
+            request_id: 10,
+            ticket: Arc::clone(&ticket),
+            brightness: RawBrightness::MatchPreview,
+        };
+        for progress in [0, 5, 34, 35, 62, 85, 100] {
+            ticket.progress().store(progress, Ordering::Relaxed);
+            let expected = if progress < 35 {
+                crate::ui_raw::RawLoadingStatus::Reading
+            } else {
+                crate::ui_raw::RawLoadingStatus::Developing(progress)
+            };
+            assert_eq!(app.raw_loading_label(0), Some(expected.label()));
+        }
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn raw_review_full_arrives_before_preview_in_both_backlog_orders_and_after_install() {
+        for order in 0..3 {
+            let mut app = app_with_raw_and_jpeg();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(0);
+            let source = app.raw_pages.page(0).unwrap().source.clone();
+            let RawPreviewPhase::Requested {
+                request_id: preview_id,
+            } = app.raw_pages.page(0).unwrap().preview
+            else {
+                unreachable!()
+            };
+            let mut f = Fixture::new();
+            f.info(RawDevelopSupport::Supported);
+            f.preparing(RawBrightness::MatchPreview);
+            *app.raw_pages.page(0).unwrap().develop.lock().unwrap() = std::mem::replace(
+                &mut *f.store.page(0).unwrap().develop.lock().unwrap(),
+                RawDevelopPhase::Idle,
+            );
+            let full = RawResultTag {
+                context: app.fs_page_load_context_serial(),
+                generation: app.items_generation,
+                source,
+                ..f.tag
+            };
+            let preview = RawResultTag {
+                request_id: preview_id,
+                stage: RawResultStage::Preview,
+                ..full.clone()
+            };
+            let develop = RawPageResult::Develop(Box::new(FsLoadResult::Static {
+                ci: egui::ColorImage::filled([6, 4], egui::Color32::WHITE),
+                source_dims: [12000, 8000],
+                animation: StaticAnimationState::Still,
+            }));
+            let preview_result = RawPageResult::Preview {
+                pixels: Some(egui::ColorImage::filled([3, 2], egui::Color32::RED)),
+            };
+            let uploads = [(full, develop), (preview, preview_result)];
+            let mut uploads = uploads.into_iter().collect::<Vec<_>>();
+            if order == 1 {
+                uploads.reverse();
+            }
+            let generation = app.items_generation;
+            for (pos, (tag, result)) in uploads.into_iter().enumerate() {
+                app.fs_upload_backlog.push_for_generation(
+                    generation,
+                    FsUploadResult::new(
+                        0,
+                        FsLoadResult::Raw { tag, result },
+                        10 + pos as u64,
+                        FsLoadPurpose::Display,
+                    ),
+                );
+                if order == 2 {
+                    app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+                }
+            }
+            for _ in 0..3 {
+                app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            }
+            assert_eq!(app.raw_pages.classify(0), RawPageLoadState::Developed);
+            assert!(app.fs_upload_backlog.is_empty());
+            let Some(FsCacheEntry::Static { pixels, .. }) = app.fs_cache.get(&0) else {
+                panic!("late preview replaced Full")
+            };
+            assert_eq!(pixels.size, [6, 4]);
+            assert!(pixels.pixels.iter().all(|p| *p == egui::Color32::WHITE));
+        }
+    }
+
     #[test]
     fn warm_half_thumbnail_cannot_be_drawn_or_used_for_a_rendition_until_preview_validation() {
         let mut app = app_with_raw_and_jpeg();
@@ -1771,6 +1957,15 @@ fn raw_developed_raster(
 }
 
 impl App {
+    /// Removing a load receiver and retiring its preview request are one operation.
+    /// Completed loads instead disarm their ticket: their request remains valid in backlog.
+    pub(crate) fn cancel_fs_page_load(&mut self, idx: usize) {
+        if let Some(pending) = self.fs_pending.remove(&idx) {
+            pending.cancel();
+        }
+        self.raw_pages.preview_disconnected(idx);
+        self.fs_early_dims.remove(&idx);
+    }
     pub(super) fn take_fs_page_for_snapshot(&mut self, idx: usize) -> FsPageTransfer {
         let raw = match self.raw_pages.pages.remove(&idx) {
             Some(RawPageRecord::Page(mut page)) => {
@@ -1870,7 +2065,10 @@ impl App {
                 self.record_fs_cache_page_dims_for_spread(tag.idx);
                 self.fs_margin_bbox_cache.remove(&tag.idx);
                 if developed {
-                    if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&tag.idx) {
+                    if self.fullscreen_idx == Some(tag.idx)
+                        && let Some(FsCacheEntry::Static { pixels, .. }) =
+                            self.fs_cache.get(&tag.idx)
+                    {
                         let pixels = Arc::clone(pixels);
                         self.apply_sync_adjustment(ctx, tag.idx, &pixels);
                     }
@@ -2420,7 +2618,7 @@ impl App {
                     Some(crate::raw::RawTicketState::Queued) => Status::Queued,
                     Some(crate::raw::RawTicketState::Running) => {
                         let progress = ticket.progress().load(Ordering::Relaxed);
-                        if progress > 0 {
+                        if progress >= crate::raw::raw_decoder::RAW_PROCESSING_PROGRESS_START {
                             Status::Developing(progress)
                         } else {
                             Status::Reading

@@ -67451,10 +67451,7 @@ impl App {
             })
             .collect();
         for idx in stale_promotions {
-            if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending.cancel();
-            }
-            self.fs_early_dims.remove(&idx);
+            self.cancel_fs_page_load(idx);
         }
         // 昇格の upload も、表示中のページのぶんだけ残す。
         self.fs_upload_backlog.retain(|entry| {
@@ -67495,11 +67492,7 @@ impl App {
             })
             .collect();
         for k in to_cancel {
-            if let Some(pending) = self.fs_pending.remove(&k) {
-                pending.cancel();
-            }
-            // 先行 dims ヒントはキャンセルされた idx では意味がないので破棄。
-            self.fs_early_dims.remove(&k);
+            self.cancel_fs_page_load(k);
         }
 
         if current_loading {
@@ -73854,7 +73847,10 @@ impl App {
     /// level is held. Resident caches and completed upload backlog entries are kept;
     /// only in-flight full-resolution decode/effect/AI work is stopped.
     pub(crate) fn defer_page_turn_full_resolution_work(&mut self) {
-        self.fs_pending.clear();
+        let pending = self.fs_pending.keys().copied().collect::<Vec<_>>();
+        for idx in pending {
+            self.cancel_fs_page_load(idx);
+        }
         self.fs_early_dims.clear();
         for pending in self.final_ai_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);

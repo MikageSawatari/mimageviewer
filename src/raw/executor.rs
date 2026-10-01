@@ -377,6 +377,10 @@ pub struct RawDevelopExecutor {
 
 impl RawDevelopExecutor {
     #[cfg(test)]
+    pub(crate) fn desired_parallelism_for_test(&self) -> usize {
+        self.shared.state.lock().unwrap().desired
+    }
+    #[cfg(test)]
     pub(crate) fn block_one_slot_for_test(
         &self,
         started: mpsc::Sender<()>,
