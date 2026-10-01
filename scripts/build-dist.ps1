@@ -48,6 +48,8 @@ $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspaceTargetDir = Join-Path $repoRoot 'target'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
 . (Join-Path $scripts 'effetune-distribution.ps1')
+. (Join-Path $scripts 'vst3-host-identity.ps1')
+if ($SkipVst3Bridge) { Assert-MivVst3HostIdentity -RepoRoot $repoRoot }
 # Fail before tests/clean if the complete release bundle or tracked licenses are
 # missing. build-release stages a fresh copy and signs its PE(s) before embedding.
 $null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetune-mixwright') `
@@ -137,6 +139,9 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests faile
 Write-Host '[build-dist]       EffeTune staging/signing-enumeration regression tests'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-effetune-distribution.ps1')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] EffeTune script tests failed (exit {0})" -f $LASTEXITCODE) }
+Write-Host '[build-dist]       VST3 host source-identity regression tests'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-identity.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
@@ -211,6 +216,7 @@ $finalRuntimePe = @(
     (Join-Path $repoRoot 'target\effetune-dist-source\EffeTune Mixwright.vst3')
 )
 Write-Host '[build-dist] (7/7) final PE dependency closure'
+Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot (Join-Path $repoRoot 'target\effetune-dist-source')
 & (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
     -InputPaths $finalRuntimePe -RequireCompanionRuntime `

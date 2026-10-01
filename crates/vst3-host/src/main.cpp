@@ -55,6 +55,7 @@
 #include "ipc_strings.h"
 #include "utf8_paths.h"
 #include "vcrt_preload.h"
+#include "build_identity.h"
 
 namespace miv {
 
@@ -1962,6 +1963,7 @@ static void start_parent_watchdog(DWORD parent_pid) {
 }
 
 int main(int argc, char** argv) {
+    std::fprintf(stderr, "%s\n", MIV_VST3_HOST_SOURCE_MARKER);
     // bridge プロセスを Per-Monitor v2 DPI Aware に設定する。
     // これがないと GetDpiForSystem / GetDpiForWindow がプライマリ DPI ではなく
     // 96 を返してしまい、setContentScaleFactor で正しい scale を伝えられない。

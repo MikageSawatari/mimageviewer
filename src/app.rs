@@ -26108,12 +26108,25 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_available(&self) -> bool {
+        !self.remote_session_blocks_local_control() && self.effetune.runtime.toolbar_available()
+    }
+
+    #[cfg(windows)]
     pub(crate) fn effetune_toolbar_click(&mut self, pointer_click: bool) {
         let foreground = self.effetune.click_foreground(pointer_click);
-        if self.remote_session_blocks_local_control() {
+        if !self.effetune_toolbar_available() {
             return;
         }
         match self.effetune.runtime.clone() {
+            crate::effetune::EffetuneRuntime::Unavailable(ref reason)
+                if reason.preparation_retryable() =>
+            {
+                self.effetune.click_idle(
+                    self.settings.effetune_gui_pos,
+                    self.settings.effetune_gui_size,
+                )
+            }
             crate::effetune::EffetuneRuntime::Idle => self.effetune.click_idle(
                 self.settings.effetune_gui_pos,
                 self.settings.effetune_gui_size,
@@ -26149,6 +26162,9 @@ impl App {
         }
         use crate::effetune::{EffectiveState, EffetuneRuntime};
         match &self.effetune.runtime {
+            EffetuneRuntime::Unavailable(reason) if reason.preparation_retryable() => {
+                format!("音響調整を利用できません: {}\nクリックして準備を再確認します", reason.user_reason())
+            }
             EffetuneRuntime::Unavailable(reason) => {
                 format!("音響調整を利用できません: {}", reason.user_reason())
             }

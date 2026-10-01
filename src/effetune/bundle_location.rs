@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 pub const POINTER_FILE: &str = "current";
 pub const PREPARATION_ERROR_ENV: &str = "MIV_EFFETUNE_PREPARATION_ERROR";
 pub const GENERATION_ENV: &str = "MIV_EFFETUNE_GENERATION";
+pub const REJECTED_GENERATION_ENV: &str = "MIV_EFFETUNE_REJECTED_GENERATION";
+pub const FINGERPRINT_LENGTH: usize = 12;
+pub const PATH_TOO_LONG_MARKER: &str = "EffeTune path too long";
 
 pub fn checked_directory(path: &Path) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
@@ -28,7 +31,7 @@ pub fn valid_generation(name: &str) -> bool {
     let Some((fingerprint, nonce)) = name.split_once('-') else {
         return false;
     };
-    fingerprint.len() == 64
+    fingerprint.len() == FINGERPRINT_LENGTH
         && fingerprint
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
@@ -53,6 +56,12 @@ pub fn parse_pointer(text: &str) -> io::Result<&str> {
 }
 
 pub fn read_generation(container: &Path) -> io::Result<PathBuf> {
+    let generation = container.join(read_pointer(container)?);
+    checked_directory(&generation)?;
+    Ok(generation)
+}
+
+pub fn read_pointer(container: &Path) -> io::Result<String> {
     checked_directory(container)?;
     let pointer = container.join(POINTER_FILE);
     // A pointer is a regular file; do not follow symlinks/reparse points.
@@ -68,9 +77,7 @@ pub fn read_generation(container: &Path) -> io::Result<PathBuf> {
         return Err(io::Error::other("invalid EffeTune pointer file"));
     }
     let text = std::fs::read_to_string(pointer)?;
-    let generation = container.join(parse_pointer(&text)?);
-    checked_directory(&generation)?;
-    Ok(generation)
+    Ok(parse_pointer(&text)?.to_owned())
 }
 
 #[cfg(test)]
@@ -79,7 +86,7 @@ mod tests {
 
     #[test]
     fn pointer_accepts_only_a_fingerprint_and_single_generation_basename() {
-        let name = format!("{}-Abc123", "a".repeat(64));
+        let name = format!("{}-Abc123", "a".repeat(FINGERPRINT_LENGTH));
         let text = encode_pointer(&name).unwrap();
         assert_eq!(parse_pointer(&text).unwrap(), name);
         for bad in [

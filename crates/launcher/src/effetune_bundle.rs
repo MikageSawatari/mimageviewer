@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub struct BundleFile {
     pub name: &'static str,
@@ -15,7 +15,48 @@ pub struct BundleFile {
     pub hash: &'static str,
 }
 
-pub fn ensure_bundle(runtime: &Path, files: &[BundleFile], manifest: &str) -> io::Result<PathBuf> {
+#[derive(Debug)]
+pub struct PreparationError {
+    pub reason: io::Error,
+    pub rejected_generation: Option<String>,
+}
+
+impl std::fmt::Display for PreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(formatter)
+    }
+}
+
+pub fn ensure_bundle(
+    runtime: &Path,
+    files: &[BundleFile],
+    manifest: &str,
+) -> Result<PathBuf, PreparationError> {
+    ensure_bundle_with_wait(runtime, files, manifest, Duration::from_secs(60))
+}
+
+fn ensure_bundle_with_wait(
+    runtime: &Path,
+    files: &[BundleFile],
+    manifest: &str,
+    wait: Duration,
+) -> Result<PathBuf, PreparationError> {
+    let mut rejected_generation = None;
+    ensure_bundle_inner(runtime, files, manifest, wait, &mut rejected_generation).map_err(
+        |reason| PreparationError {
+            reason,
+            rejected_generation,
+        },
+    )
+}
+
+fn ensure_bundle_inner(
+    runtime: &Path,
+    files: &[BundleFile],
+    manifest: &str,
+    wait: Duration,
+    rejected_generation: &mut Option<String>,
+) -> io::Result<PathBuf> {
     if !checked_metadata(runtime)?.is_dir() {
         return Err(io::Error::other("runtime directory required"));
     }
@@ -24,7 +65,7 @@ pub fn ensure_bundle(runtime: &Path, files: &[BundleFile], manifest: &str) -> io
         return Err(io::Error::other("EffeTune container must be a directory"));
     }
     // A valid installation has no write/lock requirement, including read-only APPDATA.
-    if let Ok(root) = ready_generation(&container, files, manifest) {
+    if let Ok(root) = ready_generation(&container, files, manifest, rejected_generation) {
         return Ok(root);
     }
     std::fs::create_dir_all(&container)?;
@@ -38,32 +79,63 @@ pub fn ensure_bundle(runtime: &Path, files: &[BundleFile], manifest: &str) -> io
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    // A busy/unavailable publisher must not hold up application startup.
-    if !lock.try_lock_exclusive()? {
-        return ready_generation(&container, files, manifest).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "EffeTune publisher is busy; retry on the next launch",
-            )
-        });
-    }
-    if let Ok(root) = ready_generation(&container, files, manifest) {
+    // Blocking OS locking runs on a worker, with a bounded launcher wait. A
+    // timed-out worker only releases its lock: it never publishes anything.
+    let _lock = match wait_for_publish_lock(lock, wait) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return ready_generation(&container, files, manifest, rejected_generation)
+                .or(Err(error));
+        }
+    };
+    if let Ok(root) = ready_generation(&container, files, manifest, rejected_generation) {
         return Ok(root);
     }
     publish_generation(&container, files, manifest)
 }
 
-fn ready_generation(container: &Path, files: &[BundleFile], manifest: &str) -> io::Result<PathBuf> {
+fn wait_for_publish_lock(lock: std::fs::File, wait: Duration) -> io::Result<std::fs::File> {
+    if lock.try_lock_exclusive()? {
+        return Ok(lock);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("effetune-publish-lock".into())
+        .spawn(move || {
+            let result = lock.lock_exclusive().map(|()| lock);
+            let _ = tx.send(result);
+        })?;
+    rx.recv_timeout(wait).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("EffeTune publisher wait failed after {wait:?}: {error}; retry 音響調整"),
+        )
+    })?
+}
+
+fn ready_generation(
+    container: &Path,
+    files: &[BundleFile],
+    manifest: &str,
+    rejected_generation: &mut Option<String>,
+) -> io::Result<PathBuf> {
     if !checked_metadata(container)?.is_dir() {
         return Err(io::Error::other("EffeTune directory required"));
     }
-    let root = bundle_location::read_generation(container)?;
+    *rejected_generation = None;
+    let generation = bundle_location::read_pointer(container)?;
+    *rejected_generation = Some(generation.clone());
+    let root = container.join(generation);
+    bundle_location::checked_directory(&root)?;
     let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
     if !root
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .starts_with(&format!("{fingerprint}-"))
+        .starts_with(&format!(
+            "{}-",
+            &fingerprint[..bundle_location::FINGERPRINT_LENGTH]
+        ))
     {
         return Err(io::Error::other("EffeTune generation fingerprint mismatch"));
     }
@@ -133,8 +205,12 @@ fn publish_generation(
 ) -> io::Result<PathBuf> {
     let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
     let stage = tempfile::Builder::new()
-        .prefix(&format!("{fingerprint}-"))
+        .prefix(&format!(
+            "{}-",
+            &fingerprint[..bundle_location::FINGERPRINT_LENGTH]
+        ))
         .tempdir_in(container)?;
+    check_publish_path_length(stage.path(), files)?;
     for file in files {
         relative_name(Path::new(file.name))?;
         let path = stage.path().join(file.name);
@@ -168,6 +244,37 @@ fn publish_generation(
         .map_err(|e| e.error)?;
     // Cleanup is outside startup: absence of a lock cannot prove assets are unused.
     Ok(stage.keep())
+}
+
+fn check_publish_path_length(root: &Path, files: &[BundleFile]) -> io::Result<()> {
+    let root = std::path::absolute(root)?;
+    let mut paths = files
+        .iter()
+        .map(|file| root.join(file.name))
+        .collect::<Vec<_>>();
+    paths.push(root.join(".manifest"));
+    let deepest = paths.into_iter().max_by_key(|path| path_units(path));
+    if let Some(path) = deepest {
+        let length = path_units(&path);
+        if length >= 260 {
+            return Err(io::Error::other(format!(
+                "{}: {length} UTF-16 units (maximum 259): {}. Use a shorter APPDATA path.",
+                bundle_location::PATH_TOO_LONG_MARKER,
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn path_units(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().count()
+    }
+    #[cfg(not(windows))]
+    path.to_string_lossy().encode_utf16().count()
 }
 
 #[cfg(test)]
@@ -246,13 +353,11 @@ mod tests {
                 let handles: Vec<_> = (0..6)
                     .map(|_| scope.spawn(|| ensure_bundle(dir, files, "same")))
                     .collect();
-                assert!(
-                    handles
-                        .into_iter()
-                        .filter_map(|h| h.join().unwrap().ok())
-                        .count()
-                        >= 1
-                );
+                let roots = handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(roots.iter().all(|root| root == &roots[0]));
             });
             let root = ensure_bundle(dir, files, "same").unwrap();
             assert!(snapshot(&root, files, "same").is_ok());
@@ -324,11 +429,64 @@ mod tests {
         });
     }
     #[test]
-    fn busy_publisher_returns_without_blocking_startup() {
+    fn publisher_wait_is_bounded_and_later_publication_can_be_used() {
         with_fixture(|dir, files| {
             let lock = std::fs::File::create(dir.join(".effetune.lock")).unwrap();
             lock.lock_exclusive().unwrap();
-            assert!(ensure_bundle(dir, files, "current").is_err());
+            let error = ensure_bundle_with_wait(dir, files, "current", Duration::from_millis(20))
+                .unwrap_err();
+            assert_eq!(error.reason.kind(), io::ErrorKind::TimedOut);
+            lock.unlock().unwrap();
+            assert!(ensure_bundle(dir, files, "current").is_ok());
+        });
+    }
+
+    #[test]
+    fn checks_deepest_utf16_path_before_writing_bundle_files() {
+        with_fixture(|dir, files| {
+            let root = dir.join("a".repeat(260));
+            let error = check_publish_path_length(&root, files).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(bundle_location::PATH_TOO_LONG_MARKER)
+            );
+            assert!(!root.exists());
+            let short = ensure_bundle(dir, files, "current").unwrap();
+            assert_eq!(
+                short.file_name().unwrap().len(),
+                bundle_location::FINGERPRINT_LENGTH + 1 + 6
+            );
+            assert!(path_units(&short.join(files[0].name)) < 260);
+        });
+    }
+
+    #[test]
+    fn failure_identifies_the_generation_actually_rejected_after_pointer_change() {
+        with_fixture(|dir, files| {
+            let first = ensure_bundle(dir, files, "first").unwrap();
+            let second = ensure_bundle(dir, files, "second").unwrap();
+            std::fs::remove_file(second.join(".manifest")).unwrap();
+            let invalid = [BundleFile {
+                name: files[0].name,
+                bytes: files[0].bytes,
+                hash: "invalid",
+            }];
+            // Stale pre-capture must not survive the real integrity check.
+            let mut rejected = Some(first.file_name().unwrap().to_string_lossy().into_owned());
+            assert!(
+                ensure_bundle_inner(
+                    dir,
+                    &invalid,
+                    "second",
+                    Duration::from_secs(1),
+                    &mut rejected
+                )
+                .is_err()
+            );
+            assert_eq!(rejected.as_deref(), second.file_name().unwrap().to_str());
+            let error = ensure_bundle(dir, &invalid, "second").unwrap_err();
+            assert_eq!(error.rejected_generation, rejected);
         });
     }
 }

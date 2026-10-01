@@ -161,27 +161,42 @@ fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn configure_effetune_command(cmd: &mut Command, result: Result<PathBuf, String>) {
+fn configure_effetune_command(
+    cmd: &mut Command,
+    result: Result<PathBuf, effetune_bundle::PreparationError>,
+) {
     cmd.env_remove(bundle_location::PREPARATION_ERROR_ENV);
     cmd.env_remove(bundle_location::GENERATION_ENV);
+    cmd.env_remove(bundle_location::REJECTED_GENERATION_ENV);
     match result {
         Ok(root) => {
             cmd.env(bundle_location::GENERATION_ENV, root.file_name().unwrap());
         }
         Err(error) => {
             eprintln!("{error}");
-            cmd.env(bundle_location::PREPARATION_ERROR_ENV, error);
+            cmd.env(bundle_location::PREPARATION_ERROR_ENV, error.to_string());
+            if let Some(generation) = error.rejected_generation {
+                cmd.env(bundle_location::REJECTED_GENERATION_ENV, generation);
+            }
         }
     }
 }
 
-fn prepare_effetune(runtime_dir: &Path) -> Result<std::path::PathBuf, String> {
-    effetune_bundle::ensure_bundle(runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST).map_err(|e| {
-        format!(
-            "extract EffeTune {EFFETUNE_VERSION} failed: {e}\n(runtime dir: {})",
-            runtime_dir.display()
-        )
-    })
+fn prepare_effetune(
+    runtime_dir: &Path,
+) -> Result<std::path::PathBuf, effetune_bundle::PreparationError> {
+    effetune_bundle::ensure_bundle(runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST).map_err(
+        |mut e| {
+            e.reason = std::io::Error::new(
+                e.reason.kind(),
+                format!(
+                    "extract EffeTune {EFFETUNE_VERSION} failed: {e}\n(runtime dir: {})",
+                    runtime_dir.display()
+                ),
+            );
+            e
+        },
+    )
 }
 
 fn extract_asset(runtime_dir: &Path, asset: &(&str, &[u8], &str)) -> Result<(), String> {
@@ -616,7 +631,17 @@ mod tests {
     #[test]
     fn preparation_failure_and_success_are_forwarded_without_starting_core() {
         let mut cmd = std::process::Command::new("dummy-core-never-run.exe");
-        super::configure_effetune_command(&mut cmd, Err("EffeTune publish: access denied".into()));
+        let name = format!(
+            "{}-Abc123",
+            "a".repeat(super::bundle_location::FINGERPRINT_LENGTH)
+        );
+        super::configure_effetune_command(
+            &mut cmd,
+            Err(super::effetune_bundle::PreparationError {
+                reason: std::io::Error::other("EffeTune publish: access denied"),
+                rejected_generation: Some(name.clone()),
+            }),
+        );
         let vars: Vec<_> = cmd.get_envs().collect();
         assert!(vars.iter().any(|(key, value)| *key
             == super::bundle_location::PREPARATION_ERROR_ENV
@@ -626,7 +651,9 @@ mod tests {
                 |(key, value)| *key == super::bundle_location::GENERATION_ENV && value.is_none()
             )
         );
-        let name = format!("{}-Abc123", "a".repeat(64));
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::REJECTED_GENERATION_ENV
+            && *value == Some(std::ffi::OsStr::new(&name))));
         super::configure_effetune_command(&mut cmd, Ok(std::path::PathBuf::from(&name)));
         let vars: Vec<_> = cmd.get_envs().collect();
         assert!(vars.iter().any(|(key, value)| *key
@@ -636,6 +663,9 @@ mod tests {
             |(key, value)| *key == super::bundle_location::GENERATION_ENV
                 && *value == Some(std::ffi::OsStr::new(&name))
         ));
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::REJECTED_GENERATION_ENV
+            && value.is_none()));
     }
 
     #[test]

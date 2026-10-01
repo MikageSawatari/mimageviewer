@@ -168,9 +168,10 @@ Microsoft VC/Redist 由来の `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.
 manifest exact hash、Microsoft Authenticode Valid を必須とする。package 内コピーも canonical と
 exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。
 EffeTune pluginの依存は `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` の
-processで解決する。同梱CRT4本は非検索subdir `vcrt/` に置き、hostがSystem32を依存順にpreloadし、
-systemに無いDLLだけ同梱版を絶対pathでloadする。systemに存在するがload不能なら理由をlogへ記録し、
-固定版で黙って置き換えない。旧host／CRTの上書きはせず、同一bytesは再抽出しない。
+processで解決する。同梱CRT4本は非検索subdir `vcrt/`。System32の全4本が存在・版数読取可能で
+vcruntime140のfile versionが同梱版以上なら全4本System32、他は全4本同梱を選ぶ。選択元と両版数をlogへ記録し、
+依存順に絶対pathからpreloadする。途中で混在させず、load不能なら理由を記録して停止する。
+旧host／CRTの上書きはせず、同一bytesは再抽出しない。
 同梱CRTはWindows Updateで更新されないため、native dependency更新時に正本と実体を一体で更新する。
 
 `onnxruntime*.dll` も Microsoft Authenticode Valid を必須にする。既知4名以外の `msvcp*` /
@@ -211,9 +212,10 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   - 準備完了の判定はトレイ通知「SimplySign connected / Amount of cards available: 1」、
     または `certutil -scinfo` に Reader Name が出ること。
   - 毎回避けたければ `Set-Service SCardSvr -StartupType Automatic` (管理者)。
-- **R1 host更新 (2026-10-02)**: UTF-8 path／system-first CRT preload修正前hostは配布不可。
-  必ず現C++ソースをCMakeで再buildしSHA256／sizeを記録する。旧cacheを使うSDK欠落fallbackや
-  `-SkipVst3Bridge` は今回の再buildを代替しない。実host起動の確認は承認済み手動検証へ分ける。
+- **R2 host identity gate (2026-10-02)**: CMakeのsourcehash markerを現CMakeLists／include／src／testsと照合する。
+  `build-release`／`build-dist`の署名前・core埋込前・最終gateと非portable coreのbare cargo releaseでも必須。
+  `-SkipVst3Bridge`／SDK欠落時は一致するvendor hostのみ再利用できる。APPDATA等からのcopy fallbackはない。
+  一致しなければCMakeで再buildしSHA256／sizeを記録する。実host確認は承認済み手動検証へ分ける。
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
   vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
@@ -300,9 +302,11 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
   [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
   launcher が VERSION を記録した全 bundle (v0.11.1 は407ファイル、VERSION込み入力408ファイル) を
-  `runtime/<version>/effetune/<content SHA256>-<generation>/` へ全hash検証して公開し、
+  `runtime/<version>/effetune/<hash12>-<generation>/` へ全hash検証して公開し、
   atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。
-  coreには成功generationを渡して固定し、修復失敗・publisher busyなら理由を渡して起動を継続する。
+  hash12はcontent SHA256先頭12桁でstampにはfull hashを使う。最深fileのUTF-16長260以上は理由付きで拒否する。
+  publisher busyは最大60秒待ってpointerを再確認する。coreには成功generationを渡して固定し、
+  修復失敗／timeoutは理由と拒否世代を渡して起動継続。音響調整ボタンで別公開世代を再確認できる。
   正常時はstamp一覧・サイズ・更新時刻・作成時刻の一致を確認し、全量再hashとwrite lockを避ける。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
 - **検証**: ビルド後、**Chrome で実際に zip をダウンロード**してブロックされないことを確認する

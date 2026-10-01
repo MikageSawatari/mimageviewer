@@ -24,6 +24,33 @@
 cmake_minimum_required(VERSION 3.20)
 project(mimageviewer-vst3-host CXX)
 
+# Canonical build identity, shared with scripts/vst3-host-identity.ps1.
+# Each sorted slash-relative name contributes name:lowercase-SHA256(raw-bytes)\n.
+# The aggregate UTF-8 (no BOM) text is SHA256 hashed. Generated headers, SDK
+# downloads and binaries are excluded. Current source paths are ASCII, so CMake's
+# case-sensitive lexicographic sorting is the same as ordinal sorting.
+file(GLOB_RECURSE HOST_IDENTITY_FILES CONFIGURE_DEPENDS
+    RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+list(APPEND HOST_IDENTITY_FILES "CMakeLists.txt")
+list(SORT HOST_IDENTITY_FILES)
+set(HOST_IDENTITY_TEXT "")
+foreach(HOST_IDENTITY_FILE IN LISTS HOST_IDENTITY_FILES)
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${HOST_IDENTITY_FILE}" HOST_FILE_SHA256)
+    string(TOLOWER "${HOST_FILE_SHA256}" HOST_FILE_SHA256)
+    string(APPEND HOST_IDENTITY_TEXT "${HOST_IDENTITY_FILE}:${HOST_FILE_SHA256}\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/${HOST_IDENTITY_FILE}")
+endforeach()
+string(SHA256 HOST_SOURCE_SHA256 "${HOST_IDENTITY_TEXT}")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/build_identity.h"
+    CONTENT "#pragma once\n#define MIV_VST3_HOST_SOURCE_MARKER \"MIV_VST3_HOST_SOURCE_SHA256:@HOST_SOURCE_SHA256@\"\n"
+    @ONLY)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -61,6 +88,7 @@ add_executable(mimageviewer-vst3-host
 
 target_include_directories(mimageviewer-vst3-host PRIVATE
     include
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 # VST3 SDK の必要最小限のソースを取り込む
@@ -106,6 +134,7 @@ if(WIN32)
         comctl32    # SetWindowSubclass / RemoveWindowSubclass for plugin child HWND hooks
         advapi32
         avrt        # AvSetMmThreadCharacteristicsW (MMCSS)
+        version     # Read all four CRT DLL file versions before selecting a set
     )
 endif()
 

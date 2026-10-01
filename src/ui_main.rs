@@ -9642,11 +9642,7 @@ impl App {
                             self.effetune.effective_state(),
                             Some(crate::effetune::EffectiveState::Effective)
                         );
-                        let available = !self.remote_session_blocks_local_control() && matches!(
-                            self.effetune.runtime,
-                            crate::effetune::EffetuneRuntime::Idle
-                                | crate::effetune::EffetuneRuntime::Running { .. }
-                        );
+                        let available = self.effetune_toolbar_available();
                         let resp = ui
                             .add_enabled(
                                 available,
@@ -23539,6 +23535,73 @@ mod effetune_toolbar_flavor_tests {
     fn only_effetune(settings: &mut crate::settings::Settings) {
         for &section in TS::default_order() {
             set_toolbar_section_visible(settings, section, section == TS::EffeTune);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn effetune_button_enables_preparation_retry_but_keeps_other_failures_disabled() {
+        use crate::effetune::{EffetuneFailure, EffetuneRuntime, LoadOrigin, UnavailableReason};
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+        let cases = [
+            (EffetuneRuntime::Idle, true),
+            (EffetuneRuntime::Running { generation: 1 }, true),
+            (
+                EffetuneRuntime::Unavailable(UnavailableReason::BundlePreparationFailed {
+                    reason: "publisher timeout".into(),
+                    rejected_generation: None,
+                }),
+                true,
+            ),
+            (
+                EffetuneRuntime::Unavailable(UnavailableReason::BundleMissing("fixture".into())),
+                false,
+            ),
+            (
+                EffetuneRuntime::Unavailable(UnavailableReason::CpuUnsupported),
+                false,
+            ),
+            (
+                EffetuneRuntime::Loading {
+                    origin: LoadOrigin::UserButton,
+                    open_gui_when_ready: None,
+                },
+                false,
+            ),
+            (
+                EffetuneRuntime::Failed(EffetuneFailure::LoadFailed("fixture".into())),
+                false,
+            ),
+        ];
+        for (runtime, expected) in cases {
+            let mut app = crate::app::setup_app_for_test();
+            only_effetune(&mut app.settings);
+            app.settings.toolbar_section_order = vec![TS::EffeTune];
+            app.effetune.runtime = runtime;
+            assert_eq!(app.effetune_toolbar_available(), expected);
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1200.0, 300.0))
+                .build(move |ctx| {
+                    if fonts_ready {
+                        app.render_toolbar(ctx);
+                    } else {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                    }
+                });
+            harness.run();
+            assert_eq!(
+                harness
+                    .get_by_label("音響調整")
+                    .accesskit_node()
+                    .is_disabled(),
+                !expected
+            );
+            // Inspect only: never click/load a real VST host.
         }
     }
 

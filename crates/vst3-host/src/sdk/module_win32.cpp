@@ -160,7 +160,7 @@ public:
 		namespace StringConvert = Steinberg::Vst::StringConvert;
 
 		filesystem::path p = miv::bundle_binary_path (inPath, archString);
-		const std::wstring wString = p.generic_wstring ();
+		const std::wstring wString = p.native ();
 		HINSTANCE instance = LoadLibraryW (reinterpret_cast<LPCWSTR> (wString.data ()));
 		const DWORD loadError = instance ? ERROR_SUCCESS : GetLastError ();
 #if SMTG_CPU_ARM_64EC
@@ -179,7 +179,7 @@ public:
 	{
 		namespace StringConvert = Steinberg::Vst::StringConvert;
 
-		auto wideStr = miv::utf8_to_utf16 (inPath);
+		auto wideStr = miv::path_from_utf8 (inPath).native ();
 		HINSTANCE instance = LoadLibraryW (reinterpret_cast<LPCWSTR> (wideStr.data ()));
 		const DWORD loadError = instance ? ERROR_SUCCESS : GetLastError ();
 		if (instance == nullptr)
@@ -198,7 +198,15 @@ public:
 	{
 		const filesystem::path tmp = miv::path_from_utf8 (inPath);
 		std::error_code ec;
-		if (filesystem::is_directory (tmp, ec))
+		const bool directory = filesystem::is_directory (tmp, ec);
+		const auto kind = miv::inspected_plugin_kind (directory, ec);
+		if (kind == miv::PluginPathKind::Error)
+		{
+			errorDescription = "Cannot inspect plugin path: " + inPath + ": " + ec.category ().name () +
+			                   "/" + std::to_string (ec.value ());
+			return false;
+		}
+		if (kind == miv::PluginPathKind::Bundle)
 		{
 			// try as package (bundle)
 			mModule = loadAsPackage (inPath, errorDescription);
@@ -265,7 +273,7 @@ bool openVST3Package (const filesystem::path& p, const char* archString,
 	path /= "Contents";
 	path /= archString;
 	path /= p.filename ();
-	const std::wstring wString = path.generic_wstring ();
+	const std::wstring wString = path.native ();
 	auto hFile = CreateFileW (reinterpret_cast<LPCWSTR> (wString.data ()), GENERIC_READ,
 	                          FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
 	if (hFile != INVALID_HANDLE_VALUE)
@@ -302,7 +310,7 @@ bool isFolderSymbolicLink (const filesystem::path& p)
 	if (filesystem::is_symlink (p, ec))
 		return true;
 #else
-	const std::wstring wString = p.generic_wstring ();
+	const std::wstring wString = p.native ();
 	auto attrib = GetFileAttributesW (reinterpret_cast<LPCWSTR> (wString.data ()));
 	if (attrib & FILE_ATTRIBUTE_REPARSE_POINT)
 	{

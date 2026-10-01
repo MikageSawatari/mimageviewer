@@ -1161,8 +1161,10 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 
 Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
 明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
-2026-10-02 R1修正以後の配布は旧host cacheを再利用せず、必ず現C++ソースから再buildする。
-`-SkipVst3Bridge` やSDK欠落時のcache fallbackでは、この修正前hostを配布しない。
+2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
+現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。SDK欠落時や
+`-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
+build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
 再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。
 
 ### セットアップ (メインビルド前に必須)
@@ -1174,7 +1176,7 @@ bash scripts/setup-vst3-sdk.sh
 # 2. CMake で C++ bridge をビルド
 cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 cmake --build crates/vst3-host/build --config Release
-# → vendor/vst3-host/mimageviewer-vst3-host.exe (R1 build: 815,616 bytes)
+# → vendor/vst3-host/mimageviewer-vst3-host.exe (R2 build: 826,880 bytes)
 ```
 
 - 前提:
@@ -1630,12 +1632,15 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   `third_party/effetune-mixwright/v0.11.1/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
-  launcherは `runtime/<version>/effetune/<content SHA256>-<generation>/EffeTune Mixwright.vst3/` に
+  launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
   検証済み世代を一度だけ公開する。既存・使用中treeの移動、置換、削除はしない。**atomicなのは
   完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
   正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
   不一致は別世代を全hash検証して公開する。公開済み旧世代のcleanupは起動経路外に保留する。
-  repair不能／publisher busyでもcoreは起動し、専用envで理由を渡して音響調整だけUnavailableにする。
+  hash12はcontent SHA256先頭12桁（stampはfull hashを比較）。公開前に最深fileのUTF-16長を確認し、
+  260以上なら明示理由で拒否する。publisher busyはworkerのOS lockを最大60秒待ってpointerを再確認する。
+  repair不能／timeoutでもcoreは起動し、理由と実際に拒否した世代をenvで渡してUnavailableにする。
+  音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
   成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
   通知原文とmanifestは `third_party/effetune-mixwright/v0.11.1/` に追跡し、`.gitattributes -text`で
@@ -1645,8 +1650,9 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。
   EffeTune pluginも動的VC runtimeをimportする。hostは
   `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe`、同梱CRTは非検索subdir `vcrt/`。
-  host自身がSystem32から依存順にpreloadし、system欠落分だけ同梱版を絶対pathでloadする。
-  shared host直下に固定CRTを置かず、既存ユーザーVSTのsystem CRT選択を保つ。抽出は一致bytesを
+  hostはCRTを一組で選ぶ。System32の全4本が存在・版数読取可能でvcruntime140のfile versionが
+  同梱版以上なら全4本System32、それ以外は全4本同梱。選択後に依存順で絶対pathからpreloadし、
+  途中のsource切替はしない。選択元と両版数をlogへ記録する。shared host直下に固定CRTを置かず、抽出は一致bytesを
   書き換えず、成功だけcacheして失敗の再試行を許す。portableはこの抽出経路を使わない。
   `scripts/check-vcrt-pe-dependencies.ps1` が全配布 PE の machine / import closure と、CRT・ORT の
   Microsoft 署名、CRT の同一版・最低版・manifest hash を検査する。未知の `msvcp*` /

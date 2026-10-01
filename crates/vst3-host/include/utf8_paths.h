@@ -3,6 +3,7 @@
 // IPC and SDK strings are UTF-8. Convert explicitly at every Windows boundary;
 // /utf-8 does not change filesystem::path's narrow constructor or the process ACP.
 #include <windows.h>
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -37,15 +38,38 @@ inline std::string utf16_to_utf8(std::wstring_view text) {
     return out;
 }
 
+inline std::filesystem::path native_windows_path(std::wstring text) {
+    if (text.empty()) throw std::runtime_error("Empty Windows path");
+    std::replace(text.begin(), text.end(), L'/', L'\\');
+    if (text.rfind(LR"(\\?\)", 0) == 0) return std::filesystem::path(text);
+    const DWORD needed = GetFullPathNameW(text.c_str(), 0, nullptr, nullptr);
+    if (!needed) throw std::runtime_error("Cannot resolve absolute Windows path");
+    std::wstring absolute(needed, L'\0');
+    const DWORD length = GetFullPathNameW(text.c_str(), needed, absolute.data(), nullptr);
+    if (!length || length >= needed) throw std::runtime_error("Cannot resolve absolute Windows path");
+    absolute.resize(length);
+    // Extended local/UNC syntax works without a longPathAware manifest or a
+    // machine-wide registry setting. Native backslashes must remain intact.
+    if (absolute.rfind(LR"(\\)", 0) == 0)
+        absolute = LR"(\\?\UNC\)" + absolute.substr(2);
+    else
+        absolute = LR"(\\?\)" + absolute;
+    return std::filesystem::path(absolute);
+}
 inline std::filesystem::path path_from_utf8(std::string_view text) {
-    return std::filesystem::path(utf8_to_utf16(text));
+    return native_windows_path(utf8_to_utf16(text));
 }
 inline std::string path_to_utf8(const std::filesystem::path& path) {
-    return utf16_to_utf8(path.generic_wstring());
+    return utf16_to_utf8(path.native());
 }
 inline std::filesystem::path bundle_binary_path(std::string_view text, std::string_view architecture) {
     const auto bundle = path_from_utf8(text);
-    return bundle / L"Contents" / path_from_utf8(architecture) / bundle.filename();
+    return bundle / L"Contents" / std::filesystem::path(utf8_to_utf16(architecture)) / bundle.filename();
+}
+enum class PluginPathKind { Bundle, Dll, Error };
+inline PluginPathKind inspected_plugin_kind(bool directory, const std::error_code& error) {
+    if (error && error != std::errc::no_such_file_or_directory) return PluginPathKind::Error;
+    return directory ? PluginPathKind::Bundle : PluginPathKind::Dll;
 }
 // Factory/editor display text belongs to third-party plugins. A malformed title
 // must not escape a Win32 paint callback or terminate an otherwise usable host.

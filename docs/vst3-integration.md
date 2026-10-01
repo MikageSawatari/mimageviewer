@@ -226,10 +226,14 @@ include_bytes! でメイン exe に埋め込み、初回 enable 時に
 ```
 
 通常版のhost／CRTは内容hash別ディレクトリへ抽出する。CRT4本は非検索subdir `vcrt/` に置き、
-hostがSystem32を依存順にpreloadして欠落分だけ同梱版を絶対pathでloadする。既存host／CRTを
+System32の全4本が存在・版数読取可能でvcruntime140のfile versionが同梱版以上なら全4本System32、
+他は全4本同梱を選び、依存順に絶対pathでpreloadする。選択元と両版数をlogへ記録する。既存host／CRTを
 上書きせず、抽出成功だけcacheする。portableのhost非同梱は維持する。
 Windows SDK hosting moduleは `crates/vst3-host/src/sdk/` のMIT原文付きcopyを使い、IPCのUTF-8
 pathを明示的にUTF-16へ変換してwide APIでload／探索する。ACP manifestは変更しない。
+directory checkはNotFound以外のerrorを報告して停止し、Win32へnative backslash pathを渡す。
+host PE内のsourcehash markerを現在のCMakeLists／include／src／testsと照合する。releaseは古いAPPDATA等の
+hostをimportせず、現vendor hostが一致しなければCMakeで再buildする。bare cargo releaseにも同じgateがある。
 state／presetデータはopaque bytesでありhostによるnarrow pathファイル操作はない。
 IPC JSONのpath decoderはescape／Unicode surrogateを扱う。日本語APPDATA、ユーザーVST path、
 state保存・復元の実機確認は承認済み手動検証で行う。
@@ -487,7 +491,7 @@ VST3 SDK 3.8.0 (MIT、2025-10-20 以降) を採用しているため、**追加�
 
 ## 11. 配布物への影響
 
-- host exeのサイズはR1 buildで815,616 bytes。coreがhostとfallback CRT4本を内包し、launcherがそのcoreを内包する。サイズ／SHA256は各検証buildで記録する。
+- host exeのサイズはR2 buildで826,880 bytes。coreがhostとfallback CRT4本を内包し、launcherがそのcoreを内包する。サイズ／SHA256は各検証buildで記録する。
 - `mimageviewer-core.exe`: 既存に bridge exe を `include_bytes!` で内包
 - 初回 VST3 enable 時 (= デフォルトでは展開されない) に
   `%APPDATA%\mimageviewer\vst3\hosts\<host+CRT SHA256>\mimageviewer-vst3-host.exe` を展開

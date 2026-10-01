@@ -101,6 +101,7 @@ function Invoke-ReleaseCargo {
 $repoRoot = (Get-Location).Path
 $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'effetune-distribution.ps1')
+. (Join-Path $PSScriptRoot 'vst3-host-identity.ps1')
 $null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetune-mixwright') `
     -NoticesRoot (Join-Path $repoRoot 'third_party\effetune-mixwright')
 if ($PreserveRuntime) {
@@ -158,31 +159,6 @@ $stoppableProcessNames = @(
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
-$appDataVst3Bridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
-
-function Ensure-VendorVst3BridgeFromCache {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string] $VendorExe,
-        [string] $Reason = 'VST3 bridge rebuild skipped'
-    )
-
-    if (Test-Path $VendorExe) {
-        return $true
-    }
-    if (-not (Test-Path $appDataVst3Bridge)) {
-        return $false
-    }
-
-    $vendorDir = Split-Path -Parent $VendorExe
-    if (-not (Test-Path $vendorDir)) {
-        New-Item -ItemType Directory -Path $vendorDir | Out-Null
-    }
-    Copy-Item -LiteralPath $appDataVst3Bridge -Destination $VendorExe -Force
-    Write-Warning ("[build-release] {0}; copied extracted bridge cache back to vendor: {1}" -f $Reason, $VendorExe)
-    return $true
-}
-
 # Only the exact executables this build produces. A "mimageviewer*" prefix match would
 # also select Cargo test harnesses (backlog 5.3); an unnamed allowlist is the one thing
 # that keeps a concurrent `cargo test` alive.
@@ -306,12 +282,9 @@ if (-not $SkipVst3Bridge) {
         throw "[build-release] cmake was not found. Install CMake or pass -SkipVst3Bridge to reuse the existing vendor bridge."
     }
     if (-not (Test-Path $vst3SdkLicense)) {
-        if (Ensure-VendorVst3BridgeFromCache -VendorExe $vst3VendorExe -Reason 'VST3 SDK was not found at vendor\vst3sdk') {
-            Write-Warning "[build-release] reusing existing VST3 bridge. Run scripts\setup-vst3-sdk.sh to rebuild bridge changes."
-            $SkipVst3Bridge = $true
-        } else {
-            throw "[build-release] VST3 SDK was not found at vendor\vst3sdk, and no reusable bridge exe was found in vendor\vst3-host or APPDATA. Run scripts\setup-vst3-sdk.sh, or restore an existing vendor bridge and pass -SkipVst3Bridge."
-        }
+        Assert-MivVst3HostIdentity -RepoRoot $repoRoot
+        Write-Warning '[build-release] VST3 SDK missing; reusing only the verified current-source vendor host.'
+        $SkipVst3Bridge = $true
     }
     if (-not $SkipVst3Bridge -and -not (Test-Path (Join-Path -Path $vst3BuildDir -ChildPath 'CMakeCache.txt'))) {
         Write-Host "[build-release] configuring VST3 bridge (cmake)"
@@ -329,11 +302,13 @@ if (-not $SkipVst3Bridge) {
     }
 } else {
     $vst3VendorExe = Join-Path -Path $repoRoot -ChildPath 'vendor\vst3-host\mimageviewer-vst3-host.exe'
-    if (-not (Ensure-VendorVst3BridgeFromCache -VendorExe $vst3VendorExe -Reason 'VST3 bridge rebuild skipped')) {
-        throw "[build-release] -SkipVst3Bridge was specified, but no reusable bridge exe was found in vendor\vst3-host or APPDATA."
-    }
-    Write-Warning "[build-release] skipping VST3 bridge rebuild; core will embed the existing vendor/vst3-host exe."
+    Assert-MivVst3HostIdentity -RepoRoot $repoRoot
+    Write-Warning '[build-release] skipping VST3 bridge rebuild; core will embed the verified current-source vendor host.'
 }
+
+# A successful rebuild and every reuse route must prove the same identity before
+# signing or embedding. Signature/PE validity alone cannot detect an old host.
+Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 
 # Use a fresh complete copy: signed distribution builds must not mutate the
 # upstream EffeTune bundle. This path is also the final embedded-PE gate input.
@@ -377,6 +352,7 @@ Ensure-LibclangPath
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
 Write-Host ("[build-release] (2/5) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
+Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd
 if ($coreExit -ne 0) { exit $coreExit }
 
