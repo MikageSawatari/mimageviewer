@@ -431,6 +431,8 @@ worker thread の stack は 1 MiB 以上 (LibRaw は 1 呼び出しで 130〜140
 
 ## 6. RAW ページの状態 (単一の持ち主)
 
+> **S3 の実装は §7.10 (S3 着手前の改訂、2026-10-01) を優先する。** §6〜§7・§13 の記述と食い違う箇所は §7.10 が正。
+
 第1版は現像の状態を `fs_cache` の variant・`raw_develop_pending`・`fs_upload_backlog` の 3 か所に
 分けていた。これでは「現像済みなのに遅れたプレビューで上書き」(独立レビュー P1-1) のような
 矛盾した組み合わせを禁止する持ち主がいない (P2-4)。第2版では **viewer context ごとの `RawPageStore`
@@ -698,6 +700,96 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
   同じ寸法の JPEG と同じ扱いで、RAW だけプレビューへ降格して解放する処理は作らない。
   決定 9 が除いているのは追加の保持 (LRU・ディスク) であり、この通常の保持ではない
 - keep set を出た後、または fullscreen を閉じて開き直した後は、現像はやり直しになる
+
+### 7.10 S3 着手前の改訂 (2026-10-01、設計再レビュー反映)
+
+S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現コードに照らして再レビューした結果 (P1×4 / P2×4 / P3×1) を
+反映した規則。§6〜§7・§13 と食い違う箇所はこの節が正。
+
+**(A) フルスクリーンに出してよい画素 (決定 11 の徹底)**
+
+- `RawPageState` に **埋め込みプレビューの有無** `preview_availability: Unknown | Available | Absent` を持たせる
+  (`info()` の結果で決まる。§5.3.3 の「使えるプレビュー」)
+- RAW のページでサムネイル・色忠実 rendition を fullscreen に出してよいのは **`Available` が確定した後だけ**。
+  `Unknown` の間は「読込中」の表示だけにする (`info()` は数 ms なので短い)。catalog のサムネイルは half 現像由来の
+  ことがあり (`src/thumb_loader.rs:4105`)、`ThumbnailState` からは出所を判別できない (`src/grid_item.rs:523`) ため
+- この判定は 1 つの述語 `raw_fullscreen_fallback_allowed(idx)` に集め、直接の描画・ページ送りの強制 rendition
+  (`src/app.rs:80806`)・見開き・連結読みのすべてから呼ぶ。テスト: half 現像のサムネイルが既にある RAW を開き、
+  プレビューの特定が遅れる場合に、その間サムネイルが提示されない
+
+**(B) 配置の基準 (差し替えで跳ばない)**
+
+- RAW のページは **プレビュー段・現像後・派生 texture (edit / final / AI) のすべてで、配置・fit・Original・Z ズームの
+  基準を `developed_dims` (canonical な RAW の寸法) にする**。現像結果が 8192 に clamp された Static でも、texture 寸法
+  ではなくこの基準で解く (現行の Static は texture 寸法で解く、`src/ui_fullscreen.rs:35891`, `35906`、
+  `src/displayed_image_transform.rs:277`)。Z ズームの経路 (`src/ui_fullscreen.rs:12089`) も同じ基準を通す
+- 判定は §7.5 の `fs_page_layout_uses_source_size` を「RAW のページなら段階にかかわらず真」に広げる
+- テスト: 8192 を超える RAW で、プレビュー → 現像 → final の各段の Original・Z・パン・回転・見開きで paint rect と
+  source↔screen 写像が一致する
+
+**(C) 保持範囲 (現像窓を keep range が削らない)**
+
+- RAW の `RawPageState` と `fs_cache` の entry を残す範囲は **「既存の keep range」と「現像窓 (先 2・前 1)」と「実際に表示中の
+  ページ (見開きの相方・表紙の補助・連結読みで見えているページ)」の和**。`prefetch_forward` を 0 や 1 にしても
+  (`src/ui_dialogs/preferences/pages.rs:6486`、既存の保持 `src/app.rs:67410`, `67443`)、現像窓の RAW を消さない
+- テスト: prefetch_forward 0 / 1、遠い表紙の相方、連結読みで複数ページが見えている状態
+
+**(D) 明るさの変更 = RAW の source 変更 (1 つの transaction)**
+
+- 設定 `raw_brightness` の変更は、**mounted と parked の全 context** に対して 1 つの「RAW source 変更」transaction で反映する:
+  RAW ページの現像要求と backlog を取消、`RawPageState` を `PreviewShown` / `PreviewAbsent` へ戻す (プレビューは残す)、
+  RAW ページの `input_generation` を進め、edit / final / 比較 / 360 度 / **retained final AI** を RAW ページについて失効させる
+  (通常の source 再読込は retained AI を残すが、`src/app.rs:72075`、その key に明るさが無い `:72794` ので、ここでは消す)
+- 現像要求の identity に明るさを含め、古い明るさの完了は `apply_result` が拒否する
+- サムネイル (catalog / edit preview) と RAW 以外のページには触らない
+
+**(E) S2a の暫定構造からの置き換え**
+
+- S2a の `FsRawJobState` (`src/app.rs:7177`, `7191`, `7204`) は、ticket が付く前の「source 準備中」の取消と最高優先度を
+  持っている。これを `RawDevelopPhase` に移す: `Idle` / **`Preparing { cancel, highest_priority }`** / `Submitted { ticket, … }` /
+  `Done` / `Blocked`。`Preparing` 中の取消・昇格を取りこぼさない
+- `RawPreviewPhase` に **`NotRequested`** を加える (§6.3 の表と揃える)
+- `RawPageStore` を **`ContextAsyncOwner`** (`src/app/viewer_context_registry.rs:1178`, `1255`, `1336`) に登録し、未完了の
+  発見・poll・park・drop・generation の設定・bundle の受け渡しのすべてで `fs_pending` と同じに扱う。park では
+  `Done` / `Blocked` を保持し、`Preparing` / `Submitted` を取消す
+- 置き換え後も、canonical routing・clamp / 360 度の tee・permit の解放 (§9 の D1 の行) はそのまま使う。暫定の
+  「Full を待つ」経路と「予期しないプレビューを失敗にする」経路 (`src/app.rs:66917`) は削除する
+- RAW の `DimsOnly` も owner の `apply_result` を通す (現行はアップロードの検証を通らない、`src/app.rs:81077`)
+
+**(F) generation の変更は「破棄」だけではない**
+
+- snapshot の再構築は、表示中の entry を generation の差し替えの前に取り出し、後で戻す (`src/app/snapshot_ops.rs:446`, `184`)。
+  RAW ではこれに合わせて **`fs_cache` の entry と `RawPageState` を一緒に移す原子的な操作**を用意する (source を確かめ、
+  古い要求は取消し、generation と idx を付け直す)。`discard_fs_page` とは別の操作にする
+- worker 側でも source を確かめる: 現像要求は要求時の `RawSourceIdentity` (path・高精度 mtime・size) を持ち、worker は
+  ファイルを開く前と現像の後に stat して一致を確かめる。食い違えば typed な `Stale` で終える (queued の要求は後で
+  ファイルを開き直すため、`src/canonical_image_loader.rs:404`。外部変更の反映は閲覧中に遅れることがある、`src/app.rs:22632`)
+
+**(G) ページ送り・フォルダ移動の分類を 1 か所に**
+
+- RAW の「表示できるか / 終端の失敗か / 強制 rendition を使えるか / 実際に提示したか」は **1 つの分類関数**から読む。
+  ページ送りの typed sequence (`src/ui_fullscreen.rs:11745`) と旧来の分岐、フォルダ移動の lock の両方がそれを使う。
+  `FsCacheEntry::Failed` だけを見る判定 (`:11140`, `:11793`) は RAW の `Terminal` も含める。`Ready` / `Presenting` の
+  target でも分類を読み直す (`:11081`)。producer の起動とアップロードの admission の両方に同じ分類を使う
+- §7.7 の点検表に次を追加する: 連結読みの fallback と pending (`src/ui_fullscreen.rs:37970`, `38002`)、座標・配置と見開きの
+  cache の有無 (`:26559`, `:40279`)、paint resource / Lanczos の identity (`:9398`) と producer の texture 束縛
+  (`src/app.rs:19067`)、VRAM の会計 (`src/app/vram_accounting.rs:8`)、自動テスト用の readiness
+  (`src/app/test_script_support.rs:343`。プレビュー表示可と現像済み・編集可を区別する)
+
+**(H) 外部ツールの明るさ**
+
+- materializer は起動時の明るさを持ち続けている (`src/app.rs:17188`, `18398`、`src/materializer.rs:425`)。**実体化の要求ごとに
+  その時点の明るさを取り**、RAW 由来の出力の再利用 key (`src/materializer.rs:303`, `605`) に含める
+
+**(I) 観測と表示**
+
+- `RawTicket` に typed な状態 (`Queued` / `Running` / `Cancelling`) を足し、進捗表示はそれで「現像待ち」「読み込み中」
+  「現像中 NN%」を分ける (進捗値だけでは待機と読み込み開始を区別できない、`src/raw/executor.rs:255`、
+  `src/raw/raw_decoder.rs:642`)。現在ページが現像中の間の再描画は上限付きの間隔 (100ms) にする
+- `set_parallelism` の失敗 (`src/raw/executor.rs:427`) を設定 UI に返す
+- perf: `raw/preview_presented` / `raw/develop_presented` (context・要求 ID・所要時間) を足す
+- テストに、明るさの変更が現像中・park 中に起きた場合、古い AI / materializer の完了、RAW の終端でのページ送り、を加える
+- 設計文書: display-pipeline・async-architecture・settings の該当節を更新する。既存の名前は `RawBrightness` を使う
 
 ## 8. サムネイル
 
@@ -1432,3 +1524,10 @@ generation を session 単位の 1 本の counter にし表示の共通確定点
 
 前回 5 件のうち 4 件解決。残る P2 (capacity の epoch の取り方しだいで空きを見逃す) は、起きるたびに実際の admission を
 試し直す規則に改め (第5版)、「この 1 点を明記すれば着手してよい。構造の作り直しは不要」の判定に沿って着手する。
+
+### 20.15 S3 の設計再レビュー (2026-10-01、現コードとの突き合わせ)
+
+S2a の暫定実装と master 取り込みの後で §6〜§7・§13 を再レビュー。P1×4 / P2×4 / P3×1 をすべて採用し §7.10 にまとめた
+(フォールバックはプレビュー確定後だけ、RAW は全段で canonical 寸法を配置の基準、保持範囲は keep range と現像窓の和、
+明るさの変更は 1 つの source 変更 transaction、暫定構造の置き換えと `ContextAsyncOwner` への登録、generation 変更時の
+移送と worker 側の source 確認、分類関数の一本化と点検表の追加、外部ツールの明るさ、観測)。S2b / S2c の作り直しは不要。
