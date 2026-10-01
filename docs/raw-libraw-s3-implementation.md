@@ -1,8 +1,8 @@
 # RAW LibRaw S3 implementation handoff
 
-Branch `raw-libraw`; S3 review baseline `ef0b2dac5`, following WIP `3e57109e4` and design decisions J (`999c8e46b`) and K (`453b0baa2`). The independent review rejected the baseline. The review corrections described below are uncommitted and require independent re-review. No product binary was launched; build-dev is explicitly deferred to the design lead. Remote and user-facing documentation remain outside S3.
+Branch `raw-libraw`; current re-review baseline `d585c3af8` (original S3 baseline `ef0b2dac5`), following WIP `3e57109e4` and design decisions J (`999c8e46b`) and K (`453b0baa2`). The latest review left two findings. Their corrections below are uncommitted and require independent re-review; the earlier six-finding correction is committed in the baseline. No product binary was launched; build-dev is explicitly deferred to the design lead. Remote and user-facing documentation remain outside S3.
 
-## Independent-review corrections
+## First-review corrections (d585c3af8 baseline)
 
 The preview cancellation bug came from removing the pending receiver without retiring the request in `RawPageStore`. `cancel_fs_page_load` now owns both operations in paged and continuous prefetch, including animation-promotion cleanup. The equivalent held-page-turn deferral also uses that boundary. Resolving sources are discarded, Requested previews return to NotRequested, and re-entry allocates a fresh request ID. Completed receivers still disarm their ticket without cancellation so backlog uploads remain valid. The regressions exercise both prefetch routes before/after info, reject superseded info, re-enter the page through the real producer, and cover held-page-turn deferral.
 
@@ -14,17 +14,27 @@ The new layout regression draws through App's fullscreen state, single-page pain
 
 No new design decision was needed. The only extension to the review directions is applying the same cancellation boundary to held-page-turn deferral, found by auditing equivalent receiver-removal paths. The render/settings/backlog findings were missing coverage of already-connected behavior; mutation checks validate that the new tests detect removal of those connections, rather than changing correct behavior to manufacture a baseline failure.
 
+## Second re-review corrections (uncommitted)
+
+The remaining repaint finding is fixed in `src/ui_fullscreen.rs:38265`: a developing PreviewShown page requiring colorization/LUT waits for input when no faithful rendition is cached and either the catalog texture or catalog pixels are missing. The same predicate already serves deferred processing, selected processing and pending display work. Both inputs present keeps the existing bounded rendition admission. Non-RAW behavior, workers, ownership, navigation and viewport paths are unchanged. `docs/async-architecture.md:566` records this distinction.
+
+The actual-draw regression `src/ui_fullscreen.rs:48351` covers colorization and LUT with both catalog inputs missing, either input missing, and both present. It measures the real repaint request and verifies ready catalog inputs still produce a processed rendition. On unchanged HEAD it failed with 16ms versus 100ms (0 passed / 1 failed); after the predicate correction it passed. This addresses remaining finding 4 without a timer-based correctness mechanism.
+
+The preferences regression `src/ui_dialogs/preferences.rs:3536` now locates the actual RAW DragValue by its 1..10 range, focuses its editor, types 1 and blurs through the brightness control. It checks the changed draft and unchanged committed setting/executor before clicking OK, then checks commit, save/load, reopen, executor desired parallelism and source invalidation, including executor shutdown failure. The correct production widget needed no change. A temporary mutation disconnected its binding (`src/ui_raw.rs:35`); the strengthened regression failed with draft 3 versus typed 1 (0 passed / 1 failed), while the real binding passed. The widget was restored byte-for-byte. This addresses remaining finding 5 at the actual input boundary; no correct behavior was changed to manufacture a pre-fix failure.
+
+Current files changed: `src/ui_fullscreen.rs`, `src/ui_dialogs/preferences.rs`, `docs/async-architecture.md`, and this report. No settings schema, snapshot PNG, RAW/Remote shared type, detached predicate or viewport path changed. No design deviation or further decision was required. Affected verification is recorded below.
+
 ## Approved Blocked-preview behavior (7.10 K)
 
 The previous failing regression exposed a validated preview with failed catalog thumbnail, blocked development and a final-effect gate that could never complete. The lead resolved this with K: Blocked development is processing-unavailable, and the embedded preview is displayed unchanged regardless of catalog rendition availability.
 
 `src/app/raw_page_store.rs:2266` derives `raw_development_blocked` from the owner development axis in one place. The shared color/LUT gate (`src/ui_fullscreen.rs:9618`) excludes it. Both texture resolvers (`:9372`, `:10630`) select the original preview before processed caches. The shared rendition getters (`src/app.rs:80775`, `:81062`) return that same preview for Blocked pages, covering held paging and atomic spread/continuous rendition requests, and paint-time post filters (`:9496`) are bypassed for that preview texture; an unrelated JPEG holdover sharing the idx retains its existing filtering. The existing status overlay and edit notice use the same Japanese notice (`src/ui_raw.rs:4`, `src/app/raw_page_store.rs:2604`). No worker, time window or navigation release path was added. Failed returning to Idle during the existing brightness transaction restores the normal gate.
 
-The replacement regression (`src/ui_fullscreen.rs:48575`) covers Unsupported/Failed, failed/available catalog thumbnails (including a warm rendition), colorization/LUT/disabled effects, single/spread/continuous modes, normal and forced-rendition navigation retirement by actual preview presentation, folder-lock readiness, the notice, paint-time filtering with unchanged JPEG holdovers, edit prohibition and Failed-to-Idle gate restoration. Its latest result is recorded below.
+The replacement regression (`src/ui_fullscreen.rs:48718`) covers Unsupported/Failed, failed/available catalog thumbnails (including a warm rendition), colorization/LUT/disabled effects, single/spread/continuous modes, normal and forced-rendition navigation retirement by actual preview presentation, folder-lock readiness, the notice, paint-time filtering with unchanged JPEG holdovers, edit prohibition and Failed-to-Idle gate restoration. Its latest result is recorded below.
 
 ## Original S3 files (review baseline)
 
-The uncommitted review diff changes nine files: `src/app.rs`, `src/app/raw_page_store.rs`, `src/raw/executor.rs`, `src/raw/raw_decoder.rs`, `src/ui_dialogs/preferences.rs`, `src/ui_fullscreen.rs`, `docs/async-architecture.md`, `docs/display-pipeline.md`, and this report. The executor addition is a test-only desired-parallelism accessor. No snapshot PNG or settings schema changed. The original S3 inventory below is retained as baseline context.
+The first-review correction committed in `d585c3af8` changed nine files: `src/app.rs`, `src/app/raw_page_store.rs`, `src/raw/executor.rs`, `src/raw/raw_decoder.rs`, `src/ui_dialogs/preferences.rs`, `src/ui_fullscreen.rs`, `docs/async-architecture.md`, `docs/display-pipeline.md`, and this report. The executor addition is a test-only desired-parallelism accessor. No snapshot PNG or settings schema changed. The original S3 inventory below is retained as baseline context.
 
 `docs/async-architecture.md`, `docs/detached-rework-plan.md`, `docs/display-pipeline.md`, `docs/raw-libraw-s3-implementation.md`, `docs/spec.md`, `src/app.rs`, `src/app/collection_navigation.rs`, `src/app/raw_page_store.rs`, `src/app/snapshot_ops.rs`, `src/app/test_script_support.rs`, `src/app/tests.rs`, `src/app/viewer_context_registry.rs`, `src/app/vram_accounting.rs`, `src/cache_maintenance.rs`, `src/canonical_image_loader.rs`, `src/creative_lut.rs`, `src/external_tool.rs`, `src/fs_animation.rs`, `src/fs_page_load_scheduler.rs`, `src/lib.rs`, `src/materializer.rs`, `src/pipeline_debug.rs`, `src/raw/executor.rs`, `src/raw/mod.rs`, `src/raw/raw_decoder.rs`, `src/test_script.rs`, `src/test_script/pointer_input.rs`, `src/tray_integration.rs`, `src/ui_adjustment_panel.rs`, `src/ui_analysis_panel.rs`, `src/ui_conceal.rs`, `src/ui_crop.rs`, `src/ui_dialogs/preferences.rs`, `src/ui_dialogs/preferences/pages.rs`, `src/ui_dialogs/preferences/search_index.rs`, `src/ui_erase.rs`, `src/ui_fullscreen.rs`, `src/ui_raw.rs`, `src/ui_sns_split.rs`, `src/ui_text.rs`, `tests/snapshots/preferences_parallelism_pdf_count.png`, `tests/snapshots/raw_progress_dark.png`, `tests/snapshots/raw_settings_dark.png`, `tests/snapshots/raw_settings_light.png`, `tests/ui_snapshot.rs`, `tests/snapshots/raw_blocked_preview_notice_dark.png`.
 
@@ -34,11 +44,11 @@ Review-fix anchors (current tree):
 
 | Finding | Fix and failing regression |
 | --- | --- |
-| Preview cancellation / re-entry | `src/app/raw_page_store.rs:1962`: shared receiver/ticket/owner cancellation; `src/app.rs:67454`, `:67495` and `src/ui_fullscreen.rs:37762`, `:37784`: both prefetch routes; `src/app.rs:73849`: held-page-turn deferral. Real-path tests: `src/ui_fullscreen.rs:48140`, `:48145`, `src/app/raw_page_store.rs:1154`. |
-| Screen filters on embedded preview | `src/ui_fullscreen.rs:9496`: texture identity bypass independent of Blocked. Supported-preview/rendition regression `:48229`; existing K matrix also protects JPEG holdovers. |
+| Preview cancellation / re-entry | `src/app/raw_page_store.rs:1962`: shared receiver/ticket/owner cancellation; `src/app.rs:67454`, `:67495` and `src/ui_fullscreen.rs:37762`, `:37784`: both prefetch routes; `src/app.rs:73849`: held-page-turn deferral. Real-path tests: `src/ui_fullscreen.rs:48157`, `:48162`, `src/app/raw_page_store.rs:1154`. |
+| Screen filters on embedded preview | `src/ui_fullscreen.rs:9496`: texture identity bypass independent of Blocked. Supported-preview/rendition regression `:48246`; existing K matrix also protects JPEG holdovers. |
 | Offscreen completion synchronous correction/upload | `src/app/raw_page_store.rs:2068`: same current-page condition as ordinary image completion. Regression `:1118` covers excluded prefetch and preserved current behavior. |
-| Continuous repaint cadence | `src/ui_fullscreen.rs:38027`, `:38067`, `:38142`, `:38251`, `:38265`: exclude RAW development waits from next-frame work and request 100ms if current development is the only pending work. Actual-draw regression `:48271`; predicted frame time is zero in the fixture so the requested interval is measured directly. |
-| Missing production connections/backlog coverage | `src/ui_fullscreen.rs:48334`: App state and real single/Z/spread/continuous paint, canonical dimensions and final-cache selection. `src/ui_dialogs/preferences.rs:3536`: actual edit/OK/save/reload/reopen, executor update/error and source invalidation. `src/app/raw_page_store.rs:1211`: actual poll/upload admission in both backlog orders and late preview after Full installation. |
+| Continuous repaint cadence | `src/ui_fullscreen.rs:38027`, `:38067`, `:38142`, `:38251`, `:38265`: exclude RAW development waits from next-frame work and request 100ms if current development is the only pending work. Actual-draw regression `:48288`; predicted frame time is zero in the fixture so the requested interval is measured directly. |
+| Missing production connections/backlog coverage | `src/ui_fullscreen.rs:48477`: App state and real single/Z/spread/continuous paint, canonical dimensions and final-cache selection. `src/ui_dialogs/preferences.rs:3536`: actual edit/OK/save/reload/reopen, executor update/error and source invalidation. `src/app/raw_page_store.rs:1211`: actual poll/upload admission in both backlog orders and late preview after Full installation. |
 | Unpack label | `src/raw/raw_decoder.rs:7`: shared 35 boundary used by callback mapping; `src/app/raw_page_store.rs:2604`: typed ticket plus interval label. Channel-controlled Running-ticket regression `:1184`. |
 
 The original A–K/6/7 implementation and complete consumer inventory follow with references refreshed for this diff.
@@ -73,13 +83,13 @@ The references below describe the current diff, not the historical line numbers 
 | Folder-move lock | Same RAW readiness predicate; validated preview or faithful rendition releases lock before full development according to the shared color gate; Blocked uses unchanged preview, and Terminal releases the lock; `src/ui_fullscreen.rs:11810`. |
 | Pass-through / faithful rendition | Validation gate precedes thumbnail/pixel lookup and cached rendition lookup; Blocked returns the unchanged preview before either lookup, including forced rendition calls; display-only output, no edit input; `src/app.rs:80775`, `:80858`, `:81062`. |
 | Original-image hold | Valid embedded preview is permitted as display source; gated fallback; `src/ui_fullscreen.rs:10567`. |
-| Loupe / overview navigator | Resolved display source and shared source-coordinate transform; thumbnail fallback is gated; `src/ui_fullscreen.rs:32154`, `:40016`. |
+| Loupe / overview navigator | Resolved display source and shared source-coordinate transform; thumbnail fallback is gated; `src/ui_fullscreen.rs:32154`, `:40033`. |
 | Automatic margin bbox | RawPreview pixels and load sequence; recalculated after replacement; `src/ui_fullscreen.rs:35740`. |
-| Spread dimensions / pairing / cache-presence layout | Canonical owner dimensions, RawPreview dimensions, RAW source-size layout in every stage, including spread offset; `src/ui_fullscreen.rs:16369`, `:40401`. |
+| Spread dimensions / pairing / cache-presence layout | Canonical owner dimensions, RawPreview dimensions, RAW source-size layout in every stage, including spread offset; `src/ui_fullscreen.rs:16369`, `:40418`. |
 | Edit result, erase, local adjustment, conceal, saved masks, synchronous adjustment, final composite, final AI and AI prefetch | Source pixels remain Static-only. RAW preview cannot enter these pipelines. AI prefetch indicators exclude RAW outside its development demand; `src/app.rs:72281`, `:72560`, `:78366`. |
-| Export / copy / fullscreen comparison capture | Existing complete-final requirement retained; RAW preview cannot satisfy it; `src/ui_fullscreen.rs:45814`. |
-| Grid comparison pin | RAW source is developed High while pending; Terminal reports failure; `src/app.rs:41547`, `src/ui_fullscreen.rs:44075`. |
-| Comparison source preparation | Waits for development as well as fs_pending; `src/ui_fullscreen.rs:38449`. |
+| Export / copy / fullscreen comparison capture | Existing complete-final requirement retained; RAW preview cannot satisfy it; `src/ui_fullscreen.rs:45831`. |
+| Grid comparison pin | RAW source is developed High while pending; Terminal reports failure; `src/app.rs:41547`, `src/ui_fullscreen.rs:44092`. |
+| Comparison source preparation | Waits for development as well as fs_pending; `src/ui_fullscreen.rs:38466`. |
 | Panorama | Static-only detection and canonical dimensions; full development uses existing high-resolution tee and page-local invalidation; `src/app/raw_page_store.rs:1905`, `:2114`. |
 | Analysis / histogram | Static-only; preview stage displays Japanese development-wait text; `src/ui_analysis_panel.rs:1096`. |
 | Color-search palette | Existing Static-only source unchanged; no palette cached from preview; `src/app/color_filter.rs:120`. |
@@ -105,21 +115,48 @@ No unapproved design deviation is intended; approved 7.10 J and K are part of th
 | --- | --- |
 | 15 / E: monotonic stages, early Full, identity, cancellation and isolation | `src/app/raw_page_store.rs:781`, `:810`, `:958`, `:1026`, `:1554`; dimensions/result rejection precedes allocation, late preview cannot replace Static, park/cancel/drop reject completion without affecting siblings. |
 | A: corrupt/orientation-rejected/no preview with warm half thumbnail | `src/app/raw_page_store.rs:849`, `:1283`; all display/rendition paths reject fallback until decoded preview validation. |
-| B / 7.5: clamped layout through preview/develop/final | `raw_canonical_layout_survives_preview_clamped_develop_and_final_in_all_fit_modes` in `src/ui_fullscreen.rs:48906`; fit, Original, Z, pan, rotation and singleton spread are compared at canonical 12000 x 8000 dimensions. |
+| B / 7.5: clamped layout through preview/develop/final | `raw_canonical_layout_survives_preview_clamped_develop_and_final_in_all_fit_modes` in `src/ui_fullscreen.rs:49049`; fit, Original, Z, pan, rotation and singleton spread are compared at canonical 12000 x 8000 dimensions. |
 | C: prefetch 0/1, distant cover, every continuous visible page | `src/app/raw_page_store.rs:1048`, `:1501`; displayed High demand and union retention survive narrow keep settings. |
 | D / I: independent brightness transitions, pending upload, preparing and parked | `src/app/raw_page_store.rs:896`, `:945`, `:1463`, `:1794`; every preview axis is preserved, brightness-specific failure returns to Idle, mounted/parked transactions and processed holdovers cover single/spread/continuous color/LUT modes. |
 | F: overwrite, superseded Stale, retained cached/running RAW AI and surviving JPEG | `src/app/raw_page_store.rs:994`, `:1362`, `:1392`, `:1535`; worker stat, request identity, atomic snapshot transfer and page-local retained-key validation. |
-| G / 15: typed navigation, terminal RAW, actual presentation and folder locks | `src/app/raw_page_store.rs:1611`, `:1717`; absent-preview navigation regression (`src/ui_fullscreen.rs:48817`) and K regression (`:48575`); scheduler LatestSeek regression preserves both RAW request purposes and sibling contexts. |
+| G / 15: typed navigation, terminal RAW, actual presentation and folder locks | `src/app/raw_page_store.rs:1611`, `:1717`; absent-preview navigation regression (`src/ui_fullscreen.rs:48960`) and K regression (`:48718`); scheduler LatestSeek regression preserves both RAW request purposes and sibling contexts. |
 | H: materializer request brightness and stale cached rendition prevention | `src/materializer.rs:1756` RAW brightness/cache-key fixture checks distinct output and same-key reuse without launching an external application. |
 | I: partial spawn failure and typed ticket progress | Fake executor transaction/state tests in `src/raw/executor.rs:969`; raw progress/preferences snapshot tests use shared UI helpers. |
 | J / 15: resolved edit target and mutation order | `src/app/raw_page_store.rs:1330`, `:1763`; all six tools, in-tool switches and JPEG anchor with undeveloped RAW spread partner. Script feature regression distinguishes page_ready from edit_ready. |
-| K: blocked preview exception and gate restoration | `src/ui_fullscreen.rs:48575`; complete effect/catalog/mode/block-reason matrix, existing navigation presentation retirement, folder lock, unchanged preview, post-filter bypass and edit notices. `tests/ui_snapshot.rs` adds the shared blocked-preview overlay PNG. |
+| K: blocked preview exception and gate restoration | `src/ui_fullscreen.rs:48718`; complete effect/catalog/mode/block-reason matrix, existing navigation presentation retirement, folder lock, unchanged preview, post-filter bypass and edit notices. `tests/ui_snapshot.rs` adds the shared blocked-preview overlay PNG. |
 
-## Review verification
+## Second re-review verification
+
+All Cargo commands used `MSBUILDDISABLENODEREUSE=1`. Counts below are real reruns on this correction; overlapping filters are not summed. The new repaint test failed on HEAD (0/1), the numeric-control test passed with the correct binding (1/0) and failed with the disconnected-binding mutation (0/1). Both tests pass in the affected suites below. The production control was restored byte-for-byte before the final source checks. No command was interrupted by a timeout.
+
+| Command / filter | Actual result |
+| --- | --- |
+| `cargo test -p mimageviewer --lib raw_rereview_continuous_preview_effect_wait -- --test-threads=1` | 1 passed, 0 failed; eight effect/catalog combinations |
+| `cargo test -p mimageviewer --lib ui_fullscreen::tests:: -- --test-threads=1` | 630 passed, 0 failed, 1 ignored |
+| `cargo test -p mimageviewer --lib ui_dialogs::preferences:: -- --test-threads=1` | 70 passed, 0 failed |
+| `cargo test -p mimageviewer --lib raw_review_ -- --test-threads=1` | 10 passed, 0 failed; includes strengthened numeric-input regression |
+| `cargo test -p mimageviewer --lib raw_page_store -- --test-threads=1` | 27 passed, 0 failed |
+| `cargo test -p mimageviewer --lib passthrough -- --test-threads=1` | 18 passed, 0 failed |
+| `cargo test -p mimageviewer --lib settings:: -- --test-threads=1` | 260 passed, 0 failed, 12 ignored |
+| `cargo test -p mimageviewer --lib raw:: -- --test-threads=1` | 63 passed, 0 failed |
+| `cargo test --test ui_snapshot -- --test-threads=1` | 59 passed, 0 failed; no PNG changes |
+| `cargo test -p libraw-sys` | 3 passed, 0 failed; 0 doctests |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | Exit 0 |
+| `cargo check --bin mimageviewer-core --features portable` | Exit 0 |
+| `cargo clippy -p mimageviewer --lib --tests` | Exit 0; unchanged 1,925 lib-test warnings (1,489 duplicates) |
+| `.\scripts\test-full.ps1` | Exit 0 / PASS; **11,099 passed, 0 failed, 57 ignored**, across 59 top-level Cargo suites. Main library: 10,048 passed / 51 ignored. Workspace: 11,049 passed; vendor egui / egui-wgpu / eframe: 25 / 9 / 16 passed. Two nested child-harness results are excluded. |
+| `cargo fmt --check`, `git diff --check` | Exit 0 |
+| `python scripts/check_ui_glyphs.py` | Exit 0; zero dangerous UI glyphs |
+
+Logs are `target/s3-rereview-*.log`; RAW dark settings/progress PNGs were visually reviewed again. The unaffected App tests were not repeated as a separate targeted command; their earlier result is retained below and the complete gate exercises them on the final tree. All three prerequisite release executables already existed. No build-dev, commit or product launch occurred.
+
+Full-gate evidence: `target/s3-rereview-full-summary.log` records all 59 top-level suite headers and final results; `target/s3-rereview-full-native.log` contains captured native output, and `target/s3-rereview-full-transcript.log` records the PowerShell invocation. The full gate covered the final source tree; subsequent changes only completed this report.
+
+## First-review verification (d585c3af8)
 
 All Cargo commands set `MSBUILDDISABLENODEREUSE=1`. The first reviewed-code bug run failed all five new regressions (0 passed / 5 failed), before the fixes. After adding real-path coverage, a temporary mutation restored the reviewed bugs, omitted layout/settings connections and removed late-preview guards: all ten regressions failed (0 passed / 10 failed). All three mutated source files were restored byte-for-byte before running the suites below. No verification command was interrupted by a timeout.
 
-| Command / filter | Current result |
+| Command / filter | Baseline result |
 | --- | --- |
 | `cargo test -p mimageviewer --lib raw_review_ -- --test-threads=1` | 10 passed, 0 failed |
 | `cargo test -p mimageviewer --lib raw:: -- --test-threads=1` | 63 passed, 0 failed |
@@ -140,7 +177,7 @@ All Cargo commands set `MSBUILDDISABLENODEREUSE=1`. The first reviewed-code bug 
 | `cargo fmt --check`, `git diff --check` | Exit 0 |
 | `python scripts/check_ui_glyphs.py` | Exit 0; zero dangerous UI glyphs |
 
-Logs are `target/s3-review-*.log`. RAW progress and dark settings PNGs were visually reviewed again; no expected PNG changed. The preferences test includes real UI control editing and the OK commit path, rather than a direct settings assignment. The layout test repeats source cycles through the existing invalidation transaction; differing preview aspect ratios retain the explicitly permitted contain difference in §7.5. Initial compile/fixture failures (test-only visibility/default executor size, egui maximum texture size and predicted frame time, stale fixture edit textures, and the contain exception) were corrected before the successful suites.
+Logs are `target/s3-review-*.log`. RAW progress and dark settings PNGs were visually reviewed again; no expected PNG changed. That preferences test exercised brightness and OK but still assigned draft parallelism directly; the re-review correction replaces that assignment with actual numeric control input. The layout test repeats source cycles through the existing invalidation transaction; differing preview aspect ratios retain the explicitly permitted contain difference in §7.5. Initial compile/fixture failures (test-only visibility/default executor size, egui maximum texture size and predicted frame time, stale fixture edit textures, and the contain exception) were corrected before the successful suites.
 
 Final full-gate evidence: `target/s3-review-full-summary.log` records the 59 suite headers/results and reconciled totals; `target/s3-review-full-native.log` records captured native output; `target/s3-review-full-transcript.log` records the PowerShell invocation. The required release core/remote/epub-pdf executables already existed. No build-dev or product launch occurred. After removing the two test-only style warnings, the focused ten regressions and clippy were rerun successfully; the full gate then covered the final source tree.
 
@@ -181,8 +218,10 @@ Earlier iterations included corrected compile errors and fixture failures: owner
 
 ## Open work
 
-Independent re-review of this uncommitted diff and real-device verification remain pending. All requested automated gates passed; there is no known unresolved review finding or required new design decision. The design lead owns build-dev after review, per the explicit handoff instruction. The review fixes follow the requested directions, with the equivalent held-page-turn cancellation route included in the ownership audit. The forced-rendition correction in the baseline implements existing K and adds no navigation exception.
+Independent re-review of this uncommitted diff and real-device verification remain pending. All requested automated gates passed; there is no known unresolved review finding or required new design decision. The design lead owns build-dev after review, per the explicit handoff instruction. Both remaining corrections follow the requested directions: the existing input-wait predicate now includes gated PreviewShown pages, and the preferences regression uses the real numeric editor. The production numeric control was already correct, so only its coverage changed. The equivalent held-page-turn cancellation route and forced-rendition correction remain in the accepted baseline.
 
 ## Real-device verification
 
 No product binary was launched. These checks remain pending after independent review and the design lead's verification build. Verify a large RAW folder with warm half-developed thumbnails, missing/corrupt/orientation-rejected previews, rapid paging with parallelism 1 and 3, distant cover/spread partners and multiple continuous pages, Original/Z/pan/rotation across preview/develop/final, colorization/LUT plus brightness changes, edit availability, physical overwrite during development, and independent viewer contexts. Remote and binding remain manual regression scenarios from the plan.
+
+For this re-review, specifically check continuous reading with colorization/LUT while a validated RAW preview is developing and catalog inputs have not arrived: progress should refresh at 100ms without a 16ms idle loop, and the faithful rendition should appear when its inputs arrive. Edit the actual simultaneous-development numeric control from 3 to 1, click OK, reopen/restart and confirm persistence and the changed executor limit while jobs are active.

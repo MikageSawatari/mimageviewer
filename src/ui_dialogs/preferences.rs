@@ -3578,14 +3578,43 @@ mod tests {
             harness.run();
             harness.get_by_label("補正しない").click();
             harness.run();
+            // Select the actual RAW DragValue by its unique allowed range, focus
+            // its numeric editor, and replace the selected text. No draft writes.
             harness
-                .state_mut()
-                .pref_state
-                .as_mut()
-                .unwrap()
-                .settings
-                .raw_develop_parallelism = 1;
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0) && node.max_numeric_value() == Some(10.0)
+                })
+                .focus();
             harness.run();
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0) && node.max_numeric_value() == Some(10.0)
+                })
+                .type_text("1");
+            harness.run();
+            harness.get_by_label("補正しない").click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .raw_develop_parallelism,
+                1
+            );
+            assert_eq!(
+                harness.state().settings.raw_develop_parallelism,
+                old_parallelism
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .raw_develop_executor
+                    .desired_parallelism_for_test(),
+                old_parallelism as usize
+            );
             assert_eq!(
                 harness.state().settings.raw_brightness,
                 RawBrightness::MatchPreview

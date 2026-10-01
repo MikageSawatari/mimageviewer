@@ -563,7 +563,7 @@ worker は info / preview / develop の前後、および executor が queued so
 
 現在ページの現像中だけ 100ms の repaint を要求し、queued / running / cancelling は `RawTicketState` で区別する。RAW source preparation と preview は既存の読み込み経路、完了は worker の repaint 通知で進む。
 
-連結読みでも、表示可能な画素を待つ RAW の現像待ちは次フレームで進める処理の集合から外す。通常画像の読み込みや処理待ちがあれば従来の 16ms、RAW 現像待ちだけなら現在ページの 100ms を使う。Running の進捗 0〜34 は source の open / unpack 区間なので「読み込み中」、処理区間の 35 以降は「現像中 NN%」とする。画面外の RAW Full 完了は source texture の bounded upload だけを行い、同期の色調補正・追加 texture 作成を開始しない。表示時の既存 final pipeline が処理を所有する。
+連結読みでも、表示可能な画素を待つ RAW の現像待ちは次フレームで進める処理の集合から外す。PreviewShown でもカラー化 / LUT の色忠実 rendition が必要で、catalog texture と画素のどちらかが未取得なら入力待ちに含める。両方が揃えば既存の 1 ページずつの処理 admission を維持し、thumbnail / 現像の完了通知で入力待ちから復帰する。通常画像の読み込みや処理待ちがあれば従来の 16ms、RAW 現像待ちだけなら現在ページの 100ms を使う。Running の進捗 0〜34 は source の open / unpack 区間なので「読み込み中」、処理区間の 35 以降は「現像中 NN%」とする。画面外の RAW Full 完了は source texture の bounded upload だけを行い、同期の色調補正・追加 texture 作成を開始しない。表示時の既存 final pipeline が処理を所有する。
 
 ### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
 

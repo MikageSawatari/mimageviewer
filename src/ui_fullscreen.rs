@@ -38263,7 +38263,24 @@ impl App {
     }
 
     fn continuous_page_waits_for_raw_development(&self, idx: usize) -> bool {
-        self.raw_current_developing(idx) && self.fs_page_load_state(idx).waiting_for_display()
+        if !self.raw_current_developing(idx) {
+            return false;
+        }
+        if self.fs_page_load_state(idx).waiting_for_display() {
+            return true;
+        }
+        // A validated preview may still need a faithful color/LUT rendition.
+        // Without both catalog inputs the resolver cannot progress next frame;
+        // thumbnail/development completion wakes the UI instead. Ready inputs
+        // retain the existing bounded processing admission.
+        self.raw_page_load_state(idx)
+            == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown)
+            && self.colorize_display_requires_final_effect(idx)
+            && self.cached_passthrough_rendition(idx).is_none()
+            && !(matches!(
+                self.thumbnails.get(idx),
+                Some(ThumbnailState::Loaded { .. })
+            ) && self.thumb_pixels.contains_key(&idx))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -48328,6 +48345,132 @@ mod tests {
             delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         }
         assert_eq!(delay, std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn raw_rereview_continuous_preview_effect_wait_repaints_at_100ms() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPreviewPhase};
+        for effect in 0..2 {
+            // Missing texture, missing pixels, missing both, and ready catalog.
+            for catalog in 0..4 {
+                let ctx = egui::Context::default();
+                let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+                app.items.truncate(1);
+                app.visible_indices = vec![0];
+                app.fullscreen_idx = Some(0);
+                app.reading_flow = ReadingFlow::Vertical;
+                if effect == 0 {
+                    app.settings.global_preset.colorize.mode =
+                        crate::colorize::ColorizeMode::AllImages;
+                } else {
+                    let builtin = crate::creative_lut::BuiltinCreativeLut::WarmFilm;
+                    app.creative_lut_library =
+                        crate::creative_lut::CreativeLutLibrary::from_builtin_for_test(builtin);
+                    app.settings.global_preset.creative_lut =
+                        crate::creative_lut::CreativeLutSelection {
+                            id: Some(builtin.id()),
+                            strength: 1.0,
+                        };
+                }
+                let pixels =
+                    std::sync::Arc::new(egui::ColorImage::filled([3, 2], egui::Color32::GRAY));
+                let preview_tex = ctx.load_texture(
+                    "raw-preview-wait",
+                    pixels.as_ref().clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.thumbnails = vec![ThumbnailState::Pending];
+                if catalog == 1 || catalog == 3 {
+                    let tex = ctx.load_texture(
+                        "raw-catalog-wait",
+                        pixels.as_ref().clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    app.thumbnails[0] = ThumbnailState::Loaded {
+                        tex,
+                        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                            evaluated_display_px: 3,
+                        },
+                        from_edit_preview: false,
+                        rendered_at_px: 3,
+                        source_dims: Some((12000, 8000)),
+                        layout_dims: None,
+                    };
+                }
+                if catalog == 2 || catalog == 3 {
+                    app.thumb_pixels.insert(0, pixels.clone());
+                }
+                let scheduler =
+                    crate::fs_page_load_scheduler::FsPageLoadScheduler::with_limits(1, 0);
+                let ticket = scheduler.request(
+                    11,
+                    0,
+                    crate::fs_page_load_scheduler::FsPageLoadPriority::High,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    None,
+                    0,
+                );
+                let page = app.raw_pages.page_mut(0).unwrap();
+                page.stage = RawInstalledStage::PreviewShown;
+                page.preview = RawPreviewPhase::Done;
+                *page.develop.lock().unwrap() = RawDevelopPhase::Preparing {
+                    request_id: 10,
+                    cancel: std::sync::Arc::new(std::sync::Mutex::new(ticket)),
+                    highest_priority: crate::raw::RawPriority::High,
+                    brightness: crate::raw::RawBrightness::MatchPreview,
+                };
+                app.fs_cache.insert(
+                    0,
+                    FsCacheEntry::RawPreview {
+                        preview: Some(crate::fs_animation::RawPreviewTexture {
+                            tex: preview_tex.clone(),
+                            pixels,
+                        }),
+                        developed_dims: [12000, 8000],
+                        load_seq: 1,
+                    },
+                );
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+                let mut delay = std::time::Duration::ZERO;
+                for frame in 0..4 {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(rect),
+                            time: Some(frame as f64),
+                            predicted_dt: 0.0,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    rect,
+                                    0,
+                                    false,
+                                    FsPageTurnDecision::normal(),
+                                );
+                            });
+                        },
+                    );
+                    delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                }
+                assert_eq!(
+                    delay,
+                    std::time::Duration::from_millis(100),
+                    "effect={effect}, catalog={catalog}"
+                );
+                if catalog == 3 {
+                    let rendition = app
+                        .cached_passthrough_rendition(0)
+                        .expect("ready catalog must still be processed by actual drawing");
+                    assert_ne!(rendition.id(), preview_tex.id());
+                    assert!(app.vertical_reading_processed_texture_cached(0));
+                } else {
+                    assert!(app.cached_passthrough_rendition(0).is_none());
+                }
+            }
+        }
     }
 
     #[test]
