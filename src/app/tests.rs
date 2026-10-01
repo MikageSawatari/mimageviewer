@@ -19,6 +19,243 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+mod folder_mtime_rescan_tests {
+    use super::phase_c_support::{AppTestEnv, setup_app};
+    use super::*;
+    use folder_scan::signature_tests::{fixture, real_changes};
+
+    fn prepare() -> (AppTestEnv, PathBuf) {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("folder_mtime_rescan");
+        std::fs::create_dir(&folder).unwrap();
+        let scan = fixture(&folder);
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(signature_from_scan(&scan));
+        app.items = scan
+            .folders
+            .iter()
+            .map(|entry| entry.item.clone())
+            .chain(scan.all_media.iter().map(|entry| match entry.kind {
+                folder_scan::ScanMediaKind::Image => GridItem::Image(entry.path.clone()),
+                folder_scan::ScanMediaKind::Video => GridItem::Video(entry.path.clone()),
+                folder_scan::ScanMediaKind::Audio => GridItem::Audio(entry.path.clone()),
+            }))
+            .collect();
+        app.image_metas = scan
+            .folders
+            .iter()
+            .map(|entry| entry.display_meta)
+            .chain(
+                scan.all_media
+                    .iter()
+                    .map(|entry| Some((entry.mtime, entry.file_size))),
+            )
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.thumbnails[0] = mutation_refresh_loaded_thumb(&egui::Context::default());
+        app.thumbnails[1] = ThumbnailState::Evicted;
+        app.thumbnails[2] = ThumbnailState::Failed;
+        app.visible_indices = vec![5, 0, 2];
+        app.details_lazy_meta.insert(
+            "sentinel".into(),
+            DetailsLazyMeta {
+                source_mtime: 10,
+                source_size: 20,
+                page_count: Some(7),
+                ..Default::default()
+            },
+        );
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                item_id: app.item_id(5),
+                items_generation: app.items_generation,
+                idx: 5,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 42,
+            bg: 0,
+        };
+        app.insert_retained_final_ai(
+            5,
+            key,
+            [1, 1],
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        );
+        assert!(
+            !app.retained_final_ai_cache.is_empty(),
+            "fixture must populate the retained cache"
+        );
+        (app, folder)
+    }
+
+    fn folder_mtime_changed(folder: &Path) -> folder_scan::ScannedDir {
+        let mut scan = fixture(folder);
+        scan.folders[0].display_meta = Some((11, 0));
+        scan.folders[0].sort_meta = crate::settings::ListingSortMetadata::new(11, None);
+        scan
+    }
+
+    #[test]
+    fn folder_mtime_only_rescan_preserves_listing_and_advances_applied_stamps() {
+        let (mut app, folder) = prepare();
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        let items_ptr = app.items.as_ptr();
+        let metas = app.image_metas.clone();
+        let metas_ptr = app.image_metas.as_ptr();
+        let thumbs_ptr = app.thumbnails.as_ptr();
+        let texture_id = match &app.thumbnails[0] {
+            ThumbnailState::Loaded { tex, .. } => tex.id(),
+            _ => unreachable!(),
+        };
+        let old_sig = app.current_folder_signature;
+        let scan = folder_mtime_changed(&folder);
+        let new_sig = signature_from_scan(&scan);
+        assert_ne!(old_sig, Some(new_sig));
+        let parent_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        app.apply_external_rescan(folder.clone(), parent_mtime, scan, new_sig);
+
+        assert_eq!(app.current_folder_signature, Some(new_sig));
+        assert_eq!(app.current_folder_last_mtime, Some(parent_mtime));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items, items);
+        assert_eq!(app.items.as_ptr(), items_ptr);
+        assert_eq!(app.image_metas, metas);
+        assert_eq!(app.image_metas.as_ptr(), metas_ptr);
+        assert_eq!(app.thumbnails.as_ptr(), thumbs_ptr);
+        assert!(
+            matches!(&app.thumbnails[0], ThumbnailState::Loaded { tex, .. } if tex.id() == texture_id)
+        );
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Evicted));
+        assert!(matches!(app.thumbnails[2], ThumbnailState::Failed));
+        assert!(
+            app.thumbnails[3..]
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::Pending))
+        );
+        assert_eq!(app.visible_indices, vec![5, 0, 2]);
+        assert_eq!(app.details_lazy_meta["sentinel"].page_count, Some(7));
+        assert_eq!(app.details_lazy_meta["sentinel"].source_mtime, 10);
+        assert!(!app.retained_final_ai_cache.is_empty());
+        assert!(app.folder_refresh_pending.is_none());
+
+        // Every real change still reloads after acknowledging the folder-only stamp.
+        let mut real = folder_mtime_changed(&folder);
+        real.all_media[0].file_size += 1;
+        let signature = signature_from_scan(&real);
+        app.apply_external_rescan(folder, parent_mtime, real, signature);
+        assert_ne!(app.items_generation, generation);
+        assert_eq!(app.current_folder_signature, Some(signature));
+        assert!(app.retained_final_ai_cache.is_empty());
+    }
+
+    #[test]
+    fn folder_mtime_rescan_real_changes_still_fully_reload() {
+        let (mut app, folder) = prepare();
+        for (label, scan) in real_changes(&folder) {
+            app.current_folder_signature = Some(signature_from_scan(&fixture(&folder)));
+            let generation = app.items_generation;
+            let signature = signature_from_scan(&scan);
+            app.apply_external_rescan(
+                folder.clone(),
+                std::time::SystemTime::now(),
+                scan,
+                signature,
+            );
+            assert_ne!(app.items_generation, generation, "{label}");
+            assert_eq!(app.current_folder_signature, Some(signature), "{label}");
+        }
+    }
+
+    #[test]
+    fn folder_mtime_rescan_keeps_existing_deferred_real_change() {
+        let (mut app, folder) = prepare();
+        let initial = app.current_folder_signature;
+        app.fullscreen_idx = Some(5);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        let mut real = fixture(&folder);
+        real.all_media[0].mtime += 1;
+        let signature = signature_from_scan(&real);
+        app.apply_external_rescan(
+            folder.clone(),
+            std::time::SystemTime::now(),
+            real,
+            signature,
+        );
+        assert_eq!(app.folder_refresh_pending, Some(folder.clone()));
+        assert_eq!(app.current_folder_signature, initial);
+        let generation = app.items_generation;
+        let scan = folder_mtime_changed(&folder);
+        let signature = signature_from_scan(&scan);
+        app.apply_external_rescan(
+            folder.clone(),
+            std::time::SystemTime::now(),
+            scan,
+            signature,
+        );
+        assert_eq!(app.current_folder_signature, Some(signature));
+        assert_eq!(app.folder_refresh_pending, Some(folder));
+        assert_eq!(app.fullscreen_idx, Some(5));
+        assert_eq!(app.items_generation, generation);
+    }
+
+    #[test]
+    fn folder_mtime_rescan_rejected_completions_do_not_advance_stamps() {
+        let (mut app, folder) = prepare();
+        let signature = app.current_folder_signature;
+        let mtime = app.current_folder_last_mtime;
+        let ctx = egui::Context::default();
+        for case in ["failed", "stale", "other owner", "other folder", "accepted"] {
+            let scan = folder_mtime_changed(&folder);
+            let new_signature = signature_from_scan(&scan);
+            let (tx, rx) = mpsc::channel();
+            tx.send(if case == "failed" {
+                None
+            } else {
+                Some((scan, new_signature))
+            })
+            .unwrap();
+            app.external_rescan_pending = Some(ExternalRescanPending {
+                owner_context_id: if case == "other owner" {
+                    ViewerContextId::for_test(u64::MAX)
+                } else {
+                    app.edit_request_owner_context()
+                },
+                folder: if case == "other folder" {
+                    folder.join("other")
+                } else {
+                    folder.clone()
+                },
+                mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+                items_generation: app.items_generation + u64::from(case == "stale"),
+                scan_options: ExternalRescanOptions {
+                    include_convertible_archives: true,
+                    include_epub: true,
+                    show_hidden_files: false,
+                },
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                restart_requested: false,
+            });
+            let generation = app.items_generation;
+            app.poll_external_rescan(&ctx);
+            assert_eq!(app.items_generation, generation, "{case}");
+            if case == "accepted" {
+                assert_eq!(app.current_folder_signature, Some(new_signature));
+                assert_ne!(app.current_folder_last_mtime, mtime);
+            } else {
+                assert_eq!(app.current_folder_signature, signature, "{case}");
+                assert_eq!(app.current_folder_last_mtime, mtime, "{case}");
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn send_activation_open_path(app: &App, path: PathBuf) {
     app.activation_open_path_tx
@@ -27547,7 +27784,7 @@ fn begin_detached_bookmark_media_test(
         )]),
     )));
     app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-    app.current_folder_signature = Some(0xCAFE);
+    app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0xCAFE));
 
     assert!(app.open_bookmark_media_in_detached_context(
         &egui::Context::default(),
@@ -27595,7 +27832,10 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             app.current_folder_last_mtime,
             Some(std::time::SystemTime::UNIX_EPOCH)
         );
-        assert_eq!(app.current_folder_signature, Some(0xCAFE));
+        assert_eq!(
+            app.current_folder_signature,
+            Some(folder_scan::FolderScanSignature::for_test(0xCAFE))
+        );
         app.with_active_viewer_context(|active| {
             assert!(
                 !active
@@ -44649,7 +44889,8 @@ mod favorite_adjustment_defaults_tests {
         std::fs::write(&target_path, b"dummy").unwrap();
 
         app.current_folder = Some(folder.clone());
-        app.current_folder_signature = Some(0xDEAD_BEEF);
+        app.current_folder_signature =
+            Some(folder_scan::FolderScanSignature::for_test(0xDEAD_BEEF));
         app.items.push(GridItem::Image(target_path.clone()));
         app.thumbnails.push(ThumbnailState::Pending);
         app.rating_cache.insert(0, 5);
@@ -52088,7 +52329,7 @@ mod pipeline_cache_refactor_tests {
 
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
 
         // 先に画面を静止させる。起床要求が残っていると、この検査が意味を失う。
         for _ in 0..8 {
@@ -52131,7 +52372,7 @@ mod pipeline_cache_refactor_tests {
 
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
         app.items = Vec::new();
         app.thumbnails = Vec::new();
 
@@ -52165,7 +52406,7 @@ mod pipeline_cache_refactor_tests {
 
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
         app.items = Vec::new();
         app.thumbnails = Vec::new();
 
@@ -65796,7 +66037,7 @@ mod still_window_mode_key_tests {
             vec![Some((1, 1))],
             std::collections::HashSet::new(),
             vec![],
-            Some(1),
+            Some(folder_scan::FolderScanSignature::for_test(1)),
         );
 
         assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
@@ -65860,7 +66101,7 @@ mod still_window_mode_key_tests {
             vec![Some((1, 1))],
             std::collections::HashSet::new(),
             vec![],
-            Some(1),
+            Some(folder_scan::FolderScanSignature::for_test(1)),
         );
 
         assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
@@ -67215,7 +67456,7 @@ mod still_window_mode_key_tests {
         app.image_metas.push(Some((1, 5)));
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;

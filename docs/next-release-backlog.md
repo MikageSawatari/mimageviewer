@@ -29,6 +29,15 @@
 
 ## 1. 優先候補
 
+### 1.314 サブフォルダ内の一時ファイル作成・削除で親一覧がちらつく — 最小設計で修正 (2026-10-01)
+
+- 観測者: 利用者 (2026-10-01)。ダウンローダーがサブフォルダ内で `.part` を作成・削除すると、親フォルダのグリッドが繰り返し更新される。
+- 原因 (設計担当のコード調査): NTFS が子フォルダ自身の mtime を更新し、親の NonRecursive watch (`poll_current_folder_watch`) が worker 再走査を起動する。`signature_from_scan` が実 Folder の `display_meta` mtime も含めるため、`apply_external_rescan` が `load_folder_with_scan` を呼び、全サムネイルの Pending 化と cache 破棄が発生する。
+- 修正 (利用者決定、2026-10-01、v4.3.0): scan の既存全 stamp hash と、実 `GridItem::Folder` の mtime だけを除く listing hash を比較する。path・種類・ファイル mtime / size・書庫 / ZIP / PDF / EPUB stamp が同じ再走査は適用済み signature／親 mtime だけを進める。items・image_metas・サムネイル・sort・遅延 metadata・cache は維持。それ以外は既存全面 reload／viewer 中の更新保留を維持する。外部再走査の signature 計算は worker 上で行う。
+- 受け入れ済みの仕様: 開いている一覧では子フォルダの「更新日時」列／tooltip／日付 sort と代表サムネ要求 stamp を一覧作成時のまま保つ。画面外からの再要求も同じ cache row を使い、再利用可能な cache hit なら子フォルダの mtime 変化だけでは再選定しない。既存の proof 失効／cache miss／idle 品質 upgrade の再生成は維持する。開き直し／「最新の情報に更新」で最新の mtime と代表を取得する。
+- **B1 (一覧 session ごとの自動代表固定) は実装しない**。代表は PC の各ビュー、aggregate、Remote、idle upgrade、pin seeds の共有 cached product なので、一覧ごとの選択には共有状態が必要で組み合わせが増える。旧 `v430-folder-refresh` では独立レビューのたび新しい P2 が見つかった。最小設計ですでに開いている一覧の代表が安定するため、旧 A+B1 は再利用せず、新しい session state／catalog／Remote・IPC 変更は加えない。
+- 回帰範囲: mtime-only 時の世代・サムネイル・metadata・cache 不変と適用 stamp 更新、無視後の実変更、追加／削除／改名／kind／mtime／size／書庫 stamp の全面 reload、viewer 保留維持、失敗／古い世代／別 owner／別 folder の非適用。製品バイナリ起動／UI smoke は行わず、利用者による修正後の実機確認は未実施。詳細は [UI 応答性 §2.6](ui-responsiveness.md#26-外部再走査-実サブフォルダの-mtime-だけでは一覧を差し替えない-v430)。
+
 ### 1.312 メイン最小化中も音響調整のビジュアライザーを表示する設定 — 利用者案 (2026-09-30)
 
 - 出典: 利用者 (開発者本人) の案。メインを最小化しても EffeTune のビジュアライザーを残せる設定がほしい。
