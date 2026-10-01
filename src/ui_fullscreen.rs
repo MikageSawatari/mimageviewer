@@ -9374,6 +9374,9 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        if self.raw_development_blocked(idx) {
+            return self.resolve_original_preview_tex(idx);
+        }
         if self.fs_entry_is_animated(idx) {
             return self.current_animated_frame_texture(idx);
         }
@@ -9494,7 +9497,14 @@ impl App {
         &self,
         resource: &crate::gpu_lanczos::FullscreenPaintResource,
     ) -> crate::adjustment::PostFilter {
-        if self.post_filter_bypassed {
+        if self.post_filter_bypassed
+            || resource.page_idx().is_some_and(|idx| {
+                self.raw_development_blocked(idx)
+                    && matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::RawPreview {
+                            preview: Some(preview), ..
+                        }) if preview.tex.id() == resource.source_texture().id())
+            })
+        {
             crate::adjustment::PostFilter::None
         } else {
             resource
@@ -9609,6 +9619,7 @@ impl App {
     pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
         if self.post_filter_bypassed
             || self.fs_entry_is_animated(idx)
+            || self.raw_development_blocked(idx)
             || !matches!(
                 self.items.get(idx),
                 Some(GridItem::Image(_))
@@ -10623,6 +10634,9 @@ impl App {
         idx: usize,
         original_preview_active: bool,
     ) -> Option<egui::TextureHandle> {
+        if self.raw_development_blocked(idx) {
+            return self.resolve_original_preview_tex(idx);
+        }
         let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
         if is_video {
             return None;
@@ -24117,23 +24131,11 @@ impl App {
                                 } else {
                                     "読込中..."
                                 };
-                            let font = egui::FontId::proportional(13.0);
-                            let pos = egui::pos2(image_rect.min.x + 12.0, image_rect.max.y - 12.0);
-                            let galley = ui.painter().layout_no_wrap(
-                                raw_label.clone().unwrap_or_else(|| label.to_string()),
-                                font.clone(),
-                                egui::Color32::WHITE,
+                            let bg = crate::ui_raw::paint_processing_status_overlay(
+                                ui.painter(),
+                                image_rect,
+                                raw_label.as_deref().unwrap_or(label),
                             );
-                            let text_rect =
-                                egui::Align2::LEFT_BOTTOM.anchor_size(pos, galley.size());
-                            let bg = text_rect.expand(4.0);
-                            ui.painter().rect_filled(
-                                bg,
-                                4.0,
-                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
-                            );
-                            ui.painter()
-                                .galley(text_rect.min, galley, egui::Color32::WHITE);
                             self.fs_loading_label_top = Some(bg.top());
                         }
 
@@ -35173,9 +35175,7 @@ impl App {
                 "360° ビュー中は画像編集モードを利用できません"
             }
             FsNavNoOpReason::RawDevelopmentPending => "RAW の現像が終わると編集できます",
-            FsNavNoOpReason::RawDevelopmentUnavailable => {
-                "この RAW 形式は現像に対応していません（埋め込みプレビューを表示中）"
-            }
+            FsNavNoOpReason::RawDevelopmentUnavailable => crate::ui_raw::RAW_BLOCKED_PREVIEW_NOTICE,
             FsNavNoOpReason::ContinuousReadingUnavailable(feature) => feature.noop_title(),
         }
     }
@@ -48134,50 +48134,245 @@ impl App {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn raw_valid_preview_with_failed_catalog_and_blocked_development_cannot_leave_navigation_waiting()
-     {
+    fn raw_blocked_preview_settles_navigation_and_folder_lock_with_or_without_rendition() {
         use crate::app::raw_page_store::{
             RawDevelopBlocked, RawDevelopPhase, RawInstalledStage, RawPreviewPhase,
         };
-        let ctx = egui::Context::default();
-        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
-        app.fullscreen_idx = Some(0);
-        app.settings.global_preset.colorize.mode = crate::colorize::ColorizeMode::AllImages;
-        app.thumbnails = vec![ThumbnailState::Failed, ThumbnailState::Pending];
-        let pixels = std::sync::Arc::new(egui::ColorImage::filled([3, 2], egui::Color32::GRAY));
-        let tex = ctx.load_texture(
-            "valid_raw_preview_without_catalog",
-            pixels.as_ref().clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        app.fs_cache.insert(
-            0,
-            FsCacheEntry::RawPreview {
-                preview: Some(crate::fs_animation::RawPreviewTexture { tex, pixels }),
-                developed_dims: [12000, 8000],
-                load_seq: 1,
-            },
-        );
-        let page = app.raw_pages.page_mut(0).unwrap();
-        page.stage = RawInstalledStage::PreviewShown;
-        page.preview = RawPreviewPhase::Done;
-        *page.develop.lock().unwrap() = RawDevelopPhase::Blocked(RawDevelopBlocked::Unsupported);
-        assert!(app.raw_fullscreen_fallback_allowed(0));
-        assert!(app.raw_development_unavailable(0));
-        assert!(app.colorize_display_requires_final_effect(0));
-        assert!(app.resolve_fs_processed_texture(&ctx, 0, false).is_none());
-        app.fs_holdover_tex = Some(page_wait_navigation_sequence(
-            std::time::Instant::now(),
-            app.items_generation,
-            vec![0],
-            navigation_awaiting(vec![0]),
-        ));
-        app.resolve_bound_fs_navigation_sequence_target_with_perf(&ctx, 0, false, &mut None);
-        app.fs_nav_holdover_for_draw();
-        assert!(
-            !app.fs_navigation_sequence_blocks_new_target(),
-            "valid preview remains PreviewShown, but no catalog rendition or development can ever satisfy this target"
-        );
+        for failed in [false, true] {
+            for catalog_available in [false, true] {
+                // Exercise colorization, LUT alone, and unchanged disabled behavior in
+                // all three display modes through the shared texture/readiness paths.
+                for effect in 0..3 {
+                    for mode in 0..3 {
+                        let ctx = egui::Context::default();
+                        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg_after_generation_change();
+                        app.fullscreen_idx = Some(0);
+                        if mode == 1 {
+                            app.spread_mode = crate::settings::SpreadMode::Ltr;
+                        } else if mode == 2 {
+                            app.reading_flow = crate::settings::ReadingFlow::Vertical;
+                        }
+                        if effect == 0 {
+                            app.settings.global_preset.colorize.mode =
+                                crate::colorize::ColorizeMode::AllImages;
+                        } else if effect == 1 {
+                            let builtin = crate::creative_lut::BuiltinCreativeLut::WarmFilm;
+                            app.creative_lut_library =
+                                crate::creative_lut::CreativeLutLibrary::from_builtin_for_test(
+                                    builtin,
+                                );
+                            app.settings.global_preset.creative_lut =
+                                crate::creative_lut::CreativeLutSelection {
+                                    id: Some(builtin.id()),
+                                    strength: 1.0,
+                                };
+                        }
+                        let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+                            [3, 2],
+                            egui::Color32::GRAY,
+                        ));
+                        let tex = ctx.load_texture(
+                            "valid_raw_preview",
+                            pixels.as_ref().clone(),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        app.fs_cache.insert(
+                            0,
+                            FsCacheEntry::RawPreview {
+                                preview: Some(crate::fs_animation::RawPreviewTexture {
+                                    tex: tex.clone(),
+                                    pixels: pixels.clone(),
+                                }),
+                                developed_dims: [12000, 8000],
+                                load_seq: 1,
+                            },
+                        );
+                        let page = app.raw_pages.page_mut(0).unwrap();
+                        page.stage = RawInstalledStage::PreviewShown;
+                        page.preview = RawPreviewPhase::Done;
+                        if catalog_available {
+                            let catalog = ctx.load_texture(
+                                "catalog_raw_preview",
+                                pixels.as_ref().clone(),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            app.thumbnails = vec![
+                                ThumbnailState::Loaded {
+                                    tex: catalog,
+                                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                                        evaluated_display_px: 3,
+                                    },
+                                    from_edit_preview: false,
+                                    rendered_at_px: 3,
+                                    source_dims: Some((12000, 8000)),
+                                    layout_dims: None,
+                                },
+                                ThumbnailState::Pending,
+                            ];
+                            app.thumb_pixels.insert(0, pixels);
+                            let rendition = app.ensure_passthrough_rendition(&ctx, 0).unwrap();
+                            assert_ne!(rendition.id(), tex.id());
+                        } else {
+                            app.thumbnails = vec![ThumbnailState::Failed, ThumbnailState::Pending];
+                        }
+                        assert_eq!(app.colorize_display_requires_final_effect(0), effect != 2);
+                        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() =
+                            RawDevelopPhase::Blocked(if failed {
+                                RawDevelopBlocked::Failed {
+                                    error: crate::raw::RawError::Corrupt(
+                                        "development failed".into(),
+                                    ),
+                                    brightness: app.settings.raw_brightness,
+                                }
+                            } else {
+                                RawDevelopBlocked::Unsupported
+                            });
+                        assert!(app.raw_fullscreen_fallback_allowed(0));
+                        assert!(app.raw_development_unavailable(0));
+                        assert!(!app.colorize_display_requires_final_effect(0));
+                        assert_eq!(
+                            app.resolve_fs_processed_texture(&ctx, 0, false)
+                                .unwrap()
+                                .id(),
+                            tex.id()
+                        );
+                        assert_eq!(app.resolve_fs_display_tex(0, true).unwrap().id(), tex.id());
+                        assert_eq!(
+                            app.raw_loading_label(0).as_deref(),
+                            Some(crate::ui_raw::RAW_BLOCKED_PREVIEW_NOTICE)
+                        );
+                        assert_eq!(app.raw_navigation_display_ready(0, false), Some(true));
+                        assert!(!app.raw_edit_target_gate(0));
+                        assert!(!app.raw_edit_target_entry_allowed(0));
+                        assert!(matches!(
+                            app.fs_boundary_hint,
+                            Some(FsBoundaryHint::NavNoOp {
+                                reason: FsNavNoOpReason::RawDevelopmentUnavailable,
+                                ..
+                            })
+                        ));
+                        app.settings.global_preset.post_filter =
+                            crate::adjustment::PostFilter::GameBoy;
+                        let resource = app.fullscreen_paint_resource_for_texture(0, tex.clone());
+                        assert_eq!(
+                            app.fullscreen_paint_post_filter(&resource),
+                            crate::adjustment::PostFilter::None
+                        );
+                        let previous_jpeg = ctx.load_texture(
+                            "previous_jpeg_holdover",
+                            egui::ColorImage::filled([3, 2], egui::Color32::WHITE),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        let holdover = crate::gpu_lanczos::FullscreenPaintResource::resampleable(
+                            0,
+                            previous_jpeg,
+                            crate::gpu_lanczos::FullscreenPaintSourceGeneration {
+                                items: 0,
+                                input: 0,
+                            },
+                        );
+                        assert_eq!(
+                            app.fullscreen_paint_post_filter(&holdover),
+                            crate::adjustment::PostFilter::GameBoy,
+                            "an unrelated holdover sharing idx must retain its existing behavior"
+                        );
+                        app.settings.global_preset.post_filter =
+                            crate::adjustment::PostFilter::None;
+                        app.fs_nav_locked_gen = Some(0);
+                        app.poll_fs_nav_lock(&ctx);
+                        assert!(app.fs_nav_locked_gen.is_none());
+                        assert_eq!(
+                            app.ensure_passthrough_rendition(&ctx, 0).unwrap().id(),
+                            tex.id()
+                        );
+                        assert_eq!(app.cached_passthrough_rendition(0).unwrap().id(), tex.id());
+                        for accept_rendition in [false, true] {
+                            app.fs_holdover_tex = Some(page_wait_navigation_sequence(
+                                std::time::Instant::now(),
+                                app.items_generation,
+                                vec![0],
+                                navigation_awaiting(vec![0]),
+                            ));
+                            let FsNavigationSequenceTarget::Display(target) = &mut app
+                                .fs_holdover_tex
+                                .as_mut()
+                                .unwrap()
+                                .navigation_sequence_mut()
+                                .unwrap()
+                                .target
+                            else {
+                                unreachable!()
+                            };
+                            target.accept_rendition = accept_rendition;
+                            app.resolve_bound_fs_navigation_sequence_target_with_perf(
+                                &ctx, 0, false, &mut None,
+                            );
+                            if accept_rendition {
+                                assert_eq!(
+                                    app.fs_navigation_rendition_target_pages(0),
+                                    Some(vec![0])
+                                );
+                                assert_eq!(
+                                    app.ensure_passthrough_rendition(&ctx, 0).unwrap().id(),
+                                    tex.id()
+                                );
+                            }
+                            app.fs_nav_holdover_for_draw();
+                            // Both normal and held-paging presentation retire through the
+                            // existing live-page observation, without an unlock exception.
+                            assert!(app.fs_navigation_sequence_blocks_new_target());
+                            app.observe_fs_navigation_sequence_presented(&[navigation_trace_page(
+                                0,
+                                0,
+                                tex.id(),
+                                FsDisplayUnitPageProvenance::Live,
+                            )]);
+                            assert!(!app.fs_navigation_sequence_blocks_new_target());
+                            assert!(app.fs_holdover_tex.is_none());
+                        }
+                        if failed {
+                            app.settings.raw_brightness = crate::raw::RawBrightness::None;
+                            app.raw_brightness_changed();
+                            assert!(!app.raw_development_blocked(0));
+                            assert!(!app.raw_edit_target_entry_allowed(0));
+                            assert!(matches!(
+                                app.fs_boundary_hint,
+                                Some(FsBoundaryHint::NavNoOp {
+                                    reason: FsNavNoOpReason::RawDevelopmentPending,
+                                    ..
+                                })
+                            ));
+                            assert_eq!(app.colorize_display_requires_final_effect(0), effect != 2);
+                            if effect != 2 {
+                                if catalog_available {
+                                    assert_ne!(
+                                        app.resolve_fs_processed_texture(&ctx, 0, false)
+                                            .unwrap()
+                                            .id(),
+                                        tex.id()
+                                    );
+                                } else {
+                                    assert!(
+                                        app.resolve_fs_processed_texture(&ctx, 0, false).is_none()
+                                    );
+                                    assert_eq!(
+                                        app.raw_navigation_display_ready(0, false),
+                                        Some(false)
+                                    );
+                                }
+                            } else {
+                                assert_eq!(
+                                    app.resolve_fs_processed_texture(&ctx, 0, false)
+                                        .unwrap()
+                                        .id(),
+                                    tex.id()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

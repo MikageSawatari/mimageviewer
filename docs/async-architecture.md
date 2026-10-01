@@ -555,6 +555,8 @@ diffusion fallback を UI へ通知する。UI は pending が存在する間だ
 
 park は Requested preview を NotRequested に戻し Preparing / Submitted を取消すが、Done / Blocked は残す。mount / swap は結果 channel も交換し、drop / generation 更新は owning context の要求だけを取消す。idx 単位の破棄は `discard_fs_page`、snapshot 再構築は entry と owner の原子的 transfer を使う。
 
+現像軸が Blocked の RAW は `raw_development_blocked` から処理不可と判定し、カラー化 / LUT の待機対象から外す。検証済み preview があれば加工せず表示し、既存の共通 readiness と実提示によってナビゲーションを終える。catalog rendition があっても同じ表示とし、専用 worker や lock 解除経路は追加しない。明るさ変更で Failed が Idle へ戻ると通常の色 gate が再評価される (計画 7.10 K)。
+
 worker は info / preview / develop の前後、および executor が queued source を開くときに高精度 mtime と size を検証する。現在要求の typed `Stale` は RAW source transaction に進み、source を取り直す。古い要求の Stale は要求 ID で拒否する。明るさ変更も同じページ単位の入力・派生結果失効を使うが、preview と寸法の要求・backlog は残す。mounted / parked の双方を処理し、retained final AI は source 指紋 + 明るさの key と完了検証で失効させる。App-global retained epoch は進めないので、無関係な JPEG の AI 完了は保存できる。
 
 現在ページの現像中だけ 100ms の repaint を要求し、queued / running / cancelling は `RawTicketState` で区別する。RAW source preparation と preview は既存の読み込み経路、完了は worker の repaint 通知で進む。

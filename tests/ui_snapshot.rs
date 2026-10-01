@@ -54,6 +54,17 @@ fn raw_progress_dark() {
     );
 }
 
+#[test]
+fn raw_blocked_preview_notice_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_blocked_preview_notice_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(800.0, 120.0),
+        mimageviewer::draw_raw_blocked_preview_snapshot_fixture,
+    );
+}
+
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
 /// 絵文字混じりテキストの実際のレイアウトを検証できない。
@@ -79,28 +90,42 @@ fn snapshot_with_theme_and_contrast(
     name: &str,
     resolved: mimageviewer::os_theme::ResolvedTheme,
     contrast: mimageviewer::settings::TextContrast,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_contrast_and_size(
+        name,
+        resolved,
+        contrast,
+        egui::vec2(480.0, 360.0),
+        build_ui,
+    );
+}
+
+fn snapshot_with_theme_contrast_and_size(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
     mut build_ui: impl FnMut(&mut egui::Ui),
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(480.0, 360.0))
-        .build(move |ctx| {
-            mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
-            if !fonts_ready {
-                install_app_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    egui::Frame::central_panel(ui.style())
-                        .outer_margin(8.0)
-                        .inner_margin(0.0)
-                        .show(ui, |ui| build_ui(ui));
-                });
-        });
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                egui::Frame::central_panel(ui.style())
+                    .outer_margin(8.0)
+                    .inner_margin(0.0)
+                    .show(ui, |ui| build_ui(ui));
+            });
+    });
 
     harness.run();
     harness.snapshot(name);

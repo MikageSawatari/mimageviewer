@@ -426,7 +426,7 @@ fullscreen に catalog サムネイルや色忠実 rendition を出せるのは�
 
 RAW の配置・fit・Original・Z・pan・回転・見開き・連結読み・座標変換の基準は全表示段で `developed_dims`。8192 clamp 後の Static や派生 final / AI texture の実寸を配置基準に戻さない。actual raster は canonical 枠へ contain し、ナビゲータ・ルーペ・capture の写像も共有 transform を使う。
 
-preview は生デコード段の表示専用で、編集・同期補正・AI・final composite の入力にしない。カラー化 / LUT の既存 gate は維持し、必要なページは検証済み preview の後だけ色忠実 rendition を表示する。PreviewShown はその提示でページ送り・フォルダ lock を終えられる。PreviewAbsent は developed / complete final の提示か Terminal まで待つ。両ナビゲーション経路は RAW の分類と同じ readiness 述語を使う。編集の全入口・見開き左右・ツール内ページ切替・ボタン状態は、実際の編集対象に対する `raw_edit_target_gate` を mode / page mutation の前に確認する。
+preview は生デコード段の表示専用で、編集・同期補正・AI・final composite の入力にしない。カラー化 / LUT の既存 gate は維持し、必要なページは検証済み preview の後だけ色忠実 rendition を表示する。ただし現像が Blocked (非対応・失敗) の RAW は処理入力が得られないため gate の対象外とし、rendition の有無にかかわらず埋め込み preview をそのまま表示して通知する。判定は owner の現像軸から導く `raw_development_blocked` に集約する。設定変更で Failed が Idle に戻れば通常の gate が再評価される (計画 7.10 K)。PreviewShown はその提示でページ送り・フォルダ lock を終えられる。PreviewAbsent は developed / complete final の提示か Terminal まで待つ。両ナビゲーション経路は RAW の分類と同じ readiness 述語を使う。編集の全入口・見開き左右・ツール内ページ切替・ボタン状態は、実際の編集対象に対する `raw_edit_target_gate` を mode / page mutation の前に確認する。
 
 明るさ変更と worker の Stale はページ単位の source transaction。既存の `capture_final_effect_source_reload_holdover` だけで提示中のユニット / 連結読み transition を退避し、入力と派生 cache を失効させる。明るさ変更では preview / 寸法の要求を残す。retained AI の source 指紋 + 明るさ key を更新し、他ページの retained epoch は変更しない。
 

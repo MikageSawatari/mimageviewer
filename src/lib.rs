@@ -271,7 +271,10 @@ mod ui_conceal;
 mod ui_crop;
 mod ui_raw;
 #[doc(hidden)]
-pub use ui_raw::{draw_raw_progress_snapshot_fixture, draw_raw_settings_snapshot_fixture};
+pub use ui_raw::{
+    draw_raw_blocked_preview_snapshot_fixture, draw_raw_progress_snapshot_fixture,
+    draw_raw_settings_snapshot_fixture,
+};
 pub mod ui_dialogs;
 mod ui_sns_split;
 #[doc(hidden)]

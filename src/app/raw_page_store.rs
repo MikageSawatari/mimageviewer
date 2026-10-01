@@ -1082,6 +1082,17 @@ pub(crate) mod tests {
         app
     }
 
+    pub(crate) fn app_with_raw_and_jpeg_after_generation_change()
+    -> super::super::tests::phase_c_support::AppTestEnv {
+        let mut app = app_with_raw_and_jpeg();
+        let transfer = app.take_fs_page_for_snapshot(0);
+        app.items_generation = 1;
+        app.fs_cache.set_items_generation(1);
+        app.raw_pages.set_items_generation(1);
+        app.restore_fs_page_from_snapshot(0, transfer);
+        app
+    }
+
     #[test]
     fn warm_half_thumbnail_cannot_be_drawn_or_used_for_a_rendition_until_preview_validation() {
         let mut app = app_with_raw_and_jpeg();
@@ -2054,24 +2065,23 @@ impl App {
         !self.is_raw_page(idx) || self.raw_pages.classify(idx) == RawPageLoadState::Developed
     }
 
+    pub(crate) fn raw_development_blocked(&self, idx: usize) -> bool {
+        self.is_raw_page(idx)
+            && self.raw_pages.page(idx).is_some_and(|page| {
+                matches!(*page.develop.lock().unwrap(), RawDevelopPhase::Blocked(_))
+            })
+    }
+
     pub(crate) fn raw_development_unavailable(&self, idx: usize) -> bool {
         self.is_raw_page(idx)
-            && (self.raw_pages.classify(idx).terminal()
-                || self.raw_pages.page(idx).is_some_and(|page| {
-                    matches!(*page.develop.lock().unwrap(), RawDevelopPhase::Blocked(_))
-                }))
+            && (self.raw_pages.classify(idx).terminal() || self.raw_development_blocked(idx))
     }
 
     pub(crate) fn raw_edit_target_entry_allowed(&mut self, idx: usize) -> bool {
         if self.raw_edit_target_gate(idx) {
             return true;
         }
-        let unavailable = self.raw_pages.page(idx).is_some_and(|page| {
-            matches!(
-                *page.develop.lock().unwrap(),
-                RawDevelopPhase::Blocked(RawDevelopBlocked::Unsupported)
-            )
-        });
+        let unavailable = self.raw_development_blocked(idx);
         self.set_fullscreen_nav_noop(if unavailable {
             crate::ui_fullscreen::FsNavNoOpReason::RawDevelopmentUnavailable
         } else {
@@ -2397,6 +2407,11 @@ impl App {
         use crate::ui_raw::RawLoadingStatus as Status;
         if !self.is_raw_page(idx) {
             return None;
+        }
+        if self.raw_development_blocked(idx)
+            && self.raw_pages.classify(idx) == RawPageLoadState::PreviewShown
+        {
+            return Some(crate::ui_raw::RAW_BLOCKED_PREVIEW_NOTICE.into());
         }
         let status = if let Some(page) = self.raw_pages.page(idx) {
             match &*page.develop.lock().unwrap() {

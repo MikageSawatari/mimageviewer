@@ -1,6 +1,9 @@
 //! Shared RAW preferences and loading presentation, also used by UI snapshots.
 use crate::raw::RawBrightness;
 
+pub(crate) const RAW_BLOCKED_PREVIEW_NOTICE: &str =
+    "この RAW 形式は現像に対応していません（埋め込みプレビューを表示中）";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawLoadingStatus {
     Queued,
@@ -61,6 +64,29 @@ pub(crate) fn paint_loading_label(painter: &egui::Painter, rect: egui::Rect, lab
         egui::FontId::proportional(18.0),
         egui::Color32::from_gray(150),
     );
+}
+
+pub(crate) fn paint_processing_status_overlay(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    label: &str,
+) -> egui::Rect {
+    let pos = egui::pos2(image_rect.min.x + 12.0, image_rect.max.y - 12.0);
+    let galley = painter.layout_no_wrap(
+        label.into(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    let text_rect = egui::Align2::LEFT_BOTTOM.anchor_size(pos, galley.size());
+    let bg = text_rect.expand(4.0);
+    painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200));
+    painter.galley(text_rect.min, galley, egui::Color32::WHITE);
+    bg
+}
+
+#[doc(hidden)]
+pub fn draw_raw_blocked_preview_snapshot_fixture(ui: &mut egui::Ui) {
+    paint_processing_status_overlay(ui.painter(), ui.max_rect(), RAW_BLOCKED_PREVIEW_NOTICE);
 }
 
 #[doc(hidden)]

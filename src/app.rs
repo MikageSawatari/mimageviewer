@@ -80782,6 +80782,9 @@ impl App {
         idx: usize,
         mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
     ) -> Option<egui::TextureHandle> {
+        if self.raw_development_blocked(idx) {
+            return self.resolve_fs_display_tex(idx, false);
+        }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
         }
@@ -81061,6 +81064,9 @@ impl App {
     }
 
     pub(crate) fn cached_passthrough_rendition(&self, idx: usize) -> Option<egui::TextureHandle> {
+        if self.raw_development_blocked(idx) {
+            return self.resolve_fs_display_tex(idx, false);
+        }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
         }
