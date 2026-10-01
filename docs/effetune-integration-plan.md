@@ -549,13 +549,16 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   launcher build 時に `MIMV_EFFETUNE_DIR` を staging に向け、PE dependency gate も同じ
   staging の bundle を明示的な検査入力にする。
 - VST hostは `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` へ展開し、
-  CRT4本は非検索subdir `vcrt/` に置く。System32の全4本が存在・版数読取可能でvcruntime140の
+  CRT4本は非検索subdir `vcrt/` に置く。System32の全4本が存在・版数読取可能で各DLLの
   file versionが同梱セット以上なら全4本System32、他は全4本同梱。一度選び依存順でpreloadし、混在させない。
   旧host／旧CRTを触らず、成功のみcacheして抽出失敗の再試行を許す。basenameは維持するので
   WebViewの `%APPDATA%/mimageviewer-vst3-host.exe/` 保存先は変わらない。
 - SDK Windows hosting moduleはMIT原文を保持したtracked copyでUTF-8→UTF-16／wide APIを使う。
   IPCのWindows backslash／Unicode escapeもdecodeする。pluginのANSI APIに影響する
   activeCodePage manifestは使わない。stateはopaque IPC bytesで、hostにstate/preset path I/Oはない。
+- **R3補正 (2026-10-02、利用者決定)**: System32は4本それぞれが同梱版以上の場合だけ
+  選ぶ。1本でも古い／読取不能なら全4本同梱へ統一する。直接起動用vendor hostも必須CRTセットを
+  保持し、CMakeが公式正本を `vendor/vst3-host/vcrt/` に毎回配置する。必須条件の緩和はしない。
 - **R2簡素化 (2026-10-02、利用者決定)**: CRTはDLLごとの組み合わせを作らず一組で選ぶ。
   publisher競合は最大60秒のOS lock待機で起動を直列化する（try_lock＋sleepループは使わない）。
   timeout／修復失敗時は既存Loading／pending_loadに再解決とロードを統合し、新しい待機stateを追加しない。

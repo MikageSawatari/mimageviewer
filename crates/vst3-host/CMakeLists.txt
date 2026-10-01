@@ -15,7 +15,8 @@
 ##   cmake --build build --config Release
 ##
 ## 出力:
-##   build/Release/mimageviewer-vst3-host.exe
+##   vendor/vst3-host/mimageviewer-vst3-host.exe (リポジトリ root から相対)
+##   vendor/vst3-host/vcrt/ に公式 VC runtime 4 DLL を毎回配置
 ##
 ## この exe は最終的に Rust 本体に include_bytes! で埋め込まれ、
 ## %APPDATA%\mimageviewer\ に展開されて子プロセスとして起動される
@@ -156,6 +157,29 @@ endif()
 # 出力ディレクトリは vendor/vst3-host/ にして、Rust 本体の include_bytes! で
 # 拾えるようにする (PDFium / Susie ワーカーと同じパターン)。
 set(OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/vst3-host")
+# Direct bridge consumers (handler tests and the VST tester) launch this vendor
+# exe rather than the Rust-extracted copy. Stage its required official CRT set on
+# every build, including when the exe itself is up to date. POST_BUILD would miss
+# that case. Keep the DLLs below vcrt/, outside the executable's default search.
+set(VCRT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/vcrt")
+set(VCRT_FILES vcruntime140.dll vcruntime140_1.dll msvcp140.dll msvcp140_1.dll)
+set(VCRT_SOURCES "")
+foreach(VCRT_FILE IN LISTS VCRT_FILES)
+    set(VCRT_SOURCE "${VCRT_SOURCE_DIR}/${VCRT_FILE}")
+    if(NOT EXISTS "${VCRT_SOURCE}" OR IS_DIRECTORY "${VCRT_SOURCE}")
+        message(FATAL_ERROR
+            "Required official VC runtime is missing: ${VCRT_SOURCE}\n"
+            "Restore all four official x64 DLLs from the licensed VC/Redist source recorded in\n"
+            "vendor/vcrt/provenance.json (see vendor/vcrt/README.md), then configure again.")
+    endif()
+    list(APPEND VCRT_SOURCES "${VCRT_SOURCE}")
+endforeach()
+add_custom_target(vst3-host-stage-vcrt ALL
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${OUTPUT_DIR}/vcrt"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${VCRT_SOURCES} "${OUTPUT_DIR}/vcrt"
+    COMMENT "Stage the official VC runtime set for direct VST3 bridge consumers"
+    VERBATIM)
+add_dependencies(mimageviewer-vst3-host vst3-host-stage-vcrt)
 set_target_properties(mimageviewer-vst3-host PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY         "${OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${OUTPUT_DIR}"

@@ -169,9 +169,13 @@ manifest exact hash、Microsoft Authenticode Valid を必須とする。package 
 exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。
 EffeTune pluginの依存は `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` の
 processで解決する。同梱CRT4本は非検索subdir `vcrt/`。System32の全4本が存在・版数読取可能で
-vcruntime140のfile versionが同梱版以上なら全4本System32、他は全4本同梱を選ぶ。選択元と両版数をlogへ記録し、
+各DLLのfile versionが同梱版以上なら全4本System32、他は全4本同梱を選ぶ。選択元と両版数をlogへ記録し、
 依存順に絶対pathからpreloadする。途中で混在させず、load不能なら理由を記録して停止する。
 旧host／CRTの上書きはせず、同一bytesは再抽出しない。
+直接起動テスト用にもCMakeが `vendor/vst3-host/vcrt/` へ公式CRT4本を配置する。
+`build-dist.ps1` のfull gateはrelease buildより前なので、事前にCMake buildまたは
+現ソース一致のhost＋CRTセットの復元を済ませる。exeだけを復元してfull gateへ進まない。
+両scriptのテスト前preflightはhostを起動せず、CRT4本と公式正本の完全一致を検査する。
 同梱CRTはWindows Updateで更新されないため、native dependency更新時に正本と実体を一体で更新する。
 
 `onnxruntime*.dll` も Microsoft Authenticode Valid を必須にする。既知4名以外の `msvcp*` /

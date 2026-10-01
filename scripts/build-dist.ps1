@@ -119,6 +119,8 @@ if ($running.Count -gt 0) {
 
 # Run the complete Rust gate before cleaning release outputs. The explicit skip
 # exists for retrying packaging/signing on an unchanged, already-tested tree.
+. (Join-Path $scripts 'vst3-host-vcrt.ps1')
+Assert-MivVst3HostVcrt -RepoRoot $repoRoot
 if ($SkipRustTests) {
     Write-Warning '[build-dist] (1/7) Rust test gate skipped; use only for an unchanged tested tree'
 } else {
@@ -142,6 +144,8 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] EffeTune script tests failed (ex
 Write-Host '[build-dist]       VST3 host source-identity regression tests'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-identity.ps1')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-vcrt.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests failed (exit {0})" -f $LASTEXITCODE) }
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero

@@ -351,7 +351,9 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`**: VST3 SDK の DL が ~490 MB と
   大きいので bootstrap には含めていない。以下のいずれかで配置する:
   - **既存ビルド済み exe をコピー** (推奨): 別 worktree やバックアップに残っている
-    `mimageviewer-vst3-host.exe` を `vendor/vst3-host/` に置く。SDK 不要で即解決
+    `mimageviewer-vst3-host.exe` と必須の `vcrt/` (公式CRT4本) を
+    `vendor/vst3-host/` に実ファイルでコピーする。現ソースidentityが一致する成果物のみ再利用可。
+    SDK不要だが、exe単体のコピーではhostを直接起動できない
   - **CMake で再ビルド**:
     ```bash
     bash scripts/setup-vst3-sdk.sh
@@ -384,11 +386,12 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 ```
 C:\home\mimageviewer_vendor_backup\
   ├ models\        (*.onnx 一式)
-  └ vst3-host\     (mimageviewer-vst3-host.exe)
+  └ vst3-host\     (mimageviewer-vst3-host.exe と vcrt\ の公式CRT4本)
 ```
 
 - **定期ジョブは不要**。`vendor/` の中身は静的なので、モデル追加や vst3-host を
-  再ビルドした**ときだけ**バックアップを取り直す。
+  再ビルドした**ときだけ**バックアップを取り直す。hostはexeと `vcrt/` を含む
+  ディレクトリ全体を `C:\home\mimageviewer_vendor_backup\vst3-host` へ実ファイルでコピーする。
 - **復旧手順**: `vendor/` 消失時、`bootstrap-vendor.sh` を流した後に
   `cp -r C:/home/mimageviewer_vendor_backup/models vendor/` と
   `cp -r C:/home/mimageviewer_vendor_backup/vst3-host vendor/` で埋め戻す。
@@ -1165,6 +1168,7 @@ Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持�
 現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。SDK欠落時や
 `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
 build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
+`dev-runtime` もrelease継承profileのためこのgate対象。host変更時は先にCMakeで再buildする。
 再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。
 
 ### セットアップ (メインビルド前に必須)
@@ -1176,14 +1180,23 @@ bash scripts/setup-vst3-sdk.sh
 # 2. CMake で C++ bridge をビルド
 cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 cmake --build crates/vst3-host/build --config Release
-# → vendor/vst3-host/mimageviewer-vst3-host.exe (R2 build: 826,880 bytes)
+# → vendor/vst3-host/mimageviewer-vst3-host.exe と vendor/vst3-host/vcrt/ の公式CRT4本
 ```
 
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
   - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
-- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` (.gitignore)。
+- CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
+  `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
+  hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。
+  コピーはMicrosoft署名を保持し、mIVとして再署名しない。CRTをhost直下には置かない。
+  testerと `test-full.ps1` 内の直接起動テストはこのvendor exeと隣の `vcrt/` を使うので、
+  full gateの前にこのCMake build（または現ソース一致のexe＋CRTセットの復元）を済ませる。
+  `test-full.ps1`／`build-dist.ps1` はテスト前に非起動preflightでCRT4本と正本の完全一致を検査し、
+  欠落／破損ならCMake buildまたはセット全体の復元を案内して停止する。
+  `build-dev.ps1` のcoreは公式CRTを埋め込み、通常の抽出経路で同じ `vcrt/` layoutを作る。
+- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` と `vcrt/` (.gitignore)。
   メイン exe のリリースビルド時に `include_bytes!` で内包される
 - 動作確認用: `crates/vst3-host-tester/` (Rust 単独 GUI exe)。本体に依存せずに
   プラグインのロード / GUI / 音声パススルーをテストできる。`cargo run -p vst3-host-tester`
@@ -1650,7 +1663,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。
   EffeTune pluginも動的VC runtimeをimportする。hostは
   `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe`、同梱CRTは非検索subdir `vcrt/`。
-  hostはCRTを一組で選ぶ。System32の全4本が存在・版数読取可能でvcruntime140のfile versionが
+  hostはCRTを一組で選ぶ。System32の全4本が存在・版数読取可能で各DLLのfile versionが
   同梱版以上なら全4本System32、それ以外は全4本同梱。選択後に依存順で絶対pathからpreloadし、
   途中のsource切替はしない。選択元と両版数をlogへ記録する。shared host直下に固定CRTを置かず、抽出は一致bytesを
   書き換えず、成功だけcacheして失敗の再試行を許す。portableはこの抽出経路を使わない。

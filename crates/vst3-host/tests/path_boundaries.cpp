@@ -23,9 +23,25 @@ constexpr bool incomplete_system_uses_one_bundled_set() {
     return miv::choose_vcrt_set(system, bundled_set) == miv::VcrtLocation::Bundled;
 }
 constexpr bool unreadable_system_uses_one_bundled_set() {
-    auto system = crt_set({14, 51, 0, 0});
-    system[0].readable = false;
-    return miv::choose_vcrt_set(system, bundled_set) == miv::VcrtLocation::Bundled;
+    for (size_t index = 0; index < bundled_set.size(); ++index) {
+        auto system = crt_set({14, 51, 0, 0});
+        system[index].readable = false;
+        if (miv::choose_vcrt_set(system, bundled_set) != miv::VcrtLocation::Bundled) return false;
+    }
+    return true;
+}
+constexpr bool mixed_system_versions_select_one_set() {
+    for (size_t index = 0; index < bundled_set.size(); ++index) {
+        auto system = crt_set({14, 51, 0, 0});
+        system[index].version = {14, 29, 0, 0};
+        if (miv::choose_vcrt_set(system, bundled_set) != miv::VcrtLocation::Bundled) return false;
+        system[index].version = bundled_version;
+        if (miv::choose_vcrt_set(system, bundled_set) != miv::VcrtLocation::System32) return false;
+        auto one_newer = crt_set({14, 29, 0, 0});
+        one_newer[index].version = {14, 51, 0, 0};
+        if (miv::choose_vcrt_set(one_newer, bundled_set) != miv::VcrtLocation::Bundled) return false;
+    }
+    return true;
 }
 constexpr bool invalid_bundled_set_is_rejected() {
     auto unreadable = bundled_set;
@@ -37,6 +53,7 @@ constexpr bool invalid_bundled_set_is_rejected() {
 }
 static_assert(incomplete_system_uses_one_bundled_set());
 static_assert(unreadable_system_uses_one_bundled_set());
+static_assert(mixed_system_versions_select_one_set());
 static_assert(invalid_bundled_set_is_rejected());
 
 int main() {

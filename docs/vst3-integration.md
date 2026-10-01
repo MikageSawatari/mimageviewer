@@ -226,7 +226,7 @@ include_bytes! でメイン exe に埋め込み、初回 enable 時に
 ```
 
 通常版のhost／CRTは内容hash別ディレクトリへ抽出する。CRT4本は非検索subdir `vcrt/` に置き、
-System32の全4本が存在・版数読取可能でvcruntime140のfile versionが同梱版以上なら全4本System32、
+System32の全4本が存在・版数読取可能で各DLLのfile versionが同梱版以上なら全4本System32、
 他は全4本同梱を選び、依存順に絶対pathでpreloadする。選択元と両版数をlogへ記録する。既存host／CRTを
 上書きせず、抽出成功だけcacheする。portableのhost非同梱は維持する。
 Windows SDK hosting moduleは `crates/vst3-host/src/sdk/` のMIT原文付きcopyを使い、IPCのUTF-8
