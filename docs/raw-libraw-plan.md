@@ -844,6 +844,21 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
 - テストに、明るさの変更が現像中・park 中に起きた場合、古い AI / materializer の完了、RAW の終端でのページ送り、を加える
 - 設計文書: display-pipeline・async-architecture・settings の該当節を更新する。既存の名前は `RawBrightness` を使う
 
+**(J) 編集の gate は「実際に編集する page」に掛ける (S3 実装着手時の前提違い、2026-10-01)**
+
+§7.4 の「既存の入口は共通入口を通る」は不正確だった: SNS 分割のボタンは `enter_sns_split_mode` を直接呼び
+(`src/ui_adjustment_panel.rs:15865`、`src/ui_sns_split.rs:668`)、既存の各ツールは `fs_idx` で判定してから実際の編集対象を
+決める (`src/ui_erase.rs:258`。見開きでは左ページが対象になり得る、`src/app.rs:10716`)。また、ツール内のページ切替は表示ページを
+変えてからツールに入り直す (`src/ui_text.rs:2041`)。そこで:
+
+- RAW の gate は **解決済みの編集対象 page** に掛ける 1 つの述語 `raw_edit_target_gate(target_idx)` にする。判定は
+  `RawPageStore` の `stage != Developed` から導く (§7.4 と同じ)
+- **モード・表示ページを変える前に** 判定する。対象はモードへの入口 (キー・ボタン・SNS 分割を含むすべて)、見開きの左右の切替、
+  ツール内のページ切替、ボタンの有効 / 無効表示。拒否時はモード・ページを一切変えず、§7.4 の no-op 表示を出す
+- 見開きで、現像済みの JPEG を anchor に未現像の RAW の相方を編集対象にする操作も拒否する
+- RAW 以外のページの挙動は変えない (述語は RAW 以外で常に許可)。既存の `fs_idx` での判定はそのまま残し、この述語を足すだけにする
+- テスト: SNS 分割のボタン、見開きの相方が未現像 RAW、ツール内のページ切替先が未現像 RAW、非 RAW の挙動不変
+
 ## 8. サムネイル
 
 - D2 (`load_one_cached` / `decode_zip_chain`) で RAW を最初に振り分け、`preview()` を使う。JPEG の
