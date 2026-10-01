@@ -23,6 +23,10 @@ is MIT-licensed repository code, published with the application source.
 - All three root notices ship beside the executable in both
   `installer/mimageviewer.iss` and `scripts/build-portable.ps1`, and are named
   in their respective readmes. `.gitattributes` preserves their upstream bytes.
+  All three are also embedded
+  with `include_str!` from the tracked root files and viewable in full in About
+  through collapsible scroll areas, including for launcher-only downloads.
+  The required IJG attribution is visible without expanding a license section.
 - `htdocs/mimageviewer/libraw-0.22.2-source.tar.gz.sha256`: tracked checksum
   of the unmodified official GitHub tag archive used by setup-libraw.sh.
 

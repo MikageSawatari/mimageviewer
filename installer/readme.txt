@@ -96,8 +96,12 @@ DirectML.dll は Windows 11 に標準で同梱
 RAW は追加インストールなしで表示・現像できます。
 HEIC / AVIF / JPEG XL を表示するには Windows Imaging
 Component（WIC）が必要ですが、Windows 11 には標準で
-含まれています。一部フォーマットは Microsoft Store から
-コーデックの追加インストールが必要な場合があります。
+含まれています。追加が必要な場合は Microsoft Store から次を入れます:
+  - HEIC / HEIF: HEIF 画像表示オプション
+    HEIC は、HEVC に対応していない PC では HEVC ビデオ拡張機能も必要です。
+    HEVC ビデオ拡張機能は有料の場合があります。
+  - AVIF: AV1 ビデオ拡張機能
+  - JPEG XL: JPEG XL 画像表示オプション
 
 
 ----------------------------------------------------------------

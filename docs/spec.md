@@ -1382,9 +1382,9 @@ Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応で、使える埋め込�
 
 | フォーマット | 拡張子 | 必要なコーデック |
 |------------|--------|----------------|
-| HEIC / HEIF | .heic, .heif | HEIF 画像拡張機能 |
-| AVIF | .avif | AV1 Video Extension |
-| JPEG XL | .jxl | JPEG XL Image Extension |
+| HEIC / HEIF | .heic, .heif | HEIF 画像表示オプション。HEIC は HEVC 非対応の PC では HEVC ビデオ拡張機能も必要（有料の場合あり） |
+| AVIF | .avif | AV1 ビデオ拡張機能 |
+| JPEG XL | .jxl | JPEG XL 画像表示オプション |
 | TIFF | .tiff, .tif | 標準搭載 |
 
 #### 動画（サムネイル表示 + フルスクリーンインライン再生）

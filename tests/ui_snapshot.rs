@@ -25,7 +25,7 @@
 //! - [egui_kittest docs](https://docs.rs/egui_kittest/)
 //! - mimageviewer 側のポリシー: [docs/ui-snapshot-policy.md](../docs/ui-snapshot-policy.md)
 
-use egui_kittest::Harness;
+use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
 fn raw_license_information_light() {
@@ -33,7 +33,7 @@ fn raw_license_information_light() {
         "raw_license_information_light",
         mimageviewer::os_theme::ResolvedTheme::Light,
         mimageviewer::settings::TextContrast::default(),
-        egui::vec2(620.0, 180.0),
+        egui::vec2(620.0, 340.0),
         mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
     );
 }
@@ -44,8 +44,31 @@ fn raw_license_information_dark() {
         "raw_license_information_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         mimageviewer::settings::TextContrast::default(),
-        egui::vec2(620.0, 180.0),
+        egui::vec2(620.0, 340.0),
         mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_license_information_expanded_dark() {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "raw_license_information_expanded_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 920.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+        |harness| {
+            for title in [
+                "LibRaw ライセンス・著作権表記 全文",
+                "zlib License 全文",
+                "libjpeg-turbo ライセンス・著作権表記 全文",
+            ] {
+                harness.get_by_label(title).click();
+                harness.run();
+            }
+            harness.remove_cursor();
+            harness.run();
+        },
     );
 }
 
@@ -129,7 +152,25 @@ fn snapshot_with_theme_contrast_and_size(
     resolved: mimageviewer::os_theme::ResolvedTheme,
     contrast: mimageviewer::settings::TextContrast,
     size: egui::Vec2,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        resolved,
+        contrast,
+        size,
+        build_ui,
+        |_| {},
+    );
+}
+
+fn snapshot_with_theme_contrast_and_size_with_interaction(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
     mut build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
 ) {
     let mut fonts_ready = false;
     let mut harness = Harness::builder().with_size(size).build(move |ctx| {
@@ -151,6 +192,7 @@ fn snapshot_with_theme_contrast_and_size(
     });
 
     harness.run();
+    interact(&mut harness);
     harness.snapshot(name);
 }
 

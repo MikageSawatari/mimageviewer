@@ -104,7 +104,13 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
 RAW は追加インストールなしで表示・現像できます。
 AI 機能は DirectML（Microsoft 公式、Windows 11 標準同梱）を、
 HEIC / AVIF / JPEG XL 表示は Windows Imaging Component（WIC）を
-利用します。いずれも Windows 11 に標準で含まれています。
+利用します。いずれも Windows 11 に標準で含まれていますが、画像形式に
+応じて Microsoft Store から次の追加機能が必要な場合があります:
+  - HEIC / HEIF: HEIF 画像表示オプション
+    HEIC は、HEVC に対応していない PC では HEVC ビデオ拡張機能も必要です。
+    HEVC ビデオ拡張機能は有料の場合があります。
+  - AVIF: AV1 ビデオ拡張機能
+  - JPEG XL: JPEG XL 画像表示オプション
 
 本ソフトウェアが外部と通信するのは次の場合だけです。利用状況の送信・
 広告・アカウント登録は一切ありません。画像・動画そのものを外部へ送る

@@ -1,6 +1,6 @@
 ﻿# RAW via LibRaw S4 results
 
-Base: `85ccf0721`, branch `raw-libraw`. Uncommitted implementer handoff;
+Initial S4 base: `85ccf0721`, branch `raw-libraw` (checkpoint `392f31f5a`);
 no product executable was launched. Release/version/changelog files and the
 lead-owned `raw-libraw-plan.md` were not changed.
 
@@ -55,7 +55,7 @@ storage location, so no privacy text change is needed. Whole-tree HTML checks
 find no Microsoft Raw Image Extension claim or RAW/WIC line; added public text
 contains no specific downloader/posting-site name or new implementation jargon.
 
-## Verification
+## Initial S4 verification (before independent-review corrections)
 
 All Cargo commands use `MSBUILDDISABLENODEREUSE=1`; logs are in
 `target/s4-verification/` (ignored). Automated verification and build passed.
@@ -78,3 +78,54 @@ All Cargo commands use `MSBUILDDISABLENODEREUSE=1`; logs are in
   checks passed. No distribution build/signing was run, as authorized.
 - No `.sh` changed. Attempted `bash -n` on setup/bootstrap could not start:
   Git Bash failed with `CreateFileMapping ... Win32 error 5` under the sandbox.
+
+## Independent-review corrections: P1 / P2 / P3
+
+Base: `392f31f5a`. Corrections are uncommitted. No product executable was
+launched, and `build-dev` was not run, as explicitly instructed.
+
+- P1: About embeds all three tracked root notices with `include_str!`. Full
+  texts are exposed through the existing egui license pattern (collapsible
+  headers, wrapped monospace text and independent vertical scroll areas).
+  The renderer is shared with egui's existing notices; original egui header
+  and scroll IDs are preserved. IJG attribution stays visible while collapsed.
+  Launcher-only downloads now carry the notices inside the core. Original
+  notice files and installer/portable copies remain unchanged.
+- One new unit test compares all three embedded texts exactly with the tracked
+  files and checks CDDL, DCB/FBDD/X3F BSD, zlib and IJG attribution/conditions.
+  Light/dark notice snapshots are updated. A new expanded snapshot clicks all
+  three real headers through the headless harness and shows their scroll areas.
+  All three PNGs were reviewed; attribution, headings and text are legible.
+- P2/P3: formats, troubleshooting, getting-started, all five affected migration
+  pages, both readmes and spec use the lead-verified Japanese Store names.
+  HEIC guidance includes HEIF plus HEVC on PCs without HEVC support; it states
+  that HEVC may be paid and gives no price. Unconditional codec-free claims
+  were removed. HTML guidance links directly to all applicable Store listings.
+  This agrees with Microsoft's HEIF/HEVC guidance:
+  https://support.microsoft.com/en-us/windows/apps/photos/photos-app-video-editor-error-can-t-view-this-file-type
+- Product-page license text, CLAUDE and the source-distribution document now
+  describe in-app full notices for every distribution form. Readmes preserve
+  UTF-8 BOM/CRLF. No RAW behavior, dependency version or release metadata changed.
+
+### Correction verification
+
+`MSBUILDDISABLENODEREUSE=1` is set for Cargo. Logs are in
+`target/s4-review-fixes/` (ignored). All requested automated checks passed.
+
+- `cargo test -p mimageviewer --lib ui_dialogs::about::tests`: 2 passed,
+  0 failed, including the new embed test. The isolated `cargo test -p
+  mimageviewer --lib embedded_raw_notices_equal_tracked_files_with_bsd_and_ijg_attribution`
+  also passed: 1 passed, 0 failed (the same test, not an additional unique test).
+- `cargo test --test ui_snapshot`: 62 passed, 0 failed (includes the expanded
+  interaction snapshot); all three affected PNGs visually reviewed.
+- `cargo check -p mimageviewer --bin mimageviewer-core`: passed (16.42 s).
+  `cargo check --bin mimageviewer-core --features portable`: passed (16.23 s).
+  Existing lib warnings remain (138); no compilation errors.
+- `python scripts/check_ui_glyphs.py`: zero dangerous glyphs.
+  `cargo fmt --all --check` and `git diff --check`: clean.
+- Guidance checks: all 10 public guidance files match HEIF/conditional HEVC;
+  four verified Store names/URLs, no old names or RAW Store requirement,
+  removed unconditional codec-free claims, preserved readme encoding, and
+  unchanged full notice files / installer / portable lists all passed.
+- Fresh upstream/public archive hash verification and distribution-build
+  contents remain release-lead work; this correction run does not claim them.

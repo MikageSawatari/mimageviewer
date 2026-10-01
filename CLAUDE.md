@@ -1157,6 +1157,8 @@ libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加し�
 
 - tracked notice はルートの `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` /
   `LIBJPEG-TURBO-LICENSE.txt`。installer / portable の双方へ同梱する。
+  3 本とも root ファイルから `include_str!` で本体へ埋め込み、バージョン情報で全文を表示する。
+  単体 exe 版でも全文と IJG 帰属文を読めることを維持する。
 - LibRaw 本体は無改変の公式 tarball、shim は本リポジトリの MIT コード。
 - 対応ソースは [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) に従って
   SHA-256 を照合し、mikage.to へ配置する。tarball は git に入れず、`.sha256` を追跡する。
