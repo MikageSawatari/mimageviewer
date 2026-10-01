@@ -372,11 +372,13 @@ enum EffectiveState {
 - `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
-- 実行時は **EffeTune モジュール自身の解決関数** で `<実行中 exe のディレクトリ>\effetune\EffeTune Mixwright.vst3`
-  を探す。`native_assets` は使わない (ポータブル版の DLL 解決専用に `#[cfg(feature = "portable")]` で
-  閉じられており、公開範囲を広げない。実装時に判明、2026-09-27)。通常版・ポータブル版で同じ規則。
-  `current_exe()` が失敗したら `.` に逃がさず `Unavailable(BundleMissing(理由))`。
-  bundle が無ければ `Unavailable(BundleMissing)`。
+- 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
+  `<exe_dir>/effetune/<content SHA256>-<generation>/EffeTune Mixwright.vst3` として一度だけ解決し、
+  controllerの生存中は固定する。launcher経由でない通常版はcurrent pointerから同じ規則で選ぶ。
+  修復不能時の専用envはUnavailableと詳細logへ反映し、別世代へ黙ってfallbackしない。
+- build-devのpointer不在時だけ従来の `<exe_dir>/effetune/EffeTune Mixwright.vst3` を使う。
+  portableはこの従来経路を維持しbundleを同梱しない。`native_assets` のportable専用公開範囲は広げない。
+  `current_exe()`失敗時も `.` へfallbackしない。bundle不在はUnavailable(BundleMissing)。
 - `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` が偽なら
   `Unavailable(CpuUnsupported)`。
 - サンプル版では release / portable / launcher への埋め込みを行わず、build.rs の必須チェックにも
@@ -528,22 +530,30 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   v0.11.1 の bundle は 407 ファイル、38,491,437 bytes (約36.71 MiB)。bundle 外の VERSION を含む
   入力は計408ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
   無ければ取得・配置の復旧手順付きで build を停止する。
-- 起動時は `%APPDATA%\mimageviewer\runtime\<version>\effetune\EffeTune Mixwright.vst3\`
-  へ階層を保持して展開する。core の §7 の解決規則に一致する。一時ディレクトリで全ファイルの
-  hash を検証してから bundle 単位で置き換え、展開完了 stamp を保存する。既存のファイル一覧・
-  サイズ・更新時刻・作成時刻 (UNIX epoch からの nanoseconds) が stamp と一致するときは全量を
-  再hashしない。不一致なら bundle 全体を staging に再展開し、全ファイルの hash を検証して
-  tree を置き換える。欠落・変更・余分なファイル・部分展開を修復し、別bundleの残存を混ぜない。
-  メタデータを保持したままの内容破損は、既存asset shortcutと同様に通常起動時の検出範囲外。
+- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋407ファイルの一覧とSHA-256を
+  固定し、vendor原本の欠落・追加・改変を署名前／埋め込み前に拒否する。署名stageも全非PEが一致、
+  PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
+- 起動時は `runtime/<version>/effetune/<content SHA256>-<generation>/EffeTune Mixwright.vst3/`
+  へ新しい世代を構築する。全ファイルのhashと一覧を検証してから、小さな `effetune/current`
+  pointerだけをatomicに更新する。公開済みtreeは使用中の読手から見えるため一切移動・削除しない。
+  旧世代のcleanupは起動経路では行わない。修復は別世代の公開でありin-placeの置換ではない。
+  正常stampの一覧・サイズ・更新時刻・作成時刻が一致するときは全量再hashもwrite lockも不要。
+  metadataを保持したままの内容改変は通常起動での検出対象外。書込不能／publisher busyなどで
+  repairできなくてもcoreは起動する。失敗理由を専用envからUnavailable UI／ログへ伝え、古いtreeを
+  黙って代用しない。成功時のgenerationもlauncherがenvで指定し、coreがそのpathを一度解決・固定する。
 - `build-dist.ps1` が呼ぶ `build-release.ps1 -Sign` は vendor 原本を変更せず target の staging に
   bundle をコピーし、拡張子が
   `.vst3` の plugin PE を含む全 PE を **launcher の埋め込み前に署名**する。
   launcher build 時に `MIMV_EFFETUNE_DIR` を staging に向け、PE dependency gate も同じ
   staging の bundle を明示的な検査入力にする。
-- VST host は runtime の core の隣ではなく `data_dir/vst3/mimageviewer-vst3-host.exe` から動く。
-  plugin の動的 VC runtime imports をそこで解決するため、Microsoft 署名済み公式 CRT4本を
-  host の隣にも配置する。process ごとに1回、埋め込み bytes との照合と一時ファイルからの atomic
-  置換を行う。runtime root の CRT だけには頼らない。
+- VST hostは `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` へ展開し、
+  CRT4本は非検索subdir `vcrt/` に置く。hostはSystem32のDLLを依存順でpreloadし、欠落分だけ
+  同梱版を絶対pathでloadする。固定版app-local CRTで既存ユーザーVSTのsystem依存を変更しない。
+  旧host／旧CRTを触らず、成功のみcacheして抽出失敗の再試行を許す。basenameは維持するので
+  WebViewの `%APPDATA%/mimageviewer-vst3-host.exe/` 保存先は変わらない。
+- SDK Windows hosting moduleはMIT原文を保持したtracked copyでUTF-8→UTF-16／wide APIを使う。
+  IPCのWindows backslash／Unicode escapeもdecodeする。pluginのANSI APIに影響する
+  activeCodePage manifestは使わない。stateはopaque IPC bytesで、hostにstate/preset path I/Oはない。
 - 3種類の通知全文を `third_party/effetune-mixwright/v0.11.1/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`

@@ -1444,6 +1444,40 @@ mod concurrent_state_tests {
     use super::*;
 
     #[test]
+    fn probe_and_open_preserve_utf8_windows_paths_in_ipc() {
+        let path = r"C:\Users\山田😀\音響調整\EffeTune Mixwright.vst3";
+        let commands = [
+            Cmd::Probe {
+                plugin_path: path.into(),
+            },
+            Cmd::Open {
+                plugin_path: path.into(),
+                sample_rate: 48_000,
+                block_size: 480,
+                shm_name: "shm".into(),
+                shm_size: 4096,
+                sig_in: "in".into(),
+                sig_out: "out".into(),
+                state: Some("AA==".into()),
+                strict_state: 1,
+            },
+        ];
+        for command in commands {
+            let bytes = serde_json::to_vec(&command).unwrap();
+            let json = std::str::from_utf8(&bytes).unwrap();
+            assert!(json.contains("山田😀"));
+            assert!(json.contains(r"C:\\Users\\"));
+            let decoded: Cmd = serde_json::from_slice(&bytes).unwrap();
+            match decoded {
+                Cmd::Probe { plugin_path } | Cmd::Open { plugin_path, .. } => {
+                    assert_eq!(plugin_path, path);
+                }
+                _ => panic!("path command changed"),
+            }
+        }
+    }
+
+    #[test]
     fn host_gui_user_hidden_wakes_idle_effetune_context_only() {
         use std::sync::atomic::AtomicUsize;
 

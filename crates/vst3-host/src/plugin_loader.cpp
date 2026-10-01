@@ -4,6 +4,7 @@
 // IComponent / IAudioProcessor / IEditController の取得と最低限の lifecycle 制御まで実装する。
 
 #include "plugin_loader.h"
+#include "utf8_paths.h"
 
 #include <algorithm>
 #include <atomic>
@@ -64,16 +65,7 @@ constexpr UINT kBridgeResizePluginClientMsg = WM_APP + 0x4D9;
 #endif
 
 std::wstring utf8_to_wide(const std::string& text) {
-    if (text.empty()) {
-        return L"VST3 Plugin";
-    }
-    int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-    if (needed <= 1) {
-        return L"VST3 Plugin";
-    }
-    std::wstring out(static_cast<size_t>(needed - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), needed);
-    return out;
+    return miv::display_title_from_utf8(text);
 }
 
 int editor_titlebar_height(HWND hwnd) {
@@ -1464,8 +1456,13 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     }
     if (options.unowned) {
         auto gate = std::make_unique<GuiGateReader>();
-        if (!gate->open(utf8_to_wide(options.gui_gate_name))) {
-            error_out = "invalid or missing EffeTune presentation gate";
+        try {
+            if (!gate->open(miv::utf8_to_utf16(options.gui_gate_name))) {
+                error_out = "invalid or missing EffeTune presentation gate";
+                return false;
+            }
+        } catch (const std::runtime_error& error) {
+            error_out = error.what();
             return false;
         }
         gui_gate_ = std::move(gate);

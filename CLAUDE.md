@@ -991,8 +991,8 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 └── 起動時の動作:
     1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 exe / DLL と app-local VC runtime を展開
        (版別 SHA-256 sidecar で照合し、不一致なら atomic replace)
-       EffeTune は runtime/<version>/effetune/ 下で bundle 単位に検証／atomic 展開する。
-       全ファイルの一覧・サイズ・更新時刻・作成時刻と bundle stamp が一致するときは全量を再hashしない
+       EffeTune は同ディレクトリ下の不変世代へ全hash検証して公開し、atomic更新するのはcurrent pointerだけ。
+       一覧・サイズ・更新時刻・作成時刻とstampが一致すれば再hash／write lockなし。修復失敗もcore起動を継続。
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
     3. ランチャー即終了 (GUI なので exit code を待たない)
 ```
@@ -1159,6 +1159,12 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 互換。bridge ビルド成果物は通常の `include_bytes!` で本体に内包する (PDFium / Susie ワーカーと
 同じパターン)。
 
+Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
+明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
+2026-10-02 R1修正以後の配布は旧host cacheを再利用せず、必ず現C++ソースから再buildする。
+`-SkipVst3Bridge` やSDK欠落時のcache fallbackでは、この修正前hostを配布しない。
+再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。
+
 ### セットアップ (メインビルド前に必須)
 
 ```bash
@@ -1168,7 +1174,7 @@ bash scripts/setup-vst3-sdk.sh
 # 2. CMake で C++ bridge をビルド
 cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 cmake --build crates/vst3-host/build --config Release
-# → vendor/vst3-host/mimageviewer-vst3-host.exe (~640 KB)
+# → vendor/vst3-host/mimageviewer-vst3-host.exe (R1 build: 815,616 bytes)
 ```
 
 - 前提:
@@ -1620,20 +1626,28 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **EffeTune 配布境界**: 単体exe版／インストーラ版は launcher が bundle 全体を
-  `runtime/<version>/effetune/EffeTune Mixwright.vst3/` へ展開する。`VERSION` と全ファイルの
-  SHA-256 manifest による bundle stamp を用い、正常時は一覧・サイズ・更新時刻・作成時刻の検査だけで
-  全量再hashを避ける。不一致なら bundle 全体を staging に再展開して全ファイルの hash を検証し、
-  tree を置き換える。変更・欠落・余分なファイルや部分展開を修復し、別bundleの tree を混ぜない。
-  メタデータを保持したままの内容破損は、既存asset shortcutと同様に通常起動時の検出範囲外。
-  通知原文は `third_party/effetune-mixwright/v0.11.1/` に追跡し、about へ埋め込む。
-  `.gitattributes` の `-text` で checkout 時の改行変換を防ぎ、vendorとのバイト一致を保つ。
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.11.1 の VERSION と全407ファイルを
+  `third_party/effetune-mixwright/v0.11.1/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+  改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
+  指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
+  launcherは `runtime/<version>/effetune/<content SHA256>-<generation>/EffeTune Mixwright.vst3/` に
+  検証済み世代を一度だけ公開する。既存・使用中treeの移動、置換、削除はしない。**atomicなのは
+  完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
+  正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
+  不一致は別世代を全hash検証して公開する。公開済み旧世代のcleanupは起動経路外に保留する。
+  repair不能／publisher busyでもcoreは起動し、専用envで理由を渡して音響調整だけUnavailableにする。
+  成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
+  メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.11.1/` に追跡し、`.gitattributes -text`で
+  checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
   するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。
-  EffeTune plugin も動的 VC runtime を import するが、VST host は core の runtime ディレクトリではなく
-  `data_dir/vst3/mimageviewer-vst3-host.exe` から動くため、公式 CRT4本を host の隣にも配置する。
-  process ごとに1回、埋め込み bytes と照合し、一時ファイルから atomic に置換する。
+  EffeTune pluginも動的VC runtimeをimportする。hostは
+  `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe`、同梱CRTは非検索subdir `vcrt/`。
+  host自身がSystem32から依存順にpreloadし、system欠落分だけ同梱版を絶対pathでloadする。
+  shared host直下に固定CRTを置かず、既存ユーザーVSTのsystem CRT選択を保つ。抽出は一致bytesを
+  書き換えず、成功だけcacheして失敗の再試行を許す。portableはこの抽出経路を使わない。
   `scripts/check-vcrt-pe-dependencies.ps1` が全配布 PE の machine / import closure と、CRT・ORT の
   Microsoft 署名、CRT の同一版・最低版・manifest hash を検査する。未知の `msvcp*` /
   `vcruntime*` / `concrt*` import は gate failure とし、追加 DLL を場当たり的に配布しない。

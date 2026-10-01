@@ -15,12 +15,17 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+#[path = "../../../src/effetune/bundle_location.rs"]
+mod bundle_location;
 mod bundle_paths;
 mod effetune_bundle;
 include!(concat!(env!("OUT_DIR"), "/effetune_files.rs"));
 
 #[cfg(test)]
 mod build_const_parser;
+#[cfg(test)]
+#[path = "../build_effetune_source.rs"]
+mod build_effetune_source;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -130,12 +135,16 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
 
     extract_assets(&runtime_dir)?;
+    // EffeTune preparation is optional to application startup. Never run a
+    // damaged/old bundle silently when this launcher's preparation failed.
+    let effetune = prepare_effetune(&runtime_dir);
 
     let core_path = runtime_dir.join("mimageviewer-core.exe");
     let launcher_path = std::env::current_exe().ok();
 
     let mut cmd = Command::new(&core_path);
     cmd.args(&user_args);
+    configure_effetune_command(&mut cmd, effetune);
     if let Some(path) = launcher_path {
         cmd.env("MIV_LAUNCHER_EXE_PATH", path);
     }
@@ -149,15 +158,30 @@ fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
     for asset in ASSETS {
         extract_asset(runtime_dir, asset)?;
     }
-    effetune_bundle::ensure_bundle(runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST).map_err(
-        |e| {
-            format!(
-                "extract EffeTune {EFFETUNE_VERSION} failed: {e}\n(runtime dir: {})",
-                runtime_dir.display()
-            )
-        },
-    )?;
     Ok(())
+}
+
+fn configure_effetune_command(cmd: &mut Command, result: Result<PathBuf, String>) {
+    cmd.env_remove(bundle_location::PREPARATION_ERROR_ENV);
+    cmd.env_remove(bundle_location::GENERATION_ENV);
+    match result {
+        Ok(root) => {
+            cmd.env(bundle_location::GENERATION_ENV, root.file_name().unwrap());
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            cmd.env(bundle_location::PREPARATION_ERROR_ENV, error);
+        }
+    }
+}
+
+fn prepare_effetune(runtime_dir: &Path) -> Result<std::path::PathBuf, String> {
+    effetune_bundle::ensure_bundle(runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST).map_err(|e| {
+        format!(
+            "extract EffeTune {EFFETUNE_VERSION} failed: {e}\n(runtime dir: {})",
+            runtime_dir.display()
+        )
+    })
 }
 
 fn extract_asset(runtime_dir: &Path, asset: &(&str, &[u8], &str)) -> Result<(), String> {
@@ -590,15 +614,39 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn preparation_failure_and_success_are_forwarded_without_starting_core() {
+        let mut cmd = std::process::Command::new("dummy-core-never-run.exe");
+        super::configure_effetune_command(&mut cmd, Err("EffeTune publish: access denied".into()));
+        let vars: Vec<_> = cmd.get_envs().collect();
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::PREPARATION_ERROR_ENV
+            && value.is_some()));
+        assert!(
+            vars.iter().any(
+                |(key, value)| *key == super::bundle_location::GENERATION_ENV && value.is_none()
+            )
+        );
+        let name = format!("{}-Abc123", "a".repeat(64));
+        super::configure_effetune_command(&mut cmd, Ok(std::path::PathBuf::from(&name)));
+        let vars: Vec<_> = cmd.get_envs().collect();
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::PREPARATION_ERROR_ENV
+            && value.is_none()));
+        assert!(vars.iter().any(
+            |(key, value)| *key == super::bundle_location::GENERATION_ENV
+                && *value == Some(std::ffi::OsStr::new(&name))
+        ));
+    }
+
+    #[test]
     fn embedded_effetune_extracts_complete_bundle_beside_core() {
         let temp = tempfile::tempdir().unwrap();
-        super::effetune_bundle::ensure_bundle(
+        let root = super::effetune_bundle::ensure_bundle(
             temp.path(),
             super::EFFETUNE_FILES,
             super::EFFETUNE_MANIFEST,
         )
         .unwrap();
-        let root = temp.path().join("effetune");
         let bundle = root.join("EffeTune Mixwright.vst3");
         assert!(
             bundle

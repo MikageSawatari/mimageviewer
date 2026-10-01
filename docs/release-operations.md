@@ -167,10 +167,11 @@ Microsoft VC/Redist 由来の `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.
 `vcruntime140_1.dll` は `vendor/vcrt/provenance.json` が正本で、全4本同一版、最低14.44、x64、
 manifest exact hash、Microsoft Authenticode Valid を必須とする。package 内コピーも canonical と
 exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。
-EffeTune plugin の依存は `data_dir/vst3/mimageviewer-vst3-host.exe` の process で解決するため、
-通常版 core は公式 CRT4本を host の隣にも展開する (process ごとに bytes を照合し atomic 置換)。
-core の `runtime/<version>/` にある CRT だけでは、この別processの検索経路を満たさない。app-local CRT は Windows Update で
-更新されないため、toolchain / native dependency 更新時にこの正本と実体を一体で更新する。
+EffeTune pluginの依存は `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` の
+processで解決する。同梱CRT4本は非検索subdir `vcrt/` に置き、hostがSystem32を依存順にpreloadし、
+systemに無いDLLだけ同梱版を絶対pathでloadする。systemに存在するがload不能なら理由をlogへ記録し、
+固定版で黙って置き換えない。旧host／CRTの上書きはせず、同一bytesは再抽出しない。
+同梱CRTはWindows Updateで更新されないため、native dependency更新時に正本と実体を一体で更新する。
 
 `onnxruntime*.dll` も Microsoft Authenticode Valid を必須にする。既知4名以外の `msvcp*` /
 `vcruntime*` / `concrt*` import は依存 closure の再設計が必要なので fail とする。artifact の machine
@@ -210,13 +211,17 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   - 準備完了の判定はトレイ通知「SimplySign connected / Amount of cards available: 1」、
     または `certutil -scinfo` に Reader Name が出ること。
   - 毎回避けたければ `Set-Service SCardSvr -StartupType Automatic` (管理者)。
+- **R1 host更新 (2026-10-02)**: UTF-8 path／system-first CRT preload修正前hostは配布不可。
+  必ず現C++ソースをCMakeで再buildしSHA256／sizeを記録する。旧cacheを使うSDK欠落fallbackや
+  `-SkipVst3Bridge` は今回の再buildを代替しない。実host起動の確認は承認済み手動検証へ分ける。
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
   vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
   EffeTune は `vendor/effetune-mixwright/` を target staging にコピーしてから全 PE を署名する
   (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、
   `build-release.ps1` の launcher build と dependency gate が同じ署名済み実体を使う。
-  VERSION と tracked 3通知原文の照合も配布ビルドで行い、更新時は
+  署名前にtracked manifestの全408ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
+  PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
   `third_party/effetune-mixwright/<version>/` と about の include_str! を一体で更新する。
 - **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
   `*.onnx` は PE でないので対象外。
@@ -295,9 +300,11 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
   [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
   launcher が VERSION を記録した全 bundle (v0.11.1 は407ファイル、VERSION込み入力408ファイル) を
-  `runtime/<version>/effetune/` へ展開する。初回／修復時は staging の全ファイルを hash 検証する。
-  通常起動時は stamp の一覧・サイズ・更新時刻・作成時刻が一致すれば全量再hashしないため、
-  メタデータを保持したままの内容破損は既存asset shortcutと同様に検出範囲外。
+  `runtime/<version>/effetune/<content SHA256>-<generation>/` へ全hash検証して公開し、
+  atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。
+  coreには成功generationを渡して固定し、修復失敗・publisher busyなら理由を渡して起動を継続する。
+  正常時はstamp一覧・サイズ・更新時刻・作成時刻の一致を確認し、全量再hashとwrite lockを避ける。
+  メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
 - **検証**: ビルド後、**Chrome で実際に zip をダウンロード**してブロックされないことを確認する
   (VirusTotal のスコアはキャッシュラグがあるので最終確認は実 DL)。
 - **運用知見** (AV ベンダーへの誤検知申請が必要になった場合):

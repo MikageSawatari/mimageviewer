@@ -70,7 +70,18 @@ pub fn relative_name(path: &Path) -> io::Result<String> {
 
 /// Sorted inventory, rejecting links at every level before following directories.
 pub fn inventory(root: &Path) -> io::Result<Vec<(String, bool, PathBuf)>> {
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, bool, PathBuf)>) -> io::Result<()> {
+    Ok(inventory_metadata(root)?
+        .into_iter()
+        .map(|(name, meta, path)| (name, meta.is_dir(), path))
+        .collect())
+}
+
+pub fn inventory_metadata(root: &Path) -> io::Result<Vec<(String, std::fs::Metadata, PathBuf)>> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        out: &mut Vec<(String, std::fs::Metadata, PathBuf)>,
+    ) -> io::Result<()> {
         if !checked_metadata(dir)?.is_dir() {
             return Err(io::Error::other("bundle directory required"));
         }
@@ -82,7 +93,7 @@ pub fn inventory(root: &Path) -> io::Result<Vec<(String, bool, PathBuf)>> {
             }
             out.push((
                 relative_name(path.strip_prefix(root).unwrap())?,
-                meta.is_dir(),
+                meta.clone(),
                 path.clone(),
             ));
             if meta.is_dir() {

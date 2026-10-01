@@ -31,6 +31,7 @@ path = "src/main.rs"
 [dependencies]
 sha2 = "0.10"
 fs4 = "0.13"
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

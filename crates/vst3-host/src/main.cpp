@@ -52,6 +52,9 @@
 #include "host_app.h"
 #include "plugin_loader.h"
 #include "protocol.h"
+#include "ipc_strings.h"
+#include "utf8_paths.h"
+#include "vcrt_preload.h"
 
 namespace miv {
 
@@ -183,16 +186,10 @@ void send_event_gui_bypass_toggle(uint64_t slot_id) {
 }
 
 static std::string wide_to_utf8(const wchar_t* text) {
-    if (!text || !*text) {
-        return {};
-    }
-    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-    if (needed <= 1) {
-        return {};
-    }
-    std::string out(static_cast<size_t>(needed - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
-    return out;
+    // Window titles originate in third-party plugins; a malformed surrogate
+    // should not terminate the host just while producing a diagnostic.
+    try { return text ? miv::utf16_to_utf8(text) : std::string{}; }
+    catch (const std::exception&) { return "(invalid UTF-16)"; }
 }
 
 static BOOL CALLBACK enum_current_thread_window_proc(HWND hwnd, LPARAM param) {
@@ -654,16 +651,7 @@ private:
     // 単純な JSON 解析: { "cmd": "<value>", ... } から cmd を取り出す。
     // POC 用なので本格的な JSON パーサは入れない (将来 nlohmann/json 採用検討)。
     static std::string extract_string_field(const std::string& json, const std::string& key) {
-        std::string needle = "\"" + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return {};
-        pos = json.find(':', pos);
-        if (pos == std::string::npos) return {};
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) return {};
-        auto end = json.find('"', pos + 1);
-        if (end == std::string::npos) return {};
-        return json.substr(pos + 1, end - pos - 1);
+        return extract_json_string_field(json, key);
     }
 
     static uint64_t extract_number_field(const std::string& json, const std::string& key) {
@@ -1980,6 +1968,7 @@ int main(int argc, char** argv) {
     // VST3 GUI を任意のスレッドで attached する前に必ずプロセス全体に設定する必要がある。
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     start_parent_watchdog(parse_parent_pid_arg(argc, argv));
+    if (!miv::preload_vcrt()) return 1;
     miv::Bridge bridge;
     return bridge.run();
 }

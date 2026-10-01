@@ -56,6 +56,7 @@ add_executable(mimageviewer-vst3-host
     src/plugin_loader.cpp
     src/audio_pipe.cpp
     src/protocol.cpp
+    src/vcrt_preload.cpp
 )
 
 target_include_directories(mimageviewer-vst3-host PRIVATE
@@ -75,7 +76,7 @@ target_sources(mimageviewer-vst3-host PRIVATE
     "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/connectionproxy.cpp"
     "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/hostclasses.cpp"
     "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/module.cpp"
-    "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/module_win32.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sdk/module_win32.cpp"
     "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/plugprovider.cpp"
     "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp"
     "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/parameterchanges.cpp"
@@ -131,3 +132,13 @@ set_target_properties(mimageviewer-vst3-host PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OUTPUT_DIR}"
 )
+
+# Pure UTF-8/Windows-path and CRT-policy test executable. It cannot load plugins
+# or construct the product host; release verification may run it separately.
+add_executable(vst3-path-tests tests/path_boundaries.cpp)
+target_include_directories(vst3-path-tests PRIVATE include)
+if(MSVC)
+    target_compile_options(vst3-path-tests PRIVATE /utf-8 /W4 /permissive-)
+    target_compile_definitions(vst3-path-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    set_property(TARGET vst3-path-tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()

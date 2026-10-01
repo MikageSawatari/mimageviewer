@@ -362,6 +362,7 @@ if ($Sign) {
     Write-Host '[build-release] signing every staged EffeTune PE (pre-launcher)'
     Invoke-MivSign -Files @($effetunePe | ForEach-Object { $_.FullName }) -Verify
 }
+Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot $effetuneStage
 
 Ensure-LibclangPath
 
@@ -426,6 +427,7 @@ $oldEffetuneDir = $env:MIMV_EFFETUNE_DIR
 $hadEffetuneDir = Test-Path Env:MIMV_EFFETUNE_DIR
 $env:MIMV_EFFETUNE_DIR = $effetuneStage
 try {
+    Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot $effetuneStage
     $launcherExit = Invoke-ReleaseCargo -Args $launcherCmd
 } finally {
     if ($hadEffetuneDir) { $env:MIMV_EFFETUNE_DIR = $oldEffetuneDir }

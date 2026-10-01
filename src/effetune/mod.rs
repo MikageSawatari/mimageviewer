@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 
+mod bundle_location;
 pub mod composition;
 pub(crate) mod gui_gate;
 mod window;
@@ -41,6 +42,7 @@ const EXIT_FENCE: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnavailableReason {
     BundleMissing(String),
+    BundlePreparationFailed(String),
     CpuUnsupported,
     PlatformUnsupported,
 }
@@ -49,6 +51,9 @@ impl UnavailableReason {
     pub(crate) fn user_reason(&self) -> &'static str {
         match self {
             Self::BundleMissing(_) => "必要なファイルが見つかりません",
+            Self::BundlePreparationFailed(_) => {
+                "同梱ファイルを準備できません (詳しくはログを確認してください)"
+            }
             Self::CpuUnsupported => "この CPU では動作しません (AVX2/FMA が必要です)",
             Self::PlatformUnsupported => "この OS では利用できません",
         }
@@ -596,12 +601,63 @@ pub fn resolve_bundle_from_exe(
     let parent = exe.parent().ok_or_else(|| {
         UnavailableReason::BundleMissing("executable has no parent directory".into())
     })?;
-    let bundle = parent.join("effetune").join(BUNDLE_NAME);
+    resolve_bundle_at(parent, None, None)
+}
+
+fn resolve_bundle_at(
+    parent: &Path,
+    generation: Option<&str>,
+    preparation_error: Option<&str>,
+) -> Result<PathBuf, UnavailableReason> {
+    #[cfg(not(feature = "portable"))]
+    if let Some(error) = preparation_error {
+        return Err(UnavailableReason::BundlePreparationFailed(error.into()));
+    }
+    let container = parent.join("effetune");
+    #[cfg(not(feature = "portable"))]
+    let root = {
+        let result = if let Some(generation) = generation {
+            bundle_location::encode_pointer(generation)
+                .and_then(|_| bundle_location::checked_directory(&container))
+                .and_then(|_| {
+                    let root = container.join(generation);
+                    bundle_location::checked_directory(&root)?;
+                    Ok(root)
+                })
+        } else {
+            match std::fs::symlink_metadata(container.join(bundle_location::POINTER_FILE)) {
+                Ok(_) => bundle_location::read_generation(&container),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(container.clone()),
+                Err(error) => Err(error),
+            }
+        };
+        result.map_err(|error| UnavailableReason::BundlePreparationFailed(error.to_string()))?
+    };
+    #[cfg(feature = "portable")]
+    let root = {
+        let _ = (generation, preparation_error);
+        container
+    };
+    #[cfg(not(feature = "portable"))]
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => bundle_location::checked_directory(&root)
+            .map_err(|error| UnavailableReason::BundlePreparationFailed(error.to_string()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => {
+            return Err(UnavailableReason::BundlePreparationFailed(
+                error.to_string(),
+            ));
+        }
+    }
+    let bundle = root.join(BUNDLE_NAME);
     if !bundle.is_dir() {
         return Err(UnavailableReason::BundleMissing(
             bundle.display().to_string(),
         ));
     }
+    #[cfg(not(feature = "portable"))]
+    bundle_location::checked_directory(&bundle)
+        .map_err(|error| UnavailableReason::BundlePreparationFailed(error.to_string()))?;
     Ok(bundle)
 }
 
@@ -609,13 +665,19 @@ fn resolve_bundle() -> Result<PathBuf, UnavailableReason> {
     if !cfg!(windows) {
         return Err(UnavailableReason::PlatformUnsupported);
     }
-    let bundle = resolve_bundle_from_exe(std::env::current_exe())?;
+    let exe = std::env::current_exe()
+        .map_err(|error| UnavailableReason::BundleMissing(format!("current_exe: {error}")))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| UnavailableReason::BundleMissing("executable has no parent".into()))?;
+    let generation = std::env::var(bundle_location::GENERATION_ENV).ok();
+    let error = std::env::var(bundle_location::PREPARATION_ERROR_ENV).ok();
+    let bundle = resolve_bundle_at(parent, generation.as_deref(), error.as_deref())?;
     if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
         return Err(UnavailableReason::CpuUnsupported);
     }
     Ok(bundle)
 }
-
 fn remote_playback_snapshot(
     source: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
 ) -> (bool, Option<u64>) {
@@ -1449,6 +1511,56 @@ mod tests {
         let bundle = temp.path().join("effetune").join(BUNDLE_NAME);
         std::fs::create_dir_all(&bundle).unwrap();
         assert_eq!(resolve_bundle_from_exe(Ok(exe)).unwrap(), bundle);
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn bundle_resolution_pins_the_verified_generation_and_surfaces_preparation_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path();
+        let container = parent.join("effetune");
+        let first = format!("{}-Abc123", "a".repeat(64));
+        let second = format!("{}-Def456", "b".repeat(64));
+        for name in [&first, &second] {
+            std::fs::create_dir_all(container.join(name).join(BUNDLE_NAME)).unwrap();
+        }
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            bundle_location::encode_pointer(&first).unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_bundle_at(parent, Some(&first), None).unwrap();
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            bundle_location::encode_pointer(&second).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_bundle_at(parent, Some(&first), None).unwrap(),
+            resolved
+        );
+        assert_eq!(
+            resolve_bundle_at(parent, None, None).unwrap(),
+            container.join(&second).join(BUNDLE_NAME)
+        );
+        let failure =
+            resolve_bundle_at(parent, Some(&first), Some("publish: access denied")).unwrap_err();
+        assert!(
+            matches!(failure, UnavailableReason::BundlePreparationFailed(ref why) if why.contains("access denied"))
+        );
+        assert!(failure.user_reason().contains("準備できません"));
+        // Corrupt pointers must not silently select the old legacy tree.
+        std::fs::create_dir_all(container.join(BUNDLE_NAME)).unwrap();
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            "effetune-v2\n../outside\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_bundle_at(parent, None, None),
+            Err(UnavailableReason::BundlePreparationFailed(_))
+        ));
+        assert!(resolve_bundle_at(parent, Some("../outside"), None).is_err());
     }
 
     #[test]

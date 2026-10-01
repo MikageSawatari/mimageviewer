@@ -1,6 +1,7 @@
 // Shared memory + named events で親プロセスと音声を交換する SPSC リング実装。
 
 #include "audio_pipe.h"
+#include "utf8_paths.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8,18 +9,6 @@
 #include <string>
 
 namespace miv {
-
-namespace {
-// std::string (UTF-8) → wide string. shm 名や event 名はパス区切りなしの ASCII 想定なので
-// 単純変換で OK。
-std::wstring to_wide(const std::string& s) {
-    std::wstring w(s.size(), L'\0');
-    for (size_t i = 0; i < s.size(); ++i) {
-        w[i] = static_cast<wchar_t>(static_cast<unsigned char>(s[i]));
-    }
-    return w;
-}
-}  // namespace
 
 AudioPipe::AudioPipe() = default;
 
@@ -41,7 +30,15 @@ bool AudioPipe::attach(const std::string& shm_name,
         return false;
     }
 
-    auto wshm = to_wide(shm_name);
+    std::wstring wshm, wsi, wso;
+    try {
+        wshm = utf8_to_utf16(shm_name);
+        wsi = utf8_to_utf16(sig_in_name);
+        wso = utf8_to_utf16(sig_out_name);
+    } catch (const std::exception& error) {
+        error_out = error.what();
+        return false;
+    }
     shm_handle_ = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wshm.c_str());
     if (!shm_handle_) {
         error_out = "OpenFileMappingW failed for " + shm_name;
@@ -116,14 +113,12 @@ bool AudioPipe::attach(const std::string& shm_name,
     in_ring_ = reinterpret_cast<float*>(base + sizeof(ShmHeader));
     out_ring_ = in_ring_ + cached_capacity_;
 
-    auto wsi = to_wide(sig_in_name);
     sig_in_ = OpenEventW(EVENT_ALL_ACCESS, FALSE, wsi.c_str());
     if (!sig_in_) {
         error_out = "OpenEventW failed for sig_in";
         detach();
         return false;
     }
-    auto wso = to_wide(sig_out_name);
     sig_out_ = OpenEventW(EVENT_ALL_ACCESS, FALSE, wso.c_str());
     if (!sig_out_) {
         error_out = "OpenEventW failed for sig_out";

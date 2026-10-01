@@ -5,8 +5,13 @@ use std::path::Path;
 #[allow(dead_code)]
 mod bundle_paths;
 
+#[path = "build_effetune_source.rs"]
+mod source_approval;
+
 pub fn generate(workspace: &Path) {
     println!("cargo:rerun-if-env-changed=MIMV_EFFETUNE_DIR");
+    println!("cargo:rerun-if-env-changed=MIV_SIGN_SHA1");
+    println!("cargo:rerun-if-env-changed=MIV_SIGN_SUBJECT");
     let source = std::env::var_os("MIMV_EFFETUNE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| workspace.join("vendor/effetune-mixwright"));
@@ -16,6 +21,7 @@ pub fn generate(workspace: &Path) {
         workspace.join(source)
     };
     let recover = "Restore vendor/effetune-mixwright/VERSION and the complete EffeTune Mixwright.vst3 bundle (v0.11.1); or run scripts/build-release.ps1 to stage it. MIMV_EFFETUNE_DIR must point to a root containing VERSION and the bundle.";
+    source_approval::validate(workspace, &source).unwrap_or_else(|e| panic!("{e}. {recover}"));
     bundle_paths::checked_metadata(&source)
         .unwrap_or_else(|e| panic!("EffeTune source {}: {e}. {recover}", source.display()));
     let version_file = source.join("VERSION");

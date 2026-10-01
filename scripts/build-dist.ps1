@@ -211,6 +211,7 @@ $finalRuntimePe = @(
     (Join-Path $repoRoot 'target\effetune-dist-source\EffeTune Mixwright.vst3')
 )
 Write-Host '[build-dist] (7/7) final PE dependency closure'
+Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot (Join-Path $repoRoot 'target\effetune-dist-source')
 & (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
     -InputPaths $finalRuntimePe -RequireCompanionRuntime `
     -ReportPath 'target\vcrt-pe-reports\dist-runtime-portable.json'
