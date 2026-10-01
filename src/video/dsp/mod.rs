@@ -897,46 +897,49 @@ impl DspBridge {
         // ── Step 2: active 合計超過チェック + 最大 latency slot の auto-bypass loop ──
         // 個別では cap 内でも、合計が超えるケース (例: 1973ms + 50ms = 2023ms) に対応。
         // 合計が cap 以下になるまで、active で最大 latency の slot を bypass し続ける。
-        while self.latency_policy == LatencyPolicy::AutoBypass {
-            let total: u32 = inner
-                .slots
-                .iter()
-                .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
-                .map(|s| s.latency_samples)
-                .fold(0u32, |a, b| a.saturating_add(b));
-            if total <= max_samples {
-                break;
+        // ポリシーはこのループ内で変わらないので 1 回だけ判定し、合計が収まったら break で抜ける。
+        if self.latency_policy == LatencyPolicy::AutoBypass {
+            loop {
+                let total: u32 = inner
+                    .slots
+                    .iter()
+                    .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
+                    .map(|s| s.latency_samples)
+                    .fold(0u32, |a, b| a.saturating_add(b));
+                if total <= max_samples {
+                    break;
+                }
+                // active で最大 latency の slot を 1 つ bypass
+                let target_idx = inner
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !s.bypass && matches!(s.state, SlotState::Loaded))
+                    .max_by_key(|(_, s)| s.latency_samples)
+                    .map(|(i, _)| i);
+                let Some(idx) = target_idx else {
+                    break; // active slot が無いのに total > max は通常起きない、防御
+                };
+                let slot = &mut inner.slots[idx];
+                // 既に auto-bypass 済の slot にはログ再発火しない (= ログ連打防止)
+                let already_logged = slot.auto_bypassed_for_latency;
+                slot.bypass = true;
+                slot.auto_bypassed_for_latency = true;
+                active_changed = true;
+                if !already_logged {
+                    let total_ms = total as f64 / sr.max(1) as f64 * 1000.0;
+                    let this_ms = slot.latency_samples as f64 / sr.max(1) as f64 * 1000.0;
+                    crate::logger::log(format!(
+                        "[VST3 PDC] AUTO-BYPASS (total): chain total {:.1}ms exceeds {:.1}s cap, \
+                         disabling largest active plugin '{}' ({:.1}ms).",
+                        total_ms,
+                        MAX_PDC_LATENCY_SECS,
+                        slot.plugin_name.as_deref().unwrap_or("?"),
+                        this_ms,
+                    ));
+                }
+                // loop 継続: bypass 後の total を再計算
             }
-            // active で最大 latency の slot を 1 つ bypass
-            let target_idx = inner
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.bypass && matches!(s.state, SlotState::Loaded))
-                .max_by_key(|(_, s)| s.latency_samples)
-                .map(|(i, _)| i);
-            let Some(idx) = target_idx else {
-                break; // active slot が無いのに total > max は通常起きない、防御
-            };
-            let slot = &mut inner.slots[idx];
-            // 既に auto-bypass 済の slot にはログ再発火しない (= ログ連打防止)
-            let already_logged = slot.auto_bypassed_for_latency;
-            slot.bypass = true;
-            slot.auto_bypassed_for_latency = true;
-            active_changed = true;
-            if !already_logged {
-                let total_ms = total as f64 / sr.max(1) as f64 * 1000.0;
-                let this_ms = slot.latency_samples as f64 / sr.max(1) as f64 * 1000.0;
-                crate::logger::log(format!(
-                    "[VST3 PDC] AUTO-BYPASS (total): chain total {:.1}ms exceeds {:.1}s cap, \
-                     disabling largest active plugin '{}' ({:.1}ms).",
-                    total_ms,
-                    MAX_PDC_LATENCY_SECS,
-                    slot.plugin_name.as_deref().unwrap_or("?"),
-                    this_ms,
-                ));
-            }
-            // loop 継続: bypass 後の total を再計算
         }
 
         // active_slot_count atomic を更新
