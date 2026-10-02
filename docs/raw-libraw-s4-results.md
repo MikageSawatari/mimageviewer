@@ -177,3 +177,47 @@ in `target/s4-priority-fix/` (ignored).
   zero dangerous glyphs. Edited documentation retains its original BOM state
   and decodes as UTF-8. No snapshots changed: priority data is covered by the
   real-load preferences-state test; the renderer and layout are unchanged.
+
+## Native-format fingerprint invalidation (review P2)
+
+Base: `c9eac849c`. The previous completion fix did not invalidate cached page
+counts when a user's priority list already included every new RAW extension.
+
+- The shared ZIP/image-folder recognition fingerprint now hashes
+  `folder_tree::SUPPORTED_EXTENSIONS`, the native list consumed by the folder
+  scanner's `is_recognized_image_ext`. It is independent of saved priorities.
+  A private helper accepts a native list so regression tests can model support
+  before an addition without changing process-global scanning behavior.
+- Chose hashing the actual list rather than merely bumping `v1`: future native
+  format additions/removals automatically change the key without a developer
+  remembering another version bump. The new delimited section also changes
+  existing keys once, including for complete saved lists. The static list has
+  deterministic ordering; a list reorder may harmlessly invalidate once too.
+  Version bytes remain available for recognition-rule changes beyond formats.
+- Architecture documentation records this cache identity contract. No UI,
+  settings normalization, storage location or network behavior changes.
+- Regression starts with a complete saved priority list and confirms that
+  normalization appends nothing. With the same settings and source stamps,
+  the pre-addition native set yields a different key from today's scanner set.
+  Real catalog lookups reject the old non-book result for a RAW-only folder
+  and the old one-page result for a JPEG-plus-RAW folder; real scanning returns
+  one and two pages respectively. No RAW decoding or application launch occurs.
+
+### P2 verification
+
+Logs: `target/s4-native-fingerprint-fix/` (ignored). Cargo runs use
+`MSBUILDDISABLENODEREUSE=1`. All checks below were rerun after the PC restart
+against the inspected, uncommitted diff on `c9eac849c`.
+
+- `cargo test -p mimageviewer --lib app::folder_scan::`: 20 passed, 0 failed,
+  including the new complete-priority regression. Final rerun uses both real
+  folder shapes described above.
+- `cargo test -p mimageviewer --lib catalog::tests::container_page_meta_`:
+  2 passed, 0 failed.
+- `cargo test -p mimageviewer --lib details_page_count_`: 3 passed, 0 failed
+  (EPUB/PDF identity, direct RAR caching, nested ZIP enumeration/cache).
+  These filters cover 25 distinct tests.
+- `cargo check -p mimageviewer --bin mimageviewer-core`: passed (0.84 s,
+  incremental), with existing warnings (138).
+- `cargo fmt --all --check` and `git diff --check`: passed. No product was
+  launched, no verification/distribution build was run, and no commit was made.
