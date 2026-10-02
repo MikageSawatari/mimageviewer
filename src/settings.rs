@@ -4656,6 +4656,17 @@ pub struct Settings {
     #[serde(default)]
     pub slideshow_end_action: SlideshowEndAction,
 
+    // ── クリップボード取り込み ──────────────────────────────────
+    /// 起動中の画像コピーを自動保存する。既定 OFF。
+    #[serde(default)]
+    pub clipboard_capture_image_enabled: bool,
+    /// HTML コピー内の画像を選んで保存する監視。S2 で UI に公開する。
+    #[serde(default)]
+    pub clipboard_capture_html_enabled: bool,
+    /// None は capture::default_output_dir()/clipboard。保存まで作成しない。
+    #[serde(default)]
+    pub clipboard_capture_output_dir: Option<PathBuf>,
+
     // ── キャプチャ保存 ──────────────────────────────────────────
     /// Ctrl+S キャプチャ保存先。None のときは OS の Pictures/mimageviewer を使う。
     #[serde(default)]
@@ -7230,6 +7241,9 @@ impl Default for Settings {
             slideshow_continuous_scroll_secs: default_slideshow_continuous_scroll_secs(),
             slideshow_continuous_scroll_percent: default_slideshow_continuous_scroll_percent(),
             slideshow_end_action: SlideshowEndAction::default(),
+            clipboard_capture_image_enabled: false,
+            clipboard_capture_html_enabled: false,
+            clipboard_capture_output_dir: None,
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
             bake_stage_book: crate::bake_stage::BakeStage::default(),
@@ -10021,6 +10035,27 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipboard_capture_settings_default_off_and_roundtrip() {
+        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.clipboard_capture_image_enabled);
+        assert!(!defaults.clipboard_capture_html_enabled);
+        assert!(defaults.clipboard_capture_output_dir.is_none());
+        let configured = super::Settings {
+            clipboard_capture_image_enabled: true,
+            clipboard_capture_html_enabled: true,
+            clipboard_capture_output_dir: Some(std::path::PathBuf::from("C:/captures/clipboard")),
+            ..defaults
+        };
+        let restored: super::Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert!(restored.clipboard_capture_image_enabled);
+        assert!(restored.clipboard_capture_html_enabled);
+        assert_eq!(
+            restored.clipboard_capture_output_dir,
+            configured.clipboard_capture_output_dir
+        );
+    }
     #[test]
     fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_media_duration);

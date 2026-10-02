@@ -261,6 +261,31 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["PNG", "JPEG", "JPG", "キャプチャ"]
     ),
     entry!(
+        "clipboard-capture/image",
+        ClipboardCapture,
+        "画像がコピーされたら自動で保存する",
+        [
+            "クリップボード",
+            "clipboard",
+            "コピー",
+            "画像",
+            "自動保存",
+            "監視"
+        ]
+    ),
+    entry!(
+        "clipboard-capture/folder",
+        ClipboardCapture,
+        "保存先フォルダ",
+        [
+            "クリップボード",
+            "clipboard",
+            "保存場所",
+            "出力先",
+            "既定に戻す"
+        ]
+    ),
+    entry!(
         "capture/folder",
         Capture,
         "保存先フォルダ",
@@ -1368,6 +1393,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn clipboard_capture_search_finds_monitor_and_output_folder() {
+        for (query, anchor) in [
+            ("clipboard 自動保存", "clipboard-capture/image"),
+            ("クリップボード 保存場所", "clipboard-capture/folder"),
+        ] {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("clipboard capture settings must be discoverable");
+            assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
     }
 
     #[test]

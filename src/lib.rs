@@ -48,6 +48,7 @@ pub mod canonical_image_loader;
 pub mod capture;
 pub mod catalog;
 pub mod changelog_markdown;
+mod clipboard_capture;
 pub mod collection_store;
 pub mod color_search;
 pub mod colorize;
@@ -82,6 +83,7 @@ mod gpu_lanczos;
 pub mod metadata_transfer;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
 /// (HWND 引数の関数群の呼び出し元はすべて cfg(windows) 済み)。
@@ -267,6 +269,8 @@ mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
 mod ui_sns_split;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_clipboard_capture_settings_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;
 #[doc(hidden)]

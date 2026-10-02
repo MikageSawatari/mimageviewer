@@ -2503,13 +2503,6 @@ fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
 fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::DataExchange::{
-            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-        };
-        use windows::Win32::System::Memory::{
-            GLOBAL_ALLOC_FLAGS, GlobalAlloc, GlobalLock, GlobalUnlock,
-        };
         use windows::Win32::System::Ole::CF_DIB;
 
         let row_size = (width * 3 + 3) & !3;
@@ -2540,30 +2533,232 @@ fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
         let Ok(_lock) = CLIPBOARD_WRITE_MUTEX.lock() else {
             return;
         };
-        if !clipboard_seq_is_latest(my_seq) {
-            return;
-        }
-
-        unsafe {
-            let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), total_size);
-            let Ok(hmem) = hmem else { return };
-            let ptr = GlobalLock(hmem);
-            if ptr.is_null() {
-                return;
-            }
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, total_size);
-            let _ = GlobalUnlock(hmem);
-
-            if OpenClipboard(None).is_ok() {
-                let _ = EmptyClipboard();
-                let _ = SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hmem.0)));
-                let _ = CloseClipboard();
-            }
-        }
+        write_image_clipboard_if_latest(
+            &mut NativeClipboardImageApi,
+            &buf,
+            CF_DIB.0 as u32,
+            crate::clipboard_capture::data::process_nonce(),
+            || clipboard_seq_is_latest(my_seq),
+        );
     }
     #[cfg(not(windows))]
     {
         let _ = (width, height, rgba, my_seq);
+    }
+}
+
+/// Only the native calls are injected: the production writer and tests share
+/// every branch that retains or transfers ownership of a clipboard allocation.
+#[cfg(any(windows, test))]
+trait ClipboardImageApi {
+    type Memory: Copy;
+    type Error: std::fmt::Display;
+
+    fn allocate(&mut self, size: usize) -> Result<Self::Memory, Self::Error>;
+    fn lock_and_copy(&mut self, memory: Self::Memory, bytes: &[u8]) -> Result<(), Self::Error>;
+    fn unlock(&mut self, memory: Self::Memory) -> Result<(), Self::Error>;
+    fn free(&mut self, memory: Self::Memory) -> Result<(), Self::Error>;
+    fn open(&mut self) -> Result<(), Self::Error>;
+    fn empty(&mut self) -> Result<(), Self::Error>;
+    fn set_data(&mut self, format: u32, memory: Self::Memory) -> Result<(), Self::Error>;
+    fn register_origin(&mut self) -> Result<u32, Self::Error>;
+    fn close(&mut self) -> Result<(), Self::Error>;
+    fn log(&mut self, message: String);
+}
+
+#[cfg(any(windows, test))]
+fn free_clipboard_memory<A: ClipboardImageApi>(api: &mut A, memory: A::Memory, role: &str) {
+    if let Err(error) = api.free(memory) {
+        api.log(format!("Clipboard {role} free failed: {error}"));
+    }
+}
+
+#[cfg(any(windows, test))]
+fn prepare_clipboard_memory<A: ClipboardImageApi>(
+    api: &mut A,
+    bytes: &[u8],
+    role: &str,
+) -> Option<A::Memory> {
+    let memory = match api.allocate(bytes.len()) {
+        Ok(memory) => memory,
+        Err(error) => {
+            api.log(format!("Clipboard {role} allocation failed: {error}"));
+            return None;
+        }
+    };
+    if let Err(error) = api.lock_and_copy(memory, bytes) {
+        api.log(format!("Clipboard {role} lock failed: {error}"));
+        free_clipboard_memory(api, memory, role);
+        return None;
+    }
+    if let Err(error) = api.unlock(memory) {
+        api.log(format!("Clipboard {role} unlock failed: {error}"));
+    }
+    Some(memory)
+}
+
+/// The caller holds CLIPBOARD_WRITE_MUTEX, including the final generation
+/// check. Once SetClipboardData succeeds, that allocation is system-owned.
+#[cfg(any(windows, test))]
+fn write_image_clipboard_if_latest<A: ClipboardImageApi>(
+    api: &mut A,
+    dib: &[u8],
+    dib_format: u32,
+    nonce: &[u8],
+    is_latest: impl FnOnce() -> bool,
+) -> bool {
+    if !is_latest() {
+        return false;
+    }
+    let Some(image) = prepare_clipboard_memory(api, dib, "image") else {
+        return false;
+    };
+    if let Err(error) = api.open() {
+        api.log(format!("OpenClipboard for image failed: {error}"));
+        free_clipboard_memory(api, image, "image");
+        return false;
+    }
+    let copied = match api.empty() {
+        Err(error) => {
+            api.log(format!("EmptyClipboard for image failed: {error}"));
+            free_clipboard_memory(api, image, "image");
+            false
+        }
+        Ok(()) => match api.set_data(dib_format, image) {
+            Err(error) => {
+                api.log(format!("SetClipboardData for image failed: {error}"));
+                free_clipboard_memory(api, image, "image");
+                false
+            }
+            Ok(()) => {
+                // Marker failures must never undo or prevent the saved CF_DIB.
+                match api.register_origin() {
+                    Err(error) => api.log(format!(
+                        "Clipboard image origin format registration failed: {error}"
+                    )),
+                    Ok(format) => {
+                        if let Some(marker) = prepare_clipboard_memory(api, nonce, "image origin") {
+                            if let Err(error) = api.set_data(format, marker) {
+                                api.log(format!(
+                                    "SetClipboardData for image origin failed: {error}"
+                                ));
+                                free_clipboard_memory(api, marker, "image origin");
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        },
+    };
+    if let Err(error) = api.close() {
+        api.log(format!("CloseClipboard for image failed: {error}"));
+    }
+    copied
+}
+
+// GlobalUnlock returns zero both when the last lock was released and on
+// failure. GetLastError distinguishes those cases; a nonzero return succeeds.
+#[cfg(any(windows, test))]
+fn clipboard_unlock_succeeded(nonzero_return: bool, last_error: u32) -> bool {
+    nonzero_return || last_error == 0
+}
+
+#[cfg(windows)]
+struct NativeClipboardImageApi;
+
+#[cfg(windows)]
+impl ClipboardImageApi for NativeClipboardImageApi {
+    type Memory = windows::Win32::Foundation::HGLOBAL;
+    type Error = windows::core::Error;
+
+    fn allocate(&mut self, size: usize) -> Result<Self::Memory, Self::Error> {
+        use windows::Win32::System::Memory::{GLOBAL_ALLOC_FLAGS, GlobalAlloc};
+        unsafe { GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), size) }
+    }
+
+    fn lock_and_copy(&mut self, memory: Self::Memory, bytes: &[u8]) -> Result<(), Self::Error> {
+        let ptr = unsafe { windows::Win32::System::Memory::GlobalLock(memory) };
+        if ptr.is_null() {
+            return Err(windows::core::Error::from_win32());
+        }
+        // memory was allocated for bytes.len() and is exclusively owned here.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len()) };
+        Ok(())
+    }
+
+    fn unlock(&mut self, memory: Self::Memory) -> Result<(), Self::Error> {
+        use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, SetLastError};
+        // The generated windows wrapper treats the documented zero-success
+        // return as an error. Read the native BOOL and last error directly.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            #[link_name = "GlobalUnlock"]
+            fn native_global_unlock(memory: windows::Win32::Foundation::HGLOBAL) -> i32;
+        }
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        let nonzero = unsafe { native_global_unlock(memory) } != 0;
+        let error = unsafe { GetLastError() };
+        if clipboard_unlock_succeeded(nonzero, error.0) {
+            Ok(())
+        } else {
+            Err(windows::core::Error::from_hresult(error.to_hresult()))
+        }
+    }
+
+    fn free(&mut self, memory: Self::Memory) -> Result<(), Self::Error> {
+        // GlobalFree's null return is success, unlike the generated wrapper's
+        // usual handle-return convention. A nonnull return retains ownership.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            #[link_name = "GlobalFree"]
+            fn native_global_free(
+                memory: windows::Win32::Foundation::HGLOBAL,
+            ) -> windows::Win32::Foundation::HGLOBAL;
+        }
+        if unsafe { native_global_free(memory) }.0.is_null() {
+            Ok(())
+        } else {
+            Err(windows::core::Error::from_win32())
+        }
+    }
+
+    fn open(&mut self) -> Result<(), Self::Error> {
+        unsafe { windows::Win32::System::DataExchange::OpenClipboard(None) }
+    }
+
+    fn empty(&mut self) -> Result<(), Self::Error> {
+        unsafe { windows::Win32::System::DataExchange::EmptyClipboard() }
+    }
+
+    fn set_data(&mut self, format: u32, memory: Self::Memory) -> Result<(), Self::Error> {
+        use windows::Win32::{Foundation::HANDLE, System::DataExchange::SetClipboardData};
+        unsafe { SetClipboardData(format, Some(HANDLE(memory.0))) }.map(|_| ())
+    }
+
+    fn register_origin(&mut self) -> Result<u32, Self::Error> {
+        let name: Vec<u16> = crate::clipboard_capture::data::ORIGIN_FORMAT_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let format = unsafe {
+            windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::PCWSTR(
+                name.as_ptr(),
+            ))
+        };
+        if format == 0 {
+            Err(windows::core::Error::from_win32())
+        } else {
+            Ok(format)
+        }
+    }
+
+    fn close(&mut self) -> Result<(), Self::Error> {
+        unsafe { windows::Win32::System::DataExchange::CloseClipboard() }
+    }
+
+    fn log(&mut self, message: String) {
+        crate::logger::log(message);
     }
 }
 
@@ -2865,6 +3060,292 @@ fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod clipboard_image_writer_tests {
+    use super::*;
+
+    const DIB_FORMAT: u32 = 8;
+    const ORIGIN_FORMAT: u32 = 0xc001;
+    const DIB: &[u8] = b"image bytes";
+    const NONCE: &[u8] = b"process nonce";
+
+    #[derive(Default)]
+    struct FakeClipboardImageApi {
+        failures: Vec<&'static str>,
+        events: Vec<&'static str>,
+        logs: Vec<String>,
+        next_memory: usize,
+        allocated: Vec<usize>,
+        freed: Vec<usize>,
+        transferred: Vec<(u32, usize)>,
+        payloads: Vec<(usize, Vec<u8>)>,
+        opened: bool,
+    }
+
+    impl FakeClipboardImageApi {
+        fn with_failures(failures: &[&'static str]) -> Self {
+            Self {
+                failures: failures.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn result(&mut self, event: &'static str) -> Result<(), &'static str> {
+            self.events.push(event);
+            if self.failures.contains(&event) {
+                Err(event)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn write(&mut self) -> bool {
+            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, || true)
+        }
+    }
+
+    impl ClipboardImageApi for FakeClipboardImageApi {
+        type Memory = usize;
+        type Error = &'static str;
+
+        fn allocate(&mut self, _size: usize) -> Result<usize, Self::Error> {
+            self.next_memory += 1;
+            let memory = self.next_memory;
+            self.result(if memory == 1 {
+                "alloc_image"
+            } else {
+                "alloc_origin"
+            })?;
+            self.allocated.push(memory);
+            Ok(memory)
+        }
+
+        fn lock_and_copy(&mut self, memory: usize, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.result(if memory == 1 {
+                "lock_image"
+            } else {
+                "lock_origin"
+            })?;
+            self.payloads.push((memory, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn unlock(&mut self, memory: usize) -> Result<(), Self::Error> {
+            self.result(if memory == 1 {
+                "unlock_image"
+            } else {
+                "unlock_origin"
+            })
+        }
+
+        fn free(&mut self, memory: usize) -> Result<(), Self::Error> {
+            assert!(self.allocated.contains(&memory));
+            assert!(!self.freed.contains(&memory), "no double free");
+            assert!(
+                !self.transferred.iter().any(|(_, h)| *h == memory),
+                "system-owned memory"
+            );
+            self.result("free")?;
+            self.freed.push(memory);
+            Ok(())
+        }
+
+        fn open(&mut self) -> Result<(), Self::Error> {
+            assert!(!self.opened);
+            self.result("open")?;
+            self.opened = true;
+            Ok(())
+        }
+
+        fn empty(&mut self) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            self.result("empty")
+        }
+
+        fn set_data(&mut self, format: u32, memory: usize) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            assert!(!self.freed.contains(&memory));
+            assert!(!self.transferred.iter().any(|(_, h)| *h == memory));
+            self.result(if format == DIB_FORMAT {
+                "set_image"
+            } else {
+                "set_origin"
+            })?;
+            self.transferred.push((format, memory));
+            Ok(())
+        }
+
+        fn register_origin(&mut self) -> Result<u32, Self::Error> {
+            assert!(self.opened);
+            assert_eq!(self.transferred, vec![(DIB_FORMAT, 1)]);
+            self.result("register_origin")?;
+            Ok(ORIGIN_FORMAT)
+        }
+
+        fn close(&mut self) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            self.result("close")?;
+            self.opened = false;
+            Ok(())
+        }
+
+        fn log(&mut self, message: String) {
+            self.logs.push(message);
+        }
+    }
+
+    #[test]
+    fn successful_image_and_marker_transfer_in_one_open_without_free() {
+        let mut api = FakeClipboardImageApi::default();
+        assert!(api.write());
+        assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+        assert_eq!(api.payloads, vec![(1, DIB.to_vec()), (2, NONCE.to_vec())]);
+        assert!(api.freed.is_empty());
+        assert!(api.logs.is_empty());
+        assert_eq!(
+            api.events,
+            vec![
+                "alloc_image",
+                "lock_image",
+                "unlock_image",
+                "open",
+                "empty",
+                "set_image",
+                "register_origin",
+                "alloc_origin",
+                "lock_origin",
+                "unlock_origin",
+                "set_origin",
+                "close",
+            ]
+        );
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn image_failures_release_only_owned_memory_and_close_only_after_open() {
+        for (failure, allocated, freed, closes) in [
+            ("alloc_image", vec![], vec![], 0),
+            ("lock_image", vec![1], vec![1], 0),
+            ("open", vec![1], vec![1], 0),
+            ("empty", vec![1], vec![1], 1),
+            ("set_image", vec![1], vec![1], 1),
+        ] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(!api.write(), "{failure}");
+            assert_eq!(api.allocated, allocated, "{failure}");
+            assert_eq!(api.freed, freed, "{failure}");
+            assert!(api.transferred.is_empty(), "{failure}");
+            assert!(!api.events.contains(&"register_origin"), "{failure}");
+            assert_eq!(
+                api.events.iter().filter(|event| **event == "close").count(),
+                closes,
+                "{failure}"
+            );
+            assert_eq!(api.logs.len(), 1, "{failure}");
+            assert!(api.logs[0].contains(failure), "{failure}");
+            assert!(!api.opened, "{failure}");
+        }
+    }
+
+    #[test]
+    fn marker_failures_log_without_undoing_image_and_release_owned_marker() {
+        for (failure, allocated, freed) in [
+            ("register_origin", vec![1], vec![]),
+            ("alloc_origin", vec![1], vec![]),
+            ("lock_origin", vec![1, 2], vec![2]),
+            ("set_origin", vec![1, 2], vec![2]),
+        ] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(api.write(), "{failure}");
+            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1)], "{failure}");
+            assert_eq!(api.allocated, allocated, "{failure}");
+            assert_eq!(api.freed, freed, "{failure}");
+            assert_eq!(
+                api.events.iter().filter(|event| **event == "empty").count(),
+                1,
+                "{failure}"
+            );
+            assert_eq!(api.events.last(), Some(&"close"), "{failure}");
+            assert_eq!(api.logs.len(), 1, "{failure}");
+            assert!(api.logs[0].contains(failure), "{failure}");
+            assert!(api.logs[0].contains("origin"), "{failure}");
+            assert!(!api.opened, "{failure}");
+        }
+    }
+
+    #[test]
+    fn obsolete_generation_does_not_allocate_open_or_write() {
+        let mut api = FakeClipboardImageApi::default();
+        let mut checks = 0;
+        assert!(!write_image_clipboard_if_latest(
+            &mut api,
+            DIB,
+            DIB_FORMAT,
+            NONCE,
+            || {
+                checks += 1;
+                false
+            }
+        ));
+        assert_eq!(checks, 1);
+        assert!(api.events.is_empty());
+        assert!(api.logs.is_empty());
+    }
+
+    #[test]
+    fn final_unlock_zero_with_no_error_is_success() {
+        assert!(clipboard_unlock_succeeded(false, 0));
+        assert!(clipboard_unlock_succeeded(true, 0));
+        assert!(clipboard_unlock_succeeded(true, 123));
+        assert!(!clipboard_unlock_succeeded(false, 123));
+    }
+
+    #[test]
+    fn unlock_failures_log_and_do_not_undo_successfully_transferred_data() {
+        for failure in ["unlock_image", "unlock_origin"] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(api.write(), "{failure}");
+            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+            assert!(api.freed.is_empty());
+            assert_eq!(api.logs.len(), 1);
+            assert!(api.logs[0].contains(failure));
+            assert!(!api.opened);
+        }
+    }
+
+    #[test]
+    fn close_failure_is_logged_after_empty_failure_and_successful_transfers() {
+        for failures in [&["empty", "close"][..], &["close"][..]] {
+            let mut api = FakeClipboardImageApi::with_failures(failures);
+            assert_eq!(api.write(), !failures.contains(&"empty"));
+            assert_eq!(api.events.last(), Some(&"close"));
+            assert_eq!(api.logs.len(), failures.len());
+            assert!(api.logs.last().unwrap().contains("CloseClipboard"));
+            if failures.contains(&"empty") {
+                assert_eq!(api.freed, vec![1]);
+            } else {
+                assert!(api.freed.is_empty());
+                assert_eq!(api.transferred.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn free_failure_is_logged_without_retry_and_opened_clipboard_is_closed() {
+        let mut api = FakeClipboardImageApi::with_failures(&["empty", "free"]);
+        assert!(!api.write());
+        assert_eq!(api.logs.len(), 2);
+        assert!(api.logs[1].contains("image free failed"));
+        assert_eq!(
+            api.events.iter().filter(|event| **event == "free").count(),
+            1
+        );
+        assert_eq!(api.events.last(), Some(&"close"));
+        assert!(!api.opened);
     }
 }
 

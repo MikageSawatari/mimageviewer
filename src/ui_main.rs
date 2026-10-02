@@ -13937,6 +13937,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                 }
                             }
+                            if let Some(destination) = crate::known_folders::main_clipboard_capture_location(&self.settings) {
+                                ui.separator();
+                                if ui.button("クリップボード取り込み").hover_tip(destination.to_string_lossy().to_string()).clicked() {
+                                    self.start_folder_pane_open(destination);
+                                    ui.close();
+                                }
+                            }
                         })
                         .response
                         .hover_tip(if snapshot_active {

@@ -1,0 +1,809 @@
+//! An ownerless, nonactivating notification window, owned by its own thread.
+//! The mailbox and displayed content each retain only the latest notification.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+const DISPLAY_LIFETIME: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Debug)]
+pub(crate) enum PopupContent {
+    Saved(PathBuf),
+    Failure(String),
+    Abandoned,
+}
+
+impl PopupContent {
+    fn text(&self) -> String {
+        match self {
+            Self::Saved(_) => "クリップボードの画像を保存しました".into(),
+            Self::Failure(reason) => format!("保存できませんでした: {reason}"),
+            Self::Abandoned => "取り込めませんでした。もう一度コピーしてください".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifetime {
+    Hidden,
+    Counting(Instant),
+    Hovered,
+}
+
+impl Lifetime {
+    fn show(&mut self, now: Instant, hovered: bool) {
+        *self = if hovered {
+            Self::Hovered
+        } else {
+            Self::Counting(now + DISPLAY_LIFETIME)
+        };
+    }
+
+    fn enter(&mut self) -> bool {
+        if matches!(self, Self::Counting(_)) {
+            *self = Self::Hovered;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn leave(&mut self, now: Instant, pointer_inside: bool) -> bool {
+        if *self == Self::Hovered && !pointer_inside {
+            *self = Self::Counting(now + DISPLAY_LIFETIME);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expired(self, now: Instant) -> bool {
+        matches!(self, Self::Counting(deadline) if now >= deadline)
+    }
+}
+
+fn scaled(logical: i32, dpi: u32) -> i32 {
+    ((i64::from(logical) * i64::from(dpi.max(96)) + 48) / 96) as i32
+}
+
+/// Clamp even undersized or negative-coordinate work areas without moving onto
+/// the taskbar. The caller uses physical coordinates throughout.
+fn bottom_right(work: [i32; 4], dpi: u32) -> [i32; 4] {
+    let [left, top, right, bottom] = work;
+    let width = scaled(420, dpi).min((right - left).max(1));
+    let height = scaled(112, dpi).min((bottom - top).max(1));
+    let margin = scaled(16, dpi);
+    [
+        (right - width - margin).max(left),
+        (bottom - height - margin).max(top),
+        width,
+        height,
+    ]
+}
+
+#[cfg(windows)]
+mod native {
+    use super::{Lifetime, PopupContent, bottom_right, scaled};
+    use crate::clipboard_capture::CaptureEvent;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::w;
+
+    const WAKE: u32 = WM_APP + 91;
+    const HIDE_TIMER: usize = 1;
+    const LIFETIME_MS: u32 = 8_000;
+
+    enum Command {
+        Show {
+            generation: u64,
+            dark: bool,
+            content: PopupContent,
+        },
+        Hide,
+    }
+
+    struct Mailbox {
+        latest: Mutex<Option<Command>>,
+        current_generation: Arc<AtomicU64>,
+        thread_id: AtomicU32,
+        stop: AtomicBool,
+    }
+
+    impl Mailbox {
+        fn publish_show(&self, generation: u64, dark: bool, content: PopupContent) -> bool {
+            let mut latest = self.latest.lock().unwrap_or_else(|p| p.into_inner());
+            // Validate inside the same ownership boundary as replacement: an old
+            // worker must not erase a pending Hide or a newer generation's Show.
+            if generation != self.current_generation.load(Ordering::Acquire) {
+                return false;
+            }
+            *latest = Some(Command::Show {
+                generation,
+                dark,
+                content,
+            });
+            true
+        }
+
+        fn wake(&self) {
+            let id = self.thread_id.load(Ordering::Acquire);
+            if id != 0 {
+                // The thread publishes its id only after creating a message queue.
+                let _ = unsafe { PostThreadMessageW(id, WAKE, WPARAM(0), LPARAM(0)) };
+            }
+        }
+    }
+
+    pub(crate) struct PopupRuntime {
+        mailbox: Arc<Mailbox>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl PopupRuntime {
+        pub(crate) fn start(
+            current_generation: Arc<AtomicU64>,
+            foreground_main: Arc<dyn Fn() + Send + Sync>,
+            event_tx: mpsc::Sender<CaptureEvent>,
+            repaint: Arc<dyn Fn() + Send + Sync>,
+        ) -> Result<Self, String> {
+            let mailbox = Arc::new(Mailbox {
+                latest: Mutex::new(None),
+                current_generation: current_generation.clone(),
+                thread_id: AtomicU32::new(0),
+                stop: AtomicBool::new(false),
+            });
+            let worker_mailbox = mailbox.clone();
+            let thread = std::thread::Builder::new()
+                .name("clipboard-capture-popup".into())
+                .spawn(move || {
+                    let mut state = Box::new(WindowState {
+                        current_generation,
+                        foreground_main,
+                        event_tx,
+                        repaint,
+                        shown: None,
+                        dark: false,
+                        dpi: 96,
+                        font: HFONT::default(),
+                        lifetime: Lifetime::Hidden,
+                    });
+                    if let Err(error) = run(&worker_mailbox, &mut state) {
+                        crate::logger::log(format!("clipboard_capture popup: {error}"));
+                        let _ = state.event_tx.send(CaptureEvent::StartupFailed(error));
+                        (state.repaint)();
+                    }
+                    worker_mailbox.thread_id.store(0, Ordering::Release);
+                })
+                .map_err(|error| format!("clipboard capture popup thread: {error}"))?;
+            Ok(Self {
+                mailbox,
+                thread: Some(thread),
+            })
+        }
+
+        pub(crate) fn show(&self, generation: u64, dark: bool, content: PopupContent) {
+            if self.mailbox.publish_show(generation, dark, content) {
+                self.mailbox.wake();
+            }
+        }
+
+        pub(crate) fn hide(&self) {
+            *self
+                .mailbox
+                .latest
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(Command::Hide);
+            self.mailbox.wake();
+        }
+    }
+
+    impl Drop for PopupRuntime {
+        fn drop(&mut self) {
+            self.mailbox.stop.store(true, Ordering::Release);
+            self.mailbox.wake();
+            // UI teardown never waits for a thread that is inside native dispatch.
+            if let Some(thread) = self.thread.take()
+                && thread.is_finished()
+            {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    struct WindowState {
+        current_generation: Arc<AtomicU64>,
+        foreground_main: Arc<dyn Fn() + Send + Sync>,
+        event_tx: mpsc::Sender<CaptureEvent>,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+        shown: Option<(u64, PopupContent)>,
+        dark: bool,
+        dpi: u32,
+        font: HFONT,
+        lifetime: Lifetime,
+    }
+
+    impl Drop for WindowState {
+        fn drop(&mut self) {
+            if !self.font.0.is_null() {
+                let _ = unsafe { DeleteObject(self.font.into()) };
+            }
+        }
+    }
+
+    fn register_class() -> Result<(), String> {
+        static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+        REGISTERED
+            .get_or_init(|| unsafe {
+                let module = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(window_proc),
+                    hInstance: module.into(),
+                    hCursor: LoadCursorW(None, IDC_ARROW).map_err(|e| e.to_string())?,
+                    lpszClassName: w!("mImageViewer.ClipboardCapturePopup"),
+                    ..Default::default()
+                };
+                if RegisterClassW(&class) == 0 {
+                    return Err(format!(
+                        "RegisterClassW popup: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(())
+            })
+            .clone()
+    }
+
+    fn run(mailbox: &Mailbox, state: &mut Box<WindowState>) -> Result<(), String> {
+        unsafe {
+            let previous_dpi =
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            if previous_dpi.0.is_null() {
+                return Err(format!(
+                    "popup DPI awareness: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            register_class()?;
+            // Creates the thread message queue before producers are allowed to post.
+            let mut message = MSG::default();
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            mailbox
+                .thread_id
+                .store(GetCurrentThreadId(), Ordering::Release);
+            let state_ptr: *mut WindowState = &mut **state;
+            let mut window = None;
+            loop {
+                if mailbox.stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let command = mailbox
+                    .latest
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
+                match command {
+                    Some(Command::Show {
+                        generation,
+                        dark,
+                        content,
+                    }) if generation == (*state_ptr).current_generation.load(Ordering::Acquire) => {
+                        if window.is_none() {
+                            let module = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+                            window = Some(
+                                CreateWindowExW(
+                                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                    w!("mImageViewer.ClipboardCapturePopup"),
+                                    w!("クリップボード取り込み"),
+                                    WS_POPUP,
+                                    0,
+                                    0,
+                                    1,
+                                    1,
+                                    None,
+                                    None,
+                                    Some(module.into()),
+                                    Some(state_ptr.cast()),
+                                )
+                                .map_err(|e| format!("CreateWindowExW popup: {e}"))?,
+                            );
+                        }
+                        show(window.unwrap(), state_ptr, generation, dark, content);
+                    }
+                    Some(Command::Hide) => {
+                        if let Some(hwnd) = window {
+                            hide(hwnd, state_ptr);
+                        }
+                    }
+                    _ => {}
+                }
+                // The generation can change after a producer's checked enqueue
+                // and before its Hide arrives. Draining always retires any old
+                // displayed notification, including when the drained Show was
+                // discarded as stale.
+                let shown_stale = (*state_ptr).shown.as_ref().is_some_and(|(generation, _)| {
+                    *generation != mailbox.current_generation.load(Ordering::Acquire)
+                });
+                if shown_stale && let Some(hwnd) = window {
+                    hide(hwnd, state_ptr);
+                }
+                // A producer may have replaced the mailbox while show() dispatched
+                // synchronous window messages. Its wake remains in this queue.
+                let result = GetMessageW(&mut message, None, 0, 0);
+                if result.0 == -1 || !result.as_bool() {
+                    break;
+                }
+                if message.message != WAKE {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            if let Some(hwnd) = window {
+                let _ = DestroyWindow(hwnd);
+            }
+            let _ = SetThreadDpiAwarenessContext(previous_dpi);
+        }
+        Ok(())
+    }
+
+    /// Native calls may synchronously reenter window_proc. No Rust reference to
+    /// WindowState survives any window-position/show/dispatch operation.
+    unsafe fn show(
+        hwnd: HWND,
+        state: *mut WindowState,
+        generation: u64,
+        dark: bool,
+        content: PopupContent,
+    ) {
+        unsafe {
+            (*state).shown = Some((generation, content));
+            (*state).dark = dark;
+            (*state).lifetime = Lifetime::Hidden;
+            let _ = KillTimer(Some(hwnd), HIDE_TIMER);
+            if let Some(work) = crate::monitor::foreground_work_area() {
+                let area = [work.left, work.top, work.right, work.bottom];
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    work.left,
+                    work.top,
+                    1,
+                    1,
+                    SWP_NOACTIVATE,
+                );
+                rebuild_font(state, GetDpiForWindow(hwnd));
+                let [x, y, width, height] = bottom_right(area, (*state).dpi);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE,
+                );
+            } else {
+                // GetMonitorInfo failure is a native initialization error; report
+                // rather than placing a notification on an arbitrary screen.
+                hide(hwnd, state);
+                crate::logger::log("clipboard_capture popup: foreground work area unavailable");
+                return;
+            }
+            if generation != (*state).current_generation.load(Ordering::Acquire) {
+                hide(hwnd, state);
+                return;
+            }
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            let mut cursor = POINT::default();
+            let mut rect = RECT::default();
+            let hovered = GetCursorPos(&mut cursor).is_ok()
+                && GetWindowRect(hwnd, &mut rect).is_ok()
+                && contains(rect, cursor.x, cursor.y);
+            (*state).lifetime.show(Instant::now(), hovered);
+            if hovered {
+                if !track_leave(hwnd) {
+                    // Without a leave notification the pause could never end.
+                    (*state).lifetime.show(Instant::now(), false);
+                    SetTimer(Some(hwnd), HIDE_TIMER, LIFETIME_MS, None);
+                }
+            } else {
+                SetTimer(Some(hwnd), HIDE_TIMER, LIFETIME_MS, None);
+            }
+        }
+    }
+
+    unsafe fn hide(hwnd: HWND, state: *mut WindowState) {
+        unsafe {
+            (*state).lifetime = Lifetime::Hidden;
+            (*state).shown = None;
+            let _ = KillTimer(Some(hwnd), HIDE_TIMER);
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
+    unsafe fn rebuild_font(state: *mut WindowState, dpi: u32) {
+        unsafe {
+            (*state).dpi = dpi.max(96);
+            let new_font = CreateFontW(
+                -scaled(14, (*state).dpi),
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH.0 as u32,
+                w!("Yu Gothic UI"),
+            );
+            if !(*state).font.0.is_null() {
+                let _ = DeleteObject((*state).font.into());
+            }
+            // A null font is rendered with the stock UI font, never deleted.
+            (*state).font = new_font;
+        }
+    }
+
+    fn contains(rect: RECT, x: i32, y: i32) -> bool {
+        x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+    }
+
+    fn buttons(width: i32, height: i32, dpi: u32) -> (RECT, RECT) {
+        let margin = scaled(12, dpi);
+        let close = RECT {
+            left: (width - scaled(36, dpi)).max(0),
+            top: 0,
+            right: width,
+            bottom: scaled(32, dpi).min(height),
+        };
+        let open = RECT {
+            left: margin,
+            top: (height - scaled(42, dpi)).max(0),
+            right: (margin + scaled(76, dpi)).min(width),
+            bottom: (height - margin).max(0),
+        };
+        (open, close)
+    }
+
+    unsafe fn track_leave(hwnd: HWND) -> bool {
+        let mut tracking = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let registered = unsafe { TrackMouseEvent(&mut tracking) }.is_ok();
+        if !registered {
+            crate::logger::log("clipboard_capture popup: TrackMouseEvent failed");
+        }
+        registered
+    }
+
+    unsafe fn paint(hwnd: HWND, state: *const WindowState) {
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let dark = (*state).dark;
+            let background = if dark {
+                COLORREF(0x002b2b2b)
+            } else {
+                COLORREF(0x00fafafa)
+            };
+            let foreground = if dark {
+                COLORREF(0x00f5f5f5)
+            } else {
+                COLORREF(0x00202020)
+            };
+            let button_color = if dark {
+                COLORREF(0x00464646)
+            } else {
+                COLORREF(0x00e4e4e4)
+            };
+            let brush = CreateSolidBrush(background);
+            FillRect(dc, &client, brush);
+            let _ = DeleteObject(brush.into());
+            let font = if (*state).font.0.is_null() {
+                GetStockObject(DEFAULT_GUI_FONT)
+            } else {
+                (*state).font.into()
+            };
+            let old_font = SelectObject(dc, font);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, foreground);
+            let (mut open, mut close) = buttons(client.right, client.bottom, (*state).dpi);
+            if let Some((_, content)) = &(*state).shown {
+                let mut text_rect = RECT {
+                    left: scaled(16, (*state).dpi),
+                    top: scaled(16, (*state).dpi),
+                    right: close.left.max(0),
+                    bottom: open.top.max(scaled(16, (*state).dpi)),
+                };
+                let mut text: Vec<u16> = content.text().encode_utf16().collect();
+                DrawTextW(
+                    dc,
+                    &mut text,
+                    &mut text_rect,
+                    DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+                if matches!(content, PopupContent::Saved(_)) {
+                    let brush = CreateSolidBrush(button_color);
+                    FillRect(dc, &open, brush);
+                    let _ = DeleteObject(brush.into());
+                    let mut label: Vec<u16> = "開く".encode_utf16().collect();
+                    DrawTextW(
+                        dc,
+                        &mut label,
+                        &mut open,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+            }
+            let mut label: Vec<u16> = "×".encode_utf16().collect();
+            DrawTextW(
+                dc,
+                &mut label,
+                &mut close,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(dc, old_font);
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            if message == WM_NCCREATE {
+                let create = &*(lparam.0 as *const CREATESTRUCTW);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            }
+            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if state.is_null() {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            match message {
+                WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+                WM_ERASEBKGND => LRESULT(1),
+                WM_PAINT => {
+                    paint(hwnd, state);
+                    LRESULT(0)
+                }
+                WM_TIMER if wparam.0 == HIDE_TIMER => {
+                    // KillTimer cannot remove WM_TIMER already in the queue. The
+                    // typed deadline keeps such a message from hiding new content
+                    // or a popup whose hover pause has just ended.
+                    if (*state).lifetime.expired(Instant::now()) {
+                        hide(hwnd, state);
+                    }
+                    LRESULT(0)
+                }
+                WM_MOUSEMOVE => {
+                    if (*state).lifetime.enter() {
+                        let _ = KillTimer(Some(hwnd), HIDE_TIMER);
+                        if !track_leave(hwnd) {
+                            (*state).lifetime.show(Instant::now(), false);
+                            SetTimer(Some(hwnd), HIDE_TIMER, LIFETIME_MS, None);
+                        }
+                    }
+                    LRESULT(0)
+                }
+                WM_MOUSELEAVE => {
+                    let mut cursor = POINT::default();
+                    let mut rect = RECT::default();
+                    let pointer_inside = GetCursorPos(&mut cursor).is_ok()
+                        && GetWindowRect(hwnd, &mut rect).is_ok()
+                        && contains(rect, cursor.x, cursor.y);
+                    if (*state).lifetime.leave(Instant::now(), pointer_inside) {
+                        SetTimer(Some(hwnd), HIDE_TIMER, LIFETIME_MS, None);
+                    } else if (*state).lifetime == Lifetime::Hovered && !track_leave(hwnd) {
+                        (*state).lifetime.show(Instant::now(), false);
+                        SetTimer(Some(hwnd), HIDE_TIMER, LIFETIME_MS, None);
+                    }
+                    LRESULT(0)
+                }
+                WM_DPICHANGED => {
+                    let dpi = (wparam.0 & 0xffff) as u32;
+                    rebuild_font(state, dpi);
+                    if lparam.0 != 0 {
+                        let rect = *(lparam.0 as *const RECT);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND_TOPMOST),
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            SWP_NOACTIVATE,
+                        );
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    LRESULT(0)
+                }
+                WM_LBUTTONUP => {
+                    let x = (lparam.0 & 0xffff) as u16 as i16 as i32;
+                    let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    let (open, close) = buttons(client.right, client.bottom, (*state).dpi);
+                    if contains(close, x, y) {
+                        hide(hwnd, state);
+                    } else if contains(open, x, y) {
+                        let saved = match &(*state).shown {
+                            Some((generation, PopupContent::Saved(path)))
+                                if *generation
+                                    == (*state).current_generation.load(Ordering::Acquire) =>
+                            {
+                                Some((*generation, path.clone()))
+                            }
+                            _ => None,
+                        };
+                        if let Some((generation, path)) = saved {
+                            let foreground = (*state).foreground_main.clone();
+                            let events = (*state).event_tx.clone();
+                            let repaint = (*state).repaint.clone();
+                            hide(hwnd, state);
+                            foreground();
+                            let _ = events.send(CaptureEvent::RevealSaved { generation, path });
+                            repaint();
+                        }
+                    }
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    hide(hwnd, state);
+                    LRESULT(0)
+                }
+                WM_NCDESTROY => {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                }
+                _ => DefWindowProcW(hwnd, message, wparam, lparam),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn mailbox(generation: u64) -> Mailbox {
+            Mailbox {
+                latest: Mutex::new(None),
+                current_generation: Arc::new(AtomicU64::new(generation)),
+                thread_id: AtomicU32::new(0),
+                stop: AtomicBool::new(false),
+            }
+        }
+
+        #[test]
+        fn stale_show_cannot_replace_pending_hide() {
+            let mailbox = mailbox(1);
+            assert!(mailbox.publish_show(1, false, PopupContent::Abandoned));
+            mailbox.current_generation.store(2, Ordering::Release);
+            *mailbox.latest.lock().unwrap() = Some(Command::Hide);
+            assert!(!mailbox.publish_show(1, true, PopupContent::Failure("old".into())));
+            assert!(matches!(
+                *mailbox.latest.lock().unwrap(),
+                Some(Command::Hide)
+            ));
+        }
+
+        #[test]
+        fn stale_show_cannot_replace_current_generation_show() {
+            let mailbox = mailbox(2);
+            assert!(mailbox.publish_show(2, false, PopupContent::Abandoned));
+            assert!(!mailbox.publish_show(1, true, PopupContent::Failure("old".into())));
+            assert!(matches!(
+                *mailbox.latest.lock().unwrap(),
+                Some(Command::Show {
+                    generation: 2,
+                    dark: false,
+                    content: PopupContent::Abandoned,
+                })
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use native::PopupRuntime;
+
+#[cfg(not(windows))]
+pub(crate) struct PopupRuntime;
+
+#[cfg(not(windows))]
+impl PopupRuntime {
+    pub(crate) fn start(
+        _: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        _: std::sync::Arc<dyn Fn() + Send + Sync>,
+        _: std::sync::mpsc::Sender<crate::clipboard_capture::CaptureEvent>,
+        _: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, String> {
+        Err("clipboard capture popup requires Windows".into())
+    }
+    pub(crate) fn show(&self, _: u64, _: bool, _: PopupContent) {}
+    pub(crate) fn hide(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_position_handles_negative_monitors_and_taskbars() {
+        assert_eq!(bottom_right([-1920, 0, 0, 1040], 96), [-436, 912, 420, 112]);
+        assert_eq!(
+            bottom_right([0, 0, 2560, 1400], 144),
+            [1906, 1208, 630, 168]
+        );
+        assert_eq!(bottom_right([0, 0, 200, 80], 192), [0, 0, 200, 80]);
+    }
+
+    #[test]
+    fn dpi_scales_geometry_and_font_in_same_units() {
+        assert_eq!(scaled(14, 96), 14);
+        assert_eq!(scaled(14, 144), 21);
+        assert_eq!(scaled(14, 192), 28);
+        assert_eq!(scaled(14, 0), 14);
+    }
+
+    #[test]
+    fn hover_pauses_and_leave_restarts_full_lifetime() {
+        let mut state = Lifetime::Hidden;
+        let now = Instant::now();
+        assert!(!state.leave(now, false));
+        state.show(now, false);
+        assert!(!state.expired(now + Duration::from_secs(7)));
+        assert!(state.enter());
+        assert_eq!(state, Lifetime::Hovered);
+        assert!(!state.enter());
+        assert!(!state.expired(now + Duration::from_secs(60)));
+        let leave_time = now + Duration::from_secs(60);
+        assert!(state.leave(leave_time, false));
+        assert_eq!(state, Lifetime::Counting(leave_time + DISPLAY_LIFETIME));
+        assert!(!state.expired(leave_time + Duration::from_secs(7)));
+        assert!(state.expired(leave_time + DISPLAY_LIFETIME));
+        assert!(!state.leave(leave_time, false));
+        state.show(now, true);
+        assert_eq!(state, Lifetime::Hovered);
+        state = Lifetime::Hidden;
+        assert!(!state.enter());
+        assert!(!state.leave(now, false));
+    }
+
+    #[test]
+    fn stale_leave_does_not_expire_hovered_replacement() {
+        let now = Instant::now();
+        let mut state = Lifetime::Hovered;
+        state.show(now, true);
+        assert!(!state.leave(now + Duration::from_secs(1), true));
+        assert_eq!(state, Lifetime::Hovered);
+        assert!(!state.expired(now + Duration::from_secs(60)));
+        assert!(state.leave(now + Duration::from_secs(61), false));
+        assert!(state.expired(now + Duration::from_secs(69)));
+    }
+}

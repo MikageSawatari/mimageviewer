@@ -1941,7 +1941,9 @@ fn read_clipboard_rgba_image() -> Result<(u32, u32, Vec<u8>), String> {
     Err("この環境ではクリップボード画像を読み取れません".to_string())
 }
 
-fn decode_cf_dib_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+/// Shared DIB interpretation. Capture-specific allocation limits belong at its
+/// entrance; books intentionally retains its existing accepted dimensions.
+pub(crate) fn decode_cf_dib_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     const BI_RGB: u32 = 0;
     const BI_BITFIELDS: u32 = 3;
 
@@ -3543,6 +3545,40 @@ mod tests {
 
         assert_eq!((width, height), (1, 1));
         assert_eq!(rgba, vec![0, 0, 255, 128]);
+    }
+
+    #[test]
+    fn clipboard_dib_shared_alpha_rule_and_books_dimension_range() {
+        for (alpha, expected) in [
+            ([0, 0], [255, 255]),
+            ([0, 128], [0, 128]),
+            ([255, 255], [255, 255]),
+        ] {
+            let mut dib = vec![0u8; 48];
+            dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+            dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+            dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+            dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+            dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+            dib[40..48].copy_from_slice(&[3, 2, 1, alpha[0], 6, 5, 4, alpha[1]]);
+            let books = decode_cf_dib_rgba(&dib).unwrap();
+            let capture = crate::clipboard_capture::data::decode_capture_dib(&dib).unwrap();
+            assert_eq!(books, capture);
+            assert_eq!([books.2[3], books.2[7]], expected);
+        }
+
+        let mut wide = vec![0u8; 40 + 40000 * 3];
+        wide[0..4].copy_from_slice(&40u32.to_le_bytes());
+        wide[4..8].copy_from_slice(&40000i32.to_le_bytes());
+        wide[8..12].copy_from_slice(&1i32.to_le_bytes());
+        wide[12..14].copy_from_slice(&1u16.to_le_bytes());
+        wide[14..16].copy_from_slice(&24u16.to_le_bytes());
+        assert_eq!(decode_cf_dib_rgba(&wide).unwrap().0, 40000);
+        assert!(
+            crate::clipboard_capture::data::decode_capture_dib(&wide)
+                .unwrap_err()
+                .contains("大きすぎ")
+        );
     }
 
     #[test]

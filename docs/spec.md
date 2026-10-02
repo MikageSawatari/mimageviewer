@@ -2055,8 +2055,20 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 
 ### 8.4 その他
 
+環境設定「起動と連携 → クリップボード取り込み」では画像コピーの自動保存と保存先を設定する。
+監視は mIV の起動中だけ動き、タスクトレイ常駐と組み合わせて使える。保存先は変更・既定に戻す・
+フォルダを開くに対応し、月ごとのサブフォルダを最初の保存時に作成する。監視が有効なときは
+メインウィンドウの「場所▼」に保存先を表示する。Remote の場所一覧には追加しない。
+HTML 監視の設定値は S2 用に保持するが、S1 の環境設定には表示しない。
+保存完了の小窓の「開く」は、一覧表示中でモーダル・Remote の操作占有・移動の準備が
+ない場合だけ保存先へ移動して保存ファイルを選択する。それ以外はメインを前面に出し、
+一覧へ戻って「場所▼」から開く案内を表示する。フルスクリーンの終了や保留は行わない。
+
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
+| `clipboard_capture_image_enabled` | bool | false | 起動中にコピーされた画像を自動保存する |
+| `clipboard_capture_html_enabled` | bool | false | HTML 内画像の監視。S2 で UI に公開する |
+| `clipboard_capture_output_dir` | Option\<PathBuf\> | None | None は `capture::default_output_dir().join("clipboard")` (= ピクチャ/mimageviewer/clipboard) |
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `pdf_worker_count` | u32 | 5 | PDF worker pool のプロセス数。UI と起動時読み出しは 3〜10 に clamp する。pool は遅延初期化だが、起動時に static snapshot へ固定するため変更は常に次回起動から有効 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30）。PDF/変換アーカイブはコンテナ候補として停止対象 |

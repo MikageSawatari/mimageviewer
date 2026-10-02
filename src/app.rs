@@ -23,6 +23,84 @@ use crate::keymap::{
 pub(crate) const BOOK_READING_PAGE_ORDER: crate::settings::SortOrder =
     crate::settings::SortOrder::FileName;
 
+/// RevealSaved has the same admission boundary as the future selection dialog.
+/// Rejected clicks are consumed immediately, without a navigation reservation.
+fn clipboard_capture_reveal_admitted(
+    list: bool,
+    modal: bool,
+    remote: bool,
+    preparing: bool,
+) -> bool {
+    list && !modal && !remote && !preparing
+}
+
+#[cfg(test)]
+mod clipboard_capture_admission_tests {
+    use super::clipboard_capture_reveal_admitted;
+
+    #[test]
+    fn saved_reveal_requires_list_and_all_admission_conditions() {
+        for list in [false, true] {
+            for modal in [false, true] {
+                for remote in [false, true] {
+                    for preparing in [false, true] {
+                        assert_eq!(
+                            clipboard_capture_reveal_admitted(list, modal, remote, preparing),
+                            list && !(modal || remote || preparing)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_reveal_preserves_a_staged_classification_without_reserving_navigation() {
+        use super::{FolderOpenOutcome, OpenRequestOwner};
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let source = app.tmp.path().join("source");
+        let candidate = app.tmp.path().join("candidate.epub");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&candidate).unwrap();
+        app.load_folder(source.clone());
+        assert_eq!(
+            app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                candidate,
+                false,
+                OpenRequestOwner::Navigation
+            ),
+            FolderOpenOutcome::Classifying
+        );
+        let request_id = app
+            .top_level_grid_view
+            .open_path_classification()
+            .unwrap()
+            .request_id;
+        let saved = app.tmp.path().join("capture/2026-10/saved.png");
+        app.handle_clipboard_capture_reveal(saved, &ctx);
+        assert_eq!(app.current_folder, Some(source));
+        assert_eq!(
+            app.top_level_grid_view
+                .open_path_classification()
+                .unwrap()
+                .request_id,
+            request_id
+        );
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(app.select_after_load.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|t| t.0.contains("一覧画面に戻ると"))
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(super::ActionSurface::MainWindow)
+        );
+    }
+}
+
 /// Full-resolution still images use a complete mip chain for stable minification.
 /// Thumbnails, animated frames, masks, and pixel-art filters intentionally keep
 /// their existing texture options.
@@ -13911,11 +13989,12 @@ pub struct App {
     pub(crate) preferences_requested_page:
         Option<crate::ui_dialogs::preferences::PreferencesOpenRequest>,
     /// 統合環境設定の一時編集状態
-    pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    pub(crate) pref_state: Option<Box<crate::ui_dialogs::preferences::PreferencesState>>,
     pub(crate) show_preferences_discard_confirm: bool,
     /// 操作カスタマイズダイアログ (キーボード / 右ドラッグ / リング / ジェスチャ)
     pub(crate) show_operation_customize: bool,
-    pub(crate) operation_customize_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    pub(crate) operation_customize_state:
+        Option<Box<crate::ui_dialogs::preferences::PreferencesState>>,
     pub(crate) show_operation_customize_discard_confirm: bool,
 
     // ── 設定の復元ダイアログ ───────────────────────────────────────
@@ -16665,6 +16744,7 @@ pub struct App {
     /// Process-global Windows file clipboard observation. Viewer contexts only read the
     /// normalized path snapshot; OS listener/reader ownership stays outside every bundle.
     pub(crate) cut_clipboard: crate::cut_clipboard::CutClipboardObserver,
+    pub(crate) clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService,
     /// 2 重起動されたプロセスが Named Pipe で送ってきた「開くパス」を UI スレッドへ
     /// 渡すための channel。listener thread は App を直接触らず、ここへ積むだけにする。
     #[cfg(windows)]
@@ -16797,6 +16877,82 @@ impl App {
     ) {
         if let Err(error) = self.cut_clipboard.install_production(repaint) {
             crate::logger::log(format!("cut_clipboard: observer startup failed: {error}"));
+        }
+    }
+
+    pub(crate) fn clipboard_capture_startup_failed(&self) -> bool {
+        self.clipboard_capture_service.startup_failed()
+    }
+
+    #[cfg(windows)]
+    fn sync_clipboard_capture(&mut self, ctx: &egui::Context) {
+        let (Some(hwnd), Some(slot)) = (self.main_hwnd, self.placement_slot.clone()) else {
+            return;
+        };
+        self.clipboard_capture_service.synchronize(
+            &self.settings,
+            ctx.style().visuals.dark_mode,
+            ctx,
+            hwnd,
+            slot,
+        );
+    }
+
+    fn poll_clipboard_capture(&mut self, ctx: &egui::Context) {
+        for path in self.clipboard_capture_service.poll() {
+            self.handle_clipboard_capture_reveal(path, ctx);
+        }
+    }
+
+    fn clipboard_capture_navigation_preparing(&self) -> bool {
+        self.folder_open_preparation_pending()
+            || self
+                .top_level_grid_view
+                .open_path_classification()
+                .is_some()
+            || self
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            || self.top_level_grid_view.collection_navigation_pending()
+            || self.smart_folder_transition.is_some()
+            || self.staged_smart_child_preflight_from_visible_scope()
+            || self
+                .rating_view_pending
+                .as_ref()
+                .is_some_and(|p| p.navigation.is_some())
+            || self.startup_open_path_resolve_pending.is_some()
+            || self.bookmark_open_pending.is_some()
+            || self
+                .pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|p| matches!(p.5, PdfOpenPhase::ColdCandidate { .. }))
+    }
+
+    fn handle_clipboard_capture_reveal(&mut self, path: PathBuf, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if !self.window_visible {
+            self.sync_after_restore(ctx);
+        }
+        if !clipboard_capture_reveal_admitted(
+            self.fullscreen_idx.is_none()
+                && !self.current_viewer_session_is_detached_or_switching(),
+            self.common_modal_dialog_open() || self.document_open_modal_admission_blocked(),
+            self.remote_session_blocks_local_control(),
+            self.clipboard_capture_navigation_preparing(),
+        ) {
+            let text =
+                "一覧画面に戻ると、場所▼の『クリップボード取り込み』から開けます".to_string();
+            let duration = crate::ui_fullscreen::feedback_toast_duration(&text);
+            self.show_feedback_toast_on_with_duration(text, ActionSurface::MainWindow, duration);
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            self.start_folder_pane_open(parent.to_path_buf());
+            self.select_after_load = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            ctx.request_repaint();
         }
     }
 
@@ -18533,6 +18689,7 @@ impl App {
             placement_slot: None,
             activation_listener: None,
             cut_clipboard: crate::cut_clipboard::CutClipboardObserver::default(),
+            clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService::default(),
             #[cfg(windows)]
             activation_open_path_tx,
             #[cfg(windows)]
@@ -86511,6 +86668,7 @@ impl eframe::App for App {
         // Process-global clipboard events must be visible before fullscreen/native early
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
+        self.poll_clipboard_capture(ctx);
         // Retired asset requests must cancel even when presentation returns early.
         self.prune_current_view_pin_refreshes();
         // Collection startup/revision/worker responses must likewise progress even when
@@ -86530,6 +86688,8 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
+        #[cfg(windows)]
+        self.sync_clipboard_capture(ctx);
         // Dedicated viewer viewports draw their mounted owner's dialog in their callback.
         // Root and embedded presentations draw here; parked contexts are not serviced.
         if self.fullscreen_idx.is_none()

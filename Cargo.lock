@@ -4013,6 +4013,7 @@ dependencies = [
  "unicode-normalization",
  "unrar",
  "ureq 2.12.1",
+ "url",
  "uuid",
  "webp",
  "wgpu",

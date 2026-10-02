@@ -144,6 +144,7 @@ pub(crate) enum PreferencesPage {
     Thumbnail,
     Slideshow,
     Capture,
+    ClipboardCapture,
     BakeStage,
     /// 静止画・動画で共用する Creative 3D LUT (.cube) の登録
     CreativeLut,
@@ -235,6 +236,7 @@ impl PreferencesPage {
         Self::Thumbnail,
         Self::Slideshow,
         Self::Capture,
+        Self::ClipboardCapture,
         Self::BakeStage,
         Self::CreativeLut,
         Self::MenuLayout,
@@ -271,6 +273,7 @@ impl PreferencesPage {
             Self::Thumbnail => "サムネイル",
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
+            Self::ClipboardCapture => "クリップボード取り込み",
             Self::BakeStage => "書き出しの焼き込み",
             Self::CreativeLut => "LUT",
             Self::MenuLayout => "通常メニュー",
@@ -494,6 +497,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::Startup,
             PreferencesPage::ExternalTools,
             PreferencesPage::ExplorerIntegration,
+            PreferencesPage::ClipboardCapture,
             PreferencesPage::TrayResidency,
             PreferencesPage::UpdateCheck,
         ],
@@ -699,6 +703,30 @@ impl Drop for ExternalToolPathCheckPending {
     }
 }
 
+pub(super) enum ClipboardCaptureFolderResult {
+    Selected(Option<PathBuf>),
+    Opened,
+}
+
+#[doc(hidden)]
+pub fn draw_clipboard_capture_settings_snapshot_fixture(ui: &mut egui::Ui, startup_failed: bool) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.clipboard_capture_default_output_dir =
+        PathBuf::from("C:/Pictures/mimageviewer/clipboard");
+    state.clipboard_capture_startup_failed = startup_failed;
+    state.selected = PreferencesPage::ClipboardCapture;
+    draw_page(ui, &mut state, false);
+}
+
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
@@ -789,6 +817,12 @@ pub(crate) struct PreferencesState {
     // ページ固有の一時状態
     pub manual_threads: usize,
     pub capture_output_dir_input: String,
+    pub clipboard_capture_output_dir_input: String,
+    pub clipboard_capture_default_output_dir: PathBuf,
+    pub clipboard_capture_folder_task:
+        Option<mpsc::Receiver<Result<ClipboardCaptureFolderResult, String>>>,
+    pub clipboard_capture_folder_message: Option<String>,
+    pub clipboard_capture_startup_failed: bool,
     pub book_root_input: String,
     pub startup_folder_path_input: String,
     pub exif_add_tag_input: String,
@@ -1303,6 +1337,16 @@ impl PreferencesState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            clipboard_capture_output_dir_input: s
+                .clipboard_capture_output_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            clipboard_capture_default_output_dir: crate::capture::default_output_dir()
+                .join("clipboard"),
+            clipboard_capture_folder_task: None,
+            clipboard_capture_folder_message: None,
+            clipboard_capture_startup_failed: false,
             book_root_input: s
                 .book_root
                 .as_ref()
@@ -2119,7 +2163,7 @@ impl App {
             {
                 new_state.vst3_discovered = self.vst3_discovered.clone();
             }
-            self.pref_state = Some(new_state);
+            self.pref_state = Some(Box::new(new_state));
         }
         if let Some(generation) = opened_scroll_generation {
             self.pref_state
@@ -2128,7 +2172,9 @@ impl App {
                 .right_panel_scroll_generation = generation;
         }
         let favorite_view_state_active = self.settings.active_favorite_view_id().is_some();
+        let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
+            state.clipboard_capture_startup_failed = clipboard_capture_startup_failed;
             state.favorite_view_state_entry_count = self.favorite_view_states.len();
             state.favorite_view_state_active = favorite_view_state_active;
         }
@@ -2957,7 +3003,7 @@ impl App {
                     .unwrap_or(0),
             );
             state.operation_tab = OperationCustomizeTab::Settings;
-            self.operation_customize_state = Some(state);
+            self.operation_customize_state = Some(Box::new(state));
         }
 
         let mut open = true;
@@ -3035,7 +3081,7 @@ impl App {
         let mut close_requested_this_frame = false;
         if apply {
             if let Some(state) = self.operation_customize_state.take() {
-                self.apply_operation_customize_state(state);
+                self.apply_operation_customize_state(*state);
             }
             self.show_operation_customize = false;
             self.show_operation_customize_discard_confirm = false;
@@ -3489,6 +3535,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
+        PreferencesPage::ClipboardCapture => page_clipboard_capture(ui, state),
         PreferencesPage::BakeStage => page_bake_stage(ui, state),
         PreferencesPage::CreativeLut => page_creative_lut(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),
@@ -3559,7 +3606,7 @@ mod tests {
         app.settings
             .video_audio_track_choices
             .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
-        app.pref_state = Some(state);
+        app.pref_state = Some(Box::new(state));
         assert!(!app.preferences_dialog_has_unsaved_changes());
         let mut state = app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
@@ -3595,7 +3642,7 @@ mod tests {
                 prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
                 app.settings = state.settings;
             } else {
-                app.pref_state = Some(state);
+                app.pref_state = Some(Box::new(state));
                 assert!(!app.preferences_dialog_has_unsaved_changes());
                 app.discard_preferences_dialog();
             }
@@ -3627,7 +3674,7 @@ mod tests {
                     prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
                     app.settings = state.settings;
                 } else {
-                    app.pref_state = Some(state);
+                    app.pref_state = Some(Box::new(state));
                     app.discard_preferences_dialog();
                 }
                 assert_eq!(app.settings.video_audio_track_choices, expected);
@@ -3655,7 +3702,7 @@ mod tests {
         app.settings
             .video_audio_track_choices
             .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
-        app.pref_state = Some(state);
+        app.pref_state = Some(Box::new(state));
         app.discard_preferences_dialog();
         assert!(app.settings.video_audio_track_choices.contains_key(&key));
 
@@ -3714,14 +3761,14 @@ mod tests {
         );
         state.settings.gamepad_enabled = false;
 
-        app.operation_customize_state = Some(state);
+        app.operation_customize_state = Some(Box::new(state));
         assert!(
             app.operation_customize_dialog_has_unsaved_changes(),
             "切った状態は未保存の変更として数える"
         );
 
         let state = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(state);
+        app.apply_operation_customize_state(*state);
         assert!(!app.settings.gamepad_enabled, "OK で本体へ届く");
     }
 
@@ -3747,7 +3794,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
-        app.pref_state = Some(preferences_state);
+        app.pref_state = Some(Box::new(preferences_state));
         assert!(
             app.preferences_dialog_has_unsaved_changes(),
             "Videoページで変えた通常ホイール設定は未保存変更として扱う"
@@ -3812,13 +3859,13 @@ mod tests {
             .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::AdjustVolume;
-        app.operation_customize_state = Some(operation_state);
+        app.operation_customize_state = Some(Box::new(operation_state));
         assert!(
             app.operation_customize_dialog_has_unsaved_changes(),
             "別の ring 項目の編集は未保存のまま数える"
         );
         let operation_state = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(operation_state);
+        app.apply_operation_customize_state(*operation_state);
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -3861,13 +3908,13 @@ mod tests {
         let untouched_operation = preferences_state_for_test(&app.settings);
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::AdjustVolume;
-        app.operation_customize_state = Some(untouched_operation);
+        app.operation_customize_state = Some(Box::new(untouched_operation));
         assert!(
             !app.operation_customize_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、操作カスタマイズの未保存変更にしない"
         );
         let untouched_operation = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(untouched_operation);
+        app.apply_operation_customize_state(*untouched_operation);
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume
@@ -3893,12 +3940,12 @@ mod tests {
         );
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::NavigateItems;
-        app.pref_state = Some(reopened_preferences);
+        app.pref_state = Some(Box::new(reopened_preferences));
         assert!(
             !app.preferences_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、環境設定の未保存変更にしない"
         );
-        reopened_preferences = app.pref_state.take().unwrap();
+        reopened_preferences = *app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut reopened_preferences, &mut app.settings);
         assert_eq!(
             reopened_preferences
@@ -3926,13 +3973,13 @@ mod tests {
         let reopened_operation = preferences_state_for_test(&app.settings);
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::NavigateItems;
-        app.operation_customize_state = Some(reopened_operation);
+        app.operation_customize_state = Some(Box::new(reopened_operation));
         assert!(
             !app.operation_customize_dialog_has_unsaved_changes(),
             "操作カスタマイズの再表示も、その session の基準値で外部変更を判定する"
         );
         let reopened_operation = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(reopened_operation);
+        app.apply_operation_customize_state(*reopened_operation);
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::NavigateItems
