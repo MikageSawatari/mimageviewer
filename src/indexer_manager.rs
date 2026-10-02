@@ -744,18 +744,13 @@ pub(crate) fn run_reconciliation_via_dispatcher(
     let not_ok = meta_db
         .list_not_ok_paths_for_favorites(&target_favs)
         .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
-    // Failed cleanup must invalidate the owner before this startup decides to reuse it.
+    // Failed cleanup invalidates the current owner and saved old roots in the delete transaction.
     let failed_ids: std::collections::HashSet<_> = not_ok.iter().map(|(_, id, _)| *id).collect();
     let failed_roots: std::collections::HashSet<_> = favorites
         .iter()
         .filter(|favorite| failed_ids.contains(&favorite.id))
         .map(|favorite| crate::metadata_ownership::root_key(&favorite.path))
         .collect();
-    for root in failed_roots {
-        meta_db
-            .clear_scanned_once_for_root(&root)
-            .map_err(|error| format!("reconciliation clear scan marker: {error}"))?;
-    }
     let deletes: Vec<String> = not_ok.iter().map(|(p, _, _)| p.clone()).collect();
     let _ = fts;
     if !deletes.is_empty() {
@@ -764,7 +759,10 @@ pub(crate) fn run_reconciliation_via_dispatcher(
             .batch(vec![], deletes, true, true, WriterPriority::Background)
             .map_err(|e| format!("reconciliation batch: {e}"))?;
         meta_db
-            .delete_paths(&deletes_for_sqlite)
+            .delete_paths_and_invalidate_scans(
+                &deletes_for_sqlite,
+                &failed_roots.into_iter().collect::<Vec<_>>(),
+            )
             .map_err(|e| format!("reconciliation delete_paths: {e}"))?;
         report.failed_cleaned = deletes_for_sqlite.len();
     }
@@ -966,9 +964,20 @@ mod tests {
             &crate::indexer_supervisor::fts_scan_extensions(),
         );
         meta.mark_scanned_once(&key, &fingerprint).unwrap();
+        let mut previous = favorite.clone();
+        previous.path = std::path::PathBuf::from("C:/OldImages/");
+        let previous_key = crate::metadata_ownership::root_key(&previous.path);
+        let previous_fingerprint = crate::indexer_supervisor::fts_scan_fingerprint(
+            &previous.path,
+            previous.id,
+            &[],
+            &crate::indexer_supervisor::fts_scan_extensions(),
+        );
+        meta.mark_scanned_once(&previous_key, &previous_fingerprint)
+            .unwrap();
         meta.mark_scanned_once("c:/unrelated", "untouched").unwrap();
         for path in ["c:/images/a.jpg", "c:/images/b.jpg"] {
-            meta.upsert_meta_ok(path, favorite.id, &favorite.path, IndexKind::Image, 1, 1)
+            meta.upsert_meta_ok(path, favorite.id, &previous.path, IndexKind::Image, 1, 1)
                 .unwrap();
             meta.mark_failed(path).unwrap();
         }
@@ -993,6 +1002,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.failed_cleaned, 2);
         assert_eq!(meta.scanned_once(&key).unwrap(), None);
+        assert_eq!(meta.scanned_once(&previous_key).unwrap(), None);
         assert_eq!(
             meta.scanned_once("c:/unrelated").unwrap().as_deref(),
             Some("untouched")
@@ -1005,6 +1015,17 @@ mod tests {
             favorite.id,
             &[]
         ));
+        drop(meta);
+        let reopened = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        assert!(!crate::indexer_supervisor::can_skip_initial_scan(
+            &reopened,
+            true,
+            false,
+            &previous.path,
+            previous.id,
+            &[]
+        ));
+        assert!(reopened.scanned_once("c:/unrelated").unwrap().is_some());
     }
 
     fn seed_valid_fts_dir(data_dir: &std::path::Path) -> std::path::PathBuf {

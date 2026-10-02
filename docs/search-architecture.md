@@ -250,6 +250,9 @@ perf には照会時間・取得行数と、Vec/String の capacity から算出
 rebuild pending の対象でない場合だけ省く。watcher は従来どおり動き、差分・overflow・回復・
 手動確認は省かない。完全な観測・書き込み・prune の typed 成功でだけ印を立てる。
 イベントや途中終了・クラッシュでは消さず、ストア再作成と Failed cleanup で消す。
+構成変更と起動補修の削除は、旧行のrootと現在の補修先rootの印を同じ transaction で失効させる。
+Susieの対応拡張子集合が変わるFullは、削除済み文書の旧印が残る追加経路として
+startup-index-scan-plan §11.5で修正範囲を確認中。
 「お気に入り > 編集」の [今すぐ確認] は metadata-only Full、名前索引 Full、全 root の similar
 Manual 1回を非同期に要求する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
 理由を通知して名前索引だけを確認する。一時停止中は再開後に実行する。
@@ -327,7 +330,8 @@ v2.3.0第12弾では次を不変条件とする。
 起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
 
 この整理は `skip_offline_change_scan` ON でも省かない。Failed 行を掃除した root の印を消し、
-所有者の付け替えが必要な root は must-scan 集合で初回 Full を強制する。Tantivy の新規作成・
+所有者の付け替えが必要な root は、削除と同じ SQLite transaction で印を消したうえで
+must-scan 集合で初回 Full を強制する。変更が無い起動整理は印を保持する。Tantivy の新規作成・
 schema 再構築・rebuild pending でも全印を消し、同じ起動で古い印を再利用しない。
 
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して

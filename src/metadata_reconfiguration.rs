@@ -207,7 +207,11 @@ pub(crate) fn cleanup_failure(stores: &Stores, shared: &Shared, error: impl std:
 }
 
 /// Background FIFO puts cleanup behind batches whose cancelled caller abandoned the reply.
-fn delete_paths(stores: &Stores, paths: Vec<String>) -> Result<(), String> {
+fn delete_paths(
+    stores: &Stores,
+    paths: Vec<String>,
+    affected_roots: &[String],
+) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -223,7 +227,7 @@ fn delete_paths(stores: &Stores, paths: Vec<String>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     stores
         .meta
-        .delete_paths(&paths)
+        .delete_paths_and_invalidate_scans(&paths, affected_roots)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -259,7 +263,7 @@ pub(crate) fn startup_cleanup(
         }
     }
     let count = paths.len();
-    let result = delete_paths(stores, paths);
+    let result = delete_paths(stores, paths, &roots.iter().cloned().collect::<Vec<_>>());
     crate::perf::event(
         "startup",
         "metadata_out_of_range_cleanup",
@@ -407,6 +411,15 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
             })
             .collect::<Vec<_>>();
         if !newly_excluded.is_empty() {
+            let affected_roots = old
+                .ownership
+                .favorites
+                .values()
+                .chain(next.ownership.favorites.values())
+                .map(|favorite| favorite.root.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
             let result = stores
                 .writer
                 .purge_path_ranges(
@@ -417,7 +430,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                 .and_then(|()| {
                     stores
                         .meta
-                        .delete_path_ranges(&newly_excluded)
+                        .delete_path_ranges_and_invalidate_scans(&newly_excluded, &affected_roots)
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 });
@@ -433,6 +446,11 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                     p.root != n.root || (p.effective_metadata && !n.effective_metadata)
                 })
             });
+            let affected_roots = previous
+                .into_iter()
+                .chain(current)
+                .map(|favorite| favorite.root.clone())
+                .collect::<Vec<_>>();
             let result = if purge {
                 stores
                     .writer
@@ -444,7 +462,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                     .and_then(|()| {
                         stores
                             .meta
-                            .delete_all_for_favorite(*id)
+                            .delete_all_for_favorite_and_invalidate_scans(*id, &affected_roots)
                             .map(|_| ())
                             .map_err(|e| e.to_string())
                     })
@@ -453,7 +471,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                     .meta
                     .list_paths_outside_range(*id, current.and_then(|c| c.owned_range.as_ref()))
                     .map_err(|e| e.to_string())
-                    .and_then(|paths| delete_paths(&stores, paths))
+                    .and_then(|paths| delete_paths(&stores, paths, &affected_roots))
             };
             if let Err(e) = result {
                 cleanup_failure(&stores, &shared, e);
@@ -642,6 +660,144 @@ mod tests {
                 .initial_scan_skipped
         );
         runtime.shutdown();
+    }
+
+    #[test]
+    fn configuration_roundtrip_then_normal_stop_cannot_reuse_deleted_fts_scope() {
+        for change in ["off", "root", "exclusions"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut stores = stores(tmp.path());
+            let f = favorite(1, tmp.path().join("images"), true);
+            let nested = f.path.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            image::RgbImage::new(1, 1)
+                .save(f.path.join("a.png"))
+                .unwrap();
+            image::RgbImage::new(1, 1)
+                .save(nested.join("b.png"))
+                .unwrap();
+            let mut initial = Configuration::new(&[f.clone()], Vec::new());
+            initial.skip_offline_change_scan = true;
+            let mut runtime = Runtime::start(stores.clone(), initial.clone()).unwrap();
+            settled(&runtime);
+            initial_done(&runtime);
+            let root = root_key(&f.path);
+            assert!(stores.meta.scanned_once(&root).unwrap().is_some());
+            // Full を ActivityGate で止め、構成変更の purge だけを確定させる。
+            stores.gate.set_paused(true);
+            let mut away = f.clone();
+            let exclusions = match change {
+                "off" => {
+                    away.auto_index_metadata = false;
+                    vec![]
+                }
+                "root" => {
+                    away.path = tmp.path().join("other");
+                    std::fs::create_dir(&away.path).unwrap();
+                    vec![]
+                }
+                _ => vec![nested],
+            };
+            runtime.submit(Configuration::new(&[away], exclusions));
+            settled(&runtime);
+            assert_eq!(stores.meta.scanned_once(&root).unwrap(), None, "{change}");
+            runtime.submit(initial.clone());
+            settled(&runtime);
+            assert!(
+                !runtime.shared.state.lock().unwrap().controls[&f.id]
+                    .snapshot_stats()
+                    .initial_scan_done
+            );
+            runtime.shutdown();
+            drop(runtime);
+            stores.meta =
+                Arc::new(crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap());
+            assert_eq!(stores.meta.scanned_once(&root).unwrap(), None);
+            stores.gate.set_paused(false);
+            let mut restarted = Runtime::start(stores.clone(), initial).unwrap();
+            settled(&restarted);
+            initial_done(&restarted);
+            let stats = restarted.shared.state.lock().unwrap().controls[&f.id].snapshot_stats();
+            assert!(!stats.initial_scan_skipped, "{change}");
+            assert_eq!(
+                stats.last_full_outcome,
+                Some(indexer_supervisor::FullScanOutcome::Complete)
+            );
+            assert_eq!(stores.meta.list_path_owners().unwrap().len(), 2);
+            restarted.shutdown();
+        }
+    }
+
+    #[test]
+    fn startup_repair_marker_loss_survives_normal_stop_before_full_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stores = stores(tmp.path());
+        let f = favorite(1, tmp.path().join("images"), true);
+        std::fs::create_dir(&f.path).unwrap();
+        let root = root_key(&f.path);
+        let old_root = root_key(&tmp.path().join("old"));
+        let fingerprint = indexer_supervisor::fts_scan_fingerprint(
+            &f.path,
+            f.id,
+            &[],
+            &indexer_supervisor::fts_scan_extensions(),
+        );
+        stores.meta.mark_scanned_once(&root, &fingerprint).unwrap();
+        stores
+            .meta
+            .mark_scanned_once(&old_root, "old complete")
+            .unwrap();
+        let path = crate::search_index_db::normalize_path(&f.path.join("wrong-owner.png"));
+        stores
+            .meta
+            .upsert_meta_ok(
+                &path,
+                Uuid::from_u128(99),
+                &tmp.path().join("old"),
+                crate::fts_index::IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+        stores.gate.set_paused(true);
+        let mut initial = Configuration::new(&[f.clone()], vec![]);
+        initial.skip_offline_change_scan = true;
+        let mut runtime = Runtime::start(stores.clone(), initial.clone()).unwrap();
+        settled(&runtime);
+        assert!(
+            runtime
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .must_scan_roots
+                .contains(&root)
+        );
+        assert_eq!(stores.meta.scanned_once(&root).unwrap(), None);
+        assert_eq!(stores.meta.scanned_once(&old_root).unwrap(), None);
+        runtime.shutdown();
+        drop(runtime);
+        stores.meta =
+            Arc::new(crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap());
+        stores.gate.set_paused(false);
+        let mut restarted = Runtime::start(stores, initial).unwrap();
+        settled(&restarted);
+        initial_done(&restarted);
+        assert!(
+            restarted
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .must_scan_roots
+                .is_empty()
+        );
+        assert!(
+            !restarted.shared.state.lock().unwrap().controls[&f.id]
+                .snapshot_stats()
+                .initial_scan_skipped
+        );
+        restarted.shutdown();
     }
 
     #[test]

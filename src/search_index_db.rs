@@ -114,9 +114,39 @@ const UPSERT_CHILDREN_DELETE_SQL: &str = "DELETE FROM entries \
 
 pub struct SearchIndexDb {
     conn: Mutex<Connection>,
+    #[cfg(test)]
+    full_scan_write_gate: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
 }
 
 impl SearchIndexDb {
+    /// Full が別の構成で行を変更する前に、旧構成の完走印を失効させる。
+    /// commit が失敗した場合は呼び出し側も走査を開始しない。同じ構成の印は
+    /// 通常の途中終了でも維持するため、指紋が違う行だけを削除する。
+    pub(crate) fn prepare_full_scan(&self, root: &Path, fingerprint: &str) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scanned_once WHERE root = ?1 AND fingerprint <> ?2",
+            params![normalize_path(root), fingerprint],
+        )?;
+        tx.commit()
+    }
+
+    /// Full の最初の直下置換 commit 後を固定する。待機中は DB lock を保持しない。
+    #[cfg(test)]
+    pub(crate) fn set_full_scan_write_gate(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        resume: crossbeam_channel::Receiver<()>,
+    ) {
+        *self.full_scan_write_gate.lock().unwrap() = Some((entered, resume));
+    }
+
     /// 印と rebuild pending は同じ lock で読む。再構築要求済みの起動では省略しない。
     pub(crate) fn can_reuse_initial_scan(
         &self,
@@ -175,6 +205,8 @@ impl SearchIndexDb {
         rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -185,6 +217,8 @@ impl SearchIndexDb {
         rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -199,6 +233,8 @@ impl SearchIndexDb {
         rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -217,6 +253,8 @@ impl SearchIndexDb {
         conn.busy_timeout(std::time::Duration::from_millis(750))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -287,6 +325,15 @@ impl SearchIndexDb {
             return Ok(false);
         }
         Self::upsert_children_locked(&mut conn, favorite_root, parent, children)?;
+        #[cfg(test)]
+        {
+            drop(conn);
+            let gate = self.full_scan_write_gate.lock().unwrap().take();
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
+        }
         Ok(true)
     }
 
@@ -957,6 +1004,7 @@ mod tests {
         init_schema(&conn).unwrap();
         SearchIndexDb {
             conn: Mutex::new(conn),
+            full_scan_write_gate: Mutex::new(None),
         }
     }
 
@@ -1023,6 +1071,41 @@ mod tests {
         assert_eq!(
             db.scanned_once_fingerprint(nested).unwrap().as_deref(),
             Some("inner")
+        );
+    }
+
+    #[test]
+    fn full_scan_preparation_invalidates_only_changed_root_marker_transactionally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let sibling = Path::new("C:/other");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.record_complete_scan(root, "old").unwrap();
+        db.record_complete_scan(sibling, "sibling").unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_marker_delete BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        // 同じ構成は印を変更しない。別構成の失効失敗は caller に返し、rollback する。
+        db.prepare_full_scan(root, "old").unwrap();
+        assert!(db.prepare_full_scan(root, "new").is_err());
+        assert_eq!(
+            db.scanned_once_fingerprint(root).unwrap().as_deref(),
+            Some("old")
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_marker_delete;")
+            .unwrap();
+        db.prepare_full_scan(Path::new("c:/FAV"), "new").unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.scanned_once_fingerprint(root).unwrap(), None);
+        assert_eq!(
+            reopened
+                .scanned_once_fingerprint(sibling)
+                .unwrap()
+                .as_deref(),
+            Some("sibling")
         );
     }
 

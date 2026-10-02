@@ -463,14 +463,30 @@ fn run_full_scan(
         if is_initial { "initial" } else { "rescan" }
     ));
 
-    let summary = run_bulk_name_index(
+    // 全入口 (initial / manual / overflow) で、別構成の行へ変更する前に
+    // 旧構成の印を失効させる。途中終了後に旧設定へ戻しても省略させない。
+    let summary = match db.prepare_full_scan(
         favorite_root,
-        db,
-        activity_gate,
-        excluded_roots,
-        cancel,
-        Some(progress),
-    );
+        &name_scan_fingerprint(favorite_root, excluded_roots),
+    ) {
+        Ok(()) => run_bulk_name_index(
+            favorite_root,
+            db,
+            activity_gate,
+            excluded_roots,
+            cancel,
+            Some(progress),
+        ),
+        Err(error) => {
+            crate::logger::log(format!(
+                "name_index[{favorite_id}]: scan marker invalidation failed: {error}"
+            ));
+            BulkSummary {
+                had_error: true,
+                ..Default::default()
+            }
+        }
+    };
 
     let dur_ms = t0.elapsed().as_millis() as u64;
     crate::logger::log(format!(
@@ -1128,6 +1144,122 @@ mod tests {
         assert!(stats.initial_scan_done);
         assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Failed));
         assert_eq!(db.scanned_once_fingerprint(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn changed_exclusions_cancelled_full_then_restored_startup_does_not_skip() {
+        cancelled_full_reopen_for_test(true);
+    }
+
+    #[test]
+    fn same_fingerprint_cancelled_full_keeps_marker_after_reopen() {
+        cancelled_full_reopen_for_test(false);
+    }
+
+    fn cancelled_full_reopen_for_test(change_exclusions: bool) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        let child = root.join("child");
+        fs::create_dir_all(child.join("nested")).unwrap();
+        let path = tmp.path().join("names.db");
+        let db = Arc::new(SearchIndexDb::open_at(&path).unwrap());
+        assert_eq!(
+            initial_scan_for_test(&root, &db, &[], false).last_full_scan,
+            Some(NameFullScanOutcome::Complete)
+        );
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 2);
+        let fingerprint = name_scan_fingerprint(&root, &[]);
+        let exclusions = if change_exclusions {
+            vec![child]
+        } else {
+            // 同じ構成でも実際の置換が済んだ後に停止させる。
+            fs::create_dir_all(root.join("new_offline_child")).unwrap();
+            vec![]
+        };
+        let (entered_tx, entered_rx) = bounded(1);
+        let (resume_tx, resume_rx) = bounded(1);
+        db.set_full_scan_write_gate(entered_tx, resume_rx);
+        let handle = try_spawn_with_startup_policy(
+            Uuid::from_u128(1),
+            root.clone(),
+            Arc::clone(&db),
+            exclusions,
+            None,
+            false,
+        )
+        .unwrap();
+        // Full の最初の直下置換 commit を固定する。時間による順序推測はしない。
+        let entered = entered_rx.recv_timeout(Duration::from_secs(10));
+        if entered.is_err() {
+            handle.signal_stop();
+            drop(resume_tx);
+            drop(handle);
+            panic!("Full did not reach the committed row replacement: {entered:?}");
+        }
+        let in_full_scan = handle.snapshot_stats().in_full_scan;
+        let marker_during_scan = db.scanned_once_fingerprint(&root);
+        let count_during_scan = db.count_for_favorite(&root);
+        let expected_marker = (!change_exclusions).then_some(fingerprint.as_str());
+        // 通常の supervisor 停止を実行し、取消完了後に実 DB を開き直す。
+        handle.signal_stop();
+        resume_tx.send(()).unwrap();
+        let (monitor, thread) = handle.into_worker_parts();
+        thread.join().unwrap();
+        assert!(in_full_scan);
+        assert_eq!(marker_during_scan.unwrap().as_deref(), expected_marker);
+        assert_eq!(
+            count_during_scan.unwrap(),
+            if change_exclusions { 1 } else { 3 }
+        );
+        assert_eq!(
+            monitor.snapshot_stats().last_full_scan,
+            Some(NameFullScanOutcome::Cancelled)
+        );
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(
+            reopened.scanned_once_fingerprint(&root).unwrap().as_deref(),
+            expected_marker
+        );
+        // 除外を元へ戻した起動。印を使う設定 ON でも、不一致 Full の取消後は再走査する。
+        let stats = initial_scan_for_test(&root, &reopened, &[], true);
+        assert_eq!(
+            stats.last_full_scan,
+            change_exclusions.then_some(NameFullScanOutcome::Complete)
+        );
+        assert_eq!(
+            reopened.count_for_favorite(&root).unwrap(),
+            if change_exclusions { 2 } else { 3 }
+        );
+    }
+
+    #[test]
+    fn marker_invalidation_failure_does_not_modify_full_scan_rows() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        initial_scan_for_test(&root, &db, &[], false);
+        let fingerprint = name_scan_fingerprint(&root, &[]);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_marker_delete BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let stats = initial_scan_for_test(&root, &db, &[child], false);
+        assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Failed));
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+        assert_eq!(
+            db.scanned_once_fingerprint(&root).unwrap().as_deref(),
+            Some(fingerprint.as_str())
+        );
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.count_for_favorite(&root).unwrap(), 1);
+        assert!(
+            reopened
+                .can_reuse_initial_scan(&root, &fingerprint)
+                .unwrap()
+        );
     }
 
     #[test]

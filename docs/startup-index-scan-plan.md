@@ -296,6 +296,11 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
 - **消す**: 索引ストアが作り直された・交換された・再構築されたとき (fts の rebuild pending、
   Tantivy の新規作成・schema 再構築 ([fts_index.rs:361](../src/fts_index.rs))、similar の作り直し)。
   消したことをその起動の判断に渡す (同じ起動で「印あり」と読まない)。
+- **構成変更が旧印の範囲のデータを削除・書き換える前にも消す**。削除と印の失効は同じ
+  DB transaction。name/similarの別指紋 Full は最初の行変更より前に失効を確定する。
+  ftsの拡張子集合変更Fullの追加修正範囲は §11.5 の設計確認事項を参照。構成を元へ戻し、
+  Full の途中で正常終了しても旧印を再利用しない。fts の起動補修の must-scan root も
+  同じ削除 transaction で印を失効させる。通常 watcher の削除と、変更が無い起動整理は保持する。
 - **イベント・クラッシュ・強制終了・電源断・処理途中の終了では消さない**。終了中や処理途中の
   変更の取りこぼし、終了時に捨てる watcher の待ち行列 (search-architecture §4.1 終了応答性)、
   Tantivy First の SQLite 側更新漏れ (§4.2) が次回起動で直らないことは、この設定の利用者が
@@ -844,3 +849,101 @@ metadata 結合テストの最初の並列実行は6成功・8件が既存10秒�
 
 Git の書き込み・stash・コミットは行っていない。指定署名を末尾に含むコミット文を
 `target/startup-scan-s3/commit-message.txt` に作成した。
+
+### 11.5 S3 独立レビュー ACCEPT WITH CHANGES の修正
+
+`4483e6f4d` に対する P2 3件と P3 文言1件を修正する。旧構成の完走印を残したまま構成変更が
+索引を削除すると、元の構成へ戻して Full 完了前に正常終了した次の起動で、不完全な索引を
+旧指紋により再利用できたことが根因。途中終了そのものではなく、構成変更のデータ変更境界で
+証拠を失効させる。通常イベントと同一指紋 Full の取消で旧印を保持する許容範囲は変えない。
+
+- fts: OFF・root変更の favorite purge、共通除外拡大の range purge、所有範囲変更と起動補修の
+  path削除に専用の印失効を接続。旧行の正規化 favorite_root と現在の補修先 root を、行の削除と
+  同じ SQLite transaction で消す。favorite purge は SQLite 0件でも既知の旧rootの印を消す
+  (Tantivy-only文書も削除し得る)。range purge は実行がある区間と交差する root だけ消し、
+  無関係root・行が無い区間・変更が無い起動整理は保持する。通常 `delete_paths` は保持する。
+  must-scan 集合を返す起動補修にも同じ durable な失効を適用し、次回起動までの穴を閉じた。
+  Failed cleanup も事前の現在rootだけの失効から同じ削除transactionへ統合した。
+  UUIDと現在の範囲が一致して保存favorite_rootだけ旧rootである行も、旧/現在rootを消す。
+- name: Full開始時、保存指紋と異なる root の印だけを transaction で消し、commit成功後に
+  bulkの最初の行置換へ進む。失効の書き込み失敗なら行を変更せず Failed で終える。
+- similar: 設定purgeで実際に削除する transaction に印削除を統合。別指紋 Full は既存の
+  未完build掃除 transaction で旧印を消し、列挙・書き換え前に確定する。同一指紋 Full と
+  no-op purge は保持する。通常 watcher は変更しない。
+- OFF時 purge の ActivityGate迂回は、既存の「OFFにした範囲を検索から即座に除く」設定反映を
+  維持するため許容。workerで実行されUIを待たせず、keep-root和集合と構成epochを確認する。
+  pauseは索引作成を止めるもので設定による整理を保留しない。paused gateでpurgeが確定する
+  回帰を追加した。新しいretry・復旧state・modalは不要で、既存transactionに失効を統合した。
+- fav_add の「変更監視と起動時スキャンで自動更新」を、変更監視と起動確認を設定で選べる
+  説明へ更新。設定や操作自体は変わらず、マニュアルの既存説明とも一致する。
+
+追加回帰は13件。ftsのOFF/root/除外往復と起動補修、nameの除外往復、similarのOFF/除外往復を
+実DB・既存ActivityGateまたはchannel gateで固定し、通常stop/join・DB再open・元構成の次回
+起動で省略しないことを検証する。transaction失敗時rollbackと無関係/no-op印保持も検証する。
+検証結果と確認buildは以下へ記録する。
+
+独立レビュー (`gpt-6.1-sol` / `xhigh`) は上記の所有境界に合意し、完成差分を承認した。
+途中レビューで見つかった無関係rangeの印失効とFailed行の旧root印残存も修正済み。
+similar再起動回帰は旧DB接続を使い回さず新connectionへ変更した。未解決P1/P2は0。
+Cargoと確認buildは親の実装担当が所有し、reviewerとimplementerは重複実行していない。
+
+自動検証は `MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定。
+libの成功分は267件、コマンドは `cargo test -j1 -p mimageviewer --lib <filter>`。
+`indexer_manager` は再実行時に `-- --test-threads=1` を追加した。
+
+| filter | 成功件数 |
+| --- | ---: |
+| `fts_meta` | 27 |
+| `metadata_reconfiguration` | 16 |
+| `name_index_supervisor` | 16 |
+| `search_index_db` | 43 |
+| `similar_db` | 63 |
+| `similar_index::tests::startup_` | 10 |
+| `name_index_manager` | 10 |
+| `indexer_supervisor` | 17 |
+| `indexer_manager` | 13 |
+| `similar_index::tests::incremental_reconcile` | 25 |
+| `index_full_check_tests` | 3 |
+| `fts_writer_dispatcher` | 10 |
+| `ingest_worker` | 14 |
+
+similar_db の既存手動用3件は ignore のまま (11.4と同じ)。追加のignoreはない。
+最初のlib test compileはテスト用DB gateの直接initializer不足で停止し、補完後に成功。
+最初の `indexer_manager` は12成功・1失敗で、既存の共有watch回帰がarray公開の
+`0x80070005` (アクセス拒否) を報告した。コード・待ち時間を変えず直列再実行で13件成功。
+原因は確定とは扱わず、最初の失敗ログも保存した。製品へretryは追加していない。
+
+| integration コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j1 -p mimageviewer --test search_metadata_e2e -- --test-threads=1` | 14 |
+| `cargo test -j1 -p mimageviewer --test search_name_e2e -- --test-threads=1` | 15 |
+| `cargo test -j1 -p mimageviewer --test ui_snapshot -- --test-threads=1` | 59 |
+
+成功分の合計は355件。今回の文言変更で既存snapshot画像の差分はなく、更新指定なしで59件成功。
+永続schema・既存行の意味・保存先は変更していない。検証ログは
+`target/startup-scan-s3/review-fixes/` に保存した。
+
+最後のコード変更後に全 workspace の `cargo fmt --all` / `cargo fmt --all --check` が成功。
+`python scripts/check_ui_glyphs.py` は問題0、`git diff --check` と
+`cargo check -j1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+コミット文は指定署名付きで `target/startup-scan-s3/commit-message.txt` を上書きし、
+UTF-8 BOMなし (先頭3byteを検査) とした。今回もGitの書き込み・コミットは行っていない。
+全 workspace suite・アプリ起動・実データの性能測定は行っていない。
+
+確認用 build は `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`
+が exit 0。coreの最適化コンパイルは7分11秒、remote service・EPUB workerも成功し、
+CRT検査は `runtime=4 pe=3`。ログは `target/startup-scan-s3/review-fixes/build-dev.log`。
+成果物は起動しておらず、通常 `%APPDATA%\mimageviewer` に触れていない。
+
+#### 追加の設計確認事項: fts の拡張子集合変更 Full
+
+指定された4指摘の修正後、限定棚卸しで新しいP2経路を確認した。Susie非対応になった
+拡張子はwalkerの候補から外れ、完全観測なら既存行をto_deleteへ回す。IngestSessionが
+削除バッチを確定し通常 `delete_paths` で行を消した後に正常停止すると、FullはStoppedで
+新印を立てず、旧印が残る。次回Susieの集合を戻すと旧指紋に一致し、削除済み索引を省略できる。
+起動補修は既に消えた行を拾えない。通常の同一指紋Fullの取消とは区別が必要。
+
+独立reviewerもこの経路をソースで確認した。利用者はftsを「構成変更と起動補修の削除経路だけ」
+と明示しており、Full側まで広げるかは設計側へ確認した。追加案はname/similarと同じく、
+別指紋Fullの最初の行変更前に旧root印を失効する小さい変更単位。retryや復旧stateは不要。
+現段階では指定4件の修正と355件成功のgreen差分を保持し、この追加範囲は未実装・回答待ち。

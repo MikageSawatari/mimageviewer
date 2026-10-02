@@ -1353,7 +1353,7 @@ impl SimilarDb {
 
     /// 前回停止時に公開されなかった世代だけを掃除する。
     pub fn cleanup_incomplete(&self) -> rusqlite::Result<usize> {
-        self.cleanup_incomplete_inner(None)
+        self.cleanup_incomplete_inner(None, None)
             .map(|removed| removed.expect("unconditional cleanup cannot be cancelled"))
     }
 
@@ -1368,12 +1368,28 @@ impl SimilarDb {
             return Ok(None);
         }
         let cancel = Arc::clone(cancel);
-        self.cleanup_incomplete_inner(Some(Arc::new(move || cancel.load(Ordering::Acquire))))
+        self.cleanup_incomplete_inner(Some(Arc::new(move || cancel.load(Ordering::Acquire))), None)
+    }
+
+    /// A Full for another configuration may rewrite the old marker's corpus before completing.
+    /// Revoke that evidence in the existing startup cleanup transaction, before any scan writes.
+    /// A Full for the same fingerprint preserves the accepted prior-completion policy on failure.
+    pub(crate) fn cleanup_incomplete_for_full_if(
+        &self,
+        cancel: &Arc<AtomicBool>,
+        fingerprint: &str,
+    ) -> rusqlite::Result<Option<usize>> {
+        let cancel = Arc::clone(cancel);
+        self.cleanup_incomplete_inner(
+            Some(Arc::new(move || cancel.load(Ordering::Acquire))),
+            Some(fingerprint),
+        )
     }
 
     fn cleanup_incomplete_inner(
         &self,
         cancel: Option<CleanupCancel>,
+        full_fingerprint: Option<&str>,
     ) -> rusqlite::Result<Option<usize>> {
         if cancel.as_ref().is_some_and(|cancel| cancel()) {
             return Ok(None);
@@ -1386,6 +1402,12 @@ impl SimilarDb {
             return Ok(None);
         }
         let transaction = write_transaction(&mut conn)?;
+        if let Some(fingerprint) = full_fingerprint {
+            transaction.execute(
+                "DELETE FROM scanned_once WHERE fingerprint <> ?1",
+                [fingerprint],
+            )?;
+        }
         if cancel.as_ref().is_some_and(|cancel| cancel()) {
             return Ok(None);
         }
@@ -3077,6 +3099,12 @@ impl SimilarDb {
         for key in prefill_keys.into_iter().filter(|key| should_purge(key)) {
             removed +=
                 transaction.execute("DELETE FROM item_prefill WHERE item_key = ?1", [&key])?;
+        }
+
+        // These purges are configuration/store cleanup, not ordinary watcher deletions.
+        // Once covered data is discarded, returning to an older fingerprint must scan again.
+        if removed != 0 {
+            transaction.execute("DELETE FROM scanned_once", [])?;
         }
 
         transaction.execute(
@@ -6366,9 +6394,12 @@ mod tests {
         let checks = Arc::new(AtomicUsize::new(0));
         let cancel_checks = Arc::clone(&checks);
         let cancelled = db
-            .cleanup_incomplete_inner(Some(Arc::new(move || {
-                cancel_checks.fetch_add(1, Ordering::AcqRel) >= 8
-            })))
+            .cleanup_incomplete_inner(
+                Some(Arc::new(move || {
+                    cancel_checks.fetch_add(1, Ordering::AcqRel) >= 8
+                })),
+                None,
+            )
             .unwrap();
 
         assert_eq!(cancelled, None);
@@ -6865,6 +6896,115 @@ mod tests {
         }
         let db = SimilarDb::open_at(&path).unwrap();
         assert!(!db.scanned_once_matches("current").unwrap());
+    }
+
+    #[test]
+    fn startup_configuration_purge_invalidates_marker_with_data_atomically() {
+        for outside_union in [false, true] {
+            let db = SimilarDb::open_in_memory().unwrap();
+            db.upsert_loose_item(&item("c:/library/a.jpg", None, None, 1))
+                .unwrap();
+            db.mark_scanned_once("original").unwrap();
+            let purge = |should_publish: &dyn Fn() -> bool| {
+                if outside_union {
+                    db.purge_outside_active_roots_if(&[], &[], should_publish)
+                } else {
+                    db.purge_roots_except_if(&["c:/library".to_owned()], &[], should_publish)
+                }
+            };
+            let before = db.load_search_rows(current_hash_version()).unwrap();
+            let checks = AtomicUsize::new(0);
+            assert_eq!(
+                purge(&|| checks.fetch_add(1, Ordering::AcqRel) == 0).unwrap(),
+                ConditionalCommit::Skipped
+            );
+            assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+            assert!(db.scanned_once_matches("original").unwrap());
+
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fail_marker_delete BEFORE DELETE ON scanned_once
+                 BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;",
+                )
+                .unwrap();
+            assert!(purge(&|| true).is_err());
+            assert_eq!(db.load_search_rows(current_hash_version()).unwrap(), before);
+            assert!(db.scanned_once_matches("original").unwrap());
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_marker_delete")
+                .unwrap();
+
+            assert_eq!(purge(&|| true).unwrap(), ConditionalCommit::Committed(1));
+            assert!(
+                db.load_search_rows(current_hash_version())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!db.scanned_once_matches("original").unwrap());
+        }
+    }
+
+    #[test]
+    fn startup_configuration_purge_without_discard_preserves_marker() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/library/a.jpg", None, None, 1))
+            .unwrap();
+        db.mark_scanned_once("original").unwrap();
+        assert_eq!(
+            db.purge_roots_except(&["c:/library".to_owned()], &["c:/library".to_owned()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.purge_outside_active_roots_if(&["c:/library".to_owned()], &[], || true)
+                .unwrap(),
+            ConditionalCommit::Committed(0)
+        );
+        assert!(db.scanned_once_matches("original").unwrap());
+    }
+
+    #[test]
+    fn startup_full_preparation_revokes_only_other_fingerprints_and_rolls_back_on_cancel() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let building_ids = insert_unpublished_container_items(&db, "c:/library/incomplete.zip", 32);
+        db.mark_scanned_once("original").unwrap();
+        let checks = AtomicUsize::new(0);
+        assert_eq!(
+            db.cleanup_incomplete_inner(
+                Some(Arc::new(move || checks.fetch_add(1, Ordering::AcqRel) >= 8)),
+                Some("changed"),
+            )
+            .unwrap(),
+            None
+        );
+        assert!(db.scanned_once_matches("original").unwrap());
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM item", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            building_ids.len()
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            db.cleanup_incomplete_for_full_if(&cancel, "original")
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.scanned_once_matches("original").unwrap());
+        assert!(
+            db.cleanup_incomplete_for_full_if(&cancel, "changed")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!db.scanned_once_matches("original").unwrap());
     }
 
     #[test]

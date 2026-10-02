@@ -3157,6 +3157,10 @@ impl SimilarIndexScheduler {
                 &purge_result,
                 Ok(crate::similar_db::ConditionalCommit::Committed(_))
             );
+            #[cfg(test)]
+            if purge_committed && matches!(plan.running.kind, ReconcileJobKind::Purge) {
+                self.probe_startup("configuration_purge_committed");
+            }
             let outcome = purge_result.and_then(|purge| {
                 let purged = match purge {
                     crate::similar_db::ConditionalCommit::Committed(removed) => removed,
@@ -3198,6 +3202,7 @@ impl SimilarIndexScheduler {
                         &self.progress,
                         &array_refresh,
                         Some(&telemetry),
+                        &fingerprint,
                     ),
                     ReconcileJobKind::Delta => run_delta_index_job(
                         &db,
@@ -5253,6 +5258,7 @@ fn run_index_job(
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
     telemetry: Option<&ReconcileRunTelemetry>,
+    fingerprint: &str,
 ) -> Result<ScanJobOutcome, String> {
     if !wait_for_full_inventory_start(activity_gate, cancel) {
         return Ok(ScanJobOutcome {
@@ -5263,7 +5269,7 @@ fn run_index_job(
         });
     }
     if db
-        .cleanup_incomplete_if(cancel)
+        .cleanup_incomplete_for_full_if(cancel, fingerprint)
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?
         .is_none()
     {
@@ -5273,6 +5279,10 @@ fn run_index_job(
             requires_full: false,
             watermark: None,
         });
+    }
+    #[cfg(test)]
+    if let Some(scheduler) = array_refresh.scheduler.upgrade() {
+        scheduler.probe_startup("full_prepared");
     }
     set_stage(progress, IndexStage::Opening, None);
     let Some(inventory) = db
@@ -7200,6 +7210,7 @@ mod tests {
             &Arc::new(Mutex::new(IndexProgress::Idle)),
             &notifier,
             Some(&full_safe),
+            "test fingerprint",
         )
         .unwrap();
         assert!(outcome.prune_safe);
@@ -7230,6 +7241,7 @@ mod tests {
             &Arc::new(Mutex::new(IndexProgress::Idle)),
             &notifier,
             Some(&full_incomplete),
+            "test fingerprint",
         )
         .unwrap();
         assert!(!outcome.prune_safe);
@@ -7833,6 +7845,7 @@ mod tests {
                         scheduler: Weak::new(),
                     },
                     None,
+                    "test fingerprint",
                 )
                 .unwrap()
             });
@@ -7865,6 +7878,7 @@ mod tests {
                     scheduler: Weak::new(),
                 },
                 None,
+                "test fingerprint",
             )
             .unwrap()
             .prune_safe,
@@ -7899,6 +7913,7 @@ mod tests {
                         scheduler: Weak::new(),
                     },
                     None,
+                    "test fingerprint",
                 )
                 .unwrap()
             });
@@ -8031,6 +8046,7 @@ mod tests {
                 scheduler: Weak::new(),
             },
             None,
+            "test fingerprint",
         )
         .unwrap()
         .report;
@@ -8138,6 +8154,7 @@ mod tests {
                 scheduler: Weak::new(),
             },
             Some(&telemetry),
+            "test fingerprint",
         )
         .unwrap();
 
@@ -8182,6 +8199,7 @@ mod tests {
                 scheduler: Weak::new(),
             },
             None,
+            "test fingerprint",
         )
         .unwrap();
         assert_eq!(full.report.unchanged, 0);
@@ -10442,6 +10460,7 @@ mod tests {
                     scheduler: Weak::new(),
                 },
                 None,
+                &similar_scan_fingerprint(&config),
             )
             .unwrap();
             assert!(!outcome.prune_safe);
@@ -10504,6 +10523,113 @@ mod tests {
             ))
             .unwrap()
         );
+    }
+
+    #[test]
+    fn startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker() {
+        for off_purge in [false, true] {
+            let (temp, manager, db, id) = startup_worker_fixture(true, true);
+            let original = manager
+                .scheduler
+                .state
+                .lock()
+                .unwrap()
+                .desired_config
+                .clone()
+                .unwrap();
+            let fingerprint = similar_scan_fingerprint(&original);
+            let item_key = format!("{}/old.jpg", original.roots[0].key);
+            db.upsert_loose_item(&row(1, &item_key, [7; 32], 10).item)
+                .unwrap();
+            let gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+            gate.set_paused(true);
+            // OFF purge must still commit immediately while full scanning is paused.
+            manager.scheduler.configure(
+                if off_purge {
+                    Vec::new()
+                } else {
+                    original.roots.clone()
+                },
+                original.pdf_passwords.clone(),
+                if off_purge {
+                    Some(Arc::clone(&gate))
+                } else {
+                    None
+                },
+                if off_purge {
+                    Vec::new()
+                } else {
+                    vec![original.roots[0].path.join("excluded")]
+                },
+            );
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            *manager.scheduler.startup_test_probe.lock().unwrap() = Some(Arc::new(move |phase| {
+                let target = if off_purge {
+                    "configuration_purge_committed"
+                } else {
+                    "full_prepared"
+                };
+                if phase == target {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }));
+            std::thread::scope(|threads| {
+                let scheduler = Arc::clone(&manager.scheduler);
+                let worker = threads.spawn(move || scheduler.worker_loop());
+                entered_rx.recv().unwrap();
+                assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+                assert_eq!(
+                    db.load_search_rows(current_hash_version()).unwrap().len(),
+                    usize::from(!off_purge)
+                );
+                manager.scheduler.configure(
+                    original.roots.clone(),
+                    original.pdf_passwords.clone(),
+                    Some(Arc::clone(&gate)),
+                    original.excluded_roots.clone(),
+                );
+                // A normal shutdown cancels the current run with the replacement Full pending.
+                manager.scheduler.shutdown();
+                *manager.scheduler.startup_test_probe.lock().unwrap() = None;
+                release_tx.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            // The cancelled Full may enter the loader, which checks cancel before any reads.
+            let cancelled_loader_calls = usize::from(!off_purge);
+            assert_eq!(db.full_inventory_load_count(), cancelled_loader_calls);
+            assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+            drop(manager);
+            drop(db);
+
+            let db = Arc::new(SimilarDb::open_at(&temp.path().join("similar.db")).unwrap());
+            assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+            assert_eq!(db.full_inventory_load_count(), 0);
+            let restarted = SimilarIndexManager::new(temp.path().to_path_buf());
+            let mut state =
+                coordinator_state_with_watch(id, &original.roots[0].path, WatchHealth::Ready);
+            state.pending_full = Some(initial_full_intent());
+            state.phase = SchedulerPhase::Starting;
+            *restarted.scheduler.prefill_db.lock().unwrap() = Some(Arc::clone(&db));
+            *restarted.scheduler.state.lock().unwrap() = state;
+            restarted.set_skip_offline_change_scan(true);
+            let reused = Arc::new(AtomicBool::new(false));
+            let observed_reuse = Arc::clone(&reused);
+            *restarted.scheduler.startup_test_probe.lock().unwrap() =
+                Some(Arc::new(move |phase| {
+                    if phase == "reused_initial" {
+                        observed_reuse.store(true, Ordering::Release);
+                    }
+                }));
+            Arc::clone(&restarted.scheduler).worker_loop();
+            assert!(!reused.load(Ordering::Acquire));
+            assert_eq!(restarted.reconcile_job_counts_for_test(), (1, 0));
+            assert_eq!(db.full_inventory_load_count(), 1);
+            assert!(db.scanned_once_matches(&fingerprint).unwrap());
+        }
     }
 
     #[test]

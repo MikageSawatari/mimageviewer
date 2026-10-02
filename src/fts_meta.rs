@@ -156,6 +156,124 @@ mod ownership_tests {
         assert!(db.get("c:/a/bookshelf/y.jpg").unwrap().is_some());
         assert!(db.get("c:/a/z.jpg").unwrap().is_some());
     }
+
+    #[test]
+    fn configuration_delete_invalidates_old_and_repair_roots_atomically_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db");
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        let id = Uuid::new_v4();
+        for root in ["c:/old", "c:/current", "c:/other"] {
+            db.mark_scanned_once(root, "complete").unwrap();
+        }
+        db.upsert_meta_ok(
+            "c:/current/a.jpg",
+            id,
+            Path::new("C:/Old/"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let paths = vec!["c:/current/a.jpg".to_owned()];
+        let roots = vec!["c:/current".to_owned()];
+        assert!(
+            db.delete_paths_and_invalidate_scans(&paths, &roots)
+                .is_err()
+        );
+        assert!(db.get(&paths[0]).unwrap().is_some());
+        for root in ["c:/old", "c:/current", "c:/other"] {
+            assert!(db.scanned_once(root).unwrap().is_some(), "rollback: {root}");
+        }
+        conn.execute_batch("DROP TRIGGER fail_delete").unwrap();
+        assert_eq!(
+            db.delete_paths_and_invalidate_scans(&paths, &roots)
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.scanned_once("c:/old").unwrap(), None);
+        assert_eq!(db.scanned_once("c:/current").unwrap(), None);
+        assert!(db.scanned_once("c:/other").unwrap().is_some());
+
+        db.mark_scanned_once("c:/current", "complete").unwrap();
+        db.upsert_meta_ok(
+            &paths[0],
+            id,
+            Path::new("c:/current"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.delete_paths(&paths).unwrap();
+        db.delete_paths_and_invalidate_scans(&[], &roots).unwrap();
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: "c:/current".into(),
+            exclusions: vec![],
+        }
+        .sql_ranges();
+        assert_eq!(
+            db.delete_path_ranges_and_invalidate_scans(&ranges, &roots)
+                .unwrap(),
+            0
+        );
+        assert!(
+            db.scanned_once("c:/current").unwrap().is_some(),
+            "watcher and unchanged tidy preserve markers"
+        );
+    }
+
+    #[test]
+    fn favorite_purge_invalidates_known_root_even_without_sqlite_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        db.mark_scanned_once("c:/old", "complete").unwrap();
+        assert_eq!(
+            db.delete_all_for_favorite_and_invalidate_scans(Uuid::new_v4(), &["c:/old".into()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.scanned_once("c:/old").unwrap(), None);
+    }
+
+    #[test]
+    fn configuration_range_delete_preserves_unrelated_and_noop_scope_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let roots = vec!["c:/a".to_owned(), "c:/b".to_owned(), "c:/c".to_owned()];
+        for root in &roots {
+            db.mark_scanned_once(root, "complete").unwrap();
+        }
+        db.upsert_meta_ok(
+            "c:/b/new-exclusion/x.jpg",
+            Uuid::new_v4(),
+            Path::new("c:/b"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        let ranges = ["c:/b/new-exclusion", "c:/c/new-exclusion"]
+            .into_iter()
+            .flat_map(|root| {
+                crate::metadata_ownership::OwnedRange {
+                    root: root.into(),
+                    exclusions: vec![],
+                }
+                .sql_ranges()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            db.delete_path_ranges_and_invalidate_scans(&ranges, &roots)
+                .unwrap(),
+            1
+        );
+        assert!(db.scanned_once("c:/a").unwrap().is_some());
+        assert_eq!(db.scanned_once("c:/b").unwrap(), None);
+        assert!(db.scanned_once("c:/c").unwrap().is_some());
+    }
 }
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
@@ -526,11 +644,27 @@ impl FtsMetaDb {
     /// お気に入り配下の全行を物理削除する (favorite の「メタ」チェックを OFF にした時)。
     /// 返り値は削除した行数。Tantivy 側の delete は呼び出し側の責務。
     pub fn delete_all_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn.execute(
+        self.delete_all_for_favorite_and_invalidate_scans(favorite_id, &[])
+    }
+
+    pub(crate) fn delete_all_for_favorite_and_invalidate_scans(
+        &self,
+        favorite_id: Uuid,
+        affected_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        invalidate_scan_roots_for_rows(
+            &tx,
+            "SELECT DISTINCT favorite_root FROM files WHERE favorite_id = ?1",
+            [favorite_id.to_string()],
+            affected_roots,
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM files WHERE favorite_id = ?1",
             params![favorite_id.to_string()],
         )?;
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -597,10 +731,54 @@ impl FtsMetaDb {
         &self,
         ranges: &[crate::metadata_ownership::PathRange],
     ) -> rusqlite::Result<usize> {
+        self.delete_path_ranges_inner(ranges, None)
+    }
+
+    pub(crate) fn delete_path_ranges_and_invalidate_scans(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+        affected_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        self.delete_path_ranges_inner(ranges, Some(affected_roots))
+    }
+
+    fn delete_path_ranges_inner(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+        affected_roots: Option<&[String]>,
+    ) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted = 0;
         for range in ranges {
+            if let Some(roots) = affected_roots {
+                let has_rows: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE path >= ?1 AND path < ?2)",
+                    params![range.start, range.end],
+                    |row| row.get(0),
+                )?;
+                if has_rows {
+                    let roots = roots
+                        .iter()
+                        .filter(|root| {
+                            crate::metadata_ownership::OwnedRange {
+                                root: (*root).clone(),
+                                exclusions: vec![],
+                            }
+                            .sql_ranges()
+                            .iter()
+                            .any(|scope| scope.start < range.end && range.start < scope.end)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    invalidate_scan_roots_for_rows(
+                        &tx,
+                        "SELECT DISTINCT favorite_root FROM files WHERE path >= ?1 AND path < ?2",
+                        params![range.start, range.end],
+                        &roots,
+                    )?;
+                }
+            }
             deleted += tx.execute(
                 "DELETE FROM files WHERE path >= ?1 AND path < ?2",
                 params![range.start, range.end],
@@ -612,6 +790,23 @@ impl FtsMetaDb {
 
     /// 指定 path 群の行を物理削除する。Tantivy 側 delete 完了後の cleanup として呼ぶ。
     pub fn delete_paths(&self, paths: &[String]) -> rusqlite::Result<usize> {
+        self.delete_paths_inner(paths, None)
+    }
+
+    /// 構成変更・起動補修だけが使う。通常の watcher 削除は完走印を保持する。
+    pub(crate) fn delete_paths_and_invalidate_scans(
+        &self,
+        paths: &[String],
+        affected_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        self.delete_paths_inner(paths, Some(affected_roots))
+    }
+
+    fn delete_paths_inner(
+        &self,
+        paths: &[String],
+        affected_roots: Option<&[String]>,
+    ) -> rusqlite::Result<usize> {
         if paths.is_empty() {
             return Ok(0);
         }
@@ -619,6 +814,18 @@ impl FtsMetaDb {
         let tx = conn.transaction()?;
         let mut deleted = 0;
         for chunk in paths.chunks(500) {
+            if let Some(roots) = affected_roots {
+                let sql = format!(
+                    "SELECT DISTINCT favorite_root FROM files WHERE path IN ({})",
+                    sql_in_placeholders(chunk.len())
+                );
+                invalidate_scan_roots_for_rows(
+                    &tx,
+                    &sql,
+                    rusqlite::params_from_iter(chunk),
+                    roots,
+                )?;
+            }
             let sql = format!(
                 "DELETE FROM files WHERE path IN ({})",
                 sql_in_placeholders(chunk.len())
@@ -963,6 +1170,27 @@ fn init_index_state_schema(conn: &Connection) -> rusqlite::Result<()> {
             value INTEGER NOT NULL
          );",
     )?;
+    Ok(())
+}
+
+/// 旧行の保存 root と現在の補修先を、行の変更と同じ transaction で失効させる。
+fn invalidate_scan_roots_for_rows(
+    conn: &Connection,
+    select: &str,
+    values: impl rusqlite::Params,
+    affected_roots: &[String],
+) -> rusqlite::Result<()> {
+    let roots = conn
+        .prepare(select)?
+        .query_map(values, |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for root in roots
+        .iter()
+        .map(|root| crate::metadata_ownership::root_key(Path::new(root)))
+        .chain(affected_roots.iter().cloned())
+    {
+        conn.execute("DELETE FROM scanned_once WHERE root = ?1", [root])?;
+    }
     Ok(())
 }
 
