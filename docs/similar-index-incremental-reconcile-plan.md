@@ -33,6 +33,20 @@ configure が watcher 登録より先に走る欠落窓、登録失敗のログ�
 
 ## 段階と検証
 
+### 起動時の再利用 (`ReusedInitial`)
+
+`skip_offline_change_scan` ON、`scanned_once` の有効 root 集合全体の指紋一致、純粋な Initial、
+現在構成の全 watch が Ready、未修復 gap なしの場合だけ、既存 worker 内で `ReusedInitial` を
+選ぶ。Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair の合流は `ScannedFull`。
+再利用では Full inventory と FS 列挙を省くが、未完 build の掃除、有効 root 和集合から共通除外を
+差し引いた範囲外の公開 item/container・build・prefill の purge、page order 修復、メモリ読み込みを
+行う。purge は入れ子 root を保護し、変更履歴・watermark を通常の purge と同じ transaction で
+更新する。現在 store と array snapshot の ack が揃ってから既存の終端経路で Complete を出す。
+dirty の `retain_after` と gap repair は `ScannedFull` だけに適用し、再利用中の dirty は MoreWork
+から Delta へ残す。印は完全な Full だけで立て、イベント・クラッシュでは消さない。
+指紋は正規化・重複除去した有効 root 集合、整列・重複除去した共通除外、DB schema / hash /
+page order の版、走査拡張子集合を含む。構成 epoch と password revision は含めない。
+
 第一段階は上記 scheduler/増分処理/公開境界を一貫して実装し、狭域回帰と独立差分レビューを行う。
 Full 中の通知は `[Full, Delta]`、Delta 中の通知は次 Delta、overflow/root 変更だけが必要な repair Full を発生させることを決定的な barrier テストで確認する。
 baseline 前後・prune 中通知、watch 登録失敗/復旧、remove/readd/重複 root、旧 epoch、array CAS/store 交換/shutdown、rename、book↔loose、ZIP/PDF、I/O 不完全時の保護を含める。実 IndexerManager→supervisor→notifier 境界の回帰も必要。

@@ -269,6 +269,21 @@ fn open_stores_with_rebuild_sync_using(
         }
     };
     crate::perf::emit_ms("startup", "fts_index_open", 0, t_fts);
+    if fts.recreated_on_open() {
+        meta_db
+            .reset_inventory_for_recreated_tantivy()
+            .map_err(|error| {
+                crate::logger::log(format!(
+                    "{log_tag}: clear scan markers after store recreation failed: {error}"
+                ));
+                if let Err(pending_error) = meta_db.request_item_index_rebuild() {
+                    crate::logger::log(format!(
+                        "{log_tag}: request rebuild failed: {pending_error}"
+                    ));
+                }
+                StoreOpenFailure::RebuildDeferred
+            })?;
+    }
     if rebuild_pending && let Err(e) = meta_db.complete_tantivy_rebuild() {
         crate::logger::log(format!(
             "{log_tag}: clear Tantivy rebuild marker failed: {e}; rebuild remains pending"
@@ -297,6 +312,7 @@ impl IndexerManager {
         similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
         similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
         progress: Option<StartupProgressHook>,
+        skip_offline_change_scan: bool,
     ) -> StartupInitOutcome {
         let data_dir = crate::data_dir::get();
         let (meta_db, fts) =
@@ -321,6 +337,7 @@ impl IndexerManager {
             similar_notifier,
             similar_passwords,
             progress,
+            skip_offline_change_scan,
         ) {
             Some(manager) => StartupInitOutcome::Ready(manager),
             None => StartupInitOutcome::Unavailable,
@@ -355,7 +372,32 @@ impl IndexerManager {
             None,
             None,
             None,
+            false,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_at_with_similar_for_test(
+        data_dir: &std::path::Path,
+        gate: Arc<ActivityGate>,
+        similar: crate::similar_index::SimilarIndexNotifier,
+        passwords: crate::pdf_passwords::PdfPasswordStore,
+    ) -> Self {
+        std::fs::create_dir_all(data_dir).unwrap();
+        let (meta, fts) = open_stores_with_rebuild_sync(data_dir, "S3 fanout", None).unwrap();
+        Self::new_with_stores(
+            meta,
+            fts,
+            &[],
+            crate::settings::IndexerSpeedProfile::default(),
+            gate,
+            Vec::new(),
+            Some(similar),
+            Some(passwords),
+            None,
+            false,
+        )
+        .unwrap()
     }
 
     /// `new` / `new_at` 共通の本体。stores を受け取って reconciliation + supervisor spawn を行う。
@@ -369,6 +411,7 @@ impl IndexerManager {
         similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
         similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
         progress: Option<StartupProgressHook>,
+        skip_offline_change_scan: bool,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
         // dispatcher が常駐スレッドで処理するので、reconciliation も submit ベースで行う。
@@ -415,6 +458,7 @@ impl IndexerManager {
                     excluded_roots.clone(),
                 );
                 config.similar_passwords = similar_passwords;
+                config.skip_offline_change_scan = skip_offline_change_scan;
                 config
             },
         )
@@ -495,6 +539,18 @@ impl IndexerManager {
         if let Some(h) = self.runtime.shared.state.lock().unwrap().controls.get(&id) {
             h.request_full_rescan();
         }
+    }
+    /// 全体確認は構成採用後に metadata Full と similar Manual 1回を owner から発行する。
+    pub fn request_shared_full_check(&self) {
+        self.runtime.request_full_check();
+    }
+    #[cfg(test)]
+    pub(crate) fn full_check_requested_for_test(&self) -> bool {
+        self.runtime.full_check_requested_for_test()
+    }
+    #[cfg(test)]
+    pub(crate) fn wait_full_check_dispatched_for_test(&self) {
+        self.runtime.wait_full_check_dispatched_for_test();
     }
     pub fn take_notifications(&self) -> Vec<&'static str> {
         std::mem::take(&mut self.runtime.shared.state.lock().unwrap().notifications)
@@ -688,6 +744,18 @@ pub(crate) fn run_reconciliation_via_dispatcher(
     let not_ok = meta_db
         .list_not_ok_paths_for_favorites(&target_favs)
         .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
+    // Failed cleanup must invalidate the owner before this startup decides to reuse it.
+    let failed_ids: std::collections::HashSet<_> = not_ok.iter().map(|(_, id, _)| *id).collect();
+    let failed_roots: std::collections::HashSet<_> = favorites
+        .iter()
+        .filter(|favorite| failed_ids.contains(&favorite.id))
+        .map(|favorite| crate::metadata_ownership::root_key(&favorite.path))
+        .collect();
+    for root in failed_roots {
+        meta_db
+            .clear_scanned_once_for_root(&root)
+            .map_err(|error| format!("reconciliation clear scan marker: {error}"))?;
+    }
     let deletes: Vec<String> = not_ok.iter().map(|(p, _, _)| p.clone()).collect();
     let _ = fts;
     if !deletes.is_empty() {
@@ -816,6 +884,127 @@ mod tests {
             .unwrap();
         conn.execute_batch("DROP TABLE index_state; PRAGMA user_version = 9;")
             .unwrap();
+    }
+
+    #[test]
+    fn recreated_fts_store_resets_matching_inventory_and_restores_docs_same_startup() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("pictures");
+        std::fs::create_dir(&root).unwrap();
+        image::RgbImage::new(2, 2)
+            .save(root.join("restored.png"))
+            .unwrap();
+        let favorite = mk_fav("restore", &root, true);
+        let key = crate::metadata_ownership::root_key(&root);
+        let manager = IndexerManager::new_at(
+            tmp.path(),
+            std::slice::from_ref(&favorite),
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            vec![],
+        )
+        .unwrap();
+        wait_until("first complete marker", || {
+            manager.meta_db.scanned_once(&key).unwrap().is_some()
+        });
+        assert_eq!(manager.fts.searcher().num_docs(), 1);
+        let mut manager = manager;
+        manager.runtime.shutdown();
+        let writer = Arc::downgrade(&manager.writer);
+        let fts_weak = Arc::downgrade(&manager.fts);
+        drop(manager);
+        wait_until("store finalizer released", || {
+            writer.strong_count() == 0 && fts_weak.strong_count() == 0
+        });
+        // Remove only the derived full-text store; unchanged stamps remain in the released DB.
+        std::fs::remove_dir_all(tmp.path().join("fts_index")).unwrap();
+        let (meta, fts) = open_stores_with_rebuild_sync(tmp.path(), "S3 recreation", None).unwrap();
+        assert_eq!(meta.scanned_once(&key).unwrap(), None);
+        assert!(
+            meta.get(&crate::search_index_db::normalize_path(
+                &root.join("restored.png")
+            ))
+            .unwrap()
+            .is_none()
+        );
+        let manager = IndexerManager::new_with_stores(
+            meta,
+            fts,
+            std::slice::from_ref(&favorite),
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            vec![],
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        wait_until("restored complete marker", || {
+            manager.meta_db.scanned_once(&key).unwrap().is_some()
+        });
+        assert_eq!(manager.fts.searcher().num_docs(), 1);
+        wait_until("restored supervisor complete", || {
+            manager
+                .all_stats()
+                .iter()
+                .any(|entry| entry.stats.ingested_ok == 1 && entry.stats.initial_scan_done)
+        });
+    }
+
+    #[test]
+    fn startup_failed_cleanup_invalidates_only_affected_root_before_skip_decision() {
+        let tmp = TempDir::new().unwrap();
+        let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap());
+        let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
+        let favorite = mk_fav("failed", std::path::Path::new("C:/Images/"), true);
+        let key = crate::metadata_ownership::root_key(&favorite.path);
+        let fingerprint = crate::indexer_supervisor::fts_scan_fingerprint(
+            &favorite.path,
+            favorite.id,
+            &[],
+            &crate::indexer_supervisor::fts_scan_extensions(),
+        );
+        meta.mark_scanned_once(&key, &fingerprint).unwrap();
+        meta.mark_scanned_once("c:/unrelated", "untouched").unwrap();
+        for path in ["c:/images/a.jpg", "c:/images/b.jpg"] {
+            meta.upsert_meta_ok(path, favorite.id, &favorite.path, IndexKind::Image, 1, 1)
+                .unwrap();
+            meta.mark_failed(path).unwrap();
+        }
+        assert!(crate::indexer_supervisor::can_skip_initial_scan(
+            &meta,
+            true,
+            false,
+            &favorite.path,
+            favorite.id,
+            &[]
+        ));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            Arc::clone(&fts),
+        );
+        let report = run_reconciliation_via_dispatcher(
+            &meta,
+            &fts,
+            &writer,
+            std::slice::from_ref(&favorite),
+        )
+        .unwrap();
+        assert_eq!(report.failed_cleaned, 2);
+        assert_eq!(meta.scanned_once(&key).unwrap(), None);
+        assert_eq!(
+            meta.scanned_once("c:/unrelated").unwrap().as_deref(),
+            Some("untouched")
+        );
+        assert!(!crate::indexer_supervisor::can_skip_initial_scan(
+            &meta,
+            true,
+            false,
+            &favorite.path,
+            favorite.id,
+            &[]
+        ));
     }
 
     fn seed_valid_fts_dir(data_dir: &std::path::Path) -> std::path::PathBuf {

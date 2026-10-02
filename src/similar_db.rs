@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
-const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 pub const HASH_ALGORITHM_VERSION: u32 = 1;
 
 /// `page_index` がどの並べ方で振られているか。
@@ -1316,6 +1316,39 @@ impl SimilarDb {
 
     pub fn db_path_at(data_dir: &Path) -> PathBuf {
         data_dir.join("similar.db")
+    }
+
+    pub(crate) fn scanned_once_matches(&self, fingerprint: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(conn
+            .query_row(
+                "SELECT fingerprint FROM scanned_once WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(fingerprint))
+    }
+
+    pub(crate) fn mark_scanned_once(&self, fingerprint: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .execute(
+                "INSERT INTO scanned_once(singleton, fingerprint) VALUES(1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET fingerprint = excluded.fingerprint",
+                [fingerprint],
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_scanned_once(&self) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .execute("DELETE FROM scanned_once", [])?;
+        Ok(())
     }
 
     /// 前回停止時に公開されなかった世代だけを掃除する。
@@ -2973,13 +3006,36 @@ impl SimilarDb {
             return Ok(ConditionalCommit::Committed(0));
         }
 
+        self.purge_keys_if(
+            |key| key_is_under_any(key, purge_roots) && !key_is_under_any(key, keep_roots),
+            should_publish,
+        )
+    }
+
+    /// 現在の有効 root の和集合の外と共通除外を消す。入れ子の有効 root は残す。
+    /// 公開世代・build・prefill を同じ transaction で処理し、削除履歴と集計も更新する。
+    pub(crate) fn purge_outside_active_roots_if(
+        &self,
+        active_roots: &[String],
+        excluded_roots: &[String],
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<ConditionalCommit<usize>> {
+        self.purge_keys_if(
+            |key| !key_is_under_any(key, active_roots) || key_is_under_any(key, excluded_roots),
+            should_publish,
+        )
+    }
+
+    fn purge_keys_if(
+        &self,
+        should_purge: impl Fn(&str) -> bool,
+        should_publish: impl Fn() -> bool,
+    ) -> rusqlite::Result<ConditionalCommit<usize>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         if !should_publish() {
             return Ok(ConditionalCommit::Skipped);
         }
         let transaction = write_transaction(&mut conn)?;
-        let should_purge =
-            |key: &str| key_is_under_any(key, purge_roots) && !key_is_under_any(key, keep_roots);
 
         let item_keys = query_string_column(&transaction, "SELECT item_key FROM item")?;
         let container_keys =
@@ -4758,6 +4814,11 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     // 定常状態では書き込みロックを一切取らない。索引 worker・配列更新 worker・パネル照会・
     // 集計はそれぞれ別の接続でこの店を開くので、開くこと自体が writer になると互いに競合する。
     if stored_schema_version(conn)? == SCHEMA_VERSION {
+        // リリース済み v5 へ表だけ追加する。定常 open は DDL / writer lock を取らない。
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scanned_once')", [], |row| row.get::<_, bool>(0))? {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS scanned_once (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1), fingerprint TEXT NOT NULL);")?;
+        }
         return Ok(());
     }
     // 作成と移行は writer なので、読んでから書きへ上げない。WAL の deferred transaction は
@@ -4767,6 +4828,10 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
     let user_version = stored_schema_version(&transaction)?;
     if user_version == SCHEMA_VERSION {
         // ロックを待っている間に、別の接続が作成か移行を終えていた。
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scanned_once (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1), fingerprint TEXT NOT NULL);",
+        )?;
         return transaction.commit();
     }
     // 中断しても旧schemaのまま残るかv5へ移り切るかのどちらかになるよう、退避・作成・移送・
@@ -4785,7 +4850,8 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         // Only the known v1/v2/v3/v4 layouts are migrated. Preserve the existing recovery contract
         // for an unknown generation instead of guessing at its table meanings.
         transaction.execute_batch(
-            "DROP TABLE IF EXISTS item_change;
+            "DROP TABLE IF EXISTS scanned_once;
+             DROP TABLE IF EXISTS item_change;
              DROP TABLE IF EXISTS item_build;
              DROP TABLE IF EXISTS item_prefill;
              DROP TABLE IF EXISTS container_build;
@@ -4796,7 +4862,9 @@ fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
         )?;
     }
     transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS item (
+        "CREATE TABLE IF NOT EXISTS scanned_once (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1), fingerprint TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS item (
            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
            item_key TEXT NOT NULL UNIQUE,
            revision INTEGER NOT NULL CHECK(revision > 0),
@@ -6750,6 +6818,141 @@ mod tests {
                 .unwrap()
                 .registered_items,
             2
+        );
+    }
+
+    #[test]
+    fn startup_marker_addition_preserves_released_v5_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("released.db");
+        {
+            let db = SimilarDb::open_at(&path).unwrap();
+            db.upsert_loose_item(&item("c:/library/kept.jpg", None, None, 1))
+                .unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TABLE scanned_once")
+                .unwrap();
+        }
+        let db = SimilarDb::open_at(&path).unwrap();
+        assert!(!db.scanned_once_matches("current").unwrap());
+        assert_eq!(
+            db.load_search_rows(current_hash_version()).unwrap().len(),
+            1
+        );
+        db.mark_scanned_once("current").unwrap();
+        drop(db);
+        let db = SimilarDb::open_at(&path).unwrap();
+        assert!(db.scanned_once_matches("current").unwrap());
+        assert!(!db.scanned_once_matches("changed").unwrap());
+        db.clear_scanned_once().unwrap();
+        assert!(!db.scanned_once_matches("current").unwrap());
+    }
+
+    #[test]
+    fn startup_store_recreation_clears_marker_in_same_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recreate.db");
+        {
+            let db = SimilarDb::open_at(&path).unwrap();
+            db.mark_scanned_once("current").unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA user_version = 999")
+                .unwrap();
+        }
+        let db = SimilarDb::open_at(&path).unwrap();
+        assert!(!db.scanned_once_matches("current").unwrap());
+    }
+
+    #[test]
+    fn startup_union_purge_covers_all_tables_and_records_watermark() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        for (key, marker) in [
+            ("c:/root/outer.jpg", 1),
+            ("c:/root/nested/inner.jpg", 2),
+            ("c:/root/excluded/drop.jpg", 3),
+            ("c:/root-sibling/drop.jpg", 4),
+        ] {
+            db.upsert_loose_item(&item(key, None, None, marker))
+                .unwrap();
+        }
+        let generation = db
+            .begin_container_build("c:/removed/build.zip", ContainerKind::Zip, 1, 1, 10)
+            .unwrap();
+        db.stage_item(
+            generation,
+            &item(
+                "c:/removed/build.zip\u{1f}page.jpg",
+                Some("c:/removed/build.zip"),
+                Some(0),
+                5,
+            ),
+        )
+        .unwrap();
+        let prefill = item("c:/removed/prefill.jpg", None, None, 6);
+        db.put_prefill(&prefill).unwrap();
+        db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+            .unwrap();
+        let before = db.change_watermark().unwrap();
+        let roots = vec!["c:/root".to_owned(), "c:/root/nested".to_owned()];
+        assert!(matches!(
+            db.purge_outside_active_roots_if(&roots, &["c:/root/excluded".to_owned()], || true)
+                .unwrap(),
+            ConditionalCommit::Committed(6)
+        ));
+        let mut keys = db
+            .load_search_rows(current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.item_key)
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["c:/root/nested/inner.jpg", "c:/root/outer.jpg"]);
+        assert_eq!(db.count_staged(), 0);
+        assert!(
+            db.load_prefill(
+                &prefill.item_key,
+                prefill.mtime,
+                prefill.file_size,
+                prefill.hash_version
+            )
+            .unwrap()
+            .is_none()
+        );
+        let after = db.change_watermark().unwrap();
+        assert_eq!(after.store_id, before.store_id);
+        assert_eq!(after.through_change_seq, before.through_change_seq + 2);
+        let summary = db
+            .load_index_summary(current_hash_version())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.registered_items, 2);
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT through_change_seq FROM index_run WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            after.through_change_seq
+        );
+        // Removing the outer favorite must preserve the still-active nested root.
+        assert_eq!(
+            db.purge_outside_active_roots_if(&["c:/root/nested".to_owned()], &[], || true)
+                .unwrap(),
+            ConditionalCommit::Committed(1)
+        );
+        assert_eq!(
+            db.load_search_rows(current_hash_version()).unwrap()[0]
+                .item
+                .item_key,
+            "c:/root/nested/inner.jpg"
         );
     }
 

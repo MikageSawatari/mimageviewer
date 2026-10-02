@@ -744,3 +744,103 @@ core の最適化コンパイルは10分29秒。ログは
 `target/startup-scan-s2/review-fixes-build-dev.log`。成果物は起動していない。
 レビュー修正専用の `target/startup-scan-s2/commit-message.txt` を指定署名付きで上書きし、
 Git の書き込み・stash・コミットは行っていない。
+
+### 11.4 S3: 終了中の変更確認の省略と手動確認 (2026-10-02)
+
+第7版 §6 E を3系統とも実装した。既定 OFF の `skip_offline_change_scan` を既存 Settings
+保存経路へ追加し、欠落キーは false として読む。お気に入り編集と環境設定の常駐ページが
+同じ値を編集する。検索語と anchor、終了後の再走査を断定していた説明も更新した。
+共通の純描画 helper に設定・補足・[今すぐ確認] を置き、Light/Dark の snapshot を追加した。
+
+- リリース済みの3 DB に `CREATE TABLE IF NOT EXISTS` で `scanned_once` だけを追加する。
+  fts/name は root 単位、similar は全有効 root の集合で1印。既存の行の意味・保存先は変えず、
+  各旧DBを開いて既存行が保たれ、印が無く通常の走査へ進む互換テストを追加した。
+- 指紋は各系統に1関数と入力一覧コメントを置いた。fts/name は安定 JSON tuple、similar は
+  JSON tuple の SHA-256。similar の拡張子は画像・Susie・ZIP/CBZ/PDF に加え、本の分類に
+  関与する既存の動画・音声の集合も含める。プロセス epoch/password revision は含めない。
+- 印は typed Complete (取消・不完全観測・書き込み失敗・prune失敗なし) だけで更新する。
+  通常イベント・途中終了・通常Full/Deltaの失敗では以前の印を保持する。S2 の Failed 行の
+  起動 cleanup と再構築要求は消し、同じ起動の判断へ反映する。Failed root は重複除去して
+  1 root 1回だけ消す。retry loop や新しい段階的な復旧は追加しない。
+- fts の新規作成/schema再作成は、古い管理行の stamp が stable と判定されると文書を再投入
+  できない。store open 境界で管理行と印を同一 transaction で消し、現在の起動で復元する。
+  失敗は既存 rebuild pending と通知へ渡す。独立レビューとこの根本修正に合意し、実文書が
+  復元されるまでの回帰を追加した。
+- 起動設定は構成の集約対象から分離して worker 開始時に固定する。name も最初の構成だけ
+  省略を許し、実行中の除外変更・OFF/ON等の再構成では通常Fullへ戻す。watcher は省略前に
+  起動する。再構成・手動・overflow・回復を省かない。
+- similar は既存 worker 内で `ScannedFull / ReusedInitial` を分ける。pure Initial・全Ready・
+  gapなしだけを再利用する。未完build掃除、共通除外を差し引くroot和集合外のpurge、ページ順
+  修復とメモリ読み込みを維持し、現在storeのarray ack後に同じComplete経路へ進む。
+  dirty吸収とgap修復はScannedFullだけに適用し、再利用中のdirtyはDeltaへ残す。
+- [今すぐ確認] は App の1入口。名前は独立managerのmailboxへ即時提出、metadata/similarは
+  App初期化中の予約を1回へ集約し、共有managerの構成採用後にmetadata-only Fullとsimilar
+  Manual 1回を発行する。初期構成の採用前にも要求を失わない。pause中は受付を保ち再開後に
+  実行し、共有manager利用不能時は理由を通知して名前の要求を維持する。
+- 設計簡素化: 手動確認をモーダルにすると索引更新中の通常閲覧を妨げるため採用しない。
+  新しいworker/復旧stateを作らず、既存構成ownerのmailboxと既存完了経路へ集約した。
+- 名前bulkのComplete前提を確認し、深さ上限、特殊DirEntry分類失敗、root metadataの
+  NotFound以外の失敗を不完全観測へ伝えた。NotFoundは既存仕様どおり完全な空走査とする。
+  watcherによるroot消滅は名前行だけを消し、完走印は保持する。
+
+独立レビュー (`gpt-6.1-sol` / `xhigh`) は設計と完成差分を確認した。store再作成のinventory、
+起動設定の集約、初期構成前のManual、nameの再構成時省略、通常失敗の印保持の指摘を修正し、
+決定的な回帰を追加した。未解決のP1/P2は0。Cargo検証は親の実装担当が所有する。
+similarのUnavailable/Manual合流・array ack・dirty、構成採用と手動予約はchannel gateで
+競合地点を固定し、処理時間の推測で順序を決めない。
+
+自動検証の成功分は373件 (lib 285、integration 29、snapshot 59)。
+`MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定し、Cargo は `-j 1`。
+lib のコマンドは `cargo test -j 1 -p mimageviewer --lib <filter>`。
+
+| filter | 成功件数 |
+| --- | ---: |
+| `metadata_reconfiguration` | 14 |
+| `fts_meta` | 24 |
+| `fts_index` | 27 |
+| `indexer_supervisor` | 17 |
+| `indexer_manager` | 13 |
+| `name_index_manager` | 10 |
+| `name_index_supervisor` | 13 |
+| `name_bulk_indexer` | 16 |
+| `search_index_db` | 42 |
+| `similar_db` | 60 |
+| `similar_index::tests::startup_` | 9 |
+| `similar_index::tests::incremental_reconcile` | 25 |
+| `index_full_check_tests` | 3 |
+| `skip_offline_change_scan` | 1 |
+| `preferences::search_index` | 11 |
+
+similar_db の既存手動用3件 (`measure_delta_scoped_reconcile_candidate_scaling`、
+`measure_full_reconcile_inventory_reference_cardinality`、`migrate_a_real_v1_store_copy`)
+は ignore のまま。新規に ignore を追加していない。
+
+| integration コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j 1 -p mimageviewer --test search_metadata_e2e -- --test-threads=1` | 14 |
+| `cargo test -j 1 -p mimageviewer --test search_name_e2e -- --test-threads=1` | 15 |
+| `cargo test -j 1 -p mimageviewer --test ui_snapshot` | 59 |
+
+metadata 結合テストの最初の並列実行は6成功・8件が既存10秒の初回走査待ちで timeout。
+コードや待ち時間を変更せず、テストを直列実行して14件成功した。並列実行時の資源競合は
+疑われるが原因確定とは扱わない。手動確認のfixture初期化と検索設定タイトル検査の失敗は
+実装を修正し、それぞれ3件・11件の再実行が成功した。
+
+新しい Light/Dark 2画像だけを `UPDATE_SNAPSHOTS=1` の対象フィルタ
+`offline_change_scan_setting` で生成し、文字・折り返し・checkbox・ボタンを目視確認した。
+既存snapshot画像の更新はない。その後、更新指定なしの59件が成功した。
+
+全 workspace の `cargo fmt --all` / `cargo fmt --all --check`、`git diff --check` は成功。
+`python scripts/check_ui_glyphs.py` は問題0、
+`cargo check -j 1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+ログは `target/startup-scan-s3/` (再実行は `*-final.log` / `*-serial.log`) に保存した。
+全 workspace suite・アプリ起動・実データの性能計測は行っていない。
+
+確認用 build は `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`
+が exit 0。core は8分43秒、remote service・EPUB worker も成功し、CRT 検査は
+`runtime=4 pe=3`。ログは `target/startup-scan-s3/build-dev.log`。
+通常 feature set の成果物は起動しておらず、実 `%APPDATA%\mimageviewer` に触れていない。
+実機での省略と[今すぐ確認]の確認は利用者へ引き継ぐ。S3 の実装残件はない。
+
+Git の書き込み・stash・コミットは行っていない。指定署名を末尾に含むコミット文を
+`target/startup-scan-s3/commit-message.txt` に作成した。

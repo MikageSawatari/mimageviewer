@@ -77,11 +77,14 @@ struct Mailbox {
     phase: Phase,
     monitors: BTreeMap<String, NameIndexMonitor>,
     requested_roots: BTreeSet<String>,
+    full_check_requested: bool,
 }
 
 struct Shared {
     state: Mutex<Mailbox>,
     wake: Condvar,
+    #[cfg(test)]
+    full_check_requests: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -105,6 +108,7 @@ trait Backend: Send + Sync + 'static {
         root: &RootConfig,
         excluded: &[PathBuf],
         shared: &Arc<Shared>,
+        startup: bool,
     ) -> Result<ManagedSupervisor, String>;
     fn clear(&self, root: &std::path::Path) -> Result<(), String>;
 }
@@ -112,6 +116,7 @@ trait Backend: Send + Sync + 'static {
 struct DatabaseBackend {
     db: Arc<SearchIndexDb>,
     gate: Option<Arc<ActivityGate>>,
+    skip_offline_change_scan: bool,
 }
 
 impl Backend for DatabaseBackend {
@@ -120,13 +125,15 @@ impl Backend for DatabaseBackend {
         root: &RootConfig,
         excluded: &[PathBuf],
         _shared: &Arc<Shared>,
+        startup: bool,
     ) -> Result<ManagedSupervisor, String> {
-        let handle = crate::name_index_supervisor::try_spawn(
+        let handle = crate::name_index_supervisor::try_spawn_with_startup_policy(
             root.id,
             root.path.clone(),
             Arc::clone(&self.db),
             excluded.to_vec(),
             self.gate.clone(),
+            startup && self.skip_offline_change_scan,
         )
         .map_err(|e| e.to_string())?;
         let (monitor, thread) = handle.into_worker_parts();
@@ -153,7 +160,20 @@ pub struct NameIndexManager {
 
 impl NameIndexManager {
     pub fn new(db: Arc<SearchIndexDb>, gate: Option<Arc<ActivityGate>>) -> std::io::Result<Self> {
-        Self::with_backend(Arc::new(DatabaseBackend { db, gate }))
+        Self::new_with_startup_policy(db, gate, false)
+    }
+
+    /// 起動時の設定 snapshot。実行中の設定変更では既存 supervisor を再構成しない。
+    pub fn new_with_startup_policy(
+        db: Arc<SearchIndexDb>,
+        gate: Option<Arc<ActivityGate>>,
+        skip_offline_change_scan: bool,
+    ) -> std::io::Result<Self> {
+        Self::with_backend(Arc::new(DatabaseBackend {
+            db,
+            gate,
+            skip_offline_change_scan,
+        }))
     }
 
     fn with_backend(backend: Arc<dyn Backend>) -> std::io::Result<Self> {
@@ -164,8 +184,11 @@ impl NameIndexManager {
                 phase: Phase::Idle,
                 monitors: BTreeMap::new(),
                 requested_roots: BTreeSet::new(),
+                full_check_requested: false,
             }),
             wake: Condvar::new(),
+            #[cfg(test)]
+            full_check_requests: std::sync::atomic::AtomicUsize::new(0),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
@@ -220,7 +243,8 @@ impl NameIndexManager {
 
     pub fn any_in_full_scan(&self) -> bool {
         let state = self.shared.state.lock().unwrap();
-        state.pending.is_some()
+        state.full_check_requested
+            || state.pending.is_some()
             || !matches!(state.phase, Phase::Idle)
             || state
                 .monitors
@@ -229,10 +253,23 @@ impl NameIndexManager {
     }
 
     pub fn request_full_rescan(&self) {
-        let monitors = self.shared.state.lock().unwrap().monitors.clone();
-        for monitor in monitors.values() {
-            monitor.request_full_rescan();
+        let mut state = self.shared.state.lock().unwrap();
+        if matches!(state.lifecycle, Lifecycle::Running) {
+            #[cfg(test)]
+            self.shared
+                .full_check_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // stop/join/clear/start 中も受け付け、採用された構成の supervisor へ1回送る。
+            state.full_check_requested = true;
+            self.shared.wake.notify_all();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_full_check_count_for_test(&self) -> usize {
+        self.shared
+            .full_check_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn signal_shutdown(&self) {
@@ -243,6 +280,7 @@ impl NameIndexManager {
             };
         }
         state.pending = None;
+        state.full_check_requested = false;
         for monitor in state.monitors.values() {
             monitor.signal_stop();
         }
@@ -263,10 +301,12 @@ struct Worker {
     known: BTreeMap<String, PathBuf>,
     running: BTreeMap<String, ManagedSupervisor>,
     cleared: BTreeSet<String>,
+    startup: bool,
 }
 
 enum Action {
     Configure(Configuration),
+    FullCheck,
     Shutdown,
 }
 
@@ -276,6 +316,7 @@ fn run_worker(shared: Arc<Shared>, backend: Arc<dyn Backend>) {
         known: BTreeMap::new(),
         running: BTreeMap::new(),
         cleared: BTreeSet::new(),
+        startup: true,
     };
     loop {
         let action = {
@@ -288,6 +329,11 @@ fn run_worker(shared: Arc<Shared>, backend: Arc<dyn Backend>) {
                     state.phase = Phase::Applying;
                     break Action::Configure(config);
                 }
+                if state.full_check_requested {
+                    state.full_check_requested = false;
+                    state.phase = Phase::Applying;
+                    break Action::FullCheck;
+                }
                 state.phase = Phase::Idle;
                 shared.wake.notify_all();
                 state = shared.wake.wait(state).unwrap();
@@ -296,13 +342,21 @@ fn run_worker(shared: Arc<Shared>, backend: Arc<dyn Backend>) {
         if matches!(action, Action::Shutdown) {
             break;
         }
+        let configured = matches!(action, Action::Configure(_));
         if let Action::Configure(config) = action {
             worker.configure(config, &shared);
+        } else if matches!(action, Action::FullCheck) {
+            for supervisor in worker.running.values() {
+                supervisor.monitor.request_full_rescan();
+            }
         }
         if shared.shutdown_deadline().is_some() {
             break;
         }
         worker.clear_and_start(&shared, backend.as_ref());
+        if configured {
+            worker.startup = false;
+        }
     }
     for supervisor in worker.running.values() {
         supervisor.monitor.signal_stop();
@@ -375,7 +429,7 @@ impl Worker {
         if matches!(state.lifecycle, Lifecycle::Shutdown { .. }) {
             return Ok(false);
         }
-        let supervisor = backend.spawn(root, &self.current.excluded, shared)?;
+        let supervisor = backend.spawn(root, &self.current.excluded, shared, self.startup)?;
         state
             .monitors
             .insert(key.to_owned(), supervisor.monitor.clone());
@@ -438,12 +492,14 @@ mod tests {
         Stop(String),
         Joined(String),
         Clear(String),
+        FullCheck(String),
     }
 
     struct FakeBackend {
         events: Sender<Event>,
         stop_gate: Mutex<Option<Receiver<()>>>,
         fail_clear: AtomicBool,
+        startup_policies: Mutex<Vec<bool>>,
     }
 
     impl Backend for FakeBackend {
@@ -452,7 +508,9 @@ mod tests {
             root: &RootConfig,
             _excluded: &[PathBuf],
             _shared: &Arc<Shared>,
+            startup: bool,
         ) -> Result<ManagedSupervisor, String> {
+            self.startup_policies.lock().unwrap().push(startup);
             let key = normalize_path(&root.path);
             self.events.send(Event::Spawn(key.clone())).unwrap();
             let events = self.events.clone();
@@ -460,6 +518,12 @@ mod tests {
             let (monitor, commands) = NameIndexMonitor::for_test();
             let thread = std::thread::spawn(move || {
                 while let Ok(command) = commands.recv() {
+                    if matches!(
+                        command,
+                        crate::name_index_supervisor::NameIndexCommand::FullRescan
+                    ) {
+                        let _ = events.send(Event::FullCheck(key.clone()));
+                    }
                     if matches!(
                         command,
                         crate::name_index_supervisor::NameIndexCommand::Stop
@@ -506,6 +570,7 @@ mod tests {
             events,
             stop_gate: Mutex::new(gate),
             fail_clear: AtomicBool::new(false),
+            startup_policies: Mutex::new(Vec::new()),
         });
         let manager = NameIndexManager::with_backend(backend.clone()).unwrap();
         (manager, backend, rx)
@@ -519,7 +584,10 @@ mod tests {
     fn idle(manager: &NameIndexManager) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut state = manager.shared.state.lock().unwrap();
-        while state.pending.is_some() || !matches!(state.phase, Phase::Idle) {
+        while state.pending.is_some()
+            || state.full_check_requested
+            || !matches!(state.phase, Phase::Idle)
+        {
             assert!(Instant::now() < deadline, "manager did not settle");
             state = manager
                 .shared
@@ -533,6 +601,28 @@ mod tests {
     fn shutdown(mut manager: NameIndexManager) {
         manager.signal_shutdown();
         manager.worker.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn startup_reuse_policy_is_not_reused_after_runtime_exclusion_roundtrip() {
+        let (manager, backend, events) = setup(None);
+        let favorites = vec![favorite(1, r"C:\Books", true)];
+        for excluded in [vec![], vec![PathBuf::from(r"C:\Books\Excluded")], vec![]] {
+            manager.sync_with_favorites(&favorites, excluded);
+            idle(&manager);
+        }
+        assert_eq!(
+            *backend.startup_policies.lock().unwrap(),
+            [true, false, false]
+        );
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, Event::Spawn(_)))
+                .count(),
+            3
+        );
+        shutdown(manager);
     }
 
     #[test]
@@ -718,5 +808,53 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn manual_check_reaches_every_normalized_root_once() {
+        let (manager, _, events) = setup(None);
+        manager.sync_with_favorites(
+            &[
+                favorite(1, "a", true),
+                favorite(2, "A", true),
+                favorite(3, "b", true),
+            ],
+            vec![],
+        );
+        assert_eq!(event(&events), Event::Spawn("a".into()));
+        assert_eq!(event(&events), Event::Spawn("b".into()));
+        idle(&manager);
+        manager.request_full_rescan();
+        let mut checked = vec![event(&events), event(&events)];
+        checked.sort_by_key(|event| format!("{event:?}"));
+        assert_eq!(
+            checked,
+            vec![Event::FullCheck("a".into()), Event::FullCheck("b".into())]
+        );
+        idle(&manager);
+        assert!(events.try_recv().is_err());
+        shutdown(manager);
+    }
+
+    #[test]
+    fn manual_check_while_joining_is_reserved_for_new_supervisor() {
+        let (release, gate) = unbounded();
+        let (manager, _, events) = setup(Some(gate));
+        manager.sync_with_favorites(&[favorite(1, "a", true)], vec![]);
+        assert_eq!(event(&events), Event::Spawn("a".into()));
+        idle(&manager);
+        manager.sync_with_favorites(&[favorite(1, "b", true)], vec![]);
+        assert_eq!(event(&events), Event::Stop("a".into()));
+        manager.request_full_rescan();
+        manager.request_full_rescan();
+        assert!(events.try_recv().is_err());
+        release.send(()).unwrap();
+        assert_eq!(event(&events), Event::Joined("a".into()));
+        assert_eq!(event(&events), Event::Clear("a".into()));
+        assert_eq!(event(&events), Event::Spawn("b".into()));
+        assert_eq!(event(&events), Event::FullCheck("b".into()));
+        idle(&manager);
+        assert!(events.try_recv().is_err());
+        shutdown(manager);
     }
 }

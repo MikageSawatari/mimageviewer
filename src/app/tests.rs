@@ -12510,6 +12510,7 @@ mod paused_similar_feature_tests {
         app.startup_init = Some(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
+            full_check_requested: false,
         });
         app.startup_done = false;
         app.poll_startup_init();
@@ -12564,6 +12565,7 @@ mod paused_similar_feature_tests {
         app.startup_init = Some(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
+            full_check_requested: false,
         });
         app.startup_done = false;
 

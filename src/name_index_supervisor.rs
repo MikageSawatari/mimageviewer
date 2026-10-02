@@ -29,6 +29,7 @@
 //! 過ぎず、その後 FS に追加されたフォルダ/ZIP/PDF/動画は Ctrl+S 検索にヒットしなかった。
 //! この module が FsWatcher を握って差分追従する責務を担う。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,7 +41,7 @@ use uuid::Uuid;
 
 use crate::folder_tree::walk_dirs_recursive_with_progress_excluding;
 use crate::indexer_progress::ProgressReporter;
-use crate::name_bulk_indexer::{collect_index_entries, run_bulk_name_index};
+use crate::name_bulk_indexer::{BulkSummary, collect_index_entries, run_bulk_name_index};
 use crate::search_index_db::SearchIndexDb;
 use crate::search_watcher::{ChangeKind, DebouncedChange, FsWatcher, OVERFLOW_MARKER_PATH};
 
@@ -70,9 +71,26 @@ pub enum NameFullScanOutcome {
     Cancelled,
 }
 
+/// 名前の走査・分類の意味を変えたら上げる。既存行のスキーマ版とは分ける。
+const NAME_INDEX_VERSION: u32 = 1;
+
+/// 入力: root の正規化パス、除外 root の正規化・整列・重複除去集合、NAME_INDEX_VERSION。
+/// UUID・表示名・お気に入りの並び順は root 単位の名前索引を変えない。
+pub(crate) fn name_scan_fingerprint(root: &Path, excluded_roots: &[PathBuf]) -> String {
+    let excluded: BTreeSet<_> = excluded_roots
+        .iter()
+        .map(|p| crate::search_index_db::normalize_path(p))
+        .collect();
+    serde_json::to_string(&(
+        NAME_INDEX_VERSION,
+        crate::search_index_db::normalize_path(root),
+        excluded,
+    ))
+    .expect("name scan fingerprint contains only strings and a version")
+}
+
 pub enum NameIndexCommand {
     Stop,
-    #[allow(dead_code)] // 将来の手動再構築ボタン用
     FullRescan,
 }
 
@@ -197,6 +215,24 @@ pub(crate) fn try_spawn(
     excluded_roots: Vec<PathBuf>,
     activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
 ) -> std::io::Result<NameIndexSupervisorHandle> {
+    try_spawn_with_startup_policy(
+        favorite_id,
+        favorite_root,
+        db,
+        excluded_roots,
+        activity_gate,
+        false,
+    )
+}
+
+pub(crate) fn try_spawn_with_startup_policy(
+    favorite_id: Uuid,
+    favorite_root: PathBuf,
+    db: Arc<SearchIndexDb>,
+    excluded_roots: Vec<PathBuf>,
+    activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+    skip_offline_change_scan: bool,
+) -> std::io::Result<NameIndexSupervisorHandle> {
     let cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(NameIndexStats::default()));
     let progress = ProgressReporter::new();
@@ -228,6 +264,7 @@ pub(crate) fn try_spawn(
                 cmd_rx,
                 change_tx,
                 change_rx,
+                skip_offline_change_scan,
             );
         })?;
 
@@ -254,6 +291,7 @@ fn supervisor_loop(
     cmd_rx: Receiver<NameIndexCommand>,
     change_tx: Sender<DebouncedChange>,
     change_rx: Receiver<DebouncedChange>,
+    skip_offline_change_scan: bool,
 ) {
     // 1. FsWatcher を先に起動して変更を取りこぼさない
     //    (初期 bulk 中に変更が起きても change_rx にたまる)
@@ -265,7 +303,7 @@ fn supervisor_loop(
     }
 
     // 2. 初期バルク
-    run_full_scan(
+    run_initial_scan(
         favorite_id,
         &favorite_root,
         &db,
@@ -274,6 +312,7 @@ fn supervisor_loop(
         &cancel,
         &stats,
         &progress,
+        skip_offline_change_scan,
     );
 
     // 3. watcher イベント + cmd を select で受信するループ
@@ -343,6 +382,62 @@ fn supervisor_loop(
     crate::logger::log(format!("name_index[{favorite_id}]: supervisor exiting"));
 }
 
+/// watcher 開始後の初回だけを省略する。手動・overflow は run_full_scan へ直行する。
+#[allow(clippy::too_many_arguments)]
+fn run_initial_scan(
+    favorite_id: Uuid,
+    favorite_root: &Path,
+    db: &SearchIndexDb,
+    excluded_roots: &[PathBuf],
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    cancel: &AtomicBool,
+    stats: &Mutex<NameIndexStats>,
+    progress: &ProgressReporter,
+    skip_offline_change_scan: bool,
+) {
+    let fingerprint = name_scan_fingerprint(favorite_root, excluded_roots);
+    let reuse = skip_offline_change_scan
+        && match db.can_reuse_initial_scan(favorite_root, &fingerprint) {
+            Ok(reuse) => reuse,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "name_index[{favorite_id}]: scan marker read failed: {error}"
+                ));
+                false
+            }
+        };
+    if reuse {
+        stats.lock().unwrap().initial_scan_done = true;
+        crate::logger::log(format!("name_index[{favorite_id}]: initial scan skipped"));
+        crate::perf::event(
+            "index",
+            "initial_scan_done",
+            None,
+            0,
+            &[
+                ("index_kind", serde_json::Value::from("name")),
+                (
+                    "favorite_id",
+                    serde_json::Value::from(favorite_id.to_string()),
+                ),
+                ("duration_ms", serde_json::Value::from(0)),
+                ("skipped", serde_json::Value::from(true)),
+            ],
+        );
+        return;
+    }
+    run_full_scan(
+        favorite_id,
+        favorite_root,
+        db,
+        excluded_roots,
+        activity_gate,
+        cancel,
+        stats,
+        progress,
+    );
+}
+
 /// 初期 bulk / 手動再構築 / overflow で呼ばれる「フル scan」経路。
 #[allow(clippy::too_many_arguments)]
 fn run_full_scan(
@@ -386,16 +481,18 @@ fn run_full_scan(
         summary.cancelled,
     ));
 
+    let outcome = record_full_scan_outcome(
+        favorite_id,
+        favorite_root,
+        db,
+        excluded_roots,
+        summary,
+        cancel,
+    );
     {
         let mut s = stats.lock().unwrap();
         s.in_full_scan = false;
-        s.last_full_scan = Some(if summary.cancelled {
-            NameFullScanOutcome::Cancelled
-        } else if summary.had_error {
-            NameFullScanOutcome::Failed
-        } else {
-            NameFullScanOutcome::Complete
-        });
+        s.last_full_scan = Some(outcome);
         if is_initial {
             s.initial_scan_done = true;
             s.initial_entries_written = summary.entries_written;
@@ -414,10 +511,40 @@ fn run_full_scan(
                     serde_json::Value::from(favorite_id.to_string()),
                 ),
                 ("duration_ms", serde_json::Value::from(dur_ms)),
+                ("skipped", serde_json::Value::from(false)),
             ],
         );
     }
     progress.clear();
+}
+
+fn record_full_scan_outcome(
+    favorite_id: Uuid,
+    favorite_root: &Path,
+    db: &SearchIndexDb,
+    excluded_roots: &[PathBuf],
+    summary: BulkSummary,
+    cancel: &AtomicBool,
+) -> NameFullScanOutcome {
+    let outcome = if summary.cancelled || cancel.load(Ordering::SeqCst) {
+        NameFullScanOutcome::Cancelled
+    } else if summary.had_error {
+        NameFullScanOutcome::Failed
+    } else {
+        NameFullScanOutcome::Complete
+    };
+    if outcome == NameFullScanOutcome::Complete {
+        if let Err(error) = db.record_complete_scan(
+            favorite_root,
+            &name_scan_fingerprint(favorite_root, excluded_roots),
+        ) {
+            // 印が失われても次回走査するだけ。稀な書込失敗は retry しない。
+            crate::logger::log(format!(
+                "name_index[{favorite_id}]: scan marker write failed: {error}"
+            ));
+        }
+    }
+    outcome
 }
 
 /// `run_subtree_scan` の結果。`apply_single_change` の `Ok(true) + is_dir()` 分岐で
@@ -441,7 +568,7 @@ enum SubtreeScanOutcome {
 /// 2. **`changed_path.try_exists()` を唯一の削除判定にする** (`kind` はヒントのみ。
 ///    `ChangeKind::Remove` の直後に再作成されるレースがあり得るため):
 ///    - `Ok(false)`: 確実に存在しない → ancestor chain を辿り「最も浅い missing 祖先」を
-///      `delete_subtree`。favorite_root 自身まで届いた場合は `clear_for_favorite`。
+///      `delete_subtree`。favorite_root 自身まで届いた場合も印を保ったまま全行を消す。
 ///    - `Ok(true)`: 存在する → sibling 整合 (parent refresh) + (dir なら) subtree
 ///      recursive upsert + post-scan prune (`prune_stale_under_subtree`)。
 ///      ただし `changed_path == favorite_root` のときは parent refresh を **skip**
@@ -514,17 +641,17 @@ fn apply_single_change(
 /// `changed_path` から `favorite_root` 手前まで親を辿り、`try_exists() == Ok(false)` で
 /// 連鎖する祖先のうち **最も浅い missing 祖先** を `delete_subtree` の対象にする。
 /// 連鎖が favorite_root 自身まで届いた場合 (= favorite root も消えた) は
-/// `clear_for_favorite` で全消し。
+/// `delete_subtree` で全消し。watcher イベントでは scanned_once を消さない。
 ///
 /// `changed_path == favorite_root` の特殊ケース: ancestor chain では拾えないので
-/// `clear_for_favorite` で全消し (supervisor 自身の停止は `IndexerManager::sync_with_favorites`
+/// `delete_subtree` で全消し (supervisor 自身の停止は `IndexerManager::sync_with_favorites`
 /// 経由で別途処理されるので、ここでは index データの掃除だけ責任を持つ)。
 fn handle_missing_path(favorite_root: &Path, db: &SearchIndexDb, changed_path: &Path) {
     // 特殊ケース: changed_path == favorite_root
     if path_equals(changed_path, favorite_root) {
-        if let Err(e) = db.clear_for_favorite(favorite_root) {
+        if let Err(e) = db.delete_subtree(favorite_root, favorite_root) {
             crate::logger::log(format!(
-                "name_index: clear_for_favorite failed for {}: {e}",
+                "name_index: delete_subtree failed for {}: {e}",
                 favorite_root.display()
             ));
         }
@@ -543,9 +670,9 @@ fn handle_missing_path(favorite_root: &Path, db: &SearchIndexDb, changed_path: &
             match favorite_root.try_exists() {
                 Ok(false) => {
                     // favorite root も消えた → 全消し
-                    if let Err(e) = db.clear_for_favorite(favorite_root) {
+                    if let Err(e) = db.delete_subtree(favorite_root, favorite_root) {
                         crate::logger::log(format!(
-                            "name_index: clear_for_favorite failed for {}: {e}",
+                            "name_index: delete_subtree failed for {}: {e}",
                             favorite_root.display()
                         ));
                     }
@@ -865,6 +992,227 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn initial_scan_for_test(
+        root: &Path,
+        db: &SearchIndexDb,
+        excluded: &[PathBuf],
+        skip: bool,
+    ) -> NameIndexStats {
+        let stats = Mutex::new(NameIndexStats::default());
+        run_initial_scan(
+            Uuid::from_u128(1),
+            root,
+            db,
+            excluded,
+            None,
+            &AtomicBool::new(false),
+            &stats,
+            &ProgressReporter::new(),
+            skip,
+        );
+        stats.into_inner().unwrap()
+    }
+
+    #[test]
+    fn initial_skip_requires_setting_marker_and_matching_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("visible")).unwrap();
+        for (skip, marker, excluded, skipped) in [
+            (true, Some(name_scan_fingerprint(&root, &[])), vec![], true),
+            (
+                false,
+                Some(name_scan_fingerprint(&root, &[])),
+                vec![],
+                false,
+            ),
+            (true, None, vec![], false),
+            (true, Some("old fingerprint".into()), vec![], false),
+            (
+                true,
+                Some(name_scan_fingerprint(&root, &[])),
+                vec![root.join("excluded")],
+                false,
+            ),
+        ] {
+            let db = SearchIndexDb::open_in_memory().unwrap();
+            if let Some(marker) = marker {
+                db.record_complete_scan(&root, &marker).unwrap();
+            }
+            let stats = initial_scan_for_test(&root, &db, &excluded, skip);
+            assert!(stats.initial_scan_done);
+            assert_eq!(stats.last_full_scan.is_none(), skipped);
+            assert_eq!(db.count_for_favorite(&root).unwrap(), u64::from(!skipped));
+            assert_eq!(stats.initial_entries_written, usize::from(!skipped));
+        }
+    }
+
+    #[test]
+    fn name_fingerprint_uses_only_root_exclusions_and_version() {
+        let root = Path::new(r"C:\Books");
+        let exclusions = vec![PathBuf::from(r"C:\Books\B"), PathBuf::from("C:/Books/a")];
+        assert_eq!(
+            name_scan_fingerprint(root, &exclusions),
+            name_scan_fingerprint(
+                Path::new("c:/BOOKS"),
+                &[
+                    PathBuf::from("c:/books/A"),
+                    PathBuf::from("c:/books/b"),
+                    PathBuf::from("c:/books/b")
+                ]
+            )
+        );
+        assert_ne!(
+            name_scan_fingerprint(root, &[]),
+            name_scan_fingerprint(root, &exclusions)
+        );
+        assert_ne!(
+            name_scan_fingerprint(root, &[]),
+            name_scan_fingerprint(Path::new("C:/Other"), &[])
+        );
+        assert!(name_scan_fingerprint(root, &[]).starts_with(&format!("[{NAME_INDEX_VERSION},")));
+    }
+
+    #[test]
+    fn only_typed_complete_sets_name_marker_even_when_initial_display_is_done() {
+        let root = Path::new("C:/fav");
+        for (summary, cancelled, expected) in [
+            (BulkSummary::default(), false, NameFullScanOutcome::Complete),
+            (
+                BulkSummary {
+                    cancelled: true,
+                    ..Default::default()
+                },
+                false,
+                NameFullScanOutcome::Cancelled,
+            ),
+            (BulkSummary::default(), true, NameFullScanOutcome::Cancelled),
+            (
+                BulkSummary {
+                    had_error: true,
+                    ..Default::default()
+                },
+                false,
+                NameFullScanOutcome::Failed,
+            ),
+        ] {
+            let db = SearchIndexDb::open_in_memory().unwrap();
+            let outcome = record_full_scan_outcome(
+                Uuid::from_u128(1),
+                root,
+                &db,
+                &[],
+                summary,
+                &AtomicBool::new(cancelled),
+            );
+            assert_eq!(outcome, expected);
+            assert_eq!(
+                db.scanned_once_fingerprint(root).unwrap().is_some(),
+                expected == NameFullScanOutcome::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn actual_full_write_failure_does_not_set_marker() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_insert BEFORE INSERT ON entries BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let stats = initial_scan_for_test(&root, &db, &[], false);
+        assert!(stats.initial_scan_done);
+        assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Failed));
+        assert_eq!(db.scanned_once_fingerprint(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn cleared_or_rebuild_pending_marker_forces_initial_scan_same_startup() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        fs::create_dir_all(root.join("child")).unwrap();
+        for rebuild in [false, true] {
+            let db = SearchIndexDb::open_in_memory().unwrap();
+            db.record_complete_scan(&root, &name_scan_fingerprint(&root, &[]))
+                .unwrap();
+            if rebuild {
+                db.request_rebuild_on_next_start().unwrap();
+            } else {
+                db.clear_for_favorite(&root).unwrap();
+            }
+            let stats = initial_scan_for_test(&root, &db, &[], true);
+            assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Complete));
+            assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+            assert_eq!(
+                db.scanned_once_fingerprint(&root).unwrap().is_some(),
+                !rebuild
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_initial_keeps_watcher_delta_and_full_scan_paths_working() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        fs::create_dir_all(&root).unwrap();
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let fingerprint = name_scan_fingerprint(&root, &[]);
+        db.record_complete_scan(&root, &fingerprint).unwrap();
+        let stats = Mutex::new(initial_scan_for_test(&root, &db, &[], true));
+        let progress = ProgressReporter::new();
+        let cancel = AtomicBool::new(false);
+        let changed = root.join("watched");
+        fs::create_dir_all(&changed).unwrap();
+        apply_single_change(
+            &root,
+            &db,
+            &changed,
+            ChangeKind::Upsert,
+            &[],
+            &progress,
+            &stats,
+            &cancel,
+            None,
+        );
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+        fs::create_dir_all(root.join("unreported")).unwrap();
+        run_full_scan(
+            Uuid::from_u128(1),
+            &root,
+            &db,
+            &[],
+            None,
+            &cancel,
+            &stats,
+            &progress,
+        );
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 2);
+        assert_eq!(
+            stats.lock().unwrap().last_full_scan,
+            Some(NameFullScanOutcome::Complete)
+        );
+        fs::remove_dir_all(&root).unwrap();
+        apply_single_change(
+            &root,
+            &db,
+            &root,
+            ChangeKind::Remove,
+            &[],
+            &progress,
+            &stats,
+            &cancel,
+            None,
+        );
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 0);
+        assert_eq!(
+            db.scanned_once_fingerprint(&root).unwrap().as_deref(),
+            Some(fingerprint.as_str())
+        );
+    }
 
     /// 初期スキャン完了 + stats 反映を確認する最小 smoke test。
     /// watcher の E2E は OS 依存なので固定秒で polling する。

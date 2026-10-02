@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 
 pub const SEARCH_RESULT_LIMIT: usize = 5000;
@@ -115,6 +117,52 @@ pub struct SearchIndexDb {
 }
 
 impl SearchIndexDb {
+    /// 印と rebuild pending は同じ lock で読む。再構築要求済みの起動では省略しない。
+    pub(crate) fn can_reuse_initial_scan(
+        &self,
+        root: &Path,
+        fingerprint: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scanned_once WHERE root = ?1 AND fingerprint = ?2) \
+             AND NOT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE pending <> 0)",
+            params![normalize_path(root), fingerprint],
+            |row| row.get(0),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scanned_once_fingerprint(&self, root: &Path) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM scanned_once WHERE root = ?1",
+                [normalize_path(root)],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// 呼び出し側は typed Complete のときだけ使う。rebuild 待ちは再び印を立てない。
+    pub(crate) fn record_complete_scan(
+        &self,
+        root: &Path,
+        fingerprint: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO scanned_once (root, fingerprint) SELECT ?1, ?2 \
+             WHERE NOT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE pending <> 0) \
+             ON CONFLICT(root) DO UPDATE SET fingerprint = excluded.fingerprint",
+                params![normalize_path(root), fingerprint],
+            )
+            .map(|_| ())
+    }
+
     /// `%APPDATA%/mimageviewer/search_index.db` を開く (なければ作成)。
     pub fn open() -> rusqlite::Result<Self> {
         let db_path = Self::db_path();
@@ -355,7 +403,7 @@ impl SearchIndexDb {
         self.clear_for_favorite_with_hook(favorite_root, invalidate_name_completion_marker)
     }
 
-    /// S3 の marker 無効化はこの transaction に接続する。hook 失敗時は rows も戻す。
+    /// marker 無効化もこの transaction 内。hook 失敗時は rows も戻す。
     pub fn clear_for_favorite_with_hook(
         &self,
         favorite_root: &Path,
@@ -378,13 +426,16 @@ impl SearchIndexDb {
         let conn = self.conn.lock().unwrap();
         let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        let result = conn
-            .execute(
+        let result = (|| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO name_index_rebuild_state (id, pending) VALUES (1, 1) \
              ON CONFLICT(id) DO UPDATE SET pending = 1",
                 [],
-            )
-            .map(|_| ());
+            )?;
+            tx.execute("DELETE FROM scanned_once", [])?;
+            tx.commit()
+        })();
         let restore = conn.pragma_update(None, "synchronous", synchronous);
         result.and(restore)
     }
@@ -665,12 +716,13 @@ impl SearchIndexDb {
     }
 }
 
-/// S3 が実際の marker DELETE を実装する単一の hook。S2 は marker schema を持たない。
+/// 名前行の clear と印の削除を同じ transaction に含める。
 fn invalidate_name_completion_marker(
-    _tx: &rusqlite::Transaction<'_>,
-    _root: &str,
+    tx: &rusqlite::Transaction<'_>,
+    root: &str,
 ) -> rusqlite::Result<()> {
-    Ok(())
+    tx.execute("DELETE FROM scanned_once WHERE root = ?1", [root])
+        .map(|_| ())
 }
 
 // -----------------------------------------------------------------------
@@ -680,7 +732,8 @@ fn invalidate_name_completion_marker(
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS name_index_rebuild_state (\
-         id INTEGER PRIMARY KEY CHECK(id = 1), pending INTEGER NOT NULL);",
+         id INTEGER PRIMARY KEY CHECK(id = 1), pending INTEGER NOT NULL); \
+         CREATE TABLE IF NOT EXISTS scanned_once (root TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);",
     )?;
     // 新規 DB 用: 複合 PRIMARY KEY `(favorite_root, path)` で作る。
     // 同じ実体 path が複数 favorite に所属する (nested favorites) ケースを表現できる。
@@ -746,6 +799,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         pk_cols.len() == 1 && pk_cols[0].1 == "path"
     };
     if old_pk_is_path_only {
+        conn.execute("DELETE FROM scanned_once", [])?;
         crate::logger::log("search_index_db: migrating PRIMARY KEY (path) → (favorite_root, path)");
         conn.execute_batch(
             "CREATE TABLE entries_new (
@@ -800,7 +854,7 @@ fn rebuild_names_if_requested(conn: &Connection) -> rusqlite::Result<()> {
     }
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM entries", [])?;
-    // S3 の全 marker 削除 hook はこの transaction に接続する。
+    tx.execute("DELETE FROM scanned_once", [])?;
     tx.execute("DELETE FROM name_index_rebuild_state", [])?;
     tx.commit()?;
     crate::logger::log("search_index_db: rebuilding name index after failed clear".to_owned());
@@ -913,6 +967,106 @@ mod tests {
             kind,
             mtime: 0,
         }
+    }
+
+    #[test]
+    fn released_db_gets_empty_marker_table_without_changing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE scanned_once; DROP TABLE name_index_rebuild_state;")
+            .unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.count_for_favorite(root).unwrap(), 1);
+        assert_eq!(reopened.scanned_once_fingerprint(root).unwrap(), None);
+        assert!(!reopened.can_reuse_initial_scan(root, "v1").unwrap());
+    }
+
+    #[test]
+    fn scanned_once_persists_per_root_and_clear_removes_same_root_atomically() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        let nested = Path::new("C:/fav/inner");
+        db.record_complete_scan(root, "outer").unwrap();
+        db.record_complete_scan(nested, "inner").unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_marker_clear BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        assert!(db.clear_for_favorite(root).is_err());
+        assert_eq!(db.count_for_favorite(root).unwrap(), 1);
+        assert_eq!(
+            db.scanned_once_fingerprint(root).unwrap().as_deref(),
+            Some("outer")
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_marker_clear;")
+            .unwrap();
+        db.clear_for_favorite(root).unwrap();
+        assert_eq!(db.scanned_once_fingerprint(root).unwrap(), None);
+        assert_eq!(
+            db.scanned_once_fingerprint(nested).unwrap().as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn rebuild_pending_invalidates_scan_marker_in_same_startup_and_after_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.record_complete_scan(root, "v1").unwrap();
+        assert!(db.can_reuse_initial_scan(root, "v1").unwrap());
+        db.request_rebuild_on_next_start().unwrap();
+        assert!(!db.can_reuse_initial_scan(root, "v1").unwrap());
+        db.record_complete_scan(root, "v1").unwrap();
+        assert_eq!(db.scanned_once_fingerprint(root).unwrap(), None);
+        // 再構築までに旧版相当の書き手が印を残しても writable open で消える。
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO scanned_once VALUES ('c:/fav', 'v1')", [])
+            .unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.scanned_once_fingerprint(root).unwrap(), None);
+        assert!(!reopened.can_reuse_initial_scan(root, "v1").unwrap());
+    }
+
+    #[test]
+    fn scan_marker_survives_reopen_and_event_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.record_complete_scan(root, "v1").unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.delete_subtree(root, root).unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert!(reopened.can_reuse_initial_scan(root, "v1").unwrap());
     }
 
     #[test]

@@ -10,9 +10,8 @@
 //! を扱う。旧 2 つのダイアログを別にしていた頃は「フラグは A で切り替え、状態は B で
 //! 見る」という導線で分かりにくかったため 1 本化した。
 //!
-//! 索引メンテナンスは notify-rs + 起動時スキャンで自動同期される前提。
-//! 手動再構築・一括作成系の UI は v0.8.0 で外し、索引が壊れたときはプロセス再起動で
-//! 初期スキャンから作り直す運用にしている。
+//! 索引メンテナンスは変更監視と起動時の確認で自動同期する。
+//! 終了中の変更の確認を省く設定でも「今すぐ確認」で全索引へ手動確認を要求できる。
 
 use std::time::Duration;
 
@@ -609,8 +608,7 @@ impl App {
                 ui.group(|ui| {
                     ui.label(
                         egui::RichText::new(
-                            "💡 アプリケーションを終了すると、次回起動時に\
-                             インデックスの再スキャンが行われます。\
+                            "アプリケーションを終了するとファイルの変更監視も停止します。\
                              終了する代わりにタスクトレイに常駐すると、\
                              起動がスムーズになります。",
                         )
@@ -654,6 +652,15 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
+                if crate::ui_helpers::draw_offline_change_scan_setting(
+                    ui, &mut self.settings.skip_offline_change_scan,
+                ).changed() {
+                    any_setting_dirty = true;
+                }
+                if crate::ui_helpers::draw_index_full_check_button(ui).clicked() {
+                    self.request_index_full_check();
+                }
+                ui.add_space(4.0);
 
                 if self.settings.favorites.is_empty() {
                     ui.label("お気に入りはまだ登録されていません。");
@@ -663,12 +670,12 @@ impl App {
                         "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
                          アイテム検索 (Ctrl+G) と別バージョン検索ができます。\
                          チェックを入れた項目はこの場で 1 回全走査し、以降は\
-                         ファイルの変更監視と起動時スキャンで自動更新します。"
+                         ファイルの変更監視で自動更新します。起動時の確認は上の設定で選べます。"
                     } else {
                         "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
                          アイテム検索 (Ctrl+G) ができます。\
                          チェックを入れた項目はこの場で 1 回全走査し、以降は\
-                         ファイルの変更監視と起動時スキャンで自動更新します。"
+                         ファイルの変更監視で自動更新します。起動時の確認は上の設定で選べます。"
                     };
                     ui.label(
                         egui::RichText::new(indexing_description)

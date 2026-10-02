@@ -220,7 +220,8 @@ Incomplete とし、その走査では削除候補を生成しない。観測で
 診断には `entry_errors` と `classification_errors` も残し、supervisor のログに完全性を出す。
 取消は結果を成功として返さず、既存の取消経路で終了する。
 この型は観測の完全性だけを表し、書き込みの成功や Full 全体の成功を保証しない。
-起動省略の印は未実装 (詳細・残作業は [起動スキャン計画](startup-index-scan-plan.md) §11)。
+Full 全体の `FullScanOutcome::Complete` でだけ起動省略の印を立てる
+(詳細・検証は [起動スキャン計画](startup-index-scan-plan.md) §11)。
 
 metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
 同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を
@@ -243,6 +244,16 @@ perf には照会時間・取得行数と、Vec/String の capacity から算出
 
 #### 終了応答性と有界 shutdown
 
+`skip_offline_change_scan` (既定 false) は起動時の初回 Full だけを省く設定。
+`fts_meta.db.scanned_once` の root ごとの印と指紋 (正規化 root・所有 UUID・入れ子を含む
+除外 root・INDEX_VERSION・Susie を含む走査拡張子) が一致し、起動 cleanup の must-scan 集合と
+rebuild pending の対象でない場合だけ省く。watcher は従来どおり動き、差分・overflow・回復・
+手動確認は省かない。完全な観測・書き込み・prune の typed 成功でだけ印を立てる。
+イベントや途中終了・クラッシュでは消さず、ストア再作成と Failed cleanup で消す。
+「お気に入り > 編集」の [今すぐ確認] は metadata-only Full、名前索引 Full、全 root の similar
+Manual 1回を非同期に要求する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
+理由を通知して名前索引だけを確認する。一時停止中は再開後に実行する。
+
 大量削除では watcher overflow の full rescan、または debounce 済みイベント列が
 delete ingest を集中させる。walker / ingest のループcheckだけでは、共有I/O permit取得と
 writer dispatcherのreply待ちが無期限だったため、cancelを観測できずApp dropのjoinを塞いだ。
@@ -256,6 +267,7 @@ v2.3.0第12弾では次を不変条件とする。
   final commitとdispatcherの最終Dropはbackground finalizerがbest-effortで担当する。
 - submit済みbatchがcancel後にTantivyだけへ反映されても、SQLiteを先行更新しない
   Tantivy Firstを維持する。次回起動時のFS / Tantivy / fts_meta 3-way diffが再投入・再削除する。
+  `skip_offline_change_scan` ON で省略した起動ではこの補修を行わず、[今すぐ確認] で確認する。
 
 ### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
 
@@ -296,6 +308,10 @@ v2.3.0第12弾では次を不変条件とする。
 削除済みファイルが結果に出るのと同じ "短い窓" として許容する (実害はサムネイル
 読み込み失敗で気付ける)。
 
+上記の「次回起動で補修」は初回 Full を実行する場合の説明である。
+`skip_offline_change_scan` ON で印を再利用した場合、クラッシュや書き込み途中終了で残った
+両ストアの不一致も自動では確認しない。これは設定の許容範囲で、[今すぐ確認] で照合する。
+
 ### 4.3 起動時 reconciliation
 
 `IndexerManager::new` が supervisor spawn 前に同期実行する:
@@ -309,6 +325,10 @@ v2.3.0第12弾では次を不変条件とする。
 
 所有範囲外の掃除も含め、manager worker 内で reconciliation の完了後に supervisor を
 起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
+
+この整理は `skip_offline_change_scan` ON でも省かない。Failed 行を掃除した root の印を消し、
+所有者の付け替えが必要な root は must-scan 集合で初回 Full を強制する。Tantivy の新規作成・
+schema 再構築・rebuild pending でも全印を消し、同じ起動で古い印を再利用しない。
 
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
@@ -339,8 +359,9 @@ watcher の部分走査は既存の `upsert_children` と stamp による subtre
 
 `NameIndexManager` が起動・編集の共通経路を所有し、root ごとに停止・join・clear・起動を
 直列化する。同じ root を使う structure 有効のお気に入りが残る間は clear しない。
-UUID ごとの進捗は現在の root の monitor へ解決する。clear は transaction 内に S3 の
-印削除用 hook を置くが、起動走査を省く印自体はまだ実装しない。
+UUID ごとの進捗は現在の root の monitor へ解決する。clear は名前行と `scanned_once` の印を
+同じ transaction で消す。印は root・共通除外・名前索引の版を含む指紋で照合し、設定 ON の
+一致時だけ watcher 起動後の初回 Full を省く。完全な Full だけが印を更新する。
 Ctrl+S の現行絞り込みは OFF の root も含み、集合が空なら全 root を検索するため、
 clear 失敗を放置すると古い結果が出る。失敗時は名前 DB の次回起動 rebuild 印を立て、
 次の writable open で名前行と印を同じ transaction で削除する。
@@ -396,7 +417,8 @@ clear 失敗を放置すると古い結果が出る。失敗時は名前 DB の�
      フォルダを fav の行として誤投入する事故になる)
    - **`Err(e)`** → アクセス拒否 / 一時ロック / NAS 切断などの曖昧状態。
      `crate::logger::log` に warn を残し、**破壊的 cleanup も再帰 upsert も
-     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す
+     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す。
+     `skip_offline_change_scan` ON で初回 Full を省略した起動は拾い直さず、[今すぐ確認] で確認する
 
 3. **subtree scan の不完全観測時は post-scan prune を skip**:
    `run_subtree_scan` は cancel / read_dir error / upsert error を `SubtreeScanOutcome::Cancelled`
@@ -913,7 +935,7 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
 4. **Tantivy First の書き込み順序を崩さない**: ingest の順序 (IndexDoc 構築 →
    Tantivy batch commit → SQLite upsert_meta_ok / delete_paths) は順番入替・
    削減しない。failure はキャッシュせず次回起動時の walker 3-way diff で補修
-   する前提。
+   する前提。`skip_offline_change_scan` ON で初回 Full を省略した起動では補修しない。
 5. **新しい SourceKind / IndexKind を追加するなら**: `fts_index::Fields` /
    `IndexDoc` / `fts_meta::files` テーブル / `PerSourceText` / UI の
    `TargetChoice` / `KIND_CHOICES` / `search_page` のすべてに反映する。

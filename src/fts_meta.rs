@@ -264,6 +264,7 @@ impl FtsMetaDb {
         // wipe が必要。既知の旧 version は行の MIN に依存せず semantic rebuild とする。
         let version_requires_rebuild = user_version > 0 && user_version < INDEX_VERSION;
         init_index_state_schema(&conn)?;
+        init_scanned_once_schema(&conn)?;
         let requested_rebuild: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM index_state WHERE key = ?1 AND value != 0)",
             params![TANTIVY_REBUILD_PENDING_KEY],
@@ -298,6 +299,7 @@ impl FtsMetaDb {
         init_schema(&tx)?;
         init_index_state_schema(&tx)?;
         if rebuild_needed || force_tantivy_rebuild {
+            tx.execute("DELETE FROM scanned_once", [])?;
             tx.execute(
                 "INSERT INTO index_state(key, value) VALUES (?1, 1)
                  ON CONFLICT(key) DO UPDATE SET value = 1",
@@ -348,9 +350,61 @@ impl FtsMetaDb {
 
     /// Next startup recreates both stores through the existing rebuild-pending path.
     pub fn request_item_index_rebuild(&self) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM scanned_once", [])?;
+        tx.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
+        tx.commit()
+    }
+
+    /// root 単位の完全走査の印。root は metadata_ownership::root_key で正規化する。
+    pub(crate) fn scanned_once(&self, root: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM scanned_once WHERE root = ?1",
+                [root],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub(crate) fn mark_scanned_once(&self, root: &str, fingerprint: &str) -> rusqlite::Result<()> {
+        // rebuild pending と印の採用を同じ DB lock で判定し、再構築要求を追い越さない。
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO scanned_once(root, fingerprint) SELECT ?1, ?2
+             WHERE NOT EXISTS(SELECT 1 FROM index_state WHERE key = ?3 AND value != 0)
+             ON CONFLICT(root) DO UPDATE SET fingerprint = excluded.fingerprint",
+            params![root, fingerprint, TANTIVY_REBUILD_PENDING_KEY],
+        )?;
         Ok(())
+    }
+
+    pub(crate) fn clear_scanned_once_for_root(&self, root: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM scanned_once WHERE root = ?1", [root])?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_scanned_once(&self) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM scanned_once", [])?;
+        Ok(())
+    }
+
+    /// Tantivy が再作成された起動では、古い stamp を stable と判定させない。
+    /// 新しい全文ストアと対応する inventory・完走印を同じ transaction で空にする。
+    pub(crate) fn reset_inventory_for_recreated_tantivy(&self) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM files", [])?;
+        tx.execute("DELETE FROM scanned_once", [])?;
+        tx.commit()
     }
 
     /// Cross-store owner (`open_stores_with_rebuild_sync`) だけが、旧 directory の wipe と
@@ -912,6 +966,15 @@ fn init_index_state_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn init_scanned_once_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scanned_once (
+        root TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL
+    );",
+    )
+}
+
 /// `IN (?1,?2,…?N)` 用の placeholder 文字列を生成する。
 /// rusqlite には配列バインドが無いので各 IN 句で個別に組み立てる必要がある。
 /// お気に入り / path 一括取得など小さい N (< 数百) 専用。
@@ -969,6 +1032,64 @@ mod tests {
         let id = Uuid::new_v4();
         assert!(db.list_favorite_files(id).unwrap().is_empty());
         assert!(db.list_not_ok().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scanned_once_legacy_open_preserves_released_rows_without_a_marker() {
+        let (tmp, db) = tmp_db();
+        let id = Uuid::new_v4();
+        db.upsert_meta_ok(
+            "c:/images/a.jpg",
+            id,
+            Path::new("c:/images"),
+            IndexKind::Image,
+            1,
+            2,
+        )
+        .unwrap();
+        drop(db);
+        let conn = Connection::open(tmp.path().join("fts_meta.db")).unwrap();
+        conn.execute_batch("DROP TABLE scanned_once").unwrap();
+        drop(conn);
+        let reopened = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+        assert!(!reopened.rebuilt_on_open());
+        assert!(reopened.get("c:/images/a.jpg").unwrap().is_some());
+        assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
+        reopened
+            .mark_scanned_once("c:/images", "fingerprint")
+            .unwrap();
+        assert_eq!(
+            reopened.scanned_once("c:/images").unwrap().as_deref(),
+            Some("fingerprint")
+        );
+    }
+
+    #[test]
+    fn scanned_once_rebuild_clears_immediately_and_blocks_late_complete() {
+        let (tmp, db) = tmp_db();
+        db.mark_scanned_once("c:/images", "fingerprint").unwrap();
+        db.request_item_index_rebuild().unwrap();
+        assert_eq!(db.scanned_once("c:/images").unwrap(), None);
+        db.mark_scanned_once("c:/images", "late complete").unwrap();
+        assert_eq!(db.scanned_once("c:/images").unwrap(), None);
+        drop(db);
+        let reopened = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+        assert!(reopened.rebuilt_on_open());
+        assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
+    }
+
+    #[test]
+    fn scanned_once_forced_store_recreation_clears_same_open() {
+        let (tmp, db) = tmp_db();
+        db.mark_scanned_once("c:/images", "fingerprint").unwrap();
+        drop(db);
+        let reopened = FtsMetaDb::open_at_with_tantivy_rebuild_requirement(
+            &tmp.path().join("fts_meta.db"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
+        assert!(reopened.tantivy_rebuild_pending().unwrap());
     }
 
     /// 新規 DB 作成後に `PRAGMA user_version` が `INDEX_VERSION` と一致すること。

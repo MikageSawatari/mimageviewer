@@ -3947,6 +3947,8 @@ impl Drop for StartupOpenPathResolvePending {
 pub(crate) struct StartupInitPending {
     rx: mpsc::Receiver<crate::indexer_manager::StartupInitOutcome>,
     started_at: std::time::Instant,
+    /// 名前索引は即時に要求済み。残る metadata / similar の要求だけを集約する。
+    full_check_requested: bool,
 }
 
 impl StartupInitPending {
@@ -17262,6 +17264,9 @@ impl App {
             crate::data_dir::get(),
             notify_book_query_change,
         );
+        if let Some(index) = similar_index.as_ref() {
+            index.set_skip_offline_change_scan(settings.skip_offline_change_scan);
+        }
 
         let mut app = Self {
             address: String::new(),
@@ -25572,9 +25577,10 @@ impl App {
             let Some(db) = self.search_index_db.as_ref().cloned() else {
                 return;
             };
-            match crate::name_index_manager::NameIndexManager::new(
+            match crate::name_index_manager::NameIndexManager::new_with_startup_policy(
                 db,
                 Some(Arc::clone(&self.activity_gate)),
+                self.settings.skip_offline_change_scan,
             ) {
                 Ok(manager) => self.name_index_manager = Some(manager),
                 Err(error) => {
@@ -25598,6 +25604,34 @@ impl App {
             .as_ref()
             .map(|manager| manager.stats_by_id(&self.settings.favorites))
             .unwrap_or_default()
+    }
+
+    /// 全索引の確認を非同期に要求する。初期化中は metadata / similar だけを予約する。
+    pub(crate) fn request_index_full_check(&mut self) {
+        if self.name_index_manager.is_none() {
+            self.sync_name_index_supervisors();
+        }
+        if let Some(manager) = self.name_index_manager.as_ref() {
+            manager.request_full_rescan();
+        }
+        self.request_index_full_check_shared();
+    }
+
+    fn request_index_full_check_shared(&mut self) {
+        if let Some(manager) = self.indexer_manager.as_ref() {
+            manager.request_shared_full_check();
+        } else if let Some(pending) = self.startup_init.as_mut() {
+            pending.full_check_requested = true;
+        } else {
+            let name_status = if self.name_index_manager.is_some() {
+                "コンテナ索引の確認は受け付けました。"
+            } else {
+                "コンテナ索引も初期化できなかったため、確認を行えません。"
+            };
+            self.show_feedback_toast(format!(
+                "アイテム索引を初期化できなかったため、アイテム索引と別バージョン索引の確認は行えません。{name_status}"
+            ));
+        }
     }
 
     /// 別バージョン索引フラグの変更を、共有 watcher と同じ構成 snapshot に提出する。
@@ -25746,6 +25780,7 @@ impl App {
             .as_ref()
             .map(crate::similar_index::SimilarIndexManager::notifier);
         let speed = self.settings.indexer_speed_profile;
+        let skip_offline_change_scan = self.settings.skip_offline_change_scan;
         let activity_gate = Arc::clone(&self.activity_gate);
         let progress = Arc::clone(&self.startup_progress);
         let (tx, rx) = mpsc::channel();
@@ -25765,6 +25800,7 @@ impl App {
                         similar_notifier.clone(),
                         Some(similar_passwords.clone()),
                         Some(hook),
+                        skip_offline_change_scan,
                     );
                     if !matches!(
                         &outcome,
@@ -25800,6 +25836,7 @@ impl App {
                     .map(crate::similar_index::SimilarIndexManager::notifier),
                 Some(self.pdf_passwords.clone()),
                 Some(hook),
+                self.settings.skip_offline_change_scan,
             );
             self.indexer_manager = match outcome {
                 crate::indexer_manager::StartupInitOutcome::Ready(manager) => Some(manager),
@@ -25819,7 +25856,11 @@ impl App {
             self.sync_shared_favorite_indexers();
             return;
         }
-        self.startup_init = Some(StartupInitPending { rx, started_at });
+        self.startup_init = Some(StartupInitPending {
+            rx,
+            started_at,
+            full_check_requested: false,
+        });
     }
 
     /// 起動直後の VST3 bridge enable + チェーン自動ロードを UI とは独立に開始する。
@@ -26428,6 +26469,7 @@ impl App {
         };
         match pending.try_recv() {
             Ok(outcome) => {
+                let full_check_requested = pending.full_check_requested;
                 crate::logger::log(format!(
                     "startup: IndexerManager init completed in {:.0} ms",
                     pending.elapsed_ms()
@@ -26444,12 +26486,16 @@ impl App {
                 self.startup_done = true;
                 self.housekeeping_armed = true;
                 self.sync_shared_favorite_indexers();
+                if full_check_requested {
+                    self.request_index_full_check_shared();
+                }
                 if let Ok(mut p) = self.startup_progress.lock() {
                     *p = "起動完了".to_string();
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
+                let full_check_requested = pending.full_check_requested;
                 // bg スレッドが panic 等で落ちた: 検索機能なしで継続させる。
                 crate::logger::log("startup: init thread disconnected unexpectedly");
                 self.indexer_manager = None;
@@ -26462,6 +26508,9 @@ impl App {
                     // before that owner runs, so close the same barrier here instead of leaving
                     // the optional Similar service permanently AwaitingWatch.
                     similar_index.notifier().finish_watch_bootstrap();
+                }
+                if full_check_requested {
+                    self.request_index_full_check_shared();
                 }
             }
         }
@@ -88530,6 +88579,186 @@ mod still_seek_thumbnail_ownership;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+mod index_full_check_tests {
+    use super::*;
+
+    #[test]
+    fn index_full_check_initializing_reserves_shared_once_and_runs_name_immediately() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        app.sync_name_index_supervisors();
+        let (tx, rx) = mpsc::channel();
+        app.startup_init = Some(StartupInitPending {
+            rx,
+            started_at: std::time::Instant::now(),
+            full_check_requested: false,
+        });
+        app.startup_done = false;
+        app.request_index_full_check();
+        app.request_index_full_check();
+        assert!(app.startup_init.as_ref().unwrap().full_check_requested);
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            2
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            0
+        );
+        let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
+            &env.tmp.path().join("full-check"),
+            Arc::clone(&app.activity_gate),
+            app.similar_index.as_ref().unwrap().notifier(),
+            app.pdf_passwords.clone(),
+        );
+        assert!(
+            tx.send(crate::indexer_manager::StartupInitOutcome::Ready(manager))
+                .is_ok()
+        );
+        app.poll_startup_init();
+        assert!(app.startup_init.is_none());
+        assert!(
+            app.indexer_manager
+                .as_ref()
+                .unwrap()
+                .full_check_requested_for_test()
+        );
+        app.indexer_manager
+            .as_ref()
+            .unwrap()
+            .wait_full_check_dispatched_for_test();
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            1
+        );
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            2
+        );
+    }
+
+    #[test]
+    fn index_full_check_unavailable_keeps_name_and_explains_shared_failure() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        app.startup_done = true;
+        app.request_index_full_check();
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            1
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            0
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("初期化できなかった")
+        );
+        let (tx, rx) = mpsc::channel();
+        app.startup_init = Some(StartupInitPending {
+            rx,
+            started_at: std::time::Instant::now(),
+            full_check_requested: false,
+        });
+        app.startup_done = false;
+        app.request_index_full_check();
+        assert!(
+            tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
+                .is_ok()
+        );
+        app.poll_startup_init();
+        assert!(app.startup_init.is_none());
+        assert!(app.indexer_manager.is_none());
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            2
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            0
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("コンテナ索引")
+        );
+    }
+
+    #[test]
+    fn index_full_check_ready_fans_out_once_per_subsystem_while_paused() {
+        let mut env = setup_app_for_test();
+        let data = env.tmp.path().join("full-check");
+        let app = &mut env.app;
+        app.activity_gate.set_paused(true);
+        app.indexer_manager = Some(
+            crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
+                &data,
+                Arc::clone(&app.activity_gate),
+                app.similar_index.as_ref().unwrap().notifier(),
+                app.pdf_passwords.clone(),
+            ),
+        );
+        app.startup_done = true;
+        app.request_index_full_check();
+        assert!(
+            app.indexer_manager
+                .as_ref()
+                .unwrap()
+                .full_check_requested_for_test()
+        );
+        app.indexer_manager
+            .as_ref()
+            .unwrap()
+            .wait_full_check_dispatched_for_test();
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            1
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            1
+        );
+        app.activity_gate.set_paused(false);
+    }
+}
 
 #[cfg(test)]
 impl App {

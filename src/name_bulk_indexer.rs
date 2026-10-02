@@ -137,15 +137,28 @@ where
             summary.cancelled = true;
             break;
         }
-        if depth > MAX_WALK_DEPTH
-            || crate::books::path_is_under_any(&folder, excluded_roots)
+        if depth > MAX_WALK_DEPTH {
+            // 深さ上限の先は未観測なので、prune と scanned_once の成功扱いを避ける。
+            had_error = true;
+            continue;
+        }
+        if crate::books::path_is_under_any(&folder, excluded_roots)
             || !crate::fs_entry::mark_directory_visited(&folder, &mut cycle_keys)
         {
             continue;
         }
-        // 旧 DFS と同じく、存在しない root は完全な空走査として stale を消す。
-        if depth == 0 && !folder.is_dir() {
-            continue;
+        // 存在しない root は従来どおり完全な空走査。アクセス拒否は不在と決めない。
+        if depth == 0 {
+            match std::fs::metadata(&folder) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    had_error = true;
+                    read_dir_logger.log(&folder, &error);
+                    continue;
+                }
+            }
         }
         if let Some(p) = progress {
             let display = folder.strip_prefix(fav_path).unwrap_or(&folder).display();
@@ -347,7 +360,18 @@ fn collect_index_entries_with_cancel(
                 continue;
             }
         };
-        let Some(kind) = classify_name_index_kind(&p, &entry, &ft) else {
+        let kind = match crate::fs_entry::try_classify_dir_entry(&entry, &ft) {
+            Ok(kind) => kind,
+            Err(error) => {
+                had_entry_error = true;
+                crate::logger::log(format!(
+                    "{log_prefix}: entry classification failed for {}: {error}",
+                    p.display()
+                ));
+                continue;
+            }
+        };
+        let Some(kind) = name_index_kind_from_entry_kind(&p, kind) else {
             continue;
         };
         // 旧 DFS は ._* ディレクトリにも入るが、そのディレクトリ自身は索引行にしない。
@@ -384,6 +408,13 @@ pub fn classify_name_index_kind(
     file_type: &std::fs::FileType,
 ) -> Option<IndexKind> {
     let kind = crate::fs_entry::classify_dir_entry(entry, file_type);
+    name_index_kind_from_entry_kind(path, kind)
+}
+
+fn name_index_kind_from_entry_kind(
+    path: &Path,
+    kind: crate::fs_entry::DirEntryKind,
+) -> Option<IndexKind> {
     if kind.is_directory() {
         return Some(IndexKind::Folder);
     }
@@ -819,5 +850,31 @@ mod tests {
             .search("book", &[root], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(hits[0].path, lower_root.join("sub/book.zip"));
+    }
+    #[test]
+    fn depth_limit_is_incomplete_and_does_not_prune_unobserved_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fav");
+        let mut deep = root.clone();
+        for _ in 0..65 {
+            deep.push("x");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        db.upsert_children(
+            &root,
+            &deep,
+            &[IndexEntry {
+                path: deep.join("stale.zip"),
+                display_name: "stale.zip".into(),
+                kind: IndexKind::ZipFile,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        let summary = run_bulk_name_index(&root, &db, None, &[], &AtomicBool::new(false), None);
+        assert!(summary.had_error);
+        assert!(!summary.cancelled);
+        assert!(db.count_for_favorite(&root).unwrap() >= 66);
     }
 }

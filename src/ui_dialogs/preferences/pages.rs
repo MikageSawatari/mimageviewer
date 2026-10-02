@@ -7412,10 +7412,23 @@ pub(super) fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesStat
             "アプリを閉じる代わりに、タスクトレイに常駐する",
         )
         .on_hover_text(
-            "OFF (既定): [×] でプロセス終了。次回起動時にインデックスが再スキャンされます。\n\
-         ON: [×] でウィンドウを隠してタスクトレイに常駐。notify-rs でファイル変更を\n\
+            "OFF (既定): [×] でアプリ終了。終了中の変更を次回起動時に確認するかは下の設定で選べます。\n\
+         ON: [×] でウィンドウを隠してタスクトレイに常駐。ファイル変更を\n\
          追い続けるため、次回開いたときは最新のインデックスがそのまま使えます。\n\
          終了はタスクトレイアイコンを右クリックして「終了」を選んでください。",
+        );
+    });
+    ui.add_space(12.0);
+
+    anchored(ui, state, "tray/offline-change-scan", |ui, state| {
+        crate::ui_helpers::draw_offline_change_scan_setting(
+            ui,
+            &mut state.settings.skip_offline_change_scan,
+        );
+        ui.label(
+            egui::RichText::new("[今すぐ確認] は「お気に入り > 編集」にあります。")
+                .weak()
+                .size(11.0),
         );
     });
     ui.add_space(12.0);

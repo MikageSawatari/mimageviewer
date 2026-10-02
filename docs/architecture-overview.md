@@ -6,6 +6,9 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
 `metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。
 UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は各 manager worker が担う。
+起動確認の省略には既存の `fts_meta.db`・`search_index.db`・`similar.db` 内の追加テーブル
+`scanned_once` を使う。fts/name は root 単位、similar は有効 root 集合全体で1つの完走印を持ち、
+永続ストアの追加や保存先の変更はない。
 
 ---
 

@@ -15,6 +15,7 @@ pub(crate) struct Configuration {
     pub excluded: Vec<PathBuf>,
     pub ownership: MetadataOwnership,
     pub similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
+    pub skip_offline_change_scan: bool,
 }
 impl Configuration {
     pub fn new(favorites: &[FavoriteEntry], excluded: Vec<PathBuf>) -> Self {
@@ -23,6 +24,7 @@ impl Configuration {
             ownership: metadata_ownership(favorites, &excluded),
             excluded,
             similar_passwords: None,
+            skip_offline_change_scan: false,
         }
     }
     fn signature(&self, id: Uuid, similar: bool) -> Option<(String, bool, Option<String>)> {
@@ -51,6 +53,9 @@ pub(crate) struct View {
     pub reconciliation_ms: u64,
     pub failed_cleaned: usize,
     pub notifications: Vec<&'static str>,
+    full_check_pending: bool,
+    #[cfg(test)]
+    pub(crate) full_check_dispatched: usize,
 }
 pub(crate) struct Shared {
     pub state: Mutex<View>,
@@ -86,6 +91,21 @@ pub(crate) struct Stores {
 
 impl Runtime {
     pub fn start(stores: Stores, initial: Configuration) -> std::io::Result<Self> {
+        Self::start_inner(
+            stores,
+            initial,
+            #[cfg(test)]
+            None,
+        )
+    }
+    fn start_inner(
+        stores: Stores,
+        initial: Configuration,
+        #[cfg(test)] gate: Option<Arc<dyn Fn(&Configuration, &'static str) + Send + Sync>>,
+    ) -> std::io::Result<Self> {
+        let startup_skip_offline_change_scan = initial.skip_offline_change_scan;
+        #[cfg(test)]
+        let first_config = initial.clone();
         let shared = Arc::new(Shared {
             state: Mutex::new(View {
                 controls: HashMap::new(),
@@ -97,15 +117,22 @@ impl Runtime {
                 reconciliation_ms: 0,
                 failed_cleaned: 0,
                 notifications: Vec::new(),
+                full_check_pending: false,
+                #[cfg(test)]
+                full_check_dispatched: 0,
             }),
             changed: Condvar::new(),
             #[cfg(test)]
-            gate: Mutex::new(None),
+            gate: Mutex::new(gate),
         });
         let shared_worker = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("metadata-reconfigure".into())
-            .spawn(move || run(stores, shared_worker))?;
+            .spawn(move || {
+                #[cfg(test)]
+                shared_worker.checkpoint(&first_config, "before_snapshot");
+                run(stores, shared_worker, startup_skip_offline_change_scan)
+            })?;
         Ok(Self {
             shared,
             worker: Some(worker),
@@ -116,6 +143,29 @@ impl Runtime {
         if view.shutdown.is_none() {
             view.pending = Some(config);
             self.shared.changed.notify_one();
+        }
+    }
+    /// The worker consumes this after supervisor adoption, including requests during init.
+    pub fn request_full_check(&self) {
+        let mut view = self.shared.state.lock().unwrap();
+        if view.shutdown.is_none() {
+            view.full_check_pending = true;
+            self.shared.changed.notify_one();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn full_check_requested_for_test(&self) -> bool {
+        let view = self.shared.state.lock().unwrap();
+        view.full_check_pending || view.full_check_dispatched != 0
+    }
+    #[cfg(test)]
+    pub(crate) fn wait_full_check_dispatched_for_test(&self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut view = self.shared.state.lock().unwrap();
+        while view.full_check_dispatched == 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "full check was not dispatched");
+            view = self.shared.changed.wait_timeout(view, remaining).unwrap().0;
         }
     }
     fn signal_shutdown(&self) -> Instant {
@@ -231,24 +281,44 @@ pub(crate) fn startup_cleanup(
     Ok(roots)
 }
 
-fn run(stores: Stores, shared: Arc<Shared>) {
+fn dispatch_full_check(stores: &Stores, view: &mut View) {
+    for control in view.controls.values() {
+        control.request_metadata_full_rescan();
+    }
+    if let Some(similar) = stores.similar.as_ref() {
+        similar.request_full_all();
+    }
+    #[cfg(test)]
+    {
+        view.full_check_dispatched += 1;
+    }
+    view.full_check_pending = false;
+}
+
+fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bool) {
     let mut handles: HashMap<Uuid, SupervisorHandle> = HashMap::new();
     let mut old = Configuration::new(&[], Vec::new());
     let mut startup = true;
     loop {
         let next = {
             let mut view = shared.state.lock().unwrap();
-            while view.pending.is_none() && view.shutdown.is_none() {
+            while view.pending.is_none() && !view.full_check_pending && view.shutdown.is_none() {
                 view = shared.changed.wait(view).unwrap();
             }
             if view.shutdown.is_some() {
                 break;
+            }
+            if view.pending.is_none() {
+                dispatch_full_check(&stores, &mut view);
+                shared.changed.notify_all();
+                continue;
             }
             view.busy = true;
             let config = view.pending.take().unwrap();
             view.favorites = config.favorites.clone();
             config
         };
+        let initial_configuration = startup;
         shared.checkpoint(&next, "snapshot");
         if startup {
             let t = Instant::now();
@@ -401,6 +471,22 @@ fn run(stores: Stores, shared: Arc<Shared>) {
             if !owned.effective_metadata && !similar_enabled {
                 continue;
             }
+            let must_scan = shared
+                .state
+                .lock()
+                .unwrap()
+                .must_scan_roots
+                .contains(&owned.root);
+            let skip_initial_scan = initial_configuration
+                && owned.effective_metadata
+                && indexer_supervisor::can_skip_initial_scan(
+                    &stores.meta,
+                    startup_skip_offline_change_scan,
+                    must_scan,
+                    &favorite.path,
+                    favorite.id,
+                    &owned.excluded_roots,
+                );
             // Shutdown and spawn adoption are serialized by this short state lock.
             let mut view = shared.state.lock().unwrap();
             if view.shutdown.is_some() {
@@ -412,6 +498,7 @@ fn run(stores: Stores, shared: Arc<Shared>) {
                     favorite_root: favorite.path.clone(),
                     excluded_roots: owned.excluded_roots.clone(),
                     enable_metadata_index: owned.effective_metadata,
+                    skip_initial_scan,
                     similar_notifier: if similar_enabled {
                         stores.similar.clone()
                     } else {
@@ -429,6 +516,9 @@ fn run(stores: Stores, shared: Arc<Shared>) {
         }
         old = next;
         let mut view = shared.state.lock().unwrap();
+        if view.full_check_pending && view.pending.is_none() {
+            dispatch_full_check(&stores, &mut view);
+        }
         view.busy = false;
         shared.changed.notify_all();
     }
@@ -512,6 +602,145 @@ mod tests {
         crate::fts_index::find_doc_by_path(&stores.fts.searcher(), stores.fts.fields(), path)
             .unwrap()
             .is_some()
+    }
+    #[test]
+    fn startup_skip_policy_survives_latest_configuration_coalescing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        let f = favorite(1, tmp.path().join("images"), true);
+        std::fs::create_dir(&f.path).unwrap();
+        let fingerprint = indexer_supervisor::fts_scan_fingerprint(
+            &f.path,
+            f.id,
+            &[],
+            &indexer_supervisor::fts_scan_extensions(),
+        );
+        stores
+            .meta
+            .mark_scanned_once(&crate::metadata_ownership::root_key(&f.path), &fingerprint)
+            .unwrap();
+        let mut initial = Configuration::new(&[f.clone()], Vec::new());
+        initial.skip_offline_change_scan = true;
+        let (entered, ready) = mpsc::channel();
+        let (release, wait) = crossbeam_channel::bounded(0);
+        let checkpoint = Arc::new(move |_: &Configuration, phase| {
+            if phase == "before_snapshot" {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+            }
+        });
+        let mut runtime = Runtime::start_inner(stores, initial, Some(checkpoint)).unwrap();
+        ready.recv_timeout(Duration::from_secs(60)).unwrap();
+        // App adopts the manager and submits current favorites before the worker takes initial.
+        runtime.submit(Configuration::new(&[f.clone()], Vec::new()));
+        release.send(()).unwrap();
+        settled(&runtime);
+        initial_done(&runtime);
+        assert!(
+            runtime.shared.state.lock().unwrap().controls[&f.id]
+                .snapshot_stats()
+                .initial_scan_skipped
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn shared_full_check_waits_for_first_similar_configuration_adoption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let similar = crate::similar_index::SimilarIndexManager::new(tmp.path().join("similar"));
+        let mut stores = stores(tmp.path());
+        stores.similar = Some(similar.notifier());
+        stores.gate.set_paused(true);
+        let mut f = favorite(1, tmp.path().join("images"), true);
+        f.auto_index_similar = true;
+        std::fs::create_dir(&f.path).unwrap();
+        image::RgbImage::new(2, 2)
+            .save(f.path.join("a.png"))
+            .unwrap();
+        let mut config = Configuration::new(&[f.clone()], Vec::new());
+        config.similar_passwords = Some(crate::pdf_passwords::PdfPasswordStore::empty_for_test());
+        let (entered, ready) = mpsc::channel();
+        let (release, wait) = crossbeam_channel::bounded(0);
+        let checkpoint = Arc::new(move |_: &Configuration, phase| {
+            if phase == "joined" {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+            }
+        });
+        let mut runtime = Runtime::start_inner(stores.clone(), config, Some(checkpoint)).unwrap();
+        ready.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(similar.notifier().password_snapshot().is_none());
+        runtime.request_full_check();
+        runtime.request_full_check();
+        assert_eq!(similar.full_check_request_count_for_test(), 0);
+        release.send(()).unwrap();
+        runtime.wait_full_check_dispatched_for_test();
+        assert!(similar.notifier().password_snapshot().is_some());
+        assert_eq!(similar.full_check_request_count_for_test(), 1);
+        *runtime.shared.gate.lock().unwrap() = None;
+        stores.gate.set_paused(false);
+        settled(&runtime);
+        initial_done(&runtime);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !matches!(
+            similar.progress(),
+            crate::similar_index::IndexProgress::Complete(_)
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "manual similar full did not complete"
+            );
+            std::thread::yield_now();
+        }
+        assert!(similar.reconcile_job_counts_for_test().0 >= 1);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn full_check_before_adoption_coalesces_and_is_accepted_while_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        stores.gate.set_paused(true);
+        let mut runtime =
+            Runtime::start(stores.clone(), Configuration::new(&[], Vec::new())).unwrap();
+        settled(&runtime);
+        let (entered, ready) = mpsc::channel();
+        let (release, wait) = crossbeam_channel::bounded(0);
+        *runtime.shared.gate.lock().unwrap() = Some(Arc::new(move |_, phase| {
+            if phase == "joined" {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+            }
+        }));
+        let f = favorite(1, tmp.path().join("images"), true);
+        std::fs::create_dir(&f.path).unwrap();
+        std::fs::write(f.path.join("a.jpg"), b"image").unwrap();
+        runtime.submit(Configuration::new(&[f.clone()], Vec::new()));
+        ready.recv_timeout(Duration::from_secs(60)).unwrap();
+        runtime.request_full_check();
+        runtime.request_full_check();
+        assert!(runtime.shared.state.lock().unwrap().controls.is_empty());
+        release.send(()).unwrap();
+        settled(&runtime);
+        {
+            let view = runtime.shared.state.lock().unwrap();
+            assert_eq!(view.full_check_dispatched, 1);
+            assert!(view.controls.contains_key(&f.id));
+        }
+        assert!(stores.meta.list_path_owners().unwrap().is_empty());
+        *runtime.shared.gate.lock().unwrap() = None;
+        stores.gate.set_paused(false);
+        initial_done(&runtime);
+        runtime.shutdown();
+        assert!(
+            stores
+                .meta
+                .get(&crate::search_index_db::normalize_path(
+                    &f.path.join("a.jpg")
+                ))
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     fn fixed_snapshot_coalesces_later_requests_and_join_precedes_spawn() {
