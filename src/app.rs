@@ -78,7 +78,9 @@ mod clipboard_capture_admission_tests {
             .unwrap()
             .request_id;
         let saved = app.tmp.path().join("capture/2026-10/saved.png");
-        app.handle_clipboard_capture_reveal(saved, &ctx);
+        app.handle_clipboard_capture_reveal(saved, &ctx, |_, _| {
+            panic!("rejected reveal activated main")
+        });
         assert_eq!(app.current_folder, Some(source));
         assert_eq!(
             app.top_level_grid_view
@@ -89,15 +91,68 @@ mod clipboard_capture_admission_tests {
         );
         assert!(app.folder_pane_open_pending.is_none());
         assert!(app.select_after_load.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.fs_feedback_toast_surface.is_none());
+    }
+
+    #[test]
+    fn saved_reveal_app_event_preserves_fullscreen_with_default_switch_setting() {
+        use super::{GridItem, ViewerPresentation};
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        assert!(!app.settings.fullscreen_keep_on_app_switch);
+        let current = app.tmp.path().join("viewing.png");
+        app.items = vec![GridItem::Image(current.clone())];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.fs_focus_grace_elapsed = true;
+        let opened_at = std::time::Instant::now();
+        app.fs_opened_at = Some(opened_at);
+        app.window_visible = false;
+        let saved = app.tmp.path().join("capture/2026-10/saved.png");
+        app.clipboard_capture_service.inject_reveal_for_test(saved);
+
+        // The callback stands in for the native activation boundary. Feed its
+        // observed focus into the unchanged focus owner after the real App poll.
+        let mut foreground = false;
+        app.poll_clipboard_capture_with_activation(&ctx, |_, _| foreground = true);
+        app.reconcile_fullscreen_after_main_focus(&ctx, foreground, false, false);
+
         assert!(
-            app.fs_feedback_toast
-                .as_ref()
-                .is_some_and(|t| t.0.contains("一覧画面に戻ると"))
+            !foreground,
+            "rejected clipboard event must never foreground main"
         );
-        assert_eq!(
-            app.fs_feedback_toast_surface,
-            Some(super::ActionSurface::MainWindow)
-        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+        assert_eq!(app.fs_opened_at, Some(opened_at));
+        assert_eq!(app.selected, Some(0));
+        assert!(matches!(&app.items[0], GridItem::Image(path) if path == &current));
+        assert!(!app.window_visible);
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(app.select_after_load.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.clipboard_capture_service.poll().is_empty());
+    }
+
+    #[test]
+    fn saved_reveal_app_event_activates_only_after_list_admission_and_selects_file() {
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("capture/2026-10");
+        std::fs::create_dir_all(&folder).unwrap();
+        let saved = folder.join("saved.png");
+        app.clipboard_capture_service.inject_reveal_for_test(saved);
+        let mut activations = 0;
+        app.poll_clipboard_capture_with_activation(&ctx, |app, _| {
+            assert!(app.fullscreen_idx.is_none());
+            assert!(!app.clipboard_capture_navigation_preparing());
+            activations += 1;
+        });
+        assert_eq!(activations, 1);
+        assert!(app.folder_pane_open_pending.is_some());
+        assert_eq!(app.select_after_load.as_deref(), Some("saved.png"));
+        assert!(app.fs_feedback_toast.is_none());
     }
 }
 
@@ -16886,7 +16941,8 @@ impl App {
 
     #[cfg(windows)]
     fn sync_clipboard_capture(&mut self, ctx: &egui::Context) {
-        let (Some(hwnd), Some(slot)) = (self.main_hwnd, self.placement_slot.clone()) else {
+        crate::clipboard_capture::start_default_destination_resolution(ctx);
+        let Some(hwnd) = self.main_hwnd else {
             return;
         };
         self.clipboard_capture_service.synchronize(
@@ -16894,14 +16950,38 @@ impl App {
             ctx.style().visuals.dark_mode,
             ctx,
             hwnd,
-            slot,
         );
     }
 
     fn poll_clipboard_capture(&mut self, ctx: &egui::Context) {
+        self.poll_clipboard_capture_with_activation(ctx, Self::activate_clipboard_capture_main);
+    }
+
+    fn poll_clipboard_capture_with_activation(
+        &mut self,
+        ctx: &egui::Context,
+        mut activate: impl FnMut(&mut Self, &egui::Context),
+    ) {
         for path in self.clipboard_capture_service.poll() {
-            self.handle_clipboard_capture_reveal(path, ctx);
+            self.handle_clipboard_capture_reveal(path, ctx, &mut activate);
         }
+    }
+
+    fn activate_clipboard_capture_main(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if let (Some(hwnd), Some(slot)) = (self.main_hwnd, self.placement_slot.as_ref()) {
+            let state = crate::window_activation::activate_main_window(
+                hwnd,
+                slot,
+                ctx,
+                "clipboard capture",
+            );
+            if state == crate::window_activation::ActivationState::TrayHidden {
+                self.sync_after_restore(ctx);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
     }
 
     fn clipboard_capture_navigation_preparing(&self) -> bool {
@@ -16929,11 +17009,12 @@ impl App {
                 .is_some_and(|p| matches!(p.5, PdfOpenPhase::ColdCandidate { .. }))
     }
 
-    fn handle_clipboard_capture_reveal(&mut self, path: PathBuf, ctx: &egui::Context) {
-        #[cfg(windows)]
-        if !self.window_visible {
-            self.sync_after_restore(ctx);
-        }
+    fn handle_clipboard_capture_reveal(
+        &mut self,
+        path: PathBuf,
+        ctx: &egui::Context,
+        activate: impl FnOnce(&mut Self, &egui::Context),
+    ) {
         if !clipboard_capture_reveal_admitted(
             self.fullscreen_idx.is_none()
                 && !self.current_viewer_session_is_detached_or_switching(),
@@ -16941,12 +17022,11 @@ impl App {
             self.remote_session_blocks_local_control(),
             self.clipboard_capture_navigation_preparing(),
         ) {
-            let text =
-                "一覧画面に戻ると、場所▼の『クリップボード取り込み』から開けます".to_string();
-            let duration = crate::ui_fullscreen::feedback_toast_duration(&text);
-            self.show_feedback_toast_on_with_duration(text, ActionSurface::MainWindow, duration);
+            self.clipboard_capture_service.resolve_reveal(&path, false);
             return;
         }
+        self.clipboard_capture_service.resolve_reveal(&path, true);
+        activate(self, ctx);
         if let Some(parent) = path.parent() {
             self.start_folder_pane_open(parent.to_path_buf());
             self.select_after_load = path

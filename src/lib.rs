@@ -270,6 +270,8 @@ mod ui_crop;
 pub mod ui_dialogs;
 mod ui_sns_split;
 #[doc(hidden)]
+pub use ui_dialogs::preferences::draw_clipboard_capture_settings_pending_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_dialogs::preferences::draw_clipboard_capture_settings_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;

@@ -1818,26 +1818,6 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
 }
 
 pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    if let Some(rx) = &state.clipboard_capture_folder_task {
-        let result = match rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Some(Err("フォルダ操作を完了できませんでした。".into()))
-            }
-            Err(mpsc::TryRecvError::Empty) => None,
-        };
-        if let Some(result) = result {
-            state.clipboard_capture_folder_task = None;
-            match result {
-                Ok(ClipboardCaptureFolderResult::Selected(Some(path))) => {
-                    state.clipboard_capture_output_dir_input = path.display().to_string();
-                    state.settings.clipboard_capture_output_dir = Some(path);
-                }
-                Ok(_) => {}
-                Err(error) => state.clipboard_capture_folder_message = Some(error),
-            }
-        }
-    }
     anchored(ui, state, "clipboard-capture/image", |ui, state| {
         ui.checkbox(
             &mut state.settings.clipboard_capture_image_enabled,
@@ -1863,8 +1843,9 @@ pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesS
             let edit_width = ui.available_width();
             let hint = state
                 .clipboard_capture_default_output_dir
-                .display()
-                .to_string();
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "確認中".to_owned());
             let mut output = crate::ime_focus::show_singleline(
                 ui,
                 &mut state.clipboard_capture_output_dir_input,
@@ -1889,15 +1870,25 @@ pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesS
                     state.settings.clipboard_capture_output_dir = None;
                     state.clipboard_capture_folder_message = None;
                 }
-                open = ui.button("フォルダを開く").clicked();
+                open = ui
+                    .add_enabled(
+                        state.settings.clipboard_capture_output_dir.is_some()
+                            || state.clipboard_capture_default_output_dir.is_some(),
+                        egui::Button::new("フォルダを開く"),
+                    )
+                    .clicked();
             });
         });
         let effective = state
             .settings
             .clipboard_capture_output_dir
             .clone()
-            .unwrap_or_else(|| state.clipboard_capture_default_output_dir.clone());
-        ui.label(egui::RichText::new(format!("実際の保存先: {}", effective.display())).weak());
+            .or_else(|| state.clipboard_capture_default_output_dir.clone());
+        let effective_label = effective
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "確認中".to_owned());
+        ui.label(egui::RichText::new(format!("実際の保存先: {effective_label}")).weak());
         ui.label(
             egui::RichText::new(
                 "月ごとのフォルダに保存します。フォルダは最初に保存するときに作成します。",
@@ -1912,29 +1903,33 @@ pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesS
                 .name("clipboard-capture-folder".into())
                 .spawn(move || {
                     let result = if choose {
-                        Ok(ClipboardCaptureFolderResult::Selected(
-                            rfd::FileDialog::new()
-                                .set_directory(&effective)
-                                .pick_folder(),
-                        ))
-                    } else if !effective.is_dir() {
-                        Err(
-                            "保存先フォルダはまだありません。最初に保存するときに作成します。"
-                                .into(),
-                        )
+                        let mut picker = rfd::FileDialog::new();
+                        if let Some(path) = &effective {
+                            picker = picker.set_directory(path);
+                        }
+                        Ok(ClipboardCaptureFolderResult::Selected(picker.pick_folder()))
+                    } else if let Some(effective) = effective {
+                        if !effective.is_dir() {
+                            Err(
+                                "保存先フォルダはまだありません。最初に保存するときに作成します。"
+                                    .into(),
+                            )
+                        } else {
+                            #[cfg(windows)]
+                            {
+                                std::process::Command::new("explorer.exe")
+                                    .arg(&effective)
+                                    .spawn()
+                                    .map(|_| ClipboardCaptureFolderResult::Opened)
+                                    .map_err(|error| format!("フォルダを開けませんでした: {error}"))
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                Ok(ClipboardCaptureFolderResult::Opened)
+                            }
+                        }
                     } else {
-                        #[cfg(windows)]
-                        {
-                            std::process::Command::new("explorer.exe")
-                                .arg(&effective)
-                                .spawn()
-                                .map(|_| ClipboardCaptureFolderResult::Opened)
-                                .map_err(|error| format!("フォルダを開けませんでした: {error}"))
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            Ok(ClipboardCaptureFolderResult::Opened)
-                        }
+                        Err("保存先フォルダを確認中です。".into())
                     };
                     let _ = tx.send(result);
                     ctx.request_repaint();

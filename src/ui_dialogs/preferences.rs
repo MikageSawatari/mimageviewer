@@ -721,8 +721,25 @@ pub fn draw_clipboard_capture_settings_snapshot_fixture(ui: &mut egui::Ui, start
         0,
     );
     state.clipboard_capture_default_output_dir =
-        PathBuf::from("C:/Pictures/mimageviewer/clipboard");
+        Some(PathBuf::from("C:/Pictures/mimageviewer/clipboard"));
     state.clipboard_capture_startup_failed = startup_failed;
+    state.selected = PreferencesPage::ClipboardCapture;
+    draw_page(ui, &mut state, false);
+}
+
+#[doc(hidden)]
+pub fn draw_clipboard_capture_settings_pending_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.clipboard_capture_default_output_dir = None;
     state.selected = PreferencesPage::ClipboardCapture;
     draw_page(ui, &mut state, false);
 }
@@ -818,7 +835,7 @@ pub(crate) struct PreferencesState {
     pub manual_threads: usize,
     pub capture_output_dir_input: String,
     pub clipboard_capture_output_dir_input: String,
-    pub clipboard_capture_default_output_dir: PathBuf,
+    pub clipboard_capture_default_output_dir: Option<PathBuf>,
     pub clipboard_capture_folder_task:
         Option<mpsc::Receiver<Result<ClipboardCaptureFolderResult, String>>>,
     pub clipboard_capture_folder_message: Option<String>,
@@ -1155,6 +1172,36 @@ impl PreferencesState {
         }
     }
 
+    /// The dialog owns this receiver, so changing its selected page must not defer
+    /// a folder selection until after the draft is committed.
+    pub(super) fn poll_clipboard_capture_folder_task(&mut self) {
+        let result =
+            self.clipboard_capture_folder_task
+                .as_ref()
+                .and_then(|rx| match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("フォルダ操作を完了できませんでした。".into()))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = result {
+            self.clipboard_capture_folder_task = None;
+            match result {
+                Ok(ClipboardCaptureFolderResult::Selected(Some(path))) => {
+                    self.clipboard_capture_output_dir_input = path.display().to_string();
+                    self.settings.clipboard_capture_output_dir = Some(path);
+                }
+                Ok(_) => {}
+                Err(error) => self.clipboard_capture_folder_message = Some(error),
+            }
+        }
+    }
+
+    fn clipboard_capture_folder_apply_ready(&self) -> bool {
+        self.clipboard_capture_folder_task.is_none()
+    }
+
     pub(super) fn poll_external_tool_workers(&mut self, ctx: &egui::Context) {
         if self
             .external_tool_path_check_due
@@ -1342,8 +1389,7 @@ impl PreferencesState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            clipboard_capture_default_output_dir: crate::capture::default_output_dir()
-                .join("clipboard"),
+            clipboard_capture_default_output_dir: crate::clipboard_capture::default_destination(),
             clipboard_capture_folder_task: None,
             clipboard_capture_folder_message: None,
             clipboard_capture_startup_failed: false,
@@ -2175,6 +2221,9 @@ impl App {
         let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
             state.clipboard_capture_startup_failed = clipboard_capture_startup_failed;
+            state.clipboard_capture_default_output_dir =
+                crate::clipboard_capture::default_destination();
+            state.poll_clipboard_capture_folder_task();
             state.favorite_view_state_entry_count = self.favorite_view_states.len();
             state.favorite_view_state_active = favorite_view_state_active;
         }
@@ -2348,7 +2397,11 @@ impl App {
                 ui.horizontal(|ui| {
                     let font_ready = state.ui_font_apply_ready();
                     let lut_ready = state.creative_lut_import_rx.is_none();
-                    let ok = ui.add_enabled(font_ready && lut_ready, egui::Button::new("  OK  "));
+                    let clipboard_folder_ready = state.clipboard_capture_folder_apply_ready();
+                    let ok = ui.add_enabled(
+                        font_ready && lut_ready && clipboard_folder_ready,
+                        egui::Button::new("  OK  "),
+                    );
                     #[cfg(all(windows, feature = "test-script"))]
                     crate::test_script::register_clickable_widget("OK", &ok);
                     if ok.clicked() {
@@ -2362,6 +2415,8 @@ impl App {
                         ui.small("フォントの準備完了後に適用できます。");
                     } else if !lut_ready {
                         ui.small("LUTのコピー完了後に適用できます。");
+                    } else if !clipboard_folder_ready {
+                        ui.small("保存先フォルダの操作完了後に適用できます。");
                     }
                 });
             });
@@ -3595,6 +3650,91 @@ mod tests {
             language: None,
             channels: Some(2),
             title: None,
+        }
+    }
+
+    #[test]
+    fn clipboard_capture_picker_result_on_another_page_is_polled_before_ok_commit() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_page(PreferencesPage::ClipboardCapture);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // Opening requests the page; the first dialog frame creates its draft.
+        harness.run();
+        let (tx, rx) = mpsc::channel();
+        let state = harness.state_mut().pref_state.as_mut().unwrap();
+        assert_eq!(state.selected, PreferencesPage::ClipboardCapture);
+        state.clipboard_capture_folder_task = Some(rx);
+        state.selected = PreferencesPage::Cache;
+        harness.run();
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Cache);
+        assert!(!state.clipboard_capture_folder_apply_ready());
+        assert_eq!(state.settings.clipboard_capture_output_dir, None);
+
+        // A click while the picker owns the draft cannot close or commit it.
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_some());
+
+        let selected = harness.state().tmp.path().join("clipboard-picker-result");
+        tx.send(Ok(ClipboardCaptureFolderResult::Selected(Some(
+            selected.clone(),
+        ))))
+        .unwrap();
+        harness.run();
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Cache);
+        assert!(state.clipboard_capture_folder_apply_ready());
+        assert_eq!(
+            state.settings.clipboard_capture_output_dir,
+            Some(selected.clone())
+        );
+        assert_eq!(
+            state.clipboard_capture_output_dir_input,
+            selected.display().to_string()
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.clipboard_capture_output_dir,
+            Some(selected)
+        );
+    }
+
+    #[test]
+    fn clipboard_capture_picker_cancel_error_and_disconnect_release_apply_gate() {
+        for result in [
+            Some(Ok(ClipboardCaptureFolderResult::Selected(None))),
+            Some(Err("選択失敗".to_owned())),
+            None,
+        ] {
+            let mut state = preferences_state_for_test(&Settings::default());
+            let original = PathBuf::from("C:/original-clipboard-output");
+            state.settings.clipboard_capture_output_dir = Some(original.clone());
+            state.clipboard_capture_output_dir_input = original.display().to_string();
+            state.selected = PreferencesPage::Cache;
+            let (tx, rx) = mpsc::channel();
+            state.clipboard_capture_folder_task = Some(rx);
+            if let Some(result) = result {
+                tx.send(result).unwrap();
+            }
+            drop(tx);
+            state.poll_clipboard_capture_folder_task();
+            assert!(state.clipboard_capture_folder_apply_ready());
+            assert_eq!(
+                state.settings.clipboard_capture_output_dir,
+                Some(original.clone())
+            );
+            assert_eq!(
+                state.clipboard_capture_output_dir_input,
+                original.display().to_string()
+            );
         }
     }
 

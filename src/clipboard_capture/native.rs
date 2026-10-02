@@ -206,6 +206,23 @@ fn copy_format(id: u32, limit: usize) -> Result<Vec<u8>, String> {
     let _ = unsafe { GlobalUnlock(global) };
     Ok(bytes)
 }
+fn format_id(entries: &[(u32, String)], name: &str) -> Option<u32> {
+    entries
+        .iter()
+        .find(|(_, n)| data::format_name_eq(n, name))
+        .map(|(id, _)| *id)
+}
+
+fn copy_named_format(
+    entries: &[(u32, String)],
+    name: &str,
+    limit: usize,
+    copy: impl FnOnce(u32, usize) -> Result<Vec<u8>, String>,
+) -> Result<Option<Vec<u8>>, String> {
+    format_id(entries, name)
+        .map(|id| copy(id, limit))
+        .transpose()
+}
 struct Observation {
     before: u32,
     after: u32,
@@ -242,11 +259,7 @@ fn read(request: &ReadRequest) -> Result<Observation, String> {
             entries.push((id, name));
         }
         let get = |name: &str, limit: usize| -> Result<Option<Vec<u8>>, String> {
-            entries
-                .iter()
-                .find(|(_, n)| n == name)
-                .map(|(id, _)| copy_format(*id, limit))
-                .transpose()
+            copy_named_format(&entries, name, limit, copy_format)
         };
         let history = get("CanIncludeInClipboardHistory", 256)?.and_then(|b| {
             b.get(..4)
@@ -270,8 +283,8 @@ fn read(request: &ReadRequest) -> Result<Observation, String> {
                 ("CF_DIBV5", &mut raw.dib_v5),
                 ("CF_DIB", &mut raw.dib),
             ] {
-                if let Some((id, _)) = entries.iter().find(|(_, n)| n == name) {
-                    *target = Some(copy_format(*id, IMAGE_LIMIT)?);
+                if let Some(id) = format_id(&entries, name) {
+                    *target = Some(copy_format(id, IMAGE_LIMIT)?);
                     break;
                 }
             }
@@ -496,13 +509,11 @@ impl CaptureRuntime {
     pub(super) fn start(
         snapshot: Arc<CaptureSnapshot>,
         generation: Arc<AtomicU64>,
-        foreground: Arc<dyn Fn() + Send + Sync>,
         events: mpsc::Sender<CaptureEvent>,
         repaint: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
         let popup = Arc::new(popup::PopupRuntime::start(
             generation.clone(),
-            foreground,
             events.clone(),
             repaint.clone(),
         )?);
@@ -524,43 +535,52 @@ impl CaptureRuntime {
         let saver = std::thread::Builder::new()
             .name("clipboard-capture-save".into())
             .spawn(move || {
-                let destination = save_state
+                let initial_destination = save_state
                     .snapshot
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .config
                     .destination
                     .clone();
-                if let Err(error) = data::cleanup_part_files(&destination) {
-                    crate::logger::log(format!("clipboard_capture: temporary cleanup: {error}"));
-                }
-                while let Ok(job) = save_rx.recv() {
-                    if !save_state.current(&job.request) {
-                        continue;
+                if let Ok(destination) = super::resolve_save_destination(&initial_destination) {
+                    if let Err(error) = data::cleanup_part_files(&destination) {
+                        crate::logger::log(format!(
+                            "clipboard_capture: temporary cleanup: {error}"
+                        ));
                     }
-                    let generation = job.request.snapshot.generation;
-                    let dark = job.request.snapshot.dark;
-                    match data::save_image(
-                        &job.image,
-                        &job.request.snapshot.config.destination,
-                        &data::CaptureTimestamp::now(),
-                    ) {
-                        Ok(saved) => {
-                            if let Some(error) = saved.metadata_error {
-                                crate::logger::log(format!("clipboard_capture: MotW: {error}"));
+                }
+                run_save_worker(
+                    save_rx,
+                    |job| save_state.current(&job.request),
+                    |job| super::resolve_save_destination(&job.request.snapshot.config.destination),
+                    |job, destination| {
+                        data::save_image(&job.image, destination, &data::CaptureTimestamp::now())
+                    },
+                    |job, result| {
+                        let generation = job.request.snapshot.generation;
+                        let dark = job.request.snapshot.dark;
+                        match result {
+                            Ok(saved) => {
+                                if let Some(error) = saved.metadata_error {
+                                    crate::logger::log(format!("clipboard_capture: MotW: {error}"));
+                                }
+                                save_popup.show(
+                                    generation,
+                                    dark,
+                                    popup::PopupContent::Saved(saved.path),
+                                );
                             }
-                            save_popup.show(
-                                generation,
-                                dark,
-                                popup::PopupContent::Saved(saved.path),
-                            );
+                            Err(error) => {
+                                crate::logger::log(format!("clipboard_capture: save: {error}"));
+                                save_popup.show(
+                                    generation,
+                                    dark,
+                                    popup::PopupContent::Failure(error),
+                                );
+                            }
                         }
-                        Err(error) => {
-                            crate::logger::log(format!("clipboard_capture: save: {error}"));
-                            save_popup.show(generation, dark, popup::PopupContent::Failure(error));
-                        }
-                    }
-                }
+                    },
+                );
             })
             .map_err(|e| format!("spawn save worker: {e}"))?;
         let reader_state = state.clone();
@@ -605,6 +625,45 @@ impl CaptureRuntime {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = snapshot;
     }
+
+    pub(super) fn resolve_reveal(
+        &self,
+        generation: u64,
+        path: &std::path::Path,
+        response: popup::RevealResponse,
+    ) {
+        self.popup.resolve_reveal(generation, path, response);
+    }
+}
+
+// A generation check surrounds destination resolution. Once save() starts,
+// settings changes cannot interrupt its file publication; popup has its own fence.
+fn run_save_worker<J, T>(
+    jobs: mpsc::Receiver<J>,
+    current: impl Fn(&J) -> bool,
+    resolve: impl Fn(&J) -> Result<std::path::PathBuf, String>,
+    save: impl Fn(&J, &std::path::Path) -> Result<T, String>,
+    publish: impl Fn(&J, Result<T, String>),
+) {
+    while let Ok(job) = jobs.recv() {
+        if !current(&job) {
+            continue;
+        }
+        let destination = resolve(&job);
+        if !current(&job) {
+            continue;
+        }
+        let result = destination.and_then(|destination| save(&job, &destination));
+        publish(&job, result);
+    }
+}
+
+fn finish_worker(thread: JoinHandle<()>, allow_wait: bool) {
+    if allow_wait || thread.is_finished() {
+        let _ = thread.join();
+    } else {
+        crate::logger::log("clipboard_capture: worker still in external call; detaching on exit");
+    }
 }
 impl Drop for CaptureRuntime {
     fn drop(&mut self) {
@@ -616,21 +675,153 @@ impl Drop for CaptureRuntime {
             && unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), SHUTDOWN, WPARAM(0), LPARAM(0)) }
                 .is_ok();
         if let Some(thread) = self.listener.take() {
-            if posted || thread.is_finished() {
-                let _ = thread.join();
-            }
+            finish_worker(thread, posted);
         }
         for thread in [self.reader.take(), self.saver.take()]
             .into_iter()
             .flatten()
         {
-            if thread.is_finished() {
-                let _ = thread.join();
-            } else {
-                crate::logger::log(
-                    "clipboard_capture: worker still in external call; detaching on exit",
-                );
-            }
+            finish_worker(thread, false);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn registered_payload_lookup_ignores_case_for_history_marker_and_preferred_image() {
+        let entries = vec![
+            (1, "cAnInClUdEiNcLiPbOaRdHiStOrY".into()),
+            (2, "MIMAGEVIEWER clipboard ORIGIN V1".into()),
+            (3, "pNg".into()),
+            (4, "CF_DIBV5".into()),
+            (5, "uNiFoRmReSoUrCeLoCaToRw".into()),
+        ];
+        let get = |name| {
+            copy_named_format(&entries, name, 256, |id, limit| {
+                assert_eq!(limit, 256);
+                Ok(match id {
+                    1 => 0u32.to_le_bytes().to_vec(),
+                    2 => data::process_nonce().to_vec(),
+                    _ => vec![id as u8],
+                })
+            })
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(get("CanIncludeInClipboardHistory"), 0u32.to_le_bytes());
+        assert!(data::marker_is_ours(&get(data::ORIGIN_FORMAT_NAME)));
+        assert_eq!(format_id(&entries, "PNG"), Some(3));
+        assert_eq!(get("UniformResourceLocatorW"), vec![5]);
+        assert_eq!(format_id(&entries, "missing"), None);
+    }
+
+    #[test]
+    fn queued_old_save_is_discarded_before_destination_resolution() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(1u64).unwrap();
+        drop(tx);
+        run_save_worker::<u64, ()>(
+            rx,
+            |generation| *generation == 2,
+            |_| panic!("obsolete job must not resolve destination"),
+            |_, _| panic!("obsolete job must not start saving"),
+            |_, _| panic!("obsolete job must not publish"),
+        );
+    }
+
+    #[test]
+    fn generation_changed_while_resolving_default_discards_save_before_it_starts() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let current = generation.clone();
+        let (tx, rx) = mpsc::channel();
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_save_worker::<u64, ()>(
+                rx,
+                |job| current.load(Ordering::Acquire) == *job,
+                |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(PathBuf::from("resolved"))
+                },
+                |_, _| panic!("generation changed before save started"),
+                |_, _| panic!("obsolete job must not publish"),
+            );
+        });
+        tx.send(1).unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        generation.store(2, Ordering::Release);
+        release.send(()).unwrap();
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn started_save_finishes_old_generation_after_setting_change() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let current = generation.clone();
+        let (tx, rx) = mpsc::channel();
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (completed, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_save_worker(
+                rx,
+                |job| current.load(Ordering::Acquire) == *job,
+                |_| Ok(PathBuf::from("original-destination")),
+                |_, destination| {
+                    assert_eq!(destination, std::path::Path::new("original-destination"));
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok("file-published")
+                },
+                |job, result| {
+                    completed
+                        .send((*job, result.unwrap(), current.load(Ordering::Acquire)))
+                        .unwrap();
+                },
+            );
+        });
+        tx.send(1).unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        generation.store(2, Ordering::Release);
+        release.send(()).unwrap();
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (1, "file-published", 2)
+        );
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_detaches_unfinished_reader_and_saver_without_waiting() {
+        for _ in 0..2 {
+            let (entered, entry) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let (finished, completion) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                finished.send(()).unwrap();
+            });
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (dropped, observed) = mpsc::channel();
+            let shutdown = std::thread::spawn(move || {
+                finish_worker(worker, false);
+                dropped.send(()).unwrap();
+            });
+            let detached = observed.recv_timeout(Duration::from_secs(5));
+            // Release even on failure, so the regression cannot leave a hung join.
+            release.send(()).unwrap();
+            assert!(detached.is_ok(), "shutdown waited for unfinished worker");
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+            shutdown.join().unwrap();
         }
     }
 }

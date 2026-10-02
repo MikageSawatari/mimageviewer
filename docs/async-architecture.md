@@ -7,6 +7,16 @@
 
 ## 1. ワーカー一覧
 
+クリップボードの既定保存先は、App 起動後に `clipboard-capture-destination` thread が
+process ごとに一度だけ Shell で解決し、共有 owner に結果を公開する。監視・設定画面・場所▼は
+同じ結果を参照し、UI はメモリ上の解決済み値だけを読む。未解決の間は設定に「確認中」を表示し、
+場所▼の項目は出さない。保存 worker だけ Condvar で待ち、待機後に保存世代を再確認する。
+Shell 呼出中の終了は待たない。
+
+小窓 thread は前面化せず、typed event と repaint (非表示メインには `WM_PAINT` の post) だけを
+App へ渡す。App は受付判定後だけ前面化し、拒否時は小窓の文面を差し替える。
+メインのトーストや表示切り替え、後で開く保留処理は使わない。
+
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
 | クリップボード画像の取り込み (S1) | message-only window STA (`clipboard-capture-listener`) + reader STA (`clipboard-capture-reader`) + bounded 保存 worker (`clipboard-capture-save`) + Win32 / GDI (`clipboard-capture-popup`) | App / process ごとに各 1 | 最初に監視を有効にしたときに非同期起動し、両 OFF でも App 終了まで保持。起動時の読取はしない。通知ごとに不変 `Arc` スナップショットと request serial / sequence を latest slot へ置く。reader は要求・直前・直後の sequence と現在世代の一致だけを受理し、不一致なら最新要求優先、なければ同じスナップショットで 1 回だけ再読取。debounce は使わない。clipboard を開いている間は上限付き生バイトのコピーだけを行い、閉じてから分類・デコード・ハッシュ計算を行う。保存 queue は 1 件に制限し、保存開始前に世代を確認する。開始済みの保存は完了まで行い、古い世代の小窓は表示しない。設定変更で小窓を隠す。UI は typed event と repaint だけを受ける。終了時は listener へ shutdown を post できた場合だけ join し、外部呼出中の reader / 保存 worker は待たない。切り取り監視とは独立。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |

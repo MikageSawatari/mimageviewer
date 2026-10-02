@@ -1,7 +1,7 @@
 //! An ownerless, nonactivating notification window, owned by its own thread.
 //! The mailbox and displayed content each retain only the latest notification.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DISPLAY_LIFETIME: Duration = Duration::from_secs(8);
@@ -11,6 +11,32 @@ pub(crate) enum PopupContent {
     Saved(PathBuf),
     Failure(String),
     Abandoned,
+    RevealUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RevealResponse {
+    Accepted,
+    Unavailable,
+}
+
+// An App reply belongs to the saved notification that was clicked. A newer
+// copy, even within the same settings generation, must retain its own content.
+fn resolve_reveal(
+    shown: &mut Option<(u64, PopupContent)>,
+    generation: u64,
+    path: &Path,
+    response: RevealResponse,
+) -> bool {
+    if !matches!(shown.as_ref(), Some((g, PopupContent::Saved(p))) if *g == generation && p == path)
+    {
+        return false;
+    }
+    *shown = match response {
+        RevealResponse::Accepted => None,
+        RevealResponse::Unavailable => Some((generation, PopupContent::RevealUnavailable)),
+    };
+    true
 }
 
 impl PopupContent {
@@ -19,6 +45,9 @@ impl PopupContent {
             Self::Saved(_) => "クリップボードの画像を保存しました".into(),
             Self::Failure(reason) => format!("保存できませんでした: {reason}"),
             Self::Abandoned => "取り込めませんでした。もう一度コピーしてください".into(),
+            Self::RevealUnavailable => {
+                "一覧画面に戻ると、場所▼の『クリップボード取り込み』から開けます".into()
+            }
         }
     }
 }
@@ -83,7 +112,7 @@ fn bottom_right(work: [i32; 4], dpi: u32) -> [i32; 4] {
 
 #[cfg(windows)]
 mod native {
-    use super::{Lifetime, PopupContent, bottom_right, scaled};
+    use super::{Lifetime, PopupContent, RevealResponse, bottom_right, resolve_reveal, scaled};
     use crate::clipboard_capture::CaptureEvent;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -114,6 +143,11 @@ mod native {
             content: PopupContent,
         },
         Hide,
+        RevealResult {
+            generation: u64,
+            path: std::path::PathBuf,
+            response: RevealResponse,
+        },
     }
 
     struct Mailbox {
@@ -146,6 +180,26 @@ mod native {
                 let _ = unsafe { PostThreadMessageW(id, WAKE, WPARAM(0), LPARAM(0)) };
             }
         }
+
+        fn publish_reveal_result(
+            &self,
+            generation: u64,
+            path: &std::path::Path,
+            response: RevealResponse,
+        ) -> bool {
+            let mut latest = self.latest.lock().unwrap_or_else(|p| p.into_inner());
+            if generation != self.current_generation.load(Ordering::Acquire)
+                || matches!(latest.as_ref(), Some(Command::Show { .. } | Command::Hide))
+            {
+                return false;
+            }
+            *latest = Some(Command::RevealResult {
+                generation,
+                path: path.to_path_buf(),
+                response,
+            });
+            true
+        }
     }
 
     pub(crate) struct PopupRuntime {
@@ -156,7 +210,6 @@ mod native {
     impl PopupRuntime {
         pub(crate) fn start(
             current_generation: Arc<AtomicU64>,
-            foreground_main: Arc<dyn Fn() + Send + Sync>,
             event_tx: mpsc::Sender<CaptureEvent>,
             repaint: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<Self, String> {
@@ -172,7 +225,6 @@ mod native {
                 .spawn(move || {
                     let mut state = Box::new(WindowState {
                         current_generation,
-                        foreground_main,
                         event_tx,
                         repaint,
                         shown: None,
@@ -209,6 +261,20 @@ mod native {
                 .unwrap_or_else(|p| p.into_inner()) = Some(Command::Hide);
             self.mailbox.wake();
         }
+
+        pub(crate) fn resolve_reveal(
+            &self,
+            generation: u64,
+            path: &std::path::Path,
+            response: RevealResponse,
+        ) {
+            if self
+                .mailbox
+                .publish_reveal_result(generation, path, response)
+            {
+                self.mailbox.wake();
+            }
+        }
     }
 
     impl Drop for PopupRuntime {
@@ -226,7 +292,6 @@ mod native {
 
     struct WindowState {
         current_generation: Arc<AtomicU64>,
-        foreground_main: Arc<dyn Fn() + Send + Sync>,
         event_tx: mpsc::Sender<CaptureEvent>,
         repaint: Arc<dyn Fn() + Send + Sync>,
         shown: Option<(u64, PopupContent)>,
@@ -326,6 +391,29 @@ mod native {
                     Some(Command::Hide) => {
                         if let Some(hwnd) = window {
                             hide(hwnd, state_ptr);
+                        }
+                    }
+                    Some(Command::RevealResult {
+                        generation,
+                        path,
+                        response,
+                    }) if generation == (*state_ptr).current_generation.load(Ordering::Acquire) => {
+                        if resolve_reveal(&mut (*state_ptr).shown, generation, &path, response)
+                            && let Some(hwnd) = window
+                        {
+                            match response {
+                                RevealResponse::Accepted => hide(hwnd, state_ptr),
+                                RevealResponse::Unavailable => {
+                                    let dark = (*state_ptr).dark;
+                                    show(
+                                        hwnd,
+                                        state_ptr,
+                                        generation,
+                                        dark,
+                                        PopupContent::RevealUnavailable,
+                                    );
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -662,11 +750,8 @@ mod native {
                             _ => None,
                         };
                         if let Some((generation, path)) = saved {
-                            let foreground = (*state).foreground_main.clone();
                             let events = (*state).event_tx.clone();
                             let repaint = (*state).repaint.clone();
-                            hide(hwnd, state);
-                            foreground();
                             let _ = events.send(CaptureEvent::RevealSaved { generation, path });
                             repaint();
                         }
@@ -726,6 +811,48 @@ mod native {
                 })
             ));
         }
+
+        #[test]
+        fn latest_reveal_reply_replaces_an_earlier_reply_and_updates_only_clicked_copy() {
+            let mailbox = mailbox(2);
+            let a = std::path::PathBuf::from("capture/a.png");
+            let b = std::path::PathBuf::from("capture/b.png");
+            assert!(mailbox.publish_reveal_result(2, &a, RevealResponse::Accepted));
+            assert!(mailbox.publish_reveal_result(2, &b, RevealResponse::Unavailable));
+            let Some(Command::RevealResult {
+                generation,
+                path,
+                response,
+            }) = mailbox.latest.lock().unwrap().take()
+            else {
+                panic!("latest App reply missing");
+            };
+            assert_eq!(path, b);
+            let mut shown = Some((2, PopupContent::Saved(b)));
+            assert!(resolve_reveal(&mut shown, generation, &path, response));
+            assert!(matches!(shown, Some((2, PopupContent::RevealUnavailable))));
+        }
+
+        #[test]
+        fn reveal_reply_never_displaces_pending_show_hide_or_current_generation() {
+            let mailbox = mailbox(2);
+            let path = std::path::Path::new("capture/a.png");
+            assert!(mailbox.publish_show(2, false, PopupContent::Abandoned));
+            assert!(!mailbox.publish_reveal_result(2, path, RevealResponse::Accepted));
+            assert!(matches!(
+                *mailbox.latest.lock().unwrap(),
+                Some(Command::Show { .. })
+            ));
+            *mailbox.latest.lock().unwrap() = Some(Command::Hide);
+            assert!(!mailbox.publish_reveal_result(2, path, RevealResponse::Unavailable));
+            assert!(matches!(
+                *mailbox.latest.lock().unwrap(),
+                Some(Command::Hide)
+            ));
+            *mailbox.latest.lock().unwrap() = None;
+            assert!(!mailbox.publish_reveal_result(1, path, RevealResponse::Unavailable));
+            assert!(mailbox.latest.lock().unwrap().is_none());
+        }
     }
 }
 
@@ -739,7 +866,6 @@ pub(crate) struct PopupRuntime;
 impl PopupRuntime {
     pub(crate) fn start(
         _: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        _: std::sync::Arc<dyn Fn() + Send + Sync>,
         _: std::sync::mpsc::Sender<crate::clipboard_capture::CaptureEvent>,
         _: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
@@ -752,6 +878,50 @@ impl PopupRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_reveal_replaces_only_its_saved_notification_without_an_open_button() {
+        let path = PathBuf::from("capture/saved.png");
+        let mut shown = Some((4, PopupContent::Saved(path.clone())));
+        assert!(resolve_reveal(
+            &mut shown,
+            4,
+            &path,
+            RevealResponse::Unavailable
+        ));
+        assert!(matches!(shown, Some((4, PopupContent::RevealUnavailable))));
+        assert_eq!(
+            shown.as_ref().unwrap().1.text(),
+            "一覧画面に戻ると、場所▼の『クリップボード取り込み』から開けます"
+        );
+    }
+
+    #[test]
+    fn reveal_reply_does_not_replace_a_newer_copy_or_generation() {
+        let old = PathBuf::from("capture/old.png");
+        let new = PathBuf::from("capture/new.png");
+        let mut shown = Some((5, PopupContent::Saved(new.clone())));
+        assert!(!resolve_reveal(
+            &mut shown,
+            5,
+            &old,
+            RevealResponse::Unavailable
+        ));
+        assert!(!resolve_reveal(
+            &mut shown,
+            4,
+            &new,
+            RevealResponse::Accepted
+        ));
+        assert!(matches!(shown.as_ref(), Some((5, PopupContent::Saved(p))) if *p == new));
+        assert!(resolve_reveal(
+            &mut shown,
+            5,
+            &new,
+            RevealResponse::Accepted
+        ));
+        assert!(shown.is_none());
+    }
 
     #[test]
     fn physical_position_handles_negative_monitors_and_taskbars() {

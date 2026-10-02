@@ -8,21 +8,122 @@ mod popup;
 
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
 
-pub(crate) fn default_destination() -> &'static std::path::Path {
-    static DESTINATION: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DESTINATION.get_or_init(|| crate::capture::default_output_dir().join("clipboard"))
+#[derive(Default)]
+enum DestinationState {
+    #[default]
+    NotStarted,
+    Resolving,
+    Ready(Result<PathBuf, String>),
+}
+
+#[derive(Default)]
+struct DestinationResolution {
+    state: Mutex<DestinationState>,
+    ready: Condvar,
+}
+
+impl DestinationResolution {
+    fn resolved(&self) -> Option<PathBuf> {
+        match &*self.state.lock().unwrap_or_else(|p| p.into_inner()) {
+            DestinationState::Ready(Ok(path)) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    fn start(
+        self: &Arc<Self>,
+        resolve: impl FnOnce() -> PathBuf + Send + 'static,
+        repaint: impl FnOnce() + Send + 'static,
+    ) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !matches!(*state, DestinationState::NotStarted) {
+                return;
+            }
+            *state = DestinationState::Resolving;
+        }
+        let owner = self.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("clipboard-capture-destination".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(resolve))
+                    .map_err(|_| "既定の保存先を確認できませんでした".to_owned());
+                owner.publish(result);
+                repaint();
+            })
+        {
+            self.publish(Err(format!("spawn destination worker: {error}")));
+        }
+    }
+
+    fn publish(&self, result: Result<PathBuf, String>) {
+        if let Err(error) = &result {
+            crate::logger::log(format!("clipboard_capture: destination: {error}"));
+        }
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = DestinationState::Ready(result);
+        self.ready.notify_all();
+    }
+
+    // Only save workers wait here. UI consumers use resolved(), which never
+    // invokes Shell APIs or waits for resolution.
+    fn wait(&self) -> Result<PathBuf, String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let DestinationState::Ready(result) = &*state {
+                return result.clone();
+            }
+            state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+fn destination_resolution() -> &'static Arc<DestinationResolution> {
+    static DESTINATION: OnceLock<Arc<DestinationResolution>> = OnceLock::new();
+    DESTINATION.get_or_init(|| Arc::new(DestinationResolution::default()))
+}
+
+pub(crate) fn default_destination() -> Option<PathBuf> {
+    destination_resolution().resolved()
+}
+
+pub(crate) fn start_default_destination_resolution(ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    destination_resolution().start(
+        || crate::capture::default_output_dir().join("clipboard"),
+        move || ctx.request_repaint(),
+    );
+}
+
+fn resolve_save_destination(destination: &Option<PathBuf>) -> Result<PathBuf, String> {
+    destination
+        .clone()
+        .map_or_else(|| destination_resolution().wait(), Ok)
+}
+
+fn synchronize_runtime<T>(
+    runtime: &mut Option<T>,
+    enabled: bool,
+    start: impl FnOnce() -> Result<T, String>,
+    update: impl FnOnce(&T),
+) -> Result<(), String> {
+    if let Some(runtime) = runtime {
+        update(runtime);
+    } else if enabled {
+        *runtime = Some(start()?);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CaptureConfig {
     pub images: bool,
     pub html: bool,
-    pub destination: PathBuf,
+    pub destination: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,15 +307,11 @@ impl ClipboardCaptureService {
         dark: bool,
         ctx: &egui::Context,
         hwnd: isize,
-        slot: crate::tray::PlacementSlot,
     ) {
         let config = CaptureConfig {
             images: settings.clipboard_capture_image_enabled,
             html: settings.clipboard_capture_html_enabled,
-            destination: settings
-                .clipboard_capture_output_dir
-                .clone()
-                .unwrap_or_else(|| default_destination().to_path_buf()),
+            destination: settings.clipboard_capture_output_dir.clone(),
         };
         if self
             .snapshot
@@ -234,35 +331,44 @@ impl ClipboardCaptureService {
         self.generation
             .store(snapshot.generation, Ordering::Release);
         self.snapshot = Some(snapshot.clone());
-        if let Some(runtime) = &self.runtime {
-            runtime.update_snapshot(snapshot);
-        } else if (snapshot.config.images || snapshot.config.html) && self.startup_error.is_none() {
-            let (tx, rx) = mpsc::channel();
-            let foreground_ctx = ctx.clone();
-            let foreground = Arc::new(move || {
-                crate::window_activation::activate_main_window(
-                    hwnd,
-                    &slot,
-                    &foreground_ctx,
-                    "clipboard capture",
-                );
-            });
-            let repaint_ctx = ctx.clone();
-            let repaint: Arc<dyn Fn() + Send + Sync> =
-                Arc::new(move || repaint_ctx.request_repaint());
-            match native::CaptureRuntime::start(
-                snapshot,
-                self.generation.clone(),
-                foreground,
-                tx,
-                repaint,
-            ) {
-                Ok(runtime) => {
-                    self.runtime = Some(runtime);
-                    self.event_rx = Some(rx);
-                }
-                Err(error) => self.record_startup_error(error),
+        let (tx, rx) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            repaint_ctx.request_repaint();
+            let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut _);
+            if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) }.as_bool()
+            {
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(hwnd),
+                        windows::Win32::UI::WindowsAndMessaging::WM_PAINT,
+                        windows::Win32::Foundation::WPARAM(0),
+                        windows::Win32::Foundation::LPARAM(0),
+                    )
+                };
             }
+        });
+        let mut started = false;
+        let result = synchronize_runtime(
+            &mut self.runtime,
+            (snapshot.config.images || snapshot.config.html) && self.startup_error.is_none(),
+            || {
+                let runtime = native::CaptureRuntime::start(
+                    snapshot.clone(),
+                    self.generation.clone(),
+                    tx,
+                    repaint,
+                )?;
+                started = true;
+                Ok(runtime)
+            },
+            |runtime| runtime.update_snapshot(snapshot.clone()),
+        );
+        if started {
+            self.event_rx = Some(rx);
+        }
+        if let Err(error) = result {
+            self.record_startup_error(error);
         }
     }
 
@@ -294,18 +400,142 @@ impl ClipboardCaptureService {
         }
         reveal
     }
+
+    #[cfg(test)]
+    pub(crate) fn inject_reveal_for_test(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.event_rx = Some(rx);
+        tx.send(CaptureEvent::RevealSaved {
+            generation: self.generation.load(Ordering::Acquire),
+            path,
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn resolve_reveal(&self, path: &std::path::Path, admitted: bool) {
+        if let Some(runtime) = &self.runtime {
+            runtime.resolve_reveal(
+                self.generation.load(Ordering::Acquire),
+                path,
+                if admitted {
+                    popup::RevealResponse::Accepted
+                } else {
+                    popup::RevealResponse::Unavailable
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn default_destination_is_resolved_once_off_caller_and_shared_with_save_waiters() {
+        let resolver = Arc::new(DestinationResolution::default());
+        let caller = std::thread::current().id();
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (wake, woken) = mpsc::channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = calls.clone();
+        resolver.start(
+            move || {
+                assert_ne!(std::thread::current().id(), caller);
+                counted.fetch_add(1, Ordering::AcqRel);
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                PathBuf::from("shared-default")
+            },
+            move || {
+                wake.send(()).unwrap();
+            },
+        );
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(resolver.resolved(), None);
+        resolver.start(|| panic!("second resolver must not start"), || {});
+        let save_resolver = resolver.clone();
+        let (waiting, waiter_started) = mpsc::channel();
+        let (result, results) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting.send(()).unwrap();
+            result.send(save_resolver.wait()).unwrap();
+        });
+        waiter_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        assert_eq!(
+            results
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            PathBuf::from("shared-default")
+        );
+        woken.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(resolver.resolved(), Some(PathBuf::from("shared-default")));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        resolver.start(|| panic!("completed resolver must not restart"), || {});
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn capture_runtime_starts_on_first_enable_and_survives_off_then_on() {
+        struct FakeRuntime {
+            tx: mpsc::Sender<bool>,
+        }
+        let mut runtime = None;
+        synchronize_runtime::<FakeRuntime>(
+            &mut runtime,
+            false,
+            || panic!("both OFF"),
+            |_| panic!("no runtime yet"),
+        )
+        .unwrap();
+        assert!(runtime.is_none());
+        let (tx, rx) = mpsc::channel();
+        let (seen, observed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Ok(enabled) = rx.recv() {
+                seen.send(enabled).unwrap();
+            }
+        });
+        synchronize_runtime(
+            &mut runtime,
+            true,
+            || Ok(FakeRuntime { tx }),
+            |_| panic!("new runtime"),
+        )
+        .unwrap();
+        let first_owner = runtime.as_ref().unwrap() as *const FakeRuntime;
+        for enabled in [false, true] {
+            synchronize_runtime(
+                &mut runtime,
+                enabled,
+                || panic!("must retain runtime"),
+                |runtime| {
+                    runtime.tx.send(enabled).unwrap();
+                },
+            )
+            .unwrap();
+            assert_eq!(runtime.as_ref().unwrap() as *const FakeRuntime, first_owner);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(5)).unwrap(),
+                enabled
+            );
+        }
+        drop(runtime);
+        worker.join().unwrap();
+    }
     fn snapshot(images: bool, html: bool, sequence: u32) -> Arc<CaptureSnapshot> {
         Arc::new(CaptureSnapshot::updated(
             None,
             CaptureConfig {
                 images,
                 html,
-                destination: PathBuf::from("capture"),
+                destination: Some(PathBuf::from("capture")),
             },
             sequence,
             false,
@@ -433,7 +663,7 @@ mod tests {
             CaptureConfig {
                 images: true,
                 html: true,
-                destination: PathBuf::from("capture"),
+                destination: Some(PathBuf::from("capture")),
             },
             41,
             false,
@@ -620,7 +850,7 @@ mod tests {
         let changed = Arc::new(CaptureSnapshot::updated(
             Some(&first.snapshot),
             CaptureConfig {
-                destination: PathBuf::from("other"),
+                destination: Some(PathBuf::from("other")),
                 ..first.snapshot.config.clone()
             },
             12,

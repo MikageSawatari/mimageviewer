@@ -46,13 +46,18 @@ pub fn location_menu_entries(settings: &Settings) -> Vec<LocationMenuEntry> {
 
 /// Main-only destination; never changes the shared Remote location enumeration.
 pub(crate) fn main_clipboard_capture_location(settings: &Settings) -> Option<PathBuf> {
+    main_clipboard_capture_location_from(settings, crate::clipboard_capture::default_destination())
+}
+
+fn main_clipboard_capture_location_from(
+    settings: &Settings,
+    resolved_default: Option<PathBuf>,
+) -> Option<PathBuf> {
     if settings.clipboard_capture_image_enabled || settings.clipboard_capture_html_enabled {
-        Some(
-            settings
-                .clipboard_capture_output_dir
-                .clone()
-                .unwrap_or_else(|| crate::clipboard_capture::default_destination().to_path_buf()),
-        )
+        settings
+            .clipboard_capture_output_dir
+            .clone()
+            .or(resolved_default)
     } else {
         None
     }
@@ -324,14 +329,24 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_capture_default_location_matches_capture_subdirectory() {
-        let settings = Settings {
+    fn clipboard_capture_default_location_is_hidden_until_resolved() {
+        let mut settings = Settings {
             clipboard_capture_image_enabled: true,
             ..Settings::default()
         };
+        let resolved = PathBuf::from("C:/Pictures/mimageviewer/clipboard");
         assert_eq!(
-            super::main_clipboard_capture_location(&settings),
-            Some(crate::capture::default_output_dir().join("clipboard"))
+            super::main_clipboard_capture_location_from(&settings, None),
+            None
+        );
+        assert_eq!(
+            super::main_clipboard_capture_location_from(&settings, Some(resolved.clone())),
+            Some(resolved)
+        );
+        settings.clipboard_capture_output_dir = Some(PathBuf::from("D:/explicit"));
+        assert_eq!(
+            super::main_clipboard_capture_location_from(&settings, None),
+            Some(PathBuf::from("D:/explicit"))
         );
     }
     use super::{

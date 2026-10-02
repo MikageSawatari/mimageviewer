@@ -1,4 +1,4 @@
-//! Main HWND activation shared by tray, second-instance requests and capture popup.
+//! Main HWND activation shared by tray, second-instance requests and accepted App capture events.
 //! Viewer routing and App restore synchronization remain with their existing owners.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

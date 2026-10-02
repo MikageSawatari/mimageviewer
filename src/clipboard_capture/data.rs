@@ -21,6 +21,18 @@ pub(crate) fn marker_is_ours(bytes: &[u8]) -> bool {
     bytes.get(..16) == Some(process_nonce())
 }
 
+/// RegisterClipboardFormat identifies names without regard to case. The known
+/// registered names used here are ASCII; share this comparison with raw-data
+/// lookup so classification and extraction recognize the same format.
+pub(super) fn format_name_eq(name: &str, expected: &str) -> bool {
+    name.eq_ignore_ascii_case(expected)
+}
+
+pub(super) fn format_name_starts_with(name: &str, prefix: &str) -> bool {
+    name.get(..prefix.len())
+        .is_some_and(|start| format_name_eq(start, prefix))
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ClipboardFormats {
     pub names: Vec<String>,
@@ -30,7 +42,7 @@ pub(crate) struct ClipboardFormats {
 
 impl ClipboardFormats {
     pub fn has(&self, name: &str) -> bool {
-        self.names.iter().any(|value| value == name)
+        self.names.iter().any(|value| format_name_eq(value, name))
     }
 
     fn has_files(&self) -> bool {
@@ -57,7 +69,7 @@ impl ClipboardFormats {
             || self
                 .names
                 .iter()
-                .any(|name| name.starts_with("PowerPoint "))
+                .any(|name| format_name_starts_with(name, "PowerPoint "))
     }
 }
 
@@ -556,6 +568,46 @@ mod tests {
         }
     }
 
+    fn mixed_case(value: &str) -> String {
+        value
+            .chars()
+            .enumerate()
+            .map(|(index, letter)| {
+                if index % 2 == 0 {
+                    letter.to_ascii_lowercase()
+                } else {
+                    letter.to_ascii_uppercase()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn registered_format_names_match_case_without_changing_name_boundaries() {
+        for name in [
+            "CanIncludeInClipboardHistory",
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "Clipboard Viewer Ignore",
+            "PNG",
+            "HTML Format",
+            "UniformResourceLocatorW",
+            "Chromium internal source URL",
+            ORIGIN_FORMAT_NAME,
+        ] {
+            assert!(format_name_eq(&mixed_case(name), name), "{name}");
+            assert!(formats(&[&mixed_case(name)]).has(name), "{name}");
+            assert!(!format_name_eq(&format!("{name} extra"), name), "{name}");
+        }
+        assert!(format_name_starts_with(
+            "pOwErPoInT 12.0 Internal Shapes",
+            "PowerPoint "
+        ));
+        assert!(!format_name_starts_with("POWERPOINT", "PowerPoint "));
+        assert!(!format_name_starts_with("POWERPOINTish", "PowerPoint "));
+        assert!(!format_name_starts_with("POWERPOINTé", "PowerPoint "));
+        assert!(!format_name_eq("ＰＮＧ", "PNG"));
+    }
+
     #[test]
     fn s0_format_fixtures_obey_automatic_and_manual_routes() {
         let fixtures: &[(&str, &[&str], Option<&str>, ClipboardKind, ClipboardKind)] = &[
@@ -690,9 +742,18 @@ mod tests {
             ),
         ];
         for (label, names, source, automatic, manual) in fixtures {
-            let formats = formats(names);
-            assert_eq!(classify_automatic(&formats, *source), *automatic, "{label}");
-            assert_eq!(classify_manual(&formats), *manual, "{label}");
+            for spelling in [
+                names.iter().map(|name| (*name).to_owned()).collect(),
+                names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+                names.iter().map(|name| mixed_case(name)).collect(),
+            ] {
+                let formats = ClipboardFormats {
+                    names: spelling,
+                    ..Default::default()
+                };
+                assert_eq!(classify_automatic(&formats, *source), *automatic, "{label}");
+                assert_eq!(classify_manual(&formats), *manual, "{label}");
+            }
         }
     }
 
@@ -702,9 +763,11 @@ mod tests {
             "ExcludeClipboardContentFromMonitorProcessing",
             "Clipboard Viewer Ignore",
         ] {
-            let formats = formats(&[excluded, "PNG", "CF_HDROP"]);
-            assert_eq!(classify_automatic(&formats, None), ClipboardKind::Ignored);
-            assert_eq!(classify_manual(&formats), ClipboardKind::Files);
+            for spelling in [excluded.to_owned(), mixed_case(excluded)] {
+                let formats = formats(&[&spelling, "pNg", "CF_HDROP"]);
+                assert_eq!(classify_automatic(&formats, None), ClipboardKind::Ignored);
+                assert_eq!(classify_manual(&formats), ClipboardKind::Files);
+            }
         }
         let mut formats = formats(&["PNG", "HTML Format", "CF_UNICODETEXT"]);
         formats.history_allowed = Some(false);
@@ -737,13 +800,15 @@ mod tests {
             "Art::GVML ClipFormat",
             "PowerPoint 12.0 Internal Shapes",
         ] {
-            assert_eq!(
-                classify_automatic(
-                    &formats(&[name, "PNG", "HTML Format"]),
-                    Some("https://example.com")
-                ),
-                ClipboardKind::Ignored
-            );
+            for spelling in [name.to_owned(), mixed_case(name)] {
+                assert_eq!(
+                    classify_automatic(
+                        &formats(&[&spelling, "pNg", "hTmL fOrMaT"]),
+                        Some("https://example.com")
+                    ),
+                    ClipboardKind::Ignored
+                );
+            }
         }
         for file in ["CF_HDROP", "FileGroupDescriptorW", "Shell IDList Array"] {
             assert_eq!(

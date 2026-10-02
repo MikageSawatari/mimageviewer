@@ -37,6 +37,15 @@ fn preferences_clipboard_capture_light() {
 }
 
 #[test]
+fn preferences_clipboard_capture_pending_default_light() {
+    snapshot_with_theme(
+        "preferences_clipboard_capture_pending_default_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_clipboard_capture_settings_pending_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_clipboard_capture_failed_dark() {
     snapshot_with_theme(
         "preferences_clipboard_capture_failed_dark",
