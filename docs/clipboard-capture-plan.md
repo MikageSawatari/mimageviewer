@@ -1,6 +1,6 @@
 # クリップボード取り込み 設計書
 
-ステータス: **第 5 版 (2026-10-02)。独立レビュー第 1〜3 回の指摘、利用者の決定 (§11)、S0 の結果 (§5.8) を反映済み。Q8 と Ctrl+V の現状確認が回答待ち。未実装**。
+ステータス: **第 6 版 (2026-10-02)。独立レビュー第 1〜3 回の指摘、利用者の決定 (§11 Q1〜Q8)、S0 の結果 (§5.8) を反映済み。未実装**。
 担当: 設計・検収 = ClaudeCode Opus 5.5 / high、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = 実装者とは別の GPT-6.1 Sol / xhigh (AGENTS.md の既定)。
 作業ブランチ: `clipboard-capture` (worktree `C:\home\mimageviewer-clipcapture`)。
@@ -186,8 +186,12 @@ CLAUDE.md「設計の簡素化」に従い、割り込みを扱う仕組みを�
 
 ### 5.2 読み取りの手順 (自動)
 
-0. **落ち着くのを待つ**: 最後の通知から 200 ms、新しい通知が来なくなるまで待ってから読む。待っている間に来た通知は latest-request slot に合流する。
-   - S0 で、Office は 1 回のコピーで通知が 2 回届くことを確認した (Excel 25 ms 後、PowerPoint 34 ms 後、§5.8)。1 回目の時点で形式がそろっていない可能性があるので、2 回目を待つ。
+0. **落ち着くのを待つ**: 最後の通知から 300 ms、新しい通知が来なくなるまで待ってから読む。待っている間に来た通知は latest-request slot に合流する。
+   - S0 で、1 回のコピーで通知が 2 回届くアプリがあることを確認した (§5.8)。1 回目の時点では形式がそろっていない可能性があるので、2 回目を待つ。
+     - 切り取りツール: 156 ms 後
+     - PowerPoint: 34 ms 後
+     - Excel: 25 ms 後
+   - 300 ms は、観測した最大の 156 ms に余裕を持たせた値。
    - Word は 2.1 秒後に 2 回目が来た。ただし Word の文章コピーには画像も `SourceURL` も無いので、待たなくても結果は変わらない。
 1. **設定の確認**: 要求に付いた設定スナップショットで、対象の種類が OFF なら読まない (§5.3)。
 2. **重複の排除**: 要求の OS sequence が、最後に受理した sequence と等しければ読まない。同じコピーで通知が複数回届く場合のため。
@@ -245,10 +249,10 @@ UI thread は次の項目を 1 つの不変スナップショットにまとめ�
 2. **mIV 自身のコピー**: §5.7 の印がある。
 3. **ファイル類**: `CF_HDROP`、`FileGroupDescriptorW`、`Shell IDList Array` のいずれかがある。
 4. **画像データ**: 登録形式 `PNG`、`CF_DIBV5`、`CF_DIB` のいずれかがある。
-   - ただし、次のどれかに当てはまるものは除く (S0 で決定、§5.8)。Excel の表のコピーはここで外れ、ブラウザの「画像をコピー」は外れない。
+   - ただし、次のどれかに当てはまるものは除く (S0 と利用者の決定 Q8、§5.8)。**Office (Excel / Word / PowerPoint) からのコピーはここで外れ**、ブラウザと切り取りツールの画像は外れない。
      - `Embed Source`、`Object Descriptor`、`XML Spreadsheet` のいずれかの形式がある
+     - `Art::GVML ClipFormat` の形式、または名前が `PowerPoint ` で始まる形式がある (Office の図形・グラフ)
      - 空でない `CF_UNICODETEXT` がある
-   - PowerPoint の図形のコピーの扱いは、利用者の回答待ち (§11 Q8)。
 5. **HTML**: `HTML Format` があり、ヘッダの `SourceURL` が `http` / `https`。
    - Word / Outlook などのコピーは `SourceURL` を持たないので、ここで外れる見込み。S0 で確認する。
 6. **それ以外**: 何もしない。
@@ -367,6 +371,9 @@ mIV の「画像をコピー」は、次のすべてが [context_menu.rs:2503](.
 | 173857 | Explorer のファイルコピー | `CF_HDROP`、`Shell IDList Array`、`FileGroupDescriptorW` ほか | ファイル類 |
 | 173911 | mIV のファイルコピー | 同上 | ファイル類 |
 | 173922 | mIV の「画像をコピー」 | `CF_DIB`、`CF_DIBV5`、`CF_BITMAP` (24bpp) | 所有者なしで書き込みに成功 (§5.7) |
+| 180739 | 切り取りツール (Win+Shift+S) | `PNG`、`CF_DIB` / `CF_DIBV5`、`CanIncludeInClipboardHistory` (値 1)、`CanUploadToCloudClipboard` | 所有者なし。テキストなし。通知 2 回 (156 ms 後) |
+| 180801 | Edge「画像をコピー」 | Chrome と同じ形式の組 (`PNG`、`HTML Format`、`UniformResourceLocatorW`、`Chromium internal source URL` ほか) | Chrome と同じ。HTML に `SourceURL` なし |
+| 180822 | Firefox「画像をコピー」 | `PNG`、`CF_DIBV5` / `CF_DIB` (24bpp)、`HTML Format`、`text/html`、`text/_moz_htmlcontext` (空) | `UniformResourceLocatorW` と Chromium の形式は無い。HTML に `SourceURL` は無く、`<img src>` だけ。通知 1 回 |
 
 すべての記録で、読み取りの前後で sequence は変わらなかった。読み取りがきっかけの遅延 rendering で、sequence が後から変わる例は無かった。
 
@@ -387,21 +394,22 @@ mIV の「画像をコピー」は、次のすべてが [context_menu.rs:2503](.
 
 **決めたこと**:
 
-- **画像データの除外規則** (§5.4): `Embed Source` / `Object Descriptor` / `XML Spreadsheet` のどれかがある、または空でない `CF_UNICODETEXT` がある場合は除外する。
-  - Excel の表は除外される。
-  - Chrome の「画像をコピー」と PowerPoint の図形は除外されない (PowerPoint は §11 Q8)。
-- **通知の待ち合わせ** (§5.2-0): 最後の通知から 200 ms 待ってから読む。
-- **`PNG` を最優先する**: Chrome も PowerPoint も `PNG` を入れていた。`PNG` があれば、DIB の alpha の扱い (§5.4) で透過が失われる場面は起きない。
+- **画像データの除外規則** (§5.4): 次のどれかがある場合は除外する。利用者の決定 (Q8) で、Office は Excel / Word / PowerPoint をそろえて除外する。
+  - `Embed Source` / `Object Descriptor` / `XML Spreadsheet`
+  - `Art::GVML ClipFormat` / 名前が `PowerPoint ` で始まる形式
+  - 空でない `CF_UNICODETEXT`
+  - Chrome / Edge / Firefox の「画像をコピー」と切り取りツールは、どれにも当たらないので取り込まれる (どれもテキストを入れていない)。
+- **通知の待ち合わせ** (§5.2-0): 最後の通知から 300 ms 待ってから読む。
+- **`PNG` を最優先する**: 3 つのブラウザ・切り取りツール・PowerPoint のすべてが `PNG` を入れていた。`PNG` があれば、DIB の alpha の扱い (§5.4) で透過が失われる場面は起きない。
 - **「画像をコピー」の出どころ** (§10.2): HTML に `SourceURL` が無いので、別の形式から取る。
-  - 画像 URL は `UniformResourceLocatorW` から取る。
-  - ページ URL は Chromium の `Chromium internal source URL` から取る。Chromium 独自の形式なので、取れたときだけ使う。中身の書式は実装時に確かめる。
+  - 画像 URL は `UniformResourceLocatorW` から取る (Chrome / Edge)。無ければ、`HTML Format` の `<img src>` が 1 件だけのときにそれを使う (Firefox)。
+  - ページ URL は Chromium の `Chromium internal source URL` から取る (Chrome / Edge)。Chromium 独自の形式なので、取れたときだけ使う。中身の書式は実装時に確かめる。
+  - Firefox ではページ URL は取れない (`text/_moz_htmlcontext` は空だった)。
 - **HTML の候補** (§7): インライン `style` の `background-image: url()` を候補に加える。SVG は mIV で扱えないので候補から外す。
 - **今の画像コピーの経路** (§5.7): 変えない。
+- **Firefox**: ページ URL を取る手段が無いので、ファイル名のドメインは画像 URL のドメインになる (§2.6)。
 
-**未確認 (S1 に着手する前に確かめる)**:
-
-- 今の mIV で、Chrome で「画像をコピー」した後に一覧で Ctrl+V を押したときの動作 (§5.5)。**利用者の回答待ち**。
-- (任意) 切り取りツールと、Edge / Firefox の「画像をコピー」。今の規則で取り込める見込み。Edge は Chromium なので、Chrome と同じ見込み。
+**今の Ctrl+V の動作** (§5.5): 今の mIV で、Chrome で「画像をコピー」した後に一覧で Ctrl+V を押すと、**何も起きなかった** (2026-10-02、利用者が確認)。画像データだけのクリップボードでは、今の Shell の貼り付けは何もしない。§5.5 の分岐で失われる既存の動作は無い。
 
 ## 6. 右下の小窓
 
@@ -667,7 +675,7 @@ App が所有する `CaptureFetchService` が、固定 4 本の worker を持つ
 
 いずれも userinfo と fragment は除く。
 
-「画像をコピー」(画像データ) の場合は、`HostUrl` を `UniformResourceLocatorW` から、`ReferrerUrl` を `Chromium internal source URL` から取る。取れなければ書かない (§5.8)。
+「画像をコピー」(画像データ) の場合は、§5.8 の取り方で `HostUrl` と `ReferrerUrl` を決める。取れないものは書かない。
 
 利点:
 - 新しい DB が要らない。
@@ -698,7 +706,7 @@ App が所有する `CaptureFetchService` が、固定 4 本の worker を持つ
 | Q4 | 選択ダイアログで最初からチェックを付けておくか | **最小サイズ以上は全部チェック済み** |
 | Q5 | 場所▼の「クリップボード取り込み」の表示条件 | **どちらかのチェックが ON のときだけ** |
 | Q6 | 社内サイト・NAS など、ローカル / プライベートアドレス上の画像を取り込めるか | **ブラウザと同じ規則で取り込める** (§8.3)。社内のページからは社内の画像を取れるが、外部のページに仕込まれた社内向けの URL は取らない。業務で社内の開発中サービスから画像を取る用途があるため |
-| Q8 | PowerPoint の図形をコピーしたときも自動保存するか | **回答待ち**。今の除外規則 (§5.4) では保存される。除外する場合は、PowerPoint 独自の形式 (`PowerPoint 12.0 Internal Shapes` 等) で見分けられる |
+| Q8 | PowerPoint の図形をコピーしたときも自動保存するか | **保存しない**。Excel / Word とそろえて Office からのコピーは除外する (§5.4) |
 | Q7 | 同じ画像を続けて 2 回コピーしたとき、2 枚目を保存するか | **保存しない** (直前の 1 件と一致する場合だけ)。間に別の内容のコピーを挟めば、同じ画像でも保存する (§5.6。経過時間は見ない) |
 
 ## 12. 範囲外 (v1)
@@ -740,7 +748,7 @@ S1〜S3 は、段ごとに独立レビューを受ける。
   - 直前と同じ内容を保存しないこと。間にテキストを挟めば保存すること
   - 画像 A を保存 → 監視 OFF → 監視 ON → 画像 A、の順で保存されること (有効化の境界でハッシュが捨てられる)
   - 3 つの sequence が一致しない場合と、世代が古い読み取りで、受理済みの sequence とハッシュが更新されないこと
-  - 200 ms の待ち合わせの間に来た通知が合流すること
+  - 300 ms の待ち合わせの間に来た通知が合流すること
 - **寸法の上限**:
   - 巨大な寸法の `PNG` / DIB が、取り込みの入口でメモリ確保の前に拒否されること。
   - **製本の「クリップボードの画像を本に追加」は今の受付範囲のまま**であること (40000×1 の DIB を受け付ける)。
@@ -749,7 +757,7 @@ S1〜S3 は、段ごとに独立レビューを受ける。
   - 印が書かれること。
   - 印の失敗で画像コピーが止まらないこと。
   - 世代が古い書き込みを捨てる既存の約束が保たれること。
-- **S0 の記録を fixture にする**: 記録した形式の集合 (Chrome「画像をコピー」/ Excel / Word / PowerPoint / Explorer / mIV) を判定関数に通し、§5.8 の決定どおりになること。
+- **S0 の記録を fixture にする**: 記録した形式の集合 (Chrome / Edge / Firefox の「画像をコピー」、切り取りツール、Excel / Word / PowerPoint、Explorer、mIV) を判定関数に通し、§5.8 の決定どおりになること。
 - **DIB**: 完全透明・部分透明・alpha 未定義を、製本の入口とクリップボード取り込みの入口の両方で確かめる (§5.4 の規則のとおりになること)。
 - **CF_HTML**:
   - 正常なもの
@@ -869,7 +877,7 @@ S1〜S3 は、段ごとに独立レビューを受ける。
 
 あわせて、S0 の結果 (§5.8) を次のとおり反映した。
 
-- 除外規則と、200 ms の待ち合わせを決めた。
+- 除外規則と、通知の待ち合わせを決めた (第 6 版で、切り取りツールの 156 ms を受けて 300 ms にした)。
 - 候補にインライン `style` の背景画像を加え、SVG を外した。
 - 「画像をコピー」の出どころの取り方を決めた。
 - 今の画像コピーが成功していると分かったので、第 4 版の書き込み専用 thread を取りやめた (§5.7)。
