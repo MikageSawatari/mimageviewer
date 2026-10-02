@@ -44,7 +44,8 @@ configure が watcher 登録より先に走る欠落窓、登録失敗のログ�
 更新する。現在 store と array snapshot の ack が揃ってから既存の終端経路で Complete を出す。
 dirty の `retain_after` と gap repair は `ScannedFull` だけに適用し、再利用中の dirty は MoreWork
 から Delta へ残す。印は完全な Full だけで立て、イベント・クラッシュでは消さない。
-設定purgeで旧索引のデータを削除するときは、その transaction 内で印も消す。
+設定purgeで公開済み item / container を削除するときは、その transaction 内で印も消す。
+build / prefill だけの整理では公開索引を失わないため、削除件数が正でも印を保持する。
 別指紋 Full は既存の未完build掃除 transaction で旧印を失効させ、最初の走査書き込みより
 前に確定する。構成を元に戻し Full 完了前に正常終了しても再利用しない。同一指紋 Full の
 取消と no-op purge は旧印を保持する。OFF時 purge は既存どおり ActivityGate を迂回して

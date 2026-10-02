@@ -10412,6 +10412,92 @@ mod tests {
     }
 
     #[test]
+    fn startup_excluded_prefill_tidy_keeps_marker_and_reuses_next_start() {
+        let (temp, manager, db, id) = startup_worker_fixture(false, false);
+        let config = {
+            let mut state = manager.scheduler.state.lock().unwrap();
+            let config = state.desired_config.as_mut().unwrap();
+            config.excluded_roots = vec![config.roots[0].path.join("bookshelf")];
+            config.excluded_root_keys = config
+                .excluded_roots
+                .iter()
+                .map(|path| crate::search_index_db::normalize_path(path))
+                .collect();
+            config.clone()
+        };
+        let fingerprint = similar_scan_fingerprint(&config);
+        Arc::clone(&manager.scheduler).worker_loop();
+        assert!(matches!(manager.progress(), IndexProgress::Complete(_)));
+        assert_eq!(db.full_inventory_load_count(), 1);
+        assert!(db.scanned_once_matches(&fingerprint).unwrap());
+
+        // Browsing an excluded bookshelf can leave auxiliary prefill after a complete Full.
+        let prefill = row(
+            1,
+            &format!("{}/browsed.jpg", config.excluded_root_keys[0]),
+            [7; 32],
+            10,
+        )
+        .item;
+        db.put_prefill(&prefill).unwrap();
+        drop(manager);
+        drop(db);
+
+        // The first reuse tidies the prefill; the following start must still reuse the index.
+        for _ in 0..2 {
+            let db = Arc::new(SimilarDb::open_at(&temp.path().join("similar.db")).unwrap());
+            assert!(db.scanned_once_matches(&fingerprint).unwrap());
+            let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+            let mut state =
+                coordinator_state_with_watch(id, &config.roots[0].path, WatchHealth::Ready);
+            state.desired_config = Some(config.clone());
+            state.pending_full = Some(initial_full_intent());
+            state.phase = SchedulerPhase::Starting;
+            *manager.scheduler.prefill_db.lock().unwrap() = Some(Arc::clone(&db));
+            *manager.scheduler.state.lock().unwrap() = state;
+            manager.set_skip_offline_change_scan(true);
+            let reused = Arc::new(AtomicBool::new(false));
+            let observed_reuse = Arc::clone(&reused);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            *manager.scheduler.startup_test_probe.lock().unwrap() = Some(Arc::new(move |phase| {
+                if phase == "reused_initial" {
+                    observed_reuse.store(true, Ordering::Release);
+                } else if phase == "before_array_request" {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }));
+            std::thread::scope(|threads| {
+                let scheduler = Arc::clone(&manager.scheduler);
+                let worker = threads.spawn(move || scheduler.worker_loop());
+                entered_rx.recv().unwrap();
+                let awaiting_ack = matches!(manager.progress(), IndexProgress::AwaitingArray(_));
+                let remaining_prefill = db.load_prefill(
+                    &prefill.item_key,
+                    prefill.mtime,
+                    prefill.file_size,
+                    prefill.hash_version,
+                );
+                let marker_kept = db.scanned_once_matches(&fingerprint);
+                // Release the worker before assertions so an invalidated marker fails, not hangs.
+                release_tx.send(()).unwrap();
+                worker.join().unwrap();
+                assert!(reused.load(Ordering::Acquire));
+                assert!(awaiting_ack);
+                assert!(remaining_prefill.unwrap().is_none());
+                assert!(marker_kept.unwrap());
+            });
+            assert!(matches!(manager.progress(), IndexProgress::Complete(_)));
+            assert_eq!(db.full_inventory_load_count(), 0);
+            assert_eq!(db.cleanup_incomplete_call_count(), 1);
+            assert_eq!(manager.reconcile_job_counts_for_test(), (0, 0));
+            assert!(db.scanned_once_matches(&fingerprint).unwrap());
+        }
+    }
+
+    #[test]
     fn startup_marker_and_setting_control_full_and_success_sets_marker() {
         for (skip, marker) in [(false, true), (true, false), (true, true)] {
             let (_temp, manager, db, _id) = startup_worker_fixture(skip, marker);

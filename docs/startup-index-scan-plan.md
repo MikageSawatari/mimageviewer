@@ -338,6 +338,8 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
   purge は「公開済みの item / container、build、prefill のキーのうち、現在の有効 root の和集合
   (共通除外を除く) の外にあるものを消す」API を新設する。包含関係 (入れ子の root) を保護し、
   変更履歴と watermark は既存の purge と同じく更新する。
+  公開済み item / container の削除は同じ transaction で完走印を失効させる。
+  build / prefill だけの整理では完走印を保持する。
   そのうえでメモリ読み込みを行い、**現在の store とメモリ snapshot の array ack を待ってから**
   Complete にする ([similar_index.rs:3032](../src/similar_index.rs))。
   実装は既存の worker loop の中で行い、job の結果を typed に `ScannedFull` / `ReusedInitial` と
@@ -1020,3 +1022,63 @@ libコマンドは `cargo test -j1 -p mimageviewer --lib <filter> -- --test-thre
 `runtime=4 pe=3`。ログは `target/startup-scan-s3/fingerprint-full/build-dev.log`。
 成果物は起動しておらず、通常 `%APPDATA%\mimageviewer` に触れていない。
 今回承認された別指紋Fullの修正に未実装項目はない。
+
+### 11.7 similar の補助データ整理と完走印 (2026-10-02)
+
+HEAD `1c54be82f` の再レビューで、同一指紋の ReusedInitial が共通除外配下の prefill だけを
+整理しても印を消し、その次の起動で不要な Full を実行することが判明した。
+`purge_keys_if` は item / container の削除数を build / prefill の削除前に保存し、その数だけで
+同じ transaction 内の印の失効を判定する。呼び出し元へ返す全テーブルの削除件数、変更履歴、
+watermark、集計更新、取消時の rollback は既存契約を維持する。
+
+- 共通除外整理と OFF 時 purge は同じ修正済み入口を通る。公開 item / container を削除する
+  purge は引き続き印を消し、補助データだけの purge は印を保持する。
+- 回帰は3件追加。DB テストで prefill のみ / build のみ / 両方の整理を両 purge API で確認し、
+  公開索引と watermark と印を保持することを固定する。公開 container のみを削除する場合は
+  印が失効することも確認する。
+- worker 回帰は Full を実際に完了させ、共通除外配下の閲覧を模した prefill を保存して正常終了。
+  同一構成の DB を開き直す2回の起動がどちらも ReusedInitial となり、Full inventory を読まず、
+  array ack 後に Complete となることを確認する。array 要求前の停止と解除は channel gate を使う。
+- 任意の prefill 保存時の共通除外チェックは見送った。現在の保存条件は検索処理と共有する
+  `enabled_roots` を正本とし、共通除外は別の scheduler 設定状態にある。既存の OFF / 保存 / purge
+  の順序保証を保って両者を読むには所有境界の変更が必要なため、単純な追加条件では済まない。
+  今回は保存経路の責務を広げず、補助データが残っても公開索引の完走印を失わない規則を採用した。
+- schema・UI・マニュアルの操作説明には変更なし。retry・新しい復旧状態・再利用時の印の再作成は
+  追加しない。
+
+初回検証では追加 fixture の前提を2点修正した。build 開始 API が作る公開 table の Building
+placeholder を除かないと補助データだけにならず、空 container の公開には page_count=0 が必要。
+製品コードの変更は公開 table の削除数で印の失効を判定する修正だけを維持した。
+また worker 回帰は gate 停止中の DB / 進捗を取得し、解除・join 後に assert する。
+旧不具合で印が消えてもテストが gate 待ちでハングせず、assert で失敗する。
+
+最終の対象テストはすべて成功。`MSBUILDDISABLENODEREUSE=1` を設定し、lib は下記を
+`cargo test -j1 -p mimageviewer --lib <filter> -- --test-threads=1` で実行した。
+
+| filter | 成功件数 | ignored |
+| --- | ---: | ---: |
+| `similar_db` | 65 | 3 |
+| `similar_index::tests::startup_` | 11 | 0 |
+| `similar_index::tests::incremental_reconcile` | 25 | 0 |
+| `prefill` | 6 | 0 |
+
+成功分は重複を除いて106件 (`prefill` に新しい startup 回帰1件が重複)。ログは
+`target/startup-scan-s3/auxiliary-tidy/*-final.log`。初回の
+`cargo test -j1 -p mimageviewer --lib startup_auxiliary_only_purge -- --test-threads=1` は
+fixture の前提不一致で0成功・1失敗 (`auxiliary-purge.log`)。
+続く `similar_db` は64成功・1失敗・3 ignored (`similar-db.log`) で、空 container の fixture を
+修正した。上表はその修正後の最終実行であり、失敗は残っていない。
+
+全workspaceの `cargo fmt --all` と `cargo fmt --all --check`、`git diff --check` が成功。
+`python scripts/check_ui_glyphs.py` は問題0。
+`cargo check -j1 -p mimageviewer --bin mimageviewer-core` は exit 0 (`cargo-check.log`)。
+UIに変更がないためsnapshotの実行・更新はせず、§11.5 の59件成功を再利用する。
+fts / name の integration は変更範囲外で、§11.6 の成功結果を再利用する。
+全workspace suite・アプリ起動・コミットは行っていない。
+
+確認用 build は `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が exit 0。
+core は4分49秒、remote service・EPUB worker も成功し、CRT 検査は `runtime=4 pe=3`。
+ログは `target/startup-scan-s3/auxiliary-tidy/build-dev.log`。成果物は起動していない。
+`target/startup-scan-s3/commit-message.txt` を指定署名付きで上書きし、先頭byte検査で
+UTF-8 BOMなし、末尾が指定の Co-Authored-By 行であることを確認した。
+要求された失効判定と回帰に未実装項目はなく、任意の保存時除外チェックの見送り理由は上記。

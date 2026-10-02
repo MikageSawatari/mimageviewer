@@ -3082,6 +3082,7 @@ impl SimilarDb {
             removed +=
                 transaction.execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
         }
+        let published_removed = removed;
         for key in build_item_keys.into_iter().filter(|key| should_purge(key)) {
             removed += transaction.execute("DELETE FROM item_build WHERE item_key = ?1", [&key])?;
         }
@@ -3102,8 +3103,9 @@ impl SimilarDb {
         }
 
         // These purges are configuration/store cleanup, not ordinary watcher deletions.
-        // Once covered data is discarded, returning to an older fingerprint must scan again.
-        if removed != 0 {
+        // Only discarded published item/container data revokes the completed scan marker.
+        // Auxiliary build/prefill tidying leaves the covered index intact.
+        if published_removed != 0 {
             transaction.execute("DELETE FROM scanned_once", [])?;
         }
 
@@ -6965,6 +6967,115 @@ mod tests {
             ConditionalCommit::Committed(0)
         );
         assert!(db.scanned_once_matches("original").unwrap());
+    }
+
+    #[test]
+    fn startup_auxiliary_only_purge_preserves_marker_and_published_watermark() {
+        for outside_union in [false, true] {
+            for (build, prefill) in [(false, true), (true, false), (true, true)] {
+                let db = SimilarDb::open_in_memory().unwrap();
+                db.upsert_loose_item(&item("c:/library/keep.jpg", None, None, 1))
+                    .unwrap();
+                if build {
+                    let generation = db
+                        .begin_container_build(
+                            "c:/library/excluded/build.zip",
+                            ContainerKind::Zip,
+                            1,
+                            1,
+                            10,
+                        )
+                        .unwrap();
+                    db.stage_item(
+                        generation,
+                        &item(
+                            "c:/library/excluded/build.zip\u{1f}page.jpg",
+                            Some("c:/library/excluded/build.zip"),
+                            Some(0),
+                            2,
+                        ),
+                    )
+                    .unwrap();
+                    // The first-build API also creates a public-table placeholder. Keep this
+                    // fixture auxiliary-only before recording the completed scan marker.
+                    db.conn
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "DELETE FROM container WHERE container_key = ?1",
+                            ["c:/library/excluded/build.zip"],
+                        )
+                        .unwrap();
+                }
+                let offered = item("c:/library/excluded/prefill.jpg", None, None, 3);
+                if prefill {
+                    db.put_prefill(&offered).unwrap();
+                }
+                db.record_completed_index(
+                    current_hash_version(),
+                    1,
+                    CompletedIndexStats::default(),
+                )
+                .unwrap();
+                db.mark_scanned_once("same fingerprint").unwrap();
+                let before = db.change_watermark().unwrap();
+                let roots = ["c:/library".to_owned()];
+                let excluded = ["c:/library/excluded".to_owned()];
+                let result = if outside_union {
+                    db.purge_outside_active_roots_if(&roots, &excluded, || true)
+                } else {
+                    db.purge_roots_except_if(&excluded, &[], || true)
+                };
+                assert_eq!(
+                    result.unwrap(),
+                    ConditionalCommit::Committed(usize::from(build) * 2 + usize::from(prefill))
+                );
+                assert_eq!(db.count_staged(), 0);
+                assert!(
+                    db.load_prefill(
+                        &offered.item_key,
+                        offered.mtime,
+                        offered.file_size,
+                        offered.hash_version,
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                assert_eq!(
+                    db.load_search_rows(current_hash_version()).unwrap().len(),
+                    1
+                );
+                assert_eq!(db.change_watermark().unwrap(), before);
+                assert!(db.scanned_once_matches("same fingerprint").unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn startup_published_container_only_purge_invalidates_marker() {
+        for outside_union in [false, true] {
+            let db = SimilarDb::open_in_memory().unwrap();
+            let generation = db
+                .begin_container_build("c:/library/empty.zip", ContainerKind::Zip, 0, 1, 10)
+                .unwrap();
+            db.complete_container("c:/library/empty.zip", generation)
+                .unwrap();
+            db.mark_scanned_once("original").unwrap();
+            assert!(
+                db.load_search_rows(current_hash_version())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(db.load_complete_containers().unwrap().len(), 1);
+            let result = if outside_union {
+                db.purge_outside_active_roots_if(&[], &[], || true)
+            } else {
+                db.purge_roots_except_if(&["c:/library".to_owned()], &[], || true)
+            };
+            assert_eq!(result.unwrap(), ConditionalCommit::Committed(1));
+            assert!(db.load_complete_containers().unwrap().is_empty());
+            assert!(!db.scanned_once_matches("original").unwrap());
+        }
     }
 
     #[test]
