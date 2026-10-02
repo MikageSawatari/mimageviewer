@@ -55,9 +55,13 @@ struct Shared {
     repaint: Arc<dyn Fn() + Send + Sync>,
 }
 impl Shared {
-    fn fail(&self, error: String) {
+    fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        super::wake_save_destination_waiters();
         let _ = self.wake.try_send(());
+    }
+    fn fail(&self, error: String) {
+        self.stop();
         crate::logger::log(format!("clipboard_capture: {error}"));
         let _ = self.events.send(CaptureEvent::StartupFailed(error));
         (self.repaint)();
@@ -542,7 +546,9 @@ impl CaptureRuntime {
                     .config
                     .destination
                     .clone();
-                if let Ok(destination) = super::resolve_save_destination(&initial_destination) {
+                // Cleanup is best effort once at startup. An unresolved default
+                // must not hold the save queue behind a stalled Shell call.
+                if let Some(destination) = super::resolved_save_destination(&initial_destination) {
                     if let Err(error) = data::cleanup_part_files(&destination) {
                         crate::logger::log(format!(
                             "clipboard_capture: temporary cleanup: {error}"
@@ -552,7 +558,12 @@ impl CaptureRuntime {
                 run_save_worker(
                     save_rx,
                     |job| save_state.current(&job.request),
-                    |job| super::resolve_save_destination(&job.request.snapshot.config.destination),
+                    |job| {
+                        super::resolve_save_destination(
+                            &job.request.snapshot.config.destination,
+                            || save_state.current(&job.request),
+                        )
+                    },
                     |job, destination| {
                         data::save_image(&job.image, destination, &data::CaptureTimestamp::now())
                     },
@@ -591,7 +602,7 @@ impl CaptureRuntime {
         {
             Ok(thread) => thread,
             Err(e) => {
-                state.stop.store(true, Ordering::Release);
+                state.stop();
                 return Err(format!("spawn reader: {e}"));
             }
         };
@@ -602,8 +613,7 @@ impl CaptureRuntime {
         {
             Ok(thread) => thread,
             Err(e) => {
-                state.stop.store(true, Ordering::Release);
-                let _ = state.wake.try_send(());
+                state.stop();
                 return Err(format!("spawn listener: {e}"));
             }
         };
@@ -624,6 +634,7 @@ impl CaptureRuntime {
             .snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = snapshot;
+        super::wake_save_destination_waiters();
     }
 
     pub(super) fn resolve_reveal(
@@ -641,7 +652,7 @@ impl CaptureRuntime {
 fn run_save_worker<J, T>(
     jobs: mpsc::Receiver<J>,
     current: impl Fn(&J) -> bool,
-    resolve: impl Fn(&J) -> Result<std::path::PathBuf, String>,
+    resolve: impl Fn(&J) -> Option<Result<std::path::PathBuf, String>>,
     save: impl Fn(&J, &std::path::Path) -> Result<T, String>,
     publish: impl Fn(&J, Result<T, String>),
 ) {
@@ -649,7 +660,9 @@ fn run_save_worker<J, T>(
         if !current(&job) {
             continue;
         }
-        let destination = resolve(&job);
+        let Some(destination) = resolve(&job) else {
+            continue;
+        };
         if !current(&job) {
             continue;
         }
@@ -667,8 +680,7 @@ fn finish_worker(thread: JoinHandle<()>, allow_wait: bool) {
 }
 impl Drop for CaptureRuntime {
     fn drop(&mut self) {
-        self.state.stop.store(true, Ordering::Release);
-        let _ = self.state.wake.try_send(());
+        self.state.stop();
         self.popup.hide();
         let hwnd = self.state.hwnd.load(Ordering::Acquire);
         let posted = hwnd != 0
@@ -747,7 +759,7 @@ mod tests {
                 |_| {
                     entered.send(()).unwrap();
                     released.recv().unwrap();
-                    Ok(PathBuf::from("resolved"))
+                    Some(Ok(PathBuf::from("resolved")))
                 },
                 |_, _| panic!("generation changed before save started"),
                 |_, _| panic!("obsolete job must not publish"),
@@ -758,6 +770,112 @@ mod tests {
         generation.store(2, Ordering::Release);
         release.send(()).unwrap();
         drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_destination_save_progresses_while_old_default_shell_resolution_is_stalled() {
+        let resolver = Arc::new(super::super::DestinationResolution::default());
+        let (shell_entered, shell_entry) = mpsc::channel();
+        let (shell_release, shell_released) = mpsc::channel();
+        resolver.start(
+            move || {
+                shell_entered.send(()).unwrap();
+                shell_released.recv().unwrap();
+                PathBuf::from("late-default")
+            },
+            || {},
+        );
+        shell_entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let generation = Arc::new(AtomicU64::new(1));
+        let current = generation.clone();
+        let resolving = resolver.clone();
+        let (tx, rx) = mpsc::sync_channel::<(u64, Option<PathBuf>)>(1);
+        let (entered, entry) = mpsc::channel();
+        let (completed, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // The same startup boundary as the native saver: unresolved
+            // cleanup is skipped before consuming the bounded save queue.
+            assert_eq!(resolving.resolved_destination(&None), None);
+            run_save_worker(
+                rx,
+                |job| current.load(Ordering::Acquire) == job.0,
+                |job| {
+                    resolving.resolve_save_destination(&job.1, || {
+                        if job.1.is_none() {
+                            entered.send(()).unwrap();
+                        }
+                        current.load(Ordering::Acquire) == job.0
+                    })
+                },
+                |job, destination| {
+                    assert_eq!(job.0, 2, "the old default job must not start saving");
+                    Ok(destination.to_path_buf())
+                },
+                |job, result| completed.send((job.0, result.unwrap())).unwrap(),
+            );
+        });
+        tx.send((1, None)).unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        generation.store(2, Ordering::Release);
+        resolver.wake_waiters();
+        tx.send((2, Some(PathBuf::from("explicit-local")))).unwrap();
+        let saved = completion.recv_timeout(Duration::from_secs(5));
+        assert_eq!(resolver.resolved(), None);
+        // Release even if the save did not progress, avoiding a hung test join.
+        shell_release.send(()).unwrap();
+        assert_eq!(saved.unwrap(), (2, PathBuf::from("explicit-local")));
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stop_releases_pending_save_without_waiting_for_default_shell_resolution() {
+        let resolver = Arc::new(super::super::DestinationResolution::default());
+        let (shell_entered, shell_entry) = mpsc::channel();
+        let (shell_release, shell_released) = mpsc::channel();
+        resolver.start(
+            move || {
+                shell_entered.send(()).unwrap();
+                shell_released.recv().unwrap();
+                PathBuf::from("late-default")
+            },
+            || {},
+        );
+        shell_entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let current = stop.clone();
+        let resolving = resolver.clone();
+        let (tx, rx) = mpsc::channel();
+        let (entered, entry) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_save_worker::<(), ()>(
+                rx,
+                |_| !current.load(Ordering::Acquire),
+                |_| {
+                    resolving.resolve_save_destination(&None, || {
+                        entered.send(()).unwrap();
+                        !current.load(Ordering::Acquire)
+                    })
+                },
+                |_, _| panic!("stopped job must not start saving"),
+                |_, _| panic!("stopped job must not publish"),
+            );
+            finished.send(()).unwrap();
+        });
+        tx.send(()).unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        stop.store(true, Ordering::Release);
+        resolver.wake_waiters();
+        drop(tx);
+        let stopped = completion.recv_timeout(Duration::from_secs(5));
+        assert_eq!(resolver.resolved(), None);
+        shell_release.send(()).unwrap();
+        assert!(
+            stopped.is_ok(),
+            "save worker still waits for the external Shell call"
+        );
         worker.join().unwrap();
     }
 
@@ -773,7 +891,7 @@ mod tests {
             run_save_worker(
                 rx,
                 |job| current.load(Ordering::Acquire) == *job,
-                |_| Ok(PathBuf::from("original-destination")),
+                |_| Some(Ok(PathBuf::from("original-destination"))),
                 |_, destination| {
                     assert_eq!(destination, std::path::Path::new("original-destination"));
                     entered.send(()).unwrap();

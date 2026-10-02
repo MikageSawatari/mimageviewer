@@ -9,9 +9,31 @@ const DISPLAY_LIFETIME: Duration = Duration::from_secs(8);
 #[derive(Clone, Debug)]
 pub(crate) enum PopupContent {
     Saved(PathBuf),
+    SavedAwaitingResponse(PathBuf),
     Failure(String),
     Abandoned,
     RevealUnavailable,
+}
+
+// Consume the button at the same ownership boundary that creates its event.
+// Native dispatch cannot emit a second request while App's response is pending.
+fn begin_reveal(
+    shown: &mut Option<(u64, PopupContent)>,
+    current_generation: u64,
+) -> Option<crate::clipboard_capture::CaptureEvent> {
+    let Some((generation, PopupContent::Saved(path))) = shown.as_ref() else {
+        return None;
+    };
+    if *generation != current_generation {
+        return None;
+    }
+    let generation = *generation;
+    let path = path.clone();
+    *shown = Some((
+        generation,
+        PopupContent::SavedAwaitingResponse(path.clone()),
+    ));
+    Some(crate::clipboard_capture::CaptureEvent::RevealSaved { generation, path })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +50,7 @@ fn resolve_reveal(
     path: &Path,
     response: RevealResponse,
 ) -> bool {
-    if !matches!(shown.as_ref(), Some((g, PopupContent::Saved(p))) if *g == generation && p == path)
+    if !matches!(shown.as_ref(), Some((g, PopupContent::SavedAwaitingResponse(p))) if *g == generation && p == path)
     {
         return false;
     }
@@ -42,7 +64,9 @@ fn resolve_reveal(
 impl PopupContent {
     fn text(&self) -> String {
         match self {
-            Self::Saved(_) => "クリップボードの画像を保存しました".into(),
+            Self::Saved(_) | Self::SavedAwaitingResponse(_) => {
+                "クリップボードの画像を保存しました".into()
+            }
             Self::Failure(reason) => format!("保存できませんでした: {reason}"),
             Self::Abandoned => "取り込めませんでした。もう一度コピーしてください".into(),
             Self::RevealUnavailable => {
@@ -112,7 +136,9 @@ fn bottom_right(work: [i32; 4], dpi: u32) -> [i32; 4] {
 
 #[cfg(windows)]
 mod native {
-    use super::{Lifetime, PopupContent, RevealResponse, bottom_right, resolve_reveal, scaled};
+    use super::{
+        Lifetime, PopupContent, RevealResponse, begin_reveal, bottom_right, resolve_reveal, scaled,
+    };
     use crate::clipboard_capture::CaptureEvent;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -633,10 +659,23 @@ mod native {
                     &mut text_rect,
                     DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
-                if matches!(content, PopupContent::Saved(_)) {
+                if matches!(
+                    content,
+                    PopupContent::Saved(_) | PopupContent::SavedAwaitingResponse(_)
+                ) {
                     let brush = CreateSolidBrush(button_color);
                     FillRect(dc, &open, brush);
                     let _ = DeleteObject(brush.into());
+                    if matches!(content, PopupContent::SavedAwaitingResponse(_)) {
+                        SetTextColor(
+                            dc,
+                            if dark {
+                                COLORREF(0x00a0a0a0)
+                            } else {
+                                COLORREF(0x00808080)
+                            },
+                        );
+                    }
                     let mut label: Vec<u16> = "開く".encode_utf16().collect();
                     DrawTextW(
                         dc,
@@ -644,6 +683,7 @@ mod native {
                         &mut open,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                     );
+                    SetTextColor(dc, foreground);
                 }
             }
             let mut label: Vec<u16> = "×".encode_utf16().collect();
@@ -740,19 +780,12 @@ mod native {
                     if contains(close, x, y) {
                         hide(hwnd, state);
                     } else if contains(open, x, y) {
-                        let saved = match &(*state).shown {
-                            Some((generation, PopupContent::Saved(path)))
-                                if *generation
-                                    == (*state).current_generation.load(Ordering::Acquire) =>
-                            {
-                                Some((*generation, path.clone()))
-                            }
-                            _ => None,
-                        };
-                        if let Some((generation, path)) = saved {
+                        let generation = (*state).current_generation.load(Ordering::Acquire);
+                        if let Some(event) = begin_reveal(&mut (*state).shown, generation) {
                             let events = (*state).event_tx.clone();
                             let repaint = (*state).repaint.clone();
-                            let _ = events.send(CaptureEvent::RevealSaved { generation, path });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            let _ = events.send(event);
                             repaint();
                         }
                     }
@@ -829,6 +862,7 @@ mod native {
             };
             assert_eq!(path, b);
             let mut shown = Some((2, PopupContent::Saved(b)));
+            assert!(begin_reveal(&mut shown, 2).is_some());
             assert!(resolve_reveal(&mut shown, generation, &path, response));
             assert!(matches!(shown, Some((2, PopupContent::RevealUnavailable))));
         }
@@ -880,9 +914,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_clicks_emit_one_event_and_keep_the_accepted_response() {
+        let path = PathBuf::from("capture/saved.png");
+        let mut shown = Some((4, PopupContent::Saved(path.clone())));
+        let (events, received) = std::sync::mpsc::channel();
+        for _ in 0..3 {
+            if let Some(event) = begin_reveal(&mut shown, 4) {
+                events.send(event).unwrap();
+            }
+        }
+        let events = received.try_iter().collect::<Vec<_>>();
+        let [
+            crate::clipboard_capture::CaptureEvent::RevealSaved {
+                generation,
+                path: clicked,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("same notification emitted more than one event");
+        };
+        assert_eq!(*generation, 4);
+        assert_eq!(clicked, &path);
+        assert!(
+            matches!(shown.as_ref(), Some((4, PopupContent::SavedAwaitingResponse(p))) if p == &path)
+        );
+        assert!(resolve_reveal(
+            &mut shown,
+            4,
+            &path,
+            RevealResponse::Accepted
+        ));
+        assert!(!resolve_reveal(
+            &mut shown,
+            4,
+            &path,
+            RevealResponse::Unavailable
+        ));
+        assert!(shown.is_none());
+    }
+
+    #[test]
+    fn new_notification_can_be_clicked_while_the_previous_reply_is_pending() {
+        let old = PathBuf::from("capture/old.png");
+        let new = PathBuf::from("capture/new.png");
+        let mut shown = Some((5, PopupContent::Saved(old.clone())));
+        assert!(begin_reveal(&mut shown, 5).is_some());
+        shown = Some((5, PopupContent::Saved(new.clone())));
+        assert!(!resolve_reveal(
+            &mut shown,
+            5,
+            &old,
+            RevealResponse::Accepted
+        ));
+        assert!(begin_reveal(&mut shown, 5).is_some());
+        assert!(begin_reveal(&mut shown, 5).is_none());
+        assert!(!resolve_reveal(
+            &mut shown,
+            5,
+            &old,
+            RevealResponse::Unavailable
+        ));
+        assert!(resolve_reveal(
+            &mut shown,
+            5,
+            &new,
+            RevealResponse::Unavailable
+        ));
+        assert!(matches!(shown, Some((5, PopupContent::RevealUnavailable))));
+    }
+
+    #[test]
+    fn stale_generation_or_closed_notification_cannot_emit_or_accept_a_reply() {
+        let path = PathBuf::from("capture/saved.png");
+        let mut shown = Some((4, PopupContent::Saved(path.clone())));
+        assert!(begin_reveal(&mut shown, 5).is_none());
+        assert!(matches!(shown.as_ref(), Some((4, PopupContent::Saved(_)))));
+        assert!(begin_reveal(&mut shown, 4).is_some());
+        shown = None; // Close while App's response is pending.
+        assert!(begin_reveal(&mut shown, 4).is_none());
+        assert!(!resolve_reveal(
+            &mut shown,
+            4,
+            &path,
+            RevealResponse::Accepted
+        ));
+        assert!(!resolve_reveal(
+            &mut shown,
+            4,
+            &path,
+            RevealResponse::Unavailable
+        ));
+        assert!(shown.is_none());
+    }
+
+    #[test]
     fn rejected_reveal_replaces_only_its_saved_notification_without_an_open_button() {
         let path = PathBuf::from("capture/saved.png");
         let mut shown = Some((4, PopupContent::Saved(path.clone())));
+        assert!(begin_reveal(&mut shown, 4).is_some());
         assert!(resolve_reveal(
             &mut shown,
             4,
@@ -904,6 +1033,13 @@ mod tests {
         assert!(!resolve_reveal(
             &mut shown,
             5,
+            &new,
+            RevealResponse::Accepted
+        ));
+        assert!(begin_reveal(&mut shown, 5).is_some());
+        assert!(!resolve_reveal(
+            &mut shown,
+            5,
             &old,
             RevealResponse::Unavailable
         ));
@@ -913,7 +1049,9 @@ mod tests {
             &new,
             RevealResponse::Accepted
         ));
-        assert!(matches!(shown.as_ref(), Some((5, PopupContent::Saved(p))) if *p == new));
+        assert!(
+            matches!(shown.as_ref(), Some((5, PopupContent::SavedAwaitingResponse(p))) if *p == new)
+        );
         assert!(resolve_reveal(
             &mut shown,
             5,

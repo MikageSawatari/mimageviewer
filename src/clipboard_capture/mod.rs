@@ -69,16 +69,41 @@ impl DestinationResolution {
         self.ready.notify_all();
     }
 
-    // Only save workers wait here. UI consumers use resolved(), which never
-    // invokes Shell APIs or waits for resolution.
-    fn wait(&self) -> Result<PathBuf, String> {
+    fn resolved_destination(&self, destination: &Option<PathBuf>) -> Option<PathBuf> {
+        destination.clone().or_else(|| self.resolved())
+    }
+
+    fn resolve_save_destination(
+        &self,
+        destination: &Option<PathBuf>,
+        current: impl Fn() -> bool,
+    ) -> Option<Result<PathBuf, String>> {
+        match destination {
+            Some(path) => current().then(|| Ok(path.clone())),
+            None => self.wait(current),
+        }
+    }
+
+    // Only save workers wait here. A settings change or stop invalidates the
+    // request and wakes it without waiting for the external Shell call.
+    fn wait(&self, current: impl Fn() -> bool) -> Option<Result<PathBuf, String>> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         loop {
+            if !current() {
+                return None;
+            }
             if let DestinationState::Ready(result) = &*state {
-                return result.clone();
+                return Some(result.clone());
             }
             state = self.ready.wait(state).unwrap_or_else(|p| p.into_inner());
         }
+    }
+
+    fn wake_waiters(&self) {
+        // The invalidation happens before this lock. Holding the same mutex as
+        // wait() prevents a wake from falling between its predicate and wait.
+        let _state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.ready.notify_all();
     }
 }
 
@@ -99,10 +124,19 @@ pub(crate) fn start_default_destination_resolution(ctx: &egui::Context) {
     );
 }
 
-fn resolve_save_destination(destination: &Option<PathBuf>) -> Result<PathBuf, String> {
-    destination
-        .clone()
-        .map_or_else(|| destination_resolution().wait(), Ok)
+fn resolved_save_destination(destination: &Option<PathBuf>) -> Option<PathBuf> {
+    destination_resolution().resolved_destination(destination)
+}
+
+fn resolve_save_destination(
+    destination: &Option<PathBuf>,
+    current: impl Fn() -> bool,
+) -> Option<Result<PathBuf, String>> {
+    destination_resolution().resolve_save_destination(destination, current)
+}
+
+fn wake_save_destination_waiters() {
+    destination_resolution().wake_waiters();
 }
 
 fn synchronize_runtime<T>(
@@ -462,7 +496,7 @@ mod tests {
         let (result, results) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
             waiting.send(()).unwrap();
-            result.send(save_resolver.wait()).unwrap();
+            result.send(save_resolver.wait(|| true)).unwrap();
         });
         waiter_started.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
@@ -470,6 +504,7 @@ mod tests {
         assert_eq!(
             results
                 .recv_timeout(Duration::from_secs(5))
+                .unwrap()
                 .unwrap()
                 .unwrap(),
             PathBuf::from("shared-default")
@@ -479,6 +514,62 @@ mod tests {
         assert_eq!(calls.load(Ordering::Acquire), 1);
         resolver.start(|| panic!("completed resolver must not restart"), || {});
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_uses_only_an_available_destination_without_waiting() {
+        let resolver = DestinationResolution::default();
+        *resolver.state.lock().unwrap() = DestinationState::Resolving;
+        assert_eq!(resolver.resolved_destination(&None), None);
+        let explicit = Some(PathBuf::from("explicit-local"));
+        assert_eq!(resolver.resolved_destination(&explicit), explicit);
+        resolver.publish(Ok(PathBuf::from("resolved-default")));
+        assert_eq!(
+            resolver.resolved_destination(&None),
+            Some(PathBuf::from("resolved-default"))
+        );
+        assert_eq!(resolver.resolved_destination(&explicit), explicit);
+    }
+
+    #[test]
+    fn destination_invalidation_wake_cannot_be_lost_between_predicate_and_wait() {
+        let resolver = Arc::new(DestinationResolution::default());
+        let generation = Arc::new(AtomicU64::new(1));
+        let (checked, check) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let (result, results) = mpsc::channel();
+        let waiting = resolver.clone();
+        let current = generation.clone();
+        let waiter = std::thread::spawn(move || {
+            let calls = AtomicU64::new(0);
+            let resolved = waiting.wait(|| {
+                let valid = current.load(Ordering::Acquire) == 1;
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // The wait mutex is held across this first predicate. Force
+                    // invalidation to happen before Condvar::wait releases it.
+                    checked.send(()).unwrap();
+                    resumed.recv().unwrap();
+                }
+                valid
+            });
+            result.send(resolved).unwrap();
+        });
+        check.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (invalidated, invalidation) = mpsc::channel();
+        let waking = resolver.clone();
+        let notifier = std::thread::spawn(move || {
+            generation.store(2, Ordering::Release);
+            invalidated.send(()).unwrap();
+            waking.wake_waiters();
+        });
+        invalidation.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume.send(()).unwrap();
+        let canceled = results.recv_timeout(Duration::from_secs(5));
+        // Unblock a broken implementation before reporting a regression.
+        resolver.publish(Ok(PathBuf::from("late-default")));
+        assert_eq!(canceled.unwrap(), None);
+        waiter.join().unwrap();
+        notifier.join().unwrap();
     }
 
     #[test]
