@@ -245,6 +245,7 @@ perf には照会時間・取得行数と、Vec/String の capacity から算出
 #### 終了応答性と有界 shutdown
 
 `skip_offline_change_scan` (既定 false) は起動時の初回 Full だけを省く設定。
+お気に入り編集と、環境設定の「ライブラリ > 検索インデックス」で変更する。
 `fts_meta.db.scanned_once` の root ごとの印と指紋 (正規化 root・所有 UUID・入れ子を含む
 除外 root・INDEX_VERSION・Susie を含む走査拡張子) が一致し、起動 cleanup の must-scan 集合と
 rebuild pending の対象でない場合だけ省く。watcher は従来どおり動き、差分・overflow・回復・

@@ -270,7 +270,7 @@
   検索結果に反映されないことがあります。その場合は [今すぐ確認] を押してください。」
 - 置き場所: お気に入りの編集の索引の節 (トレイ常駐の案内の隣、
   [favorites_editor.rs:440](../src/ui_dialogs/favorites_editor.rs)) と、環境設定の
-  タスクトレイ常駐ページ ([pages.rs:7400](../src/ui_dialogs/preferences/pages.rs))。
+  ライブラリ > 検索インデックスページ (`PreferencesPage::IndexerSpeed`)。
   値の所有者は `Settings` 1 つ。両方の既存文言「終了すると次回起動時に再スキャン」は、
   設定 ON のときに事実と異なるので書き換える。
 - **[今すぐ確認]** ボタン: §6.5。設定 ON では「再起動すれば確認される」という今の回避策
@@ -331,22 +331,21 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
 - **similar**: 省略してよいのは、要求が純粋な `Initial` で、現在の構成の全 watch が `Ready`
   (Unavailable を含む terminal ではなく Ready)、未修復の gap が無いときだけ。
   Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair が合流したら通常の Full。
-  省略時は Full の inventory 読み込みと列挙だけを行わず、
-  build 残骸の掃除 (`cleanup_incomplete_if`) と、有効 root の外の行の purge を行う。
-  similar DB は行ごとに「どのお気に入り root のものか」を持たない
-  ([similar_db.rs:4801](../src/similar_db.rs)、[similar_db.rs:4827](../src/similar_db.rs)) ので、
-  purge は「公開済みの item / container、build、prefill のキーのうち、現在の有効 root の和集合
-  (共通除外を除く) の外にあるものを消す」API を新設する。包含関係 (入れ子の root) を保護し、
-  変更履歴と watermark は既存の purge と同じく更新する。
-  公開済み item / container の削除は同じ transaction で完走印を失効させる。
-  build / prefill だけの整理では完走印を保持する。
-  そのうえでメモリ読み込みを行い、**現在の store とメモリ snapshot の array ack を待ってから**
+  省略時は Full の inventory 読み込み・列挙と、有効 root 和集合の外のキーの purge を行わない。
+  指紋は有効 root と共通除外を含み、構成変更による公開データの削除や別指紋 Full は
+  同じ transaction、または最初の走査書き込みより前に旧印を失効する。クラッシュがその前なら
+  公開データは旧構成のまま、その後なら印がなく、変更後の構成では通常 Full になる。
+  同一指紋での再利用に全キーの整理は不要。非公開の prefill はそのまま残してよい。
+  build 残骸の掃除 (`cleanup_incomplete_if`) は維持する。
+  メモリ読み込みを行い、**現在の store とメモリ snapshot の array ack を待ってから**
   Complete にする ([similar_index.rs:3032](../src/similar_index.rs))。
   実装は既存の worker loop の中で行い、job の結果を typed に `ScannedFull` / `ReusedInitial` と
   区別する。Full 完了処理の dirty の吸収 (`dirty.retain_after`) と gap の修復
   ([similar_index.rs:1872](../src/similar_index.rs)) は `ScannedFull` だけに適用する。
   watch 登録後に届いた dirty は捨てずに残し、既存の `MoreWork` で Delta に回す。
   page order の修復 ([similar_index.rs:2834](../src/similar_index.rs)) は維持する。
+  通常の `reused initial: skipped=true` ログに cleanup / page-order / memory / ack の時間を出す。
+  memory は実際の非同期読み込み時間で、cleanup・ack と並行するため合計時間ではない。
   独立した Complete の発行経路は作らない。
 - いずれの系統でも、起動後の overflow・watcher 回復・手動確認は従来どおり Full。
 
@@ -1082,3 +1081,95 @@ core は4分49秒、remote service・EPUB worker も成功し、CRT 検査は `r
 `target/startup-scan-s3/commit-message.txt` を指定署名付きで上書きし、先頭byte検査で
 UTF-8 BOMなし、末尾が指定の Co-Authored-By 行であることを確認した。
 要求された失効判定と回帰に未実装項目はなく、任意の保存時除外チェックの見送り理由は上記。
+
+### 11.8 実機確認後の ReusedInitial 費用と設定導線 (2026-10-02)
+
+利用者が HEAD `726f0cd5c` の検証用 build を確認し、設定 ON の次回起動で name / fts は
+`initial scan skipped`、similar は `reused initial: skipped=true` と記録された。省略は機能したが、
+similar.db 2.3 GB で opening 4.292 s → reused_initial 16.105 s、memory load 137 ms に対し
+ReusedInitial が約11.8秒を消費した。利用者の追加指示に従い、起動時の全キー整理を省く。
+
+- 指紋が有効 root と共通除外を含むこと、構成変更 purge が公開削除と同 transaction で旧印を
+  失効させること、別指紋 Full が初回書き込み前に失効することを公開書き手・取消・クラッシュ
+  の経路で確認した。構成 A→B→A でも、B の公開変更前なら旧 A の公開索引は無変更で再利用が
+  妥当、変更後なら印がない。純粋 Initial・全 watch Ready・gap なしの制限も維持する。
+- ReusedInitial から有効 root 和集合の外の purge を削除。旧処理は5表のキー全件列挙に加え、
+  削除0件でも集計用 item LEFT JOIN container の COUNT(*) を行っていた。非公開 prefill は
+  残っても検索 array に入らず、後の Full / Delta が対象を観測して一致を検証してから利用する。
+  未完 build 回収、page order 修復、メモリ読み込み、watermark と array ack は維持する。
+  Full / watcher / overflow / recovery / 手動確認の処理は変えない。
+- 新しい省略条件・pending・復旧状態を増やす案は採らず、指紋と失効規則によって不要な処理を
+  除いた。再利用専用 union purge API は製品から除き、共通 purge の境界回帰用に cfg(test) で
+  残す。実 purge_keys_if の列挙直前の counter を追加し、既存 purge 回帰の正値と、2回の
+  reopen / ReusedInitial の0を確認する。§11.7 の prefill 回帰は「削除後も再利用」から
+  「補助データを残したまま列挙せず再利用」へ、今回承認された契約に合わせて更新する。
+- 通常の reused initial ログに `cleanup_ms / page_order_ms / memory_ms / ack_ms` を追加。
+  cleanup はこの job の回収処理、page order は worker 入口の版確認・必要なら修復、memory は
+  実 loader の時間（Configure 起点も含む）、ack は要求から受理まで。memory は既存の epoch
+  照合成功後の publication lock 内で診断値だけを保存する。読み込みは cleanup / ack と並行
+  するため4項目を合計しない。診断値を制御や省略条件には用いない。
+- cleanup は既存の container 外側 → item_container_idx の取得で item 全件走査を避けているが、
+  scan_state 索引がないため container の走査と末尾 DELETE の再走査は残る。build 表が空でも
+  legacy / 孤立 / 0ページ Building container があり得るため、空表だけで回収を省かない。
+  page order は単一 PK 行の保存版が現行なら即 return し、定常起動で全件修復はしない。
+  新しい bool や schema 索引を足さず、使い捨て DB の計測と通常ログで残る費用を可視化する。
+- 設定を環境設定の「ライブラリ > 検索インデックス」へ移し、anchor と検索結果 page を
+  `indexer/offline-change-scan` / `IndexerSpeed` に統一。お気に入り編集と同じ Settings 値を
+  編集する契約は維持。トレイ tooltip の「下の設定」を移動先へ変更し、manual 3ページと
+  spec の案内先を更新した。manual settings の新節は既存 ID と重複しない `indexer` を使う。
+  manual の sidebar はページ単位の一覧で変更不要。
+- 共通 checkbox helper の見た目は変わらず、既存 light / dark snapshot の PNG 更新は不要。
+  全ページ / App snapshot は運用方針の対象外。検索結果の page / anchor は既存回帰を更新し、
+  「検索インデックス 起動」の検索語も確認する。
+- gpt-6.1-sol / xhigh の読み取り専用レビューで、purge 削除の構造前提と差分に P1/P2 なし。
+  削除後の不要な progress 引数という P3 は除去した。レビュー担当は build を実行せず、
+  以下の検証は実装担当が所有する。
+
+使い捨て on-disk DB の初回計測 (`startup.log`) は次のとおり。通常の開き直し後に
+cleanup と現行版の page-order 確認だけを測り、時間は合否条件にしない。
+
+| 公開 Complete container 件数 | main DB bytes | cleanup | page-order 確認 |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 253,952 | 1.014 ms | 0.030 ms |
+| 100,000 | 16,809,984 | 16.240 ms | 0.049 ms |
+
+これは生成直後の warm な合成 DB（item 0件）で、利用者の2.3 GB DBや cold I/O の時間とは
+みなさない。container 走査が残ることは隠さず、実データの費用は新しい通常ログで判断できる。
+container_build 空などによる危険な skip や schema 追加は行わない。
+初回の `cargo test -j1 -p mimageviewer --lib similar_index::tests::startup_ -- --test-threads=1 --nocapture`
+は13件成功。未使用引数を除いた最終ソースでも対象群を下記の記録どおり確認する。
+
+最終 lib の検証は `MSBUILDDISABLENODEREUSE=1` を設定し、
+`cargo test -j1 -p mimageviewer --lib <filter> -- --test-threads=1 --nocapture` で実行した。
+
+| filter | 成功件数 | ignored |
+| --- | ---: | ---: |
+| `similar_index::tests::startup_` | 13 | 0 |
+| `similar_db` | 65 | 3 |
+| `similar_index::tests::incremental_reconcile` | 25 | 0 |
+| `ui_dialogs::preferences::search_index::tests` | 11 | 0 |
+| `memory_load` | 2 | 0 |
+| `prefill` | 6 | 0 |
+| `indexer_manager` | 13 | 0 |
+
+lib は重複を除いて134件成功（prefill に startup 回帰1件が重複）。ignored 3件は既存の
+手動 benchmark / 実データコピー検証。ログは `target/startup-scan-s3/reused-initial-cost/*-final.log`。
+最終ソースでの合成計測は、1,000 container が cleanup 0.987 ms / page-order 0.031 ms、
+100,000 container が cleanup 15.868 ms / page-order 0.055 ms。初回計測と同じ生成直後の
+warm な使い捨て DB であり、実データや cold I/O の時間とは扱わない。
+
+`cargo test -j1 -p mimageviewer --test ui_snapshot -- --test-threads=1` は59件成功
+(`ui-snapshot.log`)。既存の light / dark checkbox を含め、PNG の変更はない。
+重複を除いた今回の成功件数は lib 134 + integration 59 = 193。
+UI担当が manual 3ページの HTML parse / ID 重複検査と既存 checkbox PNG の目視を行い、
+新しい節の sidebar 変更が不要であることを確認した。全workspace suite・アプリ起動・
+通常 profile の操作・コミットは行っていない。
+
+全workspaceの `cargo fmt --all` / `cargo fmt --all --check` と `git diff --check` は成功。
+`python scripts/check_ui_glyphs.py` は問題0、
+`cargo check -j1 -p mimageviewer --bin mimageviewer-core` は exit 0 (`cargo-check.log`)。
+
+確認用 build は `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` を実行したが、
+起動中の `target/dev-runtime/mimageviewer-core.exe`（PID 54080）を検出して exit 1。
+`-PreserveRuntime` の仕様に従ってプロセスは終了させていない。初回ログは `build-dev-running.log`。
+コード・自動検証は完了しており、利用者のアプリ終了後に同じ build コマンドを再実行する。

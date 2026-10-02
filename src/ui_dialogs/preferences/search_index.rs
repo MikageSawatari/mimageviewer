@@ -885,20 +885,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再読み込み", "reload", "フォルダー", "ロード済み"]
     ),
     entry!(
-        "indexer/speed",
+        "indexer/offline-change-scan",
         IndexerSpeed,
-        "速度プロファイル",
-        ["インデクサ", "index", "I/O", "High", "Low"]
-    ),
-    entry!(
-        "tray/residency",
-        TrayResidency,
-        "アプリを閉じる代わりに、タスクトレイに常駐する",
-        ["最小化", "閉じる", "常駐", "tray"]
-    ),
-    entry!(
-        "tray/offline-change-scan",
-        TrayResidency,
         crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL,
         [
             "起動",
@@ -909,6 +897,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "検索",
             "offline"
         ]
+    ),
+    entry!(
+        "indexer/speed",
+        IndexerSpeed,
+        "速度プロファイル",
+        ["インデクサ", "index", "I/O", "High", "Low"]
+    ),
+    entry!(
+        "tray/residency",
+        TrayResidency,
+        "アプリを閉じる代わりに、タスクトレイに常駐する",
+        ["最小化", "閉じる", "常駐", "tray"]
     ),
     entry!(
         "tray/pause-indexer",
@@ -1276,7 +1276,7 @@ mod tests {
                 entry.anchor
             );
             assert!(!entry.title.is_empty(), "title が空です: {}", entry.anchor);
-            if entry.anchor == "tray/offline-change-scan" {
+            if entry.anchor == "indexer/offline-change-scan" {
                 // この項目はお気に入り編集と共有する描画 helper が表示文字列を所有する。
                 assert_eq!(
                     entry.title,
@@ -1396,13 +1396,18 @@ mod tests {
     }
 
     #[test]
-    fn offline_scan_and_full_check_keywords_open_the_tray_setting_anchor() {
-        for query in ["終了 スキャン", "今すぐ確認", "offline"] {
+    fn offline_scan_and_full_check_keywords_open_the_indexer_setting_anchor() {
+        for query in [
+            "終了 スキャン",
+            "今すぐ確認",
+            "offline",
+            "検索インデックス 起動",
+        ] {
             let result = search_preferences(query, test_tree_position)
                 .into_iter()
-                .find(|entry| entry.anchor == "tray/offline-change-scan")
+                .find(|entry| entry.anchor == "indexer/offline-change-scan")
                 .unwrap();
-            assert_eq!(result.page, PreferencesPage::TrayResidency);
+            assert_eq!(result.page, PreferencesPage::IndexerSpeed);
             assert_eq!(
                 result.title,
                 crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL

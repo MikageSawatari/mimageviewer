@@ -220,6 +220,8 @@ pub struct SimilarDb {
     delta_inventory_loads: AtomicUsize,
     #[cfg(test)]
     cleanup_incomplete_calls: AtomicUsize,
+    #[cfg(test)]
+    scope_purge_enumerations: AtomicUsize,
 }
 
 const FULL_INVENTORY_CANCEL_POLL_ROWS: usize = 4096;
@@ -1293,6 +1295,8 @@ impl SimilarDb {
             delta_inventory_loads: AtomicUsize::new(0),
             #[cfg(test)]
             cleanup_incomplete_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            scope_purge_enumerations: AtomicUsize::new(0),
         })
     }
 
@@ -1307,6 +1311,8 @@ impl SimilarDb {
             delta_inventory_loads: AtomicUsize::new(0),
             #[cfg(test)]
             cleanup_incomplete_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            scope_purge_enumerations: AtomicUsize::new(0),
         })
     }
 
@@ -2692,6 +2698,11 @@ impl SimilarDb {
         self.cleanup_incomplete_calls.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn scope_purge_enumeration_count(&self) -> usize {
+        self.scope_purge_enumerations.load(Ordering::Relaxed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_full_reconcile_if(
         &self,
@@ -3036,6 +3047,7 @@ impl SimilarDb {
 
     /// 現在の有効 root の和集合の外と共通除外を消す。入れ子の有効 root は残す。
     /// 公開世代・build・prefill を同じ transaction で処理し、削除履歴と集計も更新する。
+    #[cfg(test)]
     pub(crate) fn purge_outside_active_roots_if(
         &self,
         active_roots: &[String],
@@ -3059,6 +3071,9 @@ impl SimilarDb {
         }
         let transaction = write_transaction(&mut conn)?;
 
+        #[cfg(test)]
+        self.scope_purge_enumerations
+            .fetch_add(1, Ordering::Relaxed);
         let item_keys = query_string_column(&transaction, "SELECT item_key FROM item")?;
         let container_keys =
             query_string_column(&transaction, "SELECT container_key FROM container")?;
@@ -6967,6 +6982,7 @@ mod tests {
             ConditionalCommit::Committed(0)
         );
         assert!(db.scanned_once_matches("original").unwrap());
+        assert_eq!(db.scope_purge_enumeration_count(), 2);
     }
 
     #[test]

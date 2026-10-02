@@ -557,6 +557,7 @@ impl SimilarIndexManager {
                 memory: Arc::clone(&memory),
                 summary: Arc::clone(&summary),
                 memory_epoch: Arc::clone(&memory_epoch),
+                memory_load_elapsed_us: AtomicU64::new(0),
                 item_query: Arc::clone(&item_query),
                 book_query,
                 #[cfg(test)]
@@ -990,6 +991,14 @@ fn start_memory_load(
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             if epoch_guard.load(Ordering::Acquire) != epoch {
                 return;
+            }
+            // Diagnostic only: publish the actual load time with the matching memory epoch.
+            // Configure may start this load before the index worker's eager-load call.
+            if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
+                scheduler.memory_load_elapsed_us.store(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
             }
             *state = match loaded {
                 Ok(Some(index)) => MemoryState::Ready(index),
@@ -1477,6 +1486,7 @@ struct ReconcileRunTelemetry {
     next_progress_log_ms: AtomicU64,
     terminal_logged: AtomicBool,
     work: ReconcileWorkCounters,
+    reused_cleanup_time: ReconcileDurationCounter,
     #[cfg(test)]
     phase_trace: Mutex<Vec<&'static str>>,
 }
@@ -1492,6 +1502,7 @@ impl ReconcileRunTelemetry {
             next_progress_log_ms: AtomicU64::new(RECONCILE_PROGRESS_LOG_INTERVAL_MS),
             terminal_logged: AtomicBool::new(false),
             work: ReconcileWorkCounters::default(),
+            reused_cleanup_time: ReconcileDurationCounter::default(),
             #[cfg(test)]
             phase_trace: Mutex::new(Vec::new()),
         }
@@ -1499,6 +1510,22 @@ impl ReconcileRunTelemetry {
 
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn reused_initial_log(
+        &self,
+        page_order_elapsed: Duration,
+        memory_load_elapsed_us: u64,
+        ack_elapsed: Duration,
+    ) -> String {
+        // The eager memory load overlaps cleanup and the ack wait; these are not additive.
+        format!(
+            "similar reconcile reused initial: skipped=true cleanup_ms={:.1} page_order_ms={:.1} memory_ms={:.1} ack_ms={:.1}",
+            self.reused_cleanup_time.snapshot().total_us as f64 / 1000.0,
+            page_order_elapsed.as_secs_f64() * 1000.0,
+            memory_load_elapsed_us as f64 / 1000.0,
+            ack_elapsed.as_secs_f64() * 1000.0,
+        )
     }
 
     fn prefix(&self) -> String {
@@ -2002,6 +2029,8 @@ struct SimilarIndexScheduler {
     memory: Arc<Mutex<MemoryState>>,
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
+    // Last current-epoch eager load duration; it never participates in scheduler decisions.
+    memory_load_elapsed_us: AtomicU64,
     item_query: Arc<Mutex<ItemQueryCache>>,
     book_query: BookQueryExecutor<Arc<BookQuery>>,
     #[cfg(test)]
@@ -3053,7 +3082,9 @@ impl SimilarIndexScheduler {
                 return;
             }
         };
+        let page_order_started = std::time::Instant::now();
         repair_page_order_if_stale(&db);
+        let page_order_elapsed = page_order_started.elapsed();
         // configure と DB 作成が競合しても、実行中の worker が必ず eager load を開始する。
         // この呼び出しは既に Loading / Ready なら no-op で、パネル照会には依存しない。
         start_memory_load(
@@ -3188,7 +3219,6 @@ impl SimilarIndexScheduler {
                         &db,
                         &plan.config,
                         &plan.running.cancel,
-                        &self.progress,
                         Some(&telemetry),
                     ),
                     ReconcileJobKind::Full(intent) => run_index_job(
@@ -3336,6 +3366,7 @@ impl SimilarIndexScheduler {
             telemetry.log_phase("awaiting_array", Some(&outcome.report));
             #[cfg(test)]
             self.probe_startup("before_array_request");
+            let ack_started = std::time::Instant::now();
             self.request_array_refresh_through(watermark);
             if let Err(error) = self.wait_for_array_ack(watermark, &plan.running.cancel) {
                 match error {
@@ -3365,6 +3396,7 @@ impl SimilarIndexScheduler {
                 }
             }
 
+            let ack_elapsed = ack_started.elapsed();
             if !self.job_is_current(&plan.running) {
                 telemetry.log_terminal("stale", &outcome.report);
                 match self.settle_interrupted_plan(&plan, purge_committed, outcome.report) {
@@ -3383,7 +3415,11 @@ impl SimilarIndexScheduler {
                 }
             }
             if reused_initial {
-                crate::logger::log("similar reconcile reused initial: skipped=true");
+                crate::logger::log(telemetry.reused_initial_log(
+                    page_order_elapsed,
+                    self.memory_load_elapsed_us.load(Ordering::Relaxed),
+                    ack_elapsed,
+                ));
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "similar",
@@ -5151,7 +5187,6 @@ fn run_reused_initial_job(
     db: &SimilarDb,
     config: &SchedulerConfig,
     cancel: &Arc<AtomicBool>,
-    progress: &Arc<Mutex<IndexProgress>>,
     telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
     let interrupted = || ScanJobOutcome {
@@ -5163,6 +5198,7 @@ fn run_reused_initial_job(
     if !wait_for_full_inventory_start(config.activity_gate.as_deref(), cancel) {
         return Ok(interrupted());
     }
+    let cleanup_started = std::time::Instant::now();
     if db
         .cleanup_incomplete_if(cancel)
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?
@@ -5170,23 +5206,13 @@ fn run_reused_initial_job(
     {
         return Ok(interrupted());
     }
-    set_stage(progress, IndexStage::Pruning, None);
-    let removed = match db
-        .purge_outside_active_roots_if(
-            &config.normalized_roots(),
-            &config.excluded_root_keys,
-            || !cancel.load(Ordering::Acquire),
-        )
-        .map_err(|error| format!("inactive scope purge failed: {error}"))?
-    {
-        crate::similar_db::ConditionalCommit::Committed(removed) => removed,
-        crate::similar_db::ConditionalCommit::Skipped => return Ok(interrupted()),
-    };
-    let report = IndexReport {
-        removed: removed as u64,
-        ..IndexReport::default()
-    };
+    // Matching roots/exclusions already have a completed corpus. Configuration changes revoke
+    // the marker before discarding that corpus; startup reuse need not enumerate any scope keys.
+    let report = IndexReport::default();
     if let Some(telemetry) = telemetry {
+        telemetry
+            .reused_cleanup_time
+            .observe(cleanup_started.elapsed());
         telemetry.log_phase("reused_initial", Some(&report));
     }
     Ok(ScanJobOutcome {
@@ -10412,7 +10438,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_excluded_prefill_tidy_keeps_marker_and_reuses_next_start() {
+    fn startup_reuse_leaves_auxiliary_prefill_and_never_enumerates_scope_keys() {
         let (temp, manager, db, id) = startup_worker_fixture(false, false);
         let config = {
             let mut state = manager.scheduler.state.lock().unwrap();
@@ -10443,7 +10469,7 @@ mod tests {
         drop(manager);
         drop(db);
 
-        // The first reuse tidies the prefill; the following start must still reuse the index.
+        // Reuse leaves auxiliary prefill alone; both starts must avoid any scope enumeration.
         for _ in 0..2 {
             let db = Arc::new(SimilarDb::open_at(&temp.path().join("similar.db")).unwrap());
             assert!(db.scanned_once_matches(&fingerprint).unwrap());
@@ -10486,14 +10512,92 @@ mod tests {
                 worker.join().unwrap();
                 assert!(reused.load(Ordering::Acquire));
                 assert!(awaiting_ack);
-                assert!(remaining_prefill.unwrap().is_none());
+                assert!(remaining_prefill.unwrap().is_some());
                 assert!(marker_kept.unwrap());
             });
             assert!(matches!(manager.progress(), IndexProgress::Complete(_)));
             assert_eq!(db.full_inventory_load_count(), 0);
+            assert_eq!(db.scope_purge_enumeration_count(), 0);
             assert_eq!(db.cleanup_incomplete_call_count(), 1);
             assert_eq!(manager.reconcile_job_counts_for_test(), (0, 0));
             assert!(db.scanned_once_matches(&fingerprint).unwrap());
+        }
+    }
+
+    #[test]
+    fn startup_reused_initial_log_reports_each_step_in_normal_log() {
+        let telemetry = telemetry_for_test(ReconcileJobKind::Full(initial_full_intent()));
+        telemetry
+            .reused_cleanup_time
+            .observe(Duration::from_micros(1200));
+        assert_eq!(
+            telemetry.reused_initial_log(
+                Duration::from_micros(300),
+                137_000,
+                Duration::from_micros(5000),
+            ),
+            "similar reconcile reused initial: skipped=true cleanup_ms=1.2 page_order_ms=0.3 memory_ms=137.0 ack_ms=5.0"
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_and_page_order_cost_with_complete_containers() {
+        // A disposable on-disk store measures the remaining preparation work without real data.
+        // Timing is evidence only; correctness assertions never depend on elapsed thresholds.
+        for containers in [1_000, 100_000] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("similar.db");
+            let db = SimilarDb::open_at(&path).unwrap();
+            assert_eq!(
+                db.page_order_version().unwrap(),
+                crate::similar_db::PAGE_ORDER_VERSION
+            );
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute(
+                    "WITH RECURSIVE ids(value) AS (
+                       VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+                     )
+                     INSERT INTO container
+                       (container_key, source_parent_key, kind, page_count, scan_state,
+                        generation, mtime, file_size)
+                     SELECT printf('c:/library/books/%08d.zip', value), 'c:/library/books',
+                            ?2, 0, ?3, 1, 1, 1 FROM ids",
+                    rusqlite::params![
+                        containers,
+                        ContainerKind::Zip as i64,
+                        crate::similar_db::ScanState::Complete as i64,
+                    ],
+                )
+                .unwrap();
+            }
+            db.mark_scanned_once("same configuration").unwrap();
+            drop(db);
+
+            let db = SimilarDb::open_at(&path).unwrap();
+            let cleanup_started = std::time::Instant::now();
+            assert_eq!(
+                db.cleanup_incomplete_if(&Arc::new(AtomicBool::new(false)))
+                    .unwrap(),
+                Some(0)
+            );
+            let cleanup_elapsed = cleanup_started.elapsed();
+            let page_order_started = std::time::Instant::now();
+            repair_page_order_if_stale(&db);
+            let page_order_elapsed = page_order_started.elapsed();
+            println!(
+                "reused preparation: complete_containers={containers} db_bytes={} cleanup_ms={:.3} page_order_ms={:.3}",
+                std::fs::metadata(&path).unwrap().len(),
+                cleanup_elapsed.as_secs_f64() * 1000.0,
+                page_order_elapsed.as_secs_f64() * 1000.0,
+            );
+            assert_eq!(
+                db.load_complete_containers().unwrap().len(),
+                containers as usize
+            );
+            assert_eq!(db.full_inventory_load_count(), 0);
+            assert_eq!(db.scope_purge_enumeration_count(), 0);
+            assert!(db.scanned_once_matches("same configuration").unwrap());
         }
     }
 

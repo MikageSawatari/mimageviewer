@@ -7350,13 +7350,28 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
-/// v0.8.0: 自動インデクサの速度プロファイル設定ページ。
+/// 検索インデックスの起動時確認と速度プロファイル設定ページ。
 ///
 /// `IndexerSpeedProfile` は `GlobalIoSemaphore` の permit 数を決める。
 /// 値の変更は **次回起動時に反映** される (ランタイム差し替えは `sync_with_favorites`
 /// でも反映されないので現状は再起動が必要)。
 pub(super) fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::IndexerSpeedProfile;
+    anchored(ui, state, "indexer/offline-change-scan", |ui, state| {
+        crate::ui_helpers::draw_offline_change_scan_setting(
+            ui,
+            &mut state.settings.skip_offline_change_scan,
+        );
+        ui.label(
+            egui::RichText::new("[今すぐ確認] は「お気に入り > 編集」にあります。")
+                .weak()
+                .size(11.0),
+        );
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
     anchored(ui, state, "indexer/speed", |ui, state| {
         let s = &mut state.settings;
 
@@ -7412,23 +7427,11 @@ pub(super) fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesStat
             "アプリを閉じる代わりに、タスクトレイに常駐する",
         )
         .on_hover_text(
-            "OFF (既定): [×] でアプリ終了。終了中の変更を次回起動時に確認するかは下の設定で選べます。\n\
+            "OFF (既定): [×] でアプリ終了。終了中の変更を次回起動時に確認するかは\n\
+         「ライブラリ > 検索インデックス」で選べます。\n\
          ON: [×] でウィンドウを隠してタスクトレイに常駐。ファイル変更を\n\
          追い続けるため、次回開いたときは最新のインデックスがそのまま使えます。\n\
          終了はタスクトレイアイコンを右クリックして「終了」を選んでください。",
-        );
-    });
-    ui.add_space(12.0);
-
-    anchored(ui, state, "tray/offline-change-scan", |ui, state| {
-        crate::ui_helpers::draw_offline_change_scan_setting(
-            ui,
-            &mut state.settings.skip_offline_change_scan,
-        );
-        ui.label(
-            egui::RichText::new("[今すぐ確認] は「お気に入り > 編集」にあります。")
-                .weak()
-                .size(11.0),
         );
     });
     ui.add_space(12.0);

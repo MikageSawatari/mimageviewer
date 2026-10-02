@@ -38,10 +38,15 @@ configure が watcher 登録より先に走る欠落窓、登録失敗のログ�
 `skip_offline_change_scan` ON、`scanned_once` の有効 root 集合全体の指紋一致、純粋な Initial、
 現在構成の全 watch が Ready、未修復 gap なしの場合だけ、既存 worker 内で `ReusedInitial` を
 選ぶ。Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair の合流は `ScannedFull`。
-再利用では Full inventory と FS 列挙を省くが、未完 build の掃除、有効 root 和集合から共通除外を
-差し引いた範囲外の公開 item/container・build・prefill の purge、page order 修復、メモリ読み込みを
-行う。purge は入れ子 root を保護し、変更履歴・watermark を通常の purge と同じ transaction で
-更新する。現在 store と array snapshot の ack が揃ってから既存の終端経路で Complete を出す。
+再利用では Full inventory と FS 列挙に加え、有効 root 和集合の外のキーの purge も省く。
+指紋が root / 共通除外を含み、構成変更 purge の公開削除は同 transaction で印を失効させ、
+別指紋 Full も最初の書き込みより前に失効させるため、同一指紋での全キー整理は不要。
+クラッシュが変更前なら旧構成の公開データが保たれ、変更後なら旧印がない。
+非公開の prefill は残してよい。未完 build の掃除、page order 修復、メモリ読み込みは維持し、
+現在 store と array snapshot の ack が揃ってから既存の終端経路で Complete を出す。
+通常ログの `reused initial: skipped=true` に `cleanup_ms / page_order_ms / memory_ms / ack_ms`
+を出す。memory は実 loader の時間、ack は要求から受理までの時間で、非同期 load は cleanup
+や ack と重複するため4項目を合計しない。page order が現行版なら単一 metadata 行の確認だけ。
 dirty の `retain_after` と gap repair は `ScannedFull` だけに適用し、再利用中の dirty は MoreWork
 から Delta へ残す。印は完全な Full だけで立て、イベント・クラッシュでは消さない。
 設定purgeで公開済み item / container を削除するときは、その transaction 内で印も消す。
