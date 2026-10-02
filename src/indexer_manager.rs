@@ -728,10 +728,10 @@ fn spawn_reconciliation(
 /// delete してから SQLite 行も物理削除する。次回 supervisor の walker が
 /// "DB になし" として検出して再 ingest 候補に拾う。
 ///
-/// `list_not_ok_paths` をお気に入りごとに回すと `idx_files_fav_kind` で
-/// post-filter 化されてお気に入り配下の全行 (実測 65 万行で 1.1 秒) を読む。
-/// `list_not_ok_paths_for_favorites` の 1 クエリ化で部分インデックス
-/// `idx_files_status` (status != 0) が効き 17ms 程度に収まる。
+/// favorite の索引を選ぶと post-filter 化して配下の全行を読む。
+/// `list_not_ok_paths_for_favorites` は集合クエリと `+favorite_id` で
+/// favorite 索引を候補から外し、部分インデックス `idx_files_status`
+/// (status != 0) を使う。`idx_files_fav_path` 追加後も Failed 行だけを走査する。
 pub(crate) fn run_reconciliation_via_dispatcher(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,

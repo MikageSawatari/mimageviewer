@@ -239,8 +239,8 @@ FIFO に置き、commit/reload 成功後に SQLite を削除する。失敗時�
 rebuild pending を立てて通知し、次回起動で `files` と Tantivy の両方を作り直す。
 起動時 cleanup は S3 の印に関わらず Full が必要な現所有 root 集合を返す。
 起動時の owner 照会は `path, favorite_id` の2列だけを covering index で読む。
-perf には照会時間・取得行数と、Vec/String の capacity から算出した取得バッファの
-推定確保バイト数を出す (プロセス全体のメモリ量ではない)。
+行ごとに所有判定し、削除対象 path と現所有 root だけを保持する。perf には読取と判定の
+時間・走査件数・収集した削除対象 path の最大件数を出す（プロセス全体のメモリ量ではない）。
 
 #### 終了応答性と有界 shutdown
 
@@ -330,6 +330,17 @@ v2.3.0第12弾では次を不変条件とする。
 
 所有範囲外の掃除も含め、manager worker 内で reconciliation の完了後に supervisor を
 起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
+
+Failed 行の照会は `status != 0 AND +favorite_id IN (...)` とし、favorite の索引を
+候補から外して部分索引 `idx_files_status` を使う。`idx_files_fav_path` の追加後も、
+正常行まで読む広い favorite 検索に切り替わらないことを EXPLAIN 回帰で確認する。
+単一 favorite 版も同じ規則にする。UUID は TEXT として bind する。
+所有範囲外の照会は `idx_files_fav_path` の covering scan を行単位で読み、削除する path と
+現在の所有 root だけを保持する。全行の `(path, favorite_id)` 配列を作らない。
+読取完了・connection lock 解放後に既存の削除を実行し、途中の読取失敗では部分削除しない。
+`metadata_out_of_range_cleanup` の `owner_rows` は走査件数、`peak_collected_rows` は
+収集した削除対象 path の最大件数、`query_ms` は行読取と所有判定を合わせた時間。
+正常行だけなら収集件数は0となる。
 
 この整理は `skip_offline_change_scan` ON でも省かない。Failed 行を掃除した root の印を消し、
 所有者の付け替えが必要な root は、削除と同じ SQLite transaction で印を消したうえで

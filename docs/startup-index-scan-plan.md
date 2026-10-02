@@ -160,6 +160,9 @@
   この掃除で行を消したパスがあれば、そのパスの **今の所有者の root は印に関わらず全走査** する
   (消した文書を取り込み直すのはその走査だけなので。新しい版 → 旧版 → 新しい版の往復で、
   旧版が所有 ID を書き換えた場合もここで直る)。掃除は対象行数と時間を perf に出す。
+  全行を配列にせず、行単位で所有判定して削除対象 path と現在の所有 root だけを保持する。
+  全読取が成功して DB lock を解放した後に削除する。perf は走査件数 `owner_rows`、
+  収集最大件数 `peak_collected_rows`、読取と判定を含む `query_ms` を記録する。
   必要なら `(favorite_id, path)` の索引を追加する (既存 DB への索引追加は `CREATE INDEX IF NOT EXISTS`
   で、行の意味は変えない)。
 
@@ -1173,3 +1176,81 @@ UI担当が manual 3ページの HTML parse / ID 重複検査と既存 checkbox 
 起動中の `target/dev-runtime/mimageviewer-core.exe`（PID 54080）を検出して exit 1。
 `-PreserveRuntime` の仕様に従ってプロセスは終了させていない。初回ログは `build-dev-running.log`。
 コード・自動検証は完了しており、利用者のアプリ終了後に同じ build コマンドを再実行する。
+
+### 11.9 FTS 起動照合の索引選択と所有行の逐次読取 (2026-10-03)
+
+利用者が HEAD `0dfc3b345` を確認し、全省略が成功、similar ReusedInitial は10msとなった。
+一方 `fts_reconciliation` は約3.85秒（以前約0.3秒）。利用者の読取専用コピーで、S2の
+`idx_files_fav_path` 追加後に Failed 照会が favorite 全825,000行を読む計画へ変わることが
+確認された（約3.25秒）。`+favorite_id` なら `idx_files_status` 走査となり0行 / 約0.2ms。
+これらの実データ値は利用者の測定であり、今回実装担当は通常 profile を読み取っていない。
+
+- 集合版と同じ問題を持つ単一版の Failed 照会に単項 `+favorite_id` を適用。UUID を TEXT
+  bind する現在の契約では、affinity 除去による比較結果の変更はない。すべての SQL を
+  `INDEXED BY` で固定せず、競合する favorite 索引だけを候補から外す簡素な修正にした。
+  現在単一版の呼出しはテスト系だが、同じ API の経路として合わせて保護する。
+- 製品が実際に使う SQL 定数 / builder を EXPLAIN する回帰を追加。新規 DB の索引作成順と、
+  既存 DB への fav_path 後追加順を、ANALYZE の有無で確認する。集合版は IN 1 / 2 / 12件、
+  単一版は1件で部分索引使用を固定する。時間をテストの合否条件にしない。
+- `fts_meta.rs` の全 SQL と src / tests の直接 `files` SQL を読み取り専用で監査した。
+  部分索引 / より選択的な索引の喪失は上記2本だけ。他の照会へ強制指定を加えない。
+
+| 監査した照会・変更の形 | 判定 |
+| --- | --- |
+| path 等価、path IN、path 半開区間の stamp / EXISTS / root / DELETE、UPSERT conflict | path PK の絞り込みを維持 |
+| favorite_id と NOT path 範囲、全 owner、favorite の全 path | fav_path covering。追加の意図どおり |
+| favorite の保存 root DISTINCT / DELETE、Ok stamp / COUNT、status 別 COUNT | fav_path へ移る場合も元の favorite 索引と候補行数は同じ。status != 0 の部分索引は Ok に適用不可 |
+| 全 Failed の FileMeta、起動時 legacy status UPDATE | 部分索引を失う favorite 条件なし |
+| Ok の favorite GROUP BY、MIN(index_version)、全削除、table / schema / PRAGMA / VACUUM | 今回の選択競合なし |
+| index_state / scanned_once の SQL | files 索引の選択に無関係 |
+| bench_search の独立 files、他ファイルの test UPDATE / 失敗注入 trigger | 製品の追加索引を使わない、または絞り込みの選択競合なし |
+
+- startup 所有範囲外整理の全行 Vec を、SQLite 行を借用する callback に置き換えた。
+  callback は固定構成に対する判定だけを行い、削除対象 path と現在の所有 root だけを保持。
+  orphan、無効 UUID、OFF、入れ子の誤所有、共通除外、prefix 隣接の判定を維持する。
+  callback は connection mutex 内で呼ぶので DB / writer に再入しない。読取成功後、Rows /
+  Statement / lock の解放後に既存 Tantivy First 削除を実行。途中読取失敗では部分削除しない。
+  非同期の状態・分割削除・retry / recovery は増やさず、全 supervisor 前という境界を維持した。
+- `owner_rows_bytes` を `peak_collected_rows` に変更。逐次収集は単調増加なので最終削除対象件数が
+  最大保持件数。これは収集段階の path 件数で、後段 writer の既存 path 複製の bytes ではない。
+  `owner_rows` は全走査行数、`query_ms` は行読取に所有判定時間を含む。
+  正常1,000行では path Vec capacity 0、削除4種・無効 UUID だけを保持する回帰と、読取失敗後の
+  行 / 印保持を確認する。全行のディスク走査自体は、起動時の所有不整合検出のため維持する。
+- 永続 schema / データの意味・ユーザー操作・UI 文字列は変わらないため、schema 版・migration・
+  manual / 製品ページ・UI snapshot の更新は不要。検索 architecture §4.3 と本設計 §3 を更新した。
+  UI snapshot は §11.8 の59件成功を再利用する。
+
+gpt-6.1-sol / xhigh の読み取り専用監査・差分レビューで P1/P2 なし。
+旧 capacity/bytes の architecture §4.1 説明が残っているという P3 を修正した。
+監査担当は Cargo / build を実行せず、以下は実装担当が所有する。
+
+`MSBUILDDISABLENODEREUSE=1` を設定し、
+`cargo test -j1 -p mimageviewer --lib <filter> -- --test-threads=1` を実行した。
+最終ソースの lib は107件成功、失敗 / ignored 0（新規回帰6件を含む）。
+
+| filter | 成功件数 |
+| --- | ---: |
+| `fts_meta` | 31 |
+| `metadata_reconfiguration` | 19 |
+| `indexer_manager` | 13 |
+| `indexer_supervisor` | 20 |
+| `fts_writer_dispatcher` | 10 |
+| `ingest_worker` | 14 |
+
+`cargo test -j1 -p mimageviewer --test search_metadata_e2e -- --test-threads=1` は14件成功。
+今回実行した重複のない成功件数は lib 107 + integration 14 = 121。
+`cargo check -j1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+実行計画は製品の bundled SQLite で検証した。新規 / 後追加・統計有無・IN 件数を合わせた
+16通りの EXPLAIN で `idx_files_status` を確認する。補助監査の Python SQLite 3.49.1 の
+計画だけを合否の根拠にはしていない。初回の fts_meta 31件成功は重複なので合算しない。
+ログ保存先は `target/startup-scan-s3/fts-startup-cost/`。
+
+全workspaceの `cargo fmt --all` / `cargo fmt --all --check` と `git diff --check` は成功。
+`python scripts/check_ui_glyphs.py` は問題0。
+`target/startup-scan-s3/commit-message.txt` を UTF-8 BOM なしで上書きし、指定署名を末尾に置いた。
+利用者がアプリを終了済みとの指示に従い、
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は exit 0。
+通常 feature / dev-runtime profile の core・remote・EPUB PDF worker を生成・配置した。
+core は6分35秒、companion は増分 build。VCRT / PE 検査も runtime=4 / pe=3 で成功。
+`build-dev.log` に記録。全workspace suite・アプリ起動・通常 profile の操作・コミットは
+行っていない。実データでの修正後の所要時間は、利用者がこの build で確認する。

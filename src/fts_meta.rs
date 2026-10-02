@@ -730,12 +730,44 @@ impl FtsMetaDb {
     }
 
     /// Startup includes orphan/invalid UUIDs, not just IDs still present in settings.
-    pub fn list_path_owners(&self) -> rusqlite::Result<Vec<(String, String)>> {
+    /// The callback borrows SQLite's current row and runs under the connection mutex;
+    /// it must not re-enter this DB. Only callers that retain a row need to allocate strings.
+    pub(crate) fn for_each_path_owner(
+        &self,
+        mut visit: impl FnMut(&str, &str),
+    ) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
         // EXPLAIN は idx_files_fav_path の COVERING INDEX scan (下の回帰テストで固定)。
         let mut stmt = conn.prepare("SELECT path, favorite_id FROM files")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect()
+        let mut rows = stmt.query([])?;
+        let mut visited = 0;
+        while let Some(row) = rows.next()? {
+            let path = row.get_ref(0)?.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let id = row.get_ref(1)?.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            visit(path, id);
+            visited += 1;
+        }
+        Ok(visited)
+    }
+
+    /// Test-only collection; startup retains only the paths that need deletion.
+    #[cfg(test)]
+    pub fn list_path_owners(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        self.for_each_path_owner(|path, id| out.push((path.to_owned(), id.to_owned())))?;
+        Ok(out)
     }
 
     /// Tantivy の範囲削除・commit・reload 成功後に、同じ半開区間の行を消す。
@@ -901,10 +933,8 @@ impl FtsMetaDb {
         favorite_id: Uuid,
     ) -> rusqlite::Result<Vec<(String, FileStatus)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT path, status FROM files \
-             WHERE favorite_id = ?1 AND status != 0",
-        )?;
+        // 集合版と同じく、favorite 側の全行検索より Failed の部分索引を使う。
+        let mut stmt = conn.prepare(NOT_OK_PATHS_FOR_FAVORITE_SQL)?;
         let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -919,12 +949,12 @@ impl FtsMetaDb {
     /// 起動時 reconciliation 用の最適化版: 指定お気に入り集合内で status != Ok の
     /// (path, favorite_id, status) を 1 クエリで返す。
     ///
-    /// `list_not_ok_paths` をお気に入りごとにループすると `idx_files_fav_kind`
-    /// が選ばれて status フィルタが post-filter 化し、お気に入り配下の **全行**
-    /// (mIV では 65 万行で実測 1.1 秒) を読む羽目になる。これは部分インデックス
-    /// `idx_files_status` (status != 0 の行だけを保持) を使えば 17ms で済む。
-    /// `favorite_id IN (...)` で SQLite が自動的に部分インデックスを優先するため、
-    /// 1 クエリにまとめて呼ぶ形にする。
+    /// favorite 側の索引が選ばれると status フィルタが post-filter 化し、配下の全行を読む。
+    /// 以前の単一版では `idx_files_fav_kind` が選ばれ、65 万行で実測 1.1 秒だった。
+    /// 部分インデックス `idx_files_status` (status != 0 の行だけを保持) なら同測定で 17ms。
+    /// 1 クエリにまとめ、`+favorite_id IN (...)` の単項 + で favorite 側の索引候補を外す。
+    /// `idx_files_fav_path` 追加後も全 favorite 行の検索へ戻らず、Failed の部分索引を使う。
+    /// ID は TEXT の UUID として bind するので、単項 + による affinity 除去で比較は変わらない。
     ///
     /// `favorite_ids` が空なら空配列を返す (status != 0 行が他お気に入りに残って
     /// いても、auto_index_metadata=true でない限り触らない既存の reconciliation 規約に従う)。
@@ -936,11 +966,7 @@ impl FtsMetaDb {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders = sql_in_placeholders(favorite_ids.len());
-        let sql = format!(
-            "SELECT path, favorite_id, status FROM files \
-             WHERE status != 0 AND favorite_id IN ({placeholders})"
-        );
+        let sql = not_ok_paths_for_favorites_sql(favorite_ids.len());
         let mut stmt = conn.prepare(&sql)?;
         let params_vec: Vec<String> = favorite_ids.iter().map(|id| id.to_string()).collect();
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
@@ -1071,6 +1097,17 @@ const FILEMETA_SELECT_SQL_BY_PATH: &str = concat!(
     filemeta_select_cols!(),
     " FROM files WHERE path = ?1"
 );
+
+const NOT_OK_PATHS_FOR_FAVORITE_SQL: &str =
+    "SELECT path, status FROM files WHERE +favorite_id = ?1 AND status != 0";
+
+fn not_ok_paths_for_favorites_sql(favorite_count: usize) -> String {
+    format!(
+        "SELECT path, favorite_id, status FROM files \
+         WHERE status != 0 AND +favorite_id IN ({})",
+        sql_in_placeholders(favorite_count),
+    )
+}
 
 fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let uuid_str: String = row.get(1)?;
@@ -1588,6 +1625,115 @@ mod tests {
 
         let paths: Vec<_> = rows.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(!paths.contains(&"c:/a/1.jpg"));
+    }
+
+    fn assert_not_ok_uses_status_index(favorite_count: usize, single: bool) {
+        // 新規 DB と既存 DB への追加では、競合する索引の作成順が異なる。
+        for appended in [false, true] {
+            for analyzed in [false, true] {
+                let (_tmp, db) = tmp_db();
+                let conn = db.conn.lock().unwrap();
+                conn.execute(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000)
+                     INSERT INTO files(path,favorite_id,favorite_root,kind,mtime,file_size,indexed_at,index_version,index_generation,status)
+                     SELECT 'c:/x/'||i||'.jpg',?1,'c:/x',0,1,1,1,?2,1,CASE WHEN i%100=0 THEN 2 ELSE 0 END FROM n",
+                    params![Uuid::from_u128(1).to_string(), INDEX_VERSION],
+                ).unwrap();
+                if appended {
+                    conn.execute_batch("DROP INDEX idx_files_fav_path; CREATE INDEX idx_files_fav_path ON files(favorite_id,path)").unwrap();
+                }
+                if analyzed {
+                    conn.execute_batch("ANALYZE").unwrap();
+                }
+                let sql = if single {
+                    NOT_OK_PATHS_FOR_FAVORITE_SQL.to_owned()
+                } else {
+                    not_ok_paths_for_favorites_sql(favorite_count)
+                };
+                let values: Vec<_> = (1..=favorite_count)
+                    .map(|i| Uuid::from_u128(i as u128).to_string())
+                    .collect();
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                let plan = stmt
+                    .query_map(rusqlite::params_from_iter(&values), |r| {
+                        r.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("; ");
+                assert!(
+                    plan.contains("USING INDEX idx_files_status"),
+                    "appended={appended}, analyzed={analyzed}: {plan}"
+                );
+                assert!(!plan.contains("idx_files_fav_path"), "{plan}");
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_files_fav_path'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_not_ok_paths_for_favorites_uses_partial_status_index_with_fav_path_index() {
+        for count in [1, 2, 12] {
+            assert_not_ok_uses_status_index(count, false);
+        }
+    }
+
+    #[test]
+    fn list_not_ok_paths_uses_partial_status_index_with_fav_path_index() {
+        assert_not_ok_uses_status_index(1, true);
+    }
+
+    #[test]
+    fn streaming_path_owners_reports_invalid_text_without_changing_rows() {
+        let (_tmp, db) = tmp_db();
+        let id = Uuid::new_v4();
+        db.upsert_meta_ok(
+            "c:/x/valid.jpg",
+            id,
+            Path::new("c:/x"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_meta_ok(
+            "c:/x/invalid.jpg",
+            id,
+            Path::new("c:/x"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE files SET favorite_id=x'ff' WHERE path='c:/x/invalid.jpg'",
+                [],
+            )
+            .unwrap();
+        let mut visited = 0;
+        assert!(db.for_each_path_owner(|_, _| visited += 1).is_err());
+        assert_eq!(visited, 1);
+        assert!(db.get("c:/x/valid.jpg").unwrap().is_some());
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

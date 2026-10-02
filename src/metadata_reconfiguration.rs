@@ -232,6 +232,41 @@ fn delete_paths(
     Ok(())
 }
 
+struct StartupCleanupTargets {
+    paths: Vec<String>,
+    roots: HashSet<String>,
+    owner_rows: usize,
+}
+
+/// Retain only invalid rows; the visitor must not re-enter the locked metadata DB.
+fn collect_startup_cleanup_targets(
+    meta: &crate::fts_meta::FtsMetaDb,
+    config: &Configuration,
+) -> Result<StartupCleanupTargets, String> {
+    let mut roots = HashSet::new();
+    let mut paths = Vec::new();
+    let owner_rows = meta
+        .for_each_path_owner(|path, id| {
+            let valid = Uuid::parse_str(id)
+                .ok()
+                .and_then(|id| config.ownership.favorites.get(&id))
+                .and_then(|f| f.owned_range.as_ref())
+                .is_some_and(|r| r.contains(path));
+            if !valid {
+                if let Some(owner) = config.ownership.owner(path) {
+                    roots.insert(owner.root.clone());
+                }
+                paths.push(path.to_owned());
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(StartupCleanupTargets {
+        paths,
+        roots,
+        owner_rows,
+    })
+}
+
 /// Reconciliation must run before any supervisor; orphan IDs are included.
 pub(crate) fn startup_cleanup(
     stores: &Stores,
@@ -239,29 +274,13 @@ pub(crate) fn startup_cleanup(
 ) -> Result<HashSet<String>, String> {
     let started = Instant::now();
     let query_started = Instant::now();
-    let rows = stores.meta.list_path_owners().map_err(|e| e.to_string())?;
+    let StartupCleanupTargets {
+        paths,
+        roots,
+        owner_rows,
+    } = collect_startup_cleanup_targets(&stores.meta, config)?;
+    // Includes the ownership check. Rows and the DB lock are released before deleting.
     let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
-    let owner_rows = rows.len();
-    let owner_rows_bytes = rows.capacity() * std::mem::size_of::<(String, String)>()
-        + rows
-            .iter()
-            .map(|(path, id)| path.capacity() + id.capacity())
-            .sum::<usize>();
-    let mut roots = HashSet::new();
-    let mut paths = Vec::new();
-    for (path, id) in rows {
-        let valid = Uuid::parse_str(&id)
-            .ok()
-            .and_then(|id| config.ownership.favorites.get(&id))
-            .and_then(|f| f.owned_range.as_ref())
-            .is_some_and(|r| r.contains(&path));
-        if !valid {
-            if let Some(owner) = config.ownership.owner(&path) {
-                roots.insert(owner.root.clone());
-            }
-            paths.push(path);
-        }
-    }
     let count = paths.len();
     let result = delete_paths(stores, paths, &roots.iter().cloned().collect::<Vec<_>>());
     crate::perf::event(
@@ -273,7 +292,8 @@ pub(crate) fn startup_cleanup(
             ("rows", count.into()),
             ("owner_rows", owner_rows.into()),
             ("query_ms", query_ms.into()),
-            ("owner_rows_bytes", owner_rows_bytes.into()),
+            // The streaming collector only grows, so its final size is its peak.
+            ("peak_collected_rows", count.into()),
             (
                 "ms",
                 started.elapsed().as_secs_f64().mul_add(1000.0, 0.0).into(),
@@ -1086,6 +1106,149 @@ mod tests {
             HashSet::from(["c:/photos/inner".into()])
         );
         assert!(stores.meta.list_path_owners().unwrap().is_empty());
+    }
+    #[test]
+    fn startup_cleanup_streams_valid_rows_without_collecting_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        let f = favorite(1, PathBuf::from("c:/photos"), true);
+        for i in 0..1000 {
+            stores
+                .meta
+                .upsert_meta_ok(
+                    &format!("c:/photos/{i}.jpg"),
+                    f.id,
+                    &f.path,
+                    crate::fts_index::IndexKind::Image,
+                    1,
+                    1,
+                )
+                .unwrap();
+        }
+        stores
+            .meta
+            .mark_scanned_once("c:/photos", "complete")
+            .unwrap();
+        let config = Configuration::new(&[f], Vec::new());
+        let targets = collect_startup_cleanup_targets(&stores.meta, &config).unwrap();
+        assert_eq!(targets.owner_rows, 1000);
+        assert_eq!(
+            targets.paths.capacity(),
+            0,
+            "valid rows must not be retained"
+        );
+        assert!(targets.roots.is_empty());
+        assert!(startup_cleanup(&stores, &config).unwrap().is_empty());
+        assert_eq!(
+            stores
+                .meta
+                .count_ok_grouped_by_favorite()
+                .unwrap()
+                .values()
+                .sum::<u64>(),
+            1000
+        );
+        assert_eq!(
+            stores.meta.scanned_once("c:/photos").unwrap().as_deref(),
+            Some("complete")
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_collects_only_invalid_paths_and_current_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        let outer = favorite(1, PathBuf::from("c:/photos"), true);
+        let inner = favorite(2, PathBuf::from("c:/photos/inner"), true);
+        let off = favorite(3, PathBuf::from("d:/off"), false);
+        let valid = ["c:/photos/valid.jpg", "c:/photos/private2/valid.jpg"];
+        let invalid = [
+            "c:/photos/inner/wrong-owner.jpg",
+            "c:/photos/invalid-id.jpg",
+            "c:/photos/private/excluded.jpg",
+            "d:/off/x.jpg",
+            "e:/orphan.jpg",
+        ];
+        for (path, id, root) in valid
+            .iter()
+            .map(|p| (*p, outer.id, &outer.path))
+            .chain(invalid.iter().map(|p| match *p {
+                "d:/off/x.jpg" => (*p, off.id, &off.path),
+                "e:/orphan.jpg" => (*p, Uuid::nil(), &outer.path),
+                _ => (*p, outer.id, &outer.path),
+            }))
+            .chain(std::iter::once((
+                "c:/photos/inner/valid.jpg",
+                inner.id,
+                &inner.path,
+            )))
+        {
+            stores
+                .meta
+                .upsert_meta_ok(path, id, root, crate::fts_index::IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        rusqlite::Connection::open(tmp.path().join("meta.db"))
+            .unwrap()
+            .execute(
+                "UPDATE files SET favorite_id='invalid UUID' WHERE path='c:/photos/invalid-id.jpg'",
+                [],
+            )
+            .unwrap();
+        let config = Configuration::new(&[outer, inner, off], vec!["c:/photos/private".into()]);
+        let targets = collect_startup_cleanup_targets(&stores.meta, &config).unwrap();
+        assert_eq!(targets.owner_rows, 8);
+        assert_eq!(
+            targets
+                .paths
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            HashSet::from(invalid)
+        );
+        assert_eq!(
+            targets.roots,
+            HashSet::from(["c:/photos".into(), "c:/photos/inner".into()])
+        );
+        assert_eq!(startup_cleanup(&stores, &config).unwrap(), targets.roots);
+        assert_eq!(stores.meta.list_path_owners().unwrap().len(), 3);
+    }
+    #[test]
+    fn startup_cleanup_read_failure_does_not_delete_collected_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        let id = Uuid::new_v4();
+        for path in ["c:/x/orphan.jpg", "c:/x/invalid-text.jpg"] {
+            stores
+                .meta
+                .upsert_meta_ok(
+                    path,
+                    id,
+                    std::path::Path::new("c:/x"),
+                    crate::fts_index::IndexKind::Image,
+                    1,
+                    1,
+                )
+                .unwrap();
+        }
+        let conn = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
+        // TEXT sorts before BLOB in the covering index: an orphan is collected before failure.
+        conn.execute(
+            "UPDATE files SET favorite_id=x'ff' WHERE path='c:/x/invalid-text.jpg'",
+            [],
+        )
+        .unwrap();
+        stores.meta.mark_scanned_once("c:/x", "complete").unwrap();
+        assert!(startup_cleanup(&stores, &Configuration::new(&[], Vec::new())).is_err());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            stores.meta.scanned_once("c:/x").unwrap().as_deref(),
+            Some("complete")
+        );
     }
     #[test]
     fn cleanup_failure_sets_rebuild_pending_and_notifies_without_runtime_wipe() {
