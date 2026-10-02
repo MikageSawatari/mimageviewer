@@ -297,8 +297,7 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
   Tantivy の新規作成・schema 再構築 ([fts_index.rs:361](../src/fts_index.rs))、similar の作り直し)。
   消したことをその起動の判断に渡す (同じ起動で「印あり」と読まない)。
 - **構成変更が旧印の範囲のデータを削除・書き換える前にも消す**。削除と印の失効は同じ
-  DB transaction。name/similarの別指紋 Full は最初の行変更より前に失効を確定する。
-  ftsの拡張子集合変更Fullの追加修正範囲は §11.5 の設計確認事項を参照。構成を元へ戻し、
+  DB transaction。3系統とも別指紋 Full は最初の行変更より前に失効を確定する。構成を元へ戻し、
   Full の途中で正常終了しても旧印を再利用しない。fts の起動補修の must-scan root も
   同じ削除 transaction で印を失効させる。通常 watcher の削除と、変更が無い起動整理は保持する。
 - **イベント・クラッシュ・強制終了・電源断・処理途中の終了では消さない**。終了中や処理途中の
@@ -946,4 +945,78 @@ CRT検査は `runtime=4 pe=3`。ログは `target/startup-scan-s3/review-fixes/b
 独立reviewerもこの経路をソースで確認した。利用者はftsを「構成変更と起動補修の削除経路だけ」
 と明示しており、Full側まで広げるかは設計側へ確認した。追加案はname/similarと同じく、
 別指紋Fullの最初の行変更前に旧root印を失効する小さい変更単位。retryや復旧stateは不要。
-現段階では指定4件の修正と355件成功のgreen差分を保持し、この追加範囲は未実装・回答待ち。
+この時点では指定4件の修正と355件成功のgreen差分を保持し、追加範囲は未実装・回答待ちとした。
+利用者の追加承認を受けた実装は次の §11.6 に記録する。
+
+### 11.6 fts の別指紋 Full の統一 (2026-10-02)
+
+利用者がnameと同じ一般則をftsにも適用すると決定した。Susie拡張子集合を含む全指紋入力を
+対象に、保存印と指紋が異なるFullは最初の行変更より前に旧印を失効する。同一指紋Fullの
+取消では以前の印を保持する。HEAD `84b5c141c` を基点に追加修正し、新しい復旧やretryは作らない。
+
+- `FtsMetaDb::prepare_full_scan` が root と指紋不一致の条件付きDELETEをtransactionで確定。
+  他rootと同一指紋の印は保持し、印なしでは新しい印を作らない。失効失敗なら共通Full入口で
+  Failedとして終了し、walker・Tantivyバッチ・管理行の変更へ進まない。
+- 共通入口 `run_initial_scan` の指紋算出直後へ接続。実際には初回に加え、FullRescan /
+  metadata-only手動確認・overflow・監視回復・再構成後のFullもこの入口を通る。
+- nameの稼働中Fullは `run_full_scan` の準備transactionへ集約済み。similarは実削除を伴う
+  設定purgeで同transaction失効し、通常Fullは `run_index_job` の未完build掃除transactionで
+  指紋不一致を失効してからinventoryと走査の書き込みへ進む。ReusedInitialは一致時だけ。
+  初回・手動・Overflow・WatchRecovery・Reconfigure・SummaryRepairのproducer/consumerを
+  棚卸しし、稼働中の別指紋Fullに失効を迂回する追加経路は見つからなかった。
+- 指紋の比較はFull開始時に算出した集合が対象。Susie実poolの実行途中のlive再読み込みは
+  開始指紋不一致とは異なる入力変化であり、この規則では新しい状態管理を加えない。
+  similarのpage-order修復も調べた。現在の版は1で、修復を要する旧データは完走印導入前。
+  現行版で別指紋の完走印を残して修復する経路はなく、将来の版変更時は失効境界も確認する。
+- 追加回帰は4件。旧Susie申告を模す拡張子集合の印と管理行をseedし、現在の実walkerが
+  非対応行を削除してバッチが確定した地点をchannelで固定する。Fullの完了判定前に通常取消、
+  DB再open、元の申告集合へ戻して起動判断と実supervisorの `initial_scan_skipped=false` を確認。
+  実pluginや共有poolは変更せず、元集合の注入はtest-only thread-localで他テストと分離する。
+  同一指紋での削除後取消・再openは印保持/初回省略を陽性対照として確認する。
+  失効DELETEの失敗で管理行と印を保持しTantivyバッチを提出しない回帰、root限定の準備も追加。
+
+独立レビュー (`gpt-6.1-sol` / `xhigh`) が稼働中のFull全経路と完成差分を承認した。
+失効失敗テストのwriter gateは、誤提出が起きても待ち続けないようreleaseを事前に切断し、
+提出通知のassertionで退行を検出する。指摘は反映済み、未解決のP1/P2/P3は0。
+
+自動検証は `MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定し、
+libコマンドは `cargo test -j1 -p mimageviewer --lib <filter> -- --test-threads=1`。
+成功分は271件、similar_dbの既存手動用3件はignoreのまま。
+
+| filter | 成功件数 |
+| --- | ---: |
+| `indexer_supervisor` | 20 |
+| `fts_meta` | 28 |
+| `metadata_reconfiguration` | 16 |
+| `indexer_manager` | 13 |
+| `fts_writer_dispatcher` | 10 |
+| `ingest_worker` | 14 |
+| `name_index_supervisor` | 16 |
+| `search_index_db` | 43 |
+| `name_index_manager` | 10 |
+| `similar_db` | 63 |
+| `similar_index::tests::startup_` | 10 |
+| `similar_index::tests::incremental_reconcile` | 25 |
+| `index_full_check_tests` | 3 |
+
+| integration コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j1 -p mimageviewer --test search_metadata_e2e -- --test-threads=1` | 14 |
+| `cargo test -j1 -p mimageviewer --test search_name_e2e -- --test-threads=1` | 15 |
+
+成功分の合計300件 (重複の再実行は数えない)。ログは
+`target/startup-scan-s3/fingerprint-full/`。UI変更がないためsnapshotは実行・更新せず、
+前段 §11.5 の59件成功を再利用する。全workspace suite・アプリ起動は行わない。
+
+ハング防止修正後の `indexer_supervisor` も20件成功 (`indexer_supervisor-final.log`)。
+全workspaceの `cargo fmt --all` / `cargo fmt --all --check`、`git diff --check` は成功し、
+`python scripts/check_ui_glyphs.py` は問題0。
+`cargo check -j1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+コミット文は指定署名付きで `target/startup-scan-s3/commit-message.txt` を上書きし、
+先頭byte検査でUTF-8 BOMなしを確認した。今回もGitの書き込み・コミットは行っていない。
+
+確認用 build は `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`
+が exit 0。coreは6分11秒、remote service・EPUB workerも成功し、CRT検査は
+`runtime=4 pe=3`。ログは `target/startup-scan-s3/fingerprint-full/build-dev.log`。
+成果物は起動しておらず、通常 `%APPDATA%\mimageviewer` に触れていない。
+今回承認された別指紋Fullの修正に未実装項目はない。

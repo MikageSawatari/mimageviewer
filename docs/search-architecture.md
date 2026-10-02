@@ -251,8 +251,9 @@ rebuild pending の対象でない場合だけ省く。watcher は従来どお�
 手動確認は省かない。完全な観測・書き込み・prune の typed 成功でだけ印を立てる。
 イベントや途中終了・クラッシュでは消さず、ストア再作成と Failed cleanup で消す。
 構成変更と起動補修の削除は、旧行のrootと現在の補修先rootの印を同じ transaction で失効させる。
-Susieの対応拡張子集合が変わるFullは、削除済み文書の旧印が残る追加経路として
-startup-index-scan-plan §11.5で修正範囲を確認中。
+初回・手動・overflow・監視回復の共通Full入口も、保存指紋が異なる場合は管理行や全文文書を
+変更する前に旧rootの印をtransactionで失効させる。Susieの拡張子集合を含む全指紋入力が対象で、
+元の入力に戻して再起動しても途中の索引を省略しない。同一指紋Fullの取消では旧印を保持する。
 「お気に入り > 編集」の [今すぐ確認] は metadata-only Full、名前索引 Full、全 root の similar
 Manual 1回を非同期に要求する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
 理由を通知して名前索引だけを確認する。一時停止中は再開後に実行する。

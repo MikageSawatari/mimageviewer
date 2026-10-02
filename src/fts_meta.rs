@@ -488,6 +488,18 @@ impl FtsMetaDb {
             .optional()
     }
 
+    /// 別指紋の Full は旧索引を書き換える前に完走印を失効させる。
+    /// 同一指紋の Full の取消・失敗は、以前の完走印を保持する。
+    pub(crate) fn prepare_full_scan(&self, root: &str, fingerprint: &str) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scanned_once WHERE root = ?1 AND fingerprint <> ?2",
+            params![root, fingerprint],
+        )?;
+        tx.commit()
+    }
+
     pub(crate) fn mark_scanned_once(&self, root: &str, fingerprint: &str) -> rusqlite::Result<()> {
         // rebuild pending と印の採用を同じ DB lock で判定し、再構築要求を追い越さない。
         self.conn.lock().unwrap().execute(
@@ -1318,6 +1330,26 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
         assert!(reopened.tantivy_rebuild_pending().unwrap());
+    }
+
+    #[test]
+    fn full_scan_preparation_invalidates_only_other_fingerprints_in_this_root() {
+        let (_tmp, db) = tmp_db();
+        db.mark_scanned_once("c:/images", "original").unwrap();
+        db.mark_scanned_once("c:/other", "original").unwrap();
+        db.prepare_full_scan("c:/images", "original").unwrap();
+        assert_eq!(
+            db.scanned_once("c:/images").unwrap().as_deref(),
+            Some("original")
+        );
+        db.prepare_full_scan("c:/missing", "changed").unwrap();
+        assert_eq!(db.scanned_once("c:/missing").unwrap(), None);
+        db.prepare_full_scan("c:/images", "changed").unwrap();
+        assert_eq!(db.scanned_once("c:/images").unwrap(), None);
+        assert_eq!(
+            db.scanned_once("c:/other").unwrap().as_deref(),
+            Some("original")
+        );
     }
 
     /// 新規 DB 作成後に `PRAGMA user_version` が `INDEX_VERSION` と一致すること。

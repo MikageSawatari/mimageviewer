@@ -66,6 +66,8 @@ const WATCH_HEALTH_POLL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 thread_local! {
     static FULL_SCAN_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static FULL_SCAN_AFTER_APPLY_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static FTS_SCAN_EXTENSIONS_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Supervisor が UI に返す進捗・状態スナップショット。
@@ -671,6 +673,16 @@ fn run_initial_scan(
         excluded_roots,
         &fts_scan_extensions(),
     );
+    // 初回・手動・overflow・watch回復の全 Full で、別指紋の行変更より前に失効を確定する。
+    if let Err(error) = session.meta_db.prepare_full_scan(
+        &crate::metadata_ownership::root_key(favorite_root),
+        &fingerprint,
+    ) {
+        crate::logger::log(format!(
+            "indexer[{favorite_id}]: scan marker invalidation failed: {error}"
+        ));
+        return;
+    }
     // 所要時間計測: walker + ingest を含むフル scan の時間を拾う
     // (初期スキャンは supervisor 起動後 1 度のみ "initial"、以降の FullRescan /
     //  watcher overflow は last_scan_duration_ms のみ更新する)。
@@ -777,6 +789,13 @@ fn run_initial_scan(
         }
     };
     let ingest_ms = t_ingest.elapsed().as_millis() as u64;
+    #[cfg(test)]
+    FULL_SCAN_AFTER_APPLY_GATE.with(|gate| {
+        if let Some((started, release)) = gate.borrow_mut().take() {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+    });
     let dur_ms = t_start.elapsed().as_millis() as u64;
     crate::logger::log(format!(
         "indexer[{favorite_id}]: {scan_kind} scan done in {dur_ms} ms \
@@ -858,6 +877,10 @@ pub(crate) fn fts_scan_fingerprint(
 }
 
 pub(crate) fn fts_scan_extensions() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(extensions) = FTS_SCAN_EXTENSIONS_OVERRIDE.with(|value| value.borrow().clone()) {
+        return extensions;
+    }
     crate::folder_tree::SUPPORTED_EXTENSIONS
         .iter()
         .chain(crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS)
@@ -1402,6 +1425,185 @@ mod tests {
                 .get::<_, usize>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn changed_extension_set_cancelled_full_then_reopened_original_set_does_not_skip() {
+        cancelled_full_reopen_for_extension_set(true);
+    }
+
+    #[test]
+    fn same_fingerprint_cancelled_full_preserves_marker_after_deletion_and_reopen() {
+        cancelled_full_reopen_for_extension_set(false);
+    }
+
+    fn cancelled_full_reopen_for_extension_set(change_extensions: bool) {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let root = tmp.path().join("extension_set");
+        fs::create_dir(&root).unwrap();
+        let id = Uuid::new_v4();
+        let key = crate::metadata_ownership::root_key(&root);
+        let current_extensions = fts_scan_extensions();
+        let mut original_extensions = current_extensions.clone();
+        let file = if change_extensions {
+            // 旧 Susie 申告集合だけにある形式。現在の実 walker は非対応として削除候補にする。
+            let extension = "miv_s3_retired_extension";
+            assert!(!current_extensions.iter().any(|value| value == extension));
+            original_extensions.push(extension.to_owned());
+            let path = root.join(format!("retired.{extension}"));
+            fs::write(&path, b"formerly supported by a plugin").unwrap();
+            path
+        } else {
+            // 同じ指紋の Full が、終了中に消えた通常画像を削除する許容ケース。
+            root.join("missing.jpg")
+        };
+        let file_key = crate::search_index_db::normalize_path(&file);
+        let original = fts_scan_fingerprint(&root, id, &[], &original_extensions);
+        meta.upsert_meta_ok(
+            &file_key,
+            id,
+            &root,
+            crate::fts_index::IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        meta.mark_scanned_once(&key, &original).unwrap();
+        meta.mark_scanned_once("c:/unrelated", "untouched").unwrap();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(SupervisorStats::default()));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_stats = Arc::clone(&stats);
+        let worker_meta = Arc::clone(&meta);
+        let worker_fts = Arc::clone(&fts);
+        let worker_writer = Arc::clone(&writer);
+        let worker_sem = Arc::clone(&sem);
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            FULL_SCAN_AFTER_APPLY_GATE
+                .with(|gate| *gate.borrow_mut() = Some((committed_tx, release_rx)));
+            let session = IngestSession::new(id, worker_root.clone(), &worker_meta, &worker_fts);
+            run_initial_scan(
+                id,
+                &worker_root,
+                &session,
+                &worker_writer,
+                &worker_sem,
+                &[],
+                worker_cancel,
+                &worker_stats,
+                &ProgressReporter::new(),
+            );
+        });
+        // 実 walker と削除バッチが確定した地点で止め、完了判定前に通常の取消を送る。
+        committed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let removed = meta.get(&file_key).unwrap().is_none();
+        let marker_after_delete = meta.scanned_once(&key).unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(removed);
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Stopped)
+        );
+        assert_eq!(
+            marker_after_delete.as_deref(),
+            (!change_extensions).then_some(original.as_str())
+        );
+        drop(meta);
+        let reopened = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
+        assert_eq!(
+            reopened.scanned_once(&key).unwrap().as_deref(),
+            (!change_extensions).then_some(original.as_str())
+        );
+        assert_eq!(
+            reopened.scanned_once("c:/unrelated").unwrap().as_deref(),
+            Some("untouched")
+        );
+        // 元の申告集合へ戻す。thread-local 注入なので実 Susie pool や他テストを変更しない。
+        struct RestoreExtensions;
+        impl Drop for RestoreExtensions {
+            fn drop(&mut self) {
+                FTS_SCAN_EXTENSIONS_OVERRIDE.with(|value| *value.borrow_mut() = None);
+            }
+        }
+        FTS_SCAN_EXTENSIONS_OVERRIDE.with(|value| *value.borrow_mut() = Some(original_extensions));
+        let _restore = RestoreExtensions;
+        let skip = can_skip_initial_scan(&reopened, true, false, &root, id, &[]);
+        assert_eq!(skip, !change_extensions);
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: id,
+                favorite_root: root,
+                excluded_roots: vec![],
+                enable_metadata_index: true,
+                skip_initial_scan: skip,
+                similar_notifier: None,
+            },
+            reopened,
+            fts,
+            writer,
+            sem,
+            gate,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.snapshot_stats().initial_scan_done {
+            assert!(Instant::now() < deadline, "reopened Full stalled");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            handle.snapshot_stats().initial_scan_skipped,
+            !change_extensions
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn fingerprint_invalidation_failure_aborts_before_any_full_row_mutation() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("invalidation_failure");
+        fs::create_dir(&root).unwrap();
+        let id = Uuid::new_v4();
+        let file = crate::search_index_db::normalize_path(&root.join("missing.jpg"));
+        let key = crate::metadata_ownership::root_key(&root);
+        meta.upsert_meta_ok(&file, id, &root, crate::fts_index::IndexKind::Image, 1, 1)
+            .unwrap();
+        meta.mark_scanned_once(&key, "different fingerprint")
+            .unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_marker_delete BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let (submitted, release) = writer.test_gate_next_batch();
+        // 失効が退行して提出された場合も、gateで待ち続けず後のassertionで失敗させる。
+        drop(release);
+        let stats = Mutex::new(SupervisorStats::default());
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            Arc::new(AtomicBool::new(false)),
+            &stats,
+            &ProgressReporter::new(),
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        assert!(meta.get(&file).unwrap().is_some());
+        assert_eq!(
+            meta.scanned_once(&key).unwrap().as_deref(),
+            Some("different fingerprint")
+        );
+        assert!(
+            submitted.try_recv().is_err(),
+            "Full must not submit Tantivy mutations after preparation failure"
         );
     }
 
