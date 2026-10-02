@@ -193,8 +193,8 @@ App 起動
        ├─ 旧 Tantivy STORED tags を tags.db へ一度だけ移行 (fts_index wipe より前)
        ├─ durable rebuild pending なら旧 fts_index を wipe (失敗時は旧 index を開かない)
        ├─ FtsIndex を openし、成功後だけ rebuild pending を clear
-       ├─ 起動時 reconciliation (§4.3) を **同期** で実行
-       └─ auto_index_metadata=true のお気に入りごとに
+       ├─ manager worker で起動時 reconciliation (§4.3) と所有範囲外 cleanup
+       └─ cleanup 完了後、実効 metadata / similar が有効なお気に入りごとに
             IndexerSupervisor::spawn  (1 お気に入り 1 本、以降ずっと常駐)
 
 IndexerSupervisor (スレッド 1 本):
@@ -202,7 +202,7 @@ IndexerSupervisor (スレッド 1 本):
   2. search_walker::scan  …… 初期スキャン (3-way diff)
          FS にあり DB になし → ingest queue
          DB にあり FS になし → delete queue
-         両方あり mtime/size 差 → 再 ingest queue
+         両方あり mtime/size 差、または UUID/root の所有者不一致 → 再 ingest queue
   3. IngestSession::run   …… Tantivy First 書き込み順序 (§4.2) で反映
   4. 以降 watcher イベント (DebouncedChange) を受け取り小刻みに 3 と同じ処理
   5. App drop で全員 cancel。join は全 supervisor 合計 4 秒まで、超過時は detach
@@ -212,7 +212,54 @@ IngestSession の writer は IndexerManager が保有する dispatcher 経由で
 Tantivy writer には触れない。
 ```
 
+アイテム索引の Full は `ScanResult::completeness` で FS の観測結果を
+`ObservationCompleteness::Complete / Incomplete` に分ける。read_dir 失敗、iterator の
+entry error、file_type / 特殊エントリ分類 / metadata 取得失敗、深さ制限のいずれかがあれば
+Incomplete とし、その走査では削除候補を生成しない。観測できた新規・変更ファイルの
+取り込みは継続する。存在しない root も read_dir 失敗なので、読めなかった既存行を保持する。
+診断には `entry_errors` と `classification_errors` も残し、supervisor のログに完全性を出す。
+取消は結果を成功として返さず、既存の取消経路で終了する。
+この型は観測の完全性だけを表し、書き込みの成功や Full 全体の成功を保証しない。
+Full 全体の `FullScanOutcome::Complete` でだけ起動省略の印を立てる
+(詳細・検証は [起動スキャン計画](startup-index-scan-plan.md) §11)。
+
+metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
+同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を
+差し引いた複数の SQL 区間だけを walker が取得する。Ctrl+G のお気に入り絞り込みと
+編集画面の件数も、選択 root 内の実効所有 UUID 集合を共有する。総件数は ID ごとの和。
+
+構成変更は `metadata_reconfiguration` worker が旧新 root の推移的な重複グループを
+cancel → join → cleanup → spawn の順に処理する。処理中 snapshot は固定し、
+後続要求は最新の1つに集約する。ID の OFF・削除・root 変更は Tantivy ID-term purge、
+それ以外は新所有範囲外の path cleanup を行う。共通除外の拡大は raw STRING `path` の
+範囲 query で Tantivy-only 文書も削除し、commit/reload の後に同じ SQLite 範囲を削除する。
+similar の構成も同じ固定 snapshot から worker が反映し、App の未確定要求を先行反映しない。
+cleanup は旧 ingest と同じ Background
+FIFO に置き、commit/reload 成功後に SQLite を削除する。失敗時は再試行せず既存
+rebuild pending を立てて通知し、次回起動で `files` と Tantivy の両方を作り直す。
+起動時 cleanup は S3 の印に関わらず Full が必要な現所有 root 集合を返す。
+起動時の owner 照会は `path, favorite_id` の2列だけを covering index で読む。
+行ごとに所有判定し、削除対象 path と現所有 root だけを保持する。perf には読取と判定の
+時間・走査件数・収集した削除対象 path の最大件数を出す（プロセス全体のメモリ量ではない）。
+
 #### 終了応答性と有界 shutdown
+
+`skip_offline_change_scan` (既定 false) は起動時の初回 Full だけを省く設定。
+お気に入り編集と、環境設定の「ライブラリ > 検索インデックス」で変更する。
+`fts_meta.db.scanned_once` の root ごとの印と指紋 (正規化 root・所有 UUID・入れ子を含む
+除外 root・INDEX_VERSION・Susie を含む走査拡張子) が一致し、起動 cleanup の must-scan 集合と
+rebuild pending の対象でない場合だけ省く。watcher は従来どおり動き、差分・overflow・回復・
+手動確認は省かない。完全な観測・書き込み・prune の typed 成功でだけ印を立てる。
+イベントや途中終了・クラッシュでは消さず、ストア再作成と Failed cleanup で消す。
+構成変更と起動補修の削除は、旧行のrootと現在の補修先rootの印を同じ transaction で失効させる。
+初回・手動・overflow・監視回復の共通Full入口も、保存指紋が異なる場合は管理行や全文文書を
+変更する前に旧rootの印をtransactionで失効させる。Susieの拡張子集合を含む全指紋入力が対象で、
+元の入力に戻して再起動しても途中の索引を省略しない。同一指紋Fullの取消では旧印を保持する。
+「お気に入り > 編集」の [今すぐ確認] は metadata-only Full、名前索引 Full、全 root の similar
+UserCheck 1回を非同期に要求する。similar は起動時と同じ metadata 照合で Complete の無変更
+ZIP / PDF を開かない実 Full で、起動時省略には入らない。MustOpen の修復要求と合流したときは
+そちらを優先する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
+理由を通知して名前索引だけを確認する。一時停止中は再開後に実行する。
 
 大量削除では watcher overflow の full rescan、または debounce 済みイベント列が
 delete ingest を集中させる。walker / ingest のループcheckだけでは、共有I/O permit取得と
@@ -227,6 +274,7 @@ v2.3.0第12弾では次を不変条件とする。
   final commitとdispatcherの最終Dropはbackground finalizerがbest-effortで担当する。
 - submit済みbatchがcancel後にTantivyだけへ反映されても、SQLiteを先行更新しない
   Tantivy Firstを維持する。次回起動時のFS / Tantivy / fts_meta 3-way diffが再投入・再削除する。
+  `skip_offline_change_scan` ON で省略した起動ではこの補修を行わず、[今すぐ確認] で確認する。
 
 ### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
 
@@ -267,6 +315,10 @@ v2.3.0第12弾では次を不変条件とする。
 削除済みファイルが結果に出るのと同じ "短い窓" として許容する (実害はサムネイル
 読み込み失敗で気付ける)。
 
+上記の「次回起動で補修」は初回 Full を実行する場合の説明である。
+`skip_offline_change_scan` ON で印を再利用した場合、クラッシュや書き込み途中終了で残った
+両ストアの不一致も自動では確認しない。これは設定の許容範囲で、[今すぐ確認] で照合する。
+
 ### 4.3 起動時 reconciliation
 
 `IndexerManager::new` が supervisor spawn 前に同期実行する:
@@ -278,9 +330,24 @@ v2.3.0第12弾では次を不変条件とする。
   公開せず、marker を残して次回起動で再試行する
 - `fts_index/` schema 不一致 → Tantivy の既存 schema 判定で全再構築
 
-通常は数十〜数百行程度で 100ms 以下。大量なら supervisor 起動は待たされるが、
-writer 競合防止のため同期実行する方が安全 (非同期化すると supervisor と
-reconcile が `IndexWriter` を奪い合って失敗する)。
+所有範囲外の掃除も含め、manager worker 内で reconciliation の完了後に supervisor を
+起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
+
+Failed 行の照会は `status != 0 AND +favorite_id IN (...)` とし、favorite の索引を
+候補から外して部分索引 `idx_files_status` を使う。`idx_files_fav_path` の追加後も、
+正常行まで読む広い favorite 検索に切り替わらないことを EXPLAIN 回帰で確認する。
+単一 favorite 版も同じ規則にする。UUID は TEXT として bind する。
+所有範囲外の照会は `idx_files_fav_path` の covering scan を行単位で読み、削除する path と
+現在の所有 root だけを保持する。全行の `(path, favorite_id)` 配列を作らない。
+読取完了・connection lock 解放後に既存の削除を実行し、途中の読取失敗では部分削除しない。
+`metadata_out_of_range_cleanup` の `owner_rows` は走査件数、`peak_collected_rows` は
+収集した削除対象 path の最大件数、`query_ms` は行読取と所有判定を合わせた時間。
+正常行だけなら収集件数は0となる。
+
+この整理は `skip_offline_change_scan` ON でも省かない。Failed 行を掃除した root の印を消し、
+所有者の付け替えが必要な root は、削除と同じ SQLite transaction で印を消したうえで
+must-scan 集合で初回 Full を強制する。変更が無い起動整理は印を保持する。Tantivy の新規作成・
+schema 再構築・rebuild pending でも全印を消し、同じ起動で古い印を再利用しない。
 
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
@@ -291,13 +358,32 @@ idle になった最初のフレームで `spawn_housekeeping` から別スレ�
 登録する:
 
 ```
-NameIndexSupervisor (1 お気に入り 1 本):
-  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF の再帰列挙
-  2. SearchIndexDb::upsert_children で差分反映 (INSERT OR REPLACE)
+NameIndexSupervisor (1 正規化 root 1 本):
+  1. name_bulk_indexer::run_bulk_name_index  …… 単一の深さ優先走査で各フォルダを read_dir 1 回
+  2. SearchIndexDb::upsert_children_if_changed で直下集合を比較し、変化したフォルダだけ置換
   3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
      try_exists() ベースで判定し、新規ディレクトリなら subtree 再帰 upsert、
      削除なら ancestor chain prune + delete_subtree を実行 (詳細は §4.5)
 ```
+
+フル走査では直下行の `path / display_path / display_name / kind / mtime` が同じなら
+トランザクションを開かず書き込みを省く。進捗の分母は前回の DB フォルダ行数 + root を
+目安とし、行が無いときは件数だけを表示する。完了時は同じ `favorite_root` のうち、
+今回一覧を完全に観測した親フォルダ集合に含まれず、かつ `updated_at < scan_start_stamp`
+の行だけを削除する。比較と削除は同じ DB lock 内で行い、不変の既存行と走査開始後の
+別書き手の行を保持する。訪問集合は DB と同じ列挙パスの正規化 key を使い、循環検出の
+canonical key とは分離する。除外・存在しない root は訪問集合に入らない。
+取消・不完全観測・DB 更新失敗の場合は prune せず、不完全なフォルダは置換もしない。
+watcher の部分走査は既存の `upsert_children` と stamp による subtree prune を維持する。
+
+`NameIndexManager` が起動・編集の共通経路を所有し、root ごとに停止・join・clear・起動を
+直列化する。同じ root を使う structure 有効のお気に入りが残る間は clear しない。
+UUID ごとの進捗は現在の root の monitor へ解決する。clear は名前行と `scanned_once` の印を
+同じ transaction で消す。印は root・共通除外・名前索引の版を含む指紋で照合し、設定 ON の
+一致時だけ watcher 起動後の初回 Full を省く。完全な Full だけが印を更新する。
+Ctrl+S の現行絞り込みは OFF の root も含み、集合が空なら全 root を検索するため、
+clear 失敗を放置すると古い結果が出る。失敗時は名前 DB の次回起動 rebuild 印を立て、
+次の writable open で名前行と印を同じ transaction で削除する。
 
 - アイテム索引側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。
@@ -350,7 +436,8 @@ NameIndexSupervisor (1 お気に入り 1 本):
      フォルダを fav の行として誤投入する事故になる)
    - **`Err(e)`** → アクセス拒否 / 一時ロック / NAS 切断などの曖昧状態。
      `crate::logger::log` に warn を残し、**破壊的 cleanup も再帰 upsert も
-     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す
+     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す。
+     `skip_offline_change_scan` ON で初回 Full を省略した起動は拾い直さず、[今すぐ確認] で確認する
 
 3. **subtree scan の不完全観測時は post-scan prune を skip**:
    `run_subtree_scan` は cancel / read_dir error / upsert error を `SubtreeScanOutcome::Cancelled`
@@ -867,7 +954,7 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
 4. **Tantivy First の書き込み順序を崩さない**: ingest の順序 (IndexDoc 構築 →
    Tantivy batch commit → SQLite upsert_meta_ok / delete_paths) は順番入替・
    削減しない。failure はキャッシュせず次回起動時の walker 3-way diff で補修
-   する前提。
+   する前提。`skip_offline_change_scan` ON で初回 Full を省略した起動では補修しない。
 5. **新しい SourceKind / IndexKind を追加するなら**: `fts_index::Fields` /
    `IndexDoc` / `fts_meta::files` テーブル / `PerSourceText` / UI の
    `TargetChoice` / `KIND_CHOICES` / `search_page` のすべてに反映する。

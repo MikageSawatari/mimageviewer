@@ -72,11 +72,21 @@ enum WriterJob {
         release: mpsc::Receiver<()>,
         reply: mpsc::Sender<()>,
     },
+    PurgeFavorite {
+        favorite_id: uuid::Uuid,
+        reply: mpsc::Sender<tantivy::Result<()>>,
+    },
+    PurgePathRanges {
+        ranges: Vec<crate::metadata_ownership::PathRange>,
+        reply: mpsc::Sender<tantivy::Result<()>>,
+    },
     #[cfg(test)]
     TestMark {
         label: &'static str,
         completed: mpsc::Sender<&'static str>,
     },
+    #[cfg(test)]
+    TestSetReloadFailure { fail: bool, reply: mpsc::Sender<()> },
 }
 
 #[derive(Default)]
@@ -105,6 +115,8 @@ const LOG_PREFIX: &str = "[fts-dispatcher]";
 pub struct FtsWriterDispatcher {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    batch_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 impl FtsWriterDispatcher {
@@ -120,6 +132,8 @@ impl FtsWriterDispatcher {
         Arc::new(Self {
             queue,
             thread: Mutex::new(Some(thread)),
+            #[cfg(test)]
+            batch_gate: Mutex::new(None),
         })
     }
 
@@ -186,6 +200,11 @@ impl FtsWriterDispatcher {
             },
             priority,
         );
+        #[cfg(test)]
+        if let Some((started, release)) = self.batch_gate.lock().unwrap().take() {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
@@ -200,8 +219,33 @@ impl FtsWriterDispatcher {
         }
     }
 
-    /// `tantivy::Result` を返す系ジョブ (Upsert / Commit / Batch) の共通実装。
-    /// channel 切断は同じ SystemError にマップする。
+    /// Remove the current ID's terms, commit and reload before the caller touches SQLite.
+    /// Reconfiguration uses Background FIFO so cancelled, already queued batches finish first.
+    pub fn purge_favorite(
+        &self,
+        favorite_id: uuid::Uuid,
+        priority: WriterPriority,
+    ) -> tantivy::Result<()> {
+        self.submit_with_reply(priority, |reply| WriterJob::PurgeFavorite {
+            favorite_id,
+            reply,
+        })
+    }
+
+    /// SQLite に未反映の文書も raw path の範囲で消す。再構成では Background FIFO を使う。
+    /// commit / reload の成功後に、呼び出し側が同じ範囲の SQLite 行を消す。
+    pub fn purge_path_ranges(
+        &self,
+        ranges: Vec<crate::metadata_ownership::PathRange>,
+        priority: WriterPriority,
+    ) -> tantivy::Result<()> {
+        self.submit_with_reply(priority, |reply| WriterJob::PurgePathRanges {
+            ranges,
+            reply,
+        })
+    }
+
+    /// Result-returning jobs share reply handling; disconnected workers return SystemError.
     fn submit_with_reply<F>(&self, priority: WriterPriority, build: F) -> tantivy::Result<()>
     where
         F: FnOnce(mpsc::Sender<tantivy::Result<()>>) -> WriterJob,
@@ -234,7 +278,25 @@ impl FtsWriterDispatcher {
     }
 
     #[cfg(test)]
-    fn submit_test_block(
+    pub(crate) fn test_gate_next_batch(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *self.batch_gate.lock().unwrap() = Some((started_tx, release_rx));
+        (started_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_reload_failure(&self, fail: bool) {
+        let (tx, rx) = mpsc::channel();
+        self.submit(
+            WriterJob::TestSetReloadFailure { fail, reply: tx },
+            WriterPriority::Interactive,
+        );
+        rx.recv().unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_test_block(
         &self,
         priority: WriterPriority,
     ) -> (mpsc::Receiver<()>, mpsc::Sender<()>, mpsc::Receiver<()>) {
@@ -321,13 +383,42 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
             let _ = reply.send(());
         }
         WriterJob::Commit { reload, reply } => {
-            let r = writer.commit();
-            if r.is_ok() && reload {
-                if let Err(e) = fts.reload_reader() {
-                    crate::logger::log(format!("{LOG_PREFIX} reload_reader: {e}"));
+            let r = writer
+                .commit()
+                .map(|_| ())
+                .and_then(|()| if reload { reload_reader(fts) } else { Ok(()) });
+            let _ = reply.send(r);
+        }
+        WriterJob::PurgeFavorite { favorite_id, reply } => {
+            writer.delete_term(tantivy::Term::from_field_text(
+                fts.fields().favorite_id,
+                &favorite_id.to_string(),
+            ));
+            let result = writer
+                .commit()
+                .map(|_| ())
+                .and_then(|()| reload_reader(fts));
+            let _ = reply.send(result);
+        }
+        WriterJob::PurgePathRanges { ranges, reply } => {
+            let result = (|| {
+                for range in ranges {
+                    let query = tantivy::query::RangeQuery::new(
+                        std::ops::Bound::Included(tantivy::Term::from_field_text(
+                            fts.fields().path,
+                            &range.start,
+                        )),
+                        std::ops::Bound::Excluded(tantivy::Term::from_field_text(
+                            fts.fields().path,
+                            &range.end,
+                        )),
+                    );
+                    writer.delete_query(Box::new(query))?;
                 }
-            }
-            let _ = reply.send(r.map(|_| ()));
+                writer.commit()?;
+                reload_reader(fts)
+            })();
+            let _ = reply.send(result);
         }
         WriterJob::Batch {
             upserts,
@@ -360,6 +451,11 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
         WriterJob::TestMark { label, completed } => {
             let _ = completed.send(label);
         }
+        #[cfg(test)]
+        WriterJob::TestSetReloadFailure { fail, reply } => {
+            TEST_RELOAD_FAILURE.with(|value| value.set(fail));
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -380,12 +476,23 @@ fn process_batch(
     if commit_after {
         writer.commit()?;
         if reload_after_commit {
-            if let Err(e) = fts.reload_reader() {
-                crate::logger::log(format!("{LOG_PREFIX} reload_reader after batch: {e}"));
-            }
+            reload_reader(fts)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! { static TEST_RELOAD_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn reload_reader(fts: &FtsIndex) -> tantivy::Result<()> {
+    #[cfg(test)]
+    if TEST_RELOAD_FAILURE.with(|value| value.get()) {
+        return Err(tantivy::TantivyError::SystemError(
+            "injected reader reload failure".into(),
+        ));
+    }
+    fts.reload_reader()
 }
 
 #[cfg(test)]
@@ -556,12 +663,60 @@ mod tests {
     }
 
     #[test]
+    fn id_term_purge_keeps_reowned_path_and_removes_tantivy_only_documents() {
+        let (_tmp, fts, disp) = setup();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        disp.batch(
+            vec![
+                sample_doc("c:/shared.jpg", old, "夕焼け"),
+                sample_doc("c:/orphan.jpg", old, "夕焼け"),
+            ],
+            vec![],
+            true,
+            true,
+            WriterPriority::Background,
+        )
+        .unwrap();
+        disp.batch(
+            vec![sample_doc("c:/shared.jpg", new, "夕焼け")],
+            vec![],
+            true,
+            true,
+            WriterPriority::Background,
+        )
+        .unwrap();
+        disp.purge_favorite(old, WriterPriority::Background)
+            .unwrap();
+        let query =
+            fts_index::build_bigram_and_query(fts.fields(), &["夕焼け"], &Default::default())
+                .unwrap();
+        let hits = fts_index::search_page(&fts.searcher(), fts.fields(), &query, 0, 100).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "c:/shared.jpg");
+    }
+
+    #[test]
+    fn commit_and_id_purge_propagate_reload_failure() {
+        let (_tmp, _fts, disp) = setup();
+        disp.test_set_reload_failure(true);
+        assert!(disp.commit(true, WriterPriority::Background).is_err());
+        assert!(
+            disp.purge_favorite(Uuid::new_v4(), WriterPriority::Background)
+                .is_err()
+        );
+        disp.test_set_reload_failure(false);
+        disp.commit(true, WriterPriority::Background).unwrap();
+    }
+
+    #[test]
     fn cancellable_batch_stops_waiting_behind_a_blocked_dispatcher() {
         let (_tmp, _fts, disp) = setup();
         let (started, release, blocker_done) = disp.submit_test_block(WriterPriority::Background);
         started
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
+        let (submitted, release_submitter) = disp.test_gate_next_batch();
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = mpsc::channel();
@@ -581,12 +736,11 @@ mod tests {
             done_tx.send(completed).unwrap();
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while disp.pending_snapshot().1 == 0 {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
+        submitted
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
         cancel.store(true, Ordering::Relaxed);
+        release_submitter.send(()).unwrap();
         assert!(
             !done_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
@@ -598,5 +752,173 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_background_batch_finishes_before_background_id_cleanup() {
+        let (_tmp, fts, disp) = setup();
+        let id = Uuid::new_v4();
+        let (started, release_dispatcher, blocker_done) =
+            disp.submit_test_block(WriterPriority::Background);
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (submitted, release_submitter) = disp.test_gate_next_batch();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_disp = disp.clone();
+        let worker = std::thread::spawn(move || {
+            worker_disp
+                .batch_cancellable(
+                    vec![sample_doc("c:/cancelled.jpg", id, "夕焼け")],
+                    vec![],
+                    true,
+                    true,
+                    WriterPriority::Background,
+                    &worker_cancel,
+                )
+                .unwrap()
+        });
+        submitted
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        release_submitter.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        let (purge_tx, purge_rx) = mpsc::channel();
+        disp.submit(
+            WriterJob::PurgeFavorite {
+                favorite_id: id,
+                reply: purge_tx,
+            },
+            WriterPriority::Background,
+        );
+        assert_eq!(disp.pending_snapshot(), (0, 2));
+        release_dispatcher.send(()).unwrap();
+        blocker_done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        purge_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(
+            fts_index::find_doc_by_path(&fts.searcher(), fts.fields(), "c:/cancelled.jpg")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn path_range_purge_follows_cancelled_batch_and_removes_tantivy_only_documents() {
+        let (tmp, fts, disp) = setup();
+        let meta = crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        let root = "c:/a/books";
+        let orphan = "c:/a/books/orphan.jpg";
+        let neighbor = "c:/a/bookshelf/keep.jpg";
+        let known = "c:/a/books/known.jpg";
+        meta.upsert_meta_ok(
+            known,
+            id,
+            std::path::Path::new("c:/a"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        let (started, release_dispatcher, blocker_done) =
+            disp.submit_test_block(WriterPriority::Background);
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (submitted, release_submitter) = disp.test_gate_next_batch();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_disp = disp.clone();
+        let worker = std::thread::spawn(move || {
+            worker_disp
+                .batch_cancellable(
+                    vec![
+                        sample_doc(root, id, "sunset"),
+                        sample_doc(orphan, id, "sunset"),
+                        sample_doc(known, id, "sunset"),
+                        sample_doc(neighbor, id, "sunset"),
+                    ],
+                    vec![],
+                    true,
+                    true,
+                    WriterPriority::Background,
+                    &worker_cancel,
+                )
+                .unwrap()
+        });
+        submitted
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        release_submitter.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        assert!(
+            meta.get(orphan).unwrap().is_none(),
+            "cancelled batch has no SQLite row"
+        );
+
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: root.into(),
+            exclusions: Vec::new(),
+        }
+        .sql_ranges();
+        let (purge_tx, purge_rx) = mpsc::channel();
+        disp.submit(
+            WriterJob::PurgePathRanges {
+                ranges: ranges.clone(),
+                reply: purge_tx,
+            },
+            WriterPriority::Background,
+        );
+        assert_eq!(disp.pending_snapshot(), (0, 2));
+        assert!(
+            meta.get(known).unwrap().is_some(),
+            "SQLite is retained before the writer reply"
+        );
+        release_dispatcher.send(()).unwrap();
+        blocker_done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        purge_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.delete_path_ranges(&ranges).unwrap(), 1);
+        for path in [root, orphan, known] {
+            assert!(
+                fts_index::find_doc_by_path(&fts.searcher(), fts.fields(), path)
+                    .unwrap()
+                    .is_none(),
+                "{path}"
+            );
+        }
+        assert!(
+            fts_index::find_doc_by_path(&fts.searcher(), fts.fields(), neighbor)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn path_range_purge_propagates_reload_failure() {
+        let (_tmp, _fts, disp) = setup();
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: "c:/a/books".into(),
+            exclusions: Vec::new(),
+        }
+        .sql_ranges();
+        disp.test_set_reload_failure(true);
+        assert!(
+            disp.purge_path_ranges(ranges, WriterPriority::Background)
+                .is_err()
+        );
+        disp.test_set_reload_failure(false);
     }
 }

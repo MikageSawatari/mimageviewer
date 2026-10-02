@@ -5283,6 +5283,11 @@ pub struct Settings {
     #[serde(default)]
     pub minimize_to_tray_on_close: bool,
 
+    /// 完全走査済みの索引は起動時に終了中の変更を確認しない。起動時だけ採用する。
+    /// 終了中の変更は「今すぐ確認」で反映する。旧設定の欠落キーは false。
+    #[serde(default)]
+    pub skip_offline_change_scan: bool,
+
     /// タスクトレイに常駐している間 (= ウィンドウ非表示中) にバックグラウンドインデクサ
     /// (初回スキャン + notify-rs 経由の ingest) を一時停止する。ウィンドウを開き直すと
     /// 自動的に再開し、溜まっていた notify-rs イベントを順次処理する。
@@ -7414,6 +7419,7 @@ impl Default for Settings {
             susie_enabled: true,
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
+            skip_offline_change_scan: false,
             pause_indexer_while_minimized: false,
             write_rating_to_xmp: false,
             update_check_enabled: true,

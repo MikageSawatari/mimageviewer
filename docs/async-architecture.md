@@ -92,7 +92,7 @@
 | メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
 | メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
-| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
+| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | 有効な正規化 root ごとに 1 本 (`auto_index_structure=true`) | manager が stop/join/clear/start を直列化し、完走印も同じ root の所有。印一致の起動は watcher 開始後の初回 Full だけ省く。手動 Full は owner mailbox で構成採用後・pause 再開後に実行 |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
 | タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Add / Remove / Clear / SetTags を serial に処理し、**`tags.db` だけ**を更新する。メディア本体 / XMP / Tantivy には書かない (`docs/tag-catalog-redesign-plan.md` D13)。サイドカー `mimageviewer.dat` へのミラーは結果を受けた UI スレッド側が行う |
 | 補正レイヤー書き込みワーカー | `std::thread` (常駐、最初の保存で遅延起動) | 1 | 補正レイヤー文書の直列化 (q8 量子化 → deflate → base64) + `local_adjust.db` 書き込み。24MP で 70.6ms、かつマスク系スライダーのドラッグ中は毎フレーム走っていた。**同じ page key は最新 generation だけ書く** (要求 1 件が原寸マスクを抱えるので、合体しないとキューにメモリが積み上がる)。サイドカー `mimageviewer.dat` へのミラーは、結果 (`EditStoreOutcome`) が `Committed` のときだけ UI スレッド側が行う (R-26、§5.7) |
@@ -673,6 +673,21 @@ ingest worker と tag_write_worker が共有する。独自に `fts.writer()` �
 共有 writer を使う。
 
 #### Indexer shutdown の有界化 (v2.3.0 第12弾)
+
+walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
+列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
+生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
+あり、Complete として返さない。この型は FS 観測だけの結果で、Full 全体の typed な
+完了結果とは分離する。S2 の停止は既存 cancel のまま。metadata manager worker が
+重複グループの cancel・join・cleanup・spawn を固定 snapshot で直列化し、後続要求は
+最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
+を唯一所有する。Shutdown は停止中の control にも到達し、spawn 採用と同じ短時間 lock
+で直列化する。4秒の期限には worker 自身と worker 所有の handle を含む。
+similar のお気に入り・PDF password 構成も、この worker が受理した固定 snapshot で反映する。
+App は後続要求を similar へ先行反映せず、OFF→ON の集約時に既存 watch を維持する。
+名前索引も正規化 root ごとの owner を manager worker に集約し、stop・clear・start の
+順序を起動と編集で共有する。`scanned_once` は完全な Full の後だけ立て、clear/rebuild と同じ
+transaction で消す。起動設定は最初の構成でだけ採用し、実行中の再構成は Full を維持する。
 
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、

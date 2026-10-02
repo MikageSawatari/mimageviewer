@@ -41,6 +41,14 @@ use uuid::Uuid;
 use crate::fts_index::FtsIndex;
 use crate::fts_meta::FtsMetaDb;
 use crate::indexer_progress::ProgressReporter;
+/// Filesystem observation and committed writes for the last Full; startup markers are separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullScanOutcome {
+    Complete,
+    Incomplete,
+    Failed,
+    Stopped,
+}
 use crate::ingest_worker::{IngestSession, IngestStats};
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_walker::{self, CandidateFile, ScanParams};
@@ -55,10 +63,19 @@ const WATCH_RETRY_DELAYS: [Duration; 5] = [
 ];
 const WATCH_HEALTH_POLL: Duration = Duration::from_secs(1);
 
+#[cfg(test)]
+thread_local! {
+    static FULL_SCAN_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static FULL_SCAN_AFTER_APPLY_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static FTS_SCAN_EXTENSIONS_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Supervisor が UI に返す進捗・状態スナップショット。
 #[derive(Clone, Debug, Default)]
 pub struct SupervisorStats {
     pub initial_scan_done: bool,
+    pub initial_scan_skipped: bool,
+    pub last_full_outcome: Option<FullScanOutcome>,
     pub ingested_ok: usize,
     pub ingested_failed: usize,
     pub deleted: usize,
@@ -90,24 +107,35 @@ pub struct SupervisorStats {
 pub enum SupervisorCommand {
     /// 完全再スキャン (初期スキャンと同じ動作を手動トリガ)
     FullRescan,
+    MetadataFullRescan,
     /// 停止 (drop で代替可能、明示コマンドも用意)
     Stop,
 }
 
-/// Supervisor のハンドル。Drop で自動停止する。
-pub struct SupervisorHandle {
+/// Lightweight view; cloning or dropping it never owns the worker join.
+#[derive(Clone)]
+pub struct SupervisorControl {
     pub favorite_id: Uuid,
     cmd_tx: Sender<SupervisorCommand>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
     progress: ProgressReporter,
-    thread: Option<JoinHandle<()>>,
-    finished_rx: std::sync::mpsc::Receiver<()>,
+    similar_watch: Option<(
+        crate::similar_index::SimilarIndexNotifier,
+        crate::similar_index::SimilarWatchRegistration,
+    )>,
 }
 
-impl SupervisorHandle {
-    /// スナップショット取得 (短時間のロック)。`current_activity` は ProgressReporter
-    /// 側から最新値を読み出して合成する (snapshot 時点のライブ状態)。
+impl SupervisorControl {
+    #[cfg(test)]
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancel, &other.cancel)
+    }
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     pub fn snapshot_stats(&self) -> SupervisorStats {
         let mut s = self.stats.lock().unwrap().clone();
         s.current_activity = self.progress.snapshot();
@@ -115,99 +143,94 @@ impl SupervisorHandle {
         s
     }
 
-    /// 完全再スキャン要求 (インデックス管理ダイアログの「今すぐ再構築」で使用)。
-    ///
-    /// **非ブロッキング** (Codex round-10 Should-fix #1): `try_send` を使うため、
-    /// cmd_tx は bounded(4) だがキューがフルなら silently drop する。
-    /// これは長時間スキャン中に UI スレッドから連打された場合の UI freeze を防ぐため。
-    /// "coalescing" 挙動: 同じ FullRescan が既にキューにあるなら追加リクエストは冗長なので
-    /// 落としてよい (Supervisor は次のイベントで reconcile する)。
     pub fn request_full_rescan(&self) {
-        match self.cmd_tx.try_send(SupervisorCommand::FullRescan) {
-            Ok(_) => {}
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                // キューにもう溜まっている → no-op (既にスキャン要求が届く予定)
-                crate::logger::log(format!(
-                    "indexer[{}]: request_full_rescan coalesced (queue full)",
-                    self.favorite_id
-                ));
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                // supervisor は既に終了している
-            }
+        self.request(SupervisorCommand::FullRescan);
+    }
+    pub fn request_metadata_full_rescan(&self) {
+        self.request(SupervisorCommand::MetadataFullRescan);
+    }
+
+    fn request(&self, command: SupervisorCommand) {
+        if !self.cancel.load(Ordering::SeqCst) {
+            let _ = self.cmd_tx.try_send(command);
         }
     }
 
-    /// 明示停止。
+    pub fn signal_stop(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some((notifier, registration)) = &self.similar_watch {
+            notifier.revoke_watch(registration);
+        }
+        // Cancellation remains authoritative when the bounded notification queue is full.
+        let _ = self.cmd_tx.try_send(SupervisorCommand::Stop);
+    }
+}
+
+/// Sole worker owner; cloneable control views never join or stop on drop.
+pub struct SupervisorHandle {
+    control: SupervisorControl,
+    thread: Option<JoinHandle<()>>,
+    finished_rx: std::sync::mpsc::Receiver<()>,
+}
+
+impl std::ops::Deref for SupervisorHandle {
+    type Target = SupervisorControl;
+    fn deref(&self) -> &SupervisorControl {
+        &self.control
+    }
+}
+
+impl SupervisorHandle {
+    pub fn control(&self) -> SupervisorControl {
+        self.control.clone()
+    }
     pub fn stop(self) {
-        // drop で停止するので、ここでは明示 move させるだけ
         drop(self);
     }
 
-    /// cancel シグナルだけ送り、thread join は待たない。
-    ///
-    /// **IndexerManager 終了時のデッドロック回避**: dispatcher 化 (commit 30338a3) 以降は
-    /// supervisor が直接 writer lock を握ることはなく、各 sub-batch を
-    /// `dispatcher.batch(.., Background)` で submit して `rx.recv()` で完了待ちする
-    /// 構造になった。それでも次のシナリオで join が長引く可能性がある:
-    ///
-    /// - A: dispatcher.batch の `recv()` でブロック中 (Background sub-batch 処理待ち)
-    /// - dispatcher: A の sub-batch を処理中 (commit に数百 ms 〜 数秒)
-    /// - drop(A) が先に走ると: cancel_A=true でも A は recv ブロック中なので反応できず、
-    ///   sub-batch が終わるまで A の thread が止まらない (= sub-batch 1 個分の hang)
-    ///
-    /// 対策: `IndexerManager::drop` で全 supervisor に対して先に `signal_stop()` を
-    /// 呼び、全員の cancel を立てる。各 supervisor は次の `apply()` ループ先頭で
-    /// cancel を検出して新規 sub-batch の submit を止め、現在実行中の 1 個だけ
-    /// 待ってから exit する。同時に、dispatcher の Drop は shutdown フラグ + condvar
-    /// notify で起動中の sub-batch 完了直後にスレッドを終了させる。
-    pub fn signal_stop(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(SupervisorCommand::Stop);
+    /// Worker-side reconfiguration waits here after signal_stop.
+    pub fn join(mut self) {
+        self.signal_stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 
-    /// Stop and join only until the manager-wide shutdown deadline.
-    /// Returns false after detaching a worker that did not finish in time.
+    /// False means detached at the manager-wide shutdown deadline.
     pub fn join_until(mut self, deadline: Instant) -> bool {
         self.signal_stop();
         let Some(thread) = self.thread.take() else {
             return true;
         };
-        join_thread_until(thread, &self.finished_rx, deadline)
+        join_thread_until(thread, &self.finished_rx, deadline).is_some()
     }
 }
 
-fn join_thread_until(
-    thread: JoinHandle<()>,
+fn join_thread_until<T>(
+    thread: JoinHandle<T>,
     finished_rx: &std::sync::mpsc::Receiver<()>,
     deadline: Instant,
-) -> bool {
+) -> Option<std::thread::Result<T>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     match finished_rx.recv_timeout(remaining) {
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = thread.join();
-            true
-        }
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(thread.join()),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             drop(thread);
-            false
+            None
         }
     }
 }
 
 impl Drop for SupervisorHandle {
     fn drop(&mut self) {
-        // signal_stop() と同じ効果。idempotent なので二重呼びしてもよい
-        // (IndexerManager::drop が先に一括 signal_stop してから drop を回すため)。
-        self.cancel.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(SupervisorCommand::Stop);
         if let Some(t) = self.thread.take() {
+            self.control.signal_stop();
             let _ = t.join();
         }
     }
 }
 
-/// Supervisor を起動するための構築パラメータ。
+/// Supervisor construction parameters.
 pub struct SupervisorParams {
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,
@@ -215,6 +238,8 @@ pub struct SupervisorParams {
     /// metadata インデックスが有効か (auto_index_metadata)。
     /// false でも similar_notifier があれば watcher の共有だけを担う。
     pub enable_metadata_index: bool,
+    /// 起動時の reconciliation と印の検証を済ませた場合だけ初回を省く。
+    pub skip_initial_scan: bool,
     /// 同じ watcher のイベントで別バージョン索引の再照合も要求する。
     pub similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
 }
@@ -251,28 +276,30 @@ pub fn spawn(
     let root = params.favorite_root.clone();
     let excluded_roots = params.excluded_roots.clone();
     let enable_metadata_index = params.enable_metadata_index;
+    let skip_initial_scan = params.skip_initial_scan;
     let similar_notifier = params.similar_notifier.clone();
     let similar_registration = similar_notifier
         .as_ref()
         .and_then(|notifier| notifier.begin_watch(fav_id, &root));
     let registration_on_spawn_failure = similar_registration.clone();
     let cancel_cl = Arc::clone(&cancel);
+    let similar_watch = similar_notifier.clone().zip(similar_registration.clone());
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
-
-    crate::logger::log(format!(
-        "indexer[{fav_id}]: supervisor starting for {}",
-        root.display()
-    ));
 
     let thread = std::thread::Builder::new()
         .name(format!("indexer-{}", fav_id.as_simple()))
         .spawn(move || {
+            crate::logger::log(format!(
+                "indexer[{fav_id}]: supervisor starting for {}",
+                root.display()
+            ));
             supervisor_loop(
                 fav_id,
                 root,
                 excluded_roots,
                 enable_metadata_index,
+                skip_initial_scan,
                 similar_notifier,
                 similar_registration,
                 meta_db,
@@ -306,11 +333,14 @@ pub fn spawn(
     };
 
     SupervisorHandle {
-        favorite_id: fav_id,
-        cmd_tx,
-        cancel,
-        stats,
-        progress,
+        control: SupervisorControl {
+            favorite_id: fav_id,
+            cmd_tx,
+            cancel,
+            stats,
+            progress,
+            similar_watch,
+        },
         thread: Some(thread),
         finished_rx,
     }
@@ -323,6 +353,7 @@ fn supervisor_loop(
     favorite_root: PathBuf,
     excluded_roots: Vec<PathBuf>,
     enable_metadata_index: bool,
+    skip_initial_scan: bool,
     similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
     similar_registration: Option<crate::similar_index::SimilarWatchRegistration>,
     meta_db: Arc<FtsMetaDb>,
@@ -348,7 +379,9 @@ fn supervisor_loop(
             if let (Some(notifier), Some(registration)) =
                 (similar_notifier.as_ref(), similar_registration.as_ref())
             {
-                notifier.watch_ready(registration);
+                if !cancel.load(Ordering::SeqCst) {
+                    notifier.watch_ready(registration);
+                }
             }
             Some(watcher)
         }
@@ -369,7 +402,7 @@ fn supervisor_loop(
         .then(|| Instant::now() + WATCH_RETRY_DELAYS[0]);
 
     // 2. 初期スキャン実行 (cancel は Arc のまま渡す — walker 途中で shutdown 可能に)
-    if enable_metadata_index {
+    if enable_metadata_index && !skip_initial_scan {
         run_initial_scan(
             favorite_id,
             &favorite_root,
@@ -382,10 +415,13 @@ fn supervisor_loop(
             &progress,
         );
         mark_activity(&stats);
+    } else if enable_metadata_index {
+        crate::logger::log(format!("indexer[{favorite_id}]: initial scan skipped"));
     }
     let initial_scan_duration_ms = {
         let mut stats = stats.lock().unwrap();
         stats.initial_scan_done = true;
+        stats.initial_scan_skipped = enable_metadata_index && skip_initial_scan;
         stats.initial_scan_duration_ms.unwrap_or_default()
     };
     crate::perf::event(
@@ -395,6 +431,10 @@ fn supervisor_loop(
         0,
         &[
             ("index_kind", serde_json::Value::from("fts")),
+            (
+                "skipped",
+                serde_json::Value::from(enable_metadata_index && skip_initial_scan),
+            ),
             (
                 "favorite_id",
                 serde_json::Value::from(favorite_id.to_string()),
@@ -487,14 +527,14 @@ fn supervisor_loop(
             recv(cmd_rx) -> msg => {
                 match msg {
                     Ok(SupervisorCommand::Stop) => break,
-                    Ok(SupervisorCommand::FullRescan) => {
+                    Ok(command @ (SupervisorCommand::FullRescan | SupervisorCommand::MetadataFullRescan)) => {
                         if cancel.load(Ordering::SeqCst) {
                             break;
                         }
                         if let (Some(notifier), Some(registration)) =
                             (similar_notifier.as_ref(), similar_registration.as_ref())
                         {
-                            notifier.request_full(registration);
+                            if matches!(command, SupervisorCommand::FullRescan) { notifier.request_full(registration); }
                         }
                         if enable_metadata_index {
                             run_initial_scan(
@@ -624,6 +664,25 @@ fn run_initial_scan(
     progress: &ProgressReporter,
 ) {
     if cancel.load(Ordering::SeqCst) {
+        stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
+        return;
+    }
+    // Every early write/observation error remains Failed; only complete paths publish success.
+    stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Failed);
+    let fingerprint = fts_scan_fingerprint(
+        favorite_root,
+        favorite_id,
+        excluded_roots,
+        &fts_scan_extensions(),
+    );
+    // 初回・手動・overflow・watch回復の全 Full で、別指紋の行変更より前に失効を確定する。
+    if let Err(error) = session.meta_db.prepare_full_scan(
+        &crate::metadata_ownership::root_key(favorite_root),
+        &fingerprint,
+    ) {
+        crate::logger::log(format!(
+            "indexer[{favorite_id}]: scan marker invalidation failed: {error}"
+        ));
         return;
     }
     // 所要時間計測: walker + ingest を含むフル scan の時間を拾う
@@ -647,6 +706,13 @@ fn run_initial_scan(
         }
     }
     let _scan_guard = InFullScanGuard(stats);
+    #[cfg(test)]
+    FULL_SCAN_GATE.with(|gate| {
+        if let Some((started, release)) = gate.borrow_mut().take() {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+    });
 
     crate::logger::log(format!(
         "indexer[{favorite_id}]: {scan_kind} scan starting (walker phase)"
@@ -672,20 +738,26 @@ fn run_initial_scan(
         Ok(r) => r,
         Err(e) => {
             crate::logger::log(format!("indexer[{favorite_id}]: walker scan failed: {e}"));
+            if cancel.load(Ordering::SeqCst) {
+                stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
+            }
             return;
         }
     };
     if cancel.load(Ordering::SeqCst) {
+        stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
         return;
     }
     let walk_ms = t_walk.elapsed().as_millis() as u64;
     let total_scanned = scan.total_scanned;
     let diag = scan.diag;
+    let completeness = scan.completeness;
     let ingest_n = scan.to_ingest.len();
     let delete_n = scan.to_delete.len();
     crate::logger::log(format!(
         "indexer[{favorite_id}]: walker done in {walk_ms} ms \
-         (scanned={total_scanned}, to_ingest={ingest_n}, to_delete={delete_n})"
+         (scanned={total_scanned}, to_ingest={ingest_n}, to_delete={delete_n}, \
+          observation={completeness:?})"
     ));
 
     // ingest フェーズでのみ共有 writer を lock する。walker は lock 不要なので、
@@ -719,23 +791,53 @@ fn run_initial_scan(
         }
     };
     let ingest_ms = t_ingest.elapsed().as_millis() as u64;
+    #[cfg(test)]
+    FULL_SCAN_AFTER_APPLY_GATE.with(|gate| {
+        if let Some((started, release)) = gate.borrow_mut().take() {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+    });
     let dur_ms = t_start.elapsed().as_millis() as u64;
     crate::logger::log(format!(
         "indexer[{favorite_id}]: {scan_kind} scan done in {dur_ms} ms \
          (walker={walk_ms}ms, ingest={ingest_ms}ms, scanned={total_scanned}, \
           ingest_ok={}, ingest_failed={}, deleted={}, \
-          read_dir_err={}, file_type_err={}, metadata_err={}, depth_hits={})",
+          read_dir_err={}, entry_err={}, file_type_err={}, classification_err={}, \
+          metadata_err={}, depth_hits={}, observation={completeness:?})",
         ingest_stats.ingested_ok,
         ingest_stats.ingested_failed,
         ingest_stats.deleted,
         diag.read_dir_errors,
+        diag.entry_errors,
         diag.file_type_errors,
+        diag.classification_errors,
         diag.metadata_errors,
         diag.depth_limit_hits,
     ));
     update_stats(stats, &ingest_stats);
+    let outcome = if ingest_stats.cancelled || cancel.load(Ordering::SeqCst) {
+        FullScanOutcome::Stopped
+    } else if ingest_stats.ingested_failed > 0 {
+        FullScanOutcome::Failed
+    } else if completeness == crate::search_walker::ObservationCompleteness::Complete {
+        FullScanOutcome::Complete
+    } else {
+        FullScanOutcome::Incomplete
+    };
+    if outcome == FullScanOutcome::Complete {
+        if let Err(e) = session.meta_db.mark_scanned_once(
+            &crate::metadata_ownership::root_key(favorite_root),
+            &fingerprint,
+        ) {
+            crate::logger::log(format!(
+                "indexer[{favorite_id}]: scanned_once write failed: {e}"
+            ));
+        }
+    }
     {
         let mut s = stats.lock().unwrap();
+        s.last_full_outcome = Some(outcome);
         s.last_scan_duration_ms = Some(dur_ms);
         s.last_scan_total_scanned = total_scanned;
         s.last_scan_diag = diag;
@@ -743,6 +845,74 @@ fn run_initial_scan(
             s.initial_scan_duration_ms = Some(dur_ms);
         }
         // in_full_scan のクリアは関数末尾の InFullScanGuard::drop で行う。
+    }
+}
+
+/// 入力: 正規化 root、自分の UUID、入れ子を含む除外 root、INDEX_VERSION、
+/// 走査対象拡張子集合 (Susie 申告分を含む)。順番・重複・ASCII 大文字小文字は同一視する。
+pub(crate) fn fts_scan_fingerprint(
+    root: &std::path::Path,
+    id: Uuid,
+    excluded: &[PathBuf],
+    extensions: &[String],
+) -> String {
+    let mut excluded = excluded
+        .iter()
+        .map(|p| crate::metadata_ownership::root_key(p))
+        .collect::<Vec<_>>();
+    excluded.sort();
+    excluded.dedup();
+    let mut extensions = extensions
+        .iter()
+        .map(|e| e.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    extensions.sort();
+    extensions.dedup();
+    serde_json::to_string(&(
+        crate::metadata_ownership::root_key(root),
+        id.to_string(),
+        excluded,
+        crate::fts_meta::INDEX_VERSION,
+        extensions,
+    ))
+    .expect("string fingerprint serialization")
+}
+
+pub(crate) fn fts_scan_extensions() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(extensions) = FTS_SCAN_EXTENSIONS_OVERRIDE.with(|value| value.borrow().clone()) {
+        return extensions;
+    }
+    crate::folder_tree::SUPPORTED_EXTENSIONS
+        .iter()
+        .chain(crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS)
+        .chain(crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS)
+        .chain(["pdf", "epub"].iter())
+        .map(|e| (*e).to_owned())
+        .chain(crate::susie_loader::get_pool().extensions())
+        .filter(|e| !e.eq_ignore_ascii_case("zip"))
+        .collect()
+}
+
+pub(crate) fn can_skip_initial_scan(
+    meta: &FtsMetaDb,
+    enabled: bool,
+    must_scan: bool,
+    root: &std::path::Path,
+    id: Uuid,
+    excluded: &[PathBuf],
+) -> bool {
+    if !enabled || must_scan || meta.tantivy_rebuild_pending().unwrap_or(true) {
+        return false;
+    }
+    let fingerprint = fts_scan_fingerprint(root, id, excluded, &fts_scan_extensions());
+    match meta.scanned_once(&crate::metadata_ownership::root_key(root)) {
+        Ok(Some(marker)) => marker == fingerprint,
+        Ok(None) => false,
+        Err(e) => {
+            crate::logger::log(format!("indexer[{id}]: scanned_once read failed: {e}"));
+            false
+        }
     }
 }
 
@@ -1013,6 +1183,193 @@ mod tests {
     }
 
     #[test]
+    fn scanned_once_fingerprint_and_startup_skip_guards() {
+        let (_tmp, meta, _fts, _writer, _sem, _gate) = setup();
+        let root = Path::new("C:/Images/");
+        let id = Uuid::new_v4();
+        let extensions = fts_scan_extensions();
+        let fingerprint = fts_scan_fingerprint(root, id, &[], &extensions);
+        assert!(!can_skip_initial_scan(&meta, true, false, root, id, &[]));
+        meta.mark_scanned_once(&crate::metadata_ownership::root_key(root), &fingerprint)
+            .unwrap();
+        assert!(can_skip_initial_scan(&meta, true, false, root, id, &[]));
+        assert!(!can_skip_initial_scan(&meta, false, false, root, id, &[]));
+        assert!(!can_skip_initial_scan(&meta, true, true, root, id, &[]));
+        assert!(!can_skip_initial_scan(
+            &meta,
+            true,
+            false,
+            root,
+            Uuid::new_v4(),
+            &[]
+        ));
+        assert!(!can_skip_initial_scan(
+            &meta,
+            true,
+            false,
+            root,
+            id,
+            &[root.join("nested")]
+        ));
+        assert_eq!(
+            fingerprint,
+            fts_scan_fingerprint(Path::new("c:/images"), id, &[], &extensions)
+        );
+        let mut added = extensions.clone();
+        added.push("susie-extra".into());
+        assert_ne!(fingerprint, fts_scan_fingerprint(root, id, &[], &added));
+        let excluded = vec![root.join("A"), root.join("b")];
+        let reordered = vec![root.join("B"), root.join("a"), root.join("b")];
+        assert_eq!(
+            fts_scan_fingerprint(root, id, &excluded, &extensions),
+            fts_scan_fingerprint(root, id, &reordered, &extensions)
+        );
+        meta.request_item_index_rebuild().unwrap();
+        assert!(!can_skip_initial_scan(&meta, true, false, root, id, &[]));
+    }
+
+    #[test]
+    fn skipped_initial_still_accepts_metadata_full_check_while_paused() {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let root = tmp.path().join("reused");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "a.jpg");
+        let id = Uuid::new_v4();
+        let marker = fts_scan_fingerprint(&root, id, &[], &fts_scan_extensions());
+        let key = crate::metadata_ownership::root_key(&root);
+        meta.mark_scanned_once(&key, &marker).unwrap();
+        gate.set_paused(true);
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: id,
+                favorite_root: root.clone(),
+                excluded_roots: Vec::new(),
+                enable_metadata_index: true,
+                skip_initial_scan: true,
+                similar_notifier: None,
+            },
+            meta.clone(),
+            fts,
+            writer,
+            sem,
+            gate.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.snapshot_stats().initial_scan_done {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stats = handle.snapshot_stats();
+        assert!(stats.initial_scan_skipped);
+        assert_eq!(stats.last_full_outcome, None);
+        assert_eq!(stats.ingested_ok, 0);
+        handle.control().request_metadata_full_rescan();
+        while !handle.snapshot_stats().in_full_scan {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(meta.list_path_owners().unwrap().is_empty());
+        gate.set_paused(false);
+        while handle.snapshot_stats().last_full_outcome != Some(FullScanOutcome::Complete) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handle.snapshot_stats().ingested_ok, 1);
+        assert_eq!(
+            meta.scanned_once(&key).unwrap().as_deref(),
+            Some(marker.as_str())
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn skipped_initial_preserves_watch_deltas_marker_and_overflow_full() {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let root = tmp.path().join("reused_events");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "a.jpg");
+        let id = Uuid::new_v4();
+        let key = crate::metadata_ownership::root_key(&root);
+        let marker = fts_scan_fingerprint(&root, id, &[], &fts_scan_extensions());
+        meta.mark_scanned_once(&key, &marker).unwrap();
+        let stats = Arc::new(Mutex::new(SupervisorStats::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (cmd_tx, cmd_rx) = bounded(4);
+        let (change_tx, change_rx) = crossbeam_channel::unbounded();
+        let worker_meta = meta.clone();
+        let worker_stats = stats.clone();
+        let worker_cancel = cancel.clone();
+        let worker_root = root.clone();
+        let watcher_tx = change_tx.clone();
+        let worker = std::thread::spawn(move || {
+            supervisor_loop(
+                id,
+                worker_root,
+                Vec::new(),
+                true,
+                true,
+                None,
+                None,
+                worker_meta,
+                fts,
+                writer,
+                sem,
+                gate,
+                worker_cancel,
+                worker_stats,
+                ProgressReporter::new(),
+                cmd_rx,
+                watcher_tx,
+                change_rx,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !stats.lock().unwrap().initial_scan_done {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(stats.lock().unwrap().last_full_outcome, None);
+        change_tx
+            .send(DebouncedChange {
+                favorite_id: id,
+                path: root.join("a.jpg"),
+                kind: ChangeKind::Upsert,
+            })
+            .unwrap();
+        while stats.lock().unwrap().ingested_ok == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            meta.scanned_once(&key).unwrap().as_deref(),
+            Some(marker.as_str())
+        );
+        let stale = crate::search_index_db::normalize_path(&root.join("missing.jpg"));
+        meta.upsert_meta_ok(&stale, id, &root, crate::fts_index::IndexKind::Image, 1, 2)
+            .unwrap();
+        change_tx
+            .send(DebouncedChange {
+                favorite_id: id,
+                path: PathBuf::from(OVERFLOW_MARKER_PATH),
+                kind: ChangeKind::Upsert,
+            })
+            .unwrap();
+        while stats.lock().unwrap().last_full_outcome != Some(FullScanOutcome::Complete) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stats.lock().unwrap().overflowed);
+        assert!(meta.get(&stale).unwrap().is_none());
+        cancel.store(true, Ordering::SeqCst);
+        cmd_tx.send(SupervisorCommand::Stop).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            meta.scanned_once(&key).unwrap().as_deref(),
+            Some(marker.as_str())
+        );
+    }
+
+    #[test]
     fn bounded_join_detaches_when_deadline_is_exhausted() {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -1021,9 +1378,353 @@ mod tests {
             finished_tx.send(()).unwrap();
         });
 
-        assert!(!join_thread_until(worker, &finished_rx, Instant::now()));
+        assert!(join_thread_until(worker, &finished_rx, Instant::now()).is_none());
         release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn cancel_during_full_scan_clears_activity_and_reports_stopped() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("cancelled");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "untouched.jpg");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(SupervisorStats::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_cancel = cancel.clone();
+        let worker_stats = stats.clone();
+        let worker_meta = meta.clone();
+        let worker = std::thread::spawn(move || {
+            FULL_SCAN_GATE.with(|gate| *gate.borrow_mut() = Some((started_tx, release_rx)));
+            let id = Uuid::new_v4();
+            let session = IngestSession::new(id, root.clone(), &worker_meta, &fts);
+            run_initial_scan(
+                id,
+                &root,
+                &session,
+                &writer,
+                &sem,
+                &[],
+                worker_cancel,
+                &worker_stats,
+                &ProgressReporter::new(),
+            );
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(stats.lock().unwrap().in_full_scan);
+        cancel.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let stats = stats.lock().unwrap();
+        assert!(!stats.in_full_scan);
+        assert_eq!(stats.last_full_outcome, Some(FullScanOutcome::Stopped));
+        assert!(meta.list_path_owners().unwrap().is_empty());
+        let conn = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM scanned_once", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn changed_extension_set_cancelled_full_then_reopened_original_set_does_not_skip() {
+        cancelled_full_reopen_for_extension_set(true);
+    }
+
+    #[test]
+    fn same_fingerprint_cancelled_full_preserves_marker_after_deletion_and_reopen() {
+        cancelled_full_reopen_for_extension_set(false);
+    }
+
+    fn cancelled_full_reopen_for_extension_set(change_extensions: bool) {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let root = tmp.path().join("extension_set");
+        fs::create_dir(&root).unwrap();
+        let id = Uuid::new_v4();
+        let key = crate::metadata_ownership::root_key(&root);
+        let current_extensions = fts_scan_extensions();
+        let mut original_extensions = current_extensions.clone();
+        let file = if change_extensions {
+            // 旧 Susie 申告集合だけにある形式。現在の実 walker は非対応として削除候補にする。
+            let extension = "miv_s3_retired_extension";
+            assert!(!current_extensions.iter().any(|value| value == extension));
+            original_extensions.push(extension.to_owned());
+            let path = root.join(format!("retired.{extension}"));
+            fs::write(&path, b"formerly supported by a plugin").unwrap();
+            path
+        } else {
+            // 同じ指紋の Full が、終了中に消えた通常画像を削除する許容ケース。
+            root.join("missing.jpg")
+        };
+        let file_key = crate::search_index_db::normalize_path(&file);
+        let original = fts_scan_fingerprint(&root, id, &[], &original_extensions);
+        meta.upsert_meta_ok(
+            &file_key,
+            id,
+            &root,
+            crate::fts_index::IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        meta.mark_scanned_once(&key, &original).unwrap();
+        meta.mark_scanned_once("c:/unrelated", "untouched").unwrap();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(SupervisorStats::default()));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_stats = Arc::clone(&stats);
+        let worker_meta = Arc::clone(&meta);
+        let worker_fts = Arc::clone(&fts);
+        let worker_writer = Arc::clone(&writer);
+        let worker_sem = Arc::clone(&sem);
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            FULL_SCAN_AFTER_APPLY_GATE
+                .with(|gate| *gate.borrow_mut() = Some((committed_tx, release_rx)));
+            let session = IngestSession::new(id, worker_root.clone(), &worker_meta, &worker_fts);
+            run_initial_scan(
+                id,
+                &worker_root,
+                &session,
+                &worker_writer,
+                &worker_sem,
+                &[],
+                worker_cancel,
+                &worker_stats,
+                &ProgressReporter::new(),
+            );
+        });
+        // 実 walker と削除バッチが確定した地点で止め、完了判定前に通常の取消を送る。
+        committed_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let removed = meta.get(&file_key).unwrap().is_none();
+        let marker_after_delete = meta.scanned_once(&key).unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(removed);
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Stopped)
+        );
+        assert_eq!(
+            marker_after_delete.as_deref(),
+            (!change_extensions).then_some(original.as_str())
+        );
+        drop(meta);
+        let reopened = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
+        assert_eq!(
+            reopened.scanned_once(&key).unwrap().as_deref(),
+            (!change_extensions).then_some(original.as_str())
+        );
+        assert_eq!(
+            reopened.scanned_once("c:/unrelated").unwrap().as_deref(),
+            Some("untouched")
+        );
+        // 元の申告集合へ戻す。thread-local 注入なので実 Susie pool や他テストを変更しない。
+        struct RestoreExtensions;
+        impl Drop for RestoreExtensions {
+            fn drop(&mut self) {
+                FTS_SCAN_EXTENSIONS_OVERRIDE.with(|value| *value.borrow_mut() = None);
+            }
+        }
+        FTS_SCAN_EXTENSIONS_OVERRIDE.with(|value| *value.borrow_mut() = Some(original_extensions));
+        let _restore = RestoreExtensions;
+        let skip = can_skip_initial_scan(&reopened, true, false, &root, id, &[]);
+        assert_eq!(skip, !change_extensions);
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: id,
+                favorite_root: root,
+                excluded_roots: vec![],
+                enable_metadata_index: true,
+                skip_initial_scan: skip,
+                similar_notifier: None,
+            },
+            reopened,
+            fts,
+            writer,
+            sem,
+            gate,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.snapshot_stats().initial_scan_done {
+            assert!(Instant::now() < deadline, "reopened Full stalled");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            handle.snapshot_stats().initial_scan_skipped,
+            !change_extensions
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn fingerprint_invalidation_failure_aborts_before_any_full_row_mutation() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("invalidation_failure");
+        fs::create_dir(&root).unwrap();
+        let id = Uuid::new_v4();
+        let file = crate::search_index_db::normalize_path(&root.join("missing.jpg"));
+        let key = crate::metadata_ownership::root_key(&root);
+        meta.upsert_meta_ok(&file, id, &root, crate::fts_index::IndexKind::Image, 1, 1)
+            .unwrap();
+        meta.mark_scanned_once(&key, "different fingerprint")
+            .unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_marker_delete BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let (submitted, release) = writer.test_gate_next_batch();
+        // 失効が退行して提出された場合も、gateで待ち続けず後のassertionで失敗させる。
+        drop(release);
+        let stats = Mutex::new(SupervisorStats::default());
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            Arc::new(AtomicBool::new(false)),
+            &stats,
+            &ProgressReporter::new(),
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        assert!(meta.get(&file).unwrap().is_some());
+        assert_eq!(
+            meta.scanned_once(&key).unwrap().as_deref(),
+            Some("different fingerprint")
+        );
+        assert!(
+            submitted.try_recv().is_err(),
+            "Full must not submit Tantivy mutations after preparation failure"
+        );
+    }
+
+    #[test]
+    fn control_stop_is_nonblocking_when_notification_queue_is_full() {
+        let (tx, rx) = bounded(4);
+        for _ in 0..4 {
+            tx.try_send(SupervisorCommand::FullRescan).ok().unwrap();
+        }
+        let control = SupervisorControl {
+            favorite_id: Uuid::new_v4(),
+            cmd_tx: tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(Mutex::new(SupervisorStats::default())),
+            progress: ProgressReporter::new(),
+            similar_watch: None,
+        };
+        let worker_control = control.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_control.signal_stop();
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(control.cancel.load(Ordering::SeqCst));
+        assert_eq!(rx.len(), 4);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn full_outcome_distinguishes_incomplete_reload_and_sqlite_failures() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("full_outcome");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let id = Uuid::new_v4();
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let stats = Mutex::new(SupervisorStats::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = ProgressReporter::new();
+        writer.test_set_reload_failure(true);
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        let root_key = crate::metadata_ownership::root_key(&root);
+        assert_eq!(meta.scanned_once(&root_key).unwrap(), None);
+        writer.test_set_reload_failure(false);
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Complete)
+        );
+        assert!(meta.scanned_once(&root_key).unwrap().is_some());
+        meta.clear_scanned_once_for_root(&root_key).unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_full BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'injected SQLite failure'); END;").unwrap();
+        write_image(&root, "second.jpg");
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        assert_eq!(meta.scanned_once(&root_key).unwrap(), None);
+        db.execute_batch("DROP TRIGGER fail_full;").unwrap();
+        let missing = tmp.path().join("missing");
+        let missing_session = IngestSession::new(id, missing.clone(), &meta, &fts);
+        run_initial_scan(
+            id,
+            &missing,
+            &missing_session,
+            &writer,
+            &sem,
+            &[],
+            cancel,
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Incomplete)
+        );
+        assert_eq!(
+            meta.scanned_once(&crate::metadata_ownership::root_key(&missing))
+                .unwrap(),
+            None
+        );
+        assert!(!stats.lock().unwrap().in_full_scan);
     }
 
     #[test]
@@ -1101,6 +1802,7 @@ mod tests {
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             Arc::clone(&meta),
@@ -1146,6 +1848,7 @@ mod tests {
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             meta,
@@ -1176,6 +1879,7 @@ mod tests {
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             meta,
@@ -1223,6 +1927,7 @@ mod tests {
                 favorite_root: root_a,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             Arc::clone(&meta),
@@ -1237,6 +1942,7 @@ mod tests {
                 favorite_root: root_b,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             Arc::clone(&meta),
@@ -1280,6 +1986,7 @@ mod tests {
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             Arc::clone(&meta),
@@ -1344,6 +2051,7 @@ mod tests {
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             Arc::clone(&meta),
@@ -1404,6 +2112,7 @@ mod tests {
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                skip_initial_scan: false,
                 similar_notifier: None,
             },
             meta,

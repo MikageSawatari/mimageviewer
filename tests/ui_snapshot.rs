@@ -34,6 +34,32 @@ fn install_app_fonts(ctx: &egui::Context) {
     mimageviewer::ui_fonts::configure_fonts(ctx);
 }
 
+#[test]
+fn offline_change_scan_setting_light() {
+    let mut skip = false;
+    snapshot_with_theme(
+        "offline_change_scan_setting_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        move |ui| {
+            mimageviewer::ui_helpers::draw_offline_change_scan_setting(ui, &mut skip);
+            mimageviewer::ui_helpers::draw_index_full_check_button(ui);
+        },
+    );
+}
+
+#[test]
+fn offline_change_scan_setting_dark() {
+    let mut skip = true;
+    snapshot_with_theme(
+        "offline_change_scan_setting_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        move |ui| {
+            mimageviewer::ui_helpers::draw_offline_change_scan_setting(ui, &mut skip);
+            mimageviewer::ui_helpers::draw_index_full_check_button(ui);
+        },
+    );
+}
+
 /// テストハーネスのユーティリティ: 指定テーマで UI を描画し、`name` でスナップショットを取る。
 fn snapshot_with_theme(
     name: &str,

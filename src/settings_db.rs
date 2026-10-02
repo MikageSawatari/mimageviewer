@@ -4398,6 +4398,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn skip_offline_change_scan_roundtrip_and_released_missing_key() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        assert!(!settings.skip_offline_change_scan);
+        settings.skip_offline_change_scan = true;
+        settings.grid_cols = 7;
+        db.save_full(&settings).unwrap();
+        assert!(db.load_into_settings().unwrap().skip_offline_change_scan);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'skip_offline_change_scan'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.skip_offline_change_scan);
+        assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
     fn effetune_editor_rect_round_trips_with_the_normal_full_save() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

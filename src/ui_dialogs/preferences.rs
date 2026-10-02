@@ -1957,9 +1957,13 @@ impl App {
     pub(crate) fn install_preferences_settings(&mut self, settings: Settings) {
         let media_duration_changed =
             self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
+        let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
         if media_duration_changed {
             self.invalidate_details_meta_requirements();
+        }
+        if books_root_changed {
+            self.sync_shared_favorite_indexers();
         }
     }
 
@@ -3521,6 +3525,66 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_books_root_change_submits_new_exclusion_to_name_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let favorite_root = app.tmp.path().join("preference-name-root");
+        std::fs::create_dir_all(&favorite_root).unwrap();
+        std::fs::write(favorite_root.join("indexed.zip"), b"").unwrap();
+        app.settings.book_root = Some(app.tmp.path().join("old-books-root"));
+        let mut favorite =
+            crate::settings::FavoriteEntry::new("name owner".into(), favorite_root.clone());
+        favorite.auto_index_structure = true;
+        let favorite_id = favorite.id;
+        app.settings.favorites = vec![favorite];
+        app.activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+        let db = app.search_index_db.as_ref().cloned().unwrap();
+        app.spawn_initial_name_index_supervisors();
+        let wait = |app: &App, expected_rows: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let complete = app
+                    .name_index_manager
+                    .as_ref()
+                    .unwrap()
+                    .all_initial_scans_done();
+                if complete && db.count_for_favorite(&favorite_root).unwrap() == expected_rows {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "name owner did not apply preferences exclusion"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait(&app, 1);
+        let mut edited = app.settings.clone();
+        edited.book_root = Some(favorite_root.clone());
+        app.install_preferences_settings(edited);
+        wait(&app, 0);
+        let stats = app.name_index_stats_by_id();
+        assert_eq!(
+            stats[&favorite_id].last_full_scan,
+            Some(crate::name_index_supervisor::NameFullScanOutcome::Complete)
+        );
+    }
+
+    #[test]
+    fn preferences_unchanged_effective_books_root_does_not_submit_index_configuration() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.book_root = None;
+        assert!(app.name_index_manager.is_none());
+        let mut edited = app.settings.clone();
+        // None と明示的 default の保存値が違っても、実効除外 root は同じ。
+        edited.book_root = Some(app.settings.books_root_path());
+        app.install_preferences_settings(edited);
+        assert!(
+            app.name_index_manager.is_none(),
+            "unchanged exclusion must not start/reconfigure the name owner"
+        );
+    }
 
     fn disabled_trt_worker_snapshot() -> crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot {
         crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot()

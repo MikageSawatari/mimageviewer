@@ -17,7 +17,7 @@
 | [similar-index-incremental-reconcile-plan.md](similar-index-incremental-reconcile-plan.md) | 類似索引の全件反復を解消する独立ブランチの設計・実装計画。watch 差分、収束条件、scope prune、検索 snapshot 公開と synthetic 検証 |
 | [similar-index-startup-and-delta-optimization-plan.md](similar-index-startup-and-delta-optimization-plan.md) | 起動FS確認の分類別計測と、更新時DB整理のscope限定化・メモリ案比較。実装・性能検証記録 |
 | [similar-book-query-limit-plan.md](similar-book-query-limit-plan.md) | **完了 (2026-09-19、利用者が実機で確認)**。ページ数上限 3,000 / 候補の総ページ予算 10,000。旧 §1.254 「この本と重なる本」が大きな画像フォルダで終わらない件の正本。perf ログ・索引 DB・読み取り専用ベンチの実測 (所要時間は候補の本の総ページ数で決まる)、対称のページ数上限 + 仕事量の予算、「索引を更新中です」表示の削除、再測定手順 |
-| [section228-similar-container-preopen-plan.md](section228-similar-container-preopen-plan.md) | §1.228 起動時の変更がないZIP/PDFの再列挙を省略する条件。Initial限定の再利用、その他の再確認・差分更新の維持と検証記録 |
+| [section228-similar-container-preopen-plan.md](section228-similar-container-preopen-plan.md) | §1.228 起動時と「今すぐ確認」で変更がないZIP/PDFの再列挙を省略する条件。Initial / UserCheck の再利用、修復Full・差分更新の維持と検証記録 |
 | [section223-compare-wipe-guidance.md](section223-compare-wipe-guidance.md) | §1.223 比較ワイプ境界の常時表示とCtrl中の非表示。既存の比較セッションへの操作状態統合、準備中と終了時の契約 |
 | [section164-force-new-crop-frame.md](section164-force-new-crop-frame.md) | §1.164 修飾キーによる切り取り枠の新規作成。開始時の操作決定、Spaceパン優先、キー割り当てと入力所有の維持 |
 | [section221-context-menu-layout.md](section221-context-menu-layout.md) | §1.221 右クリック専用設定ページ、表示場面の確認と項目・区切り線の編集。静的項目と動的固定枠の分離、設定互換性、共通メニュー解決と検証記録 |
