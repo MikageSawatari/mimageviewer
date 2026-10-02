@@ -141,6 +141,17 @@ always-active guidance.
   changes, rather than adding a dedicated live-rebuild path. Record in the
   design document which simplification was considered and why it was or was
   not used. (User direction 2026-09-28; see CLAUDE.md "設計の簡素化".)
+- For rare failures that ordinary use almost never hits (disk/DB write failures,
+  abrupt termination mid-operation), do not design retry loops, preserved
+  partial states, typed failure taxonomies or multi-step recovery on your own.
+  Rebuildable data (indexes, caches) may be handled crudely: log, notify the
+  user, and rebuild on next start. Raise such cases to the design owner, who
+  confirms with the user, instead of closing each one with more machinery;
+  stop when you find yourself handling a failure inside a recovery path. Data
+  the user created (settings, tags, collections) must not be dropped this way
+  without asking. As a reviewer, report a rare-failure gap together with the
+  crude option, not only the full-handling option. (User direction 2026-10-02;
+  see CLAUDE.md "まれな失敗への対処".)
 - If a new feature or fix would make ordinary use slower, add steps, or remove
   released behavior, stop before implementing and ask the design owner/user
   with the options and costs. Do not choose the behavior-removing option on
