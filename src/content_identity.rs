@@ -2619,6 +2619,10 @@ mod tests {
                     both_read_schema.wait();
                     let result =
                         tx.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)");
+                    // Hold the first writer until both CREATE attempts finish.
+                    // Rolling it back sooner can let the second writer succeed
+                    // too, hiding the contention this test is meant to reproduce.
+                    both_read_schema.wait();
                     tx.rollback().unwrap();
                     result.map_err(|error| error.to_string())
                 })
