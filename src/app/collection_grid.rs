@@ -10089,13 +10089,14 @@ mod tests {
         let installed_generation = app.items_generation;
         let stamp = app.collection_grid_stamp().unwrap();
         let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        let age = Duration::from_secs(24 * 60 * 60);
 
         let (snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
-        let snapshot_lease = crate::collection_store::CollectionReadLease::new(
+        let snapshot_lease = crate::collection_store::CollectionReadLease::new_aged_for_test(
             crate::collection_store::CollectionReadScope::app_global("grid"),
-            started,
+            now,
             "snapshot",
+            age,
         );
         let snapshot_request_id = snapshot_lease.request_id();
         app.top_level_grid_view
@@ -10132,10 +10133,11 @@ mod tests {
         )
         .unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let prepare_lease = crate::collection_store::CollectionReadLease::new(
+        let prepare_lease = crate::collection_store::CollectionReadLease::new_aged_for_test(
             crate::collection_store::CollectionReadScope::app_global("grid"),
-            started,
+            now,
             "prepare",
+            age,
         );
         let prepare_request_id = prepare_lease.request_id();
         app.top_level_grid_view
@@ -10191,10 +10193,11 @@ mod tests {
 
         let (late_sender, late_receiver) = std::sync::mpsc::channel();
         let late_cancel = Arc::new(AtomicBool::new(false));
-        let late_lease = crate::collection_store::CollectionReadLease::new(
+        let late_lease = crate::collection_store::CollectionReadLease::new_aged_for_test(
             crate::collection_store::CollectionReadScope::app_global("grid"),
-            started,
+            now,
             "prepare",
+            age,
         );
         let generation_before_cancel = app.items_generation;
         app.top_level_grid_view

@@ -873,12 +873,11 @@ mod tests {
             .as_mut()
             .expect("collection open must wait for the shared catalog");
         let request_id = request.id;
-        request.lease = crate::collection_store::CollectionReadLease::new(
+        request.lease = crate::collection_store::CollectionReadLease::new_aged_for_test(
             scope,
-            Instant::now()
-                .checked_sub(Duration::from_secs(24 * 60 * 60))
-                .unwrap(),
+            Instant::now(),
             "catalog",
+            Duration::from_secs(24 * 60 * 60),
         );
         let lease_id = request.lease.request_id();
 

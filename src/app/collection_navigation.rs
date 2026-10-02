@@ -6187,12 +6187,11 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
-            lease: crate::collection_store::CollectionReadLease::new(
+            lease: crate::collection_store::CollectionReadLease::new_aged_for_test(
                 crate::collection_store::CollectionReadScope::app_global("navigation-test"),
-                Instant::now()
-                    .checked_sub(Duration::from_secs(24 * 60 * 60))
-                    .unwrap(),
+                Instant::now(),
                 "preflight",
+                Duration::from_secs(24 * 60 * 60),
             ),
             book_owner: None,
         };
@@ -6291,12 +6290,11 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
-            lease: crate::collection_store::CollectionReadLease::new(
+            lease: crate::collection_store::CollectionReadLease::new_aged_for_test(
                 crate::collection_store::CollectionReadScope::app_global("navigation-test"),
-                Instant::now()
-                    .checked_sub(Duration::from_secs(24 * 60 * 60))
-                    .unwrap(),
+                Instant::now(),
                 "preflight",
+                Duration::from_secs(24 * 60 * 60),
             ),
             book_owner: None,
         };

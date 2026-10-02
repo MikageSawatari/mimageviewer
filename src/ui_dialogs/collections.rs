@@ -5367,14 +5367,16 @@ mod tests {
     fn runtime_starting_remains_one_owner_after_a_long_observation() {
         let mut app = crate::app::setup_app_for_test();
         let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        let age = Duration::from_secs(24 * 60 * 60);
         app.collection_ui.phase = CollectionRuntimePhase::Starting;
-        app.collection_ui.runtime_observation =
-            Some(crate::collection_store::CollectionReadLease::new(
+        app.collection_ui.runtime_observation = Some(
+            crate::collection_store::CollectionReadLease::new_aged_for_test(
                 crate::collection_store::CollectionReadScope::app_global("runtime"),
-                started,
+                now,
                 "starting",
-            ));
+                age,
+            ),
+        );
         let request_id = app
             .collection_ui
             .runtime_observation
@@ -5436,11 +5438,12 @@ mod tests {
         let installed_snapshot = app.collection_ui.snapshot.clone().unwrap();
         let (sender, receiver) = crossbeam_channel::bounded(1);
         let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
-        let current = crate::collection_store::CollectionReadLease::new(
+        let age = Duration::from_secs(24 * 60 * 60);
+        let current = crate::collection_store::CollectionReadLease::new_aged_for_test(
             crate::collection_store::CollectionReadScope::app_global("manager_catalog"),
-            started,
+            now,
             "actor",
+            age,
         );
         let current_id = current.request_id();
         let mut next = test_read_lease("manager_catalog");
@@ -5482,10 +5485,11 @@ mod tests {
         ));
 
         let (snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
-        let snapshot_lease = crate::collection_store::CollectionReadLease::new(
+        let snapshot_lease = crate::collection_store::CollectionReadLease::new_aged_for_test(
             crate::collection_store::CollectionReadScope::app_global("manager_snapshot"),
-            started,
+            now,
             "actor",
+            age,
         );
         let snapshot_request_id = snapshot_lease.request_id();
         app.collection_ui.snapshot_request = CollectionReadSlot::InFlight {

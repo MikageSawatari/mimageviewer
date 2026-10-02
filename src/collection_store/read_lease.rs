@@ -67,6 +67,8 @@ impl CollectionReadScope {
 #[derive(Clone, Debug)]
 struct ActiveTiming {
     wall_started_at: Instant,
+    #[cfg(test)]
+    elapsed_before_start: Duration,
     paused_total: Duration,
     next_poll_at: Instant,
     poll_step: PollStep,
@@ -135,6 +137,28 @@ impl CollectionReadLease {
             request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).max(1),
             scope,
             state: CollectionReadLeaseState::Active(active_timing(now, phase)),
+        };
+        emit(&inner, now, "begin");
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Simulate a long-running read without requiring the host monotonic clock
+    /// to have already run for that duration (Windows may have just booted).
+    #[cfg(test)]
+    pub(crate) fn new_aged_for_test(
+        scope: CollectionReadScope,
+        now: Instant,
+        phase: &'static str,
+        age: Duration,
+    ) -> Self {
+        let mut timing = active_timing(now, phase);
+        timing.elapsed_before_start = age;
+        let inner = CollectionReadLeaseInner {
+            request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).max(1),
+            scope,
+            state: CollectionReadLeaseState::Active(timing),
         };
         emit(&inner, now, "begin");
         Self {
@@ -431,6 +455,8 @@ impl CollectionReadLease {
 fn active_timing(now: Instant, phase: &'static str) -> ActiveTiming {
     ActiveTiming {
         wall_started_at: now,
+        #[cfg(test)]
+        elapsed_before_start: Duration::ZERO,
         paused_total: Duration::ZERO,
         next_poll_at: now,
         poll_step: PollStep::Fast,
@@ -439,7 +465,7 @@ fn active_timing(now: Instant, phase: &'static str) -> ActiveTiming {
 }
 
 fn active_elapsed(state: &CollectionReadLeaseState, now: Instant) -> Duration {
-    match state {
+    let elapsed = match state {
         CollectionReadLeaseState::Active(timing) => now
             .saturating_duration_since(timing.wall_started_at)
             .saturating_sub(timing.paused_total),
@@ -449,11 +475,18 @@ fn active_elapsed(state: &CollectionReadLeaseState, now: Instant) -> Duration {
         CollectionReadLeaseState::Dormant | CollectionReadLeaseState::Terminal { .. } => {
             Duration::ZERO
         }
-    }
+    };
+    #[cfg(test)]
+    let elapsed = match state {
+        CollectionReadLeaseState::Active(timing)
+        | CollectionReadLeaseState::Paused { timing, .. } => elapsed + timing.elapsed_before_start,
+        _ => elapsed,
+    };
+    elapsed
 }
 
 fn wall_elapsed(state: &CollectionReadLeaseState, now: Instant) -> Duration {
-    match state {
+    let elapsed = match state {
         CollectionReadLeaseState::Active(timing)
         | CollectionReadLeaseState::Paused { timing, .. } => {
             now.saturating_duration_since(timing.wall_started_at)
@@ -461,7 +494,14 @@ fn wall_elapsed(state: &CollectionReadLeaseState, now: Instant) -> Duration {
         CollectionReadLeaseState::Dormant | CollectionReadLeaseState::Terminal { .. } => {
             Duration::ZERO
         }
-    }
+    };
+    #[cfg(test)]
+    let elapsed = match state {
+        CollectionReadLeaseState::Active(timing)
+        | CollectionReadLeaseState::Paused { timing, .. } => elapsed + timing.elapsed_before_start,
+        _ => elapsed,
+    };
+    elapsed
 }
 
 fn emit(inner: &CollectionReadLeaseInner, now: Instant, outcome: &'static str) {
@@ -506,6 +546,53 @@ fn emit(inner: &CollectionReadLeaseInner, now: Instant, outcome: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aged_test_lease_keeps_poll_identity_and_excludes_paused_active_time() {
+        let now = Instant::now();
+        let age = Duration::from_secs(24 * 60 * 60);
+        let lease = CollectionReadLease::new_aged_for_test(
+            CollectionReadScope::app_global("aged-test"),
+            now,
+            "preflight",
+            age,
+        );
+        let mut continuation = lease.clone();
+        assert_eq!(lease.active_elapsed(now), age);
+        assert_eq!(lease.wall_elapsed(now), age);
+        assert_eq!(continuation.request_id(), lease.request_id());
+        assert_eq!(lease.next_poll_at_for_test(), Some(now));
+        assert!(lease.is_due(now));
+        assert_eq!(lease.poll_delay(now), Some(Duration::ZERO));
+
+        continuation.pause(now + Duration::from_secs(4), "password_input");
+        assert!(lease.is_paused());
+        assert_eq!(
+            lease.active_elapsed(now + Duration::from_secs(40)),
+            age + Duration::from_secs(4)
+        );
+        assert_eq!(
+            lease.wall_elapsed(now + Duration::from_secs(40)),
+            age + Duration::from_secs(40)
+        );
+        continuation.resume(now + Duration::from_secs(40), "preflight");
+        assert!(!lease.is_paused());
+        assert_eq!(continuation.request_id(), lease.request_id());
+        assert_eq!(
+            lease.active_elapsed(now + Duration::from_secs(45)),
+            age + Duration::from_secs(9)
+        );
+        assert_eq!(
+            lease.wall_elapsed(now + Duration::from_secs(45)),
+            age + Duration::from_secs(45)
+        );
+
+        let mut fresh = lease.fresh_dormant();
+        fresh.activate(now, "admission");
+        assert_ne!(fresh.request_id(), lease.request_id());
+        assert_eq!(fresh.active_elapsed(now), Duration::ZERO);
+        assert_eq!(fresh.wall_elapsed(now), Duration::ZERO);
+    }
 
     #[test]
     fn backoff_progression_and_phase_reset_keep_one_identity_without_a_time_limit() {
