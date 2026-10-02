@@ -143,9 +143,13 @@
      残る、[indexer_supervisor.rs:599](../src/indexer_supervisor.rs)、[similar_index.rs:2490](../src/similar_index.rs))。
   2. 全員の join を待つ。
   3. 掃除 (Tantivy First: Tantivy の commit / reload が成功してから SQLite):
-     - 削除・OFF になった UUID、**root が変わった UUID**: Tantivy を `favorite_id` の term で全削除、
-       SQLite も `favorite_id` で削除。root が変わった方は手順 4 で新 root を全走査する。
-       ID の term で消すので、取消で SQLite に載らなかった Tantivy だけの文書も消える。
+     - 削除・OFF になった UUID、**root が変わった UUID**: **先に** その UUID の SQLite 行を 1 回の
+       UPDATE で無効化する (mtime を一致し得ない値に。ディスクに確定させる)。次に Tantivy を
+       `favorite_id` の term で全削除、最後に SQLite の行を削除する。root が変わった方は手順 4 で
+       新 root を全走査する。ID の term で消すので、取消で SQLite に載らなかった Tantivy だけの文書も
+       消える。無効化を先に置くので、Tantivy の削除の後で SQLite の削除が失敗し、そのまま終了・
+       再起動しても、残った行は「署名が一致しない」として次の走査が取り込み直すか消す
+       (無効化そのものが失敗したら先へ進まず、下の失敗時の契約に従う)。
      - それ以外のグループの UUID: SQLite で「その UUID の行のうち新しい所有範囲の外」を列挙し、
        パスごとに Tantivy から消してから SQLite から消す (共通除外を広げた場合など)。
   4. 新しい構成でグループの supervisor を作る (初回走査は §6 の規則どおり)。
@@ -175,8 +179,12 @@
 - **Drain の結果は typed に返す**: `Drained` (投入済みバッチがすべて Tantivy と SQLite に反映済み) /
   `Failed` (SQLite 更新失敗・reader reload 失敗などを含む。今はログだけで成功扱い、
   [ingest_worker.rs:199](../src/ingest_worker.rs)、[fts_writer_dispatcher.rs:383](../src/fts_writer_dispatcher.rs)) /
-  `Shutdown`。`Failed` の UUID は、手順 3 の ID term による削除だけを行い (失敗の影響を受けない)、
-  範囲外の行の掃除は行わず、印を消して手順 4 で全走査させる。`Shutdown` なら再構成を中止する。
+  `Shutdown`。`Failed` の UUID (root も実効状態も変わらないもの) は、Tantivy の削除をせず、
+  その UUID の SQLite 行を 1 回の UPDATE で無効化するだけにして (範囲外の行の掃除もしない)、
+  印を消して手順 4 で全走査させる。無効化した行は次の走査が必ず取り込み直すか消すので、
+  終了・再起動をまたいでも回復する。`Shutdown` なら再構成を中止する。
+  (S3 の印: 無効化と同じトランザクションでその UUID の root の印を消す。印が残ると、設定 ON の
+  次回起動で走査が省かれ、無効化した行が直らない。)
 - **再構成は進行中の構成 snapshot を固定する**。手順 1〜4 の途中で来た変更は待ち行列で
   最新の 1 つにまとめ、今の再構成が終わってから次の再構成として最初から行う
   (途中でグループを差し替えない)。今の `favorite_info` を即座に最新化する処理
@@ -194,6 +202,10 @@
   更新だけ。終了をまたいだ後始末は、次回起動時の範囲外掃除 (Tantivy First なので、Tantivy の削除が
   失敗した行は SQLite に残り、SQLite の削除が失敗した行も残る) と、持ち主の不一致による取り込み直しが
   引き受ける。失敗した掃除を、成功したものとして先へ進める経路は作らない。
+- **実装時の判断の基準** (2026-10-02): 終了・再起動をまたぐ稀な失敗の組み合わせで、ここに書いていない
+  ものが見つかったら、「SQLite を先に無効化する (SQLite が古い・要確認の側へずれるのは安全)」
+  「失敗したら止めて再試行し、先へ進めない」の 2 つで閉じる選択を実装者が取り、§11 に記録して
+  レビューに回す。索引が恒久的に壊れる (走査しても直らない) 経路だけを止める理由とする。
 - アプリ終了時の取消で Tantivy だけに反映された文書は、今もある問題
   (search-architecture §4.1 終了応答性) で、扱いを変えない。範囲の持ち主の走査は FS にあるファイルを
   取り込み直すので、残るのは「終了と同じ時期にファイルも消えた」場合だけ。
