@@ -1,6 +1,6 @@
 # 起動時の索引スキャン軽減 (v4.3.0)
 
-状態: 設計第 4 版 (実装前レビュー 3 回目の指摘を反映)。ブランチ `v430-startup-scan`。
+状態: 設計第 5 版 (実装前レビュー 4 回目で ACCEPT WITH CHANGES、その指摘を反映)。ブランチ `v430-startup-scan`。
 
 ## 1. 背景
 
@@ -156,6 +156,36 @@
   [favorites_editor.rs:1050](../src/ui_dialogs/favorites_editor.rs) も揃える)。
 - 起動時は前回の構成が手元に無いので、起動時 reconciliation で「どの実効 metadata お気に入りの
   所有範囲にも入らない行」と「UUID の所有範囲の外にある行」を、手順 3 の後者と同じ方法で消す。
+  この掃除で行を消したパスがあれば、そのパスの **今の所有者の root は印に関わらず全走査** する
+  (消した文書を取り込み直すのはその走査だけなので。新しい版 → 旧版 → 新しい版の往復で、
+  旧版が所有 ID を書き換えた場合もここで直る)。掃除は対象行数と時間を perf に出す。
+  必要なら `(favorite_id, path)` の索引を追加する (既存 DB への索引追加は `CREATE INDEX IF NOT EXISTS`
+  で、行の意味は変えない)。
+
+#### 停止と再構成の契約 (設計レビュー 4 回目)
+
+- **停止状態は 1 つの共有値で、`Running → Drain → Shutdown` の向きにだけ進む**。通知は
+  非 blocking (今の Stop 送信は blocking、[indexer_supervisor.rs:166](../src/indexer_supervisor.rs))。
+  Drain 中の返信待ちは Shutdown を定期的に確認し、Shutdown になったら今の取消と同じく抜ける。
+- アプリ終了時の 4 秒の期限 ([indexer_manager.rs:804](../src/indexer_manager.rs)) は、
+  manager が持つ supervisor だけでなく **再構成 worker が止めている最中の handle と、
+  再構成 worker 自身** にも適用する。Shutdown の後は再作成をしない。期限を過ぎたものは今と同じく
+  detach する。同期 `read_dir` には上限が無いので、Drain が終わる時間は保証しない
+  (Shutdown が来れば期限で切る)。
+- **Drain の結果は typed に返す**: `Drained` (投入済みバッチがすべて Tantivy と SQLite に反映済み) /
+  `Failed` (SQLite 更新失敗・reader reload 失敗などを含む。今はログだけで成功扱い、
+  [ingest_worker.rs:199](../src/ingest_worker.rs)、[fts_writer_dispatcher.rs:383](../src/fts_writer_dispatcher.rs)) /
+  `Shutdown`。`Failed` の UUID は、手順 3 の ID term による削除だけを行い (失敗の影響を受けない)、
+  範囲外の行の掃除は行わず、印を消して手順 4 で全走査させる。`Shutdown` なら再構成を中止する。
+- **再構成は進行中の構成 snapshot を固定する**。手順 1〜4 の途中で来た変更は待ち行列で
+  最新の 1 つにまとめ、今の再構成が終わってから次の再構成として最初から行う
+  (途中でグループを差し替えない)。今の `favorite_info` を即座に最新化する処理
+  ([indexer_manager.rs:510](../src/indexer_manager.rs)) は、snapshot を確定する時点に移す。
+- **停止を始めた時点で similar の watch registration を失効させる**。旧 generation の Ready・
+  イベントは similar 側で拒否する (今は watch_unavailable の後も同じ generation の Ready を受理し、
+  初回の watcher 起動成功は取消を確認せずに Ready を送る、
+  [similar_index.rs:2569](../src/similar_index.rs)、[indexer_supervisor.rs:351](../src/indexer_supervisor.rs))。
+  再登録時の既存の gap 修復は維持する。
 - アプリ終了時の取消で Tantivy だけに反映された文書は、今もある問題
   (search-architecture §4.1 終了応答性) で、扱いを変えない。範囲の持ち主の走査は FS にあるファイルを
   取り込み直すので、残るのは「終了と同じ時期にファイルも消えた」場合だけ。
