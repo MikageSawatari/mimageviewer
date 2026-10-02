@@ -1081,6 +1081,9 @@ enum WatchHealth {
     Pending,
     Ready,
     Unavailable,
+    /// Stopped lifecycle: no watcher, and the replacement registration is not issued yet.
+    /// Unlike a temporary failure, this is a barrier rather than a degraded scan terminal.
+    Revoked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1757,14 +1760,19 @@ impl SchedulerState {
         config.roots.iter().all(|root| {
             self.watch_by_root
                 .get(&root.favorite_id)
-                .is_some_and(|watch| watch.health != WatchHealth::Pending)
+                .is_some_and(|watch| {
+                    matches!(watch.health, WatchHealth::Ready | WatchHealth::Unavailable)
+                })
         })
     }
 
     fn has_unavailable_watch(&self) -> bool {
-        self.watch_by_root
-            .values()
-            .any(|watch| watch.health == WatchHealth::Unavailable)
+        self.watch_by_root.values().any(|watch| {
+            matches!(
+                watch.health,
+                WatchHealth::Unavailable | WatchHealth::Revoked
+            )
+        })
     }
 
     fn has_runnable_work(&self) -> bool {
@@ -2255,6 +2263,14 @@ impl SimilarIndexNotifier {
         }
     }
 
+    /// Stop lifecycle only: revoke this generation, rejecting every late Ready and event.
+    /// Temporary watcher failures keep using watch_unavailable so retry can reuse its token.
+    pub fn revoke_watch(&self, registration: &SimilarWatchRegistration) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.revoke_watch(registration);
+        }
+    }
+
     pub fn request_change(
         &self,
         registration: &SimilarWatchRegistration,
@@ -2488,10 +2504,13 @@ impl SimilarIndexScheduler {
         }
         let previous = state.watch_by_root.get(&favorite_id).cloned()?;
         let replacement = previous.registration_generation != 0;
-        if replacement {
+        // A stopped lifecycle already owns its gap. Its replacement closes that same gap;
+        // a direct replacement of a live watcher creates a new gap here instead.
+        let inherit_revoked_gap = previous.health == WatchHealth::Revoked;
+        if replacement && !inherit_revoked_gap {
             state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
         }
-        let gap_epoch = if replacement {
+        let gap_epoch = if replacement && !inherit_revoked_gap {
             state.next_gap_epoch
         } else {
             previous.gap_epoch
@@ -2625,6 +2644,47 @@ impl SimilarIndexScheduler {
             }
             state.reserve_worker_if_runnable()
         };
+        if should_start {
+            self.spawn_worker();
+        }
+    }
+
+    fn revoke_watch(self: &Arc<Self>, registration: &SimilarWatchRegistration) {
+        let should_start = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown || !Self::registration_is_current(&state, registration) {
+                return;
+            }
+            let watch = state
+                .watch_by_root
+                .get(&registration.favorite_id)
+                .expect("validated watch");
+            let gap_epoch = if watch.gap_epoch > watch.repaired_gap_epoch {
+                watch.gap_epoch
+            } else {
+                state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
+                state.next_gap_epoch
+            };
+            // Reserve an unissued generation and wait for replacement under the same lock.
+            state.next_watch_generation = state.next_watch_generation.wrapping_add(1).max(1);
+            let generation = state.next_watch_generation;
+            let watch = state
+                .watch_by_root
+                .get_mut(&registration.favorite_id)
+                .expect("validated watch");
+            watch.health = WatchHealth::Revoked;
+            watch.registration_generation = generation;
+            watch.gap_epoch = gap_epoch;
+            let config_epoch = state.config_epoch;
+            state.merge_full_intent(FullIntent {
+                config_epoch,
+                required_gap_epoch: gap_epoch,
+                reason: FullReason::WatchRecovery,
+            });
+            state.phase.cancel();
+            state.reserve_worker_if_runnable()
+        };
+        self.mark_awaiting_watch_if_terminal();
         if should_start {
             self.spawn_worker();
         }
@@ -10322,6 +10382,179 @@ mod tests {
                 .required_gap_epoch,
             2
         );
+    }
+
+    #[test]
+    fn revoked_watch_rejects_late_ready_and_events_but_replacement_repairs_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let favorite_id = Uuid::new_v4();
+        let root = temp.path().join("library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.next_watch_generation = 11;
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Delta,
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        *manager.scheduler.state.lock().unwrap() = state;
+        let old = SimilarWatchRegistration {
+            favorite_id,
+            root_key: crate::search_index_db::normalize_path(&root),
+            registration_generation: 11,
+        };
+        manager.scheduler.revoke_watch(&old);
+        manager
+            .scheduler
+            .set_watch_health(&old, WatchHealth::Ready, None);
+        manager.scheduler.request_change_observed(
+            &old,
+            root.join("old.jpg"),
+            crate::search_watcher::ChangeKind::Upsert,
+            Some(ChangedPathObservation::File),
+        );
+        let revoked_gap = {
+            let state = manager.scheduler.state.lock().unwrap();
+            let watch = state.watch_by_root.get(&favorite_id).unwrap();
+            assert_eq!(watch.health, WatchHealth::Revoked);
+            assert_ne!(watch.registration_generation, old.registration_generation);
+            assert_eq!(state.next_event_seq, 0);
+            assert!(state.dirty.latest_by_scope.is_empty());
+            assert_eq!(
+                state.pending_full.unwrap().required_gap_epoch,
+                watch.gap_epoch
+            );
+            watch.gap_epoch
+        };
+        // Ordinary Unavailable recovery remains valid for the newly issued token.
+        let new = manager.scheduler.begin_watch(favorite_id, &root).unwrap();
+        manager.scheduler.set_watch_health(
+            &new,
+            WatchHealth::Unavailable,
+            Some("temporary gap".into()),
+        );
+        manager
+            .scheduler
+            .set_watch_health(&new, WatchHealth::Ready, None);
+        let state = manager.scheduler.state.lock().unwrap();
+        let watch = state.watch_by_root.get(&favorite_id).unwrap();
+        assert_eq!(watch.health, WatchHealth::Ready);
+        assert_eq!(watch.gap_epoch, revoked_gap);
+        assert!(watch.gap_epoch > watch.repaired_gap_epoch);
+        assert!(state.pending_full.unwrap().required_gap_epoch >= revoked_gap);
+    }
+
+    #[test]
+    fn stopped_watch_handoff_waits_at_registration_barrier_and_repairs_one_gap() {
+        // Exercise a long stopped/join interval from Idle, active reconciliation, and array ack.
+        // Phase Starting below is a deterministic reservation gate; no real worker is launched.
+        for phase in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+            let favorite_id = Uuid::new_v4();
+            let root = temp.path().join("library");
+            let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+            state.next_watch_generation = 11;
+            let interrupted = if phase == 0 {
+                None
+            } else {
+                state.pending_full = Some(initial_full_intent());
+                let plan = state.take_next_job().unwrap();
+                if phase == 2 {
+                    state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+                }
+                Some(plan)
+            };
+            *manager.scheduler.state.lock().unwrap() = state;
+            *manager.scheduler.progress.lock().unwrap() = match phase {
+                0 => IndexProgress::Complete(IndexReport::default()),
+                1 => IndexProgress::Running(RunningProgress {
+                    stage: IndexStage::Scanning,
+                    current_path: None,
+                    report: IndexReport::default(),
+                }),
+                _ => IndexProgress::AwaitingArray(IndexReport::default()),
+            };
+            let old = SimilarWatchRegistration {
+                favorite_id,
+                root_key: crate::search_index_db::normalize_path(&root),
+                registration_generation: 11,
+            };
+            manager.scheduler.revoke_watch(&old);
+            if let Some(plan) = interrupted {
+                assert!(plan.running.cancel.load(Ordering::Acquire));
+                assert_eq!(
+                    manager
+                        .scheduler
+                        .settle_interrupted_plan(&plan, false, IndexReport::default()),
+                    InterruptedJobDisposition::AwaitingWatch
+                );
+            }
+            assert!(matches!(
+                manager.progress(),
+                IndexProgress::AwaitingWatch(_)
+            ));
+            {
+                let mut state = manager.scheduler.state.lock().unwrap();
+                assert!(matches!(state.phase, SchedulerPhase::Idle));
+                assert_eq!(
+                    state.watch_by_root[&favorite_id].health,
+                    WatchHealth::Revoked
+                );
+                assert_eq!(state.next_gap_epoch, 1);
+                assert!(!state.watches_are_terminal());
+                assert!(!state.reserve_worker_if_runnable());
+                assert!(state.take_next_job().is_none());
+                assert_eq!(state.pending_full.unwrap().required_gap_epoch, 1);
+            }
+            // Repeated stop and late Ready cannot reopen the terminal barrier.
+            manager.scheduler.revoke_watch(&old);
+            manager
+                .scheduler
+                .set_watch_health(&old, WatchHealth::Ready, None);
+            assert!(matches!(
+                manager.progress(),
+                IndexProgress::AwaitingWatch(_)
+            ));
+            let new = manager.scheduler.begin_watch(favorite_id, &root).unwrap();
+            {
+                let mut state = manager.scheduler.state.lock().unwrap();
+                assert_eq!(
+                    state.watch_by_root[&favorite_id].health,
+                    WatchHealth::Pending
+                );
+                assert_eq!(state.watch_by_root[&favorite_id].gap_epoch, 1);
+                assert_eq!(state.next_gap_epoch, 1);
+                assert!(state.take_next_job().is_none());
+                state.phase = SchedulerPhase::Starting;
+            }
+            manager
+                .scheduler
+                .set_watch_health(&new, WatchHealth::Ready, None);
+            let mut state = manager.scheduler.state.lock().unwrap();
+            state.phase = SchedulerPhase::Idle;
+            let repair = state
+                .take_next_job()
+                .expect("new Ready releases exactly one repair Full");
+            assert!(matches!(
+                repair.running.kind,
+                ReconcileJobKind::Full(FullIntent {
+                    required_gap_epoch: 1,
+                    ..
+                })
+            ));
+            assert!(repair.running.repairs_watch_gap);
+            assert_eq!(
+                state.finish_successful_job(&repair),
+                SuccessfulJobDisposition::Complete
+            );
+            assert_eq!(state.watch_by_root[&favorite_id].repaired_gap_epoch, 1);
+            state.phase = SchedulerPhase::Idle;
+            assert!(!state.has_runnable_work());
+            assert!(state.take_next_job().is_none());
+        }
     }
 
     #[test]

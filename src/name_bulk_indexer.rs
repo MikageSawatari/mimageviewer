@@ -241,10 +241,13 @@ where
                 "name_bulk_indexer: pruned {n} stale rows under {}",
                 fav_path.display()
             )),
-            Err(e) => crate::logger::log(format!(
-                "name_bulk_indexer: prune_stale_for_favorite failed for {}: {e}",
-                fav_path.display()
-            )),
+            Err(e) => {
+                summary.had_error = true;
+                crate::logger::log(format!(
+                    "name_bulk_indexer: prune_stale_for_favorite failed for {}: {e}",
+                    fav_path.display()
+                ));
+            }
         }
     } else if summary.had_error {
         crate::logger::log(format!(
@@ -441,6 +444,37 @@ mod tests {
     }
     fn touch(p: &std::path::Path) {
         std::fs::write(p, b"").unwrap();
+    }
+
+    #[test]
+    fn prune_write_failure_is_a_failed_full_scan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        let db_path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&db_path).unwrap();
+        let deleted_parent = root.join("deleted");
+        db.upsert_children(
+            &root,
+            &deleted_parent,
+            &[crate::search_index_db::IndexEntry {
+                path: deleted_parent.join("stale.zip"),
+                display_name: "stale.zip".into(),
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_prune BEFORE DELETE ON entries BEGIN SELECT RAISE(FAIL, 'injected prune failure'); END;").unwrap();
+        drop(conn);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &AtomicBool::new(false), None);
+        assert!(!summary.cancelled);
+        assert!(
+            summary.had_error,
+            "prune failure cannot be a typed Complete"
+        );
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
     }
 
     #[test]

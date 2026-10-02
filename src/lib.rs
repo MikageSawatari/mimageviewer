@@ -163,12 +163,15 @@ pub mod margin_fit;
 pub mod mask_db;
 pub mod materializer;
 pub mod metadata_cleanup;
+pub mod metadata_ownership;
+mod metadata_reconfiguration;
 pub mod modifier_ownership;
 mod modifier_probe;
 pub mod monitor;
 #[cfg(windows)]
 pub(crate) mod mouse_seek_debug;
 pub mod name_bulk_indexer;
+pub mod name_index_manager;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
 mod native_name_dialog;

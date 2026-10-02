@@ -1,6 +1,6 @@
 # 起動時の索引スキャン軽減 (v4.3.0)
 
-状態: 設計第 5 版 (実装前レビュー 4 回目で ACCEPT WITH CHANGES、その指摘を反映)。ブランチ `v430-startup-scan`。
+状態: 設計第 7 版 (途中失敗は再起動で作り直す割り切りに簡素化、2026-10-02 利用者決定)。ブランチ `v430-startup-scan`。
 
 ## 1. 背景
 
@@ -134,22 +134,14 @@
   重ならないお気に入りは今と同じく触らない。並べ替え・改名は構成を変えない。
 - グループの作り直しは manager の worker で 1 本ずつ行い、UI スレッドは待たない。
   待っている間に来た変更は最新の構成 1 つにまとめる。手順:
-  1. グループの各 supervisor に **書き込みを済ませて止まる** 停止 (`StopMode::Drain`) を送る。
-     走査は次の確認点で止めるが、writer へ投入済みのバッチは返信を待ち、SQLite まで反映してから
-     抜ける。アプリ終了時の停止 (`StopMode::Shutdown`、今の取消) とは型で分ける
-     (今は取消で返信待ちをやめ SQLite 反映を省く、[fts_writer_dispatcher.rs:190](../src/fts_writer_dispatcher.rs)、
-     [ingest_worker.rs:185](../src/ingest_worker.rs))。停止を始める時点で similar へ
+  1. グループの各 supervisor を今と同じ停止 (cancel) で止める。停止を始める時点で similar へ
      `watch_unavailable` を知らせる (今は watcher を落とすだけで、次の `begin_watch` まで古い Ready が
      残る、[indexer_supervisor.rs:599](../src/indexer_supervisor.rs)、[similar_index.rs:2490](../src/similar_index.rs))。
   2. 全員の join を待つ。
   3. 掃除 (Tantivy First: Tantivy の commit / reload が成功してから SQLite):
-     - 削除・OFF になった UUID、**root が変わった UUID**: **先に** その UUID の SQLite 行を 1 回の
-       UPDATE で無効化する (mtime を一致し得ない値に。ディスクに確定させる)。次に Tantivy を
-       `favorite_id` の term で全削除、最後に SQLite の行を削除する。root が変わった方は手順 4 で
-       新 root を全走査する。ID の term で消すので、取消で SQLite に載らなかった Tantivy だけの文書も
-       消える。無効化を先に置くので、Tantivy の削除の後で SQLite の削除が失敗し、そのまま終了・
-       再起動しても、残った行は「署名が一致しない」として次の走査が取り込み直すか消す
-       (無効化そのものが失敗したら先へ進まず、下の失敗時の契約に従う)。
+     - 削除・OFF になった UUID、**root が変わった UUID**: Tantivy を `favorite_id` の term で全削除し、
+       SQLite も `favorite_id` で削除する。root が変わった方は手順 4 で新 root を全走査する。
+       ID の term で消すので、停止で SQLite に載らなかった Tantivy だけの文書も消える。
      - それ以外のグループの UUID: SQLite で「その UUID の行のうち新しい所有範囲の外」を列挙し、
        パスごとに Tantivy から消してから SQLite から消す (共通除外を広げた場合など)。
   4. 新しい構成でグループの supervisor を作る (初回走査は §6 の規則どおり)。
@@ -166,25 +158,11 @@
   必要なら `(favorite_id, path)` の索引を追加する (既存 DB への索引追加は `CREATE INDEX IF NOT EXISTS`
   で、行の意味は変えない)。
 
-#### 停止と再構成の契約 (設計レビュー 4 回目)
+#### 停止と再構成の契約
 
-- **停止状態は 1 つの共有値で、`Running → Drain → Shutdown` の向きにだけ進む**。通知は
-  非 blocking (今の Stop 送信は blocking、[indexer_supervisor.rs:166](../src/indexer_supervisor.rs))。
-  Drain 中の返信待ちは Shutdown を定期的に確認し、Shutdown になったら今の取消と同じく抜ける。
 - アプリ終了時の 4 秒の期限 ([indexer_manager.rs:804](../src/indexer_manager.rs)) は、
   manager が持つ supervisor だけでなく **再構成 worker が止めている最中の handle と、
-  再構成 worker 自身** にも適用する。Shutdown の後は再作成をしない。期限を過ぎたものは今と同じく
-  detach する。同期 `read_dir` には上限が無いので、Drain が終わる時間は保証しない
-  (Shutdown が来れば期限で切る)。
-- **Drain の結果は typed に返す**: `Drained` (投入済みバッチがすべて Tantivy と SQLite に反映済み) /
-  `Failed` (SQLite 更新失敗・reader reload 失敗などを含む。今はログだけで成功扱い、
-  [ingest_worker.rs:199](../src/ingest_worker.rs)、[fts_writer_dispatcher.rs:383](../src/fts_writer_dispatcher.rs)) /
-  `Shutdown`。`Failed` の UUID (root も実効状態も変わらないもの) は、Tantivy の削除をせず、
-  その UUID の SQLite 行を 1 回の UPDATE で無効化するだけにして (範囲外の行の掃除もしない)、
-  印を消して手順 4 で全走査させる。無効化した行は次の走査が必ず取り込み直すか消すので、
-  終了・再起動をまたいでも回復する。`Shutdown` なら再構成を中止する。
-  (S3 の印: 無効化と同じトランザクションでその UUID の root の印を消す。印が残ると、設定 ON の
-  次回起動で走査が省かれ、無効化した行が直らない。)
+  再構成 worker 自身** にも適用する。終了の後は再作成をしない。期限を過ぎたものは今と同じく detach する。
 - **再構成は進行中の構成 snapshot を固定する**。手順 1〜4 の途中で来た変更は待ち行列で
   最新の 1 つにまとめ、今の再構成が終わってから次の再構成として最初から行う
   (途中でグループを差し替えない)。今の `favorite_info` を即座に最新化する処理
@@ -194,21 +172,25 @@
   初回の watcher 起動成功は取消を確認せずに Ready を送る、
   [similar_index.rs:2569](../src/similar_index.rs)、[indexer_supervisor.rs:351](../src/indexer_supervisor.rs))。
   再登録時の既存の gap 修復は維持する。
-- **掃除 (手順 3) や名前索引の clear が失敗したとき** (2026-10-02 設計判断、実装中の質問への回答):
-  そのグループは作り直さず止めたままにし、固定した snapshot と未完了の掃除を再構成 worker が保持する。
-  自動で再試行する (5 秒、30 秒、5 分、以後 5 分ごと)。再試行を待っている間に次の構成変更が来たら、
-  未完了の掃除を新しい snapshot の掃除に引き継いで 1 回の再構成として行う (掃除の対象は消さない)。
-  Shutdown が来たら再試行をやめる。止めている間も検索は既存の索引で動き、止まるのはそのグループの
-  更新だけ。終了をまたいだ後始末は、次回起動時の範囲外掃除 (Tantivy First なので、Tantivy の削除が
-  失敗した行は SQLite に残り、SQLite の削除が失敗した行も残る) と、持ち主の不一致による取り込み直しが
-  引き受ける。失敗した掃除を、成功したものとして先へ進める経路は作らない。
-- **実装時の判断の基準** (2026-10-02): 終了・再起動をまたぐ稀な失敗の組み合わせで、ここに書いていない
-  ものが見つかったら、「SQLite を先に無効化する (SQLite が古い・要確認の側へずれるのは安全)」
-  「失敗したら止めて再試行し、先へ進めない」の 2 つで閉じる選択を実装者が取り、§11 に記録して
-  レビューに回す。索引が恒久的に壊れる (走査しても直らない) 経路だけを止める理由とする。
-- アプリ終了時の取消で Tantivy だけに反映された文書は、今もある問題
-  (search-architecture §4.1 終了応答性) で、扱いを変えない。範囲の持ち主の走査は FS にあるファイルを
-  取り込み直すので、残るのは「終了と同じ時期にファイルも消えた」場合だけ。
+- **途中で失敗したときは「次回起動で索引を作り直す」に割り切る** (2026-10-02 利用者決定:
+  稀な例外のために実装を複雑にしない)。手順 3 の掃除 (Tantivy / SQLite の書き込み) が失敗したら、
+  再試行や部分的な回復はせず、
+  1. 「次回起動時にアイテム索引を作り直す」印を fts_meta に立てる (起動時は `INDEX_VERSION` 不一致と
+     同じ経路で `files` を作り直し Tantivy を wipe する。今の rebuild pending の仕組みを流用する)。
+  2. 利用者に「索引の更新に失敗しました。mIV を再起動すると索引を作り直します。」と知らせる
+     (既存の通知の仕組みを使う)。
+  3. グループの supervisor はそのまま作り直す (検索は動き続ける。索引の一部が古いのは再起動まで)。
+  印を立てる書き込み自体も失敗したら、ログと通知だけにする。
+  名前索引の clear が失敗したときはログだけにする (外したお気に入りの行は、Ctrl+S が有効な
+  お気に入りの範囲でしか検索しないなら害が無い。実装時にこの前提を確認し、違えば同じく作り直しの印へ)。
+- 停止は今の cancel のまま (書き込みを済ませてから止まる特別な停止は作らない)。停止の瞬間に
+  処理中だったバッチは、Tantivy だけに反映されて SQLite に載らないことがある (今もある、
+  search-architecture §4.1 終了応答性)。FS にあるファイルは範囲の持ち主の走査が取り込み直し、
+  手順 3 の ID term 削除はこの文書も消す。残るのは「停止と同じ時期にファイルも消えた」場合だけで、
+  扱いを変えない。
+- 第 5〜6 版にあった「書き込みを済ませてから止める停止 (Drain) と、その typed な結果」
+  「掃除失敗時の自動再試行」「ID 削除前の SQLite 無効化」は、上の割り切りで不要になったので削除した。
+
 
 ### 名前索引
 
@@ -387,7 +369,7 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
   更新される。不完全観測 (read_dir 失敗) の走査で削除が起きないこと。
   同一 root の重複 (UUID 最小が所有)、並べ替えで所有者が変わらない、内側の追加・削除・OFF・
   パス変更を実行中に行ったとき重なるグループだけが作り直され、重ならないお気に入りは動き続けること、
-  Drain 停止で投入済みバッチが SQLite まで反映されてから掃除と再作成が行われること、
+  cancel 停止後の join と、放棄された旧バッチも追い越さない cleanup の完了後に再作成されること、
   root を変えた UUID の旧 root の文書 (Tantivy だけのものを含む) が消えること、
   共通除外を広げたとき範囲外の行が消えること、同じ root に UUID の小さいお気に入りを足したとき
   旧勝者が止まり新しい所有者だけが走ること、待っている間の連続変更が最新構成 1 つにまとまること、
@@ -501,7 +483,9 @@ core・remote service・EPUB worker を生成し、CRT 検査も `runtime=4 pe=3
 環境の許可範囲外で拒否され、`git add` が失敗した。指定の Co-Authored-By を末尾に含む
 コミット文は `target/startup-scan-s1/commit-message.txt` に準備済み。
 
-## 11. S2 の部分実装 (2026-10-02)
+## 11. S2 実装・検証記録 (2026-10-02)
+
+### 11.1 最初の部分実装 (既に受け入れ・コミット済み)
 
 S2 全体は未完了。今回の独立した変更単位は、S1 レビュー残件 P3 と、§3 の
 「不完全観測では削除しない」契約 (S2 brief の項目 3) のみ。
@@ -577,3 +561,104 @@ Git の書き込み・stash・コミットは利用者の指定どおり行っ�
 今回の部分実装専用のコミット文を `target/startup-scan-s2/commit-message.txt` に保存した。
 末尾は指定の `Co-Authored-By: Codex GPT-6.1 Sol <noreply@openai.com>`。
 ブランチは `v430-startup-scan`、HEAD は `9da28d637` のまま。
+
+### 11.2 残りの S2: 第7版に合わせた実装
+
+上の未実装一覧は 11.1 時点の記録。今回の対象は §3 A の残り全体であり、
+§6 E / S3 の初回走査を省く印・設定・手動確認ボタンには着手していない。
+第5〜6版の途中差分から Drain / DrainOutcome・自動 retry・SQLite 無効化を除去し、
+cancel → join → cleanup → spawn の第7版へ統一した。
+
+- `metadata_ownership` は最深 root・同一 root の UUID 文字列順・共通除外を純関数で
+  決める。実効状態、所有範囲、除外、Ctrl+G の filter set、件数、再構成グループを共有する。
+- walker は除外を差し引いた複数の path range を SQL で取得し、取得件数・時間を perf に
+  出す。UUID / favorite_root 不一致は同じ mtime/size でも取り込み直す。失敗行も範囲で
+  読んで再取り込み・不在削除へ回す。不完全観測の削除禁止は受け入れ済みの契約を維持する。
+- `metadata_reconfiguration` が handle を唯一所有し、固定 snapshot の重複グループを
+  直列に再構成する。後続要求は最新の1つへ集約する。Shutdown は停止中の control も
+  取消し、worker 自身とその所有 handle を同じ4秒期限に含める。終了後の spawn はない。
+- 削除・OFF・root 変更は favorite_id term purge、それ以外は新所有範囲外の path cleanup。
+  旧バッチの応答を cancel で放棄しても追い越さないよう、cleanup は同じ Background FIFO
+  に提出する。commit / reader reload 成功後だけ SQLite を削除する。失敗は既存 rebuild
+  pending を立てて指定文言で通知し、再試行せず supervisor を再作成する。
+- 起動時の所有範囲外 cleanup は全 supervisor の前に走り、強制 Full が必要な現在の owner
+  root 集合を返す。`(favorite_id, path)` は EXPLAIN で covering index が選択されることを
+  確認して `CREATE INDEX IF NOT EXISTS` で追加した。
+- similar の停止による再登録待ちは `Revoked` として通常の `Unavailable` から分離した。
+  旧 generation の Ready / event を拒否し、新登録は同じ gap を引き継ぐ。再登録前に
+  degraded Full を走らせないため、交代に必要な repair Full は1回になる。通常の障害時の
+  Unavailable Full と復旧後の gap repair は維持する。これは独立レビューとの構造合意済み。
+- `NameIndexManager` は既存 DB と同じ `normalize_path` の root 単位で supervisor を所有し、
+  停止・join・clear・起動を直列化する。同じ root の有効 UUID が残れば clear しない。
+  起動と編集は同じ経路、UUID の進捗は root monitor へ解決する。clear transaction 内に
+  S3 の印削除 hook を残す。Full 完了・観測結果は S3 が成功判定へ使える型で保持する。
+- Ctrl+S の前提確認では、現行検索が OFF のお気に入り root も含み、空集合では全 root を
+  検索することが分かった。第7版の指示に従い、name clear 失敗時も専用 rebuild pending
+  を立て、次の writable open で名前行と印を同じ transaction で削除する。検索範囲の
+  既存機能は変えていない。readonly open は印を消費しない。
+- App の共通呼出 owner は similar.configure → metadata sync の順に統一し、name sync も
+  同じ owner へ接続した。
+  本棚保存先の環境設定変更も、設定採用後に新しい共通除外を一度提出する。実効保存先が
+  同じなら再構成しない。UI で join・走査・DB 書き込みを追加していない。
+
+追加回帰は 42 件 (lib 41、metadata 統合1)。snapshot/coalescing、worker 所有 handle の
+Shutdown、旧バッチ FIFO、name stop/clear/start、revoked registration は gate / channel
+で競合地点を固定した。独立レビューは設計と差分を確認し、未修正の必須指摘は0。
+自動検証の最終コマンド・件数は以下へ記録する。
+
+以下は記録済み成功分の合計235件 (失敗・ignore 0)。すべて
+`MSBUILDDISABLENODEREUSE=1`、Cargo は `-j 1` を指定した。
+lib のコマンドは `cargo test -j 1 -p mimageviewer --lib <filter>`。
+
+| filter | 成功件数 |
+| --- | ---: |
+| `metadata_ownership` | 3 |
+| `metadata_reconfiguration` | 9 |
+| `search_walker` | 31 |
+| `fts_meta` | 19 |
+| `fts_writer_dispatcher` | 8 |
+| `ingest_worker` | 14 |
+| `indexer_manager` | 11 |
+| `indexer_supervisor` | 14 |
+| `name_index_manager` | 7 |
+| `name_index_supervisor` | 7 |
+| `name_bulk_indexer` | 15 |
+| `search_index_db` | 38 |
+| `ownership_count_tests` | 1 |
+| `preferences_books_root` | 1 |
+| `preferences_unchanged_effective_books_root` | 1 |
+| `similar_index::tests::incremental_reconcile` | 25 |
+| `similar_index::tests::revoked_watch` | 1 |
+| `similar_index::tests::stopped_watch` | 1 |
+
+| integration コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j 1 -p mimageviewer --test search_metadata_e2e` | 14 |
+| `cargo test -j 1 -p mimageviewer --test search_name_e2e` | 15 |
+
+metadata 統合テストは入れ子の不変2回目の走査に加え、同じ stamp の UUID / root 不一致を
+SQLite / Tantivy 双方へ作り、実 walker → IngestSession で両ストアの所有者と検索 filter を
+修復すること、FS に無い別所有者の文書を両方から消すことも確認した。
+
+`cargo check -j 1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+最後のコード変更後に全 workspace `cargo fmt` と `cargo fmt --check` が成功し、
+`python scripts/check_ui_glyphs.py` は問題0。`git diff --check` も成功。
+途中の check / lib コンパイルでは旧 stop module の残り配線、削除した型・API参照、
+test import の不足を修正した。manager の最初の実行は10成功・1失敗で、watch交代時に
+Fullが余分に走ることを検出した。上の Revoked 境界の修正後は期待値を緩めず11件成功。
+ログは `target/startup-scan-s2/*-v7.log` と `*-final.log` に保存した。
+全 workspace suite、アプリ起動、実データの性能計測は行っていない。
+
+設計からの逸脱はない。name rebuild 印・Background FIFO・Revoked の型分離は、
+第7版の指示・既存機能保持・停止所有の境界を具体化した上記の実装判断である。
+S2 の残項目はない。S3 の起動省略の印と§6の機能は未着手。
+
+確認用 build は `MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定して
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が exit 0。
+通常 feature set の core・remote service・EPUB worker を生成し、CRT 検査は
+`runtime=4 pe=3` で成功した。core の最適化コンパイルは10分46秒。
+成果物は起動していない。実 `%APPDATA%\mimageviewer` のデータには触れていない。
+ログは `target/startup-scan-s2/build-dev-v7.log`。
+
+Git の書き込み・stash・コミットは行っていない。残り S2 専用のコミット文を
+`target/startup-scan-s2/commit-message.txt` に上書きし、指定の Co-Authored-By を末尾にした。

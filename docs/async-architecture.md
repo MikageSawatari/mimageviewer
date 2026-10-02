@@ -677,9 +677,14 @@ ingest worker と tag_write_worker が共有する。独自に `fts.writer()` �
 walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
 列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
 生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
-あり、Complete として返さない。この型は FS 観測だけの結果で、Drain や書き込みの
-完了結果とは分離する。S2 の停止・再構成と名前索引の root 所有への変更は未実装
-([実装記録](startup-index-scan-plan.md#11-s2-の部分実装-2026-10-02))。
+あり、Complete として返さない。この型は FS 観測だけの結果で、Full 全体の typed な
+完了結果とは分離する。S2 の停止は既存 cancel のまま。metadata manager worker が
+重複グループの cancel・join・cleanup・spawn を固定 snapshot で直列化し、後続要求は
+最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
+を唯一所有する。Shutdown は停止中の control にも到達し、spawn 採用と同じ短時間 lock
+で直列化する。4秒の期限には worker 自身と worker 所有の handle を含む。
+名前索引も正規化 root ごとの owner を manager worker に集約し、stop・clear・start の
+順序を起動と編集で共有する。S3 の印は未実装。
 
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、

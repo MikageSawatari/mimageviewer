@@ -54,6 +54,42 @@ pub(crate) struct IndexFileCounts {
     pub(crate) meta_total: u64,
 }
 
+#[cfg(test)]
+mod ownership_count_tests {
+    use super::*;
+    #[test]
+    fn nested_and_duplicate_favorites_sum_filter_set_without_double_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let favorite = |id, root: &str| crate::settings::FavoriteEntry {
+            id: uuid::Uuid::from_u128(id),
+            name: String::new(),
+            path: root.into(),
+            auto_index_metadata: true,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        };
+        let favorites = vec![
+            favorite(1, "c:/photos"),
+            favorite(2, "c:/photos/inner"),
+            favorite(3, "C:/PHOTOS/INNER"),
+        ];
+        for (p, f) in [
+            ("c:/photos/x.jpg", &favorites[0]),
+            ("c:/photos/inner/y.jpg", &favorites[1]),
+        ] {
+            db.upsert_meta_ok(p, f.id, &f.path, crate::fts_index::IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let counts = collect_counts(None, Some(&db), &favorites, &[]);
+        assert_eq!(counts.meta_counts[&favorites[0].id], 2);
+        assert_eq!(counts.meta_counts[&favorites[1].id], 1);
+        assert_eq!(counts.meta_counts[&favorites[2].id], 1);
+        assert_eq!(counts.meta_total, 2);
+    }
+}
+
 /// 全 favorite 分の件数を集計する。
 ///
 /// **DB lock 1 回ずつで済む形** で取得する (`GROUP BY` 一括クエリ)。worker thread から
@@ -64,7 +100,8 @@ pub(crate) struct IndexFileCounts {
 pub(crate) fn collect_counts(
     name_db: Option<&crate::search_index_db::SearchIndexDb>,
     meta_db: Option<&crate::fts_meta::FtsMetaDb>,
-    favorites: &[(uuid::Uuid, std::path::PathBuf)],
+    favorites: &[crate::settings::FavoriteEntry],
+    common_excluded: &[std::path::PathBuf],
 ) -> IndexFileCounts {
     let mut out = IndexFileCounts::default();
     let name_map = name_db
@@ -73,15 +110,23 @@ pub(crate) fn collect_counts(
     let meta_map = meta_db
         .and_then(|db| db.count_ok_grouped_by_favorite().ok())
         .unwrap_or_default();
-    for (fav_id, fav_path) in favorites {
-        let key = crate::search_index_db::normalize_path(fav_path);
+    let ownership = crate::metadata_ownership::metadata_ownership(favorites, common_excluded);
+    let mut name_roots = std::collections::HashSet::new();
+    for f in favorites {
+        let key = crate::search_index_db::normalize_path(&f.path);
         let n = name_map.get(&key).copied().unwrap_or(0);
-        let m = meta_map.get(fav_id).copied().unwrap_or(0);
-        out.name_counts.insert(*fav_id, n);
-        out.meta_counts.insert(*fav_id, m);
-        out.name_total += n;
-        out.meta_total += m;
+        let m = ownership
+            .filter_set(f.id)
+            .iter()
+            .map(|id| meta_map.get(id).copied().unwrap_or(0))
+            .sum();
+        out.name_counts.insert(f.id, n);
+        out.meta_counts.insert(f.id, m);
+        if name_roots.insert(key) {
+            out.name_total += n;
+        }
     }
+    out.meta_total = meta_map.values().sum();
     out
 }
 
@@ -242,17 +287,18 @@ impl App {
         if counts_stale && self.favorites_index_refresh_rx.is_none() {
             let name_db = self.search_index_db.as_ref().cloned();
             let meta_db = self.indexer_manager.as_ref().map(|m| m.clone_fts_meta());
-            let fav_ids: Vec<(uuid::Uuid, std::path::PathBuf)> = self
-                .settings
-                .favorites
-                .iter()
-                .map(|f| (f.id, f.path.clone()))
-                .collect();
+            let favorites = self.settings.favorites.clone();
+            let common_excluded = vec![self.settings.books_root_path()];
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
                 .name("fav-index-counts".into())
                 .spawn(move || {
-                    let counts = collect_counts(name_db.as_deref(), meta_db.as_deref(), &fav_ids);
+                    let counts = collect_counts(
+                        name_db.as_deref(),
+                        meta_db.as_deref(),
+                        &favorites,
+                        &common_excluded,
+                    );
                     let sizes = compute_index_disk_sizes();
                     let _ = tx.send((counts, sizes));
                 })
@@ -300,11 +346,7 @@ impl App {
         let name_stats_by_id: std::collections::HashMap<
             uuid::Uuid,
             crate::name_index_supervisor::NameIndexStats,
-        > = self
-            .name_index_supervisors
-            .iter()
-            .map(|(id, h)| (*id, h.snapshot_stats()))
-            .collect();
+        > = self.name_index_stats_by_id();
         let similar_feature_enabled =
             favorites_editor_similar_controls_visible(self.similar_feature_capability());
         let similar_progress = similar_feature_enabled.then(|| self.similar_index_progress());

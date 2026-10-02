@@ -5263,31 +5263,6 @@ fn run_vst3_startup_load(
     }
 }
 
-/// 名前索引 OFF 遷移時の「supervisor join 完了 → search_index_db クリア」を実行する
-/// 共通ヘルパー (T53 + Codex P3 / 2026-05-16)。
-///
-/// 自由関数として extract する理由: `apply_favorite_name_index_change` の旧コードでは
-/// `std::thread::Builder::spawn(closure)` の closure 内に clear ロジックを直書きしていた
-/// が、`spawn` は失敗時に closure を実行せずに drop するだけなので、spawn 失敗パスでは
-/// clear が永久に走らない不具合があった。channel handoff (= spawn 成功時) と sync 呼び出し
-/// (= spawn 失敗時) の両方から本関数を呼ぶ構造に変えることで、どちらの経路でも join → clear
-/// の順序を保ったまま、必ず両方が実行される。
-fn run_name_index_off_completion(
-    handle: crate::name_index_supervisor::NameIndexSupervisorHandle,
-    clear_target: Option<(Arc<crate::search_index_db::SearchIndexDb>, PathBuf)>,
-) {
-    // Drop 内で cancel 再送 + thread.join() が走る (= bulk scan が止まるまで待つ)。
-    drop(handle);
-    if let Some((db, path)) = clear_target {
-        if let Err(e) = db.clear_for_favorite(&path) {
-            crate::logger::log(format!(
-                "favorites: clear name index for {} failed (post-join): {e}",
-                path.display()
-            ));
-        }
-    }
-}
-
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
@@ -13828,19 +13803,8 @@ pub struct App {
     // Paused capability を表し、保存済み auto_index_similar の値やデータは変更しない。
     pub(crate) similar_index: Option<crate::similar_index::SimilarIndexManager>,
 
-    /// 名前索引 Supervisor のアクティブ handle (favorite_id → handle)。
-    ///
-    /// `auto_index_structure = true` のお気に入りごとに 1 つ。長期スレッド +
-    /// FsWatcher を持ち、初期バルクが終わった後も notify-rs イベントで差分追従する。
-    ///
-    /// 2026-04 ユーザー指摘: 旧 `name_bulk_handles` はワンショット bulk thread の
-    /// JoinHandle だけを保持していたため、初期スキャン後に追加された
-    /// フォルダ/ZIP/PDF は Ctrl+S 検索にヒットしなかった。メタ索引側の
-    /// `indexer_supervisor` と対称な構造に揃えるため `NameIndexSupervisor` に差し替え。
-    pub(crate) name_index_supervisors: std::collections::HashMap<
-        uuid::Uuid,
-        crate::name_index_supervisor::NameIndexSupervisorHandle,
-    >,
+    /// 名前索引の root owner。handle/join/DB I/O は専用 worker が所有する。
+    pub(crate) name_index_manager: Option<crate::name_index_manager::NameIndexManager>,
 
     /// 操作中はバックグラウンドインデクサを一時停止するためのゲート (2026-04 F)。
     /// `App::update` の入力検知で `bump()` され、indexer 側が `wait_until_idle()` で待機。
@@ -17531,7 +17495,7 @@ impl App {
             fav_add_auto_index_similar: false,
             indexer_manager,
             similar_index,
-            name_index_supervisors: std::collections::HashMap::new(),
+            name_index_manager: None,
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
             global_search_subfolder_restore: None,
@@ -25593,109 +25557,47 @@ impl App {
         true
     }
 
-    /// 名前索引フラグ (`auto_index_structure`) の OFF→ON / ON→OFF 遷移を即時反映する。
-    /// 呼び出し側はすでに `settings.favorites[*].auto_index_structure` を更新した後に呼ぶ。
-    ///
-    /// - false → true: 既存 supervisor があれば先に drop、新規 supervisor を spawn。
-    ///   supervisor が初期バルクを走らせ、その後 notify-rs で差分追従する。
-    /// - true → false: supervisor を drop し、`search_index_db` をクリア。
-    ///   **順序重要**: supervisor の drop (cancel + join) を先に完了させないと、
-    ///   in-flight upsert が clear_for_favorite 後に走って索引を復活させる race が
-    ///   発生する。
+    /// settings 更新後の起動/編集を同じ root owner 経路へ提出する。
     pub(crate) fn apply_favorite_name_index_change(
         &mut self,
-        fav_id: uuid::Uuid,
-        fav_path: &std::path::Path,
-        new_on: bool,
+        _fav_id: uuid::Uuid,
+        _fav_path: &std::path::Path,
+        _new_on: bool,
     ) {
-        // 既存 supervisor があれば drop (OFF 遷移だけでなく ON→ON でも念のため:
-        // path 変更等で spawn し直すシナリオ)。
-        // `drop(handle)` は `thread.join()` を待つため、bulk scan 進行中は UI が
-        // 数百 ms ブロックする。signal_stop で cancel は立ててから、実際の join は
-        // バックグラウンドスレッドに逃がす。spawn 失敗時は closure が現スレッドで drop
-        // されるので同期 join にフォールバックする (UI ブロックするが整合性は保たれる)。
-        //
-        // T53 (Codex R-SEARCH-002 / 2026-05-16): OFF 遷移の `clear_for_favorite` は
-        // **必ず supervisor の join 完了後**に走らせる。旧コードは joiner スレッドを
-        // spawn した直後に UI スレッドで clear を呼んでいたため、supervisor の最後の
-        // upsert が DB mutex 待ち中に clear が走り、その後 upsert が完了して OFF 後の
-        // 索引にゴーストレコードを残す race があった。new_on=false 経路では clear を
-        // joiner closure 内に移し、join 完了後 (= in-flight upsert 全消化後) に走らせる。
-        let existing_handle = self.name_index_supervisors.remove(&fav_id);
-        let clear_target = if !new_on {
-            self.search_index_db
-                .as_ref()
-                .map(|db| (Arc::clone(db), fav_path.to_path_buf()))
-        } else {
-            None
-        };
-        if let Some(handle) = existing_handle {
-            handle.signal_stop();
-            // T53 + Codex post-merge P3 (2026-05-16): spawn 失敗時に closure 内のロジック
-            // が走らない問題を回避する。`std::thread::Builder::spawn` は失敗時 closure を
-            // **実行せずに drop** するだけなので、closure 内に `clear_for_favorite` を入れて
-            // しまうと spawn 失敗時に索引クリアが永久に行われない (= 低頻度だが OFF 後にも
-            // 行が残る)。
-            //
-            // mpsc 経由でハンドル + clear_target を background worker に手渡しする構造に
-            // すれば、spawn 成功時は worker が同じ処理を行い、spawn 失敗時は handle と
-            // clear_target が外側に残るので main thread で同期実行できる。**どちらの経路
-            // でも join → clear の順序は保たれる**。
-            let (tx, rx) = mpsc::channel::<(
-                crate::name_index_supervisor::NameIndexSupervisorHandle,
-                Option<(
-                    Arc<crate::search_index_db::SearchIndexDb>,
-                    std::path::PathBuf,
-                )>,
-            )>();
-            let spawn_result = std::thread::Builder::new()
-                .name(format!("name-index-joiner-{}", fav_id.as_simple()))
-                .spawn(move || {
-                    if let Ok((handle, target)) = rx.recv() {
-                        run_name_index_off_completion(handle, target);
-                    }
-                });
-            match spawn_result {
-                Ok(_) => {
-                    // worker が rx.recv で待機中。ここで handle + clear_target を譲渡。
-                    let _ = tx.send((handle, clear_target));
-                }
-                Err(e) => {
-                    crate::logger::log(format!(
-                        "name-index-joiner spawn failed, sync join instead: {e}"
-                    ));
-                    drop(tx); // rx もすでに drop 済 (closure dropped by failed spawn)
-                    run_name_index_off_completion(handle, clear_target);
-                }
-            }
-        } else if let Some((db, path)) = clear_target {
-            // 既存 supervisor が居なかった場合 (= 既に OFF だが clear を念のため呼ぶ
-            // / 起動直後の冪等処理) はそのまま同期 clear。
-            if let Err(e) = db.clear_for_favorite(&path) {
-                crate::logger::log(format!(
-                    "favorites: clear name index for {} failed: {e}",
-                    path.display()
-                ));
-            }
-        }
+        self.sync_name_index_supervisors();
+    }
 
-        let Some(db) = self.search_index_db.as_ref() else {
-            return;
-        };
-        if new_on {
-            crate::logger::log(format!(
-                "favorites: spawning name index supervisor for {}",
-                fav_path.display()
-            ));
-            let handle = crate::name_index_supervisor::spawn(
-                fav_id,
-                fav_path.to_path_buf(),
-                Arc::clone(db),
-                vec![self.settings.books_root_path()],
+    pub(crate) fn sync_name_index_supervisors(&mut self) {
+        if self.name_index_manager.is_none() {
+            let Some(db) = self.search_index_db.as_ref().cloned() else {
+                return;
+            };
+            match crate::name_index_manager::NameIndexManager::new(
+                db,
                 Some(Arc::clone(&self.activity_gate)),
-            );
-            self.name_index_supervisors.insert(fav_id, handle);
+            ) {
+                Ok(manager) => self.name_index_manager = Some(manager),
+                Err(error) => {
+                    crate::logger::log(format!("name-index-manager: start failed: {error}"));
+                    return;
+                }
+            }
         }
+        if let Some(manager) = &self.name_index_manager {
+            manager.sync_with_favorites(
+                &self.settings.favorites,
+                vec![self.settings.books_root_path()],
+            );
+        }
+    }
+
+    pub(crate) fn name_index_stats_by_id(
+        &self,
+    ) -> std::collections::HashMap<uuid::Uuid, crate::name_index_supervisor::NameIndexStats> {
+        self.name_index_manager
+            .as_ref()
+            .map(|manager| manager.stats_by_id(&self.settings.favorites))
+            .unwrap_or_default()
     }
 
     /// 別バージョン索引フラグの変更を、対象 snapshot と共有 watcher の両方へ即時反映する。
@@ -25705,22 +25607,19 @@ impl App {
         _favorite_path: &std::path::Path,
         _new_on: bool,
     ) {
-        if let Some(similar_index) = self.similar_index.as_ref() {
-            similar_index.configure(
-                &self.settings.favorites,
-                self.pdf_passwords.clone(),
-                Some(Arc::clone(&self.activity_gate)),
-                vec![self.settings.books_root_path()],
-            );
-        }
         self.sync_shared_favorite_indexers();
     }
 
     /// Reflect favorite changes into the ordinary metadata watcher even when the optional
     /// alternate-version service is paused.
     pub(crate) fn sync_shared_favorite_indexers(&mut self) {
+        self.sync_name_index_supervisors();
+        self.refresh_similar_index_password_config();
         if let Some(manager) = self.indexer_manager.as_mut() {
-            manager.sync_with_favorites(&self.settings.favorites);
+            manager.sync_with_configuration(
+                &self.settings.favorites,
+                vec![self.settings.books_root_path()],
+            );
         } else if self.startup_done {
             if let Some(similar_index) = self.similar_index.as_ref() {
                 similar_index.notifier().finish_watch_bootstrap();
@@ -26499,9 +26398,9 @@ impl App {
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::all_supervisors_idle);
         let name_all_done = self
-            .name_index_supervisors
-            .values()
-            .all(|handle| handle.snapshot_stats().initial_scan_done);
+            .name_index_manager
+            .as_ref()
+            .is_none_or(crate::name_index_manager::NameIndexManager::all_initial_scans_done);
 
         if Self::take_initial_scan_settled_event(
             &mut self.initial_scan_settled_pending,
@@ -26750,48 +26649,27 @@ impl App {
         });
     }
 
-    /// 起動時に `auto_index_structure = true` のお気に入りごとに name index supervisor を
-    /// spawn する。`indexer_manager.sync_with_favorites` のメタ側の挙動に対応する。
-    /// 呼び出しは `App` 構築後 (settings が load 済みで search_index_db が開いている状態) に
-    /// 1 回だけ。
+    /// 起動時も編集時と同じ root 単位の直列化経路を使う。
     pub(crate) fn spawn_initial_name_index_supervisors(&mut self) {
-        let Some(db) = self.search_index_db.as_ref().cloned() else {
-            return;
-        };
-        for fav in &self.settings.favorites {
-            if !fav.auto_index_structure {
-                continue;
-            }
-            if self.name_index_supervisors.contains_key(&fav.id) {
-                continue;
-            }
-            crate::logger::log(format!(
-                "startup: spawning name index supervisor for {}",
-                fav.path.display()
-            ));
-            let handle = crate::name_index_supervisor::spawn(
-                fav.id,
-                fav.path.clone(),
-                Arc::clone(&db),
-                vec![self.settings.books_root_path()],
-                Some(Arc::clone(&self.activity_gate)),
-            );
-            self.name_index_supervisors.insert(fav.id, handle);
-        }
+        self.sync_name_index_supervisors();
     }
 
     /// タイトルバーの「(インデックス更新中)」表示用。
     /// 名前索引 / メタ索引 / 別バージョン索引のいずれかが走査中なら true。
     /// notify-rs の watcher で待機中 (監視中) は false。
     pub(crate) fn any_indexer_in_full_scan(&self) -> bool {
-        // 名前索引
-        for h in self.name_index_supervisors.values() {
-            if h.snapshot_stats().in_full_scan {
-                return true;
-            }
+        if self
+            .name_index_manager
+            .as_ref()
+            .is_some_and(crate::name_index_manager::NameIndexManager::any_in_full_scan)
+        {
+            return true;
         }
         // メタ索引
         if let Some(mgr) = self.indexer_manager.as_ref() {
+            if mgr.is_reconciling() {
+                return true;
+            }
             for v in mgr.all_stats() {
                 if v.stats.in_full_scan {
                     return true;
@@ -26810,25 +26688,20 @@ impl App {
         false
     }
 
-    // name_index_supervisors は HashMap の Drop で各 handle が個別に cancel + join
-    // される。名前索引は SQLite ベースで Tantivy writer のような共有リソースが
-    // 無いため、1 体ずつ drop してもデッドロックしない (メタ側の writer 共有とは違う)。
+    /// purge/stop/restart は manager の worker が現在構成から順序を決める。
+    pub(crate) fn apply_favorite_meta_index_change(&mut self, _fav_id: uuid::Uuid, _new_on: bool) {
+        self.sync_shared_favorite_indexers();
+    }
 
-    /// メタデータ索引フラグ (`auto_index_metadata`) の OFF→ON / ON→OFF 遷移を即時反映する。
-    /// 呼び出し側はすでに `settings.favorites[*].auto_index_metadata` を更新した後に呼ぶ。
-    ///
-    /// - false → true: 呼び出し側で `sync_with_favorites` を呼べば supervisor が spawn される
-    /// - true → false: 当 favorite の fts_meta 行を tombstone 化 → `sync_with_favorites` で
-    ///   supervisor を停止
-    pub(crate) fn apply_favorite_meta_index_change(&mut self, fav_id: uuid::Uuid, new_on: bool) {
-        if !new_on {
-            if let Some(mgr) = self.indexer_manager.as_ref() {
-                mgr.purge_favorite_metadata(fav_id);
-            }
-        }
-        // spawn/stop は sync_with_favorites 側
-        if let Some(mgr) = self.indexer_manager.as_mut() {
-            mgr.sync_with_favorites(&self.settings.favorites);
+    /// worker で確定した再起動案内を既存の全画面トーストへ届ける。
+    fn poll_indexer_notifications(&mut self) {
+        let notifications = self
+            .indexer_manager
+            .as_ref()
+            .map(|manager| manager.take_notifications())
+            .unwrap_or_default();
+        if !notifications.is_empty() {
+            self.show_feedback_toast_with_duration(notifications.join("\n"), 5.0);
         }
     }
 
@@ -84114,6 +83987,7 @@ impl App {
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
+        self.poll_indexer_notifications();
         self.poll_housekeeping_arm();
         // VST3 起動時の bridge enable + 自動ロードは専用 worker で走らせる。
         // 画像閲覧だけの起動では通常 UI を先に出し、動画を開いた時点でまだロード中なら

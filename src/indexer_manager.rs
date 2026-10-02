@@ -27,18 +27,9 @@
 //!   App::drop → IndexerManager::drop → 全 Supervisor drop
 //! ```
 //!
-//! ## CLAUDE.md UI 応答性の遵守
-//!
-//! - `all_stats()`: 1 つの Mutex lock × N favorite。N=20 上限でも Mutex 1 回 × 1μs → 20μs で済む。
-//!   毎フレーム呼んでも問題ない。
-//! - `sync_with_favorites()`: Supervisor drop が発生する可能性あり。drop は内部で FsWatcher
-//!   join (最大 ~250ms) を伴う。**環境設定ダイアログの OK ボタン押下時のみ** 呼ぶ方針 (毎フレーム不可)。
-//! - `spawn_search()`: 別スレッド起動のみなので O(1)。
-//! - `new()` の起動時 reconciliation: **同期実行** に変更済み (Codex round-8 Must-fix #1)。
-//!   通常クラッシュ残留の僅かな行だけを処理するので 100ms 以下で完了する見込み。
-//!   同期化により supervisor 群の spawn と writer 競合しなくなった。
+//! UI calls submit snapshots and read views; all stops, joins and cleanup run on one worker.
+//! Startup reconciliation completes there before supervisors are spawned.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -49,7 +40,7 @@ use crate::activity_gate::ActivityGate;
 use crate::fts_index::FtsIndex;
 use crate::fts_meta::FtsMetaDb;
 use crate::global_search::SearchStreamEvent;
-use crate::indexer_supervisor::{self, SupervisorHandle, SupervisorParams, SupervisorStats};
+use crate::indexer_supervisor::SupervisorStats;
 use crate::io_semaphore::GlobalIoSemaphore;
 use crate::settings::FavoriteEntry;
 
@@ -86,21 +77,10 @@ pub struct IndexerManager {
     /// 廃止 (2026-04 commit 14037af + ユーザー報告)。
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
-    /// UI 入力があると `bump` され、ingest ワーカーが unit of work の前にこれで待つ。
-    /// `App::update` が ActivityGate を所有し、IndexerManager は `Arc` を受け取って保管する。
-    activity_gate: Arc<ActivityGate>,
     /// アプリ管理下で生成する派生コンテンツなど、検索索引から除外する root。
     excluded_roots: Vec<std::path::PathBuf>,
-    /// 別バージョン索引へ、同じ favorite watcher の変更通知を渡す。
-    similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
-    /// お気に入り UUID → Supervisor ハンドル
-    supervisors: HashMap<Uuid, SupervisorHandle>,
-    /// 有効化されていないお気に入りでも、お気に入り UUID → (name, path) を記憶しておく
-    /// (stats UI で name を出すため)
-    favorite_info: HashMap<Uuid, (String, std::path::PathBuf, bool, bool)>,
-    /// reconciliation が進行中なら true (UI に "DB 初期化中" 表示用)
-    pub reconciliation_in_progress: Arc<AtomicBool>,
-    /// 起動時 reconciliation の診断情報 (UI 表示用)
+    /// 再構成 worker が supervisor ハンドルと構成 snapshot を所有する。
+    runtime: crate::metadata_reconfiguration::Runtime,
     startup_diag: StartupDiag,
 }
 
@@ -304,12 +284,8 @@ impl IndexerManager {
     ///
     /// DB 初期化結果を startup completion channel 用の typed outcome で返す。
     ///
-    /// **Codex round-8 Must-fix #1 反映**: 起動時 reconciliation は
-    /// supervisors spawn の **前** に同期実行する。旧実装はバックグラウンド化していたが、
-    /// reconciliation の IndexWriter ロック中に supervisor の writer 初期化が失敗し、
-    /// supervisor thread が即 return する race があった。
-    /// reconciliation は通常クラッシュ残留の僅かな行だけを処理するので、
-    /// アプリ起動の許容範囲内 (通常 100ms 以下) で終わる。
+    /// 起動時 reconciliation は再構成 worker が supervisors spawn の前に実行する。
+    /// IndexWriter は dispatcher が所有し、掃除と通常の取り込みを直列に処理する。
     /// `progress` を渡すと各 sub-step (FtsMetaDb open / FtsIndex open / writer init /
     /// reconciliation / supervisor spawn) の前に短い進捗文字列が書き込まれる。
     /// 起動オーバーレイで状態を見せたい場合に渡す。`None` なら従来通り無音。
@@ -414,50 +390,36 @@ impl IndexerManager {
         let writer =
             crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
 
-        // === 起動時 reconciliation を先に同期実行 ===
+        // === 起動時 reconciliation → supervisor spawn を同じ worker に渡す ===
         // supervisor が走る前に status != ok の残留行を整理する。dispatcher 経由で
         // Interactive 優先度で submit する (起動直後で他ジョブはほぼ無い)。
         if let Some(p) = progress.as_ref() {
             p("アイテム索引を整理中…");
         }
-        let t_recon = std::time::Instant::now();
-        let report = match run_reconciliation_via_dispatcher(&meta_db, &fts, &writer, favorites) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::logger::log(format!(
-                    "IndexerManager: reconciliation failed (continuing anyway): {e}"
-                ));
-                ReconciliationReport::default()
-            }
-        };
-        let reconciliation_ms = t_recon.elapsed().as_millis() as u64;
-        crate::perf::emit_ms("startup", "fts_reconciliation", 0, t_recon);
-        crate::logger::log(format!(
-            "IndexerManager: reconciliation completed in {reconciliation_ms} ms"
-        ));
-
-        let mut mgr = IndexerManager {
+        let runtime = crate::metadata_reconfiguration::Runtime::start(
+            crate::metadata_reconfiguration::Stores {
+                meta: Arc::clone(&meta_db),
+                fts: Arc::clone(&fts),
+                writer: Arc::clone(&writer),
+                io: Arc::clone(&io_sem),
+                gate: Arc::clone(&activity_gate),
+                similar: similar_notifier.clone(),
+            },
+            crate::metadata_reconfiguration::Configuration::new(favorites, excluded_roots.clone()),
+        )
+        .ok()?;
+        let mgr = IndexerManager {
             meta_db,
             fts,
             writer,
             io_sem,
-            activity_gate,
             excluded_roots,
-            similar_notifier,
-            supervisors: HashMap::new(),
-            favorite_info: HashMap::new(),
-            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
+            runtime,
             startup_diag: StartupDiag {
-                reconciliation_ms,
-                failed_cleaned: report.failed_cleaned,
                 io_permits: permits,
+                ..StartupDiag::default()
             },
         };
-        // reconciliation 完了後に supervisor 群を起動 (writer 競合なし)
-        if let Some(p) = progress.as_ref() {
-            p("お気に入りの監視を起動中…");
-        }
-        mgr.sync_with_favorites(favorites);
         Some(mgr)
     }
 
@@ -475,169 +437,55 @@ impl IndexerManager {
             .ok();
     }
 
-    /// 現在のお気に入り一覧と supervisors を同期。
-    /// - 新規 `auto_index_metadata = true` または `auto_index_similar = true` → spawn
-    /// - 既存で OFF に切り替わった / 削除された → drop
-    /// - 既存で ON のまま **かつ path 不変** → 維持
-    /// - 既存で ON のまま **かつ path 変更** → drop + respawn (Codex round-8 Must-fix #2)
-    ///
-    /// **UI スレッドから呼ぶ時の注意**: 停止対象には先に cancel を通知し、join は専用
-    /// thread に逃がす。お気に入り編集画面の即時トグルから呼んでも待たない。
+    /// 現在のお気に入り構成を worker に提出する。
+    /// 重なるグループの停止・join・掃除・再作成は worker で直列に行う。
+    /// UI スレッドは I/O・join・DB lock を待たない。
     pub fn sync_with_favorites(&mut self, favorites: &[FavoriteEntry]) {
-        // Notifier presence is the typed bridge from the optional similar-index service.  Use the
-        // same derived value everywhere below so a saved similar-only flag cannot create an empty
-        // watcher when that service is paused.
-        let effective_similar = |favorite: &FavoriteEntry| {
-            self.similar_notifier.is_some() && favorite.auto_index_similar
-        };
-        // path 変更の検出は favorite_info 更新 **前** に行う (旧 path と比較するため)
-        let config_changed: std::collections::HashSet<Uuid> = favorites
-            .iter()
-            .filter_map(|f| {
-                let (_, old_path, old_metadata, old_similar) = self.favorite_info.get(&f.id)?;
-                if old_path != &f.path
-                    || *old_metadata != f.auto_index_metadata
-                    || *old_similar != effective_similar(f)
-                {
-                    Some(f.id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // favorite_info を最新化
-        self.favorite_info.clear();
-        for f in favorites {
-            self.favorite_info.insert(
-                f.id,
-                (
-                    f.name.clone(),
-                    f.path.clone(),
-                    f.auto_index_metadata,
-                    effective_similar(f),
-                ),
-            );
-        }
-
-        // 削除 / OFF 化 / **path 変更** されたものを drop 対象に含める
-        let current_on_ids: std::collections::HashSet<Uuid> = favorites
-            .iter()
-            .filter(|f| f.auto_index_metadata || effective_similar(f))
-            .map(|f| f.id)
-            .collect();
-        let to_stop: Vec<Uuid> = self
-            .supervisors
-            .keys()
-            .filter(|id| !current_on_ids.contains(id) || config_changed.contains(id))
-            .copied()
-            .collect();
-        // dispatcher 化後 (commit 30338a3) も signal_stop → drain パターンを維持する:
-        // 1 体ずつ drop すると、その supervisor が `dispatcher.batch().recv()` でブロック中の
-        // sub-batch が完了するまで join できない (= sub-batch 1 個分の hang)。先に全員に
-        // cancel を立てておけば、現在の sub-batch が終わった時点で各 supervisor が
-        // 次のループ先頭で cancel を検出し、即 exit できる。
-        for id in &to_stop {
-            if let Some(handle) = self.supervisors.get(id) {
-                crate::logger::log(format!(
-                    "IndexerManager: signaling supervisor {id} to stop (removed / off / path changed)"
-                ));
-                handle.signal_stop();
-            }
-        }
-        // **非同期 join** (2026-04 B): 各 supervisor の drop は `thread.join()` を待つため、
-        // ingest の sub-batch (commit に数百 ms かかる) を抱えた supervisor を join すると
-        // UI スレッドが丸ごとブロックする (計測で 1162ms のヒッチを観測)。
-        // 既に上の `signal_stop()` で全員の cancel は立てているので、drop (= join) 自体は
-        // バックグラウンドスレッドに逃がして UI は即 return させる。
-        let handles_to_join: Vec<SupervisorHandle> = to_stop
-            .into_iter()
-            .filter_map(|id| self.supervisors.remove(&id))
-            .collect();
-        if !handles_to_join.is_empty() {
-            let n = handles_to_join.len();
-            crate::logger::log(format!(
-                "IndexerManager: spawning joiner thread for {n} supervisor(s)"
-            ));
-            if let Err(e) = std::thread::Builder::new()
-                .name("indexer-joiner".into())
-                .spawn(move || {
-                    for handle in handles_to_join {
-                        let id = handle.favorite_id;
-                        drop(handle);
-                        crate::logger::log(format!(
-                            "IndexerManager(joiner): supervisor {id} joined"
-                        ));
-                    }
-                })
-            {
-                // spawn 失敗時は closure が現スレッドで drop される = 同期 join になる。
-                // UI がブロックするが整合性は保たれる (稀なリソース枯渇時のフェイルセーフ)。
-                crate::logger::log(format!(
-                    "IndexerManager: joiner spawn failed, sync join instead: {e}"
-                ));
-            }
-        }
-
-        // 新規 ON を spawn (path 変更で drop したものも新 path で respawn される)
-        for f in favorites {
-            let similar_enabled = effective_similar(f);
-            if !f.auto_index_metadata && !similar_enabled {
-                continue;
-            }
-            if self.supervisors.contains_key(&f.id) {
-                continue;
-            }
-            let handle = indexer_supervisor::spawn(
-                SupervisorParams {
-                    favorite_id: f.id,
-                    favorite_root: f.path.clone(),
-                    excluded_roots: self.excluded_roots.clone(),
-                    enable_metadata_index: f.auto_index_metadata,
-                    similar_notifier: if similar_enabled {
-                        self.similar_notifier.clone()
-                    } else {
-                        None
-                    },
-                },
-                Arc::clone(&self.meta_db),
-                Arc::clone(&self.fts),
-                Arc::clone(&self.writer),
-                Arc::clone(&self.io_sem),
-                Arc::clone(&self.activity_gate),
-            );
-            self.supervisors.insert(f.id, handle);
-        }
+        self.sync_with_configuration(favorites, self.excluded_roots.clone());
     }
-
-    /// 現在アクティブな全 supervisor の stats を取得 (UI 表示用)。
-    /// 戻り値の順序は favorite 登録順ではないので、UI 側でソートすること。
+    pub fn sync_with_configuration(
+        &mut self,
+        favorites: &[FavoriteEntry],
+        excluded: Vec<std::path::PathBuf>,
+    ) {
+        self.excluded_roots = excluded.clone();
+        self.runtime
+            .submit(crate::metadata_reconfiguration::Configuration::new(
+                favorites, excluded,
+            ));
+    }
     pub fn all_stats(&self) -> Vec<SupervisorStatsView> {
-        self.supervisors
+        let view = self.runtime.shared.state.lock().unwrap();
+        view.controls
             .iter()
-            .map(|(id, handle)| {
-                let info = self.favorite_info.get(id).cloned();
+            .map(|(id, h)| {
+                let f = view.favorites.iter().find(|f| f.id == *id);
                 SupervisorStatsView {
                     favorite_id: *id,
-                    favorite_name: info
-                        .as_ref()
-                        .map(|(name, _, _, _)| name.clone())
-                        .unwrap_or_default(),
-                    favorite_path: info
-                        .map(|(_, path, _, _)| path)
-                        .unwrap_or_else(std::path::PathBuf::new),
-                    stats: handle.snapshot_stats(),
+                    favorite_name: f.map(|f| f.name.clone()).unwrap_or_default(),
+                    favorite_path: f.map(|f| f.path.clone()).unwrap_or_default(),
+                    stats: h.snapshot_stats(),
                 }
             })
             .collect()
     }
-
-    /// 指定 favorite の Supervisor に手動 full-rescan を要求する。
-    /// 対応する Supervisor がない favorite は no-op。
-    pub fn request_full_rescan(&self, favorite_id: Uuid) {
-        if let Some(h) = self.supervisors.get(&favorite_id) {
+    pub fn request_full_rescan(&self, id: Uuid) {
+        if let Some(h) = self.runtime.shared.state.lock().unwrap().controls.get(&id) {
             h.request_full_rescan();
         }
+    }
+    pub fn take_notifications(&self) -> Vec<&'static str> {
+        std::mem::take(&mut self.runtime.shared.state.lock().unwrap().notifications)
+    }
+    /// S3 must bypass startup markers for these owner roots.
+    pub fn must_scan_owner_roots(&self) -> std::collections::HashSet<String> {
+        self.runtime
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .must_scan_roots
+            .clone()
     }
 
     /// Ctrl+G 検索を別スレッドで起動する。
@@ -680,7 +528,7 @@ impl IndexerManager {
 
     /// favorite 数を返す (stats UI 用)。
     pub fn supervisor_count(&self) -> usize {
-        self.supervisors.len()
+        self.runtime.shared.state.lock().unwrap().controls.len()
     }
 
     /// 全 supervisor が初期スキャンを完了しており、現在 full scan を実行していないか。
@@ -688,10 +536,13 @@ impl IndexerManager {
     /// `spawn_housekeeping` の起動タイミングを「初回 ingest が落ち着いてから」に揃える
     /// ために使う (Codex 指摘)。
     pub fn all_supervisors_idle(&self) -> bool {
-        self.supervisors.values().all(|h| {
-            let s = h.snapshot_stats();
-            s.initial_scan_done && !s.in_full_scan
-        })
+        let view = self.runtime.shared.state.lock().unwrap();
+        !view.busy
+            && view.pending.is_none()
+            && view.controls.values().all(|h| {
+                let s = h.snapshot_stats();
+                s.initial_scan_done && !s.in_full_scan
+            })
     }
 
     /// `Arc<FtsMetaDb>` を clone して返す。
@@ -714,16 +565,20 @@ impl IndexerManager {
         Arc::clone(&self.writer)
     }
 
-    /// 起動時 reconciliation が進行中か (UI インジケータ表示用)。
-    /// 現状は同期実行で即 false に戻るが、将来 async 化したときに値が変わる余地を残す。
+    /// 起動時 reconciliation または構成変更が進行中か (UI 表示用)。
     pub fn is_reconciling(&self) -> bool {
-        self.reconciliation_in_progress
-            .load(std::sync::atomic::Ordering::SeqCst)
+        let view = self.runtime.shared.state.lock().unwrap();
+        view.busy || view.pending.is_some()
     }
 
     /// 起動時 reconciliation の結果 (UI 診断表示用)。
     pub fn startup_diag(&self) -> StartupDiag {
-        self.startup_diag
+        let view = self.runtime.shared.state.lock().unwrap();
+        StartupDiag {
+            reconciliation_ms: view.reconciliation_ms,
+            failed_cleaned: view.failed_cleaned,
+            ..self.startup_diag
+        }
     }
 
     /// v0.9: トレイ常駐中に I/O 並列度を強制的に 1 permit 相当へ絞る / 解除する。
@@ -736,127 +591,26 @@ impl IndexerManager {
     pub fn io_sem(&self) -> Arc<GlobalIoSemaphore> {
         Arc::clone(&self.io_sem)
     }
-
-    /// お気に入りの「メタ索引」チェックを OFF にした時のクリーンアップ。
-    /// SQLite 行と Tantivy doc 両方を確実に消す。reconciliation は status=Failed の
-    /// 行しか走査しないので、ここで Tantivy delete_term を出さないと孤児 doc が
-    /// 残り続けてしまう。
-    ///
-    /// 呼び出し順序: **必ず `sync_with_favorites` より前に呼ぶ** こと。先に supervisor
-    /// を drop すると writer が別スレッドに移ってしまうので、こちらの SQL DELETE 中に
-    /// supervisor 側 ingest が走って race になる可能性がある (実害は限定的だが綺麗でない)。
-    pub fn purge_favorite_metadata(&self, favorite_id: Uuid) -> usize {
-        use crate::fts_writer_dispatcher::WriterPriority;
-        let paths = match self.meta_db.list_all_paths_for_favorite(favorite_id) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::logger::log(format!(
-                    "IndexerManager: purge_favorite_metadata({favorite_id}) list failed: {e}"
-                ));
-                return 0;
-            }
-        };
-        if paths.is_empty() {
-            return 0;
-        }
-        // Tantivy First: delete batch が失敗したら SQLite には触れない。
-        // 次回のメタ ON/OFF 切替や reconciliation で再試行できるよう、SQLite の
-        // 行を再試行の手がかりとして残しておく。
-        if let Err(e) = self.writer.batch(
-            vec![],
-            paths.clone(),
-            true,
-            true,
-            WriterPriority::Background,
-        ) {
-            crate::logger::log(format!(
-                "IndexerManager: purge_favorite_metadata({favorite_id}) tantivy batch failed: {e} \
-                 (SQLite rows preserved for retry)"
-            ));
-            return 0;
-        }
-        match self.meta_db.delete_all_for_favorite(favorite_id) {
-            Ok(n) => {
-                crate::logger::log(format!(
-                    "IndexerManager: purge_favorite_metadata({favorite_id}) deleted {n} rows"
-                ));
-                n
-            }
-            Err(e) => {
-                crate::logger::log(format!(
-                    "IndexerManager: purge_favorite_metadata({favorite_id}) sqlite failed: {e}"
-                ));
-                0
-            }
-        }
-    }
 }
 
 impl Drop for IndexerManager {
     fn drop(&mut self) {
-        // STEP 1: 全 supervisor に同時に cancel シグナルを送る。
-        //
-        // **重要**: dispatcher 化後 (commit 30338a3) も同じ「全員に先に cancel → 順次 join」
-        // パターンを維持する。各 supervisor は `dispatcher.batch().recv()` で sub-batch 完了
-        // 待ちにブロックすることがあり、1 体ずつ drop すると現在処理中の sub-batch が
-        // 終わるまで止まれない。先に全員の cancel を立てておけば、現 sub-batch 完了直後の
-        // ループ先頭で cancel を検出して即 exit する。
-        for (id, handle) in &self.supervisors {
-            crate::logger::log(format!("IndexerManager: signaling supervisor {id} to stop"));
-            handle.signal_stop();
-        }
-
-        // STEP 2: manager 全体で 4 秒だけ join を待つ。期限後の JoinHandle は detach し、
-        // プロセス終了を supervisor 内の将来の長時間処理で塞がない。
-        let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        let supervisor_count = self.supervisors.len();
-        let mut detached = 0usize;
-        for (id, handle) in self.supervisors.drain() {
-            crate::logger::log(format!("IndexerManager: joining supervisor {id}"));
-            if !handle.join_until(shutdown_deadline) {
-                detached += 1;
-            }
-        }
-        let joined = supervisor_count - detached;
-        if detached > 0 {
-            crate::logger::log(format!(
-                "IndexerManager: shutdown deadline reached; joined={joined}, detached={detached}"
-            ));
-        } else {
-            crate::logger::log(format!(
-                "IndexerManager: all supervisors joined within deadline ({joined})"
-            ));
-        }
-
-        // STEP 3: join済み / detach済みにかかわらず共有writerへbest-effort commitを送る。
-        // main threadでは待たない。cancel-aware waiter が abandoned job を
-        // dispatcher queue に残していても、この clone が dispatcher の最終 Drop/join を
-        // background 側で所有する。Tantivy First + 次回 3-way diff の不変条件は維持される。
+        self.runtime.shutdown();
         let writer = Arc::clone(&self.writer);
-        if let Err(e) = std::thread::Builder::new()
-            .name("indexer-writer-finalizer".into())
+        let fts = Arc::clone(&self.fts);
+        let _ = std::thread::Builder::new()
+            .name("fts-finalize".into())
             .spawn(move || {
-                if let Err(e) = writer.commit(
-                    false,
+                let _ = writer.commit(
+                    true,
                     crate::fts_writer_dispatcher::WriterPriority::Background,
-                ) {
-                    crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
-                } else {
-                    crate::logger::log(
-                        "IndexerManager: final writer commit completed (best effort)",
-                    );
-                }
-            })
-        {
-            crate::logger::log(format!(
-                "IndexerManager: writer finalizer spawn failed; skipping final commit: {e}"
-            ));
-        }
-        // dispatcher 自身は Arc::strong_count が 0 になった時点で Drop → スレッド join される。
+                );
+                drop(writer);
+                drop(fts);
+            });
     }
 }
 
-/// UI 表示用の SupervisorStats + 名前/パス。
 #[derive(Clone, Debug)]
 pub struct SupervisorStatsView {
     pub favorite_id: Uuid,
@@ -865,30 +619,7 @@ pub struct SupervisorStatsView {
     pub stats: SupervisorStats,
 }
 
-// -----------------------------------------------------------------------
-// 起動時 reconciliation (§5.6.3)
-// -----------------------------------------------------------------------
-
-/// `status != ok` の行を掃除する reconciliation を別スレッドで走らせる。
-///
-/// - Ok: 対象外
-/// - Pending: pending のまま残すと次回もフィルタから漏れる。supervisor 起動時の walker
-///   が再 ingest するので、ここでは何もしないで良い (walker が "DB になし" と判定して追加)。
-///   ただし Tantivy 側に残っている古い doc があれば整合性を取るため delete しておく。
-/// - Failed: 永久リトライを避けるため、24 時間経っていない failed はスキップ (v1 では簡略化で全部再試行)
-/// - Tombstone: tombstone として DB に残っているが Tantivy delete が commit されていない
-///   可能性があるので、念のため Tantivy 側を delete してから purge する
-///
-/// v1 実装はシンプル: `list_not_ok_paths` で取った path について
-///   - Pending → Tantivy delete_doc + DB row 削除 (次回 walker scan で再 ingest)
-///   - Failed → 同じ (再試行)
-///   - Tombstone → Tantivy delete_doc + purge_tombstone
-/// 起動時 reconciliation を別スレッドで走らせる (v1 ではテスト専用)。
-///
-/// 本番経路では `IndexerManager::new` が `run_reconciliation` を同期実行する
-/// (Codex round-8 Must-fix #1 対応)。この関数は AtomicBool 通知付き非同期版で、
-/// 将来的な「実行中 reconciliation」UI 表示や定期再 reconciliation で使う余地を残すため
-/// test-only としてのみ残している。
+// test-only としてのみ残している。
 #[cfg(test)]
 fn spawn_reconciliation(
     meta_db: Arc<FtsMetaDb>,
@@ -923,7 +654,7 @@ fn spawn_reconciliation(
 /// post-filter 化されてお気に入り配下の全行 (実測 65 万行で 1.1 秒) を読む。
 /// `list_not_ok_paths_for_favorites` の 1 クエリ化で部分インデックス
 /// `idx_files_status` (status != 0) が効き 17ms 程度に収まる。
-fn run_reconciliation_via_dispatcher(
+pub(crate) fn run_reconciliation_via_dispatcher(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,
     writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
@@ -931,11 +662,7 @@ fn run_reconciliation_via_dispatcher(
 ) -> Result<ReconciliationReport, String> {
     use crate::fts_writer_dispatcher::WriterPriority;
     let mut report = ReconciliationReport::default();
-    let target_favs: Vec<Uuid> = favorites
-        .iter()
-        .filter(|f| f.auto_index_metadata)
-        .map(|f| f.id)
-        .collect();
+    let target_favs = crate::metadata_ownership::metadata_ownership(favorites, &[]).effective_ids();
     let not_ok = meta_db
         .list_not_ok_paths_for_favorites(&target_favs)
         .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
@@ -946,9 +673,9 @@ fn run_reconciliation_via_dispatcher(
         writer
             .batch(vec![], deletes, true, true, WriterPriority::Background)
             .map_err(|e| format!("reconciliation batch: {e}"))?;
-        if let Err(e) = meta_db.delete_paths(&deletes_for_sqlite) {
-            crate::logger::log(format!("reconciliation: delete_paths failed: {e}"));
-        }
+        meta_db
+            .delete_paths(&deletes_for_sqlite)
+            .map_err(|e| format!("reconciliation delete_paths: {e}"))?;
         report.failed_cleaned = deletes_for_sqlite.len();
     }
     crate::logger::log(format!(
@@ -994,8 +721,8 @@ fn run_reconciliation(
 }
 
 #[derive(Default, Debug, Clone)]
-struct ReconciliationReport {
-    failed_cleaned: usize,
+pub(crate) struct ReconciliationReport {
+    pub(crate) failed_cleaned: usize,
 }
 
 // -----------------------------------------------------------------------
@@ -1009,6 +736,37 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    fn test_manager(
+        meta: Arc<FtsMetaDb>,
+        fts: Arc<FtsIndex>,
+        writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
+        io: Arc<GlobalIoSemaphore>,
+        gate: Arc<ActivityGate>,
+        similar: Option<crate::similar_index::SimilarIndexNotifier>,
+    ) -> IndexerManager {
+        let runtime = crate::metadata_reconfiguration::Runtime::start(
+            crate::metadata_reconfiguration::Stores {
+                meta: Arc::clone(&meta),
+                fts: Arc::clone(&fts),
+                writer: Arc::clone(&writer),
+                io: Arc::clone(&io),
+                gate: Arc::clone(&gate),
+                similar: similar.clone(),
+            },
+            crate::metadata_reconfiguration::Configuration::new(&[], Vec::new()),
+        )
+        .unwrap();
+        IndexerManager {
+            meta_db: meta,
+            fts,
+            writer,
+            io_sem: io,
+            excluded_roots: Vec::new(),
+            runtime,
+            startup_diag: StartupDiag::default(),
+        }
+    }
 
     fn mk_fav(name: &str, path: &std::path::Path, metadata: bool) -> FavoriteEntry {
         let mut fav = FavoriteEntry::new(name.to_string(), path.to_path_buf());
@@ -1146,6 +904,7 @@ mod tests {
 
         favorite.auto_index_metadata = true;
         manager.sync_with_favorites(&[favorite]);
+        wait_until("metadata supervisor adopted", || !manager.is_reconciling());
         assert_eq!(
             manager.supervisor_count(),
             1,
@@ -1284,43 +1043,28 @@ mod tests {
             fts.writer().unwrap(),
             Arc::clone(&fts),
         );
-        let mut mgr = IndexerManager {
-            meta_db: Arc::clone(&meta),
-            fts: Arc::clone(&fts),
+        let mut mgr = test_manager(
+            Arc::clone(&meta),
+            Arc::clone(&fts),
             writer,
-            io_sem: Arc::clone(&io_sem),
-            activity_gate: Arc::new(ActivityGate::new(1000)),
-            excluded_roots: Vec::new(),
-            similar_notifier: None,
-            supervisors: HashMap::new(),
-            favorite_info: HashMap::new(),
-            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
-            startup_diag: StartupDiag::default(),
-        };
+            Arc::clone(&io_sem),
+            Arc::new(ActivityGate::new(1000)),
+            None,
+        );
 
         let mut fav = mk_fav("A", &root_old, true);
         // 初回 spawn
         mgr.sync_with_favorites(&[fav.clone()]);
-        let handle1_thread_id = mgr
-            .supervisors
-            .get(&fav.id)
-            .map(|h| h.favorite_id)
-            .expect("handle inserted");
-
+        wait_until("first supervisor", || {
+            mgr.supervisor_count() == 1 && !mgr.is_reconciling()
+        });
         // path 変更 (id は同じ)
         fav.path = root_new.clone();
         mgr.sync_with_favorites(&[fav.clone()]);
-        // supervisors にはちゃんと入ったまま (新 path で respawn されたはず)
-        assert!(mgr.supervisors.contains_key(&fav.id));
-        // favorite_info の path が新パスになっている
-        assert_eq!(mgr.favorite_info.get(&fav.id).unwrap().1, root_new);
-        // favorite_id は変わっていない
-        assert_eq!(
-            mgr.supervisors.get(&fav.id).unwrap().favorite_id,
-            handle1_thread_id
-        );
-
-        // 明示 drop で clean shutdown
+        wait_until("new root supervisor", || {
+            !mgr.is_reconciling() && mgr.all_stats().iter().any(|v| v.favorite_path == root_new)
+        });
+        assert_eq!(mgr.supervisor_count(), 1);
         drop(mgr);
     }
 
@@ -1357,19 +1101,14 @@ mod tests {
         let similar_data = tmp.path().join("similar");
         let similar = crate::similar_index::SimilarIndexManager::new(similar_data.clone());
         let activity_gate = Arc::new(ActivityGate::new(0));
-        let mut manager = IndexerManager {
-            meta_db: meta,
+        let mut manager = test_manager(
+            meta,
             fts,
             writer,
-            io_sem: Arc::new(GlobalIoSemaphore::new(1)),
-            activity_gate: Arc::clone(&activity_gate),
-            excluded_roots: Vec::new(),
-            similar_notifier: Some(similar.notifier()),
-            supervisors: HashMap::new(),
-            favorite_info: HashMap::new(),
-            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
-            startup_diag: StartupDiag::default(),
-        };
+            Arc::new(GlobalIoSemaphore::new(1)),
+            Arc::clone(&activity_gate),
+            Some(similar.notifier()),
+        );
         let mut favorite = mk_fav("similar", &root, false);
         favorite.auto_index_similar = true;
 
@@ -1381,7 +1120,9 @@ mod tests {
         );
         manager.sync_with_favorites(&[favorite.clone()]);
 
-        assert_eq!(manager.supervisor_count(), 1);
+        wait_until("supervisor configuration", || {
+            !manager.is_reconciling() && manager.supervisor_count() == 1
+        });
         wait_until("similar-only watcher did not start", || {
             manager.all_supervisors_idle()
         });
@@ -1508,19 +1249,14 @@ mod tests {
         let similar_data = tmp.path().join("similar");
         let similar = crate::similar_index::SimilarIndexManager::new(similar_data.clone());
         let activity_gate = Arc::new(ActivityGate::new(0));
-        let mut manager = IndexerManager {
-            meta_db: Arc::clone(&meta),
+        let mut manager = test_manager(
+            Arc::clone(&meta),
             fts,
             writer,
-            io_sem: Arc::new(GlobalIoSemaphore::new(1)),
-            activity_gate: Arc::clone(&activity_gate),
-            excluded_roots: Vec::new(),
-            similar_notifier: Some(similar.notifier()),
-            supervisors: HashMap::new(),
-            favorite_info: HashMap::new(),
-            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
-            startup_diag: StartupDiag::default(),
-        };
+            Arc::new(GlobalIoSemaphore::new(1)),
+            Arc::clone(&activity_gate),
+            Some(similar.notifier()),
+        );
         let mut favorite = mk_fav("recovering", &root, false);
         favorite.auto_index_similar = true;
         similar.configure(

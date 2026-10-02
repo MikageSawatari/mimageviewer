@@ -124,6 +124,7 @@ impl SearchIndexDb {
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
+        rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -133,6 +134,7 @@ impl SearchIndexDb {
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         init_schema(&conn)?;
+        rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -146,6 +148,7 @@ impl SearchIndexDb {
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
+        rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -349,13 +352,41 @@ impl SearchIndexDb {
 
     /// インデックス作成時に、お気に入り配下のエントリを全削除する。
     pub fn clear_for_favorite(&self, favorite_root: &Path) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        self.clear_for_favorite_with_hook(favorite_root, invalidate_name_completion_marker)
+    }
+
+    /// S3 の marker 無効化はこの transaction に接続する。hook 失敗時は rows も戻す。
+    pub fn clear_for_favorite_with_hook(
+        &self,
+        favorite_root: &Path,
+        invalidate_marker: impl FnOnce(&rusqlite::Transaction<'_>, &str) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
         let fav_norm = normalize_path(favorite_root);
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM entries WHERE favorite_root = ?1",
             params![fav_norm],
         )?;
-        Ok(())
+        invalidate_marker(&tx, &fav_norm)?;
+        tx.commit()
+    }
+
+    /// Ctrl+S の「すべて」は OFF root も検索するため、clear 失敗は次回起動で回復する。
+    /// marker の書込だけ FULL にして、成功した印が再起動をまたいで残るようにする。
+    pub fn request_rebuild_on_next_start(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = conn
+            .execute(
+                "INSERT INTO name_index_rebuild_state (id, pending) VALUES (1, 1) \
+             ON CONFLICT(id) DO UPDATE SET pending = 1",
+                [],
+            )
+            .map(|_| ());
+        let restore = conn.pragma_update(None, "synchronous", synchronous);
+        result.and(restore)
     }
 
     /// `root_path` 自身と配下のすべての行を `favorite_root` スコープで削除する。
@@ -634,11 +665,23 @@ impl SearchIndexDb {
     }
 }
 
+/// S3 が実際の marker DELETE を実装する単一の hook。S2 は marker schema を持たない。
+fn invalidate_name_completion_marker(
+    _tx: &rusqlite::Transaction<'_>,
+    _root: &str,
+) -> rusqlite::Result<()> {
+    Ok(())
+}
+
 // -----------------------------------------------------------------------
 // スキーマ
 // -----------------------------------------------------------------------
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS name_index_rebuild_state (\
+         id INTEGER PRIMARY KEY CHECK(id = 1), pending INTEGER NOT NULL);",
+    )?;
     // 新規 DB 用: 複合 PRIMARY KEY `(favorite_root, path)` で作る。
     // 同じ実体 path が複数 favorite に所属する (nested favorites) ケースを表現できる。
     // idx_entries_fav_updated は `prune_stale_for_favorite` の
@@ -742,6 +785,25 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         bump_write_stamp_floor(max_stamp);
     }
 
+    Ok(())
+}
+
+/// schema を壊さず rows を同一 transaction で再作成。readonly open は印を消費しない。
+fn rebuild_names_if_requested(conn: &Connection) -> rusqlite::Result<()> {
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE id = 1 AND pending <> 0)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM entries", [])?;
+    // S3 の全 marker 削除 hook はこの transaction に接続する。
+    tx.execute("DELETE FROM name_index_rebuild_state", [])?;
+    tx.commit()?;
+    crate::logger::log("search_index_db: rebuilding name index after failed clear".to_owned());
     Ok(())
 }
 
@@ -851,6 +913,133 @@ mod tests {
             kind,
             mtime: 0,
         }
+    }
+
+    #[test]
+    fn clear_and_completion_hook_commit_or_rollback_together() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TABLE test_completion (root TEXT PRIMARY KEY); INSERT INTO test_completion VALUES ('c:/fav');",
+        ).unwrap();
+        let failed = db.clear_for_favorite_with_hook(root, |tx, key| {
+            tx.execute("DELETE FROM test_completion WHERE root = ?1", [key])?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(failed.is_err());
+        assert_eq!(db.count_for_favorite(root).unwrap(), 1);
+        let markers: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM test_completion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(markers, 1);
+        db.clear_for_favorite_with_hook(root, |tx, key| {
+            tx.execute("DELETE FROM test_completion WHERE root = ?1", [key])
+                .map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(db.count_for_favorite(root).unwrap(), 0);
+        let markers: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM test_completion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(markers, 0);
+    }
+
+    #[test]
+    fn rebuild_marker_survives_reopen_and_readonly_does_not_consume_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.request_rebuild_on_next_start().unwrap();
+        // 通常の名前索引の書込設定は marker の FULL 書込後も復元される。
+        let synchronous: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        drop(db);
+        let readonly = SearchIndexDb::open_readonly_at(&path).unwrap();
+        assert_eq!(readonly.count_for_favorite(root).unwrap(), 1);
+        drop(readonly);
+        let rebuilt = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(rebuilt.count_for_favorite(root).unwrap(), 0);
+        // 印は1回だけ消費される。その後の有効な行を次の open で消さない。
+        rebuilt
+            .upsert_children(
+                root,
+                root,
+                &[entry("C:/fav/b.zip", "b.zip", IndexKind::ZipFile)],
+            )
+            .unwrap();
+        drop(rebuilt);
+        assert_eq!(
+            SearchIndexDb::open_at(&path)
+                .unwrap()
+                .count_for_favorite(root)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rebuild_failure_preserves_rows_and_pending_marker_for_next_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.request_rebuild_on_next_start().unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_rebuild BEFORE DELETE ON entries BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        ).unwrap();
+        drop(db);
+        assert!(SearchIndexDb::open_at(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT pending FROM name_index_rebuild_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((pending, rows), (1, 1));
+        conn.execute_batch("DROP TRIGGER fail_rebuild").unwrap();
+        drop(conn);
+        assert_eq!(
+            SearchIndexDb::open_at(&path)
+                .unwrap()
+                .count_for_favorite(root)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

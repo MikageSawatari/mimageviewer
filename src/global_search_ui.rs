@@ -2239,15 +2239,13 @@ impl App {
         // 選択中の favorite が削除された / auto_index_metadata を外された場合、UI ラベルと
         // 検索スコープが食い違う (ラベル = 名前表示、スコープ = 全対象) のを避けるため
         // フィルタ側を None に倒して UI も「すべて」に戻す。
-        let all_favs: Vec<uuid::Uuid> = self
-            .settings
-            .favorites
-            .iter()
-            .filter(|f| f.auto_index_metadata)
-            .map(|f| f.id)
-            .collect();
+        let ownership = crate::metadata_ownership::metadata_ownership(
+            &self.settings.favorites,
+            &[self.settings.books_root_path()],
+        );
+        let all_favs = ownership.effective_ids();
         if let Some(id) = self.global_search.filters.favorite {
-            if !all_favs.contains(&id) {
+            if ownership.filter_set(id).is_empty() {
                 self.global_search.filters.favorite = None;
             }
         }
@@ -2261,7 +2259,7 @@ impl App {
         };
 
         let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
-            Some(id) => vec![id],
+            Some(id) => ownership.filter_set(id),
             None => all_favs,
         };
         let scope = crate::global_search::SearchScope {

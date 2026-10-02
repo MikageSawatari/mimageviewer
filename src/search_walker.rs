@@ -142,6 +142,76 @@ trait WalkerIo {
 
 struct FsWalkerIo;
 
+#[cfg(test)]
+mod ownership_diff_tests {
+    use super::*;
+    use crate::fts_index::IndexKind;
+    #[test]
+    fn unchanged_signature_reingests_wrong_id_and_root_and_deletes_absent_other_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("images");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("x.jpg");
+        std::fs::write(&path, b"image").unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let owner = Uuid::new_v4();
+        let sem = GlobalIoSemaphore::new(1);
+        let run = || {
+            scan(
+                ScanParams {
+                    favorite_id: owner,
+                    root: root.clone(),
+                    excluded_roots: Vec::new(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    progress: None,
+                },
+                &db,
+                &sem,
+                IoPriority::Normal,
+                None,
+            )
+            .unwrap()
+        };
+        let initial = run();
+        let c = &initial.to_ingest[0];
+        let key = normalize_path(&path);
+        db.upsert_meta_ok(
+            &key,
+            Uuid::new_v4(),
+            &root,
+            IndexKind::Image,
+            c.diff_mtime,
+            c.diff_size,
+        )
+        .unwrap();
+        assert_eq!(run().to_ingest.len(), 1);
+        db.upsert_meta_ok(
+            &key,
+            owner,
+            &root.join("old"),
+            IndexKind::Image,
+            c.diff_mtime,
+            c.diff_size,
+        )
+        .unwrap();
+        assert_eq!(run().to_ingest.len(), 1);
+        db.upsert_meta_ok(
+            &key,
+            owner,
+            &root,
+            IndexKind::Image,
+            c.diff_mtime,
+            c.diff_size,
+        )
+        .unwrap();
+        assert_eq!(run().unchanged, 1);
+        let absent = normalize_path(&root.join("absent.jpg"));
+        db.upsert_meta_ok(&absent, Uuid::new_v4(), &root, IndexKind::Image, 1, 1)
+            .unwrap();
+        assert_eq!(run().to_delete, vec![absent]);
+    }
+}
+
 impl WalkerIo for FsWalkerIo {
     type Entries = std::fs::ReadDir;
 
@@ -239,12 +309,30 @@ fn scan_with_io(
     }
 
     // 2. DB 側の登録一覧を取得
+    let t_query = std::time::Instant::now();
+    let scope = crate::metadata_ownership::OwnedRange {
+        root: crate::metadata_ownership::root_key(&root),
+        exclusions: excluded_roots
+            .iter()
+            .map(|p| crate::metadata_ownership::root_key(p))
+            .collect(),
+    };
     let db_entries = db
-        .list_favorite_files(favorite_id)
+        .list_range_files(&scope)
         .map_err(|e| format!("fts_meta list failed: {e}"))?;
-    let db_map: std::collections::HashMap<String, (i64, i64)> = db_entries
+    crate::perf::event(
+        "indexer",
+        "owned_range_query",
+        None,
+        0,
+        &[
+            ("rows", db_entries.len().into()),
+            ("ms", (t_query.elapsed().as_secs_f64() * 1000.0).into()),
+        ],
+    );
+    let db_map: std::collections::HashMap<_, _> = db_entries
         .into_iter()
-        .map(|(p, m, s)| (p, (m, s)))
+        .map(|row| (row.path.clone(), row))
         .collect();
 
     // 3. 3-way diff
@@ -262,10 +350,16 @@ fn scan_with_io(
                 // FS only → 新規 ingest
                 result.to_ingest.push(cand.clone());
             }
-            Some(&(db_mtime, db_size)) => {
+            Some(row) => {
                 // 差分判定は **差分用** 署名 (画像 + サイドカーを織り込んだ値) で行う。
                 // fts_meta には ingest_worker が diff_mtime/diff_size を保存している。
-                if db_mtime == cand.diff_mtime && db_size == cand.diff_size {
+                if row.status == 0
+                    && row.favorite_id == favorite_id.to_string()
+                    && crate::metadata_ownership::root_key(Path::new(&row.favorite_root))
+                        == scope.root
+                    && row.mtime == cand.diff_mtime
+                    && row.file_size == cand.diff_size
+                {
                     result.unchanged += 1;
                 } else {
                     // 変化あり (本体 or サイドカーの追加/編集/削除) → 再 ingest
@@ -992,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_roots_are_not_scanned_and_stale_rows_are_deleted() {
+    fn excluded_roots_are_not_fetched_or_deleted_by_walker() {
         let fav = Uuid::new_v4();
         let (tmp, db) = tmp_db();
         let root = tmp.path().join("p");
@@ -1026,11 +1120,11 @@ mod tests {
         assert_eq!(r.total_scanned, 1, "除外 root 配下のページは候補にしない");
         assert_eq!(r.to_ingest.len(), 1);
         assert_eq!(r.to_ingest[0].abs_path, root.join("keep.jpg"));
-        assert_eq!(
-            r.to_delete,
-            vec![stale_key],
-            "除外 root 配下に残った旧行は削除候補に落とす"
+        assert!(
+            r.to_delete.is_empty(),
+            "excluded rows belong to manager cleanup"
         );
+        assert!(db.get(&stale_key).unwrap().is_some());
     }
 
     #[test]

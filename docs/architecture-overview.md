@@ -3,6 +3,10 @@
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
 
+検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
+`metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。
+UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は各 manager worker が担う。
+
 ---
 
 ## 1. レイヤー構造

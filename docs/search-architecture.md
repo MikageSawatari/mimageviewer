@@ -193,8 +193,8 @@ App 起動
        ├─ 旧 Tantivy STORED tags を tags.db へ一度だけ移行 (fts_index wipe より前)
        ├─ durable rebuild pending なら旧 fts_index を wipe (失敗時は旧 index を開かない)
        ├─ FtsIndex を openし、成功後だけ rebuild pending を clear
-       ├─ 起動時 reconciliation (§4.3) を **同期** で実行
-       └─ auto_index_metadata=true のお気に入りごとに
+       ├─ manager worker で起動時 reconciliation (§4.3) と所有範囲外 cleanup
+       └─ cleanup 完了後、実効 metadata / similar が有効なお気に入りごとに
             IndexerSupervisor::spawn  (1 お気に入り 1 本、以降ずっと常駐)
 
 IndexerSupervisor (スレッド 1 本):
@@ -202,7 +202,7 @@ IndexerSupervisor (スレッド 1 本):
   2. search_walker::scan  …… 初期スキャン (3-way diff)
          FS にあり DB になし → ingest queue
          DB にあり FS になし → delete queue
-         両方あり mtime/size 差 → 再 ingest queue
+         両方あり mtime/size 差、または UUID/root の所有者不一致 → 再 ingest queue
   3. IngestSession::run   …… Tantivy First 書き込み順序 (§4.2) で反映
   4. 以降 watcher イベント (DebouncedChange) を受け取り小刻みに 3 と同じ処理
   5. App drop で全員 cancel。join は全 supervisor 合計 4 秒まで、超過時は detach
@@ -221,6 +221,19 @@ Incomplete とし、その走査では削除候補を生成しない。観測で
 取消は結果を成功として返さず、既存の取消経路で終了する。
 この型は観測の完全性だけを表し、書き込みの成功や Full 全体の成功を保証しない。
 起動省略の印は未実装 (詳細・残作業は [起動スキャン計画](startup-index-scan-plan.md) §11)。
+
+metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
+同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を
+差し引いた複数の SQL 区間だけを walker が取得する。Ctrl+G のお気に入り絞り込みと
+編集画面の件数も、選択 root 内の実効所有 UUID 集合を共有する。総件数は ID ごとの和。
+
+構成変更は `metadata_reconfiguration` worker が旧新 root の推移的な重複グループを
+cancel → join → cleanup → spawn の順に処理する。処理中 snapshot は固定し、
+後続要求は最新の1つに集約する。ID の OFF・削除・root 変更は Tantivy ID-term purge、
+それ以外は新所有範囲外の path cleanup を行う。cleanup は旧 ingest と同じ Background
+FIFO に置き、commit/reload 成功後に SQLite を削除する。失敗時は再試行せず既存
+rebuild pending を立てて通知し、次回起動で `files` と Tantivy の両方を作り直す。
+起動時 cleanup は S3 の印に関わらず Full が必要な現所有 root 集合を返す。
 
 #### 終了応答性と有界 shutdown
 
@@ -288,9 +301,8 @@ v2.3.0第12弾では次を不変条件とする。
   公開せず、marker を残して次回起動で再試行する
 - `fts_index/` schema 不一致 → Tantivy の既存 schema 判定で全再構築
 
-通常は数十〜数百行程度で 100ms 以下。大量なら supervisor 起動は待たされるが、
-writer 競合防止のため同期実行する方が安全 (非同期化すると supervisor と
-reconcile が `IndexWriter` を奪い合って失敗する)。
+所有範囲外の掃除も含め、manager worker 内で reconciliation の完了後に supervisor を
+起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
 
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
@@ -301,7 +313,7 @@ idle になった最初のフレームで `spawn_housekeeping` から別スレ�
 登録する:
 
 ```
-NameIndexSupervisor (1 お気に入り 1 本):
+NameIndexSupervisor (1 正規化 root 1 本):
   1. name_bulk_indexer::run_bulk_name_index  …… 単一の深さ優先走査で各フォルダを read_dir 1 回
   2. SearchIndexDb::upsert_children_if_changed で直下集合を比較し、変化したフォルダだけ置換
   3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
@@ -318,6 +330,14 @@ NameIndexSupervisor (1 お気に入り 1 本):
 canonical key とは分離する。除外・存在しない root は訪問集合に入らない。
 取消・不完全観測・DB 更新失敗の場合は prune せず、不完全なフォルダは置換もしない。
 watcher の部分走査は既存の `upsert_children` と stamp による subtree prune を維持する。
+
+`NameIndexManager` が起動・編集の共通経路を所有し、root ごとに停止・join・clear・起動を
+直列化する。同じ root を使う structure 有効のお気に入りが残る間は clear しない。
+UUID ごとの進捗は現在の root の monitor へ解決する。clear は transaction 内に S3 の
+印削除用 hook を置くが、起動走査を省く印自体はまだ実装しない。
+Ctrl+S の現行絞り込みは OFF の root も含み、集合が空なら全 root を検索するため、
+clear 失敗を放置すると古い結果が出る。失敗時は名前 DB の次回起動 rebuild 印を立て、
+次の writable open で名前行と印を同じ transaction で削除する。
 
 - アイテム索引側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。

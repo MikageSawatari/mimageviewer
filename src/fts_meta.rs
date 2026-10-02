@@ -46,6 +46,71 @@ use crate::search_index_db::normalize_path;
 pub const INDEX_VERSION: i64 = 10;
 
 const TANTIVY_REBUILD_PENDING_KEY: &str = "tantivy_rebuild_pending";
+#[derive(Clone, Debug)]
+pub struct RangeFileStamp {
+    pub path: String,
+    pub favorite_id: String,
+    pub favorite_root: String,
+    pub mtime: i64,
+    pub file_size: i64,
+    pub status: i64,
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn range_query_never_fetches_excluded_rows_and_includes_other_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        for path in ["c:/a/x.jpg", "c:/a/inner/y.jpg", "c:/ab/z.jpg"] {
+            db.upsert_meta_ok(path, id, Path::new("c:/a"), IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let scope = crate::metadata_ownership::OwnedRange {
+            root: "c:/a".into(),
+            exclusions: vec!["c:/a/inner".into()],
+        };
+        let rows = db.list_range_files(&scope).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].favorite_id, id.to_string());
+        assert_eq!(
+            db.list_paths_outside_range(id, Some(&scope)).unwrap().len(),
+            2
+        );
+    }
+    #[test]
+    fn requested_rebuild_recreates_files_on_next_open_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db");
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        db.upsert_meta_ok(
+            "c:/x.jpg",
+            Uuid::new_v4(),
+            Path::new("c:/"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.request_item_index_rebuild().unwrap();
+        assert!(db.get("c:/x.jpg").unwrap().is_some());
+        drop(db);
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        assert!(db.rebuilt_on_open());
+        assert!(db.tantivy_rebuild_pending().unwrap());
+        assert!(db.get("c:/x.jpg").unwrap().is_none());
+    }
+    #[test]
+    fn cleanup_index_is_covering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT path FROM files WHERE favorite_id = ?1 AND NOT(path >= ?2 AND path < ?3)",params!["id","c:/a/","c:/a0"],|r| r.get(3)).unwrap();
+        assert!(plan.contains("COVERING INDEX idx_files_fav_path"), "{plan}");
+    }
+}
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
@@ -152,7 +217,15 @@ impl FtsMetaDb {
         // v9→v10 は SQLite 列構造ではなく Tantivy 本文の意味変更なので、files が空でも
         // wipe が必要。既知の旧 version は行の MIN に依存せず semantic rebuild とする。
         let version_requires_rebuild = user_version > 0 && user_version < INDEX_VERSION;
-        let rebuild_needed = if user_version == INDEX_VERSION {
+        init_index_state_schema(&conn)?;
+        let requested_rebuild: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM index_state WHERE key = ?1 AND value != 0)",
+            params![TANTIVY_REBUILD_PENDING_KEY],
+            |r| r.get(0),
+        )?;
+        let rebuild_needed = if requested_rebuild {
+            true
+        } else if user_version == INDEX_VERSION {
             false
         } else {
             version_requires_rebuild || needs_rebuild(&conn)?
@@ -225,6 +298,13 @@ impl FtsMetaDb {
             )
             .optional()?;
         Ok(value.is_some_and(|value| value != 0))
+    }
+
+    /// Next startup recreates both stores through the existing rebuild-pending path.
+    pub fn request_item_index_rebuild(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
+        Ok(())
     }
 
     /// Cross-store owner (`open_stores_with_rebuild_sync`) だけが、旧 directory の wipe と
@@ -354,17 +434,79 @@ impl FtsMetaDb {
         Ok(deleted)
     }
 
+    /// Read only the owned intervals; descendants excluded by SQL are never materialized.
+    pub fn list_range_files(
+        &self,
+        scope: &crate::metadata_ownership::OwnedRange,
+    ) -> rusqlite::Result<Vec<RangeFileStamp>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root, mtime, file_size, status FROM files WHERE path >= ?1 AND path < ?2")?;
+        let mut out = Vec::new();
+        for range in scope.sql_ranges() {
+            let rows = stmt.query_map(params![range.start, range.end], |r| {
+                Ok(RangeFileStamp {
+                    path: r.get(0)?,
+                    favorite_id: r.get(1)?,
+                    favorite_root: r.get(2)?,
+                    mtime: r.get(3)?,
+                    file_size: r.get(4)?,
+                    status: r.get(5)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_paths_outside_range(
+        &self,
+        id: Uuid,
+        scope: Option<&crate::metadata_ownership::OwnedRange>,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from("SELECT path FROM files WHERE favorite_id = ?1");
+        let mut values = vec![id.to_string()];
+        if let Some(scope) = scope {
+            for r in scope.sql_ranges() {
+                let pos = values.len() + 1;
+                sql.push_str(&format!(
+                    " AND NOT (path >= ?{pos} AND path < ?{})",
+                    pos + 1
+                ));
+                values.extend([r.start, r.end]);
+            }
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(0))?
+            .collect()
+    }
+
+    /// Startup includes orphan/invalid UUIDs, not just IDs still present in settings.
+    pub fn list_path_owners(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root FROM files")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    }
+
     /// 指定 path 群の行を物理削除する。Tantivy 側 delete 完了後の cleanup として呼ぶ。
     pub fn delete_paths(&self, paths: &[String]) -> rusqlite::Result<usize> {
         if paths.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().unwrap();
-        let placeholders = sql_in_placeholders(paths.len());
-        let sql = format!("DELETE FROM files WHERE path IN ({placeholders})");
-        let params_vec: Vec<&dyn rusqlite::ToSql> =
-            paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let deleted = conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted = 0;
+        for chunk in paths.chunks(500) {
+            let sql = format!(
+                "DELETE FROM files WHERE path IN ({})",
+                sql_in_placeholders(chunk.len())
+            );
+            deleted += tx.execute(&sql, rusqlite::params_from_iter(chunk))?;
+        }
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -687,6 +829,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             status            INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_files_fav       ON files(favorite_id);
+         CREATE INDEX IF NOT EXISTS idx_files_fav_path ON files(favorite_id, path);
          CREATE INDEX IF NOT EXISTS idx_files_fav_mtime ON files(favorite_id, mtime);
          CREATE INDEX IF NOT EXISTS idx_files_fav_kind  ON files(favorite_id, kind);
          CREATE INDEX IF NOT EXISTS idx_files_status    ON files(status) WHERE status != 0;",

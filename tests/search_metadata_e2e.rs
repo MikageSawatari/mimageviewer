@@ -35,6 +35,161 @@ use mimageviewer::fts_meta::FtsMetaDb;
 use mimageviewer::global_search::{DoneReason, RejectReason, SearchStreamEvent};
 use std::fs;
 
+#[test]
+fn nested_ownership_second_scan_is_unchanged_and_parent_filter_includes_inner_once() {
+    use mimageviewer::fts_index::{Container, IndexDoc, IndexKind, find_doc_by_path};
+    use mimageviewer::fts_writer_dispatcher::WriterPriority;
+    use mimageviewer::ingest_worker::IngestSession;
+    use mimageviewer::io_semaphore::{GlobalIoSemaphore, IoPriority};
+    use mimageviewer::metadata_ownership::metadata_ownership;
+    use mimageviewer::search_walker::{ScanParams, scan};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let data = FixtureRoot::new();
+    let fixture = FixtureRoot::new();
+    let outer_root = fixture.mkdir("outer");
+    let inner_root = outer_root.join("inner");
+    fs::create_dir(&inner_root).unwrap();
+    write_png_with_text(&outer_root.join("one.png"), "dragon outer");
+    write_png_with_text(&inner_root.join("two.png"), "dragon inner");
+    let favorites = vec![
+        make_favorite("outer", &outer_root),
+        make_favorite("inner", &inner_root),
+    ];
+    let manager = start_indexer_at(data.path(), &favorites);
+    for favorite in &favorites {
+        wait_scan_done(&manager, favorite.id);
+    }
+    let ownership = metadata_ownership(&favorites, &[]);
+    let db = manager.clone_fts_meta();
+    let sem = GlobalIoSemaphore::new(1);
+    for favorite in &favorites {
+        let result = scan(
+            ScanParams {
+                favorite_id: favorite.id,
+                root: favorite.path.clone(),
+                excluded_roots: ownership.favorites[&favorite.id].excluded_roots.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: None,
+            },
+            &db,
+            &sem,
+            IoPriority::Normal,
+            None,
+        )
+        .unwrap();
+        assert!(result.to_ingest.is_empty());
+        assert!(result.to_delete.is_empty());
+        assert_eq!(result.unchanged, 1);
+    }
+    assert_eq!(
+        collect_search_hits(&manager, "dragon", &ownership.filter_set(favorites[0].id)).len(),
+        2
+    );
+    assert_eq!(
+        collect_search_hits(&manager, "dragon", &ownership.filter_set(favorites[1].id)).len(),
+        1
+    );
+
+    // 旧所有者の同じ stamp を残し、range diff と実 ingest で両ストアを修復する。
+    let wrong_owner = uuid::Uuid::new_v4();
+    let fts = manager.clone_fts_index();
+    let writer = manager.clone_shared_writer();
+    let mut docs = Vec::new();
+    for (i, path) in [outer_root.join("one.png"), inner_root.join("two.png")]
+        .into_iter()
+        .enumerate()
+    {
+        let key = normalize_path(&path);
+        let old = db.get(&key).unwrap().unwrap();
+        let id = if i == 0 { favorites[0].id } else { wrong_owner };
+        db.upsert_meta_ok(&key, id, fixture.path(), old.kind, old.mtime, old.file_size)
+            .unwrap();
+        docs.push(IndexDoc {
+            path: key,
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: id,
+            kind: old.kind,
+            mtime: old.mtime,
+            file_size: old.file_size,
+            norms: Default::default(),
+        });
+    }
+    let missing_key = normalize_path(&outer_root.join("missing.png"));
+    db.upsert_meta_ok(
+        &missing_key,
+        wrong_owner,
+        fixture.path(),
+        IndexKind::Image,
+        1,
+        1,
+    )
+    .unwrap();
+    docs.push(IndexDoc {
+        path: missing_key.clone(),
+        container: Container::Fs,
+        zip_entry: String::new(),
+        favorite_id: wrong_owner,
+        kind: IndexKind::Image,
+        mtime: 1,
+        file_size: 1,
+        norms: Default::default(),
+    });
+    writer
+        .batch(docs, Vec::new(), true, true, WriterPriority::Background)
+        .unwrap();
+    for favorite in &favorites {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan(
+            ScanParams {
+                favorite_id: favorite.id,
+                root: favorite.path.clone(),
+                excluded_roots: ownership.favorites[&favorite.id].excluded_roots.clone(),
+                cancel: Arc::clone(&cancel),
+                progress: None,
+            },
+            &db,
+            &sem,
+            IoPriority::Normal,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.to_ingest.len(), 1);
+        IngestSession::new(favorite.id, favorite.path.clone(), &db, &fts)
+            .apply(
+                result.to_ingest,
+                result.to_delete,
+                &writer,
+                &sem,
+                IoPriority::Normal,
+                &cancel,
+                None,
+            )
+            .unwrap();
+    }
+    for (favorite, path) in favorites
+        .iter()
+        .zip([outer_root.join("one.png"), inner_root.join("two.png")])
+    {
+        let row = db.get(&normalize_path(&path)).unwrap().unwrap();
+        assert_eq!(row.favorite_id, favorite.id);
+        assert_eq!(
+            normalize_path(&row.favorite_root),
+            normalize_path(&favorite.path)
+        );
+        assert_eq!(
+            collect_search_hits(&manager, "dragon", &[favorite.id]).len(),
+            1
+        );
+    }
+    assert!(db.get(&missing_key).unwrap().is_none());
+    assert!(
+        find_doc_by_path(&fts.searcher(), fts.fields(), &missing_key)
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// 一時的に読めない root の Full は、SQLite/Tantivy の既存行を消さない。
 /// 再び完全に観測できた Full では通常の新規取り込み・削除に戻る。
 #[test]

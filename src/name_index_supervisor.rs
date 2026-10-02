@@ -2,7 +2,8 @@
 //!
 //! ## 責務
 //!
-//! お気に入りで `auto_index_structure = true` の間、以下を 1 スレッドで担当する:
+//! 正規化 root を使うお気に入りのいずれかが `auto_index_structure = true` の間、
+//! `name_index_manager` が root ごとに 1 本だけ起動し、以下を担当する:
 //!
 //! 1. 起動時の初期バルクスキャン (`name_bulk_indexer::run_bulk_name_index`)
 //! 2. FS 監視 (`FsWatcher` = notify-rs) を張り続け、debounce 済みイベントを受信
@@ -13,7 +14,7 @@
 //! ## メタ索引 Supervisor との違い
 //!
 //! - 書き込み先が SQLite (`SearchIndexDb`) なので Tantivy writer 制約がない →
-//!   **複数お気に入りの name supervisor は真に並列で動ける**
+//!   **異なる root の name supervisor は並列で走査できる**
 //! - Ingest フェーズが軽量 (upsert_children = `INSERT OR REPLACE`) なので、メタ側の
 //!   ように `writer.lock()` 直前に「取込待ち」状態を出す必要はない
 //!
@@ -58,6 +59,15 @@ pub struct NameIndexStats {
     pub current_activity: Option<String>,
     /// 現在のカウントベース進捗 (バルク取込中のみ)。
     pub eta: Option<crate::indexer_progress::EtaSnapshot>,
+    /// Full の完了契約。初回表示用 initial_scan_done と成功を区別する。
+    pub last_full_scan: Option<NameFullScanOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameFullScanOutcome {
+    Complete,
+    Failed,
+    Cancelled,
 }
 
 pub enum NameIndexCommand {
@@ -75,6 +85,50 @@ pub struct NameIndexSupervisorHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+/// Worker-owned supervisor の UI/終了通知用投影。join の所有権は持たない。
+#[derive(Clone)]
+pub(crate) struct NameIndexMonitor {
+    cmd_tx: Sender<NameIndexCommand>,
+    cancel: Arc<AtomicBool>,
+    stats: Arc<Mutex<NameIndexStats>>,
+    progress: ProgressReporter,
+}
+
+impl NameIndexMonitor {
+    pub(crate) fn snapshot_stats(&self) -> NameIndexStats {
+        let mut s = self.stats.lock().unwrap().clone();
+        s.current_activity = self.progress.snapshot();
+        s.eta = self.progress.snapshot_eta();
+        s
+    }
+
+    pub(crate) fn signal_stop(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.try_send(NameIndexCommand::Stop);
+    }
+
+    pub(crate) fn request_full_rescan(&self) {
+        let _ = self.cmd_tx.try_send(NameIndexCommand::FullRescan);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, Receiver<NameIndexCommand>) {
+        let (cmd_tx, cmd_rx) = bounded(4);
+        (
+            Self {
+                cmd_tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+                stats: Arc::new(Mutex::new(NameIndexStats {
+                    initial_scan_done: true,
+                    ..Default::default()
+                })),
+                progress: ProgressReporter::new(),
+            },
+            cmd_rx,
+        )
+    }
+}
+
 impl NameIndexSupervisorHandle {
     pub fn snapshot_stats(&self) -> NameIndexStats {
         let mut s = self.stats.lock().unwrap().clone();
@@ -87,21 +141,35 @@ impl NameIndexSupervisorHandle {
     /// `IndexerManager::drop` と同じ「全員 signal_stop → drain」パターン用。
     pub fn signal_stop(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(NameIndexCommand::Stop);
+        let _ = self.cmd_tx.try_send(NameIndexCommand::Stop);
+    }
+
+    pub(crate) fn into_worker_parts(mut self) -> (NameIndexMonitor, JoinHandle<()>) {
+        let monitor = NameIndexMonitor {
+            cmd_tx: self.cmd_tx.clone(),
+            cancel: Arc::clone(&self.cancel),
+            stats: Arc::clone(&self.stats),
+            progress: self.progress.clone(),
+        };
+        (
+            monitor,
+            self.thread
+                .take()
+                .expect("supervisor thread already transferred"),
+        )
     }
 }
 
 impl Drop for NameIndexSupervisorHandle {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(NameIndexCommand::Stop);
         if let Some(t) = self.thread.take() {
+            self.signal_stop();
             let _ = t.join();
         }
     }
 }
 
-/// 1 お気に入り分の name index supervisor を起動する。
+/// 1 root 分の name index supervisor を起動する。UUID は watcher のイベントタグ。
 ///
 /// `activity_gate` が `Some` のとき、bulk scan は UI 操作中に自動で待機する (2026-04 F)。
 /// テスト・レガシー経路で指定不要なら `None` を渡す。
@@ -112,6 +180,23 @@ pub fn spawn(
     excluded_roots: Vec<PathBuf>,
     activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
 ) -> NameIndexSupervisorHandle {
+    try_spawn(
+        favorite_id,
+        favorite_root,
+        db,
+        excluded_roots,
+        activity_gate,
+    )
+    .expect("failed to spawn name index supervisor")
+}
+
+pub(crate) fn try_spawn(
+    favorite_id: Uuid,
+    favorite_root: PathBuf,
+    db: Arc<SearchIndexDb>,
+    excluded_roots: Vec<PathBuf>,
+    activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+) -> std::io::Result<NameIndexSupervisorHandle> {
     let cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(NameIndexStats::default()));
     let progress = ProgressReporter::new();
@@ -124,14 +209,13 @@ pub fn spawn(
     let root_cl = favorite_root.clone();
     let excluded_roots_cl = excluded_roots.clone();
 
-    crate::logger::log(format!(
-        "name_index[{favorite_id}]: supervisor starting for {}",
-        favorite_root.display()
-    ));
-
     let thread = std::thread::Builder::new()
         .name(format!("name-index-{}", favorite_id.as_simple()))
         .spawn(move || {
+            crate::logger::log(format!(
+                "name_index[{favorite_id}]: supervisor starting for {}",
+                root_cl.display()
+            ));
             supervisor_loop(
                 favorite_id,
                 root_cl,
@@ -145,17 +229,16 @@ pub fn spawn(
                 change_tx,
                 change_rx,
             );
-        })
-        .expect("failed to spawn name index supervisor");
+        })?;
 
-    NameIndexSupervisorHandle {
+    Ok(NameIndexSupervisorHandle {
         favorite_id,
         cmd_tx,
         cancel,
         stats,
         progress,
         thread: Some(thread),
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -213,7 +296,7 @@ fn supervisor_loop(
                             &stats,
                             &progress,
                         );
-                    }
+                                        }
                     Err(_) => break,
                 }
             }
@@ -236,7 +319,7 @@ fn supervisor_loop(
                                 &stats,
                                 &progress,
                             );
-                            continue;
+                                                    continue;
                         }
                         apply_single_change(
                             &favorite_root,
@@ -273,7 +356,11 @@ fn run_full_scan(
     progress: &ProgressReporter,
 ) {
     let is_initial = !stats.lock().unwrap().initial_scan_done;
-    stats.lock().unwrap().in_full_scan = true;
+    {
+        let mut s = stats.lock().unwrap();
+        s.in_full_scan = true;
+        s.last_full_scan = None;
+    }
     let t0 = Instant::now();
 
     crate::logger::log(format!(
@@ -302,6 +389,13 @@ fn run_full_scan(
     {
         let mut s = stats.lock().unwrap();
         s.in_full_scan = false;
+        s.last_full_scan = Some(if summary.cancelled {
+            NameFullScanOutcome::Cancelled
+        } else if summary.had_error {
+            NameFullScanOutcome::Failed
+        } else {
+            NameFullScanOutcome::Complete
+        });
         if is_initial {
             s.initial_scan_done = true;
             s.initial_entries_written = summary.entries_written;
@@ -627,10 +721,8 @@ fn refresh_parent_listing(
         return false;
     }
     // **upsert 直前 cancel race ガード** (Codex P2 第 17 ラウンド指摘):
-    // `apply_favorite_name_index_change` は `signal_stop()` 後に join を別スレッドへ逃がしてから
-    // `clear_for_favorite` するため、既にここに入っていた supervisor が cancel 後に
-    // upsert を投げると、clear で消した行が再投入される窓が残る。`name_bulk_indexer` 側の
-    // 同種ガード ([src/name_bulk_indexer.rs] の upsert 直前 cancel check) と整合させる。
+    // root owner は signal_stop → join → clear の順を守る。取消後の追加書込は避け、
+    // `name_bulk_indexer` 側の upsert 直前 cancel check と同じ停止点を維持する。
     // 小さい親フォルダ (< 64 件) では `collect_index_entries` 内でも cancel に当たらないので
     // ここで明示的に確認する。
     if cancel.load(Ordering::Relaxed) {

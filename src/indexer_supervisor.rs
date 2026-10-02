@@ -41,6 +41,14 @@ use uuid::Uuid;
 use crate::fts_index::FtsIndex;
 use crate::fts_meta::FtsMetaDb;
 use crate::indexer_progress::ProgressReporter;
+/// Filesystem observation and committed writes for the last Full; startup markers are separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullScanOutcome {
+    Complete,
+    Incomplete,
+    Failed,
+    Stopped,
+}
 use crate::ingest_worker::{IngestSession, IngestStats};
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_walker::{self, CandidateFile, ScanParams};
@@ -55,10 +63,16 @@ const WATCH_RETRY_DELAYS: [Duration; 5] = [
 ];
 const WATCH_HEALTH_POLL: Duration = Duration::from_secs(1);
 
+#[cfg(test)]
+thread_local! {
+    static FULL_SCAN_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Supervisor が UI に返す進捗・状態スナップショット。
 #[derive(Clone, Debug, Default)]
 pub struct SupervisorStats {
     pub initial_scan_done: bool,
+    pub last_full_outcome: Option<FullScanOutcome>,
     pub ingested_ok: usize,
     pub ingested_failed: usize,
     pub deleted: usize,
@@ -90,24 +104,35 @@ pub struct SupervisorStats {
 pub enum SupervisorCommand {
     /// 完全再スキャン (初期スキャンと同じ動作を手動トリガ)
     FullRescan,
+    MetadataFullRescan,
     /// 停止 (drop で代替可能、明示コマンドも用意)
     Stop,
 }
 
-/// Supervisor のハンドル。Drop で自動停止する。
-pub struct SupervisorHandle {
+/// Lightweight view; cloning or dropping it never owns the worker join.
+#[derive(Clone)]
+pub struct SupervisorControl {
     pub favorite_id: Uuid,
     cmd_tx: Sender<SupervisorCommand>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
     progress: ProgressReporter,
-    thread: Option<JoinHandle<()>>,
-    finished_rx: std::sync::mpsc::Receiver<()>,
+    similar_watch: Option<(
+        crate::similar_index::SimilarIndexNotifier,
+        crate::similar_index::SimilarWatchRegistration,
+    )>,
 }
 
-impl SupervisorHandle {
-    /// スナップショット取得 (短時間のロック)。`current_activity` は ProgressReporter
-    /// 側から最新値を読み出して合成する (snapshot 時点のライブ状態)。
+impl SupervisorControl {
+    #[cfg(test)]
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancel, &other.cancel)
+    }
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     pub fn snapshot_stats(&self) -> SupervisorStats {
         let mut s = self.stats.lock().unwrap().clone();
         s.current_activity = self.progress.snapshot();
@@ -115,99 +140,94 @@ impl SupervisorHandle {
         s
     }
 
-    /// 完全再スキャン要求 (インデックス管理ダイアログの「今すぐ再構築」で使用)。
-    ///
-    /// **非ブロッキング** (Codex round-10 Should-fix #1): `try_send` を使うため、
-    /// cmd_tx は bounded(4) だがキューがフルなら silently drop する。
-    /// これは長時間スキャン中に UI スレッドから連打された場合の UI freeze を防ぐため。
-    /// "coalescing" 挙動: 同じ FullRescan が既にキューにあるなら追加リクエストは冗長なので
-    /// 落としてよい (Supervisor は次のイベントで reconcile する)。
     pub fn request_full_rescan(&self) {
-        match self.cmd_tx.try_send(SupervisorCommand::FullRescan) {
-            Ok(_) => {}
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                // キューにもう溜まっている → no-op (既にスキャン要求が届く予定)
-                crate::logger::log(format!(
-                    "indexer[{}]: request_full_rescan coalesced (queue full)",
-                    self.favorite_id
-                ));
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                // supervisor は既に終了している
-            }
+        self.request(SupervisorCommand::FullRescan);
+    }
+    pub fn request_metadata_full_rescan(&self) {
+        self.request(SupervisorCommand::MetadataFullRescan);
+    }
+
+    fn request(&self, command: SupervisorCommand) {
+        if !self.cancel.load(Ordering::SeqCst) {
+            let _ = self.cmd_tx.try_send(command);
         }
     }
 
-    /// 明示停止。
+    pub fn signal_stop(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some((notifier, registration)) = &self.similar_watch {
+            notifier.revoke_watch(registration);
+        }
+        // Cancellation remains authoritative when the bounded notification queue is full.
+        let _ = self.cmd_tx.try_send(SupervisorCommand::Stop);
+    }
+}
+
+/// Sole worker owner; cloneable control views never join or stop on drop.
+pub struct SupervisorHandle {
+    control: SupervisorControl,
+    thread: Option<JoinHandle<()>>,
+    finished_rx: std::sync::mpsc::Receiver<()>,
+}
+
+impl std::ops::Deref for SupervisorHandle {
+    type Target = SupervisorControl;
+    fn deref(&self) -> &SupervisorControl {
+        &self.control
+    }
+}
+
+impl SupervisorHandle {
+    pub fn control(&self) -> SupervisorControl {
+        self.control.clone()
+    }
     pub fn stop(self) {
-        // drop で停止するので、ここでは明示 move させるだけ
         drop(self);
     }
 
-    /// cancel シグナルだけ送り、thread join は待たない。
-    ///
-    /// **IndexerManager 終了時のデッドロック回避**: dispatcher 化 (commit 30338a3) 以降は
-    /// supervisor が直接 writer lock を握ることはなく、各 sub-batch を
-    /// `dispatcher.batch(.., Background)` で submit して `rx.recv()` で完了待ちする
-    /// 構造になった。それでも次のシナリオで join が長引く可能性がある:
-    ///
-    /// - A: dispatcher.batch の `recv()` でブロック中 (Background sub-batch 処理待ち)
-    /// - dispatcher: A の sub-batch を処理中 (commit に数百 ms 〜 数秒)
-    /// - drop(A) が先に走ると: cancel_A=true でも A は recv ブロック中なので反応できず、
-    ///   sub-batch が終わるまで A の thread が止まらない (= sub-batch 1 個分の hang)
-    ///
-    /// 対策: `IndexerManager::drop` で全 supervisor に対して先に `signal_stop()` を
-    /// 呼び、全員の cancel を立てる。各 supervisor は次の `apply()` ループ先頭で
-    /// cancel を検出して新規 sub-batch の submit を止め、現在実行中の 1 個だけ
-    /// 待ってから exit する。同時に、dispatcher の Drop は shutdown フラグ + condvar
-    /// notify で起動中の sub-batch 完了直後にスレッドを終了させる。
-    pub fn signal_stop(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(SupervisorCommand::Stop);
+    /// Worker-side reconfiguration waits here after signal_stop.
+    pub fn join(mut self) {
+        self.signal_stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 
-    /// Stop and join only until the manager-wide shutdown deadline.
-    /// Returns false after detaching a worker that did not finish in time.
+    /// False means detached at the manager-wide shutdown deadline.
     pub fn join_until(mut self, deadline: Instant) -> bool {
         self.signal_stop();
         let Some(thread) = self.thread.take() else {
             return true;
         };
-        join_thread_until(thread, &self.finished_rx, deadline)
+        join_thread_until(thread, &self.finished_rx, deadline).is_some()
     }
 }
 
-fn join_thread_until(
-    thread: JoinHandle<()>,
+fn join_thread_until<T>(
+    thread: JoinHandle<T>,
     finished_rx: &std::sync::mpsc::Receiver<()>,
     deadline: Instant,
-) -> bool {
+) -> Option<std::thread::Result<T>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     match finished_rx.recv_timeout(remaining) {
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = thread.join();
-            true
-        }
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(thread.join()),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             drop(thread);
-            false
+            None
         }
     }
 }
 
 impl Drop for SupervisorHandle {
     fn drop(&mut self) {
-        // signal_stop() と同じ効果。idempotent なので二重呼びしてもよい
-        // (IndexerManager::drop が先に一括 signal_stop してから drop を回すため)。
-        self.cancel.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(SupervisorCommand::Stop);
         if let Some(t) = self.thread.take() {
+            self.control.signal_stop();
             let _ = t.join();
         }
     }
 }
 
-/// Supervisor を起動するための構築パラメータ。
+/// Supervisor construction parameters.
 pub struct SupervisorParams {
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,
@@ -257,17 +277,17 @@ pub fn spawn(
         .and_then(|notifier| notifier.begin_watch(fav_id, &root));
     let registration_on_spawn_failure = similar_registration.clone();
     let cancel_cl = Arc::clone(&cancel);
+    let similar_watch = similar_notifier.clone().zip(similar_registration.clone());
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
-
-    crate::logger::log(format!(
-        "indexer[{fav_id}]: supervisor starting for {}",
-        root.display()
-    ));
 
     let thread = std::thread::Builder::new()
         .name(format!("indexer-{}", fav_id.as_simple()))
         .spawn(move || {
+            crate::logger::log(format!(
+                "indexer[{fav_id}]: supervisor starting for {}",
+                root.display()
+            ));
             supervisor_loop(
                 fav_id,
                 root,
@@ -306,11 +326,14 @@ pub fn spawn(
     };
 
     SupervisorHandle {
-        favorite_id: fav_id,
-        cmd_tx,
-        cancel,
-        stats,
-        progress,
+        control: SupervisorControl {
+            favorite_id: fav_id,
+            cmd_tx,
+            cancel,
+            stats,
+            progress,
+            similar_watch,
+        },
         thread: Some(thread),
         finished_rx,
     }
@@ -348,7 +371,9 @@ fn supervisor_loop(
             if let (Some(notifier), Some(registration)) =
                 (similar_notifier.as_ref(), similar_registration.as_ref())
             {
-                notifier.watch_ready(registration);
+                if !cancel.load(Ordering::SeqCst) {
+                    notifier.watch_ready(registration);
+                }
             }
             Some(watcher)
         }
@@ -487,14 +512,14 @@ fn supervisor_loop(
             recv(cmd_rx) -> msg => {
                 match msg {
                     Ok(SupervisorCommand::Stop) => break,
-                    Ok(SupervisorCommand::FullRescan) => {
+                    Ok(command @ (SupervisorCommand::FullRescan | SupervisorCommand::MetadataFullRescan)) => {
                         if cancel.load(Ordering::SeqCst) {
                             break;
                         }
                         if let (Some(notifier), Some(registration)) =
                             (similar_notifier.as_ref(), similar_registration.as_ref())
                         {
-                            notifier.request_full(registration);
+                            if matches!(command, SupervisorCommand::FullRescan) { notifier.request_full(registration); }
                         }
                         if enable_metadata_index {
                             run_initial_scan(
@@ -624,8 +649,11 @@ fn run_initial_scan(
     progress: &ProgressReporter,
 ) {
     if cancel.load(Ordering::SeqCst) {
+        stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
         return;
     }
+    // Every early write/observation error remains Failed; only complete paths publish success.
+    stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Failed);
     // 所要時間計測: walker + ingest を含むフル scan の時間を拾う
     // (初期スキャンは supervisor 起動後 1 度のみ "initial"、以降の FullRescan /
     //  watcher overflow は last_scan_duration_ms のみ更新する)。
@@ -647,6 +675,13 @@ fn run_initial_scan(
         }
     }
     let _scan_guard = InFullScanGuard(stats);
+    #[cfg(test)]
+    FULL_SCAN_GATE.with(|gate| {
+        if let Some((started, release)) = gate.borrow_mut().take() {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+    });
 
     crate::logger::log(format!(
         "indexer[{favorite_id}]: {scan_kind} scan starting (walker phase)"
@@ -672,10 +707,14 @@ fn run_initial_scan(
         Ok(r) => r,
         Err(e) => {
             crate::logger::log(format!("indexer[{favorite_id}]: walker scan failed: {e}"));
+            if cancel.load(Ordering::SeqCst) {
+                stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
+            }
             return;
         }
     };
     if cancel.load(Ordering::SeqCst) {
+        stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
         return;
     }
     let walk_ms = t_walk.elapsed().as_millis() as u64;
@@ -741,6 +780,15 @@ fn run_initial_scan(
     update_stats(stats, &ingest_stats);
     {
         let mut s = stats.lock().unwrap();
+        s.last_full_outcome = Some(if ingest_stats.cancelled || cancel.load(Ordering::SeqCst) {
+            FullScanOutcome::Stopped
+        } else if ingest_stats.ingested_failed > 0 {
+            FullScanOutcome::Failed
+        } else if completeness == crate::search_walker::ObservationCompleteness::Complete {
+            FullScanOutcome::Complete
+        } else {
+            FullScanOutcome::Incomplete
+        });
         s.last_scan_duration_ms = Some(dur_ms);
         s.last_scan_total_scanned = total_scanned;
         s.last_scan_diag = diag;
@@ -1026,9 +1074,157 @@ mod tests {
             finished_tx.send(()).unwrap();
         });
 
-        assert!(!join_thread_until(worker, &finished_rx, Instant::now()));
+        assert!(join_thread_until(worker, &finished_rx, Instant::now()).is_none());
         release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn cancel_during_full_scan_clears_activity_and_reports_stopped() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("cancelled");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "untouched.jpg");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(SupervisorStats::default()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_cancel = cancel.clone();
+        let worker_stats = stats.clone();
+        let worker_meta = meta.clone();
+        let worker = std::thread::spawn(move || {
+            FULL_SCAN_GATE.with(|gate| *gate.borrow_mut() = Some((started_tx, release_rx)));
+            let id = Uuid::new_v4();
+            let session = IngestSession::new(id, root.clone(), &worker_meta, &fts);
+            run_initial_scan(
+                id,
+                &root,
+                &session,
+                &writer,
+                &sem,
+                &[],
+                worker_cancel,
+                &worker_stats,
+                &ProgressReporter::new(),
+            );
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(stats.lock().unwrap().in_full_scan);
+        cancel.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let stats = stats.lock().unwrap();
+        assert!(!stats.in_full_scan);
+        assert_eq!(stats.last_full_outcome, Some(FullScanOutcome::Stopped));
+        assert!(meta.list_path_owners().unwrap().is_empty());
+    }
+
+    #[test]
+    fn control_stop_is_nonblocking_when_notification_queue_is_full() {
+        let (tx, rx) = bounded(4);
+        for _ in 0..4 {
+            tx.try_send(SupervisorCommand::FullRescan).ok().unwrap();
+        }
+        let control = SupervisorControl {
+            favorite_id: Uuid::new_v4(),
+            cmd_tx: tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(Mutex::new(SupervisorStats::default())),
+            progress: ProgressReporter::new(),
+            similar_watch: None,
+        };
+        let worker_control = control.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_control.signal_stop();
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(control.cancel.load(Ordering::SeqCst));
+        assert_eq!(rx.len(), 4);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn full_outcome_distinguishes_incomplete_reload_and_sqlite_failures() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("full_outcome");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let id = Uuid::new_v4();
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let stats = Mutex::new(SupervisorStats::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = ProgressReporter::new();
+        writer.test_set_reload_failure(true);
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        writer.test_set_reload_failure(false);
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Complete)
+        );
+        let db = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_full BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'injected SQLite failure'); END;").unwrap();
+        write_image(&root, "second.jpg");
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        db.execute_batch("DROP TRIGGER fail_full;").unwrap();
+        let missing = tmp.path().join("missing");
+        let missing_session = IngestSession::new(id, missing.clone(), &meta, &fts);
+        run_initial_scan(
+            id,
+            &missing,
+            &missing_session,
+            &writer,
+            &sem,
+            &[],
+            cancel,
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Incomplete)
+        );
+        assert!(!stats.lock().unwrap().in_full_scan);
     }
 
     #[test]
