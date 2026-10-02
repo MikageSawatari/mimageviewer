@@ -14,6 +14,7 @@ pub(crate) struct Configuration {
     pub favorites: Vec<FavoriteEntry>,
     pub excluded: Vec<PathBuf>,
     pub ownership: MetadataOwnership,
+    pub similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
 }
 impl Configuration {
     pub fn new(favorites: &[FavoriteEntry], excluded: Vec<PathBuf>) -> Self {
@@ -21,14 +22,18 @@ impl Configuration {
             favorites: favorites.to_vec(),
             ownership: metadata_ownership(favorites, &excluded),
             excluded,
+            similar_passwords: None,
         }
     }
-    fn signature(&self, id: Uuid, similar: bool) -> Option<(String, bool, bool)> {
+    fn signature(&self, id: Uuid, similar: bool) -> Option<(String, bool, Option<String>)> {
         let f = self.favorites.iter().find(|f| f.id == id)?;
         Some((
             self.ownership.favorites[&id].root.clone(),
             self.ownership.favorites[&id].effective_metadata,
-            similar && f.auto_index_similar,
+            // Similar's persisted root key preserves a trailing separator. Re-register its
+            // watcher whenever that key changes, even if metadata owns the same path range.
+            (similar && f.auto_index_similar)
+                .then(|| crate::search_index_db::normalize_path(&f.path)),
         ))
     }
     fn exclusions(&self) -> HashSet<String> {
@@ -179,10 +184,18 @@ pub(crate) fn startup_cleanup(
     config: &Configuration,
 ) -> Result<HashSet<String>, String> {
     let started = Instant::now();
+    let query_started = Instant::now();
     let rows = stores.meta.list_path_owners().map_err(|e| e.to_string())?;
+    let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+    let owner_rows = rows.len();
+    let owner_rows_bytes = rows.capacity() * std::mem::size_of::<(String, String)>()
+        + rows
+            .iter()
+            .map(|(path, id)| path.capacity() + id.capacity())
+            .sum::<usize>();
     let mut roots = HashSet::new();
     let mut paths = Vec::new();
-    for (path, id, _) in rows {
+    for (path, id) in rows {
         let valid = Uuid::parse_str(&id)
             .ok()
             .and_then(|id| config.ownership.favorites.get(&id))
@@ -204,6 +217,9 @@ pub(crate) fn startup_cleanup(
         0,
         &[
             ("rows", count.into()),
+            ("owner_rows", owner_rows.into()),
+            ("query_ms", query_ms.into()),
+            ("owner_rows_bytes", owner_rows_bytes.into()),
             (
                 "ms",
                 started.elapsed().as_secs_f64().mul_add(1000.0, 0.0).into(),
@@ -287,6 +303,57 @@ fn run(stores: Stores, shared: Arc<Shared>) {
         shared.checkpoint(&next, "joined");
         if shared.state.lock().unwrap().shutdown.is_some() {
             break;
+        }
+        if let Some(similar) = stores.similar.as_ref() {
+            if let Some(passwords) = next
+                .similar_passwords
+                .clone()
+                .or_else(|| similar.password_snapshot())
+            {
+                similar.configure(
+                    &next.favorites,
+                    passwords,
+                    Some(Arc::clone(&stores.gate)),
+                    next.excluded.clone(),
+                );
+            }
+        }
+
+        let previous_exclusions = old.exclusions();
+        let newly_excluded = next
+            .exclusions()
+            .into_iter()
+            .filter(|root| {
+                !previous_exclusions
+                    .iter()
+                    .any(|old| crate::metadata_ownership::contains(old, root))
+            })
+            .flat_map(|root| {
+                crate::metadata_ownership::OwnedRange {
+                    root,
+                    exclusions: Vec::new(),
+                }
+                .sql_ranges()
+            })
+            .collect::<Vec<_>>();
+        if !newly_excluded.is_empty() {
+            let result = stores
+                .writer
+                .purge_path_ranges(
+                    newly_excluded.clone(),
+                    crate::fts_writer_dispatcher::WriterPriority::Background,
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    stores
+                        .meta
+                        .delete_path_ranges(&newly_excluded)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
+            if let Err(e) = result {
+                cleanup_failure(&stores, &shared, e);
+            }
         }
         for id in &group {
             let previous = old.ownership.favorites.get(id);
@@ -492,6 +559,85 @@ mod tests {
                 .controls
                 .contains_key(&last.id)
         );
+        *runtime.shared.gate.lock().unwrap() = None;
+        runtime.shutdown();
+    }
+    #[test]
+    fn coalesced_similar_off_on_keeps_unrelated_watch_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut f = favorite(1, tmp.path().join("f"), false);
+        f.auto_index_similar = true;
+        let mut other = favorite(2, tmp.path().join("other"), true);
+        for root in [&f.path, &other.path] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let similar = crate::similar_index::SimilarIndexManager::new(tmp.path().join("similar"));
+        let notifier = similar.notifier();
+        let mut stores = stores(tmp.path());
+        stores.similar = Some(notifier.clone());
+        let config = |favorites: &[FavoriteEntry]| {
+            let mut config = Configuration::new(favorites, Vec::new());
+            config.similar_passwords =
+                Some(crate::pdf_passwords::PdfPasswordStore::empty_for_test());
+            config
+        };
+        let mut runtime = Runtime::start(stores, config(&[f.clone(), other.clone()])).unwrap();
+        settled(&runtime);
+        initial_done(&runtime);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !notifier.watch_is_ready_for_test(f.id) {
+            assert!(
+                Instant::now() < deadline,
+                "initial similar watcher not Ready"
+            );
+            std::thread::yield_now();
+        }
+        let before = runtime.shared.state.lock().unwrap().controls[&f.id].clone();
+        let (entered, rx) = mpsc::channel();
+        let (release, wait) = crossbeam_channel::bounded(0);
+        let hold_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        *runtime.shared.gate.lock().unwrap() = Some(Arc::new(move |_, phase| {
+            if phase == "joined" && hold_once.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+            }
+        }));
+        other.auto_index_metadata = false;
+        runtime.submit(config(&[f.clone(), other.clone()]));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        let mut off = f.clone();
+        off.auto_index_similar = false;
+        runtime.submit(config(&[off, other.clone()]));
+        runtime.submit(config(&[f.clone(), other]));
+        assert!(
+            notifier.watch_is_ready_for_test(f.id),
+            "pending snapshots must not configure similar"
+        );
+        release.send(()).unwrap();
+        settled(&runtime);
+        assert!(before.same_instance(&runtime.shared.state.lock().unwrap().controls[&f.id]));
+        assert!(notifier.watch_is_ready_for_test(f.id));
+        let mut aliased = runtime.shared.state.lock().unwrap().favorites.clone();
+        let changed = aliased
+            .iter_mut()
+            .find(|favorite| favorite.id == f.id)
+            .unwrap();
+        changed.path.push("");
+        assert_ne!(
+            crate::search_index_db::normalize_path(&changed.path),
+            crate::search_index_db::normalize_path(&f.path)
+        );
+        runtime.submit(config(&aliased));
+        settled(&runtime);
+        assert!(!before.same_instance(&runtime.shared.state.lock().unwrap().controls[&f.id]));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !notifier.watch_is_ready_for_test(f.id) {
+            assert!(
+                Instant::now() < deadline,
+                "aliased similar watcher not Ready"
+            );
+            std::thread::yield_now();
+        }
         *runtime.shared.gate.lock().unwrap() = None;
         runtime.shutdown();
     }
@@ -755,6 +901,54 @@ mod tests {
         runtime.submit(Configuration::new(&[f], Vec::new()));
         settled(&runtime);
         assert!(!has_doc(&stores, &key));
+        runtime.shutdown();
+    }
+    #[test]
+    fn broadened_common_exclusion_removes_submitted_unapplied_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        let f = favorite(1, tmp.path().join("photos"), true);
+        let excluded = f.path.join("private");
+        std::fs::create_dir_all(&excluded).unwrap();
+        let mut runtime =
+            Runtime::start(stores.clone(), Configuration::new(&[f.clone()], Vec::new())).unwrap();
+        settled(&runtime);
+        initial_done(&runtime);
+        let key = crate::search_index_db::normalize_path(&excluded.join("ghost.jpg"));
+        let doc = crate::fts_index::IndexDoc {
+            path: key.clone(),
+            container: crate::fts_index::Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: f.id,
+            kind: crate::fts_index::IndexKind::Image,
+            mtime: 1,
+            file_size: 1,
+            norms: Default::default(),
+        };
+        let (submitted, release) = stores.writer.test_gate_next_batch();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let writer = Arc::clone(&stores.writer);
+        let pending = std::thread::spawn(move || {
+            writer.batch_cancellable(
+                vec![doc],
+                Vec::new(),
+                true,
+                true,
+                crate::fts_writer_dispatcher::WriterPriority::Background,
+                &worker_cancel,
+            )
+        });
+        submitted.recv_timeout(Duration::from_secs(60)).unwrap();
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        release.send(()).unwrap();
+        assert!(!pending.join().unwrap().unwrap());
+        assert!(stores.meta.get(&key).unwrap().is_none());
+        runtime.submit(Configuration::new(&[f], vec![excluded]));
+        settled(&runtime);
+        initial_done(&runtime);
+        assert!(!has_doc(&stores, &key));
+        assert!(stores.meta.get(&key).unwrap().is_none());
         runtime.shutdown();
     }
     #[test]

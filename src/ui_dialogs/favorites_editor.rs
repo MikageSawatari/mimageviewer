@@ -44,7 +44,7 @@ pub(crate) struct IndexDiskSizes {
 /// `COUNT(*)` を走らせないため。close 時に破棄。
 ///
 /// - `name_counts[fav_id]`: search_index.db の当 favorite_root 配下のエントリ数
-/// - `meta_counts[fav_id]`: fts_meta.db の当 favorite_id × status=Ok の件数
+/// - `meta_counts[fav_id]`: 当 favorite 配下を所有する ID 集合の status=Ok 件数
 /// - `name_total` / `meta_total`: 上記の合計 (索引サイズ表示用の総件数)
 #[derive(Default, Clone)]
 pub(crate) struct IndexFileCounts {
@@ -57,6 +57,106 @@ pub(crate) struct IndexFileCounts {
 #[cfg(test)]
 mod ownership_count_tests {
     use super::*;
+
+    fn progress_favorite(id: u128, path: &str) -> crate::settings::FavoriteEntry {
+        crate::settings::FavoriteEntry {
+            id: uuid::Uuid::from_u128(id),
+            name: String::new(),
+            path: path.into(),
+            auto_index_metadata: true,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        }
+    }
+
+    #[test]
+    fn metadata_progress_non_owner_tracks_owner_scan_and_completion() {
+        let favorites = vec![
+            progress_favorite(1, "c:/photos"),
+            progress_favorite(2, "C:/PHOTOS"),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut stats = std::collections::HashMap::new();
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[1].id, &stats),
+            None
+        );
+        stats.insert(
+            favorites[0].id,
+            SupervisorStats {
+                in_full_scan: true,
+                ..SupervisorStats::default()
+            },
+        );
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[1].id, &stats),
+            Some((true, false))
+        );
+        stats.insert(
+            favorites[0].id,
+            SupervisorStats {
+                initial_scan_done: true,
+                ..SupervisorStats::default()
+            },
+        );
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[1].id, &stats),
+            Some((false, true))
+        );
+    }
+
+    #[test]
+    fn metadata_progress_outer_waits_for_all_owners_and_ignores_other_roots() {
+        let favorites = vec![
+            progress_favorite(1, "c:/photos"),
+            progress_favorite(2, "c:/photos/inner"),
+            progress_favorite(3, "c:/other"),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut stats = std::collections::HashMap::from([
+            (
+                favorites[0].id,
+                SupervisorStats {
+                    initial_scan_done: true,
+                    ..SupervisorStats::default()
+                },
+            ),
+            (
+                favorites[2].id,
+                SupervisorStats {
+                    in_full_scan: true,
+                    ..SupervisorStats::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            None
+        );
+        stats.insert(favorites[1].id, SupervisorStats::default());
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            Some((false, false))
+        );
+        stats.get_mut(&favorites[1].id).unwrap().in_full_scan = true;
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            Some((true, false))
+        );
+        stats.insert(
+            favorites[1].id,
+            SupervisorStats {
+                initial_scan_done: true,
+                ..SupervisorStats::default()
+            },
+        );
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            Some((false, true))
+        );
+    }
+
     #[test]
     fn nested_and_duplicate_favorites_sum_filter_set_without_double_total() {
         let tmp = tempfile::tempdir().unwrap();
@@ -128,6 +228,29 @@ pub(crate) fn collect_counts(
     }
     out.meta_total = meta_map.values().sum();
     out
+}
+
+/// 件数と同じ所有者集合で進捗を見る。同 root の非所有者は自分の supervisor を持たない。
+fn metadata_progress_flags(
+    ownership: &crate::metadata_ownership::MetadataOwnership,
+    favorite_id: uuid::Uuid,
+    stats: &std::collections::HashMap<uuid::Uuid, SupervisorStats>,
+) -> Option<(bool, bool)> {
+    let owners = ownership.filter_set(favorite_id);
+    if owners.is_empty() {
+        return None;
+    }
+    let in_full_scan = owners
+        .iter()
+        .any(|id| stats.get(id).is_some_and(|s| s.in_full_scan));
+    let initial_scan_done = owners
+        .iter()
+        .all(|id| stats.get(id).is_some_and(|s| s.initial_scan_done));
+    if in_full_scan || owners.iter().all(|id| stats.contains_key(id)) {
+        Some((in_full_scan, initial_scan_done))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
@@ -342,6 +465,10 @@ impl App {
             .into_iter()
             .map(|v| (v.favorite_id, v.stats))
             .collect();
+        let metadata_ownership = crate::metadata_ownership::metadata_ownership(
+            &self.settings.favorites,
+            &[self.settings.books_root_path()],
+        );
         // 名前索引側の stats も同様に集める (名前索引 supervisor は App 直下管理)
         let name_stats_by_id: std::collections::HashMap<
             uuid::Uuid,
@@ -704,9 +831,11 @@ impl App {
                                             draw_state_inline(
                                                 ui,
                                                 meta_on,
-                                                stats_by_id
-                                                    .get(&fav_id)
-                                                    .map(|s| (s.in_full_scan, s.initial_scan_done)),
+                                                metadata_progress_flags(
+                                                    &metadata_ownership,
+                                                    fav_id,
+                                                    &stats_by_id,
+                                                ),
                                                 row_counts[i].1,
                                             );
                                         });

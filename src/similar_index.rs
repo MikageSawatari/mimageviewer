@@ -609,28 +609,8 @@ impl SimilarIndexManager {
         activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
         excluded_roots: Vec<PathBuf>,
     ) {
-        let roots: Vec<ConfiguredRoot> = favorites
-            .iter()
-            .filter(|favorite| favorite.auto_index_similar)
-            .map(|favorite| ConfiguredRoot {
-                favorite_id: favorite.id,
-                key: crate::search_index_db::normalize_path(&favorite.path),
-                path: favorite.path.clone(),
-            })
-            .collect();
-        let should_load = !roots.is_empty();
-        self.scheduler
-            .configure(roots, pdf_passwords, activity_gate, excluded_roots);
-        if should_load {
-            start_memory_load(
-                &self.data_dir,
-                &self.memory,
-                &self.memory_epoch,
-                &self.item_query,
-                MemoryLoadTrigger::Configure,
-                Some(Arc::downgrade(&self.scheduler)),
-            );
-        }
+        self.notifier()
+            .configure(favorites, pdf_passwords, activity_gate, excluded_roots);
     }
 
     /// メタデータ索引 supervisor の watcher から再照合を要求する軽量 notifier。
@@ -2241,6 +2221,64 @@ impl ArrayRefreshNotifier {
 }
 
 impl SimilarIndexNotifier {
+    /// Apply the committed shared-watcher snapshot, including its credential revision.
+    pub(crate) fn configure(
+        &self,
+        favorites: &[crate::settings::FavoriteEntry],
+        pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+        activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+        excluded_roots: Vec<PathBuf>,
+    ) {
+        let Some(scheduler) = self.scheduler.upgrade() else {
+            return;
+        };
+        let roots: Vec<ConfiguredRoot> = favorites
+            .iter()
+            .filter(|favorite| favorite.auto_index_similar)
+            .map(|favorite| ConfiguredRoot {
+                favorite_id: favorite.id,
+                key: crate::search_index_db::normalize_path(&favorite.path),
+                path: favorite.path.clone(),
+            })
+            .collect();
+        let should_load = !roots.is_empty();
+        scheduler.configure(roots, pdf_passwords, activity_gate, excluded_roots);
+        if should_load {
+            start_memory_load(
+                &scheduler.data_dir,
+                &scheduler.memory,
+                &scheduler.memory_epoch,
+                &scheduler.item_query,
+                MemoryLoadTrigger::Configure,
+                Some(Arc::downgrade(&scheduler)),
+            );
+        }
+    }
+
+    pub(crate) fn password_snapshot(&self) -> Option<crate::pdf_passwords::PdfPasswordStore> {
+        let scheduler = self.scheduler.upgrade()?;
+        let state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .desired_config
+            .as_ref()
+            .map(|config| config.pdf_passwords.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watch_is_ready_for_test(&self, id: Uuid) -> bool {
+        self.scheduler.upgrade().is_some_and(|scheduler| {
+            scheduler
+                .state
+                .lock()
+                .unwrap()
+                .watch_by_root
+                .get(&id)
+                .is_some_and(|watch| {
+                    watch.registration_generation != 0 && watch.health == WatchHealth::Ready
+                })
+        })
+    }
+
     /// Reserve one watcher generation before its thread starts.  Every terminal and event call
     /// must carry the returned token; a late supervisor can then never mutate a reconfigured root.
     pub fn begin_watch(&self, favorite_id: Uuid, root: &Path) -> Option<SimilarWatchRegistration> {

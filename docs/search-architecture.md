@@ -230,10 +230,16 @@ metadata の所有範囲は `metadata_ownership` が純関数で決める。最�
 構成変更は `metadata_reconfiguration` worker が旧新 root の推移的な重複グループを
 cancel → join → cleanup → spawn の順に処理する。処理中 snapshot は固定し、
 後続要求は最新の1つに集約する。ID の OFF・削除・root 変更は Tantivy ID-term purge、
-それ以外は新所有範囲外の path cleanup を行う。cleanup は旧 ingest と同じ Background
+それ以外は新所有範囲外の path cleanup を行う。共通除外の拡大は raw STRING `path` の
+範囲 query で Tantivy-only 文書も削除し、commit/reload の後に同じ SQLite 範囲を削除する。
+similar の構成も同じ固定 snapshot から worker が反映し、App の未確定要求を先行反映しない。
+cleanup は旧 ingest と同じ Background
 FIFO に置き、commit/reload 成功後に SQLite を削除する。失敗時は再試行せず既存
 rebuild pending を立てて通知し、次回起動で `files` と Tantivy の両方を作り直す。
 起動時 cleanup は S3 の印に関わらず Full が必要な現所有 root 集合を返す。
+起動時の owner 照会は `path, favorite_id` の2列だけを covering index で読む。
+perf には照会時間・取得行数と、Vec/String の capacity から算出した取得バッファの
+推定確保バイト数を出す (プロセス全体のメモリ量ではない)。
 
 #### 終了応答性と有界 shutdown
 

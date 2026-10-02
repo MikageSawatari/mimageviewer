@@ -25600,7 +25600,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// 別バージョン索引フラグの変更を、対象 snapshot と共有 watcher の両方へ即時反映する。
+    /// 別バージョン索引フラグの変更を、共有 watcher と同じ構成 snapshot に提出する。
     /// OFF 時の削除も同じ worker へ渡し、後続の全走査の完走には依存させない。
     pub(crate) fn apply_favorite_similar_index_change(
         &mut self,
@@ -25615,16 +25615,6 @@ impl App {
     pub(crate) fn sync_shared_favorite_indexers(&mut self) {
         self.sync_name_index_supervisors();
         self.refresh_similar_index_password_config();
-        if let Some(manager) = self.indexer_manager.as_mut() {
-            manager.sync_with_configuration(
-                &self.settings.favorites,
-                vec![self.settings.books_root_path()],
-            );
-        } else if self.startup_done {
-            if let Some(similar_index) = self.similar_index.as_ref() {
-                similar_index.notifier().finish_watch_bootstrap();
-            }
-        }
     }
 
     pub(crate) fn similar_index_progress(&self) -> crate::similar_index::IndexProgress {
@@ -25645,14 +25635,26 @@ impl App {
         }
     }
 
-    fn refresh_similar_index_password_config(&self) {
-        if let Some(similar_index) = self.similar_index.as_ref() {
-            similar_index.configure(
+    fn refresh_similar_index_password_config(&mut self) {
+        let excluded = vec![self.settings.books_root_path()];
+        if let Some(manager) = self.indexer_manager.as_mut() {
+            manager.sync_with_configuration_and_passwords(
                 &self.settings.favorites,
+                excluded,
                 self.pdf_passwords.clone(),
-                Some(Arc::clone(&self.activity_gate)),
-                vec![self.settings.books_root_path()],
             );
+        } else if self.startup_done {
+            // With no shared watcher manager, close the bootstrap barrier explicitly.
+            if let Some(similar_index) = self.similar_index.as_ref() {
+                let notifier = similar_index.notifier();
+                notifier.configure(
+                    &self.settings.favorites,
+                    self.pdf_passwords.clone(),
+                    Some(Arc::clone(&self.activity_gate)),
+                    excluded,
+                );
+                notifier.finish_watch_bootstrap();
+            }
         }
     }
 
@@ -25738,14 +25740,7 @@ impl App {
         }
         let favorites = self.settings.favorites.clone();
         let excluded_roots = vec![self.settings.books_root_path()];
-        if let Some(similar_index) = self.similar_index.as_ref() {
-            similar_index.configure(
-                &favorites,
-                self.pdf_passwords.clone(),
-                Some(Arc::clone(&self.activity_gate)),
-                excluded_roots.clone(),
-            );
-        }
+        let similar_passwords = self.pdf_passwords.clone();
         let similar_notifier = self
             .similar_index
             .as_ref()
@@ -25765,9 +25760,10 @@ impl App {
                     let outcome = crate::indexer_manager::IndexerManager::new(
                         &favorites,
                         speed,
-                        activity_gate,
-                        excluded_roots,
+                        Arc::clone(&activity_gate),
+                        excluded_roots.clone(),
                         similar_notifier.clone(),
+                        Some(similar_passwords.clone()),
                         Some(hook),
                     );
                     if !matches!(
@@ -25775,6 +25771,12 @@ impl App {
                         crate::indexer_manager::StartupInitOutcome::Ready(_)
                     ) {
                         if let Some(similar_notifier) = similar_notifier.as_ref() {
+                            similar_notifier.configure(
+                                &favorites,
+                                similar_passwords,
+                                Some(activity_gate),
+                                excluded_roots,
+                            );
                             similar_notifier.finish_watch_bootstrap();
                         }
                     }
@@ -25796,6 +25798,7 @@ impl App {
                 self.similar_index
                     .as_ref()
                     .map(crate::similar_index::SimilarIndexManager::notifier),
+                Some(self.pdf_passwords.clone()),
                 Some(hook),
             );
             self.indexer_manager = match outcome {
@@ -25813,6 +25816,7 @@ impl App {
             }
             self.startup_done = true;
             self.housekeeping_armed = true;
+            self.sync_shared_favorite_indexers();
             return;
         }
         self.startup_init = Some(StartupInitPending { rx, started_at });
@@ -26439,6 +26443,7 @@ impl App {
                 self.startup_init = None;
                 self.startup_done = true;
                 self.housekeeping_armed = true;
+                self.sync_shared_favorite_indexers();
                 if let Ok(mut p) = self.startup_progress.lock() {
                     *p = "起動完了".to_string();
                 }
@@ -26450,6 +26455,7 @@ impl App {
                 self.indexer_manager = None;
                 self.startup_init = None;
                 self.startup_done = true;
+                self.refresh_similar_index_password_config();
                 if let Some(similar_index) = self.similar_index.as_ref() {
                     // The worker normally closes the watch-registration barrier when
                     // `IndexerManager::new` returns `None`. A panic can disconnect the channel

@@ -295,6 +295,7 @@ impl IndexerManager {
         activity_gate: Arc<ActivityGate>,
         excluded_roots: Vec<std::path::PathBuf>,
         similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
+        similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
         progress: Option<StartupProgressHook>,
     ) -> StartupInitOutcome {
         let data_dir = crate::data_dir::get();
@@ -318,6 +319,7 @@ impl IndexerManager {
             activity_gate,
             excluded_roots,
             similar_notifier,
+            similar_passwords,
             progress,
         ) {
             Some(manager) => StartupInitOutcome::Ready(manager),
@@ -352,6 +354,7 @@ impl IndexerManager {
             excluded_roots,
             None,
             None,
+            None,
         )
     }
 
@@ -364,6 +367,7 @@ impl IndexerManager {
         activity_gate: Arc<ActivityGate>,
         excluded_roots: Vec<std::path::PathBuf>,
         similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
+        similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
@@ -405,7 +409,14 @@ impl IndexerManager {
                 gate: Arc::clone(&activity_gate),
                 similar: similar_notifier.clone(),
             },
-            crate::metadata_reconfiguration::Configuration::new(favorites, excluded_roots.clone()),
+            {
+                let mut config = crate::metadata_reconfiguration::Configuration::new(
+                    favorites,
+                    excluded_roots.clone(),
+                );
+                config.similar_passwords = similar_passwords;
+                config
+            },
         )
         .ok()?;
         let mgr = IndexerManager {
@@ -453,6 +464,17 @@ impl IndexerManager {
             .submit(crate::metadata_reconfiguration::Configuration::new(
                 favorites, excluded,
             ));
+    }
+    pub fn sync_with_configuration_and_passwords(
+        &mut self,
+        favorites: &[FavoriteEntry],
+        excluded: Vec<std::path::PathBuf>,
+        passwords: crate::pdf_passwords::PdfPasswordStore,
+    ) {
+        self.excluded_roots = excluded.clone();
+        let mut config = crate::metadata_reconfiguration::Configuration::new(favorites, excluded);
+        config.similar_passwords = Some(passwords);
+        self.runtime.submit(config);
     }
     pub fn all_stats(&self) -> Vec<SupervisorStatsView> {
         let view = self.runtime.shared.state.lock().unwrap();

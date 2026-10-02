@@ -37,7 +37,7 @@ use crate::indexer_manager::SearchHandle;
 /// 変更時は `reset_for_new_query` と同じ経路で検索を再実行する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSearchFilters {
-    /// None = 登録済み全お気に入りを対象。Some(id) なら単一 favorite に限定。
+    /// None = 登録済み全お気に入りを対象。Some(id) なら当 favorite 配下に限定。
     pub favorite: Option<Uuid>,
     /// None = 全タイプ (画像/PDF/動画/音声)。Some(k) で単一種別に限定。
     pub kind: Option<IndexKind>,
@@ -55,6 +55,25 @@ impl Default for GlobalSearchFilters {
             target: SearchTarget::All,
             or_mode: false,
         }
+    }
+}
+
+fn resolve_favorite_filter(
+    selected: &mut Option<Uuid>,
+    favorites: &[crate::settings::FavoriteEntry],
+    ownership: &crate::metadata_ownership::MetadataOwnership,
+) -> Vec<Uuid> {
+    // 選択できるかは保存フラグで判定する。同 root の非所有者も ON なら選択を保つ。
+    if selected.is_some_and(|id| {
+        !favorites
+            .iter()
+            .any(|favorite| favorite.id == id && favorite.auto_index_metadata)
+    }) {
+        *selected = None;
+    }
+    match *selected {
+        Some(id) => ownership.filter_set(id),
+        None => ownership.effective_ids(),
     }
 }
 
@@ -2243,12 +2262,11 @@ impl App {
             &self.settings.favorites,
             &[self.settings.books_root_path()],
         );
-        let all_favs = ownership.effective_ids();
-        if let Some(id) = self.global_search.filters.favorite {
-            if ownership.filter_set(id).is_empty() {
-                self.global_search.filters.favorite = None;
-            }
-        }
+        let favs = resolve_favorite_filter(
+            &mut self.global_search.filters.favorite,
+            &self.settings.favorites,
+            &ownership,
+        );
 
         let Some(mgr) = self.indexer_manager.as_ref() else {
             self.global_search.reject_message =
@@ -2258,10 +2276,6 @@ impl App {
             return;
         };
 
-        let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
-            Some(id) => ownership.filter_set(id),
-            None => all_favs,
-        };
         let scope = crate::global_search::SearchScope {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
@@ -3631,6 +3645,62 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    fn favorite_filter_fixture(id: u128, path: &str, on: bool) -> crate::settings::FavoriteEntry {
+        crate::settings::FavoriteEntry {
+            id: Uuid::from_u128(id),
+            name: String::new(),
+            path: path.into(),
+            auto_index_metadata: on,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        }
+    }
+
+    #[test]
+    fn favorite_filter_clears_off_outer_even_with_enabled_child() {
+        let favorites = vec![
+            favorite_filter_fixture(1, "c:/photos", false),
+            favorite_filter_fixture(2, "c:/photos/inner", true),
+            favorite_filter_fixture(3, "c:/other", true),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut selected = Some(favorites[0].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[1].id, favorites[2].id]
+        );
+        assert_eq!(selected, None);
+        selected = Some(favorites[1].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[1].id]
+        );
+        assert_eq!(selected, Some(favorites[1].id));
+    }
+
+    #[test]
+    fn favorite_filter_keeps_on_non_owner_and_clears_deleted_selection() {
+        let favorites = vec![
+            favorite_filter_fixture(1, "c:/photos", true),
+            favorite_filter_fixture(2, "C:/PHOTOS", true),
+            favorite_filter_fixture(3, "c:/other", true),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut selected = Some(favorites[1].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[0].id]
+        );
+        assert_eq!(selected, Some(favorites[1].id));
+        selected = Some(Uuid::from_u128(99));
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[0].id, favorites[2].id]
+        );
+        assert_eq!(selected, None);
+    }
 
     #[test]
     fn search_membership_keeps_survivor_order_and_appends_candidates() {

@@ -144,12 +144,17 @@
        ID の term で消すので、停止で SQLite に載らなかった Tantivy だけの文書も消える。
      - それ以外のグループの UUID: SQLite で「その UUID の行のうち新しい所有範囲の外」を列挙し、
        パスごとに Tantivy から消してから SQLite から消す (共通除外を広げた場合など)。
+     - 共通除外の拡大: 新たに除外する prefix の raw STRING `path` を範囲 query で
+       Tantivy から消して commit / reload し、同じ範囲を SQLite から消す。
+       SQLite に未反映の文書も対象にする。起動時の最初の snapshot も現在の共通除外を適用する。
   4. 新しい構成でグループの supervisor を作る (初回走査は §6 の規則どおり)。
 - 今の「停止を待たずに作る」「OFF の purge を停止前に行う」([indexer_manager.rs:553](../src/indexer_manager.rs)、
   [app.rs:26826](../src/app.rs)) はこの経路に置き換えて無くす。
-- App 側の呼び出し順は `similar.configure` → `sync_with_favorites` に揃える
-  ([app.rs:25709](../src/app.rs) の順。お気に入りの編集画面の呼び出し順
-  [favorites_editor.rs:1050](../src/ui_dialogs/favorites_editor.rs) も揃える)。
+- App はお気に入りと PDF パスワードを同じ構成 snapshot として manager に提出する。
+  manager worker が固定した snapshot で similar の構成を反映し、その後に supervisor を作る。
+  App が待ち行列の各変更を先に similar へ反映しない (OFF→ON の集約で、稼働中 watch の
+  registration を失わないため)。manager が利用不能な場合だけ、既存の degraded bootstrap
+  として similar を直接構成する。お気に入りの編集・パスワード変更・起動時もこの経路に揃える。
 - 起動時は前回の構成が手元に無いので、起動時 reconciliation で「どの実効 metadata お気に入りの
   所有範囲にも入らない行」と「UUID の所有範囲の外にある行」を、手順 3 の後者と同じ方法で消す。
   この掃除で行を消したパスがあれば、そのパスの **今の所有者の root は印に関わらず全走査** する
@@ -186,8 +191,10 @@
 - 停止は今の cancel のまま (書き込みを済ませてから止まる特別な停止は作らない)。停止の瞬間に
   処理中だったバッチは、Tantivy だけに反映されて SQLite に載らないことがある (今もある、
   search-architecture §4.1 終了応答性)。FS にあるファイルは範囲の持ち主の走査が取り込み直し、
-  手順 3 の ID term 削除はこの文書も消す。残るのは「停止と同じ時期にファイルも消えた」場合だけで、
-  扱いを変えない。
+  手順 3 の ID term 削除はこの文書も消す。ただし FS に残っていても所有範囲外へ移る
+  Tantivy-only 文書は walker が観測せず、SQLite のパス列挙でも消せない。共通除外の拡大では
+  上の path 範囲 query で削除する。所有範囲内の文書が SQLite に未反映のまま FS からも
+  消えた場合の残存は従来どおりで、扱いを変えない。
 - 第 5〜6 版にあった「書き込みを済ませてから止める停止 (Drain) と、その typed な結果」
   「掃除失敗時の自動再試行」「ID 削除前の SQLite 無効化」は、上の割り切りで不要になったので削除した。
 
@@ -662,3 +669,78 @@ S2 の残項目はない。S3 の起動省略の印と§6の機能は未着手�
 
 Git の書き込み・stash・コミットは行っていない。残り S2 専用のコミット文を
 `target/startup-scan-s2/commit-message.txt` に上書きし、指定の Co-Authored-By を末尾にした。
+
+### 11.3 S2 独立レビューの5件修正
+
+対象は受け入れコミット `3bd690d55` への ACCEPT WITH CHANGES の5件。
+範囲と稀な失敗時の方針は第7版のまま。
+
+- similar の構成 owner を metadata 再構成 worker へ移した。App はお気に入り・共通除外・
+  immutable な PDF password store clone を1つの snapshot として提出する。worker が
+  その固定 snapshot を similar へ反映し、新しい supervisor が watch を登録する。
+  待機中の OFF→ON が集約されても、触らないお気に入りの Ready を失わない。
+  起動中の変更は manager の採用時に最新 snapshot を再提出する。metadata manager が
+  利用不能なときだけ、既存の degraded bootstrap を維持する直接 configure を残した。
+- 独立レビューで同型の root 表記変更も確認した。metadata の所有範囲の root は末尾区切りを
+  除くが、similar の既存保存キーは区切りを保持するため、similar が有効な構成比較には
+  そのキーも含めた。末尾区切りだけの変更でも watch を再登録し、永続キーは変更しない。
+- Tantivy 0.26.1 の `IndexWriter::delete_query` と raw STRING path の `RangeQuery` が
+  inverted index の全一致 term を対象にできることをローカル source と回帰で確認した。
+  新しい共通除外 prefix の root 自身・子孫を半開区間で削除し、commit / reload の成功後に
+  同じ SQLite 範囲を transaction で削除する。旧 submitted batch を追い越さない
+  Background FIFO を使い、SQLite に未反映の文書も消す。通常の本棚設定変更では rebuild
+  を強制しない。範囲 cleanup の書き込み失敗は既存の marker・log・通知へ渡し、retry はない。
+- Ctrl+G は選択 UUID の存在と保存 metadata ON を先に検証し、OFF・削除なら選択解除する。
+  子だけが ON でも外側の OFF を維持しない。同じ root の非所有者は保存 ON なら選択可能。
+- metadata の編集画面進捗も、件数と同じ ownership filter set で集約する。いずれかの
+  owner が Full 中なら作成中、全 owner の初期走査が済めば監視中とする。未登録 owner は
+  起動待ちとして扱い、別 root の進捗は混ぜない。
+- `list_path_owners` は path / favorite_id の2列だけにし、実際の SELECT の EXPLAIN が
+  `COVERING INDEX idx_files_fav_path` になることをテストで固定した。
+  `metadata_out_of_range_cleanup` perf event に `owner_rows`・`query_ms`・
+  `owner_rows_bytes` を追加。bytes は Vec の capacity × tuple サイズと全 String の
+  capacity の合計という取得バッファの推定確保量で、プロセス全体や SQLite cache の量ではない。
+
+追加回帰は10件 (runtime2、writer2、fts_meta2、Ctrl+G2、編集進捗2)。
+runtime の OFF→ON 集約・root alias 変更、submitted-but-not-applied batch と prefix cleanup
+の競合地点は gate / channel で固定した。独立 source review の追加 alias 指摘も修正済みで、
+未修正の必須指摘は0。以下へ最終検証結果を記録する。
+
+自動検証は合計144件成功、失敗・ignore 0。`MSBUILDDISABLENODEREUSE=1`、
+Cargo は `-j 1` を指定。lib コマンドは
+`cargo test -j 1 -p mimageviewer --lib <filter>`。
+
+| filter | 成功件数 |
+| --- | ---: |
+| `metadata_reconfiguration` | 11 |
+| `fts_meta` | 21 |
+| `fts_writer_dispatcher` | 10 |
+| `favorite_filter_` | 2 |
+| `ownership_count_tests` | 3 |
+| `indexer_manager` | 11 |
+| `indexer_supervisor` | 14 |
+| `ingest_worker` | 14 |
+| `similar_index::tests::incremental_reconcile` | 25 |
+| `similar_index::tests::revoked_watch` | 1 |
+| `similar_index::tests::stopped_watch` | 1 |
+| `preferences_books_root` | 1 |
+| `preferences_unchanged_effective_books_root` | 1 |
+
+| integration コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j 1 -p mimageviewer --test search_metadata_e2e` | 14 |
+| `cargo test -j 1 -p mimageviewer --test search_name_e2e` | 15 |
+
+修正後の `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+全 workspace の `cargo fmt` / `cargo fmt --check`、`git diff --check` は成功し、
+`python scripts/check_ui_glyphs.py` は問題0。
+ログは `target/startup-scan-s2/review-fixes-*.log` に保存。
+全 workspace suite・アプリ起動・実データの性能計測は行っていない。
+
+確認用 build は `MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定し、
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が exit 0。
+core・remote service・EPUB worker と CRT 検査 (`runtime=4 pe=3`) が成功した。
+core の最適化コンパイルは10分29秒。ログは
+`target/startup-scan-s2/review-fixes-build-dev.log`。成果物は起動していない。
+レビュー修正専用の `target/startup-scan-s2/commit-message.txt` を指定署名付きで上書きし、
+Git の書き込み・stash・コミットは行っていない。

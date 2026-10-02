@@ -110,6 +110,52 @@ mod ownership_tests {
         let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT path FROM files WHERE favorite_id = ?1 AND NOT(path >= ?2 AND path < ?3)",params!["id","c:/a/","c:/a0"],|r| r.get(3)).unwrap();
         assert!(plan.contains("COVERING INDEX idx_files_fav_path"), "{plan}");
     }
+
+    #[test]
+    fn startup_owner_query_is_covered_without_reading_favorite_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        db.upsert_meta_ok("c:/a/x.jpg", id, Path::new("c:/a"), IndexKind::Image, 1, 1)
+            .unwrap();
+        assert_eq!(
+            db.list_path_owners().unwrap(),
+            vec![("c:/a/x.jpg".into(), id.to_string())]
+        );
+        let conn = db.conn.lock().unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT path, favorite_id FROM files",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("COVERING INDEX idx_files_fav_path"), "{plan}");
+    }
+
+    #[test]
+    fn path_range_cleanup_removes_root_and_descendants_without_prefix_neighbor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        for path in [
+            "c:/a/books",
+            "c:/a/books/x.jpg",
+            "c:/a/bookshelf/y.jpg",
+            "c:/a/z.jpg",
+        ] {
+            db.upsert_meta_ok(path, id, Path::new("c:/a"), IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: "c:/a/books".into(),
+            exclusions: Vec::new(),
+        }
+        .sql_ranges();
+        assert_eq!(db.delete_path_ranges(&ranges).unwrap(), 2);
+        assert!(db.get("c:/a/bookshelf/y.jpg").unwrap().is_some());
+        assert!(db.get("c:/a/z.jpg").unwrap().is_some());
+    }
 }
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
@@ -484,11 +530,30 @@ impl FtsMetaDb {
     }
 
     /// Startup includes orphan/invalid UUIDs, not just IDs still present in settings.
-    pub fn list_path_owners(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+    pub fn list_path_owners(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root FROM files")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        // EXPLAIN は idx_files_fav_path の COVERING INDEX scan (下の回帰テストで固定)。
+        let mut stmt = conn.prepare("SELECT path, favorite_id FROM files")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect()
+    }
+
+    /// Tantivy の範囲削除・commit・reload 成功後に、同じ半開区間の行を消す。
+    pub fn delete_path_ranges(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted = 0;
+        for range in ranges {
+            deleted += tx.execute(
+                "DELETE FROM files WHERE path >= ?1 AND path < ?2",
+                params![range.start, range.end],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// 指定 path 群の行を物理削除する。Tantivy 側 delete 完了後の cleanup として呼ぶ。

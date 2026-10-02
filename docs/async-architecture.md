@@ -683,6 +683,8 @@ walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete �
 最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
 を唯一所有する。Shutdown は停止中の control にも到達し、spawn 採用と同じ短時間 lock
 で直列化する。4秒の期限には worker 自身と worker 所有の handle を含む。
+similar のお気に入り・PDF password 構成も、この worker が受理した固定 snapshot で反映する。
+App は後続要求を similar へ先行反映せず、OFF→ON の集約時に既存 watch を維持する。
 名前索引も正規化 root ごとの owner を manager worker に集約し、stop・clear・start の
 順序を起動と編集で共有する。S3 の印は未実装。
 
