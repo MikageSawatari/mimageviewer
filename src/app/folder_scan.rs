@@ -1748,4 +1748,17 @@ mod page_count_tests {
             image_page_recognition_fingerprint(&enabled)
         );
     }
+
+    #[test]
+    fn image_ext_priority_completion_changes_page_count_fingerprint_only_once() {
+        let mut settings = crate::settings::Settings::default();
+        settings.susie_enabled = false;
+        settings.image_ext_priority.truncate(27);
+        let old = image_page_recognition_fingerprint(&settings);
+        crate::settings::apply_load_time_migrations(&mut settings);
+        let completed = image_page_recognition_fingerprint(&settings);
+        assert_ne!(old, completed);
+        crate::settings::apply_load_time_migrations(&mut settings);
+        assert_eq!(completed, image_page_recognition_fingerprint(&settings));
+    }
 }

@@ -825,6 +825,7 @@ impl SettingsDb {
         for (key, raw) in read_remote_listing_settings(&inner.conn)? {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
+        crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
         Ok(settings)
     }
 
@@ -5414,11 +5415,42 @@ mod tests {
             .unwrap()
             .apply_to(&mut startup_snapshot);
 
+        crate::settings::normalize_image_ext_priority(&mut live.image_ext_priority);
         assert_eq!(
             RemoteListingSettings::from_settings(&startup_snapshot),
             RemoteListingSettings::from_settings(&live)
         );
         assert_eq!(startup_snapshot.thumb_quality, 17);
+    }
+
+    #[test]
+    fn image_ext_priority_remote_overlay_completes_old_lists_without_writing() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let original = vec!["MOS".into(), "custom".into(), "png".into()];
+        let old = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        db.save_full(&old).unwrap();
+        let mut mirror = Settings::default();
+        db.load_remote_listing_settings(&mirror)
+            .unwrap()
+            .apply_to(&mut mirror);
+        assert_eq!(&mirror.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            mirror.image_ext_priority.len(),
+            crate::settings::default_image_ext_priority().len() + 1
+        );
+        assert!(
+            !mirror
+                .image_ext_priority
+                .iter()
+                .any(|extension| extension == "mos")
+        );
+        assert_eq!(
+            db.load_into_settings().unwrap().image_ext_priority,
+            original
+        );
     }
 
     #[test]

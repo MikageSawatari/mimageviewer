@@ -3693,6 +3693,25 @@ mod tests {
         )
     }
 
+    #[test]
+    fn image_ext_priority_preferences_exposes_new_raw_entries_after_sqlite_load() {
+        use crate::settings::Settings;
+        let app = crate::app::setup_app_for_test();
+        let mut saved = app.settings.clone();
+        saved.image_ext_priority.truncate(27);
+        saved.save();
+        let loaded = Settings::load();
+        let preferences = preferences_state_for_test(&loaded);
+        assert_eq!(
+            preferences.settings.image_ext_priority,
+            crate::settings::default_image_ext_priority()
+        );
+        assert_eq!(
+            &preferences.settings.image_ext_priority[27..],
+            ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"]
+        );
+    }
+
     fn saved_audio_choice_for_preferences_test(
         index: usize,
     ) -> crate::video::SavedAudioTrackChoice {

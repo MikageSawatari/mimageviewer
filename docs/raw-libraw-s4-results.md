@@ -129,3 +129,51 @@ launched, and `build-dev` was not run, as explicitly instructed.
   unchanged full notice files / installer / portable lists all passed.
 - Fresh upstream/public archive hash verification and distribution-build
   contents remain release-lead work; this correction run does not claim them.
+
+## Released extension-priority completion
+
+Base: `17f03f1a3`. Append-only correction for saved `image_ext_priority` lists.
+The literal master/v4.2.0 default has 15 RAW formats; loading it now appends
+exactly `crw`, `srw`, `3fr`, `erf`, `kdc`, `dcr`, `mrw`, `mos`.
+
+- `Settings::sanitize` is the shared finalization step: SQLite startup calls
+  it directly, and JSON migration calls it via `apply_load_time_migrations`
+  before saving the migrated database. Missing current defaults are appended
+  with case-insensitive membership checks. Existing order, casing, duplicates
+  and custom entries are preserved; repeated normalization does nothing.
+- Startup persists completion through the existing bootstrap save without
+  consuming user-save backup rotation, even when the version marker matches.
+  The Remote listing mirror reads individual database keys outside `sanitize`,
+  so it uses the same helper after overlaying those keys, without writing.
+- Whole-settings backup/restore preserves stored data and takes effect on
+  restart through `Settings::load`; operation-customization import/export
+  does not carry this field. No separate import/export migration is needed.
+- The image-folder page-count fingerprint already hashes the full ordered
+  list: completion changes the cache key once; later loads keep it stable.
+  Preferences consumes the completed list directly. No UI layout changed.
+- Spec and the preferences manual now describe append-only completion.
+  No network behavior or data-storage location changed. No product was
+  launched; no commit or `build-dev` run was made, as requested.
+
+### Completion verification
+
+All commands exited 0 with `MSBUILDDISABLENODEREUSE=1` for Cargo. Logs are
+in `target/s4-priority-fix/` (ignored).
+
+- `cargo test -p mimageviewer --lib image_ext_priority`: 9 passed, 0 failed.
+  Includes exact released-default completion, custom order/entries, already
+  complete lists, casing/idempotence, real SQLite and JSON loads, preferences
+  state after load, the Remote overlay and fingerprint stability. The SQLite
+  writeback test starts from fully initialized settings so unrelated first-load
+  migrations cannot mask a missing writeback; the final focused rerun passed.
+- `cargo test -p mimageviewer --lib app::folder_scan::`: 19 passed, 0 failed
+  (includes the fingerprint test above).
+- `cargo test -p mimageviewer --lib remote_listing_settings_`: 2 passed,
+  0 failed. These three filters cover 29 distinct tests, not 30.
+- `cargo check -p mimageviewer --bin mimageviewer-core`: passed (17.81 s),
+  with existing warnings. The later edit only strengthened a `#[cfg(test)]`
+  test, so this core-check evidence remains valid.
+- `cargo fmt --all --check`, `git diff --check`: passed. Glyph lint reports
+  zero dangerous glyphs. Edited documentation retains its original BOM state
+  and decodes as UTF-8. No snapshots changed: priority data is covered by the
+  real-load preferences-state test; the renderer and layout are unchanged.

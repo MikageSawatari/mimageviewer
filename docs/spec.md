@@ -2170,7 +2170,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `skip_epub_if_pdf_exists` | bool | true | 同じフォルダに同名の PDF がある EPUB をグリッド・スマートフォルダ・Ctrl+↑↓ の候補から非表示にする。名前の大小文字は区別しない |
 | `skip_image_if_video_exists` | bool | true | 同名動画がある画像をスキップ（画像は動画サムネイルとして使用） |
 | `skip_duplicate_images` | bool | true | 同名で複数拡張子がある画像を優先度でフィルタ |
-| `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先） |
+| `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先）。設定ロード時は、現在の既定リストにある未登録の拡張子を末尾へ補完する（大文字・小文字を区別しない）。既存の順序・表記・独自項目は維持する |
 
 #### 検索クエリ構文（Ctrl+F / Ctrl+G / Ctrl+S 共通）
 
