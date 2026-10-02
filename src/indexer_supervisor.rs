@@ -415,6 +415,8 @@ fn supervisor_loop(
             &progress,
         );
         mark_activity(&stats);
+    } else if enable_metadata_index {
+        crate::logger::log(format!("indexer[{favorite_id}]: initial scan skipped"));
     }
     let initial_scan_duration_ms = {
         let mut stats = stats.lock().unwrap();
