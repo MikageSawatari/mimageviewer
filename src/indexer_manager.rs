@@ -540,7 +540,7 @@ impl IndexerManager {
             h.request_full_rescan();
         }
     }
-    /// 全体確認は構成採用後に metadata Full と similar Manual 1回を owner から発行する。
+    /// 全体確認は構成採用後に metadata Full と similar UserCheck 1回を owner から発行する。
     pub fn request_shared_full_check(&self) {
         self.runtime.request_full_check();
     }

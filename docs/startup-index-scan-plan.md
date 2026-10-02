@@ -333,7 +333,7 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
 - **name**: 初回の `run_full_scan` だけを省く。watcher 起動は従来どおり先。
 - **similar**: 省略してよいのは、要求が純粋な `Initial` で、現在の構成の全 watch が `Ready`
   (Unavailable を含む terminal ではなく Ready)、未修復の gap が無いときだけ。
-  Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair が合流したら通常の Full。
+  UserCheck / Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair が合流したら通常の Full。
   省略時は Full の inventory 読み込み・列挙と、有効 root 和集合の外のキーの purge を行わない。
   指紋は有効 root と共通除外を含み、構成変更による公開データの削除や別指紋 Full は
   同じ transaction、または最初の走査書き込みより前に旧印を失効する。クラッシュがその前なら
@@ -361,7 +361,13 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
     similar への要求を 1 回にする)。
   - name: 各 supervisor へ `FullRescan` (現在 handle に要求 API が無いので追加、
     [name_index_supervisor.rs:63](../src/name_index_supervisor.rs))。
-  - similar: 全 root に対して 1 回だけ `FullReason::Manual` (registration を持たない入口を追加)。
+  - similar: 全 root に対して 1 回だけ `FullReason::UserCheck`。起動時と同じ
+    `InitialMetadataTrust` で、kind・Complete・件数・mtime・size・hash version が一致する
+    ZIP / PDF は開かず確認する。実際に走査する `ScannedFull` であり、ReusedInitial に入らず、
+    完了時の dirty 吸収・gap 修復・array ack は通常 Full と同じ。
+    同じ構成では UserCheck 同士を集約し、Initial より優先する。MustOpen の
+    Overflow / WatchRecovery / Reconfigure / SummaryRepair / 既存 Manual が優先し、
+    必要な gap epoch は最大値を保持する。新しい構成 epoch は従来どおり古い要求に優先する。
 - 要求は非 blocking。進捗は既存の索引進捗表示に出る。IndexerManager が初期化中なら
   fts / similar の分は完了後に 1 回だけ実行する予約にし、利用不能 (初期化失敗) なら
   その分は行わず理由を出す (名前索引の分は実行する)。
@@ -406,10 +412,13 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
 - E: 印あり + 指紋一致で初回 Full が走らないこと / 指紋不一致・印なし・設定 OFF で走ること /
   完全な Full でだけ印が立ち、取消・不完全観測・書き込み失敗では立たないこと /
   ストアの作り直しで印が消え、同じ起動で省かないこと / 付け替え行のある root は走査すること /
-  similar: watch が Unavailable・Manual 合流のときは省かない、省略時も purge・build 掃除・
+  similar: watch が Unavailable・UserCheck / Manual 合流のときは省かない、省略時も未完 build 掃除・
   array ack 後の Complete が起きる、watch 登録後の dirty が Delta で処理される /
   省いた起動の後も watcher 差分・overflow の Full が従来どおり動くこと。
 - [今すぐ確認]: 3 系統に要求が届くこと、初期化中の予約、利用不能時の無効化。
+  similar は UserCheck / InitialMetadataTrust、無変更 Complete ZIP/PDF を開かないこと、
+  MustOpen の修復要求との合流では MustOpen、同一構成の UserCheck を集約すること。
+  Initial の復元後も UserCheck を保持し、起動時省略に入らず、dirty / gap / ack は実 Full と同じこと。
 - 文言変更があるので UI スナップショットの該当があれば更新。
 
 ## 8. 段 3: 走査の統合 (D) は計測後に決める
@@ -1254,3 +1263,76 @@ gpt-6.1-sol / xhigh の読み取り専用監査・差分レビューで P1/P2 �
 core は6分35秒、companion は増分 build。VCRT / PE 検査も runtime=4 / pe=3 で成功。
 `build-dev.log` に記録。全workspace suite・アプリ起動・通常 profile の操作・コミットは
 行っていない。実データでの修正後の所要時間は、利用者がこの build で確認する。
+
+### 11.10 「今すぐ確認」の類似 Full を起動時と同じ確認方法へ (2026-10-03)
+
+利用者が HEAD `ffbcf460d` で確認したところ、FTS / name は約15秒で終了中の変更56件を
+取り込んだが、similar Manual Full は10分後も4.7M中243k件だった。ZIP 807 / 約3,400件、
+PDF 1,553 / 約3,580件を開いており、Manual の MustOpen による費用と確認した。
+warm の起動 Initial Full は約42秒。利用者はこのボタンを再起動の代わりに使う目的で、
+起動時と同じ確認方法にすることを明示決定した。この時間・件数は利用者の観測である。
+
+- 登録不要・全 root の `request_full_all` を専用 `FullReason::UserCheck` に変更し、
+  `reason=user_check` と `InitialMetadataTrust` を使う。App → IndexerManager の予約・
+  metadata_reconfiguration owner からの metadata-only Full / similar 1回、name の独立要求は
+  維持する。非 blocking・pause / init / unavailable の既存契約も変えない。
+- Complete ZIP/PDF の kind・正の保存 page count・公開 member 数・mtime・size・現在の hash
+  version が一致するときだけ、既存の起動時 inventory 判定で open を省く。欠落や不一致は
+  既存の open / decode / stage / publish に戻る。mtime / size を変えず内容だけ変更した場合を
+  未変更として扱う点も起動時と同じ、今回承認された確認方法の範囲に含む。
+- Full の理由だけを増やし、追加の bool・別 worker・特別な完了経路は作らない。UserCheck は
+  FS / inventory を実際に走査する ScannedFull で、設定 ON・同一指紋の印があっても純粋 Initial
+  ではない。prune-safe / current / watermark / array ack が揃った既存の終端で印を立て、
+  開始前 dirty の吸収、Ready の gap 修復、開始後 dirty の Delta を維持する。
+  ボタンは非同期で使う既存 UI を維持するため、モーダル化や専用の待機状態は採らない。
+- 同一構成で MustOpen > UserCheck > Initial とし、必要 gap は理由とは独立に最大値を保持する。
+  UserCheck 同士は1つに集約。Initial の中断復元や大きい gap の Initial が明示確認を消さない。
+  大きい gap の UserCheck が先行 MustOpen を弱めることもない。異なる構成 epoch は従来の
+  新構成優先を維持する。既存 MustOpen 同士は新しい gap の理由を残す従来規則を維持する。
+- Manual の製品内の書き手を全件確認した。変更前の全 root `request_full_all` のほかは、
+  登録単位 `SimilarIndexNotifier::request_full(registration)`。FTS supervisor が従来の
+  `SupervisorCommand::FullRescan` を受けたときこの API を呼ぶ。root 単位の
+  IndexerManager / supervisor の `request_full_rescan` API と、直接 scheduler を使う既存
+  Manual 回帰を維持した。現在の App ボタンの metadata-only command はこの Manual を出さず、
+  全 root UserCheck だけを出す。Manual を一律に軽くする変更は行わない。
+- 起動時の無変更 ZIP/PDF fixture を共通 helper にして UserCheck も検査。物理ファイルは
+  不正な ZIP/PDF なので、開いたなら破損になる対照で開かないことを確認できる。
+  署名・revision・変更履歴、ページ別 report / telemetry の維持も確認する。既存 MustOpen / Delta
+  の open 対照を維持。watch Unavailable / UserCheck / Manual の合流回帰は同じ channel gate で
+  固定し、sleep や時間による並行性の推測は使わない。
+- reconcile / architecture / §1.228 の現行契約と、本設計 §6.4 / §6.5 / §7 を更新。
+  manual 3ページのボタン説明は確認深度を説明していないため、利用者の指定どおり変更不要。
+  UI 文言・レイアウト・永続 schema は変わらず、snapshot / migration は不要。
+- gpt-6.1-sol / xhigh の読み取り専用レビューで指摘なし。レビュー担当は Cargo / build を
+  実行せず、以下の検証は実装担当が所有する。
+
+`MSBUILDDISABLENODEREUSE=1` を設定し、
+`cargo test -j1 -p mimageviewer --lib <filter> -- --test-threads=1` を実行した。
+
+| filter | 成功件数 | ignored |
+| --- | ---: | ---: |
+| `user_check` | 5 | 0 |
+| `similar_index::tests::startup_` | 15 | 0 |
+| `similar_index::tests::incremental_reconcile` | 27 | 0 |
+| `full_reuses_complete` | 2 | 0 |
+| `must_open_full` | 1 | 0 |
+| `full_inventory_preopen` | 1 | 0 |
+| `full_reconcile_inventory` | 11 | 1 |
+| `reconcile_telemetry` | 3 | 0 |
+| `full_check` | 7 | 0 |
+| `indexer_manager` | 13 | 0 |
+| `metadata_reconfiguration` | 19 | 0 |
+
+延べ104件、重複を除いて97件成功（新規5件を含む）。ignored 1件は既存の手動 benchmark。
+初回 user_check 4件成功は最終ソースより前の確認なので合算しない。
+`cargo check -j1 -p mimageviewer --bin mimageviewer-core` は exit 0。
+UI snapshot は見た目変更がないため §11.8 の59件成功を再利用し、PNG 更新・再実行は不要。
+検証ログは `target/startup-scan-s3/user-check/`。
+全workspaceの `cargo fmt --all` / `cargo fmt --all --check` と `git diff --check` は成功。
+`python scripts/check_ui_glyphs.py` は問題0。
+`target/startup-scan-s3/commit-message.txt` を UTF-8 BOM なしで上書きし、指定署名を末尾に置いた。
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は exit 0。
+通常 feature / dev-runtime profile の core・remote・EPUB PDF worker を配置し、VCRT / PE 検査も
+runtime=4 / pe=3 で成功。core の build は2分59秒、companion は増分 build。
+`build-dev.log` に記録した。全workspace suite・アプリ起動・通常 profile の操作・コミットは
+行っていない。利用者の実データでの修正後の所要時間は、この build での確認に残る。

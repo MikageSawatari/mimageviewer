@@ -573,7 +573,7 @@ impl SimilarIndexManager {
                 #[cfg(test)]
                 startup_test_probe: Mutex::new(None),
                 #[cfg(test)]
-                manual_all_requests: AtomicU64::new(0),
+                user_check_all_requests: AtomicU64::new(0),
                 #[cfg(test)]
                 full_jobs_started: AtomicU64::new(0),
                 #[cfg(test)]
@@ -637,7 +637,9 @@ impl SimilarIndexManager {
 
     #[cfg(test)]
     pub(crate) fn full_check_request_count_for_test(&self) -> u64 {
-        self.scheduler.manual_all_requests.load(Ordering::Acquire)
+        self.scheduler
+            .user_check_all_requests
+            .load(Ordering::Acquire)
     }
 
     pub fn progress(&self) -> IndexProgress {
@@ -1148,6 +1150,7 @@ pub struct SimilarWatchRegistration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FullReason {
     Initial,
+    UserCheck,
     Reconfigure,
     Overflow,
     WatchRecovery,
@@ -1159,6 +1162,7 @@ impl FullReason {
     fn label(self) -> &'static str {
         match self {
             Self::Initial => "initial",
+            Self::UserCheck => "user_check",
             Self::Reconfigure => "reconfigure",
             Self::Overflow => "overflow",
             Self::WatchRecovery => "watch_recovery",
@@ -1169,7 +1173,7 @@ impl FullReason {
 
     fn container_preopen_policy(self) -> ContainerPreopenPolicy {
         match self {
-            Self::Initial => ContainerPreopenPolicy::InitialMetadataTrust,
+            Self::Initial | Self::UserCheck => ContainerPreopenPolicy::InitialMetadataTrust,
             Self::Reconfigure
             | Self::Overflow
             | Self::WatchRecovery
@@ -1794,18 +1798,51 @@ impl SchedulerState {
             })
     }
     fn merge_full_intent(&mut self, intent: FullIntent) {
-        let should_replace = self.pending_full.is_none_or(|pending| {
-            intent.config_epoch > pending.config_epoch
-                || intent.config_epoch == pending.config_epoch
-                    && (intent.required_gap_epoch > pending.required_gap_epoch
-                        || intent.required_gap_epoch == pending.required_gap_epoch
-                            && pending.reason.container_preopen_policy()
-                                == ContainerPreopenPolicy::InitialMetadataTrust
-                            && intent.reason.container_preopen_policy()
-                                == ContainerPreopenPolicy::MustOpen)
-        });
-        if should_replace {
-            self.pending_full = Some(intent);
+        match self.pending_full {
+            None => self.pending_full = Some(intent),
+            Some(pending) if intent.config_epoch > pending.config_epoch => {
+                self.pending_full = Some(intent);
+            }
+            Some(pending) if intent.config_epoch == pending.config_epoch => {
+                // Keep the strongest check independently of the newest required gap.
+                // UserCheck also dominates Initial so an explicit check cannot be skipped.
+                let reason = match (
+                    pending.reason.container_preopen_policy(),
+                    intent.reason.container_preopen_policy(),
+                ) {
+                    (
+                        ContainerPreopenPolicy::MustOpen,
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                    ) => pending.reason,
+                    (
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                        ContainerPreopenPolicy::MustOpen,
+                    ) => intent.reason,
+                    (
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                    ) => {
+                        if pending.reason == FullReason::UserCheck {
+                            pending.reason
+                        } else {
+                            intent.reason
+                        }
+                    }
+                    (ContainerPreopenPolicy::MustOpen, ContainerPreopenPolicy::MustOpen) => {
+                        if intent.required_gap_epoch > pending.required_gap_epoch {
+                            intent.reason
+                        } else {
+                            pending.reason
+                        }
+                    }
+                };
+                self.pending_full = Some(FullIntent {
+                    reason,
+                    required_gap_epoch: pending.required_gap_epoch.max(intent.required_gap_epoch),
+                    ..pending
+                });
+            }
+            Some(_) => {}
         }
     }
 
@@ -2047,7 +2084,7 @@ struct SimilarIndexScheduler {
     #[cfg(test)]
     startup_test_probe: Mutex<Option<Arc<dyn Fn(&'static str) + Send + Sync>>>,
     #[cfg(test)]
-    manual_all_requests: AtomicU64,
+    user_check_all_requests: AtomicU64,
     #[cfg(test)]
     full_jobs_started: AtomicU64,
     #[cfg(test)]
@@ -2351,11 +2388,13 @@ impl SimilarIndexNotifier {
         }
     }
 
-    /// 全 root の確認を一つの Manual にまとめる。watch registration は不要。
+    /// 全 root の起動時と同じ確認を一つの UserCheck にまとめる。watch registration は不要。
     pub(crate) fn request_full_all(&self) {
         if let Some(scheduler) = self.scheduler.upgrade() {
             #[cfg(test)]
-            scheduler.manual_all_requests.fetch_add(1, Ordering::AcqRel);
+            scheduler
+                .user_check_all_requests
+                .fetch_add(1, Ordering::AcqRel);
             let should_start = {
                 let mut state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.shutdown || state.desired_config.is_none() {
@@ -2364,7 +2403,7 @@ impl SimilarIndexNotifier {
                 let intent = FullIntent {
                     config_epoch: state.config_epoch,
                     required_gap_epoch: state.next_gap_epoch,
-                    reason: FullReason::Manual,
+                    reason: FullReason::UserCheck,
                 };
                 state.merge_full_intent(intent);
                 state.reserve_worker_if_runnable()
@@ -7166,12 +7205,17 @@ mod tests {
         assert_eq!(ReconcileJobKind::Purge.label(), "purge");
         assert_eq!(ReconcileJobKind::Purge.reason_label(), "root_removed");
         assert_eq!(FullReason::Initial.label(), "initial");
+        assert_eq!(FullReason::UserCheck.label(), "user_check");
         assert_eq!(FullReason::Reconfigure.label(), "reconfigure");
         assert_eq!(FullReason::Overflow.label(), "overflow");
         assert_eq!(FullReason::SummaryRepair.label(), "summary_repair");
         assert_eq!(FullReason::Manual.label(), "manual");
         assert_eq!(
             FullReason::Initial.container_preopen_policy(),
+            ContainerPreopenPolicy::InitialMetadataTrust
+        );
+        assert_eq!(
+            FullReason::UserCheck.container_preopen_policy(),
             ContainerPreopenPolicy::InitialMetadataTrust
         );
         for reason in [
@@ -8155,6 +8199,15 @@ mod tests {
 
     #[test]
     fn initial_full_reuses_complete_zip_and_pdf_without_opening_them() {
+        assert_metadata_trust_full_reuses_containers(FullReason::Initial);
+    }
+
+    #[test]
+    fn user_check_full_reuses_complete_zip_and_pdf_without_opening_them() {
+        assert_metadata_trust_full_reuses_containers(FullReason::UserCheck);
+    }
+
+    fn assert_metadata_trust_full_reuses_containers(reason: FullReason) {
         let root = tempfile::tempdir().unwrap();
         let db = SimilarDb::open_in_memory().unwrap();
         populate_invalid_file_container_fixture(&db, root.path());
@@ -8164,7 +8217,7 @@ mod tests {
         let telemetry = telemetry_for_test(ReconcileJobKind::Full(FullIntent {
             config_epoch: 1,
             required_gap_epoch: 0,
-            reason: FullReason::Initial,
+            reason,
         }));
 
         let outcome = run_index_job(
@@ -8172,7 +8225,7 @@ mod tests {
             &[root.path().to_path_buf()],
             &[],
             &passwords,
-            ContainerPreopenPolicy::InitialMetadataTrust,
+            reason.container_preopen_policy(),
             None,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(IndexProgress::Idle)),
@@ -8207,7 +8260,7 @@ mod tests {
     }
 
     #[test]
-    fn non_initial_full_and_delta_keep_opening_complete_containers() {
+    fn must_open_full_and_delta_keep_opening_complete_containers() {
         let root = tempfile::tempdir().unwrap();
         let full_db = SimilarDb::open_in_memory().unwrap();
         populate_invalid_file_container_fixture(&full_db, root.path());
@@ -10299,6 +10352,7 @@ mod tests {
         state.watch_by_root.get_mut(&id).unwrap().repaired_gap_epoch = 1;
         assert!(state.can_reuse_initial(&plan));
         for reason in [
+            FullReason::UserCheck,
             FullReason::Manual,
             FullReason::Overflow,
             FullReason::WatchRecovery,
@@ -10362,7 +10416,7 @@ mod tests {
 
     #[test]
     fn startup_worker_gated_unavailable_and_manual_merge_force_scanned_full() {
-        for manual in [false, true] {
+        for change in ["unavailable", "user_check", "manual"] {
             let (_temp, manager, db, id) = startup_worker_fixture(true, true);
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -10377,8 +10431,15 @@ mod tests {
                 let scheduler = Arc::clone(&manager.scheduler);
                 let worker = threads.spawn(move || scheduler.worker_loop());
                 entered_rx.recv().unwrap();
-                if manual {
+                if change == "user_check" {
                     manager.request_full_all();
+                } else if change == "manual" {
+                    let mut state = manager.scheduler.state.lock().unwrap();
+                    let intent = FullIntent {
+                        reason: FullReason::Manual,
+                        ..initial_full_intent()
+                    };
+                    state.merge_full_intent(intent);
                 } else {
                     manager
                         .scheduler
@@ -10390,13 +10451,153 @@ mod tests {
                         .unwrap()
                         .health = WatchHealth::Unavailable;
                 }
-                // The second Manual job needs no further gate.
+                // The second explicit Full needs no further gate.
                 *manager.scheduler.startup_test_probe.lock().unwrap() = None;
                 release_tx.send(()).unwrap();
                 worker.join().unwrap();
             });
             assert!(db.full_inventory_load_count() >= 1);
         }
+    }
+
+    #[test]
+    fn startup_user_check_request_coalesces_and_repairs_gap_as_scanned_full() {
+        let (_temp, manager, _db, id) = startup_worker_fixture(true, true);
+        let root = manager
+            .scheduler
+            .state
+            .lock()
+            .unwrap()
+            .desired_config
+            .as_ref()
+            .unwrap()
+            .roots[0]
+            .path
+            .clone();
+        let old_scope = DirtyScope::DirectoryContents(root.join("old"));
+        let new_scope = DirtyScope::DirectoryContents(root.join("new"));
+        {
+            let mut state = manager.scheduler.state.lock().unwrap();
+            state.next_gap_epoch = 2;
+            state.watch_by_root.get_mut(&id).unwrap().gap_epoch = 2;
+            state.next_event_seq = 1;
+            state.dirty.insert(old_scope.clone(), 1);
+        }
+        manager.request_full_all();
+        manager.request_full_all();
+        let mut state = manager.scheduler.state.lock().unwrap();
+        let plan = state.take_next_job().unwrap();
+        assert_eq!(
+            plan.running.kind,
+            ReconcileJobKind::Full(FullIntent {
+                reason: FullReason::UserCheck,
+                required_gap_epoch: 2,
+                ..initial_full_intent()
+            })
+        );
+        assert_eq!(plan.running.kind.reason_label(), "user_check");
+        assert_eq!(
+            FullReason::UserCheck.container_preopen_policy(),
+            ContainerPreopenPolicy::InitialMetadataTrust
+        );
+        assert!(!state.can_reuse_initial(&plan));
+        assert!(plan.running.repairs_watch_gap);
+        state.next_event_seq = 2;
+        state.dirty.insert(new_scope.clone(), 2);
+        assert_eq!(
+            state.finish_successful_job(&plan),
+            SuccessfulJobDisposition::MoreWork
+        );
+        assert!(!state.dirty.latest_by_scope.contains_key(&old_scope));
+        assert_eq!(state.dirty.latest_by_scope.get(&new_scope), Some(&2));
+        assert_eq!(state.watch_by_root[&id].repaired_gap_epoch, 2);
+        assert!(state.pending_full.is_none());
+    }
+
+    #[test]
+    fn startup_user_check_worker_does_not_reuse_matching_marker() {
+        let (_temp, manager, db, _id) = startup_worker_fixture(true, true);
+        manager.request_full_all();
+        Arc::clone(&manager.scheduler).worker_loop();
+        assert_eq!(db.full_inventory_load_count(), 1);
+        assert_eq!(manager.reconcile_job_counts_for_test(), (1, 0));
+        assert!(matches!(
+            manager.scheduler.state.lock().unwrap().phase,
+            SchedulerPhase::Idle
+        ));
+    }
+
+    #[test]
+    fn incremental_reconcile_user_check_merge_keeps_stronger_checks_and_latest_gap() {
+        for must_open in [
+            FullReason::Overflow,
+            FullReason::WatchRecovery,
+            FullReason::Reconfigure,
+            FullReason::SummaryRepair,
+            FullReason::Manual,
+        ] {
+            for reverse in [false, true] {
+                for user_gap in [0, 3, 9] {
+                    let mut state = SchedulerState::default();
+                    let user = FullIntent {
+                        config_epoch: 7,
+                        required_gap_epoch: user_gap,
+                        reason: FullReason::UserCheck,
+                    };
+                    let stronger = FullIntent {
+                        config_epoch: 7,
+                        required_gap_epoch: 3,
+                        reason: must_open,
+                    };
+                    for intent in if reverse {
+                        [stronger, user]
+                    } else {
+                        [user, stronger]
+                    } {
+                        state.merge_full_intent(intent);
+                    }
+                    let pending = state.pending_full.unwrap();
+                    assert_eq!(pending.reason, must_open);
+                    assert_eq!(pending.required_gap_epoch, user_gap.max(3));
+                    assert_eq!(
+                        pending.reason.container_preopen_policy(),
+                        ContainerPreopenPolicy::MustOpen
+                    );
+                    state.merge_full_intent(FullIntent {
+                        config_epoch: 6,
+                        required_gap_epoch: 99,
+                        reason: FullReason::UserCheck,
+                    });
+                    assert_eq!(state.pending_full, Some(pending));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reconcile_user_check_survives_initial_restore_and_later_gap() {
+        let id = Uuid::new_v4();
+        let mut state =
+            coordinator_state_with_watch(id, Path::new("c:/library"), WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        let initial = state.take_next_job().unwrap();
+        state.merge_full_intent(FullIntent {
+            reason: FullReason::UserCheck,
+            ..initial_full_intent()
+        });
+        state.restore_unfinished_job(&initial, false);
+        state.merge_full_intent(FullIntent {
+            required_gap_epoch: 9,
+            ..initial_full_intent()
+        });
+        assert_eq!(
+            state.pending_full,
+            Some(FullIntent {
+                reason: FullReason::UserCheck,
+                required_gap_epoch: 9,
+                ..initial_full_intent()
+            })
+        );
     }
 
     #[test]

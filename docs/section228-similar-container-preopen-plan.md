@@ -8,8 +8,9 @@
 `container_observation` を呼んでいた。
 
 利用者は、保存済み Complete コンテナについて `mtime` とサイズが同じなら、同じ値のまま内容だけ
-変わったケースを更新なしとして扱うことを了承した。これは起動時 `FullReason::Initial` に限って
-適用する。2026-09-11 の設計で採用しなかった列挙省略は、この限定条件と明示的な利用者判断により
+変わったケースを更新なしとして扱うことを了承した。当初は起動時 `FullReason::Initial` に限って
+適用する。2026-10-03 の利用者判断で「今すぐ確認」の UserCheck Full にも同じ確認方法を適用する。
+2026-09-11 の設計で採用しなかった列挙省略は、この限定条件と明示的な利用者判断により
 置き換える。開発用検証に本番 DB やフォルダは使わず、後掲の実 corpus 観測は利用者自身による起動ログから確認した。
 
 ## 所有と判定
@@ -29,20 +30,21 @@ post-open freshness、generation staging、publish へ戻す。`mark_container_s
 再利用時は保存済み page count を discovered と ZIP/PDF page telemetry、member 数を processed と
 unchanged に反映する。
 
-policy は job 開始時に `FullReason` から一度だけ導出する。`Initial` だけが metadata trust を使い、
+policy は job 開始時に `FullReason` から一度だけ導出する。`Initial` と `UserCheck` が metadata trust を使い、
 Reconfigure、Overflow、WatchRecovery、SummaryRepair、Manual と Delta は必ず従来どおりコンテナを
 開く。これにより password 設定変更、明示修復、watch gap の再確認を変えず、Delta の scope、
 transaction、publication、prune、cancel/error 契約にも変更を入れない。別 process で変わった
 credential を起動時に識別する永続 fingerprint は持たないため、既存 Complete は今回了承された
 起動時 metadata trust の対象となる。Failed / Building / Missing は常に開く。
 
-同一 config epoch / watch gap で複数の Full intent が合流する場合も、Manual 等の `MustOpen` を
-Initial の metadata trust へ弱めない。待機中と中断後の再投入のどちらでも、より厳しい open 方針を
-持つ intent を scheduler owner に残す。
+同一 config epoch で複数の Full intent が合流する場合も、Manual 等の `MustOpen` を
+Initial / UserCheck の metadata trust へ弱めない。gap は最大値、確認方針は最も厳しいものを
+独立に保持する。UserCheck は Initial より優先し、明示確認が起動時省略へ吸収されない。
+待機中と中断後の再投入のどちらでも同じ scheduler owner の規則を使う。
 
 ## 回帰と完了条件
 
-- Complete で無変更の ZIP / PDF は Initial Full で loader を呼ばず、保存件数と従来同じ report /
+- Complete で無変更の ZIP / PDF は Initial / UserCheck Full で loader を呼ばず、保存件数と従来同じ report /
   telemetryを生成する。
 - kind、state、page count、member count、mtime、size、member hash、hash version のどれかが不一致なら
   open 経路へ戻る。

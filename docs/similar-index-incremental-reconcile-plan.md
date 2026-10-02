@@ -37,7 +37,7 @@ configure が watcher 登録より先に走る欠落窓、登録失敗のログ�
 
 `skip_offline_change_scan` ON、`scanned_once` の有効 root 集合全体の指紋一致、純粋な Initial、
 現在構成の全 watch が Ready、未修復 gap なしの場合だけ、既存 worker 内で `ReusedInitial` を
-選ぶ。Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair の合流は `ScannedFull`。
+選ぶ。UserCheck / Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair の合流は `ScannedFull`。
 再利用では Full inventory と FS 列挙に加え、有効 root 和集合の外のキーの purge も省く。
 指紋が root / 共通除外を含み、構成変更 purge の公開削除は同 transaction で印を失効させ、
 別指紋 Full も最初の書き込みより前に失効させるため、同一指紋での全キー整理は不要。
@@ -49,6 +49,17 @@ configure が watcher 登録より先に走る欠落窓、登録失敗のログ�
 や ack と重複するため4項目を合計しない。page order が現行版なら単一 metadata 行の確認だけ。
 dirty の `retain_after` と gap repair は `ScannedFull` だけに適用し、再利用中の dirty は MoreWork
 から Delta へ残す。印は完全な Full だけで立て、イベント・クラッシュでは消さない。
+
+「今すぐ確認」の全 root 要求は `UserCheck` (`reason=user_check`) とし、起動時と同じ
+`InitialMetadataTrust` を使う。Complete ZIP / PDF の kind・保存件数と公開 member 数・mtime・
+size・hash version が一致すれば開かずに既存署名を利用する。不一致・欠落・未完なら従来の
+open / decode / publish に戻る。FS と inventory の実 Full を行い、設定 ON・有効印があっても
+ReusedInitial は選ばない。prune-safe な走査と array ack 後の `ScannedFull` として、開始前の
+dirty を吸収し、Ready の gap を修復し、開始後の dirty は Delta へ残す。
+同一構成 epoch の併合は MustOpen > UserCheck > Initial とし、gap epoch は最大値を保持する。
+UserCheck 同士は1つにまとめ、MustOpen を大きい gap の軽い要求で弱めない。既存の登録単位
+`request_full` / supervisor FullRescan からの Manual は MustOpen を維持する。
+
 設定purgeで公開済み item / container を削除するときは、その transaction 内で印も消す。
 build / prefill だけの整理では公開索引を失わないため、削除件数が正でも印を保持する。
 別指紋 Full は既存の未完build掃除 transaction で旧印を失効させ、最初の走査書き込みより

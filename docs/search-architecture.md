@@ -256,7 +256,9 @@ rebuild pending の対象でない場合だけ省く。watcher は従来どお�
 変更する前に旧rootの印をtransactionで失効させる。Susieの拡張子集合を含む全指紋入力が対象で、
 元の入力に戻して再起動しても途中の索引を省略しない。同一指紋Fullの取消では旧印を保持する。
 「お気に入り > 編集」の [今すぐ確認] は metadata-only Full、名前索引 Full、全 root の similar
-Manual 1回を非同期に要求する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
+UserCheck 1回を非同期に要求する。similar は起動時と同じ metadata 照合で Complete の無変更
+ZIP / PDF を開かない実 Full で、起動時省略には入らない。MustOpen の修復要求と合流したときは
+そちらを優先する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
 理由を通知して名前索引だけを確認する。一時停止中は再開後に実行する。
 
 大量削除では watcher overflow の full rescan、または debounce 済みイベント列が
