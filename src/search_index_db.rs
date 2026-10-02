@@ -9,6 +9,7 @@
 //! PRIMARY KEY にする (rotation_db / adjustment_db / catalog と同じ規約)。
 //! ドライブ文字は保持する (お気に入りフォルダごとのスコープ判定に必要)。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -187,6 +188,63 @@ impl SearchIndexDb {
         children: &[IndexEntry],
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
+        Self::upsert_children_locked(&mut conn, favorite_root, parent, children)
+    }
+
+    /// フル走査用。直下の集合が同じなら transaction を開かず、書き込みを省く。
+    /// 比較から置換まで同じ lock を保持し、別の書き手が割り込まないようにする。
+    pub fn upsert_children_if_changed(
+        &self,
+        favorite_root: &Path,
+        parent: &Path,
+        children: &[IndexEntry],
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let (lower, upper) = direct_children_path_bounds(parent);
+        let fav_norm = normalize_path(favorite_root);
+        let mut observed: Vec<_> = children
+            .iter()
+            .map(|entry| {
+                (
+                    normalize_path(&entry.path),
+                    entry.path.to_string_lossy().into_owned(),
+                    entry.display_name.clone(),
+                    entry.kind as i64,
+                    entry.mtime,
+                )
+            })
+            .collect();
+        observed.sort_unstable();
+        let existing = {
+            let mut stmt = conn.prepare(
+                "SELECT path, display_path, display_name, kind, mtime FROM entries \
+                 WHERE favorite_root = ?1 AND path >= ?2 AND path < ?3 \
+                 AND instr(substr(path, length(?2) + 1), '/') = 0 ORDER BY path",
+            )?;
+            stmt.query_map(params![fav_norm, lower, upper], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if existing == observed {
+            return Ok(false);
+        }
+        Self::upsert_children_locked(&mut conn, favorite_root, parent, children)?;
+        Ok(true)
+    }
+
+    fn upsert_children_locked(
+        conn: &mut Connection,
+        favorite_root: &Path,
+        parent: &Path,
+        children: &[IndexEntry],
+    ) -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
 
         // 親フォルダ直下の既存エントリを一度消してから入れ直す。
@@ -226,32 +284,67 @@ impl SearchIndexDb {
         tx.commit()
     }
 
-    /// `favorite_root` 配下で `updated_at < cutoff` の行を一括削除する。
-    ///
-    /// フルバルクスキャン完了後に呼ぶ。`upsert_children` は親フォルダ直下の行しか
-    /// DELETE しないため、アプリ停止中に親フォルダごと消えたサブツリーの孫行は
-    /// upsert の経路で掃除できない。cutoff = scan 開始時に取った
-    /// `next_write_stamp()` にすれば、scan 中の upsert は **strictly greater** な
-    /// stamp を取るので `updated_at >= cutoff`、未観測の stale 行は `< cutoff` で
-    /// 分離できる。`next_write_stamp` は process-wide atomic で単調増加なので、
-    /// 同秒で連続スキャンしても cutoff が衝突しない (Codex P2 回帰対策)。
-    ///
-    /// `favorite_root = ?` スコープなので nested favorites の他 favorite の行は
-    /// 巻き込まない。戻り値: 削除行数 (診断用)。
+    /// 完全なフル走査で未訪問だった親の古い行だけを削除する。
+    /// 訪問済みの不変行は stamp を更新しなくても保持し、走査開始後に別の書き手が
+    /// 入れた行は cutoff で保護する。列挙・訪問集合との比較・削除は同じ lock 内。
     pub fn prune_stale_for_favorite(
         &self,
         favorite_root: &Path,
+        visited_parents: &HashSet<String>,
         updated_at_cutoff: i64,
     ) -> rusqlite::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let fav_norm = normalize_path(favorite_root);
-        let affected = conn.execute(
-            "DELETE FROM entries \
-             WHERE favorite_root = ?1 \
-             AND updated_at < ?2",
-            params![fav_norm, updated_at_cutoff],
-        )?;
+        let stale_paths = {
+            let mut stmt = conn
+                .prepare("SELECT path FROM entries WHERE favorite_root = ?1 AND updated_at < ?2")?;
+            let paths = stmt.query_map(params![fav_norm, updated_at_cutoff], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut stale = Vec::new();
+            for path in paths {
+                let path = path?;
+                // DB key は '/' 区切り。drive root の親だけは末尾 '/' を保持する。
+                let parent = path.rsplit_once('/').map(|(parent, _)| {
+                    if parent.ends_with(':') || parent.is_empty() {
+                        &path[..parent.len() + 1]
+                    } else {
+                        parent
+                    }
+                });
+                if !parent.is_some_and(|parent| visited_parents.contains(parent)) {
+                    stale.push(path);
+                }
+            }
+            stale
+        };
+        if stale_paths.is_empty() {
+            return Ok(0);
+        }
+        // 大きな削除でも行ごとの autocommit を避ける。比較中から lock は保持したまま。
+        let tx = conn.transaction()?;
+        let mut affected = 0;
+        {
+            let mut stmt = tx.prepare(
+                "DELETE FROM entries WHERE favorite_root = ?1 AND path = ?2 AND updated_at < ?3",
+            )?;
+            for path in stale_paths {
+                affected += stmt.execute(params![fav_norm, path, updated_at_cutoff])?;
+            }
+        }
+        tx.commit()?;
         Ok(affected)
+    }
+
+    /// 前回のフォルダ行数 + root をフル走査の進捗目安にする。行が無ければ未知。
+    pub fn previous_folder_count(&self, favorite_root: &Path) -> rusqlite::Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let (rows, folders): (u64, u64) = conn.query_row(
+            "SELECT count(*), coalesce(sum(kind = ?2), 0) FROM entries WHERE favorite_root = ?1",
+            params![normalize_path(favorite_root), IndexKind::Folder as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((rows > 0).then_some(folders + 1))
     }
 
     /// インデックス作成時に、お気に入り配下のエントリを全削除する。
@@ -763,6 +856,154 @@ mod tests {
     #[test]
     fn normalize_path_basic() {
         assert_eq!(normalize_path(Path::new(r"C:\Foo\Bar")), "c:/foo/bar");
+    }
+
+    #[test]
+    fn unchanged_children_skip_write_in_any_order_and_keep_stamp() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        let children = vec![
+            entry("C:/fav/b.pdf", "b.pdf", IndexKind::PdfFile),
+            entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile),
+        ];
+        db.upsert_children(root, root, &children).unwrap();
+        let before: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT max(updated_at) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        let mut reverse = children.clone();
+        reverse.reverse();
+        // 読み取り専用でも同一集合なら成功する (DELETE/INSERT を行わない)。
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        assert!(!db.upsert_children_if_changed(root, root, &reverse).unwrap());
+        assert!(
+            !db.upsert_children_if_changed(root, Path::new("C:/fav/empty"), &[])
+                .unwrap()
+        );
+        let after: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT max(updated_at) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn changed_children_compare_every_persisted_field() {
+        let root = Path::new("C:/fav");
+        let base = entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile);
+        for field in 0..5 {
+            let db = open_mem();
+            db.upsert_children(root, root, &[base.clone()]).unwrap();
+            let mut changed = base.clone();
+            match field {
+                0 => changed.path = "C:/fav/b.zip".into(),
+                1 => changed.path = "C:/FAV/a.zip".into(),
+                2 => changed.display_name = "A.zip".into(),
+                3 => changed.kind = IndexKind::PdfFile,
+                4 => changed.mtime = 42,
+                _ => unreachable!(),
+            }
+            assert!(
+                db.upsert_children_if_changed(root, root, &[changed.clone()])
+                    .unwrap(),
+                "field {field}"
+            );
+            assert!(
+                !db.upsert_children_if_changed(root, root, &[changed])
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn visited_prune_preserves_old_observed_and_fresh_unobserved_rows_in_scope() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        db.upsert_children(root, root, &[entry("C:/fav/sub", "sub", IndexKind::Folder)])
+            .unwrap();
+        let old = entry("C:/fav/sub/old.zip", "old.zip", IndexKind::ZipFile);
+        db.upsert_children(root, Path::new("C:/fav/sub"), &[old.clone()])
+            .unwrap();
+        let nested = Path::new("C:/fav/sub");
+        db.upsert_children(nested, nested, &[old]).unwrap();
+        db.upsert_children(
+            root,
+            Path::new("C:/fav/gone"),
+            &[entry(
+                "C:/fav/gone/stale.pdf",
+                "stale.pdf",
+                IndexKind::PdfFile,
+            )],
+        )
+        .unwrap();
+        let cutoff = next_write_stamp();
+        db.upsert_children(
+            root,
+            Path::new("C:/fav/new"),
+            &[entry(
+                "C:/fav/new/fresh.zip",
+                "fresh.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        let visited = HashSet::from(["c:/fav".into(), "c:/fav/sub".into()]);
+        assert_eq!(
+            db.prune_stale_for_favorite(root, &visited, cutoff).unwrap(),
+            1
+        );
+        assert_eq!(db.count_for_favorite(root).unwrap(), 3);
+        assert_eq!(db.count_for_favorite(nested).unwrap(), 1);
+    }
+
+    #[test]
+    fn visited_prune_handles_drive_root_parent_and_literal_wildcards() {
+        let db = open_mem();
+        let root = Path::new("C:/");
+        db.upsert_children(root, root, &[entry("C:/a_%", "a_%", IndexKind::Folder)])
+            .unwrap();
+        db.upsert_children(
+            root,
+            Path::new("C:/a_%"),
+            &[entry("C:/a_%/book.zip", "book.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        let visited = HashSet::from(["c:/".into(), "c:/a_%".into()]);
+        assert_eq!(
+            db.prune_stale_for_favorite(root, &visited, next_write_stamp())
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.count_for_favorite(root).unwrap(), 2);
+    }
+
+    #[test]
+    fn previous_folder_count_uses_folder_rows_and_root_in_favorite_scope() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        assert_eq!(db.previous_folder_count(root).unwrap(), None);
+        db.upsert_children(
+            root,
+            root,
+            &[
+                entry("C:/fav/sub", "sub", IndexKind::Folder),
+                entry("C:/fav/book.zip", "book.zip", IndexKind::ZipFile),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.previous_folder_count(root).unwrap(), Some(2));
+        assert_eq!(
+            db.previous_folder_count(Path::new("C:/other")).unwrap(),
+            None
+        );
     }
 
     #[test]

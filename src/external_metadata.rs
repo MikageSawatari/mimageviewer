@@ -71,6 +71,17 @@ pub struct SidecarSig {
 /// 画像に対応するサイドカーの 3-way diff 署名。無ければ `None`。
 pub fn sidecar_signature(image_path: &Path) -> Option<SidecarSig> {
     let (path, md) = detect_with_meta(image_path)?;
+    Some(signature_from_meta(&path, &md))
+}
+
+/// walker が一覧から他の候補の不在を確認した場合の、8.3 候補 1 件の確認。
+/// 通常の検出と同じ candidate 名・metadata から署名を作る。
+pub(crate) fn sidecar_signature_for_candidate(path: &Path) -> Option<SidecarSig> {
+    let md = std::fs::metadata(path).ok()?;
+    md.is_file().then(|| signature_from_meta(path, &md))
+}
+
+fn signature_from_meta(path: &Path, md: &std::fs::Metadata) -> SidecarSig {
     let size = md.len() as i64;
     // ファイル名 + size を安定ハッシュ。DefaultHasher は固定鍵 SipHash なので run/プロセスを
     // またいで決定的 (Rust バージョン更新で値が変わっても、最悪 1 度の再 ingest で済む)。
@@ -82,10 +93,10 @@ pub fn sidecar_signature(image_path: &Path) -> Option<SidecarSig> {
     size.hash(&mut h);
     // i64 に収め、加算しても画像 size と合わせて i64 を溢れさせない有界値 (約 30bit) + 1。
     let fingerprint = (h.finish() % 1_000_000_007) as i64 + 1;
-    Some(SidecarSig {
-        mtime: mtime_secs(&md),
+    SidecarSig {
+        mtime: mtime_secs(md),
         fingerprint,
-    })
+    }
 }
 
 /// 画像に対応するサイドカーから検索用テキストを取り出す。

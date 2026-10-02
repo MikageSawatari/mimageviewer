@@ -425,3 +425,58 @@ D1 / D2 / 不要を決める。計測には cold / warm、ボリュームごと�
 - spec.md に設定項目、マニュアル (お気に入り・検索の索引のページ) に設定とボタン。
   通信・保存先は変わらないので privacy.html / 製品ページ安心セクションは対象外。
 - CHANGELOG.md は公開準備で記入。
+
+## 10. S1 実装・検証記録 (2026-10-02)
+
+対象は §4 B と §5 C のみ。§3 A・§6 E は未実装。
+
+- B: フル走査を単一 DFS に変更し、直下の五列が同じフォルダは transaction を開かず置換を省く。
+  訪問集合は列挙パスの DB key とし、循環検出の canonical key とは分離した。
+  prune は未訪問の親かつ開始 stamp より古い行だけを、比較中から同じ DB lock を保持して削除する。
+  削除がある場合は 1 transaction にまとめる。watcher の部分走査は変更していない。
+  旧 DFS の `._*` ディレクトリ内への走査範囲も、再帰先と索引対象を別に集めて維持した。
+- C: 拡張子の保守的判定と 8.3 の形の判定を純関数に分離した。候補があるフォルダは既存の
+  `sidecar_signature` を使い、無いフォルダは該当する `<stem>.txt` だけを確認する。
+  署名の生成処理を共有し、mtime と fingerprint の意味・優先順位は変えていない。
+  列挙途中にエラーがあれば不在を確認できないため、既存の stat 経路を使う。
+- 独立実装レビューで C の不完全一覧からの不在判定を指摘され、上記の経路と回帰テストを追加。
+  再レビューで解消確認済み。設計からの逸脱はない。既存スキーマ・行の意味は変更していない。
+- 追加回帰は 19 件 (bulk 8、DB 5、walker 6)。skip を含まない 8.3 純関数テストを維持した。
+  この環境では使い捨て fixture に `fsutil file setshortname` で `.TXT` の別名も設定できたため、
+  追加の非対話 probe で「一覧に候補拡張子が無い状態の検出・不変走査・削除後の差分」を確認した。
+
+自動検証 (すべて exit 0、失敗・ignore 0):
+
+| コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j 1 -p mimageviewer --lib name_bulk_indexer` | 14 |
+| `cargo test -j 1 -p mimageviewer --lib search_index_db` | 35 |
+| `cargo test -j 1 -p mimageviewer --lib search_walker` | 21 |
+| `cargo test -j 1 -p mimageviewer --lib external_metadata` | 21 |
+| `cargo test -j 1 -p mimageviewer --test search_name_e2e` | 15 |
+| `cargo test -j 1 -p mimageviewer --test search_metadata_e2e` | 12 |
+| `rustc --test tests/startup_scan_shortname_probe.rs ...` → `target/debug/deps/startup_scan_shortname_probe.exe --nocapture` (一時 probe) | 1 |
+
+全体 `cargo fmt` 実行後、`cargo fmt --check` 成功。`python scripts/check_ui_glyphs.py` は問題 0。
+Cargo には `MSBUILDDISABLENODEREUSE=1` を設定し、lib テスト前に指定の FFmpeg DLL 6 本を
+`target/debug/deps` に配置した。初回の native dependency build は並列実行で停止したため、
+生成済みの turbojpeg CMake build を `--parallel 1` で完了し、Cargo を `-j 1` で再実行した。
+テスト実行前の build failure であり、製品テストの失敗ではない。
+テストログは `target/startup-scan-s1/` に保存 (最初の bulk テストはツール出力で確認)。
+一時 probe は既に検証済みの debug rlib を使用し、FFmpeg と Windows import library の検索パス、
+`-C target-feature=+crt-static -C linker=rust-lld.exe` を指定した。最初の直接リンクは Windows
+import library の検索パス不足で停止し、検索パスを追加して成功した。
+probe のソースは `target/startup-scan-s1/startup_scan_shortname_probe.rs` に保存し、通常のテスト
+対象からは除いた (短い別名を作れない環境では、恒久的な純関数テストで検証する)。
+
+確認用ビルドは `MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定し、
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功した。
+core・remote service・EPUB worker を生成し、CRT 検査も `runtime=4 pe=3` で成功した。
+不足していた承認済み EffeTune Mixwright v0.11.1 は、主作業ツリーの既存 bundle から
+実ファイルをコピーした。双方に reparse point がないことを確認し、依存版は変更していない。
+アプリ起動・実データでの性能計測は行っていない。
+
+コミットは未作成。共通 Git 管理領域
+`C:/home/mimageviewer/.git/worktrees/mimageviewer-startscan/index.lock` への書き込みが
+環境の許可範囲外で拒否され、`git add` が失敗した。指定の Co-Authored-By を末尾に含む
+コミット文は `target/startup-scan-s1/commit-message.txt` に準備済み。

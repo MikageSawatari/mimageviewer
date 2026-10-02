@@ -258,7 +258,7 @@ fn walk_dir_recursive(
         }
     };
     // read_dir 中は permit を握ったまま全エントリを舐める
-    let entries: Vec<_> = rd.flatten().collect();
+    let (entries, has_possible_sidecar) = collect_directory_sidecar_entries(rd);
     drop(_permit); // read_dir 完了後は permit を返し、子 walk 時に再取得
 
     let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -339,9 +339,9 @@ fn walk_dir_recursive(
 
         // 差分用署名: 画像はサイドカー (同名 .json/.txt) の mtime/size を織り込む。
         // これでサイドカーの追加・編集・削除が 3-way diff で検出される (§14-3/§14-4)。
-        // 検出は per-file の存在チェック (最大 4 回) + サイドカー 1 件の stat。
+        // 候補の無いフォルダは 8.3 の別名になり得る <stem>.txt だけ stat する。
         let (diff_mtime, diff_size) = if kind == CandidateKind::Image {
-            match crate::external_metadata::sidecar_signature(&path) {
+            match directory_sidecar_signature(&path, has_possible_sidecar) {
                 Some(sig) => (mtime.max(sig.mtime), file_size + sig.fingerprint),
                 None => (mtime, file_size),
             }
@@ -386,6 +386,67 @@ fn walk_dir_recursive(
     Ok(())
 }
 
+/// Windows の短い名前・Unicode 比較を取りこぼさない、保守的な拡張子判定。
+fn is_possible_sidecar_entry(path: &Path) -> bool {
+    let Some(extension) = path.extension() else {
+        return false;
+    };
+    let extension = extension.to_string_lossy();
+    !extension.is_ascii()
+        || extension.eq_ignore_ascii_case("json")
+        || extension
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("txt"))
+}
+
+fn collect_directory_sidecar_entries(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> (Vec<std::fs::DirEntry>, bool) {
+    let mut observed = Vec::new();
+    let mut has_possible_sidecar = false;
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                // 種類や除外を見る前に確認する。フォルダ・リンクも stat 版が判定する。
+                has_possible_sidecar |= is_possible_sidecar_entry(&entry.path());
+                observed.push(entry);
+            }
+            // 不完全な一覧では不在を確認できないため、既存の stat 経路を維持する。
+            Err(_) => has_possible_sidecar = true,
+        }
+    }
+    (observed, has_possible_sidecar)
+}
+
+/// 8.3 の形だけを確認する。明示設定された別名も扱うため文字種は制限しない。
+fn could_be_short_name(name: &str) -> bool {
+    if name.chars().filter(|ch| *ch == '.').count() > 1 {
+        return false;
+    }
+    let (stem, extension) = name.split_once('.').unwrap_or((name, ""));
+    stem.encode_utf16().count() <= 8 && extension.encode_utf16().count() <= 3
+}
+
+/// `.json` は 4 文字、<full>.txt は複数ドットなので、該当候補は <stem>.txt だけ。
+fn short_txt_sidecar_candidate(image_path: &Path) -> Option<PathBuf> {
+    image_path.file_name()?.to_str()?;
+    let stem = image_path.file_stem()?.to_str()?;
+    let name = format!("{stem}.txt");
+    could_be_short_name(&name).then(|| image_path.with_file_name(name))
+}
+
+fn directory_sidecar_signature(
+    image_path: &Path,
+    has_possible_sidecar: bool,
+) -> Option<crate::external_metadata::SidecarSig> {
+    if has_possible_sidecar {
+        crate::external_metadata::sidecar_signature(image_path)
+    } else {
+        short_txt_sidecar_candidate(image_path)
+            .and_then(|path| crate::external_metadata::sidecar_signature_for_candidate(&path))
+    }
+}
+
 // -----------------------------------------------------------------------
 // tests
 // -----------------------------------------------------------------------
@@ -396,6 +457,108 @@ mod tests {
     use crate::fts_index::IndexKind;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn possible_sidecar_extensions_are_conservative() {
+        for name in [
+            "a.JSON",
+            "a.TxT",
+            "a.txtold",
+            "a.TXToLD",
+            "a.jsön",
+            "a.ＴＸＴ",
+            "x.jpg.json",
+        ] {
+            assert!(is_possible_sidecar_entry(Path::new(name)), "{name}");
+        }
+        for name in ["a.jpg", "a.jsonold", "a.tx", "日本語.jpg", "a", "a."] {
+            assert!(!is_possible_sidecar_entry(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn short_name_shape_counts_utf16_and_dots_without_character_restrictions() {
+        for name in [
+            "IMG_0001.txt",
+            "日本語漢字abc.txt",
+            "😀😀😀😀.txt",
+            "a b!@#$%.txt",
+        ] {
+            assert!(could_be_short_name(name), "{name}");
+        }
+        for name in ["IMG_00010.txt", "a.json", "a.jpg.txt", "😀😀😀😀a.txt"] {
+            assert!(!could_be_short_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn no_possible_sidecar_only_probes_short_stem_txt() {
+        assert_eq!(
+            short_txt_sidecar_candidate(Path::new("dir/IMG_0001.jpg")),
+            Some(PathBuf::from("dir/IMG_0001.txt")),
+        );
+        // 純関数で stat する候補を分離。明示設定された短い別名も同じ形の判定を通る。
+        for image in [
+            "dir/long_image_name.png",
+            "dir/a.b.jpg",
+            "dir/😀😀😀😀a.jpg",
+        ] {
+            assert!(short_txt_sidecar_candidate(Path::new(image)).is_none());
+        }
+    }
+
+    #[test]
+    fn short_candidate_signature_matches_existing_signature() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("IMG_0001.jpg");
+        fs::write(&image, b"image").unwrap();
+        fs::write(image.with_extension("txt"), b"sidecar").unwrap();
+        let expected = crate::external_metadata::sidecar_signature(&image);
+        assert!(expected.is_some());
+        // 一覧に出ない明示 short name の経路も、候補名から同じ署名を作る。
+        assert_eq!(directory_sidecar_signature(&image, false), expected);
+        assert_eq!(directory_sidecar_signature(&image, true), expected);
+    }
+
+    #[test]
+    fn possible_sidecar_directory_keeps_existing_priority_and_signature() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("x.jpg");
+        fs::write(&image, b"image").unwrap();
+        fs::create_dir(tmp.path().join("x.jpg.json")).unwrap();
+        fs::write(tmp.path().join("x.txt"), b"text").unwrap();
+        assert!(is_possible_sidecar_entry(&tmp.path().join("x.jpg.json")));
+        assert_eq!(
+            directory_sidecar_signature(&image, true),
+            crate::external_metadata::sidecar_signature(&image),
+        );
+        let db = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+        let result = scan_sync(Uuid::new_v4(), tmp.path(), &db);
+        let sig = crate::external_metadata::sidecar_signature(&image).unwrap();
+        assert_eq!(result.to_ingest[0].diff_size, 5 + sig.fingerprint);
+    }
+
+    #[test]
+    fn incomplete_directory_listing_uses_existing_sidecar_detection() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("long_image_name.jpg");
+        fs::write(&image, b"image").unwrap();
+        let entry = fs::read_dir(tmp.path()).unwrap().next().unwrap().unwrap();
+        // 一覧にサイドカーが含まれなかった途中エラーを再現する。
+        fs::write(tmp.path().join("long_image_name.jpg.json"), b"{}").unwrap();
+        let (entries, possible) = collect_directory_sidecar_entries([
+            Ok(entry),
+            Err(std::io::ErrorKind::PermissionDenied.into()),
+        ]);
+        assert_eq!(entries.len(), 1);
+        assert!(possible);
+        assert!(short_txt_sidecar_candidate(&image).is_none());
+        assert!(directory_sidecar_signature(&image, possible).is_some());
+        assert_eq!(
+            directory_sidecar_signature(&image, possible),
+            crate::external_metadata::sidecar_signature(&image)
+        );
+    }
 
     fn make_file(dir: &Path, name: &str, content: &[u8]) {
         fs::write(dir.join(name), content).unwrap();

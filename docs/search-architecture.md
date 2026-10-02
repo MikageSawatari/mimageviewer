@@ -292,12 +292,22 @@ idle になった最初のフレームで `spawn_housekeeping` から別スレ�
 
 ```
 NameIndexSupervisor (1 お気に入り 1 本):
-  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF の再帰列挙
-  2. SearchIndexDb::upsert_children で差分反映 (INSERT OR REPLACE)
+  1. name_bulk_indexer::run_bulk_name_index  …… 単一の深さ優先走査で各フォルダを read_dir 1 回
+  2. SearchIndexDb::upsert_children_if_changed で直下集合を比較し、変化したフォルダだけ置換
   3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
      try_exists() ベースで判定し、新規ディレクトリなら subtree 再帰 upsert、
      削除なら ancestor chain prune + delete_subtree を実行 (詳細は §4.5)
 ```
+
+フル走査では直下行の `path / display_path / display_name / kind / mtime` が同じなら
+トランザクションを開かず書き込みを省く。進捗の分母は前回の DB フォルダ行数 + root を
+目安とし、行が無いときは件数だけを表示する。完了時は同じ `favorite_root` のうち、
+今回一覧を完全に観測した親フォルダ集合に含まれず、かつ `updated_at < scan_start_stamp`
+の行だけを削除する。比較と削除は同じ DB lock 内で行い、不変の既存行と走査開始後の
+別書き手の行を保持する。訪問集合は DB と同じ列挙パスの正規化 key を使い、循環検出の
+canonical key とは分離する。除外・存在しない root は訪問集合に入らない。
+取消・不完全観測・DB 更新失敗の場合は prune せず、不完全なフォルダは置換もしない。
+watcher の部分走査は既存の `upsert_children` と stamp による subtree prune を維持する。
 
 - アイテム索引側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。
