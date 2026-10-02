@@ -1,6 +1,6 @@
 # 起動時の索引スキャン軽減 (v4.3.0)
 
-状態: 設計第 3 版 (実装前レビュー 2 回目の指摘を反映)。ブランチ `v430-startup-scan`。
+状態: 設計第 4 版 (実装前レビュー 3 回目の指摘を反映)。ブランチ `v430-startup-scan`。
 
 ## 1. 背景
 
@@ -93,7 +93,8 @@
 
 - 所有範囲 = 自分の root の配下から、自分の除外 root (共通除外 + 入れ子) の配下を除いた範囲。
   walker の DB 側一覧 (`list_favorite_files`) を、`favorite_id` ではなく **パスの範囲** で引く
-  (主キー `path` の範囲検索。除外 root 配下の行は Rust 側で落とす)。
+  (主キー `path` の範囲検索。除外 root を差し引いた複数の区間を SQL で引き、除外配下の行は
+  取得しない。外側が内側の全行を読む重複を避けるため。取得行数と時間を perf に出す)。
 - 差分の判定に「持ち主の不一致」を加える: 範囲内の行で `favorite_id` か `favorite_root` が
   自分と違うものは、mtime/size が同じでも取り込み直す (upsert が両方を自分に書き換え、
   Tantivy の favorite_id も更新される)。FS に無ければ削除する。
@@ -102,8 +103,8 @@
   (§6.3 の指紋も変わる) と新しい側の走査がそれぞれ自分の範囲を片付ける。
   行を先に消す処理が無いので、既に FS から消えたファイルの Tantivy 文書も、
   範囲の持ち主の走査が削除候補として拾う (walker の削除候補は DB 行から作る、
-  [search_walker.rs:199](../src/search_walker.rs))。同じ UUID のまま root だけ変えた場合も
-  `favorite_root` の不一致として取り込み直される。
+  [search_walker.rs:199](../src/search_walker.rs))。所有範囲の外に出た行 (root の変更、共通除外の
+  拡大) は走査が見ないので、次節の作り直しの手順 3 で消す。
 - **不完全観測では削除しない**: `read_dir` 失敗などで観測が不完全な走査は、
   削除候補を作らない (取り込み・更新は確認できた分だけ行う)。現在は `read_dir` 失敗を診断に
   記録するだけで、その配下の DB 行を全部「FS に無い」として削除する
@@ -119,26 +120,45 @@
   同じパスを取り込んだ文書を消してしまう。また、取消で SQLite に反映されなかった
   Tantivy だけの文書を消せない。ID の term で消せば、今その ID を持つ文書だけが消える。
 
-### 実行中の構成変更
+### 実行中の構成変更: 重なるグループを止めて作り直す
 
-- 作り直しの判定は今の条件 (root・metadata・実効 similar の変化、
-  [indexer_manager.rs:490](../src/indexer_manager.rs)) に **除外 root の変化** を加える。
-  入れ子の内側を足した・外したときは外側も作り直す。並べ替え・改名では作り直さない。
-- 同じ UUID の旧 supervisor が止まり切ってから新しいものを作る (今は止まるのを待たずに作る、
-  [indexer_manager.rs:553](../src/indexer_manager.rs))。旧と新が同時に同じ範囲を書くと、
-  持ち主の不一致で取り込みが 1 回余分に起きるだけで壊れはしないが、外側の旧 supervisor が
-  内側の範囲を書き戻すと次の走査まで内側の絞り込みから漏れるため。停止は cancel の確認点が
-  50ms ごとにあるので短い。待ちは UI スレッドでせず manager の worker で行い、待っている間に
-  次の変更が来たら最新の構成 1 つにまとめる。
-- 停止を始める時点で、その watcher を similar へ `watch_unavailable` として知らせる
-  (今は watcher を落とすだけで、次の `begin_watch` まで similar には古い Ready が残る、
-  [indexer_supervisor.rs:599](../src/indexer_supervisor.rs)、[similar_index.rs:2490](../src/similar_index.rs))。
+設計の簡素化 (CLAUDE.md) の「閉じて作り直す」に従う。動いている supervisor を新しい所有範囲へ
+追従させる処理は作らない。
+
+- **実効 metadata 状態** = 「`auto_index_metadata` が ON で、かつ所有者の規則で走査する側」
+  (同じ root の非所有者は OFF 扱い)。稼働対象の決定、構成の比較、spawn の 3 か所でこれを使う
+  (今は保存フラグを比べる、[indexer_manager.rs:497](../src/indexer_manager.rs))。
+- 構成 = 各お気に入りの (UUID、正規化 root、実効 metadata、実効 similar) と共通除外 root。
+  変化したお気に入りがあれば、その旧 root と新 root の **どちらかと重なる** (同じ・祖先・子孫)
+  お気に入りを推移的に集めたものを「グループ」とする。共通除外が変わったときは全お気に入り。
+  重ならないお気に入りは今と同じく触らない。並べ替え・改名は構成を変えない。
+- グループの作り直しは manager の worker で 1 本ずつ行い、UI スレッドは待たない。
+  待っている間に来た変更は最新の構成 1 つにまとめる。手順:
+  1. グループの各 supervisor に **書き込みを済ませて止まる** 停止 (`StopMode::Drain`) を送る。
+     走査は次の確認点で止めるが、writer へ投入済みのバッチは返信を待ち、SQLite まで反映してから
+     抜ける。アプリ終了時の停止 (`StopMode::Shutdown`、今の取消) とは型で分ける
+     (今は取消で返信待ちをやめ SQLite 反映を省く、[fts_writer_dispatcher.rs:190](../src/fts_writer_dispatcher.rs)、
+     [ingest_worker.rs:185](../src/ingest_worker.rs))。停止を始める時点で similar へ
+     `watch_unavailable` を知らせる (今は watcher を落とすだけで、次の `begin_watch` まで古い Ready が
+     残る、[indexer_supervisor.rs:599](../src/indexer_supervisor.rs)、[similar_index.rs:2490](../src/similar_index.rs))。
+  2. 全員の join を待つ。
+  3. 掃除 (Tantivy First: Tantivy の commit / reload が成功してから SQLite):
+     - 削除・OFF になった UUID、**root が変わった UUID**: Tantivy を `favorite_id` の term で全削除、
+       SQLite も `favorite_id` で削除。root が変わった方は手順 4 で新 root を全走査する。
+       ID の term で消すので、取消で SQLite に載らなかった Tantivy だけの文書も消える。
+     - それ以外のグループの UUID: SQLite で「その UUID の行のうち新しい所有範囲の外」を列挙し、
+       パスごとに Tantivy から消してから SQLite から消す (共通除外を広げた場合など)。
+  4. 新しい構成でグループの supervisor を作る (初回走査は §6 の規則どおり)。
+- 今の「停止を待たずに作る」「OFF の purge を停止前に行う」([indexer_manager.rs:553](../src/indexer_manager.rs)、
+  [app.rs:26826](../src/app.rs)) はこの経路に置き換えて無くす。
 - App 側の呼び出し順は `similar.configure` → `sync_with_favorites` に揃える
   ([app.rs:25709](../src/app.rs) の順。お気に入りの編集画面の呼び出し順
   [favorites_editor.rs:1050](../src/ui_dialogs/favorites_editor.rs) も揃える)。
-- 取消で Tantivy だけに反映された文書が、その後ファイルの削除で残る問題は、今もある
-  (search-architecture §4.1 終了応答性)。範囲の持ち主の走査は FS にあるファイルを取り込み直すので、
-  残るのは「取消と同じ時期にファイルも消えた」場合だけ。今回は扱いを変えない。
+- 起動時は前回の構成が手元に無いので、起動時 reconciliation で「どの実効 metadata お気に入りの
+  所有範囲にも入らない行」と「UUID の所有範囲の外にある行」を、手順 3 の後者と同じ方法で消す。
+- アプリ終了時の取消で Tantivy だけに反映された文書は、今もある問題
+  (search-architecture §4.1 終了応答性) で、扱いを変えない。範囲の持ち主の走査は FS にあるファイルを
+  取り込み直すので、残るのは「終了と同じ時期にファイルも消えた」場合だけ。
 
 ### 名前索引
 
@@ -189,6 +209,13 @@
   - 拡張子に ASCII 以外の文字を含むもの (Windows の名前比較は大文字小文字の変換表を使い、
     Rust の小文字化と同じとは限らないので、判定できないものは「あり」に倒す)。
   - 種類 (ファイル・フォルダ・リンク) は問わない (stat 版が判定する)。
+- 短い名前 (8.3) の別名: 自動生成の短い名前も、`SetFileShortNameW` で明示した短い名前も、
+  一覧 (`DirEntry::file_name` は長い名前) には出ない。そこで「サイドカーになり得るエントリが無い」
+  フォルダでも、**8.3 の形になり得る候補** (stem が UTF-16 で 8 文字以下・拡張子 3 文字以下・
+  ドットが 1 つ以下。文字種は見ない) だけは stat する。`.json` は拡張子 4 文字なので該当せず、
+  該当し得るのは `<stem>.txt` だけ。`IMG_0001.jpg` なら `IMG_0001.txt` の 1 回、
+  `ComfyUI_00001_.png` のような長い名前なら 0 回になる。stat した結果の値は既存と同じ
+  (`sidecar_signature` の候補順で、短い名前の候補より前の候補は一覧から無いと分かっている)。
 - 画像ごとに名前を突き合わせる細かい判定はしない。画像名の比較の同値性 (短い名前の別名、
   Unicode の大文字小文字) を保証しにくく、サイドカーのあるフォルダでは今と同じ費用で足りる。
   効くのは「サイドカーが 1 つも無いフォルダ」で、生成画像の出力フォルダの多くがこれに当たる。
@@ -309,8 +336,12 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
   FS から消えたファイルは Tantivy からも消える、同じ UUID で root を変えたとき favorite_root が
   更新される。不完全観測 (read_dir 失敗) の走査で削除が起きないこと。
   同一 root の重複 (UUID 最小が所有)、並べ替えで所有者が変わらない、内側の追加・削除・OFF・
-  パス変更を実行中に行ったとき外側も作り直され、同じ UUID の旧 supervisor が止まってから
-  新しいものが動くこと、待っている間の連続変更が最新構成 1 つにまとまること。
+  パス変更を実行中に行ったとき重なるグループだけが作り直され、重ならないお気に入りは動き続けること、
+  Drain 停止で投入済みバッチが SQLite まで反映されてから掃除と再作成が行われること、
+  root を変えた UUID の旧 root の文書 (Tantivy だけのものを含む) が消えること、
+  共通除外を広げたとき範囲外の行が消えること、同じ root に UUID の小さいお気に入りを足したとき
+  旧勝者が止まり新しい所有者だけが走ること、待っている間の連続変更が最新構成 1 つにまとまること、
+  起動時に所有範囲外の行が消えること。
   OFF の purge が ID の term で行われ、同じパスを取り込み直した別の持ち主の文書を消さないこと。
   停止開始時に similar へ watch_unavailable が届くこと。
   名前索引: OFF→ON の連続で古い clear が新しい走査の後に走らないこと、同じ root の別 UUID を
@@ -322,7 +353,9 @@ scanned_once(k, scope) = { fingerprint }    // 行が無い = 印なし
   更新されること。不完全観測で prune しないこと。
 - C: サイドカーになり得るエントリが無いフォルダで stat を呼ばないこと (関数分離か呼び出し計数)。
   あるフォルダでは既存と同じ値になること。「なり得る」の判定: 大文字の拡張子、`.txtold`、
-  拡張子に ASCII 以外を含む名前、`x.jpg.json` がフォルダの場合。
+  拡張子に ASCII 以外を含む名前、`x.jpg.json` がフォルダの場合。8.3 の形の候補だけ stat すること
+  (`IMG_0001.jpg` は 1 回、長い名前は 0 回)、短い名前を明示設定したファイルが従来どおり検出されること
+  (短い名前を作れない環境ではテストを skip せず、8.3 判定の純関数テストで代える)。
 - E: 印あり + 指紋一致で初回 Full が走らないこと / 指紋不一致・印なし・設定 OFF で走ること /
   完全な Full でだけ印が立ち、取消・不完全観測・書き込み失敗では立たないこと /
   ストアの作り直しで印が消え、同じ起動で省かないこと / 付け替え行のある root は走査すること /
