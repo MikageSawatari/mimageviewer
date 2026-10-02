@@ -40,7 +40,7 @@ fn candidate_paths(image_path: &Path) -> Vec<PathBuf> {
 /// 存在チェックのみ (ディレクトリ走査はしない)。最大 4 回の `metadata` syscall。
 fn detect_with_meta(image_path: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
     for cand in candidate_paths(image_path) {
-        if let Ok(md) = std::fs::metadata(&cand) {
+        if let Ok(md) = sidecar_metadata(&cand) {
             if md.is_file() {
                 return Some((cand, md));
             }
@@ -77,8 +77,28 @@ pub fn sidecar_signature(image_path: &Path) -> Option<SidecarSig> {
 /// walker が一覧から他の候補の不在を確認した場合の、8.3 候補 1 件の確認。
 /// 通常の検出と同じ candidate 名・metadata から署名を作る。
 pub(crate) fn sidecar_signature_for_candidate(path: &Path) -> Option<SidecarSig> {
-    let md = std::fs::metadata(path).ok()?;
+    let md = sidecar_metadata(path).ok()?;
     md.is_file().then(|| signature_from_meta(path, &md))
+}
+
+fn sidecar_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    SIDECAR_PROBES.with(|count| count.set(count.get() + 1));
+    std::fs::metadata(path)
+}
+
+// スレッドごとに実際の stat 境界を計数し、並列テストの検出と混ぜない。
+#[cfg(test)]
+thread_local! {
+    static SIDECAR_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_sidecar_probes<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    let before = SIDECAR_PROBES.with(std::cell::Cell::get);
+    let result = run();
+    let count = SIDECAR_PROBES.with(std::cell::Cell::get) - before;
+    (result, count)
 }
 
 fn signature_from_meta(path: &Path, md: &std::fs::Metadata) -> SidecarSig {

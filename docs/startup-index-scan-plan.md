@@ -480,3 +480,80 @@ core・remote service・EPUB worker を生成し、CRT 検査も `runtime=4 pe=3
 `C:/home/mimageviewer/.git/worktrees/mimageviewer-startscan/index.lock` への書き込みが
 環境の許可範囲外で拒否され、`git add` が失敗した。指定の Co-Authored-By を末尾に含む
 コミット文は `target/startup-scan-s1/commit-message.txt` に準備済み。
+
+## 11. S2 の部分実装 (2026-10-02)
+
+S2 全体は未完了。今回の独立した変更単位は、S1 レビュー残件 P3 と、§3 の
+「不完全観測では削除しない」契約 (S2 brief の項目 3) のみ。
+実行中の再構成は manager / supervisor / ingest / dispatcher / similar と名前索引の
+停止所有をまとめて変更する規模のため、利用者が許可した coherent green subset の
+区切りを使う。所有規則を一部の consumer だけへ配線する変更は入れていない。
+
+- `search_walker::ScanResult` に `ObservationCompleteness::Complete / Incomplete` を追加。
+  `ScanDiag` の read_dir、iterator entry、file_type、特殊エントリ分類、metadata、深さ制限の
+  失敗から完全性を決め、Incomplete では `to_delete` を作らない。
+  観測できた新規・変更候補の取り込みは従来どおり。取消は成功結果にせず、既存の Err を返す。
+  root が存在せず read_dir が失敗した場合も、不在を確定せず既存行を保持する。
+- `fs_entry::try_classify_dir_entry` で、Windows の特殊エントリ分類内の属性取得失敗を
+  walker へ伝える。既存の `classify_dir_entry` は従来の fallback を保つ wrapper とした。
+  UI 同期 I/O、常駐 worker、永続スキーマ・行の意味の変更はない。
+- private な `WalkerIo` 境界へ実 FS と決定的な失敗注入をつなぎ、全観測失敗での削除禁止と
+  新規・変更取り込みの維持、次の完全走査で通常削除へ戻ることを固定した。
+- P3 は `external_metadata` の両経路が通る stat 境界を cfg(test) の thread-local counter で
+  計数。実 `scan` で長い画像名 0 回・`IMG_0001.jpg` 1 回を検証し、同じ境界で旧関数の
+  4 回も陽性対照として検証する。walker が旧関数の直呼びへ戻ると 0 / 1 の assertion が落ちる。
+- `indexer_supervisor::run_initial_scan` のログへ完全性と追加の診断件数を反映。
+  `initial_scan_done` の意味は変えていない。完全性の型は FS 観測だけの結果なので、
+  S3 の印には書き込み・prune の typed 成功結果との組み合わせが必要。
+- 新規回帰は walker 9 件と `search_metadata_e2e` 1 件の計 10 件。
+  統合テストは使い捨て fixture の root を移動して read_dir 失敗を作り、SQLite / Tantivy の
+  両方の保持と、復旧後の通常取り込み・削除まで確認する。追加テストは timing / sleep に依存しない。
+- 独立レビュー (`gpt-6.1-sol` / `xhigh`) は設計と完成差分を確認し、必須修正の指摘なし。
+  実装・自動検証は親の実装担当が所有し、reviewer は Cargo を重複実行していない。
+
+未実装 (S2 brief の項目番号):
+
+- 1: `metadata_ownership` と全 consumer の接続 (最深 root、UUID 同点決着、共通除外、実効 metadata)。
+- 2: 除外を差し引く複数 SQL range の walker diff、所有 ID / root 不一致の再取り込み、perf。
+- 4: OFF / 削除の favorite_id term purge と Tantivy First。
+- 5: Ctrl+G の所有 filter set と、お気に入り件数への同じ集合の適用。
+- 6: 推移的な重複グループ、固定 snapshot・最新要求合体の manager worker、単調な StopMode、
+  typed DrainOutcome と失敗伝播、join 後の掃除・再作成、worker 所有 handle を含む 4 秒 shutdown、
+  similar registration の revoke と旧 generation 拒否、App 呼出順統一。
+- 7: 起動 reconciliation の所有範囲外掃除、強制 Full の root 集合、perf / 必要な索引の計測。
+- 8: 名前索引の正規化 root 単位の supervisor と停止・clear・起動の直列化、共有 root の保護、
+  起動・編集の統合、UUID 進捗の解決、S3 の marker 削除 hook。
+- §6 E / S3 は未着手。Drain / Shutdown / coalescing / revoked registration の gate 付き回帰は、
+  項目 6 と同じ変更単位で追加する。今回の結果を S2 全体の acceptance として扱わない。
+
+自動検証 (すべて exit 0、失敗・ignore 0。以下の記録済み実行の合計 111 件):
+
+| コマンド | 成功件数 |
+| --- | ---: |
+| `cargo test -j 1 -p mimageviewer --lib search_walker` | 30 |
+| `cargo test -j 1 -p mimageviewer --lib external_metadata` | 21 |
+| `cargo test -j 1 -p mimageviewer --lib fs_entry` | 7 |
+| `cargo test -j 1 -p mimageviewer --lib indexer_supervisor` | 11 |
+| `cargo test -j 1 -p mimageviewer --lib name_bulk_indexer` | 14 |
+| `cargo test -j 1 -p mimageviewer --test search_metadata_e2e` | 13 |
+| `cargo test -j 1 -p mimageviewer --test search_name_e2e` | 15 |
+
+`MSBUILDDISABLENODEREUSE=1` を設定し、既存の `target/debug/deps` の FFmpeg DLL を使用した。
+最初の walker 実行は結果の捕捉が不足したため、コンパイル終了後に同じコマンドを再実行して
+ログを保存した (表の 30 件は記録済みの再実行分)。
+`cargo check -j 1 -p mimageviewer --bin mimageviewer-core` も exit 0。
+依存の初回検査と native build を含め 11 分 38 秒かかったが、timeout / 中断はない。
+全体 `cargo fmt` と `cargo fmt --check` は成功、`python scripts/check_ui_glyphs.py` は問題 0。
+workspace 全体のテスト、アプリ起動、実データによる対話検証は行っていない。
+ログは `target/startup-scan-s2/` に保存した。
+
+確認用 build は `MSBUILDDISABLENODEREUSE=1`・`CARGO_BUILD_JOBS=1` を設定し、
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で exit 0。
+通常 feature set の core・remote service・EPUB worker を生成し、CRT 検査は
+`runtime=4 pe=3` で成功した。core の最適化コンパイルは 8 分 39 秒。
+成果物は起動していない。通常 `%APPDATA%\mimageviewer` の設定・データには触れていない。
+
+Git の書き込み・stash・コミットは利用者の指定どおり行っていない。
+今回の部分実装専用のコミット文を `target/startup-scan-s2/commit-message.txt` に保存した。
+末尾は指定の `Co-Authored-By: Codex GPT-6.1 Sol <noreply@openai.com>`。
+ブランチは `v430-startup-scan`、HEAD は `9da28d637` のまま。

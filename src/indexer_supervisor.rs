@@ -681,11 +681,13 @@ fn run_initial_scan(
     let walk_ms = t_walk.elapsed().as_millis() as u64;
     let total_scanned = scan.total_scanned;
     let diag = scan.diag;
+    let completeness = scan.completeness;
     let ingest_n = scan.to_ingest.len();
     let delete_n = scan.to_delete.len();
     crate::logger::log(format!(
         "indexer[{favorite_id}]: walker done in {walk_ms} ms \
-         (scanned={total_scanned}, to_ingest={ingest_n}, to_delete={delete_n})"
+         (scanned={total_scanned}, to_ingest={ingest_n}, to_delete={delete_n}, \
+          observation={completeness:?})"
     ));
 
     // ingest フェーズでのみ共有 writer を lock する。walker は lock 不要なので、
@@ -724,12 +726,15 @@ fn run_initial_scan(
         "indexer[{favorite_id}]: {scan_kind} scan done in {dur_ms} ms \
          (walker={walk_ms}ms, ingest={ingest_ms}ms, scanned={total_scanned}, \
           ingest_ok={}, ingest_failed={}, deleted={}, \
-          read_dir_err={}, file_type_err={}, metadata_err={}, depth_hits={})",
+          read_dir_err={}, entry_err={}, file_type_err={}, classification_err={}, \
+          metadata_err={}, depth_hits={}, observation={completeness:?})",
         ingest_stats.ingested_ok,
         ingest_stats.ingested_failed,
         ingest_stats.deleted,
         diag.read_dir_errors,
+        diag.entry_errors,
         diag.file_type_errors,
+        diag.classification_errors,
         diag.metadata_errors,
         diag.depth_limit_hits,
     ));

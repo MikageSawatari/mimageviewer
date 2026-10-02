@@ -212,6 +212,16 @@ IngestSession の writer は IndexerManager が保有する dispatcher 経由で
 Tantivy writer には触れない。
 ```
 
+アイテム索引の Full は `ScanResult::completeness` で FS の観測結果を
+`ObservationCompleteness::Complete / Incomplete` に分ける。read_dir 失敗、iterator の
+entry error、file_type / 特殊エントリ分類 / metadata 取得失敗、深さ制限のいずれかがあれば
+Incomplete とし、その走査では削除候補を生成しない。観測できた新規・変更ファイルの
+取り込みは継続する。存在しない root も read_dir 失敗なので、読めなかった既存行を保持する。
+診断には `entry_errors` と `classification_errors` も残し、supervisor のログに完全性を出す。
+取消は結果を成功として返さず、既存の取消経路で終了する。
+この型は観測の完全性だけを表し、書き込みの成功や Full 全体の成功を保証しない。
+起動省略の印は未実装 (詳細・残作業は [起動スキャン計画](startup-index-scan-plan.md) §11)。
+
 #### 終了応答性と有界 shutdown
 
 大量削除では watcher overflow の full rescan、または debounce 済みイベント列が

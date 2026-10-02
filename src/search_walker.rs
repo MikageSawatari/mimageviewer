@@ -78,6 +78,17 @@ pub struct ScanResult {
     /// 診断統計 (Codex 6 回目 nice-to-have #2): インデックス管理ダイアログの
     /// トラブルシューティング表示で使える
     pub diag: ScanDiag,
+    /// 観測の完全性。Incomplete でも観測済み候補の取り込みは継続する。
+    /// 完全な Full の印を立てる際は、別途すべての書き込み成功も確認すること。
+    pub completeness: ObservationCompleteness,
+}
+
+/// FS の不在を確定できるか。未走査の既定値を Complete にしない。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationCompleteness {
+    Complete,
+    #[default]
+    Incomplete,
 }
 
 /// walker の診断統計。read_dir / file_type / metadata 失敗の件数を持つ。
@@ -85,12 +96,66 @@ pub struct ScanResult {
 pub struct ScanDiag {
     /// std::fs::read_dir が失敗した回数 (典型例: アクセス拒否フォルダ)
     pub read_dir_errors: usize,
+    /// read_dir の iterator が個別エントリを返せなかった回数
+    pub entry_errors: usize,
     /// DirEntry::file_type() が失敗した回数 (稀)
     pub file_type_errors: usize,
+    /// reparse point 等の分類中に属性を取得できなかった回数
+    pub classification_errors: usize,
     /// DirEntry::metadata() が失敗した回数 (削除競合等)
     pub metadata_errors: usize,
     /// 最大深度 (MAX_DEPTH) に到達して打ち切ったディレクトリ数
     pub depth_limit_hits: usize,
+}
+
+impl ScanDiag {
+    fn completeness(self) -> ObservationCompleteness {
+        if self.read_dir_errors == 0
+            && self.entry_errors == 0
+            && self.file_type_errors == 0
+            && self.classification_errors == 0
+            && self.metadata_errors == 0
+            && self.depth_limit_hits == 0
+        {
+            ObservationCompleteness::Complete
+        } else {
+            ObservationCompleteness::Incomplete
+        }
+    }
+}
+
+/// 実 FS と同じ走査経路で、観測失敗を決定的に検証するための I/O 境界。
+trait WalkerIo {
+    type Entries: Iterator<Item = std::io::Result<std::fs::DirEntry>>;
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<Self::Entries>;
+    fn file_type(&self, entry: &std::fs::DirEntry) -> std::io::Result<std::fs::FileType>;
+    fn metadata(&self, entry: &std::fs::DirEntry) -> std::io::Result<std::fs::Metadata>;
+    fn classify(
+        &self,
+        entry: &std::fs::DirEntry,
+        file_type: &std::fs::FileType,
+    ) -> std::io::Result<crate::fs_entry::DirEntryKind> {
+        crate::fs_entry::try_classify_dir_entry(entry, file_type)
+    }
+}
+
+struct FsWalkerIo;
+
+impl WalkerIo for FsWalkerIo {
+    type Entries = std::fs::ReadDir;
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<Self::Entries> {
+        std::fs::read_dir(path)
+    }
+
+    fn file_type(&self, entry: &std::fs::DirEntry) -> std::io::Result<std::fs::FileType> {
+        entry.file_type()
+    }
+
+    fn metadata(&self, entry: &std::fs::DirEntry) -> std::io::Result<std::fs::Metadata> {
+        entry.metadata()
+    }
 }
 
 /// 走査開始パラメータ。
@@ -132,6 +197,17 @@ pub fn scan(
     priority: IoPriority,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
 ) -> Result<ScanResult, String> {
+    scan_with_io(params, db, io_sem, priority, activity_gate, &FsWalkerIo)
+}
+
+fn scan_with_io(
+    params: ScanParams,
+    db: &FtsMetaDb,
+    io_sem: &GlobalIoSemaphore,
+    priority: IoPriority,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    io: &impl WalkerIo,
+) -> Result<ScanResult, String> {
     let ScanParams {
         favorite_id,
         root,
@@ -156,6 +232,7 @@ pub fn scan(
         0,
         &mut visited,
         &excluded_roots,
+        io,
     )?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
@@ -174,6 +251,7 @@ pub fn scan(
     let mut result = ScanResult::default();
     result.total_scanned = fs_map.len();
     result.diag = diag;
+    result.completeness = diag.completeness();
 
     for (key, cand) in &fs_map {
         if cancel.load(Ordering::Relaxed) {
@@ -196,13 +274,20 @@ pub fn scan(
             }
         }
     }
-    for key in db_map.keys() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
+    // 不完全な観測は「FS に無い」証明にならない。取り込みは残し、削除だけ生成しない。
+    if result.completeness == ObservationCompleteness::Complete {
+        for key in db_map.keys() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            if !fs_map.contains_key(key) {
+                result.to_delete.push(key.clone());
+            }
         }
-        if !fs_map.contains_key(key) {
-            result.to_delete.push(key.clone());
-        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
     }
 
     Ok(result)
@@ -221,6 +306,7 @@ fn walk_dir_recursive(
     depth: u32,
     visited: &mut std::collections::HashSet<String>,
     excluded_roots: &[PathBuf],
+    io: &impl WalkerIo,
 ) -> Result<(), String> {
     // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
     const MAX_DEPTH: u32 = 40;
@@ -250,7 +336,7 @@ fn walk_dir_recursive(
     let Some(_permit) = io_sem.acquire_cancellable(priority, cancel) else {
         return Ok(());
     };
-    let rd = match std::fs::read_dir(dir) {
+    let rd = match io.read_dir(dir) {
         Ok(r) => r,
         Err(_) => {
             diag.read_dir_errors += 1;
@@ -258,7 +344,7 @@ fn walk_dir_recursive(
         }
     };
     // read_dir 中は permit を握ったまま全エントリを舐める
-    let (entries, has_possible_sidecar) = collect_directory_sidecar_entries(rd);
+    let (entries, has_possible_sidecar) = collect_directory_sidecar_entries(rd, diag);
     drop(_permit); // read_dir 完了後は permit を返し、子 walk 時に再取得
 
     let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -270,7 +356,7 @@ fn walk_dir_recursive(
             continue;
         }
         // ★ file_type() は entry がキャッシュしているので syscall なし
-        let file_type = match entry.file_type() {
+        let file_type = match io.file_type(&entry) {
             Ok(ft) => ft,
             Err(_) => {
                 diag.file_type_errors += 1;
@@ -286,7 +372,13 @@ fn walk_dir_recursive(
             continue;
         }
 
-        let entry_kind = crate::fs_entry::classify_dir_entry(&entry, &file_type);
+        let entry_kind = match io.classify(&entry, &file_type) {
+            Ok(kind) => kind,
+            Err(_) => {
+                diag.classification_errors += 1;
+                continue;
+            }
+        };
         if entry_kind.is_directory() {
             subdirs.push(path);
             continue;
@@ -322,15 +414,18 @@ fn walk_dir_recursive(
             continue;
         };
 
-        let metadata = match entry.metadata() {
+        let metadata = match io.metadata(&entry) {
             Ok(m) => m,
             Err(_) => {
                 diag.metadata_errors += 1;
                 continue;
             }
         };
-        let mtime = metadata
-            .modified()
+        let modified = metadata.modified();
+        if modified.is_err() {
+            diag.metadata_errors += 1;
+        }
+        let mtime = modified
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
@@ -381,6 +476,7 @@ fn walk_dir_recursive(
             depth + 1,
             visited,
             excluded_roots,
+            io,
         )?;
     }
     Ok(())
@@ -401,6 +497,7 @@ fn is_possible_sidecar_entry(path: &Path) -> bool {
 
 fn collect_directory_sidecar_entries(
     entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    diag: &mut ScanDiag,
 ) -> (Vec<std::fs::DirEntry>, bool) {
     let mut observed = Vec::new();
     let mut has_possible_sidecar = false;
@@ -412,7 +509,10 @@ fn collect_directory_sidecar_entries(
                 observed.push(entry);
             }
             // 不完全な一覧では不在を確認できないため、既存の stat 経路を維持する。
-            Err(_) => has_possible_sidecar = true,
+            Err(_) => {
+                has_possible_sidecar = true;
+                diag.entry_errors += 1;
+            }
         }
     }
     (observed, has_possible_sidecar)
@@ -546,12 +646,15 @@ mod tests {
         let entry = fs::read_dir(tmp.path()).unwrap().next().unwrap().unwrap();
         // 一覧にサイドカーが含まれなかった途中エラーを再現する。
         fs::write(tmp.path().join("long_image_name.jpg.json"), b"{}").unwrap();
-        let (entries, possible) = collect_directory_sidecar_entries([
-            Ok(entry),
-            Err(std::io::ErrorKind::PermissionDenied.into()),
-        ]);
+        let mut diag = ScanDiag::default();
+        let (entries, possible) = collect_directory_sidecar_entries(
+            [Ok(entry), Err(std::io::ErrorKind::PermissionDenied.into())],
+            &mut diag,
+        );
         assert_eq!(entries.len(), 1);
         assert!(possible);
+        assert_eq!(diag.entry_errors, 1);
+        assert_eq!(diag.completeness(), ObservationCompleteness::Incomplete);
         assert!(short_txt_sidecar_candidate(&image).is_none());
         assert!(directory_sidecar_signature(&image, possible).is_some());
         assert_eq!(
@@ -591,6 +694,259 @@ mod tests {
     }
 
     #[test]
+    fn real_walker_long_image_name_makes_zero_sidecar_probes() {
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("photos");
+        fs::create_dir(&root).unwrap();
+        let image = root.join("long_image_name.jpg");
+        fs::write(&image, b"image").unwrap();
+
+        let (result, probes) = crate::external_metadata::count_sidecar_probes(|| {
+            scan_sync(Uuid::new_v4(), &root, &db)
+        });
+        assert_eq!(result.to_ingest.len(), 1);
+        assert_eq!(probes, 0);
+
+        // 旧 four-probe 直呼びも同じ stat 境界で計数され、回帰した walker は上で落ちる。
+        let (sig, old_probes) = crate::external_metadata::count_sidecar_probes(|| {
+            crate::external_metadata::sidecar_signature(&image)
+        });
+        assert!(sig.is_none());
+        assert_eq!(old_probes, 4);
+    }
+
+    #[test]
+    fn real_walker_short_image_name_makes_exactly_one_sidecar_probe() {
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("photos");
+        fs::create_dir(&root).unwrap();
+        make_file(&root, "IMG_0001.jpg", b"image");
+
+        let (result, probes) = crate::external_metadata::count_sidecar_probes(|| {
+            scan_sync(Uuid::new_v4(), &root, &db)
+        });
+        assert_eq!(result.to_ingest.len(), 1);
+        assert_eq!(probes, 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ObservationFault {
+        ReadDir,
+        Entry,
+        FileType,
+        Classification,
+        Metadata,
+    }
+
+    struct FaultIo {
+        target: PathBuf,
+        fault: ObservationFault,
+    }
+
+    impl WalkerIo for FaultIo {
+        type Entries = std::vec::IntoIter<std::io::Result<std::fs::DirEntry>>;
+
+        fn read_dir(&self, path: &Path) -> std::io::Result<Self::Entries> {
+            if path == self.target && matches!(self.fault, ObservationFault::ReadDir) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            let mut entries: Vec<_> = fs::read_dir(path)?.collect();
+            if path == self.target && matches!(self.fault, ObservationFault::Entry) {
+                entries.push(Err(std::io::ErrorKind::PermissionDenied.into()));
+            }
+            Ok(entries.into_iter())
+        }
+
+        fn file_type(&self, entry: &std::fs::DirEntry) -> std::io::Result<std::fs::FileType> {
+            if entry.path() == self.target && matches!(self.fault, ObservationFault::FileType) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            entry.file_type()
+        }
+
+        fn classify(
+            &self,
+            entry: &std::fs::DirEntry,
+            file_type: &std::fs::FileType,
+        ) -> std::io::Result<crate::fs_entry::DirEntryKind> {
+            if entry.path() == self.target && matches!(self.fault, ObservationFault::Classification)
+            {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            crate::fs_entry::try_classify_dir_entry(entry, file_type)
+        }
+
+        fn metadata(&self, entry: &std::fs::DirEntry) -> std::io::Result<std::fs::Metadata> {
+            if entry.path() == self.target && matches!(self.fault, ObservationFault::Metadata) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            entry.metadata()
+        }
+    }
+
+    fn assert_incomplete_scan_keeps_observed_changes(fault: ObservationFault) -> ScanDiag {
+        let (tmp, db) = tmp_db();
+        let fav = Uuid::new_v4();
+        let root = tmp.path().join("photos");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        make_file(&root, "new_image.jpg", b"new");
+        make_file(&root, "updated_image.jpg", b"updated");
+        make_file(&root, "unchanged_image.jpg", b"unchanged");
+        make_file(&child, "unobserved_image.jpg", b"unobserved");
+
+        let first = scan_sync(fav, &root, &db);
+        assert_eq!(first.completeness, ObservationCompleteness::Complete);
+        for candidate in first.to_ingest {
+            if candidate.abs_path != root.join("new_image.jpg") {
+                let changed = candidate.abs_path == root.join("updated_image.jpg");
+                db.upsert_meta_ok(
+                    &candidate.key,
+                    fav,
+                    &root,
+                    IndexKind::Image,
+                    if changed { 0 } else { candidate.diff_mtime },
+                    if changed { 0 } else { candidate.diff_size },
+                )
+                .unwrap();
+            }
+        }
+        let absent = normalize_path(&root.join("gone_image.jpg"));
+        db.upsert_meta_ok(&absent, fav, &root, IndexKind::Image, 1, 1)
+            .unwrap();
+
+        let target = match fault {
+            ObservationFault::ReadDir | ObservationFault::Entry => child,
+            _ => child.join("unobserved_image.jpg"),
+        };
+        let result = scan_with_io(
+            ScanParams {
+                favorite_id: fav,
+                root: root.clone(),
+                excluded_roots: Vec::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: None,
+            },
+            &db,
+            &GlobalIoSemaphore::new(2),
+            IoPriority::Normal,
+            None,
+            &FaultIo { target, fault },
+        )
+        .unwrap();
+        assert_eq!(result.completeness, ObservationCompleteness::Incomplete);
+        assert!(
+            result.to_delete.is_empty(),
+            "不完全観測では別の枝の不在行も削除しない"
+        );
+        let ingests: std::collections::HashSet<_> = result
+            .to_ingest
+            .iter()
+            .map(|candidate| candidate.abs_path.clone())
+            .collect();
+        assert_eq!(
+            ingests,
+            [root.join("new_image.jpg"), root.join("updated_image.jpg")]
+                .into_iter()
+                .collect()
+        );
+        assert!(result.unchanged >= 1);
+
+        // エラーを解消した次の完全走査では、同じ不在行が通常どおり削除候補になる。
+        let complete = scan_sync(fav, &root, &db);
+        assert_eq!(complete.completeness, ObservationCompleteness::Complete);
+        assert_eq!(complete.to_delete, vec![absent]);
+        result.diag
+    }
+
+    #[test]
+    fn read_dir_failure_suppresses_deletes_but_keeps_ingests() {
+        assert_eq!(
+            assert_incomplete_scan_keeps_observed_changes(ObservationFault::ReadDir)
+                .read_dir_errors,
+            1
+        );
+    }
+
+    #[test]
+    fn entry_failure_suppresses_deletes_but_keeps_ingests() {
+        assert_eq!(
+            assert_incomplete_scan_keeps_observed_changes(ObservationFault::Entry).entry_errors,
+            1
+        );
+    }
+
+    #[test]
+    fn file_type_failure_suppresses_deletes_but_keeps_ingests() {
+        assert_eq!(
+            assert_incomplete_scan_keeps_observed_changes(ObservationFault::FileType)
+                .file_type_errors,
+            1
+        );
+    }
+
+    #[test]
+    fn classification_failure_suppresses_deletes_but_keeps_ingests() {
+        assert_eq!(
+            assert_incomplete_scan_keeps_observed_changes(ObservationFault::Classification)
+                .classification_errors,
+            1
+        );
+    }
+
+    #[test]
+    fn metadata_failure_suppresses_deletes_but_keeps_ingests() {
+        assert_eq!(
+            assert_incomplete_scan_keeps_observed_changes(ObservationFault::Metadata)
+                .metadata_errors,
+            1
+        );
+    }
+
+    #[test]
+    fn depth_limit_suppresses_deletes_but_keeps_ingests() {
+        let (tmp, db) = tmp_db();
+        let fav = Uuid::new_v4();
+        let root = tmp.path().join("deep");
+        let mut deepest = root.clone();
+        for _ in 0..41 {
+            deepest.push("d");
+        }
+        fs::create_dir_all(&deepest).unwrap();
+        make_file(&root, "new_image.jpg", b"new");
+        make_file(&deepest, "hidden_image.jpg", b"hidden");
+        for path in [
+            deepest.join("hidden_image.jpg"),
+            root.join("gone_image.jpg"),
+        ] {
+            db.upsert_meta_ok(&normalize_path(&path), fav, &root, IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let result = scan_sync(fav, &root, &db);
+        assert_eq!(result.diag.depth_limit_hits, 1);
+        assert_eq!(result.completeness, ObservationCompleteness::Incomplete);
+        assert!(result.to_delete.is_empty());
+        assert_eq!(result.to_ingest.len(), 1);
+        assert_eq!(result.to_ingest[0].abs_path, root.join("new_image.jpg"));
+    }
+
+    #[test]
+    fn missing_root_does_not_turn_unobserved_rows_into_deletes() {
+        let (tmp, db) = tmp_db();
+        let fav = Uuid::new_v4();
+        let root = tmp.path().join("missing");
+        let key = normalize_path(&root.join("image.jpg"));
+        db.upsert_meta_ok(&key, fav, &root, IndexKind::Image, 1, 1)
+            .unwrap();
+        let result = scan_sync(fav, &root, &db);
+        assert_eq!(result.completeness, ObservationCompleteness::Incomplete);
+        assert_eq!(result.diag.read_dir_errors, 1);
+        assert!(result.to_delete.is_empty());
+        assert!(result.to_ingest.is_empty());
+        assert!(db.get(&key).unwrap().is_some());
+    }
+
+    #[test]
     fn empty_fs_empty_db_returns_zero() {
         let fav = Uuid::new_v4();
         let (tmp, db) = tmp_db();
@@ -598,6 +954,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.total_scanned, 0);
+        assert_eq!(r.completeness, ObservationCompleteness::Complete);
         assert!(r.to_ingest.is_empty());
         assert!(r.to_delete.is_empty());
     }
@@ -918,8 +1275,7 @@ mod tests {
             IoPriority::Normal,
             None,
         );
-        // cancel 中は Err("cancelled") または 早期に空の ScanResult が返る
-        assert!(r.is_err() || r.unwrap().total_scanned < 50);
+        assert_eq!(r.unwrap_err(), "cancelled");
     }
 
     #[test]

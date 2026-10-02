@@ -674,6 +674,13 @@ ingest worker と tag_write_worker が共有する。独自に `fts.writer()` �
 
 #### Indexer shutdown の有界化 (v2.3.0 第12弾)
 
+walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
+列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
+生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
+あり、Complete として返さない。この型は FS 観測だけの結果で、Drain や書き込みの
+完了結果とは分離する。S2 の停止・再構成と名前索引の root 所有への変更は未実装
+([実装記録](startup-index-scan-plan.md#11-s2-の部分実装-2026-10-02))。
+
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、
   プロセス終了を将来追加される長時間処理でも塞がない。
