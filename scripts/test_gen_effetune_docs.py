@@ -218,6 +218,12 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('共有前に選択内容を確認してください', body)
         self.assertNotIn('デバイス設定', body)
         self.assertNotIn('URLルール', body)
+        for supported in ['ドラッグ＆ドロップすると読み込めます', 'ファイルとして書き出すことはできません', 'パイプラインプリセット</strong> の <strong>保存', '設定 &gt; バックアップ / 復元', '共有</strong> ボタン', '現在選択しているチェーン', 'URL がクリップボードへコピーされます', '初回はAのみ', '保存されたA/B両方の内容', 'どちらを選択していたかが復元されます']:
+            self.assertIn(supported, body)
+        self.assertNotIn('ファイルの読み込み、書き出し、共有', body)
+        self.assertNotIn('起動時はパイプラインAのみが読み込まれ', body)
+        self.assertIn('復元された選択状態に応じて「A」または「B」を表示します', body)
+        self.assertNotIn('デフォルトで「A」を表示', body)
         self.assertIn('href="README.html">基本操作', output['index.html'])
         self.assertIn('href="README.html"', output['eq-15band-geq.html'])
 
