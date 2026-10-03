@@ -193,6 +193,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再生アイコン", "左下バッジ", "非表示"]
     ),
     entry!(
+        "thumbnail/book-resume-meter",
+        Thumbnail,
+        "本のサムネイルに前回の読書位置を表示",
+        ["読書", "ページ", "進捗", "メーター", "ZIP", "PDF"]
+    ),
+    entry!(
         "thumbnail/idle-upgrade",
         Thumbnail,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",

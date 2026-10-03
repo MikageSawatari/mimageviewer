@@ -18452,7 +18452,7 @@ mod phase_c_folder_nav_history_tests {
             .expect("book resume DB")
             .set(&book, 12)
             .expect("seed book resume");
-        app.last_book_resume = Some((book.clone(), 12));
+        app.last_book_resume = Some((book.clone(), 12, None));
         app.settings
             .video_resume_positions
             .insert("/miv-test/movie.mp4".to_string(), 91.5);
@@ -18504,7 +18504,7 @@ mod phase_c_folder_nav_history_tests {
 
         // 場所の記憶以外はこの操作の対象外。
         assert_eq!(app.checked, HashSet::from([1, 3]));
-        assert_eq!(app.last_book_resume, Some((book.clone(), 12)));
+        assert_eq!(app.last_book_resume, Some((book.clone(), 12, None)));
         assert_eq!(
             app.book_resume_db
                 .as_ref()
@@ -34133,14 +34133,20 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Folder(std::path::PathBuf::from(
             "c:/manga/series/sub",
         )));
+        app.rebuild_visible_indices();
 
         // 画像 (本ページ) idx 0 → 記録される
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 0)));
+        let meter = crate::book_resume_db::ReadingMeterValue::new(
+            1,
+            1,
+            app.reading_direction == crate::settings::ReadingDirection::Rtl,
+        );
+        assert_eq!(app.last_book_resume, Some((folder.clone(), 0, meter)));
 
         // フォルダタイル idx 1 → 対象外。直近記録は据え置き
         app.record_book_resume(1);
-        assert_eq!(app.last_book_resume, Some((folder, 0)));
+        assert_eq!(app.last_book_resume, Some((folder, 0, meter)));
     }
 
     #[test]
@@ -39267,6 +39273,7 @@ mod favorite_adjustment_defaults_tests {
             zip_path: zip_path.clone(),
             entry_name: "bookA/p1.jpg".to_string(),
         });
+        app.rebuild_visible_indices();
 
         // 本の中 (深さ 2) → 記録されない
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
@@ -39282,7 +39289,18 @@ mod favorite_adjustment_defaults_tests {
         };
         app.zip_nav = Some(test_zip_nav(&["p1.jpg", "p2.jpg"]));
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, Some((zip_path, 0)));
+        assert_eq!(
+            app.last_book_resume,
+            Some((
+                zip_path,
+                0,
+                crate::book_resume_db::ReadingMeterValue::new(
+                    1,
+                    1,
+                    app.reading_direction == crate::settings::ReadingDirection::Rtl,
+                ),
+            ))
+        );
     }
 
     /// ピンキーはルート表示では zip_path (= 外側 ZIP の代表、v1.2.x フラット UI 互換)、

@@ -1889,7 +1889,7 @@ impl crate::app::App {
                     }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
-                    let latest = self.last_book_resume.as_ref().and_then(|(path, page)| {
+                    let latest = self.last_book_resume.as_ref().and_then(|(path, page, _)| {
                         (crate::path_key::normalize(path)
                             == crate::path_key::normalize(pending.path()))
                         .then_some(*page)
@@ -2752,10 +2752,8 @@ impl crate::app::App {
         }
         let page_index = page_index as usize;
         if record_resume {
-            if let Some(writer) = self.book_resume_writer.as_ref() {
-                writer.record(&target.container_path, page_index);
-            }
-            self.last_book_resume = Some((target.container_path.clone(), page_index));
+            // 検証済みcontextに右綴じ情報がない。追加列をNULLにし、旧meterを消す。
+            self.persist_book_resume(target.container_path.clone(), page_index, None);
         }
 
         if self.settings.reading_history_enabled
@@ -5924,9 +5922,36 @@ mod tests {
         );
     }
 
+    fn settle_book_resume_meter(app: &mut crate::app::App) {
+        let writer = app.book_resume_writer.as_ref().unwrap();
+        let timeout = std::time::Duration::from_secs(10);
+        writer.read_all().recv_timeout(timeout).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        while writer.is_busy() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.poll_book_resume_meters(&egui::Context::default());
+    }
+
+    fn persisted_book_resume_meter_row(
+        data_dir: &std::path::Path,
+        book: &std::path::Path,
+    ) -> (i64, Option<i64>, Option<i64>, Option<i64>) {
+        rusqlite::Connection::open(data_dir.join("book_resume.db"))
+            .unwrap()
+            .query_row(
+                "SELECT page,page_ordinal,page_total,reading_rtl FROM book_resume WHERE path=?1",
+                [crate::path_key::normalize(book)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn remote_static_page_progress_is_the_next_pc_open_position() {
         let mut app = crate::app::tests::phase_c_support::setup_app();
+        settle_book_resume_meter(&mut app);
         let ctx = egui::Context::default();
         let folder = app.tmp.path().join("remote-book");
         std::fs::create_dir(&folder).unwrap();
@@ -5934,6 +5959,10 @@ mod tests {
         let second = folder.join("02.jpg");
         std::fs::write(&first, b"page").unwrap();
         std::fs::write(&second, b"page").unwrap();
+        let old_meter = crate::book_resume_db::ReadingMeterValue::new(1, 2, true);
+        app.persist_book_resume(folder.clone(), 0, old_meter);
+        settle_book_resume_meter(&mut app);
+        assert_eq!(app.book_resume_meters.get(&folder), old_meter);
 
         let handle = super::super::session::SessionHandle::new();
         app.set_remote_session_handle(handle.clone());
@@ -5960,6 +5989,14 @@ mod tests {
             true,
         );
         assert!(matches!(response, RemoteWriteResponse::Success(_)));
+        assert_eq!(app.last_book_resume, Some((folder.clone(), 1, None)));
+        assert_eq!(app.book_resume_meters.get(&folder), None);
+        settle_book_resume_meter(&mut app);
+        assert_eq!(
+            persisted_book_resume_meter_row(app.tmp.path(), &folder),
+            (1, None, None, None),
+            "Remoteはraw indexを更新し、方向未確定のmeter列を全てNULLにする"
+        );
         drop(app.book_resume_writer.take());
 
         handle.local_disconnect();
@@ -5974,6 +6011,48 @@ mod tests {
             crate::grid_item::GridItem::Image(second),
         ];
         assert_eq!(app.resume_page_for_container(), Some(1));
+    }
+
+    #[test]
+    fn remote_nested_page_without_resume_preserves_previous_root_meter() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        settle_book_resume_meter(&mut app);
+        let archive = app.tmp.path().join("remote-book.zip");
+        // producerの既存path guardを通す実ファイル。ZIP列挙は検証済みhandoffの前段。
+        std::fs::write(&archive, b"zip").unwrap();
+        let old_meter = crate::book_resume_db::ReadingMeterValue::new(3, 8, true);
+        app.persist_book_resume(archive.clone(), 2, old_meter);
+        settle_book_resume_meter(&mut app);
+        let previous_resume = app.last_book_resume.clone();
+
+        let response = app.persist_remote_reading_progress(
+            &mimageviewer_ipc::RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipEntry {
+                    entry_name: "chapter/01.jpg".into(),
+                },
+            },
+            &mimageviewer_ipc::RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: "chapter/".into(),
+                },
+            },
+            0,
+            1,
+            2,
+            false,
+            true,
+        );
+        assert!(matches!(response, RemoteWriteResponse::Success(_)));
+        assert_eq!(app.last_book_resume, previous_resume);
+        assert_eq!(app.book_resume_meters.get(&archive), old_meter);
+        settle_book_resume_meter(&mut app);
+        assert_eq!(
+            persisted_book_resume_meter_row(app.tmp.path(), &archive),
+            (2, Some(3), Some(8), Some(1)),
+            "非root階層のローカルindexは既存root位置やmeterを変更しない"
+        );
     }
 }
 

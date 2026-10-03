@@ -83,6 +83,7 @@
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
+| [book-resume-meter-plan.md](book-resume-meter-plan.md) | 一覧の本サムネイルの読書位置メーター。記録時のHUD位置/総数/右綴じ、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |
 | [backlog-on-hold.md](backlog-on-hold.md) | **保留・着手待ちバックログ**。判断待ち / 再現・確認待ち / 見送り。動かせるようになったら節ごと上へ戻す |
 | [release-verification-records.md](release-verification-records.md) | **リリース前確認の記録**。版ごとに実際に取った perf smoke / idle health / bench / 依存確認の測定値。次に何かが遅くなったときの比較対象。手順の正本は CLAUDE.md と release-operations.md |
 | [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画別ウィンドウの設計・実装履歴。冒頭 §§1〜2 は初期 v1 案、§3.0 は現行モード、§11 以降は CUT 前 pin 案を含む履歴 |

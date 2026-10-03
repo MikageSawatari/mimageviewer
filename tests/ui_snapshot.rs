@@ -340,6 +340,30 @@ fn preferences_video_bar_visibility_dark() {
 }
 
 #[test]
+fn preferences_book_resume_meter_light() {
+    snapshot_with_theme(
+        "preferences_book_resume_meter_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_book_resume_meter_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
+fn preferences_book_resume_meter_dark() {
+    snapshot_with_theme(
+        "preferences_book_resume_meter_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_book_resume_meter_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
 fn preferences_video_thumbnail_indicator_dark() {
     snapshot_with_theme(
         "preferences_video_thumbnail_indicator_dark",
@@ -782,6 +806,7 @@ fn cell_filename_mixed_glyphs_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -846,6 +871,7 @@ fn compact_file_format_badges_light() {
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                         cell,
                         inner,
+                        book_resume_meter: false,
                         checked: false,
                         stack_count: None,
                         filter_match_count: None,
@@ -960,6 +986,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -1018,6 +1045,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: count,
@@ -1139,6 +1167,7 @@ fn bookmark_time_and_tag_badges_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,

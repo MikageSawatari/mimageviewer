@@ -33,6 +33,11 @@ pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 }
 
 #[doc(hidden)]
+pub fn draw_book_resume_meter_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    pages::draw_book_resume_meter_settings(ui, &mut Settings::default());
+}
+
+#[doc(hidden)]
 pub fn draw_video_thumbnail_indicator_settings_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings {
         video_thumbnail_indicator: crate::settings::VideoThumbnailIndicator::BottomLeftBadge,
@@ -2108,10 +2113,7 @@ impl App {
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
-                self.book_resume_db
-                    .as_ref()
-                    .map(|db| db.count())
-                    .unwrap_or(0),
+                self.book_resume_entry_count(),
                 self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
@@ -2808,31 +2810,7 @@ impl App {
             }
         }
         if clear_book_resume_requested {
-            let result = match self.book_resume_db.as_ref() {
-                Some(db) => match db.clear_all() {
-                    Ok(deleted) => {
-                        crate::logger::log(format!(
-                            "[book_resume] cleared {deleted} reading positions"
-                        ));
-                        Ok((deleted, db.count()))
-                    }
-                    Err(e) => Err(format!("{e}")),
-                },
-                None => Err("読書位置 DB を開けませんでした".to_string()),
-            };
-            if let Some(ps) = self.pref_state.as_mut() {
-                match result {
-                    Ok((deleted, remaining)) => {
-                        ps.book_resume_entry_count = remaining;
-                        ps.book_resume_clear_result =
-                            Some(format!("ZIP/PDF の読書位置を {deleted} 件削除しました。"));
-                    }
-                    Err(err) => {
-                        ps.book_resume_clear_result =
-                            Some(format!("読書位置の削除に失敗しました: {err}"));
-                    }
-                }
-            }
+            self.clear_book_resume_async();
         }
 
         // 履歴と復元ページ: 閲覧履歴クリア (one-shot)。
@@ -2951,10 +2929,7 @@ impl App {
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
-                self.book_resume_db
-                    .as_ref()
-                    .map(|db| db.count())
-                    .unwrap_or(0),
+                self.book_resume_entry_count(),
                 self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
@@ -3613,6 +3588,101 @@ mod tests {
             channels: Some(2),
             title: None,
         }
+    }
+
+    #[test]
+    fn book_resume_meter_preferences_ok_save_db_reread_reopen_and_cancel() {
+        use crate::settings::FullscreenSeekDirection;
+
+        let mut app = crate::app::setup_app_for_test();
+        assert!(app.settings.thumb_show_book_resume_meter);
+        for (enabled, direction) in [
+            (false, FullscreenSeekDirection::LeftToRight),
+            (true, FullscreenSeekDirection::FollowReading),
+        ] {
+            let mut state = preferences_state_for_test(&app.settings);
+            state.settings.thumb_show_book_resume_meter = enabled;
+            state.settings.fullscreen_seek_direction = direction;
+
+            // Runtime and other-dialog changes made after opening Preferences must survive OK.
+            let width = app.settings.details_name_width + 17.0;
+            app.settings.details_name_width = width;
+            let favorite = crate::settings::FavoriteEntry::new(
+                "during preferences".to_owned(),
+                app.tmp.path().join("favorite"),
+            );
+            let favorite_id = favorite.id;
+            app.settings.favorites = vec![favorite];
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.install_preferences_settings(state.settings);
+            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            assert_eq!(app.settings.details_name_width, width);
+            assert_eq!(app.settings.favorites[0].id, favorite_id);
+            app.settings.save();
+
+            // Read the actual persisted DB, then construct a new real Preferences draft.
+            let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+            let persisted = db.load_into_settings().unwrap();
+            assert_eq!(persisted.thumb_show_book_resume_meter, enabled);
+            assert_eq!(persisted.fullscreen_seek_direction, direction);
+            let mut reopened = preferences_state_for_test(&persisted);
+            assert_eq!(reopened.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(reopened.settings.fullscreen_seek_direction, direction);
+
+            reopened.settings.thumb_show_book_resume_meter = !enabled;
+            reopened.settings.fullscreen_seek_direction =
+                if direction == FullscreenSeekDirection::LeftToRight {
+                    FullscreenSeekDirection::FollowReading
+                } else {
+                    FullscreenSeekDirection::LeftToRight
+                };
+            drop(reopened); // Cancel closes the draft without applying/saving it.
+            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            let after_cancel = db.load_into_settings().unwrap();
+            assert_eq!(after_cancel.thumb_show_book_resume_meter, enabled);
+            assert_eq!(after_cancel.fullscreen_seek_direction, direction);
+            assert_eq!(
+                preferences_state_for_test(&after_cancel)
+                    .settings
+                    .thumb_show_book_resume_meter,
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn book_resume_meter_preferences_missing_setting_and_default_draft_are_on() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(
+            preferences_state_for_test(&missing)
+                .settings
+                .thumb_show_book_resume_meter
+        );
+        assert!(
+            preferences_state_for_test(&Settings::default())
+                .settings
+                .thumb_show_book_resume_meter
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            preferences_state_for_test(&db.load_into_settings().unwrap())
+                .settings
+                .thumb_show_book_resume_meter
+        );
     }
 
     #[test]

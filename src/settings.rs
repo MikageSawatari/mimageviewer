@@ -4432,6 +4432,9 @@ pub struct Settings {
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
+    /// 本のサムネイル下端に、記録済みの読書位置を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_book_resume_meter: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -7209,6 +7212,7 @@ impl Default for Settings {
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
+            thumb_show_book_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -10027,6 +10031,39 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thumb_show_book_resume_meter_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_book_resume_meter);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.thumb_show_book_resume_meter);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_book_resume_meter":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_book_resume_meter);
+    }
+
+    #[test]
+    fn thumb_show_book_resume_meter_missing_db_key_defaults_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_show_book_resume_meter
+        );
+    }
+
     #[test]
     fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_media_duration);

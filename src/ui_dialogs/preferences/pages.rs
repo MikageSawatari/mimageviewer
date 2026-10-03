@@ -1487,6 +1487,11 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
     });
 
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/book-resume-meter", |ui, state| {
+        draw_book_resume_meter_settings(ui, &mut state.settings);
+    });
+
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
@@ -1594,6 +1599,19 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "閲覧履歴: 閲覧位置",
         );
     });
+}
+
+pub(super) fn draw_book_resume_meter_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.checkbox(
+        &mut settings.thumb_show_book_resume_meter,
+        "本のサムネイルに前回の読書位置を表示",
+    );
+    ui.small(
+        "記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません",
+    );
 }
 
 pub(super) fn draw_video_thumbnail_indicator_settings(
@@ -9513,7 +9531,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     );
                 }
             });
-        ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグに適用されます。");
+        ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグと、本のサムネイルの読書位置メーターに適用されます。メーターには記録時の読み方向を使います。");
     });
     anchored(ui, state, "spread/cursor-direction", |ui, state| {
         let s = &mut state.settings;

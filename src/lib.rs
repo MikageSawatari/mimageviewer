@@ -31,6 +31,8 @@ pub use app::LocalAiActivityLease;
 pub use app::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
 pub mod audio_decode;

@@ -887,6 +887,19 @@ delete では処理中 descriptor の transaction を rollback する。完了�
 
 ### 5.3 UI スレッドで重処理
 
+読書位置メーターは既存 `BookResumeWriter` のFIFOでRecord / ReadAll / Clearを扱う。
+起動時workerがnullable列を移行し、全行を1回読んでApp共通mapへ返す。UIはSQLiteを読まず、
+受理したローカル/Remote記録とscope除去/Clearをmapと読込中差分へ適用する。
+ReadAllのreceiverを差し替えることで古い結果を捨て、最新結果へ待機中差分を重ねる。
+rename・purge retry・明示整理等の既存writer待機predicateにはBookResumeWriterの未処理数も含める。
+DB変更完了後の再読込はrename/copy復元・明示整理・purge retryに接続する。
+通常削除には新しい待機を足さず、mapの該当scopeを除去する。直前Recordとの短い競合で
+存在しないpathの行が残ることは合意済み。移行失敗時はログ/不表示でraw復元を維持する。
+内容identityのcopy復元にも開始前の延期機構はなく、確認済みの未開始要求を保持する新状態は
+追加しない。直前の未処理Recordとの競合ではコピー先の位置・比率が古いままになることを
+合意済みの割り切りとし、復元完了後のmap再読込は維持する。
+詳細は [book-resume-meter-plan.md](book-resume-meter-plan.md)。
+
 `App::update` 内で CPU 重めの処理をすると fps が落ちる。
 - 補正の LUT 計算: 軽いので同期 OK (`maybe_apply_adjustment`)
 - AI 推論: 絶対に別スレッド

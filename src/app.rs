@@ -143,6 +143,9 @@ fn thumbnail_keep_bounds_for_count(
     (anchor - back, anchor + forward)
 }
 
+pub(crate) mod book_resume_meter;
+#[cfg(test)]
+mod book_resume_meter_tests;
 mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
@@ -241,7 +244,7 @@ pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     draw_cell, draw_cut_badge, draw_spread_pair_cursor, grid_tag_badge_hit_rect,
-    layout_cell_overlays, primary_grid_tag_for_badge, tq_draw_preview,
+    layout_cell_overlays, paint_book_resume_meter, primary_grid_tag_for_badge, tq_draw_preview,
 };
 use metadata_ops::{
     DetailsSortPrimary, DetailsSortRow, cmp_option_last, ctrl_f_progress_total,
@@ -14771,11 +14774,16 @@ pub struct App {
     /// 再起動を跨いで読書位置を復元する (動画の `video_resume_positions` の画像本版)。
     pub(crate) book_resume_db: Option<crate::book_resume_db::BookResumeDb>,
     /// 読書位置の書き込みを UI スレッドから外す background writer (ページ送り毎の
-    /// 同期 SQLite I/O を避ける)。読み出しは `book_resume_db` (UI スレッド) のまま。
+    /// 同期 SQLite I/O を避ける)。raw復元は既存DB、メーター読込/clearもこのwriter。
     pub(crate) book_resume_writer: Option<crate::book_resume_db::BookResumeWriter>,
-    /// 直近に DB へ書いた `(コンテナパス, page idx)`。フルスクリーンのページ送り毎の
+    /// 直近に受け付けた `(コンテナパス, page idx, meter)`。フルスクリーンのページ送り毎の
     /// 重複書き込みを抑止する dedup。
-    pub(crate) last_book_resume: Option<(PathBuf, usize)>,
+    pub(crate) last_book_resume: Option<(
+        PathBuf,
+        usize,
+        Option<crate::book_resume_db::ReadingMeterValue>,
+    )>,
+    pub(crate) book_resume_meters: Box<book_resume_meter::BookResumeMeters>,
     /// 左パネル用の現在コンテナの本ブックマーク cache。
     pub(crate) current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     pub(crate) current_book_bookmarks_key: Option<String>,
@@ -17069,6 +17077,10 @@ impl App {
         } else {
             None
         };
+        let mut book_resume_meters = Box::<book_resume_meter::BookResumeMeters>::default();
+        if let Some(writer) = &book_resume_writer {
+            book_resume_meters.reload(writer);
+        }
         crate::perf::emit_ms("startup", "db_open_book_resume", 0, t);
 
         let t = std::time::Instant::now();
@@ -17863,6 +17875,7 @@ impl App {
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
+            book_resume_meters,
             last_book_resume: None,
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
@@ -38705,6 +38718,7 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        self.book_resume_meters.remove_scopes(removed);
         let matches_key = removed_path_key_matcher(removed);
         self.settings
             .video_resume_positions
@@ -38771,7 +38785,7 @@ impl App {
         if self
             .last_book_resume
             .as_ref()
-            .is_some_and(|(path, _)| matches_key(&crate::adjustment_db::normalize_path(path)))
+            .is_some_and(|(path, _, _)| matches_key(&crate::adjustment_db::normalize_path(path)))
         {
             self.last_book_resume = None;
         }
@@ -40442,6 +40456,10 @@ impl App {
     /// 専用 service の FIFO へ旧 path の追加が残った後で rename DB を先に動かさないよう、
     /// request の結果を UI が消費し終えるまで待つ。
     pub(crate) fn rename_migration_writers_busy(&self) -> bool {
+        let book_resume_busy = self
+            .book_resume_writer
+            .as_ref()
+            .is_some_and(|writer| writer.is_busy());
         let tag_busy = self
             .tag_write_handle
             .as_ref()
@@ -40463,6 +40481,7 @@ impl App {
             .is_some_and(|handle| handle.has_unfinished_work())
             || !self.local_adjust_write_pending.is_empty();
         tag_busy
+            || book_resume_busy
             || rating_busy
             || edit_preview_busy
             || local_adjust_busy
@@ -40735,6 +40754,9 @@ impl App {
                         // 共通リネーム worker は book_bookmarks.db も更新する。現在の本の
                         // 左パネルと横断一覧が旧 identity を保持し続けないよう再読込する。
                         self.invalidate_book_bookmarks_after_path_migration();
+                        self.book_resume_meters
+                            .remove_scopes(&[mapping.old_path.clone(), mapping.new_path.clone()]);
+                        self.reload_book_resume_meters();
                         self.refresh_smart_folders_after_rename();
                         // The physical metadata migration has completed, but the durable journal
                         // remains until the collection actor acknowledges the same source mapping.
@@ -40984,6 +41006,7 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(report) => {
                     self.delete_purge_retry_pending = None;
+                    self.reload_book_resume_meters();
                     self.apply_content_identity_store_mutations(report.store_mutations);
                     crate::logger::log(format!(
                         "[delete-purge] retry done attempted={} purged={} rows={} remaining={} errors={}",
@@ -50844,17 +50867,25 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
-        if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx)) {
+        let indices = self.get_still_image_indices();
+        let meter =
+            crate::ui_fullscreen::image_reading_position(&indices, idx).and_then(|ordinal| {
+                crate::book_resume_db::ReadingMeterValue::new(
+                    ordinal,
+                    indices.len(),
+                    self.reading_direction == crate::settings::ReadingDirection::Rtl,
+                )
+            });
+        if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx, meter)) {
             return;
         }
-        // 書き込みは background writer へ逃がす (ページ送り毎の UI スレッド同期 I/O 回避)。
-        if let Some(writer) = &self.book_resume_writer {
-            writer.record(&folder, idx);
+        let writer_available = self.book_resume_writer.is_some();
+        self.persist_book_resume(folder, idx, meter);
+        if writer_available {
             self.record_current_container_content_identity(
                 crate::content_identity::ContentIdentityTrigger::ViewingState,
             );
         }
-        self.last_book_resume = Some((folder, idx));
     }
 
     /// Records a user-chosen fullscreen item in the persisted viewing history.
@@ -84318,6 +84349,7 @@ impl App {
         self.poll_pano_high_res(ctx);
         self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
+        self.poll_book_resume_meters(ctx);
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_epub_batch_convert();

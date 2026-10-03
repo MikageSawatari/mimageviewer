@@ -233,6 +233,15 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 重なる場合は左下の低優先要素を表示しない。右下の絞り込み件数は左上・左下と重ならない位置まで上げ、余地がなければ省略する。色・角丸・フォントなど各要素の見た目は
 `ui_helpers.rs` の個別描画関数が持つ。
 スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
+通常一覧のFolder/ZipFile/PdfFileには、保存済み読書位置が有効な場合だけ下端へ3ptの
+メーターを重ねる。`ThumbnailOverlayLayout` が帯と2pt gapを予約し、左下だけでなく
+cell基準の右下件数もその上へ配置する。極小セルで既存バッジが失われる場合は帯を省略する。
+セル高・画像fit・並び順・hit-testは変更せず、内容bitmapへ焼き込まない。色は
+`os_theme::book_resume_meter_palette`、方向は保存右綴じと `fullscreen_seek_direction` で決定。
+比率はHUDの読み順で記録したanchor ordinal/totalで、見開きの相手ページは加算しない。
+起動時writer全行readと稀なDB変更後read以外はAppのpath memo/mapだけを参照する。
+未読・NULL・不正値はtrackも出さず、設定OFFではpaintだけを止める。
+詳細は [book-resume-meter-plan.md](book-resume-meter-plan.md)。
 補正済みサムネイルの生成は `thumb.adjustment_build` perf event で色調処理と
 `ctx.load_texture` を分けて計測できる。`origin=visible` は一覧描画中、
 `origin=prefetch` は可視外の先読み、`n` は `frame.begin` と同じ更新フレーム番号。

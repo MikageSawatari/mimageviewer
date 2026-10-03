@@ -492,6 +492,17 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 
 ## 3. サムネイルグリッド詳細
 
+- 通常の物理一覧の Folder / ZipFile / PdfFile セル下端には、最後に記録した
+  読めるページ列内の位置 / 総数を読書位置メーターとして表示する。画像以外の混在を
+  分母に含めず、見開きも navigation anchor の位置だけを使う。最大到達位置や読了判定ではない。
+  内容・並びが変わっても次の記録までは保存比率を表示する。行無し・旧行の追加情報無し・
+  不正な位置/総数では track も出さない。Remote で記録した本は補助情報を消し、
+  ローカルで再記録するまでメーター不表示とする。従来の raw index による位置復元は維持する。
+  Stack / 個別ページ / ConvertibleArchive / 詳細行 / 合成ビューのルート / Remote の一覧は対象外。
+  Tag / Smart / Collection から開いた物理子フォルダも通常の物理一覧として対象に含める。
+  メーターはセル内の下端帯を予約し、既存バッジと重ねない。極小セルではバッジを優先する。
+  一覧はメモリ上の記録を参照し、描画から本の走査・ページ数取得・DB 読み取りを行わない。
+
 ### 3.1 仮想スクロール
 
 ```
@@ -1096,7 +1107,8 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 保存済み再生位置 (動画) と読書位置 (ZIP/PDF/対応アーカイブ) の記憶件数の確認・全件クリアは
   **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画・音声の再生位置と動画の音声トラック選択、
   本の読書位置を対象)。再生位置とトラック選択のクリアは OK 適用時、本クリアは
-  `book_resume_clear_requested` one-shot 経由で App が即時 `book_resume_db.clear_all()`。
+  `book_resume_clear_requested` one-shot 経由で既存 writer に全件クリアを依頼する。
+  一覧のメモリ上の読書位置も同じ受付で消し、件数・完了表示は非同期結果で更新する。
 - 閲覧履歴は、ユーザー操作で開いた画像フォルダ / ZIP / PDF / 対応アーカイブと、
   動画・音声ファイルを %APPDATA%\mimageviewer\reading_history.db に MRU として保存する。
   画像の本は親コンテナ、動画・音声はファイルを記録単位とする。一覧からの open、
@@ -1930,6 +1942,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_show_media_duration` | bool | true | 動画・音声のサムネイル右下に長さを表示する。1 時間未満は `m:ss`、1 時間以上は `h:mm:ss`。フィルタ一致数と既存バッジを優先し、衝突時は上へ移し、空きがなければ非表示。可視 + 先読みだけ既存遅延メタ worker で取得する。設定項目がない既存 JSON / settings.db も true になる |
+| `thumb_show_book_resume_meter` | bool | true | 通常の一覧のフォルダ・ZIP・PDF サムネイル下端に保存済み読書位置の比率を表示する。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続き、ON に戻すと追加読み取りなしに表示できる。欠落した JSON / settings.db 設定と既定設定も true |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
 | `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
 | `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |
@@ -2006,7 +2019,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
 | `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
-| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
+| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーと本サムネイルの読書位置メーターの左右方向。`FollowReading` は横の読み方向へ合わせ、メーターは保存時の RTL を使う。`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
 | `fullscreen_keep_on_app_switch` | bool | false | 「メインに戻ったらフルスクリーンへ復帰」。他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を自動で閉じずにフルスクリーン側へフォーカスを戻す。メイン一覧も並行操作する場合は F12 別ウィンドウを使う |
