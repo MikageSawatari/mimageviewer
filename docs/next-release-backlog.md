@@ -32,7 +32,7 @@
 ### 1.323 WebView2 ランタイムが壊れた環境で、EffeTune の画面が「12 秒以内に読み込みが終わらない」(EFFETUNE-UI-TIMEOUT) と出る — Sandbox 記録 (2026-10-03)
 
 - 観測 (サブPCの Windows Sandbox、利用者が確認、v4.3.0 配布ビルド 2 回目のインストール版): 「音響調整」で窓は出るが中身が出ず、EFFETUNE-UI-PENDING → EFFETUNE-UI-TIMEOUT。開き直しても同じ。45 秒間 msedgewebview2.exe は一度も起動しなかった (wv2-watch)。同じ Sandbox で EPUB 変換も「WebView2 Runtime が見つかりません」で失敗。
-- 環境: Sandbox 内の WebView2 登録 (EdgeUpdate Clients {F3017226-…}) は pv=152.0.4191.66 だが、フォルダには 153 / 154 しかない。サブPC本体は pv=154.0.4258.53 でフォルダと一致。Sandbox のベースイメージ由来のずれと判断し、v4.3.0 は出荷を止めない。
+- 環境: Sandbox 内の WebView2 登録 (EdgeUpdate Clients {F3017226-…}) は pv=152.0.4191.66 だが、フォルダには 153 / 154 しかない。サブPC本体は pv=154.0.4258.53 でフォルダと一致。ただし追加実験 (新しい Sandbox で EPUB worker を直接実行) で、登録をそのまま / 154 に修正 / キー削除の 3 状態とも `GetAvailableCoreWebView2BrowserVersionString(NULL)` が 0.1 秒で失敗 (HRESULT 0x80070002、文面は 0x80670016 STATEREPOSITORY_E_DEPENDENCY_NOT_RESOLVED)。登録のずれは原因ではなかった。Sandbox 内の WebView2 (パッケージ版の解決か EdgeWebView フォルダの中身) が使えない状態と見ている (推測)。
 - mIV 側はホスト起動・同梱 CRT preload (source=bundled 14.50.35719.0)・プラグイン読み込み・createView / attached まで正常。エラー文はプラグイン自身のもので、mIV のログには出ない。
 - 改善候補 (次版以降): EPUB 変換と同じ WebView2 有無の判定を「音響調整」を押した時点で行い、無ければ mIV 側で「WebView2 Runtime が見つかりません」と案内する (TIMEOUT の文面では原因が分からないため)。EffeTune 作者へ、壊れたランタイム登録で RUNTIME ではなく TIMEOUT になる件を伝えるかも検討。
 
