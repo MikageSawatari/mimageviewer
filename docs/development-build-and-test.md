@@ -40,6 +40,15 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
 テストの非ゼロ終了は失敗のままとし、自動再試行や期待値変更は行わない。
 スクリプトの回帰確認は `scripts/test-release-build-safety.ps1` を参照する。
 
+### 長い経過時間を扱う collection テスト
+
+Windows の `Instant` は起動直後に大きな時間を引くと underflow するため、過去の
+`Instant` を `checked_sub(Duration)` と `unwrap()` で作らない。collection read の
+長時間回帰は `TestReadClock::long_elapsed_since(started)` で観測時刻を24時間進める。
+これは `cfg(test)` 限定の thread-local scope で、poll・poll delay と後続 Grid read の時計を差し替え、
+製品ビルドの時計・動作を変えない。終了・panic 時の復元とスレッド分離、時間減算の再導入は
+`collection_store::test_clock::tests` で検査する。実時間の待機期限は通常の `Instant` を使う。
+
 ## 検証の担当と結果の再利用
 
 モデル分担・委任・レビューの粒度は [AGENTS.md](../AGENTS.md#model-roles-and-coordination) を正本とする。

@@ -433,6 +433,9 @@ impl CollectionNavigationPending {
     }
 
     pub(crate) fn poll_delay(&self) -> Option<Duration> {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         match self {
             Self::RequestNeeded { request, .. } => request.lease.poll_delay(Instant::now()),
             Self::Snapshot { request, .. }
@@ -2201,6 +2204,9 @@ impl App {
     }
 
     pub(crate) fn poll_collection_navigation(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         if self
             .top_level_grid_view
             .take_collection_navigation_retired_pdf_password()
@@ -6176,6 +6182,8 @@ mod tests {
             .advance_collection_navigation_sequence();
         let mut origin = app.collection_outer_navigation_origin(Some(0)).unwrap();
         origin.intent_sequence = request_sequence;
+        let started = Instant::now();
+        let _clock = crate::collection_store::TestReadClock::long_elapsed_since(started);
         let mut request = CollectionNavigationRequest {
             origin,
             action: CollectionNavigationAction::OuterFullscreen {
@@ -6189,15 +6197,22 @@ mod tests {
             perf_started_at: None,
             lease: crate::collection_store::CollectionReadLease::new(
                 crate::collection_store::CollectionReadScope::app_global("navigation-test"),
-                Instant::now()
-                    .checked_sub(Duration::from_secs(24 * 60 * 60))
-                    .unwrap(),
+                started,
                 "preflight",
             ),
             book_owner: None,
         };
         let lease_id = request.lease.request_id();
-        request.lease.pause(Instant::now(), "pdf_password_input");
+        request.lease.pause(
+            crate::collection_store::TestReadClock::now(),
+            "pdf_password_input",
+        );
+        assert!(
+            request
+                .lease
+                .active_elapsed(crate::collection_store::TestReadClock::now())
+                >= crate::collection_store::TestReadClock::LONG_ELAPSED
+        );
         let watch = client.subscribe().unwrap();
         let ctx = egui::Context::default();
         let revision_wake = CollectionRevisionWake::spawn(&ctx, &watch);
@@ -6280,6 +6295,8 @@ mod tests {
             .advance_collection_navigation_sequence();
         let mut origin = app.collection_root_navigation_origin(0, false).unwrap();
         origin.intent_sequence = request_sequence;
+        let started = Instant::now();
+        let _clock = crate::collection_store::TestReadClock::long_elapsed_since(started);
         let request = CollectionNavigationRequest {
             origin,
             action: CollectionNavigationAction::OuterFullscreen {
@@ -6293,9 +6310,7 @@ mod tests {
             perf_started_at: None,
             lease: crate::collection_store::CollectionReadLease::new(
                 crate::collection_store::CollectionReadScope::app_global("navigation-test"),
-                Instant::now()
-                    .checked_sub(Duration::from_secs(24 * 60 * 60))
-                    .unwrap(),
+                started,
                 "preflight",
             ),
             book_owner: None,
