@@ -5109,6 +5109,9 @@ pub struct Settings {
     /// ツールバーに「ソート」セクションを表示する (v2.0.0)。
     #[serde(default = "default_true")]
     pub show_toolbar_sort: bool,
+    /// Show an independent dropdown on the right of the facet bar. Old settings omit it.
+    #[serde(default)]
+    pub show_facet_sort: bool,
     /// 「行頭に表示」= そのセクションの前で改行するセクション集合 (v2.0.0)。
     /// 自動折返し (horizontal_wrapped) に加え、ユーザーが行区切りを固定できる。
     /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
@@ -7382,7 +7385,8 @@ impl Default for Settings {
             toolbar_section_order: Vec::new(),
             show_toolbar_cols: true,
             show_toolbar_aspect: true,
-            show_toolbar_sort: true,
+            show_toolbar_sort: false,
+            show_facet_sort: true,
             toolbar_section_new_row: Vec::new(),
             toolbar_section_drag_enabled: false,
             menu_layout: crate::keymap::MenuLayoutSettings::default(),
@@ -9703,6 +9707,7 @@ impl Settings {
         self.show_toolbar_cols = src.show_toolbar_cols;
         self.show_toolbar_aspect = src.show_toolbar_aspect;
         self.show_toolbar_sort = src.show_toolbar_sort;
+        self.show_facet_sort = src.show_facet_sort;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
@@ -11175,6 +11180,7 @@ mod tests {
         assert!(s.show_toolbar_cols);
         assert!(s.show_toolbar_aspect);
         assert!(s.show_toolbar_sort);
+        assert!(!s.show_facet_sort);
         assert!(
             s.toolbar_section_new_row.is_empty(),
             "新規 new_row 集合は欠落時 空"

@@ -7565,6 +7565,92 @@ mod tests {
     }
 
     #[test]
+    fn section292_clean_install_defaults_persist_only_once() {
+        let guard = DataDirOverrideGuard::new();
+        let first = boot_settings_db(guard.path());
+        assert_eq!(first.source, BootSource::CleanInstall);
+        assert!(!first.settings.show_toolbar_sort);
+        assert!(first.settings.show_facet_sort);
+        let mut edited = first.settings.clone();
+        edited.show_toolbar_sort = true;
+        edited.show_facet_sort = false;
+        first.db.unwrap().save_full(&edited).unwrap();
+        let second = boot_settings_db(guard.path());
+        assert_eq!(second.source, BootSource::LoadedExistingDb);
+        assert!(second.settings.show_toolbar_sort);
+        assert!(!second.settings.show_facet_sort);
+    }
+
+    #[test]
+    fn section292_legacy_db_and_json_keep_top_sort_customization() {
+        for json in [false, true] {
+            for top in [None, Some(false), Some(true)] {
+                let guard = DataDirOverrideGuard::new();
+                let mut original = Settings::default();
+                original.show_toolbar_sort = top.unwrap_or(true);
+                original.toolbar_section_order.reverse();
+                original.toolbar_sort_items = vec![crate::settings::SortOrder::DateDesc];
+                original.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Buttons;
+                if json {
+                    let mut value = serde_json::to_value(&original).unwrap();
+                    value.as_object_mut().unwrap().remove("show_facet_sort");
+                    if top.is_none() {
+                        value.as_object_mut().unwrap().remove("show_toolbar_sort");
+                    }
+                    std::fs::write(
+                        guard.path().join("settings.json"),
+                        serde_json::to_vec(&value).unwrap(),
+                    )
+                    .unwrap();
+                } else {
+                    let db = SettingsDb::create_new(guard.path()).unwrap();
+                    db.save_full(&original).unwrap();
+                    db.inner
+                        .lock()
+                        .unwrap()
+                        .conn
+                        .execute("DELETE FROM settings_kv WHERE key = 'show_facet_sort'", [])
+                        .unwrap();
+                    if top.is_none() {
+                        db.inner
+                            .lock()
+                            .unwrap()
+                            .conn
+                            .execute(
+                                "DELETE FROM settings_kv WHERE key = 'show_toolbar_sort'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                }
+                let boot = boot_settings_db(guard.path());
+                assert_eq!(
+                    boot.source,
+                    if json {
+                        BootSource::MigratedFromJson
+                    } else {
+                        BootSource::LoadedExistingDb
+                    }
+                );
+                assert_eq!(boot.settings.show_toolbar_sort, top.unwrap_or(true));
+                assert!(!boot.settings.show_facet_sort);
+                assert_eq!(
+                    boot.settings.toolbar_section_order,
+                    original.toolbar_section_order
+                );
+                assert_eq!(
+                    boot.settings.toolbar_sort_items,
+                    original.toolbar_sort_items
+                );
+                assert_eq!(
+                    boot.settings.toolbar_sort_display,
+                    original.toolbar_sort_display
+                );
+            }
+        }
+    }
+
+    #[test]
     fn boot_clean_install() {
         let guard = DataDirOverrideGuard::new();
         let outcome = boot_settings_db(guard.path());
@@ -7860,6 +7946,8 @@ mod tests {
         let outcome = boot_settings_db(dir);
         assert_eq!(outcome.source, BootSource::FailedFallbackDefault);
         assert!(outcome.db.is_none());
+        assert!(!outcome.settings.show_toolbar_sort);
+        assert!(outcome.settings.show_facet_sort);
         // SAVE_SUPPRESSED が立っており、後続の with_db は SaveSuppressed で fail-fast する
         // (Codex P2 v8b-3 2026-05-14)。
         assert!(save_suppressed());

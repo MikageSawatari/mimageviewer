@@ -358,6 +358,17 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   **ツールバー上の操作 = アドレスバー左端の `フォルダ:` ラベル右クリック**に統一する
   (`設定` メニュー → `ツールバー` には表示 ON/OFF チェックのみ。専用の環境設定ページは廃止)
 
+絞り込みバー右側にもソートのドロップダウンを表示できる。設定 → ツールバーで
+上部と絞り込みバーの表示を個別に ON/OFF にし、両方表示・両方非表示も選べる。
+絞り込みラベルの右クリックでも右側の表示を変更できる。並び順は両表示で共通で、
+コレクション等の専用順序・固定理由も既存の所有者から描く。条件が多い・狭幅の場合は
+ソートを次行の右側へ送り、popup の wheel は背面一覧へ通さない。
+既存設定の上部表示・並び替え設定は保持し、追加表示の省略は OFF、上部表示の省略は ON と読む。
+`Settings::default()` の生成値は追加表示 ON・上部 OFF とし、新規作成・読込失敗時の既定・
+ツールバーの既定復元で共通に使う。固定中も補助操作のある popup は開ける。
+ソート選択だけを無効化し、サブ展開のグループ順と「最新の情報に更新」は利用できる。
+バー自体を隠しても上部を ON にすればソート操作を続けられる。
+
 #### 名前付きコレクション
 
 - 実ファイル・実フォルダ・ZIP / PDF / 変換対象アーカイブへの参照を、名前付きの一覧として保存する。
@@ -2122,7 +2133,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `show_address_bar_folder_pin` | bool | true | フォルダバーに代表サムネ固定 (📌) を表示 |
 | `show_location_{drive_list,reading_history,rating,bookshelf,desktop,pictures,downloads,drive_roots}` | bool | true | フォルダバーの場所▼に表示する項目を個別に切り替える。フォルダバー左端の `フォルダ:` ラベルまたは場所▼を右クリックして変更 |
 | `show_toolbar_rating` | bool | true | ツールバーにレーティング（★）フィルタを表示 |
-| `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
+| `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true（ソートの生成・リセット既定は false、旧設定の省略は true） | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
+| `show_facet_sort` | bool | true（旧設定の省略は false） | 絞り込みバー右側の独立したソートドロップダウン。上部表示とは独立、ソート状態と候補は共通。生成・リセット既定は ON、上部ソートは OFF。旧設定の省略時は OFF を維持する |
 | `show_toolbar_facet_filter` | bool | true | ツールバー下のスマートフィルタ（絞り込みバー）を表示 |
 | `toolbar_facet_filter_items` | Vec\<ToolbarFacetFilterItem\> | 全項目 | スマートフィルタバーに表示するボタンとファイル名欄の並び。空 Vec は全項目を隠すが、適用中条件のチップと `全解除` は表示する。保存時は新しい `NameFilter` を配列から退避し、旧版が未知 variant として読み捨てても並びを失わない形にする |
 | `toolbar_facet_name_filter_index_stash` | Option\<usize\> | None | 保存時に `NameFilter` の位置を退避するダウングレード互換用フィールド。`usize::MAX` は利用者が明示的に非表示にした状態を表す。読込時に `toolbar_facet_filter_items` へ戻して消費し、フィールド自体が無い旧設定では従来の常設入力を維持するため末尾へ追加する |
