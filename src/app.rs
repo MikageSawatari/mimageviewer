@@ -85146,7 +85146,7 @@ impl App {
         self.stack_reconcile_after_fullscreen_close(ctx);
 
         // ── ツールバー ───────────────────────────────────────────────
-        let toolbar_fav_nav = self.render_toolbar(ctx);
+        let (toolbar_fav_nav, address_nav) = self.render_toolbar(ctx);
         // ツールバーお気に入りクリックは「指定フォルダへ飛ぶ」操作なので、検索系
         // (Ctrl+F フォルダ内ファイル名フィルタ / Ctrl+S お気に入り横断検索 /
         //  Ctrl+G 全文検索) が立っていれば全部抜けてからナビゲートする。
@@ -85178,7 +85178,7 @@ impl App {
         }
 
         // ── アドレスバー ─────────────────────────────────────────────
-        let address_nav = self.render_address_bar(ctx);
+        // Folder navigation now comes from the integrated toolbar section.
         // 現在フォルダへ保存されたファイルや、監視再走査から先送りした変更、および
         // 📌 ボタン / グリッドコンテキストメニューで書き換えた代表サムネを、
         // 同フレーム内でグリッドに反映する。

@@ -290,6 +290,7 @@ pub use ui_fullscreen::{
 mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
+pub mod ui_toolbar_layout;
 #[doc(hidden)]
 pub use ui_main::draw_color_presets_snapshot_fixture;
 #[doc(hidden)]

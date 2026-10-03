@@ -3900,6 +3900,7 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
         TS::Favorites => "お気に入り",
         TS::SmartFolders => "スマートフォルダ",
         TS::Tags => "タグ",
+        TS::Folder => "フォルダバー",
         TS::Unknown => "",
     }
 }
@@ -4039,6 +4040,7 @@ fn set_toolbar_section_visible(
         TS::Favorites => settings.show_toolbar_favorites = visible,
         TS::SmartFolders => settings.show_toolbar_smart_folders = visible,
         TS::Tags => settings.show_toolbar_tags = visible,
+        TS::Folder => settings.show_toolbar_folder = visible,
         TS::Unknown => {}
     }
 }
@@ -9483,9 +9485,15 @@ impl App {
         }
     }
 
-    /// ツールバーを描画し、お気に入りナビゲーション先を返す。
+    /// ツールバーを描画し、お気に入りとフォルダバーのナビゲーション先を返す。
     /// ソート変更があった場合はフォルダの再ロードも行う。
-    pub(crate) fn render_toolbar(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    pub(crate) fn render_toolbar(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> (Option<PathBuf>, Option<AddressBarNav>) {
+        if !self.settings.show_toolbar_folder {
+            self.address_has_focus = false;
+        }
         // Vec を先にクローンして borrow checker の制約を回避
         let tb_cols = self.settings.toolbar_cols_items.clone();
         let tb_aspects = self.settings.toolbar_aspect_items.clone();
@@ -9514,6 +9522,7 @@ impl App {
             && self.settings.show_toolbar_effetune;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
         let show_collections = self.settings.show_toolbar_collections;
+        let show_folder = self.settings.show_toolbar_folder;
         let (toolbar_collection_target_id, toolbar_collections, collections_status) =
             self.collection_toolbar_catalog();
         let toolbar_pinned_collections = self
@@ -9535,7 +9544,27 @@ impl App {
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
         let has_rating_selection = has_book_add_target;
         let toolbar_section_order =
-            crate::settings::ToolbarSectionId::render_order(&self.settings.toolbar_section_order);
+            crate::settings::ToolbarSectionId::render_order(&self.settings.toolbar_section_order)
+                .into_iter()
+                .filter(|section| {
+                    use crate::settings::ToolbarSectionId as TS;
+                    match section {
+                        TS::FolderTree => show_folder_tree_button,
+                        TS::EffeTune => show_effetune,
+                        TS::Bookshelf => show_bookshelf,
+                        TS::Collections => show_collections,
+                        TS::Cols => show_cols,
+                        TS::Aspect => show_aspect,
+                        TS::Sort => show_sort,
+                        TS::Rating => show_rating,
+                        TS::Favorites => show_favs,
+                        TS::SmartFolders => show_smart_folders,
+                        TS::Tags => show_tags,
+                        TS::Folder => show_folder,
+                        TS::Unknown => false,
+                    }
+                })
+                .collect::<Vec<_>>();
         // 前フレームのツールバー content rect (空き領域 右クリック用背景 interact の矩形)。
         let toolbar_bg_rect = self.toolbar_content_rect;
         // ドラッグ並べ替えの許可状態 (既定 OFF)。OFF のときはカーソルも変えない。
@@ -9550,13 +9579,15 @@ impl App {
             || show_favs
             || show_smart_folders
             || show_rating
-            || show_tags;
+            || show_tags
+            || self.settings.show_toolbar_folder;
 
         if !any_toolbar_section {
-            return None;
+            return (None, None);
         }
 
         let mut toolbar_fav_nav: Option<PathBuf> = None;
+        let mut toolbar_address_nav = None;
         let mut toolbar_smart_folder_open: Option<uuid::Uuid> = None;
         let mut toolbar_sort_changed = false;
         let mut toolbar_sort_reload_requested = false;
@@ -9582,7 +9613,9 @@ impl App {
             Vec::new();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(2.0);
+            if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
+                ui.add_space(2.0);
+            }
             // ツールバー内の widget は label / selectable_label / ComboBox / radio が
             // 混在しており、widget 高さの違いで縦位置がガタつく (ComboBox は label より
             // 大きい)。`horizontal_wrapped` (= 既存の折返しレイアウト) は維持しつつ、
@@ -9626,6 +9659,7 @@ impl App {
                 ui.interact(capped, ui.id().with("toolbar_bg_menu"), egui::Sense::click())
             });
 
+            let folder_style = ui.style().clone();
             let scope_resp = ui.scope(|ui| {
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
                 // FontTweak.y_offset で補正)。詳細: src/ui_fonts.rs の TOOLBAR_TEXT_FAMILY_NAME。
@@ -9676,6 +9710,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                 use crate::settings::ToolbarSectionId as TS;
                 let mut first_section = true;
+                let mut previous_was_folder = false;
                 // ピン留めタグ (タグセクションで使用)。ループ前に 1 度だけ算出する。
                 let toolbar_tags: Vec<_> = self
                     .settings
@@ -9706,12 +9741,13 @@ impl App {
                         TS::Favorites => show_favs,
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
+                        TS::Folder => self.settings.show_toolbar_folder,
                         TS::Unknown => false,
                     };
                     if !visible {
                         continue;
                     }
-                    if !first_section {
+                    if !first_section && section != TS::Folder && !previous_was_folder {
                         // 「行頭に表示」セクションは、自動折返しを待たずここで改行する
                         // (egui の end_row は wrapping layout で次の行へ移る)。それ以外は
                         // 従来どおりセパレータで区切る。
@@ -10672,6 +10708,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
                 }
+                TS::Folder => {
+                    // A scope would start a fresh placer at the remaining rect and
+                    // lose the full row's left edge. Keep the wrapping placer owner.
+                    let toolbar_style = ui.style().clone();
+                    ui.set_style(folder_style.clone());
+                    let response = self.render_address_bar(ui, toolbar_new_row.contains(&section), &last_section_anchors);
+                    ui.set_style(toolbar_style);
+                    toolbar_address_nav = response.inner;
+                    current_section_anchors.push((section, response.response.rect));
+                }
                 TS::Unknown => {}
                     }
                     // このセクションのアンカー矩形を「ラベル + 各種ボタン」の全体に広げる
@@ -10691,6 +10737,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             );
                         }
                     }
+                    previous_was_folder = section == TS::Folder;
                     first_section = false;
                 }
                 });
@@ -10704,7 +10751,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.draw_toolbar_visibility_menu(ui, false, true);
                 });
             }
-            ui.add_space(2.0);
+            if toolbar_section_order.last() != Some(&crate::settings::ToolbarSectionId::Folder) {
+                ui.add_space(2.0);
+            }
         });
 
         // 次フレームのドラッグ並べ替え drop 計算用に、今フレームの可視セクション矩形を格納。
@@ -10809,7 +10858,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
 
-        toolbar_fav_nav
+        (toolbar_fav_nav, toolbar_address_nav)
     }
 
     /// ピン留めタグの左クリックだけが使うタグビュー toggle。
@@ -10901,7 +10950,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             )
             .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。")
             .changed();
-        // フォルダバー (アドレス行) も「並べ替えできないだけのセクション」として扱う。
+        // フォルダバー (アドレス行) も通常の並べ替え対象セクションとして扱う。
         // 他セクション同様、ここ (メニュー) では表示 ON/OFF だけ。出すボタンの細かい設定は
         // ツールバー上の操作 = アドレスバー左端「フォルダ:」の右クリックに統一する
         // (実機フィードバック: フォルダバーだけメニューから設定できるのは不揃い)。
@@ -11025,7 +11074,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_location_drive_roots = true;
         // 並び順 / 行頭 / ドラッグ許可
         s.toolbar_section_order = Vec::new();
-        s.toolbar_section_new_row = Vec::new();
+        s.toolbar_section_new_row = defaults.toolbar_section_new_row;
+        s.toolbar_folder_section_migrated = true;
         s.toolbar_section_drag_enabled = false;
         // 表示形式 / 折りたたみ。「既定に戻す」= 新規インストールの既定に揃えるので、
         // 列 / 比率 / ソートは新規既定と同じプルダウンにする (Settings::default と一致)。
@@ -11054,7 +11104,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     /// セクションのラベル右クリックで開く「このセクションの設定」メニュー
     /// (v2.0.0 Phase 3, §1.2)。表示形式・出す項目・管理ダイアログ・非表示・既定化を提供。
-    fn draw_section_settings_menu(
+    pub(crate) fn draw_section_settings_menu(
         &mut self,
         ui: &mut egui::Ui,
         section: crate::settings::ToolbarSectionId,
@@ -11062,6 +11112,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         use crate::settings::ToolbarSectionDisplay as TD;
         use crate::settings::ToolbarSectionId as TS;
 
+        if section == TS::Folder {
+            self.draw_folder_bar_settings_menu(ui);
+            return;
+        }
         draw_sticky_settings_menu_header(ui, toolbar_section_display_label(section), true);
         ui.separator();
 
@@ -11081,7 +11135,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             TS::FolderTree | TS::EffeTune | TS::Rating | TS::Unknown
         );
         match section {
-            TS::FolderTree | TS::EffeTune | TS::Rating => {
+            TS::FolderTree | TS::EffeTune | TS::Rating | TS::Folder => {
                 // 表示形式・出す項目を持たない。非表示 / 既定化のみ (下の共通部)。
             }
             TS::Bookshelf => {
@@ -11242,6 +11296,35 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if has_section_specific_settings {
             ui.separator();
         }
+        changed |= self.draw_toolbar_section_layout_settings(ui, section);
+
+        ui.separator();
+        if ui
+            .button("このセクションを隠す")
+            .on_hover_text("再表示はツールバーの空き領域を右クリック")
+            .clicked()
+        {
+            set_toolbar_section_visible(&mut self.settings, section, false);
+            self.settings.save();
+            ui.ctx().request_repaint();
+            ui.close();
+            return;
+        }
+        // 「ツールバーを既定に戻す」は影響が大きいので、ここ (項目右クリック) には出さない。
+        // 「設定→ツールバー」からのみ、確認ダイアログを経て実行する (実機フィードバック)。
+
+        if changed {
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn draw_toolbar_section_layout_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        section: crate::settings::ToolbarSectionId,
+    ) -> bool {
+        let mut changed = false;
         // 行頭に表示 (= このセクションの前で必ず改行)。
         let mut new_row = self.settings.toolbar_section_new_row.contains(&section);
         if ui
@@ -11277,30 +11360,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.close();
         }
 
-        ui.separator();
-        if ui
-            .button("このセクションを隠す")
-            .on_hover_text("再表示はツールバーの空き領域を右クリック")
-            .clicked()
-        {
-            set_toolbar_section_visible(&mut self.settings, section, false);
-            self.settings.save();
-            ui.ctx().request_repaint();
-            ui.close();
-            return;
-        }
-        // 「ツールバーを既定に戻す」は影響が大きいので、ここ (項目右クリック) には出さない。
-        // 「設定→ツールバー」からのみ、確認ダイアログを経て実行する (実機フィードバック)。
-
-        if changed {
-            self.settings.save();
-            ui.ctx().request_repaint();
-        }
+        changed
     }
 
     /// フォルダバー (アドレス行) の設定メニュー (v2.0.0 Phase 3, 実機フィードバック 2026-06-20)。
     /// アドレスバー左端の「フォルダ:」ラベル右クリック、および「設定」メニュー → ツールバー →
-    /// フォルダバーの設定 から開く。フォルダバーは並べ替えできないだけのセクション扱い。
+    /// フォルダバーの設定 から開く。入力欄と付属操作を一体で並べ替える。
     fn draw_folder_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
         draw_sticky_settings_menu_header(ui, "フォルダバー", true);
         ui.separator();
@@ -11412,6 +11477,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.close();
         }
 
+        ui.separator();
+        changed |= self
+            .draw_toolbar_section_layout_settings(ui, crate::settings::ToolbarSectionId::Folder);
         ui.separator();
         if ui
             .button("フォルダバーを隠す")
@@ -13679,11 +13747,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     // ── フォルダバー ─────────────────────────────────────────────────
 
     /// フォルダバーを描画し、Enter や履歴ボタンで確定されたナビゲーションを返す。
-    pub(crate) fn render_address_bar(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
-        if !self.settings.show_toolbar_folder {
-            self.address_has_focus = false;
-            return None;
-        }
+    fn render_address_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        new_row: bool,
+        last_anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
+    ) -> egui::InnerResponse<Option<AddressBarNav>> {
+        let ctx = &ui.ctx().clone();
 
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let effective_folder = self.effective_folder();
@@ -13763,9 +13833,120 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .then(|| self.current_normal_folder_omitted_counts())
             .flatten();
         let mut open_preferences = None;
-        let result = egui::TopBottomPanel::top("address_bar")
-            .show(ctx, |ui| -> Option<AddressBarNav> {
-                ui.add_space(3.0);
+        // Measure the same visible controls in the folder bar's normal style.
+        // Frame-less buttons are conservatively budgeted with padding as well.
+        let mut widths = crate::ui_toolbar_layout::FolderBarWidth::new(ui);
+        widths.label(ui, "フォルダ:");
+        let show_history_nav = self.settings.show_address_bar_history_nav;
+        let show_quick_folders = self.settings.show_address_bar_quick_folders;
+        let show_parent = self.settings.show_toolbar_parent_button;
+        let show_tree_nav =
+            self.settings.show_toolbar_prev_folder || self.settings.show_toolbar_next_folder;
+        if show_history_nav {
+            for text in ["←", "→"] {
+                widths.button(ui, text, 0.0);
+            }
+        }
+        if show_quick_folders {
+            for text in ["A", "B"] {
+                widths.button(ui, egui::RichText::new(text).monospace().strong(), 24.0);
+            }
+        }
+        if (show_history_nav || show_quick_folders) && (show_parent || show_tree_nav) {
+            widths.space(6.0 + ui.spacing().item_spacing.x);
+        }
+        if show_parent {
+            widths.button(ui, "⬆", 0.0);
+        }
+        if show_tree_nav {
+            for text in ["▲", "▼"] {
+                widths.button(ui, text, 0.0);
+            }
+        }
+        if show_history_nav || show_parent || show_tree_nav {
+            widths.space(6.0 + ui.spacing().item_spacing.x);
+        }
+        widths.button(ui, "場所▼", 0.0);
+        widths.space(4.0 + 6.0 + ui.spacing().item_spacing.x);
+        if let Some(label) = omitted_counts.and_then(omitted_entries_chip_label) {
+            widths.button(ui, label, 0.0);
+            widths.space(4.0);
+        }
+        if (1..=5).contains(&folder_rating) {
+            widths.label(
+                ui,
+                egui::RichText::new(format!("📁{}", "★".repeat(folder_rating as usize))).strong(),
+            );
+            widths.space(4.0);
+        }
+        if let Some(count) = thumbnail_count.as_ref() {
+            widths.label(ui, egui::RichText::new(count).size(11.0).monospace());
+            widths.space(4.0);
+        }
+        for (visible, text) in [
+            (stack_available, "スタック"),
+            (subfolder_expansion_available, "サブ展開"),
+            (pin_button_info.is_some(), "📌"),
+            (self.settings.show_address_bar_history_menu, "履歴▼"),
+            (self.settings.show_address_bar_favorite_button, "♥"),
+        ] {
+            if visible {
+                widths.button(ui, text, 0.0);
+                widths.space(4.0);
+            }
+        }
+        if let Some(suffix) = self.snapshot_path_suffix() {
+            widths.label(ui, suffix);
+        }
+        let minimum_width = widths.minimum();
+        // Preserve the interior margins of the former two panels and the toolbar's
+        // trailing padding when the folder bar is explicitly on a separate row.
+        let separate_row_padding =
+            if new_row && ui.available_rect_before_wrap().width() < ui.max_rect().width() - 0.5 {
+                f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.top)
+                    + f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.bottom)
+                    + 2.0
+            } else {
+                0.0
+            };
+        if separate_row_padding > 0.0 {
+            use egui::emath::GuiRounding as _;
+            // The former toolbar panel ended after its trailing padding and frame
+            // margin. Preserve its full-width border inside the integrated panel,
+            // using TopBottomPanel's non-resizable stroke and half-stroke inset.
+            let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+            // The completed toolbar scope advanced the outer vertical cursor by
+            // item_spacing before the trailing padding was allocated.
+            // Frame::end allocates its response with Ui::allocate_rect, which
+            // rounds to egui's GUI grid. Match that rounding at fractional DPI too.
+            let former_toolbar_bottom = (ui.min_rect().bottom()
+                + ui.spacing().item_spacing.y
+                + 2.0
+                + f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.bottom))
+            .round_ui();
+            ui.painter().hline(
+                ui.clip_rect().x_range(),
+                former_toolbar_bottom - stroke.width * 0.5,
+                stroke,
+            );
+            // In the two-panel layout the folder panel's background was painted
+            // after this line. Keep that boundary compositing order too: otherwise
+            // the line's antialiasing fringe bleeds into the folder row at 150% DPI.
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(ui.clip_rect().left(), former_toolbar_bottom),
+                    ui.clip_rect().max,
+                ),
+                0.0,
+                egui::Frame::side_top_panel(ui.style()).fill,
+            );
+        }
+        let result = crate::ui_toolbar_layout::flexible_section(
+            ui,
+            minimum_width,
+            new_row,
+            |ui, compact| -> Option<AddressBarNav> {
+                ui.add_space(3.0 + separate_row_padding);
                 let mut result = None;
                 let mut pin_click = PinButtonClick::None;
                 let mut favorite_click = FavoriteButtonClick::None;
@@ -13776,12 +13957,28 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let mut subfolder_expansion_button_clicked = false;
                 // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
                 let mut search_drill_up = false;
-                ui.horizontal(|ui| {
+                crate::ui_toolbar_layout::folder_controls(ui, compact, |ui| {
                     // 左端のラベルを右クリックすると、フォルダバーの設定メニューを開く
                     // (他のツールバーセクションと操作を揃える。実機フィードバック 2026-06-20)。
                     let folder_label_response = ui
-                        .add(egui::Label::new("フォルダ:").sense(egui::Sense::click()))
-                        .on_hover_text("右クリック: フォルダバーの設定");
+                        .add(egui::Label::new("フォルダ:").sense(
+                            if self.settings.toolbar_section_drag_enabled {
+                                egui::Sense::click_and_drag()
+                            } else {
+                                egui::Sense::click()
+                            },
+                        ))
+                        .on_hover_text(if self.settings.toolbar_section_drag_enabled {
+                            "ドラッグ: 並べ替え / 右クリック: フォルダバーの設定"
+                        } else {
+                            "右クリック: フォルダバーの設定"
+                        });
+                    self.handle_toolbar_section_drag(
+                        ui,
+                        &folder_label_response,
+                        crate::settings::ToolbarSectionId::Folder,
+                        last_anchors,
+                    );
                     show_sticky_context_menu(&folder_label_response, |ui| {
                         self.draw_folder_bar_settings_menu(ui);
                     });
@@ -13848,7 +14045,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     crate::folder_tree::path_eq(current, target)
                                 })
                             });
-                            let enabled = !search_active && !local_search_active && !snapshot_active;
+                            let enabled =
+                                !search_active && !local_search_active && !snapshot_active;
                             let tooltip = if snapshot_active {
                                 format!("{label}: ★固定中は使用できません")
                             } else if search_active {
@@ -13865,9 +14063,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             };
                             let mut rich = egui::RichText::new(label).monospace();
                             if is_active {
-                                rich = rich
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(230, 170, 70));
+                                rich = rich.strong().color(egui::Color32::from_rgb(230, 170, 70));
                             } else if same_target {
                                 rich = rich.color(egui::Color32::from_rgb(120, 170, 210));
                             } else if target.is_none() {
@@ -13941,7 +14137,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
                                     }
                                     Some(AddressBarNav::GridVirtual(intent)) => {
-                                        format!("親フォルダへ [BS]\n{}", intent.path.to_string_lossy())
+                                        format!(
+                                            "親フォルダへ [BS]\n{}",
+                                            intent.path.to_string_lossy()
+                                        )
                                     }
                                     Some(AddressBarNav::DriveList(Some(origin))) => {
                                         format!("ドライブ一覧へ [BS]\n{}", origin.to_string_lossy())
@@ -13962,9 +14161,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             "レーティング一覧へ戻る [BS]".to_string()
                                         }
                                     }
-                                    Some(AddressBarNav::BooksRoot) => {
-                                        "本棚フォルダへ".to_string()
-                                    }
+                                    Some(AddressBarNav::BooksRoot) => "本棚フォルダへ".to_string(),
                                     Some(AddressBarNav::Collection(_)) => {
                                         "コレクションへ戻る [BS]".to_string()
                                     }
@@ -13973,8 +14170,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                     Some(
                                         AddressBarNav::HistoryBack
-                                            | AddressBarNav::HistoryForward
-                                            | AddressBarNav::SavedGroupReady(_),
+                                        | AddressBarNav::HistoryForward
+                                        | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
                                 }
@@ -14054,100 +14251,108 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                     let place_nav_enabled = !search_active && !snapshot_active;
                     ui.add_enabled_ui(place_nav_enabled, |ui| {
-                        let place_response = ui.menu_button("場所▼", |ui| {
-                            ui.set_min_width(220.0);
-                            let location_entries =
-                                crate::known_folders::location_menu_entries(&self.settings);
-                            for entry in location_entries {
-                                match entry {
-                                    crate::known_folders::LocationMenuEntry::DriveList => {
-                                        if ui.button("ドライブ一覧").clicked() {
-                                            result = Some(AddressBarNav::DriveList(None));
-                                            ui.close();
+                        let place_response = ui
+                            .menu_button("場所▼", |ui| {
+                                ui.set_min_width(220.0);
+                                let location_entries =
+                                    crate::known_folders::location_menu_entries(&self.settings);
+                                for entry in location_entries {
+                                    match entry {
+                                        crate::known_folders::LocationMenuEntry::DriveList => {
+                                            if ui.button("ドライブ一覧").clicked() {
+                                                result = Some(AddressBarNav::DriveList(None));
+                                                ui.close();
+                                            }
                                         }
-                                    }
-                                    crate::known_folders::LocationMenuEntry::ReadingHistory => {
-                                        if ui.button("閲覧履歴").clicked() {
-                                            result = Some(AddressBarNav::ReadingHistory);
-                                            ui.close();
+                                        crate::known_folders::LocationMenuEntry::ReadingHistory => {
+                                            if ui.button("閲覧履歴").clicked() {
+                                                result = Some(AddressBarNav::ReadingHistory);
+                                                ui.close();
+                                            }
                                         }
-                                    }
-                                    crate::known_folders::LocationMenuEntry::Bookmarks => {
-                                        if ui.button("ブックマーク").clicked() {
-                                            self.open_bookmark_browser();
-                                            ui.close();
+                                        crate::known_folders::LocationMenuEntry::Bookmarks => {
+                                            if ui.button("ブックマーク").clicked() {
+                                                self.open_bookmark_browser();
+                                                ui.close();
+                                            }
                                         }
-                                    }
-                                    crate::known_folders::LocationMenuEntry::Rating { stars } => {
-                                        ui.menu_button("レーティング", |ui| {
-                                            for stars in stars {
-                                                if ui
-                                                    .button(rating_view_menu_label(
-                                                        stars,
-                                                        rating_counts,
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    self.enter_rating_view_from_menu(stars);
-                                                    ui.close();
+                                        crate::known_folders::LocationMenuEntry::Rating {
+                                            stars,
+                                        } => {
+                                            ui.menu_button("レーティング", |ui| {
+                                                for stars in stars {
+                                                    if ui
+                                                        .button(rating_view_menu_label(
+                                                            stars,
+                                                            rating_counts,
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        self.enter_rating_view_from_menu(stars);
+                                                        ui.close();
+                                                    }
                                                 }
-                                            }
-                                        });
-                                    }
-                                    crate::known_folders::LocationMenuEntry::Bookshelf => {
-                                        if ui
-                                            .button("本棚フォルダ")
-                                            .hover_tip(
-                                                self.book_root_path().to_string_lossy().to_string(),
-                                            )
-                                            .clicked()
-                                        {
-                                            result = Some(AddressBarNav::BooksRoot);
-                                            ui.close();
+                                            });
                                         }
-                                    }
-                                    crate::known_folders::LocationMenuEntry::Separator => {
-                                        ui.separator();
-                                    }
-                                    crate::known_folders::LocationMenuEntry::QuickLocation(
-                                        location,
-                                    ) => {
-                                        let full = location.path.to_string_lossy().to_string();
-                                        if ui.button(location.label).hover_tip(&full).clicked() {
-                                            if let Some(resolved) =
-                                                resolve_folder_bar_nav_path(&location.path)
+                                        crate::known_folders::LocationMenuEntry::Bookshelf => {
+                                            if ui
+                                                .button("本棚フォルダ")
+                                                .hover_tip(
+                                                    self.book_root_path()
+                                                        .to_string_lossy()
+                                                        .to_string(),
+                                                )
+                                                .clicked()
                                             {
-                                                result = Some(AddressBarNav::Direct(resolved));
+                                                result = Some(AddressBarNav::BooksRoot);
+                                                ui.close();
                                             }
-                                            ui.close();
                                         }
-                                    }
-                                    crate::known_folders::LocationMenuEntry::DriveRoot(drive) => {
-                                        let label = drive.to_string_lossy().to_string();
-                                        if ui
-                                            .button(egui::RichText::new(&label).monospace())
-                                            .hover_tip(&label)
-                                            .clicked()
-                                        {
-                                            if let Some(resolved) =
-                                                resolve_folder_bar_nav_path(&drive)
+                                        crate::known_folders::LocationMenuEntry::Separator => {
+                                            ui.separator();
+                                        }
+                                        crate::known_folders::LocationMenuEntry::QuickLocation(
+                                            location,
+                                        ) => {
+                                            let full = location.path.to_string_lossy().to_string();
+                                            if ui.button(location.label).hover_tip(&full).clicked()
                                             {
-                                                result = Some(AddressBarNav::Direct(resolved));
+                                                if let Some(resolved) =
+                                                    resolve_folder_bar_nav_path(&location.path)
+                                                {
+                                                    result = Some(AddressBarNav::Direct(resolved));
+                                                }
+                                                ui.close();
                                             }
-                                            ui.close();
+                                        }
+                                        crate::known_folders::LocationMenuEntry::DriveRoot(
+                                            drive,
+                                        ) => {
+                                            let label = drive.to_string_lossy().to_string();
+                                            if ui
+                                                .button(egui::RichText::new(&label).monospace())
+                                                .hover_tip(&label)
+                                                .clicked()
+                                            {
+                                                if let Some(resolved) =
+                                                    resolve_folder_bar_nav_path(&drive)
+                                                {
+                                                    result = Some(AddressBarNav::Direct(resolved));
+                                                }
+                                                ui.close();
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        })
-                        .response
-                        .hover_tip(if snapshot_active {
-                            "★固定中は場所ジャンプを使用できません"
-                        } else if search_active {
-                            "検索中は場所ジャンプを使用できません"
-                        } else {
-                            "デスクトップ / 主要フォルダ / ドライブへ移動"
-                        });
+                            })
+                            .response
+                            .hover_tip(if snapshot_active {
+                                "★固定中は場所ジャンプを使用できません"
+                            } else if search_active {
+                                "検索中は場所ジャンプを使用できません"
+                            } else {
+                                "デスクトップ / 主要フォルダ / ドライブへ移動"
+                            });
                         show_sticky_context_menu(&place_response, |ui| {
                             self.draw_folder_bar_settings_menu(ui);
                         });
@@ -14155,10 +14360,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ui.add_space(4.0);
                     ui.separator();
 
+                    if compact {
+                        ui.end_row();
+                    }
                     // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(compact), |ui| {
                         if let Some(counts) = omitted_counts {
                             if let Some(page) = draw_omitted_entries_chip(ui, counts) {
                                 open_preferences = Some(page);
@@ -14338,7 +14546,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             ui.add_space(4.0);
                         }
 
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        crate::ui_toolbar_layout::address_input(ui, compact, |ui| {
                             // snapshot 中はフォルダパス入力を disabled にする (= §4.4)。
                             // suffix は TextEdit の **左** に colored_label として置く
                             // (= 旧版で右に置くと TextEdit が desired_width(INFINITY) で残り幅を
@@ -14352,14 +14560,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.add_enabled(
                                     false,
                                     egui::TextEdit::singleline(&mut self.address)
-                                        .desired_width(f32::INFINITY),
+                                        .id(egui::Id::new("folder_address_input")).desired_width(f32::INFINITY),
                                 )
                             } else {
                                 let mut output = crate::ime_focus::show_singleline(
                                     ui,
                                     &mut self.address,
                                     None,
-                                    |edit| edit.desired_width(f32::INFINITY),
+                                    |edit| edit.id(egui::Id::new("folder_address_input")).desired_width(f32::INFINITY),
                                 );
                                 crate::ui_helpers::singleline_text_edit_context_menu(
                                     ui,
@@ -14456,8 +14664,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                 }
                 result
-            })
-            .inner;
+            },
+        );
         if let Some(request) = open_preferences {
             self.open_preferences_request(request);
         }
@@ -26449,6 +26657,329 @@ mod details_header_right_click_tests {
                 harness.state().app.context_menu_idx.is_some(),
                 "gesture={gesture}: 行の右クリックでメニューが開かない"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod section207_tests {
+    use super::*;
+    use crate::settings::ToolbarSectionId as TS;
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    fn only_folder_and_tree(app: &mut App) {
+        for &id in TS::default_order() {
+            set_toolbar_section_visible(&mut app.settings, id, false);
+        }
+        app.settings.show_toolbar_folder = true;
+        app.settings.show_toolbar_folder_tree_button = true;
+    }
+
+    #[test]
+    fn section207_production_layout_all_controls_and_positions_keep_input_usable() {
+        for width in [1200.0, 720.0, 360.0] {
+            for position in [0, 1, 2] {
+                for new_row in [false, true] {
+                    for buttons in [false, true] {
+                        let mut env = crate::app::setup_app_for_test();
+                        only_folder_and_tree(&mut env);
+                        env.settings.show_toolbar_cols = true;
+                        env.settings.show_address_bar_history_nav = buttons;
+                        env.settings.show_address_bar_quick_folders = buttons;
+                        env.settings.show_toolbar_parent_button = buttons;
+                        env.settings.show_toolbar_prev_folder = buttons;
+                        env.settings.show_toolbar_next_folder = buttons;
+                        env.settings.show_address_bar_history_menu = buttons;
+                        env.settings.show_address_bar_favorite_button = buttons;
+                        if buttons {
+                            let folder = env.tmp.path().join("folder-controls");
+                            std::fs::create_dir_all(&folder).unwrap();
+                            for name in ["C165.JPG", "C165.PNG", "notes.txt"] {
+                                std::fs::write(folder.join(name), b"fixture").unwrap();
+                            }
+                            env.settings.skip_duplicate_images = true;
+                            env.load_folder_with_scan(folder, None);
+                            env.selected = Some(0);
+                            // Representative state for the existing cached status badge.
+                            env.current_folder_rating_cache = Some(5);
+                            assert!(env.compute_folder_pin_button_state().is_some());
+                        }
+                        env.settings.toolbar_section_order = vec![TS::FolderTree, TS::Cols];
+                        env.settings
+                            .toolbar_section_order
+                            .insert(position, TS::Folder);
+                        env.settings.toolbar_section_new_row =
+                            if new_row { vec![TS::Folder] } else { vec![] };
+                        let app = Rc::new(RefCell::new(env));
+                        let render = Rc::clone(&app);
+                        let fonts = Cell::new(false);
+                        let mut harness = Harness::builder()
+                            .with_size(egui::vec2(width, 360.0))
+                            .build(move |ctx| {
+                                if !fonts.replace(true) {
+                                    crate::ui_fonts::configure_fonts(ctx);
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                render.borrow_mut().render_toolbar(ctx);
+                            });
+                        harness.run();
+                        let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+                        assert!(
+                            input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH,
+                            "width={width} position={position} row={new_row} buttons={buttons}: {input:?}"
+                        );
+                        assert!(input.right() <= width, "input escaped the panel: {input:?}");
+                        let app = app.borrow();
+                        let folder_index = app
+                            .toolbar_section_anchors
+                            .iter()
+                            .position(|(id, _)| *id == TS::Folder)
+                            .unwrap();
+                        let folder = app.toolbar_section_anchors[folder_index].1;
+                        for (_, following) in
+                            app.toolbar_section_anchors.iter().skip(folder_index + 1)
+                        {
+                            assert!(
+                                following.top() >= folder.bottom(),
+                                "following section overlaps folder: {folder:?} {following:?}"
+                            );
+                        }
+                        assert!(folder.contains_rect(input));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section207_address_enter_focus_reorder_escape_and_hidden_lifecycle() {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let target = env.tmp.path().join("address-target");
+        std::fs::create_dir_all(&target).unwrap();
+        env.address = target.to_string_lossy().to_string();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if let Some(value) = app.render_toolbar(ctx).1 {
+                    nav_render.borrow_mut().push(value);
+                }
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        assert!(app.borrow().address_has_focus);
+        app.borrow_mut().settings.toolbar_section_order = vec![TS::Folder, TS::FolderTree];
+        app.borrow_mut().settings.toolbar_section_new_row.clear();
+        harness.run();
+        assert!(
+            app.borrow().address_has_focus,
+            "reordering must preserve the field identity"
+        );
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+        );
+        assert!(!app.borrow().address_has_focus);
+        nav.borrow_mut().clear();
+        app.borrow_mut().address.clear();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(matches!(
+            nav.borrow().as_slice(),
+            [AddressBarNav::DriveList(None)]
+        ));
+        nav.borrow_mut().clear();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(nav.borrow().is_empty());
+        assert!(!app.borrow().address_has_focus);
+        app.borrow_mut().settings.show_toolbar_folder = false;
+        app.borrow_mut().settings.show_toolbar_folder_tree_button = false;
+        app.borrow_mut().address_has_focus = true;
+        harness.run();
+        assert!(!app.borrow().address_has_focus);
+        assert!(
+            harness
+                .query_by_role(egui::accesskit::Role::TextInput)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn section207_address_ime_enter_and_escape_belong_to_composition() {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(Cell::new(false));
+        let nav_render = Rc::clone(&nav);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(720.0, 360.0))
+            .build(move |ctx| {
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                nav_render.set(nav_render.get() || app.render_toolbar(ctx).1.is_some());
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.event(egui::Event::Ime(egui::ImeEvent::Enabled));
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit("にほんご".into())));
+        harness.step();
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        assert!(!nav.get(), "IME confirmation must not navigate");
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        assert!(
+            app.borrow().address_has_focus,
+            "IME cancellation must keep input ownership"
+        );
+        assert!(!nav.get());
+        harness.event(egui::Event::Ime(egui::ImeEvent::Disabled));
+        harness.step();
+        assert!(app.borrow().address_has_focus);
+    }
+
+    #[test]
+    fn section207_toolbar_reset_and_drag_order_include_the_whole_folder_section() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.toolbar_section_new_row.clear();
+        app.reset_toolbar_customization();
+        assert_eq!(app.settings.toolbar_section_new_row, [TS::Folder]);
+        assert!(app.settings.toolbar_folder_section_migrated);
+        assert!(app.settings.show_facet_sort);
+        assert!(!app.settings.show_toolbar_sort);
+        let order = TS::default_order();
+        let moved = reorder_toolbar_section(order, TS::Folder, Some(TS::FolderTree), None).unwrap();
+        assert_eq!(moved[0], TS::Folder);
+        let returned = reorder_toolbar_section(&moved, TS::Folder, None, Some(TS::Tags)).unwrap();
+        assert_eq!(returned, order);
+    }
+
+    #[test]
+    fn section207_default_folder_geometry_matches_the_separate_panels() {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let legacy = Rc::new(Cell::new(true));
+        let legacy_render = Rc::clone(&legacy);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                if legacy_render.get() {
+                    app.settings.show_toolbar_folder = false;
+                    app.render_toolbar(ctx);
+                    app.settings.show_toolbar_folder = true;
+                    egui::TopBottomPanel::top("legacy_address_bar").show(ctx, |ui| {
+                        app.render_address_bar(ui, false, &[]);
+                    });
+                } else {
+                    app.render_toolbar(ctx);
+                }
+            });
+        for (theme, visuals) in [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ] {
+            harness.ctx.set_visuals(visuals);
+            for zoom in [1.0, 1.5] {
+                harness.ctx.set_zoom_factor(zoom);
+                for tree_visible in [true, false] {
+                    app.borrow_mut().settings.show_toolbar_folder_tree_button = tree_visible;
+                    legacy.set(true);
+                    harness.run();
+                    // A changed TopBottomPanel height updates its clip on the next frame.
+                    harness.step();
+                    harness.run();
+                    let old = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+                    // The reference's real TopBottomPanel paints its own separator, independently
+                    // of the shared folder widgets. Compare pixels too, not only TextEdit bounds.
+                    let old_image = harness.render().unwrap();
+                    let old_lines = harness.output().shapes.iter().filter(|s| matches!(s.shape, egui::Shape::LineSegment { points, .. } if points[0].x == 0.0)).cloned().collect::<Vec<_>>();
+                    legacy.set(false);
+                    harness.run();
+                    harness.step();
+                    harness.run();
+                    let new = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+                    let new_image = harness.render().unwrap();
+                    assert_eq!(
+                        new, old,
+                        "default geometry must survive tree_visible={tree_visible}"
+                    );
+                    let evidence = std::path::Path::new("target/section207-review-rendering/final");
+                    std::fs::create_dir_all(evidence).unwrap();
+                    old_image
+                        .save(evidence.join(format!(
+                            "legacy_{theme}_zoom_{zoom}_tree_{tree_visible}.png"
+                        )))
+                        .unwrap();
+                    new_image
+                        .save(evidence.join(format!(
+                            "integrated_{theme}_zoom_{zoom}_tree_{tree_visible}.png"
+                        )))
+                        .unwrap();
+                    if old_image.as_raw() != new_image.as_raw() {
+                        eprintln!("old panel lines: {old_lines:?}");
+                        let new_lines = harness.output().shapes.iter().filter(|s| matches!(s.shape, egui::Shape::LineSegment { points, .. } if points[0].x == 0.0)).collect::<Vec<_>>();
+                        eprintln!("new panel lines: {new_lines:?}");
+                    }
+                    assert!(
+                        old_image.as_raw() == new_image.as_raw(),
+                        "default pixels, including the panel separator, must survive theme={theme} zoom={zoom} tree_visible={tree_visible}"
+                    );
+                }
+            }
         }
     }
 }

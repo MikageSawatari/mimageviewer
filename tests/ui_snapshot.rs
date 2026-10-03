@@ -27,6 +27,159 @@
 
 use egui_kittest::Harness;
 
+/// Fix the flexible-section contract before attaching the application handlers.
+#[test]
+fn folder_toolbar_flexible_snapshots() {
+    use mimageviewer::ui_toolbar_layout as layout;
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (size, width, zoom) in [
+        ("normal", 1120.0, 1.0),
+        ("narrow", 720.0, 1.0),
+        ("dpi150", 1080.0, 1.5),
+    ] {
+        for (position, before) in [("first", 0), ("middle", 1), ("last", 2)] {
+            for new_row in [true, false] {
+                for buttons in [true, false] {
+                    let mut fonts_ready = false;
+                    let mut path = String::from(r"C:\Pictures\日本語フォルダ");
+                    let mut harness = Harness::builder()
+                        .with_size(egui::vec2(width, 220.0 * zoom))
+                        .build(move |ctx| {
+                            ctx.set_zoom_factor(zoom);
+                            mimageviewer::os_theme::apply_resolved(
+                                ctx,
+                                mimageviewer::os_theme::ResolvedTheme::Dark,
+                            );
+                            if !fonts_ready {
+                                install_app_fonts(ctx);
+                                fonts_ready = true;
+                                ctx.request_repaint();
+                                return;
+                            }
+                            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
+                                        .iter()
+                                        .take(before)
+                                    {
+                                        let _ = ui.button(*text);
+                                    }
+                                    let mut measured = layout::FolderBarWidth::new(ui);
+                                    measured.label(ui, "フォルダ:");
+                                    for text in [
+                                        "←",
+                                        "→",
+                                        "A",
+                                        "B",
+                                        "⬆",
+                                        "▲",
+                                        "▼",
+                                        "場所▼",
+                                        "スタック",
+                                        "サブ展開",
+                                        "📌",
+                                        "履歴▼",
+                                        "♡",
+                                    ]
+                                    .into_iter()
+                                    .filter(|text| buttons || *text == "場所▼")
+                                    {
+                                        measured.button(ui, text, 0.0);
+                                    }
+                                    measured.label(ui, "(25/120)");
+                                    let slot = layout::flexible_section(
+                                        ui,
+                                        measured.minimum(),
+                                        new_row,
+                                        |ui, compact| {
+                                            layout::folder_controls(ui, compact, |ui| {
+                                                ui.label("フォルダ:");
+                                                for text in
+                                                    ["←", "→", "A", "B", "⬆", "▲", "▼", "場所▼"]
+                                                        .into_iter()
+                                                        .filter(|text| buttons || *text == "場所▼")
+                                                {
+                                                    let _ = ui.button(text);
+                                                }
+                                                if compact {
+                                                    ui.end_row();
+                                                }
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    )
+                                                    .with_main_wrap(compact),
+                                                    |ui| {
+                                                        let last = ui.label("(25/120)").rect;
+                                                        for text in [
+                                                            "スタック",
+                                                            "サブ展開",
+                                                            "📌",
+                                                            "履歴▼",
+                                                            "♡",
+                                                        ]
+                                                        .into_iter()
+                                                        .filter(|_| buttons)
+                                                        {
+                                                            let _ = ui.button(text);
+                                                        }
+                                                        layout::address_input(ui, compact, |ui| {
+                                                            let input = ui.add(
+                                                                egui::TextEdit::singleline(
+                                                                    &mut path,
+                                                                )
+                                                                .desired_width(f32::INFINITY),
+                                                            );
+                                                            assert!(
+                                                            input.rect.width()
+                                                                >= layout::ADDRESS_INPUT_MIN_WIDTH
+                                                        );
+                                                            assert!(
+                                                                input.rect.right()
+                                                                    <= ui.clip_rect().right() + 0.5
+                                                            );
+                                                            assert!(!input.rect.intersects(last));
+                                                        });
+                                                    },
+                                                );
+                                            });
+                                        },
+                                    )
+                                    .response
+                                    .rect;
+                                    for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
+                                        .iter()
+                                        .skip(before)
+                                    {
+                                        let following = ui.button(*text).rect;
+                                        assert!(
+                                            following.top() >= slot.bottom(),
+                                            "subsequent sections need their own row"
+                                        );
+                                    }
+                                });
+                            });
+                        });
+                    harness.run();
+                    // All 36 combinations still run the geometry assertions above.
+                    // At the first position a row break has no effect; at smaller
+                    // widths the full controls force a break even with new_row OFF.
+                    // Keep only the 26 distinct images as persistent PNG baselines.
+                    let duplicate = !new_row && (before == 0 || (size != "normal" && buttons));
+                    if !duplicate {
+                        harness.snapshot(format!(
+                            "folder_toolbar_{size}_{position}_{}{}",
+                            if new_row { "row" } else { "inline" },
+                            if buttons { "" } else { "_minimal" }
+                        ));
+                        snapshots.extend(harness.take_snapshot_results());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn snapshot_color_presets(name: &str, width: f32) {
     let mut fonts_ready = false;
     let mut harness = Harness::builder()

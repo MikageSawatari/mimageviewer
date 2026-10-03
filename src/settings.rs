@@ -1717,6 +1717,7 @@ pub enum ToolbarSectionId {
     Favorites,
     SmartFolders,
     Tags,
+    Folder,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1758,6 +1759,7 @@ impl ToolbarSectionId {
             Self::Favorites,
             Self::SmartFolders,
             Self::Tags,
+            Self::Folder,
         ]
     }
 
@@ -5117,6 +5119,9 @@ pub struct Settings {
     /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
     #[serde(default)]
     pub toolbar_section_new_row: Vec<ToolbarSectionId>,
+    /// One-time upgrade of the released toolbar layout. Missing in old DB/JSON.
+    #[serde(default)]
+    pub(crate) toolbar_folder_section_migrated: bool,
     /// ツールバーセクションのドラッグ並べ替えを許可するか (v2.0.0、既定 false)。
     /// 既定 OFF にする理由: 常時ドラッグ可能にすると、通常操作中にラベル上で頻繁に
     /// マウスカーソルが「移動可能」形状へ変わって煩わしいため (実機フィードバック 2026-06-20)。
@@ -7387,7 +7392,8 @@ impl Default for Settings {
             show_toolbar_aspect: true,
             show_toolbar_sort: false,
             show_facet_sort: true,
-            toolbar_section_new_row: Vec::new(),
+            toolbar_section_new_row: vec![ToolbarSectionId::Folder],
+            toolbar_folder_section_migrated: true,
             toolbar_section_drag_enabled: false,
             menu_layout: crate::keymap::MenuLayoutSettings::default(),
             context_menu_layout: crate::context_menu_model::ContextMenuLayoutSettings::default(),
@@ -7982,7 +7988,7 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
 /// 3. `migrate_legacy_archive_file_handling`
-/// 4. ツールバーの列数・ソート候補の一度きりの補完
+/// 4. ツールバーの列数・ソート候補・フォルダセクションの一度きりの補完
 /// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
@@ -7992,6 +7998,7 @@ pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_toolbar_sort_size_options();
     settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.migrate_toolbar_sort_rating_options();
+    settings.migrate_toolbar_folder_section();
     settings.sanitize();
 }
 
@@ -8668,6 +8675,22 @@ impl Settings {
         true
     }
 
+    fn migrate_toolbar_folder_section(&mut self) -> bool {
+        if self.toolbar_folder_section_migrated {
+            return false;
+        }
+        self.toolbar_section_order =
+            ToolbarSectionId::ordered_with_fallback(&self.toolbar_section_order);
+        if !self
+            .toolbar_section_new_row
+            .contains(&ToolbarSectionId::Folder)
+        {
+            self.toolbar_section_new_row.push(ToolbarSectionId::Folder);
+        }
+        self.toolbar_folder_section_migrated = true;
+        true
+    }
+
     /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
     ///
     /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
@@ -8722,6 +8745,7 @@ impl Settings {
         let toolbar_sort_name_numeric_desc_options_migrated =
             settings.migrate_toolbar_sort_name_numeric_desc_options();
         let toolbar_sort_rating_options_migrated = settings.migrate_toolbar_sort_rating_options();
+        let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
         let legacy_keymap_import =
@@ -8867,6 +8891,7 @@ impl Settings {
             || toolbar_sort_size_options_migrated
             || toolbar_sort_name_numeric_desc_options_migrated
             || toolbar_sort_rating_options_migrated
+            || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
             || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -9748,6 +9773,7 @@ impl Settings {
         self.facet_name_filter_width = src.facet_name_filter_width;
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
+        self.toolbar_folder_section_migrated = src.toolbar_folder_section_migrated;
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
         // ── 操作カスタマイズ (設定メニューの専用ダイアログで編集) ──
         // 環境設定を開いたままキー / 右ドラッグ / リング / ジェスチャ設定を変更して OK した場合、
@@ -15698,6 +15724,155 @@ mod tests {
             assert!(custom.migrate_toolbar_sort_rating_options());
             assert_eq!(custom.toolbar_sort_items, before);
         }
+    }
+
+    #[test]
+    fn section207_folder_migration_json_is_once_and_preserves_customization() {
+        use ToolbarSectionId as TS;
+        let mut old: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_section_order": ["Tags", "Cols", "Tags", "FutureSection"],
+            "toolbar_section_new_row": ["Cols"],
+            "show_toolbar_sort": true,
+            "show_facet_sort": false,
+            "show_toolbar_folder": false,
+            "show_address_bar_history_nav": false
+        }))
+        .unwrap();
+        assert!(!old.toolbar_folder_section_migrated);
+        assert!(old.migrate_toolbar_folder_section());
+        assert_eq!(&old.toolbar_section_order[..2], &[TS::Tags, TS::Cols]);
+        assert_eq!(old.toolbar_section_order.last(), Some(&TS::Folder));
+        assert_eq!(
+            old.toolbar_section_order
+                .iter()
+                .filter(|&&id| id == TS::Folder)
+                .count(),
+            1
+        );
+        assert_eq!(old.toolbar_section_new_row, [TS::Cols, TS::Folder]);
+        assert!(!old.show_toolbar_folder);
+        assert!(!old.show_address_bar_history_nav);
+        assert!(old.show_toolbar_sort);
+        assert!(!old.show_facet_sort);
+        old.toolbar_section_new_row.retain(|&id| id != TS::Folder);
+        old.toolbar_section_order.rotate_right(1);
+        let order = old.toolbar_section_order.clone();
+        let mut restart: Settings =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        assert!(!restart.migrate_toolbar_folder_section());
+        apply_load_time_migrations(&mut restart);
+        assert_eq!(restart.toolbar_section_order, order);
+        assert_eq!(restart.toolbar_section_new_row, [TS::Cols]);
+        let mut empty: Settings = serde_json::from_str("{}").unwrap();
+        apply_load_time_migrations(&mut empty);
+        assert!(empty.toolbar_folder_section_migrated);
+        assert_eq!(empty.toolbar_section_order, TS::default_order());
+        assert_eq!(empty.toolbar_section_new_row, [TS::Folder]);
+        assert_eq!(Settings::default().toolbar_section_new_row, [TS::Folder]);
+    }
+
+    #[test]
+    fn section207_folder_migration_db_writes_marker_and_keeps_later_off() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut old = Settings::default();
+        old.toolbar_section_order = ToolbarSectionId::default_order()
+            .iter()
+            .copied()
+            .filter(|&id| id != ToolbarSectionId::Folder)
+            .rev()
+            .collect();
+        old.toolbar_section_new_row = vec![ToolbarSectionId::Tags];
+        old.show_toolbar_folder = false;
+        old.show_toolbar_sort = true;
+        old.show_facet_sort = false;
+        let expected_order = old.toolbar_section_order.clone();
+        old.save();
+        drop(crate::settings_db::SettingsDb::open(&dir).unwrap());
+        let db = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        db.execute(
+            "DELETE FROM settings_kv WHERE key = 'toolbar_folder_section_migrated'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        reset_backup_state_for_test();
+        let mut migrated = Settings::load();
+        assert_eq!(
+            &migrated.toolbar_section_order[..expected_order.len()],
+            expected_order
+        );
+        assert_eq!(
+            migrated.toolbar_section_order.last(),
+            Some(&ToolbarSectionId::Folder)
+        );
+        assert_eq!(
+            migrated.toolbar_section_new_row,
+            [ToolbarSectionId::Tags, ToolbarSectionId::Folder]
+        );
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.toolbar_folder_section_migrated);
+        assert_eq!(
+            persisted.toolbar_section_new_row,
+            migrated.toolbar_section_new_row
+        );
+        migrated
+            .toolbar_section_new_row
+            .retain(|&id| id != ToolbarSectionId::Folder);
+        migrated.toolbar_section_order.rotate_right(1);
+        migrated.save();
+        reset_backup_state_for_test();
+        let restart = Settings::load();
+        assert_eq!(restart.toolbar_section_new_row, [ToolbarSectionId::Tags]);
+        assert_eq!(
+            restart.toolbar_section_order,
+            migrated.toolbar_section_order
+        );
+        assert!(!restart.show_toolbar_folder);
+        assert!(restart.show_toolbar_sort);
+        assert!(!restart.show_facet_sort);
+    }
+
+    #[test]
+    fn section207_folder_migration_legacy_json_uses_production_bootstrap() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("toolbar_folder_section_migrated");
+        object.insert(
+            "toolbar_section_order".into(),
+            serde_json::json!(["Tags", "Cols"]),
+        );
+        object.insert("toolbar_section_new_row".into(), serde_json::json!([]));
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.toolbar_section_order.last(),
+            Some(&ToolbarSectionId::Folder)
+        );
+        assert_eq!(
+            loaded.settings.toolbar_section_new_row,
+            [ToolbarSectionId::Folder]
+        );
+        assert!(
+            crate::settings_db::SettingsDb::open(&dir)
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .toolbar_folder_section_migrated
+        );
     }
 
     // -- CachePolicy --

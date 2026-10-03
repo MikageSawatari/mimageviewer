@@ -94318,6 +94318,22 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     // 利用者が手で足す条件のバーなので、既定動作による非表示はこちらが定位置。
     assert!(app.settings.show_address_bar_omitted_entries);
     let ctx = egui::Context::default();
+    // The integrated bar also draws toolbar widgets using the app's named family.
+    crate::ui_fonts::configure_fonts(&ctx);
+    // TopBottomPanel learns the integrated toolbar height on its first frame.
+    // Inspect the settled frame, as the real event loop and Harness do.
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 240.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            app.render_toolbar(ctx);
+        },
+    );
     let output = ctx.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -94327,7 +94343,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_address_bar(ctx);
+            app.render_toolbar(ctx);
         },
     );
     let mut drawn = String::new();
@@ -94355,7 +94371,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_address_bar(ctx);
+            app.render_toolbar(ctx);
         },
     );
     let mut drawn_off = String::new();
