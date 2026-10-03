@@ -234,10 +234,19 @@ pathを明示的にUTF-16へ変換してwide APIでload／探索する。ACP man
 directory checkはNotFound以外のerrorを報告して停止し、Win32へnative backslash pathを渡す。
 2026-10-03 v4.3.0 release checkではEffeTuneのmissing-assets画面を調査し、pluginから観測できる
 load pathを `loader_path_from_utf8` に統一した。通常Win32絶対形式 (`C:\...` / `\\server\share\...`) の
-長さがMAX_PATH (260、NULを除くUTF-16単位) 未満なら通常形式、260以上だけ `\\?\` / `\\?\UNC\` を使う。
+長さがMAX_PATH (260、NULを除くUTF-16単位) 未満で同一pathを保持できる場合だけ通常形式にする。
+Codex P2/P3 対応では、通常候補を `GetFullPathNameW` に通して再拡張し、検査済み拡張pathとの
+完全一致を要求する (UNC namespace markerだけ大小文字を区別しない)。正規化差分／失敗、260以上、
+通常形式を持たないdevice namespaceは `\\?\` / `\\?\UNC\` 等の元の拡張形式を維持する。
+さらに各componentの末尾dot／spaceとDOS device名 (`CON` / `NUL` / `PRN` / `AUX`、
+`COM1`〜`COM9` / `LPT1`〜`LPT9`、superscript 1/2/3、`CONIN$` / `CONOUT$`、
+大小文字・拡張子付きも含む) は拡張形式を維持する。`GetFullPathNameW` 単独ではdevice名や
+一部の途中component末尾spaceが変わらず、file APIが別の対象へ解釈するための保守的な除外である。
+これによりplugin binary／CRTの検査とloadで対象が変わることを防ぐ。
 入力のforward slashはbackslashへ正規化し、日本語・emojiとstrict UTF-8変換を維持する。
 host内の探索・bundle検査・resource検査は従来どおり拡張形式を使う。EffeTuneはlauncherが
-最深file pathの260以上を公開前に拒否するため、plugin binaryのloadは必ず通常形式となる。
+最深file pathの260以上を公開前に拒否するため、通常のAPPDATA配下ではplugin binaryは通常形式でloadする。
+上記の同一性例外を含む祖先pathでは短くても拡張形式を維持し、asset解決の制限が残り得る。
 
 非製品の専用DLLによる回帰テストで、`LoadLibraryW` の拡張pathを `GetModuleFileNameW` がそのまま返すこと、
 存在するassetに `/css/effetune.css` を付加すると通常pathの `GetFileAttributesW` は成功し、拡張pathは
@@ -258,6 +267,7 @@ path境界の監査範囲:
 
 `ctest --test-dir crates/vst3-host/build -C Release --verbose` は `vst3-path-boundaries` を実行し、
 日本語＋emoji、短いlocal／UNC、slash正規化、259／260境界、長いlocal／UNC、strict変換、
+末尾dot／space、DOS device名のcomponent／file名、通常pathのround-trip、UNC／unc／UnC、
 専用DLLの短い通常／拡張loadと長い拡張loadを検査する。`gui_visibility.cpp` はbuild時のstatic_assert検査。
 host PE内のsourcehash markerを現在のCMakeLists／include／src／testsと照合する。releaseは古いAPPDATA等の
 hostをimportせず、現vendor hostが一致しなければCMakeで再buildする。bare cargo releaseにも同じgateがある。

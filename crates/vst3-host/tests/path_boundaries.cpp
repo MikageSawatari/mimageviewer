@@ -94,6 +94,38 @@ int wmain(int argc, wchar_t** argv) {
         require(miv::loader_path_from_utf8(u8R"(//?/C:/Users/山田/音響調整.vst3)").native() == LR"(C:\Users\山田\音響調整.vst3)");
         require(miv::loader_path_from_utf8(u8R"(//server/share/山田😀/音響調整.vst3)").native() == LR"(\\server\share\山田😀\音響調整.vst3)");
         require(miv::loader_path_from_utf8(u8R"(\\?\UNC\server\share\山田😀)").native() == LR"(\\server\share\山田😀)");
+        require(miv::loader_path_from_utf8(u8R"(\\?\unc\server\share\山田😀)").native() == LR"(\\server\share\山田😀)");
+        require(miv::loader_path_from_utf8(u8R"(\\?\UnC\server\share\山田😀)").native() == LR"(\\server\share\山田😀)");
+        // Only a spelling-preserving normal candidate may replace the inspected
+        // extended path. Device names need explicit checks: GetFullPathNameW can
+        // leave them unchanged even though file APIs resolve them as devices.
+        for (const auto* unsafe : {
+                LR"(\\?\C:\plugins.\Effect.vst3)", LR"(\\?\C:\plugins \Effect.vst3)",
+                LR"(\\?\C:\plugins\Effect.vst3.)", LR"(\\?\C:\plugins\Effect.vst3 )",
+                LR"(\\?\C:\plugins\..\Effect.vst3)", LR"(\\?\C:\plugins\.\Effect.vst3)",
+                LR"(\\?\UNC\server\share\plugins.\Effect.vst3)",
+                LR"(\\?\unc\server\share\plugins \Effect.vst3)"}) {
+            require(miv::loader_path_from_utf8(miv::utf16_to_utf8(unsafe)).native() == unsafe);
+        }
+        for (const auto* device : {L"CON", L"NUL", L"PRN", L"AUX", L"COM1", L"COM9",
+                L"LPT1", L"LPT9", L"con", L"NuL", L"cOm1", L"CONIN$", L"CONOUT$",
+                L"COM\u00b9", L"LPT\u00b2", L"COM\u00b3", L"NUL .vst3"}) {
+            for (const auto* prefix : {LR"(\\?\C:\plugins\)", LR"(\\?\UnC\server\share\)"}) {
+                const std::wstring base = std::wstring(prefix) + device;
+                for (const auto* suffix : {L"", L".vst3", LR"(\Effect.vst3)"}) {
+                    const auto input = base + suffix;
+                    require(miv::loader_path_from_utf8(miv::utf16_to_utf8(input)).native() == input);
+                }
+            }
+        }
+        const auto ordinary = miv::loader_path_from_utf8(u8R"(\\?\C:\plugins\音響😀\Effect.vst3)");
+        require(ordinary.native() == LR"(C:\plugins\音響😀\Effect.vst3)");
+        require(miv::path_from_utf8(miv::path_to_utf8(ordinary)).native() ==
+            LR"(\\?\C:\plugins\音響😀\Effect.vst3)");
+        for (const auto* non_device : {L"CONCERT", L"NULify", L"COM0", L"COM10", L"LPT0", L"LPT10"}) {
+            const auto normal = std::wstring(LR"(C:\plugins\)") + non_device + L".vst3";
+            require(miv::loader_path_from_utf8(miv::utf16_to_utf8(LR"(\\?\)" + normal)).native() == normal);
+        }
         require(miv::loader_path_from_utf8("./loader-fixture.dll").is_absolute());
         require(miv::path_to_utf8(binary).find(u8"山田😀") != std::string::npos);
         require(miv::path_from_utf8(u8R"(//?/C:/Users/山田/音響調整.vst3)").native() == LR"(\\?\C:\Users\山田\音響調整.vst3)");
@@ -107,6 +139,8 @@ int wmain(int argc, wchar_t** argv) {
         require(miv::loader_path_from_utf8(boundary).native().rfind(LR"(\\?\)", 0) == 0);
         require(miv::loader_path_from_utf8("C:/" + std::string(MAX_PATH - 4, 'a')).native().size() == MAX_PATH - 1);
         require(miv::loader_path_from_utf8("//server/share/" + std::string(280, 'a')).native().rfind(LR"(\\?\UNC\)", 0) == 0);
+        const auto long_mixed_unc = std::string(R"(\\?\UnC\server\share\)") + std::string(280, 'a');
+        require(miv::loader_path_from_utf8(long_mixed_unc).native() == miv::utf8_to_utf16(long_mixed_unc));
         require(GetACP() == acp); // Plugin ANSI behavior remains unchanged.
         require(miv::inspected_plugin_kind(true, {}) == miv::PluginPathKind::Bundle);
         require(miv::inspected_plugin_kind(false, {}) == miv::PluginPathKind::Dll);
