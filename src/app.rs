@@ -26052,6 +26052,16 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn local_audio_dsp_chain(&self) -> crate::video::audio::AudioDspChain {
+        crate::video::audio::AudioDspChain {
+            user: Some(self.dsp_bridge.clone()),
+            effetune: Arc::clone(&self.effetune.slot),
+            effetune_pre_limiter_enabled: self.settings.effetune_pre_limiter_enabled,
+            coordinator: Arc::clone(&self.dsp_processing),
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn effetune_toolbar_available(&self) -> bool {
         !self.remote_session_blocks_local_control() && self.effetune.runtime.toolbar_available()
     }
@@ -65888,11 +65898,7 @@ impl App {
                 // attaching them to this player's unused audio pump would create another claimant.
                 None
             } else {
-                Some(crate::video::audio::AudioDspChain {
-                    user: Some(self.dsp_bridge.clone()),
-                    effetune: Arc::clone(&self.effetune.slot),
-                    coordinator: Arc::clone(&self.dsp_processing),
-                })
+                Some(self.local_audio_dsp_chain())
             },
             output_consumer,
             #[cfg(windows)]
@@ -66331,11 +66337,7 @@ impl App {
             #[cfg(windows)]
             None, // gpu_video_device (headless)
             #[cfg(windows)]
-            Some(crate::video::audio::AudioDspChain {
-                user: Some(self.dsp_bridge.clone()),
-                effetune: Arc::clone(&self.effetune.slot),
-                coordinator: Arc::clone(&self.dsp_processing),
-            }),
+            Some(self.local_audio_dsp_chain()),
             crate::video::VideoOutputConsumer::Presentation,
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)

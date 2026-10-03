@@ -5600,6 +5600,9 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+    /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。再生開始時に取得する。
+    #[serde(default = "default_true")]
+    pub effetune_pre_limiter_enabled: bool,
     /// EffeTune GUI の最後の位置と外枠サイズ。
     #[serde(default)]
     pub effetune_gui_pos: Option<(i32, i32)>,
@@ -7492,6 +7495,7 @@ impl Default for Settings {
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
+            effetune_pre_limiter_enabled: true,
             effetune_gui_pos: None,
             effetune_gui_size: None,
             vst3_video_compact: false,

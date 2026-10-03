@@ -1143,6 +1143,50 @@ impl SafetyLimiter {
     }
 }
 
+/// Owns only the optional EffeTune input delay. Preserve the user-chain buffer so
+/// a failed EffeTune block can fall back without either limiting or added latency.
+pub(crate) struct EffetuneInputLimiter {
+    limiter: SafetyLimiter,
+    samples: Vec<f32>,
+    generation: Option<u64>,
+}
+
+impl EffetuneInputLimiter {
+    pub(crate) fn new(sample_rate: u32) -> Self {
+        Self {
+            limiter: SafetyLimiter::new(sample_rate, 2),
+            samples: Vec::new(),
+            generation: None,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.limiter.reset();
+        self.generation = None;
+    }
+
+    pub(crate) fn prepare<'a>(
+        &'a mut self,
+        input: &'a [f32],
+        generation: u64,
+        enabled: bool,
+    ) -> (&'a [f32], f64) {
+        if !enabled {
+            self.reset();
+            return (input, 0.0);
+        }
+        if self.generation != Some(generation) {
+            self.reset();
+            self.generation = Some(generation);
+        }
+        self.samples.clear();
+        self.samples.extend_from_slice(input);
+        // The HUD indicator continues to describe the final output limiter only.
+        self.limiter.process_block(&mut self.samples);
+        (&self.samples, self.limiter.latency_secs())
+    }
+}
+
 /// preroll (測定前待機) が解除された最初のブロックか判定する (前ブロック suspended かつ
 /// 今ブロック released)。true のブロックで normalize gain を snap し、確定 gain で即再生
 /// 開始することで 4 秒 ramp (`NORMALIZE_GAIN_RAMP_SECS`) を回避する。中盤再生中の gain 変更
@@ -1302,6 +1346,8 @@ pub fn default_output_sample_rate() -> Option<u32> {
 pub struct AudioDspChain {
     pub user: Option<Arc<crate::video::dsp::DspBridge>>,
     pub effetune: Arc<crate::effetune::EffetuneAudioSlot>,
+    /// Snapshot for this playback; close and reopen to apply preference changes.
+    pub effetune_pre_limiter_enabled: bool,
     pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
 }
 
@@ -1641,9 +1687,13 @@ fn run_pump(
     #[cfg(windows)]
     boost_audio_pump_priority();
     #[cfg(windows)]
-    let (dsp_bridge, effetune_slot) = match dsp_chain {
-        Some(chain) => (chain.user, Some(chain.effetune)),
-        None => (None, None),
+    let (dsp_bridge, effetune_slot, effetune_pre_limiter_enabled) = match dsp_chain {
+        Some(chain) => (
+            chain.user,
+            Some(chain.effetune),
+            chain.effetune_pre_limiter_enabled,
+        ),
+        None => (None, None, true),
     };
 
     // VST3 process_block 用の出力バッファ。再利用して realloc を抑える。
@@ -1682,6 +1732,8 @@ fn run_pump(
     let samples_per_sec = (sample_rate as f64) * 2.0;
     let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
+    #[cfg(windows)]
+    let mut effetune_input_limiter = EffetuneInputLimiter::new(sample_rate);
     let mut time_stretcher = TimeStretcher::new(sample_rate);
     let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
     let mut last_processed_normalize_stream: Option<usize> = None;
@@ -1877,6 +1929,8 @@ fn run_pump(
                 seen_valid_audio_frame = true;
                 // 新 seek 世代: target / activate を reset
                 safety_limiter.reset();
+                #[cfg(windows)]
+                effetune_input_limiter.reset();
                 // AV seek ではここで reset。1.0x bypass 境界の reset は
                 // TimeStretcher::process 内で自動的に行う。
                 time_stretcher.reset();
@@ -2300,12 +2354,18 @@ fn run_pump(
                             }
                             Ok(()) => {
                                 effetune_out.resize(output_samples.len(), 0.0);
-                                match bridge.process_block(&output_samples, &mut effetune_out) {
+                                let (input, input_latency_secs) = effetune_input_limiter.prepare(
+                                    &output_samples,
+                                    generation,
+                                    effetune_pre_limiter_enabled,
+                                );
+                                match bridge.process_block(input, &mut effetune_out) {
                                     Ok(()) => {
                                         effetune_applied = true;
                                         effetune_generation = Some(generation);
                                         effetune_health.succeeded();
-                                        applied_effetune_latency_secs = effetune_latency_secs;
+                                        applied_effetune_latency_secs =
+                                            effetune_latency_secs + input_latency_secs;
                                     }
                                     Err(error) => {
                                         let threshold_reached = effetune_health.failed();
@@ -2332,6 +2392,11 @@ fn run_pump(
                 } else {
                     effetune_health = crate::effetune::composition::StageHealth::default();
                 }
+            }
+
+            #[cfg(windows)]
+            if !effetune_applied {
+                effetune_input_limiter.reset();
             }
 
             #[cfg(windows)]
@@ -2374,6 +2439,8 @@ fn run_pump(
                 current_pdc_latency_secs += safety_limiter.latency_secs();
             } else {
                 safety_limiter.reset();
+                #[cfg(windows)]
+                effetune_input_limiter.reset();
             }
 
             // ── chunk metadata 計算 ──
@@ -3478,6 +3545,7 @@ mod tests {
         let chain = AudioDspChain {
             user: None,
             effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+            effetune_pre_limiter_enabled: true,
             coordinator: Arc::clone(&coordinator),
         };
         let (at_commit_tx, at_commit_rx) = bounded(1);
@@ -3570,6 +3638,7 @@ mod tests {
         AudioDspChain {
             user: None,
             effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+            effetune_pre_limiter_enabled: true,
             coordinator,
         }
     }
@@ -4993,6 +5062,41 @@ mod tests {
             silence.iter().all(|&v| v == 0.0),
             "reset should prevent old delayed audio from leaking"
         );
+    }
+
+    #[test]
+    fn effetune_pre_limiter_limits_a_copy_and_off_preserves_input() {
+        let input = vec![1.28, -1.27].repeat(32);
+        let mut limiter = EffetuneInputLimiter::new(1_000);
+        let (limited, latency) = limiter.prepare(&input, 1, true);
+        assert_eq!(latency, 0.005);
+        assert!(limited.iter().all(|sample| sample.abs() <= 1.0));
+        assert!(limited.iter().any(|sample| sample.abs() > 0.9));
+        assert_eq!(input[0], 1.28);
+        let (dry, latency) = limiter.prepare(&input, 1, false);
+        assert_eq!(dry, input);
+        assert_eq!(latency, 0.0);
+    }
+
+    #[test]
+    fn effetune_pre_limiter_reset_generation_and_toggle_clear_old_audio() {
+        let mut limiter = EffetuneInputLimiter::new(1_000);
+        for reset_kind in 0..3 {
+            limiter.prepare(&[0.8, -0.8].repeat(3), 1, true);
+            let generation = match reset_kind {
+                0 => {
+                    limiter.reset();
+                    1
+                }
+                1 => 2,
+                _ => {
+                    limiter.prepare(&[0.0; 2], 1, false);
+                    1
+                }
+            };
+            let (samples, _) = limiter.prepare(&[0.0; 20], generation, true);
+            assert!(samples.iter().all(|sample| *sample == 0.0));
+        }
     }
 
     /// 完全 underrun (= processed 空) で callback が来ても `next_pts_secs` が進まない。

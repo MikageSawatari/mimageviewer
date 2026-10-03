@@ -19,7 +19,7 @@ use ffmpeg::util::frame::{Audio, Video};
 use ffmpeg_the_third as ffmpeg;
 
 use super::audio::ProcessedChunk;
-use super::audio::SafetyLimiter;
+use super::audio::{EffetuneInputLimiter, SafetyLimiter};
 use super::stream::audio_encoder::{OpenedAacEncoder, open_aac_encoder};
 use super::stream::encoder::{
     EncoderPreference, FrameRate, H264InputFormat, SEGMENT_DURATION_SECS,
@@ -436,6 +436,7 @@ struct ClocklessVstChain {
 #[derive(Clone)]
 pub(crate) struct ClocklessAudioProcessing {
     pub(crate) normalize_gain: f64,
+    effetune_pre_limiter_enabled: bool,
     vst3: Option<ClocklessVstChain>,
     effetune: Option<ClocklessVstChain>,
     vst3_status: ClocklessVstStatus,
@@ -444,6 +445,19 @@ pub(crate) struct ClocklessAudioProcessing {
 }
 
 impl ClocklessAudioProcessing {
+    #[cfg(test)]
+    pub(crate) fn effetune_pre_limiter_enabled(&self) -> bool {
+        self.effetune_pre_limiter_enabled
+    }
+
+    pub(crate) fn with_effetune_preferences(
+        mut self,
+        settings: &crate::settings::Settings,
+    ) -> Self {
+        self.effetune_pre_limiter_enabled = settings.effetune_pre_limiter_enabled;
+        self
+    }
+
     pub(crate) fn without_vst3(normalize_gain: f64) -> Self {
         let vst3_status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
             requested: false,
@@ -453,6 +467,7 @@ impl ClocklessAudioProcessing {
         });
         Self {
             normalize_gain,
+            effetune_pre_limiter_enabled: true,
             vst3: None,
             effetune: None,
             vst3_status,
@@ -476,6 +491,7 @@ impl ClocklessAudioProcessing {
         });
         Self {
             normalize_gain,
+            effetune_pre_limiter_enabled: true,
             vst3: Some(ClocklessVstChain {
                 processor,
                 failed: Arc::new(AtomicBool::new(false)),
@@ -1316,6 +1332,8 @@ impl AudioPath {
 
 struct ClocklessAudioProcessor {
     normalize_gain: f32,
+    effetune_pre_limiter_enabled: bool,
+    effetune_input_limiter: EffetuneInputLimiter,
     vst3: Option<ClocklessVstChain>,
     vst3_output: Vec<f32>,
     effetune: Option<ClocklessVstChain>,
@@ -1584,6 +1602,8 @@ impl ClocklessAudioProcessor {
         }
         Ok(Self {
             normalize_gain: config.normalize_gain as f32,
+            effetune_pre_limiter_enabled: config.effetune_pre_limiter_enabled,
+            effetune_input_limiter: EffetuneInputLimiter::new(sample_rate),
             vst3,
             vst3_output: Vec::new(),
             effetune,
@@ -1611,6 +1631,10 @@ impl ClocklessAudioProcessor {
     }
 
     fn process(&mut self, mut chunk: ProcessedChunk) -> Option<ProcessedChunk> {
+        if self.latency_reconciler.seek_serial != Some(chunk.seek_serial) {
+            self.limiter.reset();
+            self.effetune_input_limiter.reset();
+        }
         if (self.normalize_gain - 1.0).abs() > f32::EPSILON {
             for sample in &mut chunk.samples {
                 *sample *= self.normalize_gain;
@@ -1705,14 +1729,21 @@ impl ClocklessAudioProcessor {
                     }
                     Ok(()) => {
                         self.effetune_output.resize(chunk.samples.len(), 0.0);
+                        // Each processor belongs to one Remote generation. A new worker
+                        // starts with a fresh limiter; a nonapplied block resets below.
+                        let (input, input_latency_secs) = self.effetune_input_limiter.prepare(
+                            &chunk.samples,
+                            0,
+                            self.effetune_pre_limiter_enabled,
+                        );
                         match chain
                             .processor
-                            .process_if_available(&chunk.samples, &mut self.effetune_output)
+                            .process_if_available(input, &mut self.effetune_output)
                         {
                             Ok(true) => {
                                 self.effetune_health.succeeded();
                                 effetune_applied = true;
-                                effetune_latency_secs = proposed_latency;
+                                effetune_latency_secs = proposed_latency + input_latency_secs;
                             }
                             Ok(false) => {}
                             Err(error) => {
@@ -1730,6 +1761,9 @@ impl ClocklessAudioProcessor {
                     }
                 }
             }
+        }
+        if !effetune_applied {
+            self.effetune_input_limiter.reset();
         }
         let (samples, scratch, composition) = crate::effetune::composition::compose_samples(
             chunk.samples,
@@ -1749,6 +1783,7 @@ impl ClocklessAudioProcessor {
             latency_secs += self.limiter.latency_secs();
         } else {
             self.limiter.reset();
+            self.effetune_input_limiter.reset();
         }
         chunk.audible_pts_secs -= latency_secs;
         chunk.pdc_latency_secs_at_process = latency_secs;
@@ -3286,7 +3321,7 @@ mod tests {
         );
     }
 
-    fn with_fake_effetune<P: ClocklessVstProcessor + 'static>(
+    fn with_unlimited_fake_effetune<P: ClocklessVstProcessor + 'static>(
         mut config: ClocklessAudioProcessing,
         effect: Arc<P>,
     ) -> ClocklessAudioProcessing {
@@ -3296,6 +3331,8 @@ mod tests {
             active_slots: 0,
             warning: None,
         });
+        // Legacy routing tests explicitly exercise the unaltered input mode.
+        config.effetune_pre_limiter_enabled = false;
         config.vst3_status = ClocklessVstStatus::combined(config.vst3_status, status.clone());
         config.effetune = Some(ClocklessVstChain {
             processor: effect,
@@ -3306,23 +3343,114 @@ mod tests {
     }
 
     #[test]
+    fn effetune_pre_limiter_remote_setting_controls_input_and_latency() {
+        for enabled in [true, false] {
+            let effect = Arc::new(FakeVstProcessor::new(1_000, false));
+            let settings = crate::settings::Settings {
+                effetune_pre_limiter_enabled: enabled,
+                ..crate::settings::Settings::default()
+            };
+            let config = with_unlimited_fake_effetune(
+                ClocklessAudioProcessing::without_vst3(1.0),
+                effect.clone(),
+            )
+            .with_effetune_preferences(&settings);
+            let mut processor = ClocklessAudioProcessor::new(config, 1_000).unwrap();
+            let input = vec![1.28, -1.27].repeat(20);
+            let result = processor.process(audio_chunk(input.clone())).unwrap();
+            let inputs = effect.inputs.lock().unwrap();
+            if enabled {
+                assert!(inputs[0].iter().all(|sample| sample.abs() <= 1.0));
+                assert_eq!(result.pdc_latency_secs_at_process, 0.010);
+            } else {
+                assert_eq!(inputs[0], input);
+                assert_eq!(result.pdc_latency_secs_at_process, 0.005);
+            }
+        }
+    }
+
+    #[test]
+    fn effetune_pre_limiter_remote_failure_skip_seek_and_restart_reset() {
+        let effect = Arc::new(ChangingLatencyVstProcessor {
+            sample_rate: 1_000,
+            latency_samples: AtomicU32::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let config = with_unlimited_fake_effetune(
+            ClocklessAudioProcessing::without_vst3(1.0),
+            effect.clone(),
+        )
+        .with_effetune_preferences(&crate::settings::Settings::default());
+        let mut processor = ClocklessAudioProcessor::new(config.clone(), 1_000).unwrap();
+        let first = processor.process(audio_chunk(vec![0.8; 40])).unwrap();
+        assert_eq!(first.pdc_latency_secs_at_process, 0.010);
+        effect.fail.store(true, Ordering::Release);
+        let dry = vec![1.2; 40];
+        let failed = processor.process(audio_chunk(dry.clone())).unwrap();
+        assert_eq!(failed.pdc_latency_secs_at_process, 0.0);
+        assert_eq!(&failed.samples[failed.samples.len() - dry.len()..], dry);
+        effect.fail.store(false, Ordering::Release);
+        let success = processor.process(audio_chunk(vec![0.0; 40])).unwrap();
+        assert_eq!(success.pdc_latency_secs_at_process, 0.010);
+        assert!(success.samples.iter().all(|sample| *sample == 0.0));
+
+        processor.process(audio_chunk(vec![0.8; 40]));
+        let mut seek = audio_chunk(vec![0.0; 40]);
+        seek.seek_serial += 1;
+        let seek = processor.process(seek).unwrap();
+        assert!(seek.samples.iter().all(|sample| *sample == 0.0));
+        // Remote seek/quality/source generations recreate the processor with its
+        // admitted preference snapshot, never the old lookahead delay.
+        let mut restarted = ClocklessAudioProcessor::new(config, 1_000).unwrap();
+        let restart = restarted.process(audio_chunk(vec![0.0; 40])).unwrap();
+        assert!(restart.samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn effetune_pre_limiter_remote_plugin_cap_excludes_both_limiters() {
+        let mut effect = FakeVstProcessor::new(1_000, false);
+        effect.latency_samples = 2_000;
+        let effect = Arc::new(effect);
+        let config = with_unlimited_fake_effetune(
+            ClocklessAudioProcessing::without_vst3(1.0),
+            effect.clone(),
+        )
+        .with_effetune_preferences(&crate::settings::Settings::default());
+        let mut processor = ClocklessAudioProcessor::new(config, 1_000).unwrap();
+        let result = processor.process(audio_chunk(vec![0.0; 40])).unwrap();
+        assert_eq!(effect.inputs.lock().unwrap().len(), 1);
+        assert_eq!(result.pdc_latency_secs_at_process, 2.010);
+        let mut disabled =
+            ClocklessAudioProcessor::new(ClocklessAudioProcessing::without_vst3(1.0), 1_000)
+                .unwrap();
+        let result = disabled.process(audio_chunk(vec![1.28; 40])).unwrap();
+        assert_eq!(result.pdc_latency_secs_at_process, 0.0);
+        assert!(result.samples.iter().all(|sample| *sample == 1.28));
+    }
+
+    #[test]
     fn remote_effect_only_fallback_reconciles_plugin_and_limiter_through_aac() {
         const RATE: u32 = 44_100;
-        const FRAMES: usize = 512;
+        // Include both 5ms delays plus plugin latency within the initial chunk,
+        // so this still exercises the encoder's partial pre-session trim path.
+        const FRAMES: usize = 1024;
         for cap_exceeded in [false, true] {
             let effect = Arc::new(ChangingLatencyVstProcessor {
                 sample_rate: RATE,
                 latency_samples: AtomicU32::new(128),
                 fail: AtomicBool::new(false),
             });
-            let config = with_fake_effetune(
+            let config = with_unlimited_fake_effetune(
                 ClocklessAudioProcessing::without_vst3(1.0),
                 Arc::clone(&effect),
-            );
+            )
+            .with_effetune_preferences(&crate::settings::Settings::default());
             let status = config.vst3_status();
             let mut processor = ClocklessAudioProcessor::new(config, RATE).unwrap();
-            let limiter_samples =
-                (processor.limiter.latency_secs() * f64::from(RATE)).round() as usize;
+            let limiter_samples = ((processor.limiter.latency_secs()
+                + processor.effetune_input_limiter.prepare(&[], 0, true).1)
+                * f64::from(RATE))
+            .round() as usize;
             let mut encoder = open_aac_encoder(
                 RATE,
                 96_000,
@@ -3399,7 +3527,7 @@ mod tests {
         let mut effect = FakeVstProcessor::new(AUDIO_OUTPUT_RATE, true);
         effect.gain = 3.0;
         let effect = Arc::new(effect);
-        let config = with_fake_effetune(
+        let config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(0.5, user_handle, 1, None),
             Arc::clone(&effect),
         );
@@ -3430,7 +3558,7 @@ mod tests {
         let user = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, true));
         let user_handle: Arc<dyn ClocklessVstProcessor> = user;
         let effect = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, false));
-        let config = with_fake_effetune(
+        let config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(0.5, user_handle, 1, None),
             Arc::clone(&effect),
         );
@@ -3453,7 +3581,7 @@ mod tests {
     #[test]
     fn remote_effect_stage_runs_without_a_user_vst_chain() {
         let effect = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, false));
-        let config = with_fake_effetune(
+        let config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::without_vst3(1.0),
             Arc::clone(&effect),
         );
@@ -3475,7 +3603,7 @@ mod tests {
         let mut effect = FakeVstProcessor::new(AUDIO_OUTPUT_RATE, false);
         effect.latency_samples = AUDIO_OUTPUT_RATE / 2 + 1;
         let effect = Arc::new(effect);
-        let config = with_fake_effetune(
+        let config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(1.0, user_handle, 1, None),
             Arc::clone(&effect),
         );
@@ -3494,7 +3622,7 @@ mod tests {
     fn rebuilt_user_bridge_rate_mismatch_removes_only_user_stage() {
         let user = mutable_stage(44_100);
         let effect = mutable_stage(44_100);
-        let config = with_fake_effetune(
+        let config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(1.0, user.clone(), 1, None),
             effect.clone(),
         );
@@ -3515,7 +3643,7 @@ mod tests {
     fn inactive_user_stage_does_not_select_rate_over_effect() {
         let user = Arc::new(FakeVstProcessor::unavailable(48_000));
         let effect = mutable_stage(44_100);
-        let config = with_fake_effetune(
+        let config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(1.0, user, 0, None),
             effect,
         );
@@ -3525,8 +3653,10 @@ mod tests {
     #[test]
     fn admitted_effect_slot_disappearing_does_not_join_or_process_again() {
         let effect = mutable_stage(44_100);
-        let config =
-            with_fake_effetune(ClocklessAudioProcessing::without_vst3(1.0), effect.clone());
+        let config = with_unlimited_fake_effetune(
+            ClocklessAudioProcessing::without_vst3(1.0),
+            effect.clone(),
+        );
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, 44_100).unwrap();
         processor.process(audio_chunk(vec![0.25, -0.25]));
@@ -3560,7 +3690,7 @@ mod tests {
         let old_block = coordinator.permit(local).unwrap();
         let user = Arc::new(FakeVstProcessor::new(44_100, false));
         let effect = Arc::new(FakeVstProcessor::new(44_100, false));
-        let mut config = with_fake_effetune(
+        let mut config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(1.0, user.clone(), 1, None),
             effect.clone(),
         );
@@ -3683,7 +3813,7 @@ mod tests {
             release: Mutex::new(release_rx),
         });
         let effect = Arc::new(FakeVstProcessor::new(44_100, false));
-        let mut config = with_fake_effetune(
+        let mut config = with_unlimited_fake_effetune(
             ClocklessAudioProcessing::with_vst3(1.0, user, 1, None),
             effect.clone(),
         );

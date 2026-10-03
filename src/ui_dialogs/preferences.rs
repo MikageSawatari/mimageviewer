@@ -22,6 +22,11 @@ use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
 
 #[doc(hidden)]
+pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
+    pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
+}
+
+#[doc(hidden)]
 pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings {
         video_top_bar_locked: true,
@@ -4992,6 +4997,60 @@ mod tests {
                 .map(|item| item.name().into_owned())
                 .collect::<Vec<_>>(),
             ["two.jpg", "one.jpg", "unrated.jpg"],
+        );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-input-limit",
+        ));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // The search anchor intentionally animates a highlight; settle the scroll
+        // then stop that animation before querying controls in this headless test.
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        harness
+            .get_by_label("EffeTune に渡す前に 0dB を超える音を抑える")
+            .click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .effetune_pre_limiter_enabled
+        );
+        assert!(harness.state().settings.effetune_pre_limiter_enabled);
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert!(!harness.state().settings.effetune_pre_limiter_enabled);
+        let reloaded = Settings::load();
+        assert!(!reloaded.effetune_pre_limiter_enabled);
+        harness.state_mut().settings = reloaded;
+        let chain = harness.state().local_audio_dsp_chain();
+        assert!(!chain.effetune_pre_limiter_enabled);
+        // Exercise the actual limiter consumer with the saved local snapshot.
+        let input = [1.28, -1.27];
+        let mut limiter = crate::video::audio::EffetuneInputLimiter::new(1_000);
+        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune_pre_limiter_enabled);
+        assert_eq!(samples, input);
+        assert_eq!(latency, 0.0);
+        assert!(
+            !harness
+                .state()
+                .remote_clockless_audio_processing(1.0)
+                .effetune_pre_limiter_enabled()
         );
     }
 

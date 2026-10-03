@@ -7882,6 +7882,14 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
     }
 
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-input-limit", |ui, state| {
+        draw_effetune_input_limit_settings(ui, &mut state.settings);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+    });
+
     anchored(ui, state, "video/normalize-cache", |ui, state| {
         draw_audio_normalize_cache_controls(ui, state);
     });
@@ -8003,6 +8011,24 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
             }
         }
     });
+}
+
+pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    {
+        ui.label(egui::RichText::new("音響調整 (EffeTune)").strong());
+        ui.checkbox(
+            &mut settings.effetune_pre_limiter_enabled,
+            "EffeTune に渡す前に 0dB を超える音を抑える",
+        )
+        .on_hover_text(
+            "音量を全体的に下げず、0dB を超えるピークを抑えます。音の可視化だけでも OVERLOAD が出るのを防ぎます。\n\
+             EffeTune 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
+             変更後は動画・音声の画面を閉じて開き直してください。リモート配信は終了してから始め直してください。",
+        );
+    }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
 }
 
 fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {

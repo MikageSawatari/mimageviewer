@@ -340,6 +340,16 @@ fn preferences_video_bar_visibility_dark() {
 }
 
 #[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_input_limit_dark() {
+    snapshot_with_theme(
+        "preferences_effetune_input_limit_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_video_thumbnail_indicator_dark() {
     snapshot_with_theme(
         "preferences_video_thumbnail_indicator_dark",
