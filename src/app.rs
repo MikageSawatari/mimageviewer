@@ -13838,6 +13838,7 @@ pub struct App {
     pub(crate) new_folder_pending: Option<crate::ui_dialogs::new_folder::NewFolderReceiver>,
 
     // ── 実ファイル/実フォルダの名前変更ダイアログ ───────────────
+    pub(crate) file_organize_request: crate::ui_dialogs::file_organize::FileOrganizeRequest,
     pub(crate) show_rename_dialog: bool,
     pub(crate) rename_target: Option<PathBuf>,
     pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenamePending>,
@@ -17524,6 +17525,7 @@ impl App {
             show_new_folder_dialog: false,
             new_folder_parent: None,
             new_folder_pending: None,
+            file_organize_request: Default::default(),
             show_rename_dialog: false,
             rename_target: None,
             rename_pending: None,
@@ -19826,6 +19828,7 @@ impl App {
             // visible dialogs and therefore do not belong in this predicate.
             self.show_new_folder_dialog => "new_folder",
             self.show_rename_dialog => "rename",
+            self.file_organize_dialog_visible() => "file_organize",
             self.show_book_manager => "book_manager",
             self.book_reorder.is_some() => "book_reorder",
             self.show_preferences => "preferences",
@@ -47213,6 +47216,13 @@ impl App {
             return None;
         }
 
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridOrganizeFiles)
+        {
+            self.request_file_organize_dialog(None);
+            return None;
+        }
         if self.keymap.consume_action(ctx, KeyAction::GridRename) {
             self.request_grid_rename_dialog();
             return None;
@@ -84357,6 +84367,7 @@ impl App {
         self.poll_external_tool_launch(ctx);
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
+        self.poll_file_organize(ctx);
         self.poll_rename_migration_pending(ctx);
         self.poll_delete_purge_retry(ctx);
         self.poll_capture_pending(ctx);
@@ -85082,6 +85093,7 @@ impl App {
         self.show_subfolder_expansion_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);
         self.show_rename_dialog_window(ctx);
+        self.show_file_organize_dialog(ctx);
         self.show_rename_migration_recovery_dialog(ctx);
         self.draw_book_manager(ctx);
         self.draw_book_reorder(ctx);

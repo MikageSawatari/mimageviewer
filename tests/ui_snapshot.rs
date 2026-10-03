@@ -27,6 +27,72 @@
 
 use egui_kittest::Harness;
 
+#[test]
+fn preferences_file_organize_light() {
+    snapshot_with_theme(
+        "preferences_file_organize_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_file_organize_destinations_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_file_organize_dark() {
+    snapshot_with_theme(
+        "preferences_file_organize_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_file_organize_destinations_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_organize_destinations_light() {
+    use mimageviewer::settings::FileOrganizeDestination;
+    use mimageviewer::shell_file_ops::ShellTransferOperation;
+    let sources = vec![std::path::PathBuf::from(r"C:\写真\画像.jpg")];
+    let destinations = vec![
+        FileOrganizeDestination {
+            name: "保管".into(),
+            path: r"D:\写真\保管".into(),
+        },
+        FileOrganizeDestination {
+            name: "確認".into(),
+            path: r"\\server\share\長い名前の写真フォルダ\整理先".into(),
+        },
+    ];
+    let mut focus = Some((1, Some(ShellTransferOperation::Copy)));
+    snapshot_with_theme(
+        "file_organize_destinations_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        move |ui| {
+            ui.heading("ファイル整理先");
+            let _ = mimageviewer::ui_dialogs::file_organize::render_file_organize_contents(
+                ui,
+                &sources,
+                &destinations,
+                &mut focus,
+            );
+        },
+    );
+}
+
+#[test]
+fn file_organize_empty_dark() {
+    snapshot_with_theme(
+        "file_organize_empty_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.heading("ファイル整理先");
+            let _ = mimageviewer::ui_dialogs::file_organize::render_file_organize_contents(
+                ui,
+                &[std::path::PathBuf::from(r"C:\写真\画像.jpg")],
+                &[],
+                &mut None,
+            );
+        },
+    );
+}
+
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
 /// 絵文字混じりテキストの実際のレイアウトを検証できない。

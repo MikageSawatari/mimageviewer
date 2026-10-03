@@ -8552,7 +8552,87 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 #[cfg(not(windows))]
 pub(super) fn page_vst3(_ui: &mut egui::Ui, _state: &mut PreferencesState) {}
 
+pub(super) fn draw_file_organize_destinations_settings(
+    ui: &mut egui::Ui,
+    destinations: &mut Vec<crate::settings::FileOrganizeDestination>,
+) {
+    ui.label(egui::RichText::new("ファイル整理先").strong());
+    ui.label("一覧の右クリックから使うコピー・移動先を登録します。OK で確定します。");
+    let count = destinations.len();
+    let mut reorder = None;
+    let mut remove = None;
+    for (index, destination) in destinations.iter_mut().enumerate() {
+        ui.push_id(("organize-destination", index), |ui| {
+            ui.group(|ui| {
+                // 狭い右ペインでも編集欄と操作列を上下に分け、パスを隠さない。
+                ui.horizontal(|ui| {
+                    ui.label("表示名");
+                    let width = ui.available_width().max(80.0);
+                    crate::ime_focus::add_singleline(ui, &mut destination.name, None, |edit| {
+                        edit.desired_width(width)
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("パス");
+                    let mut path = destination.path.to_string_lossy().into_owned();
+                    let width = ui.available_width().max(80.0);
+                    let response = crate::ime_focus::add_singleline(ui, &mut path, None, |edit| {
+                        edit.desired_width(width)
+                    });
+                    if response.changed() {
+                        destination.path = PathBuf::from(path);
+                    }
+                    response.on_hover_text(destination.path.display().to_string());
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("参照…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        destination.path = path;
+                    }
+                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                        reorder = Some((index, index - 1));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < count, egui::Button::new("↓"))
+                        .clicked()
+                    {
+                        reorder = Some((index, index + 1));
+                    }
+                    if ui
+                        .button("削除")
+                        .on_hover_text("登録を外します。フォルダは削除しません。")
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+                if let Err(error) = destination.validate() {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        destinations.remove(index);
+    } else if let Some((from, to)) = reorder {
+        destinations.swap(from, to);
+    }
+    if ui.button("追加…").clicked()
+        && let Some(path) = rfd::FileDialog::new().pick_folder()
+    {
+        destinations.push(crate::settings::FileOrganizeDestination::from_path(path));
+    }
+}
+
 pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "folder/organize-destinations", |ui, state| {
+        draw_file_organize_destinations_settings(
+            ui,
+            &mut state.settings.file_organize_destinations,
+        );
+    });
+    ui.add_space(12.0);
     anchored(ui, state, "folder/hidden-files", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("ファイル・フォルダの表示").strong());

@@ -479,6 +479,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["変換済みアーカイブ", "キャッシュ", "無制限", "MB"]
     ),
     entry!(
+        "folder/organize-destinations",
+        Folder,
+        "ファイル整理先",
+        ["コピー", "移動", "登録", "表示名", "パス", "順序"]
+    ),
+    entry!(
         "folder/hidden-files",
         Folder,
         "隠しファイル・フォルダを表示する",

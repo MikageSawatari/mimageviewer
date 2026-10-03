@@ -22,6 +22,21 @@ use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
 
 #[doc(hidden)]
+pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut destinations = vec![
+        crate::settings::FileOrganizeDestination {
+            name: "保管".into(),
+            path: PathBuf::from(r"D:\写真\保管"),
+        },
+        crate::settings::FileOrganizeDestination {
+            name: "要確認".into(),
+            path: PathBuf::from(r"\\server\写真\非常に長いフォルダ名\要確認"),
+        },
+    ];
+    pages::draw_file_organize_destinations_settings(ui, &mut destinations);
+}
+
+#[doc(hidden)]
 pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings {
         video_top_bar_locked: true,
@@ -2308,7 +2323,13 @@ impl App {
                 ui.horizontal(|ui| {
                     let font_ready = state.ui_font_apply_ready();
                     let lut_ready = state.creative_lut_import_rx.is_none();
-                    let ok = ui.add_enabled(font_ready && lut_ready, egui::Button::new("  OK  "));
+                    let organize_validation = crate::settings::validate_file_organize_destinations(
+                        &state.settings.file_organize_destinations,
+                    );
+                    let ok = ui.add_enabled(
+                        font_ready && lut_ready && organize_validation.is_ok(),
+                        egui::Button::new("  OK  "),
+                    );
                     #[cfg(all(windows, feature = "test-script"))]
                     crate::test_script::register_clickable_widget("OK", &ok);
                     if ok.clicked() {
@@ -2322,6 +2343,8 @@ impl App {
                         ui.small("フォントの準備完了後に適用できます。");
                     } else if !lut_ready {
                         ui.small("LUTのコピー完了後に適用できます。");
+                    } else if let Err(error) = organize_validation {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
                     }
                 });
             });
@@ -2591,7 +2614,9 @@ impl App {
                         self.enter_reading_history();
                     }
                 }
-                self.settings.save();
+                if !self.settings.save_checked() {
+                    self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
+                }
                 creative_lut_transaction.commit();
 
                 // Settings are global; every live native presenter receives the new display
@@ -3588,6 +3613,170 @@ mod tests {
             channels: Some(2),
             title: None,
         }
+    }
+
+    #[test]
+    fn file_organize_destinations_preferences_ok_save_db_reread_reopen_and_cancel() {
+        use crate::settings::FileOrganizeDestination;
+        let mut app = crate::app::setup_app_for_test();
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .file_organize_destinations
+                .is_empty()
+        );
+        let mut state = preferences_state_for_test(&app.settings);
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("absent"),
+            ));
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("second"),
+            ));
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("removed"),
+            ));
+        state.settings.file_organize_destinations.remove(2);
+        state.settings.file_organize_destinations[0].name = "保管".into();
+        state.settings.file_organize_destinations[0].path = app.tmp.path().join("edited absent");
+        state.settings.file_organize_destinations.swap(0, 1);
+        let expected = state.settings.file_organize_destinations.clone();
+        let toolbar = app.settings.toolbar_section_order.clone();
+        let favorite_path = app.tmp.path().join("favorite");
+        app.settings
+            .favorites
+            .push(crate::settings::FavoriteEntry::new(
+                "live favorite".into(),
+                favorite_path,
+            ));
+        let favorite_id = app.settings.favorites[0].id;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        assert_eq!(app.settings.file_organize_destinations, expected);
+        assert_eq!(app.settings.favorites[0].id, favorite_id);
+        assert_eq!(app.settings.toolbar_section_order, toolbar);
+        assert!(app.settings.save_checked());
+        let persisted = db.load_into_settings().unwrap();
+        let mut reopened = preferences_state_for_test(&persisted);
+        assert_eq!(reopened.settings.file_organize_destinations, expected);
+        reopened.settings.file_organize_destinations.clear();
+        drop(reopened); // 本番 Cancel と同じく draft を捨てるだけ。
+        assert_eq!(app.settings.file_organize_destinations, expected);
+        assert_eq!(
+            db.load_into_settings().unwrap().file_organize_destinations,
+            expected
+        );
+        let mut empty = preferences_state_for_test(&persisted);
+        empty.settings.file_organize_destinations.clear();
+        prepare_preferences_state_settings_for_commit(&mut empty, &mut app.settings);
+        app.install_preferences_settings(empty.settings);
+        assert!(app.settings.save_checked());
+        assert!(
+            preferences_state_for_test(&db.load_into_settings().unwrap())
+                .settings
+                .file_organize_destinations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn file_organize_destinations_preferences_ok_save_failure_keeps_memory_db_and_notifies() {
+        use crate::settings::FileOrganizeDestination;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.file_organize_destinations = vec![FileOrganizeDestination::from_path(
+            app.tmp.path().join("saved destination"),
+        )];
+        assert!(app.settings.save_checked());
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        let persisted_before = serde_json::to_value(db.load_into_settings().unwrap()).unwrap();
+        let saved_generation = crate::settings::save_generation();
+        let edited = vec![FileOrganizeDestination {
+            name: "今回の整理先".into(),
+            path: app.tmp.path().join("edited destination"),
+        }];
+
+        app.open_preferences_page(PreferencesPage::Folder);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .file_organize_destinations = edited.clone();
+        harness.run();
+        // The App fixture holds the process-global test lock and clears this flag
+        // on drop, including a panic. Exercise the real OK button and save boundary.
+        crate::settings_db::set_save_suppressed(true);
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.file_organize_destinations, edited);
+        let notice = &harness.state().fs_feedback_toast.as_ref().unwrap().0;
+        assert!(notice.contains("設定を保存できませんでした"));
+        assert!(notice.contains("今回の変更が残らない可能性があります"));
+        assert!(crate::settings_db::save_suppressed());
+        assert_eq!(crate::settings::save_generation(), saved_generation);
+        assert_eq!(
+            serde_json::to_value(db.load_into_settings().unwrap()).unwrap(),
+            persisted_before
+        );
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Folder);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .file_organize_destinations,
+            edited
+        );
+    }
+
+    #[test]
+    fn file_organize_destinations_input_validation() {
+        use crate::settings::{FileOrganizeDestination, validate_file_organize_destinations};
+        let mut item = FileOrganizeDestination::from_path(PathBuf::from(r"C:\offline\保管"));
+        assert!(item.validate().is_ok());
+        item.path = PathBuf::from(r"\\server\share\offline");
+        assert!(item.validate().is_ok());
+        assert!(validate_file_organize_destinations(&[item.clone(), item.clone()]).is_ok());
+        for path in [
+            "",
+            "relative",
+            r"C:relative",
+            r"\root-relative",
+            "C:\\nul\0path",
+        ] {
+            item.path = PathBuf::from(path);
+            assert!(item.validate().is_err(), "{path:?}");
+        }
+        item.path = PathBuf::from(r"D:\");
+        item.name = "  \t".into();
+        assert!(item.validate().is_err());
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.file_organize_destinations.is_empty());
     }
 
     #[test]

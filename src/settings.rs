@@ -5,6 +5,60 @@ use uuid::Uuid;
 
 pub const MAX_FAVORITES: usize = 100;
 
+/// お気に入りとは独立した、登録順で表示するファイル整理先。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileOrganizeDestination {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl FileOrganizeDestination {
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string());
+        Self { name, path }
+    }
+
+    /// 入力の構文だけを検証する。不在・未接続のフォルダも登録を維持する。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() {
+            return Err("表示名を入力してください。");
+        }
+        let path = self.path.as_os_str();
+        if path.is_empty() {
+            return Err("フォルダのパスを入力してください。");
+        }
+        #[cfg(windows)]
+        let contains_nul = {
+            use std::os::windows::ffi::OsStrExt;
+            path.encode_wide().any(|unit| unit == 0)
+        };
+        #[cfg(not(windows))]
+        let contains_nul = path.to_string_lossy().contains('\0');
+        if contains_nul {
+            return Err("パスに NUL 文字は使用できません。");
+        }
+        if !self.path.is_absolute() {
+            return Err("フォルダの絶対パスを入力してください。");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_file_organize_destinations(
+    destinations: &[FileOrganizeDestination],
+) -> Result<(), String> {
+    for (index, destination) in destinations.iter().enumerate() {
+        if let Err(error) = destination.validate() {
+            return Err(format!("ファイル整理先 {}: {error}", index + 1));
+        }
+    }
+    Ok(())
+}
+
 pub const UI_SCALE_FACTOR_MIN: f32 = 0.5;
 pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
@@ -4206,6 +4260,9 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// 環境設定で編集する固定のコピー／移動先。Vec の順序が表示順。
+    #[serde(default)]
+    pub file_organize_destinations: Vec<FileOrganizeDestination>,
     /// お気に入り配下へ入ったとき、そのお気に入り専用の表示状態を適用・自動更新する。
     /// 既定 OFF。保存済みの専用状態は OFF にしても削除しない。
     #[serde(default)]
@@ -7151,6 +7208,7 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            file_organize_destinations: Vec::new(),
             remember_favorite_view_state: false,
             favorite_view_overlay: None,
             smart_folders: Vec::new(),

@@ -2,6 +2,173 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[cfg(test)]
+mod file_organize_tests {
+    use super::*;
+    use crate::shell_file_ops::{
+        ShellTransferOperation, ShellTransferOutcome, ShellTransferRequest,
+    };
+    use crate::ui_dialogs::file_organize::{
+        FileOrganizeRequest, FileOrganizeRunning, FileOrganizeSelection,
+    };
+
+    #[test]
+    fn file_organize_completion_requests_existing_external_rescan_only_for_current_real_folder() {
+        let mut env = phase_c_support::setup_app();
+        let root = env.tmp.path().to_owned();
+        let source = root.join("organize-source");
+        let destination = root.join("organize-destination");
+        let unrelated = root.join("unrelated");
+        for folder in [&source, &destination, &unrelated] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let ctx = egui::Context::default();
+        for (folder, physical, should_refresh) in [
+            (&source, true, true),
+            (&destination, true, true),
+            (&unrelated, true, false),
+            (&source, false, false),
+        ] {
+            for terminal in 0..4 {
+                env.current_folder = Some(folder.clone());
+                env.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+                    folder: folder.clone(),
+                    counts: Default::default(),
+                });
+                env.top_level_grid_view.replace_surface(if physical {
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                } else {
+                    top_level_grid_view::TopLevelGridSurface::Search(
+                        top_level_grid_view::TopLevelSearchView::Global,
+                    )
+                });
+                let (tx, rx) = mpsc::channel();
+                match terminal {
+                    0 => tx
+                        .send(Ok(ShellTransferOutcome { aborted: false }))
+                        .unwrap(),
+                    1 => tx.send(Ok(ShellTransferOutcome { aborted: true })).unwrap(),
+                    2 => tx.send(Err("fake failure".into())).unwrap(),
+                    _ => {}
+                }
+                drop(tx);
+                env.file_organize_request =
+                    FileOrganizeRequest::Running(Box::new(FileOrganizeRunning {
+                        request: ShellTransferRequest {
+                            sources: vec![source.join("item.png")],
+                            destination: destination.clone(),
+                            operation: ShellTransferOperation::Move,
+                        },
+                        rx,
+                    }));
+                env.poll_file_organize(&ctx);
+                assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                ));
+                assert_eq!(env.external_rescan_pending.is_some(), should_refresh);
+                if let Some(pending) = env.external_rescan_pending.take() {
+                    assert_eq!(pending.folder, *folder);
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_organize_production_submission_rejects_shutdown_and_root_close() {
+        let mut env = phase_c_support::setup_app();
+        env.main_hwnd = Some(1); // A refused boundary must never pass this fake HWND to Shell.
+        for closing_event in [false, true] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            if closing_event {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            ctx.begin_pass(input);
+            env.shutdown_requested
+                .store(!closing_event, Ordering::SeqCst);
+            env.file_organize_request =
+                FileOrganizeRequest::Selecting(Box::new(FileOrganizeSelection {
+                    sources: vec![r"C:\source\a.png".into()],
+                    destinations: vec![crate::settings::FileOrganizeDestination {
+                        name: "target".into(),
+                        path: r"D:\target".into(),
+                    }],
+                    focus: None,
+                }));
+            env.submit_file_organize(&ctx, 0, ShellTransferOperation::Copy);
+            assert!(matches!(
+                env.file_organize_request,
+                FileOrganizeRequest::Hidden
+            ));
+            assert!(env.fs_feedback_toast.as_ref().unwrap().0.contains("終了"));
+            let _ = ctx.end_pass();
+        }
+        env.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn file_organize_enter_needs_explicit_operation_after_row_navigation() {
+        let mut env = phase_c_support::setup_app();
+        env.file_organize_request =
+            FileOrganizeRequest::Selecting(Box::new(FileOrganizeSelection {
+                sources: vec![r"C:\source\a.png".into()],
+                destinations: vec![crate::settings::FileOrganizeDestination {
+                    name: "target".into(),
+                    path: r"D:\target".into(),
+                }],
+                focus: None,
+            }));
+        // The final Enter is refused before any Shell call, allowing this to use fake paths.
+        env.main_hwnd = Some(1);
+        env.shutdown_requested.store(true, Ordering::SeqCst);
+        let ctx = egui::Context::default();
+        for (step, key) in [
+            egui::Key::ArrowDown,
+            egui::Key::Enter,
+            egui::Key::ArrowRight,
+            egui::Key::Enter,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            env.show_file_organize_dialog(&ctx);
+            let _ = ctx.end_pass();
+            match step {
+                0 | 1 => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Selecting(ref selection) if selection.focus == Some((0, None))
+                )),
+                2 => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Selecting(ref selection) if selection.focus == Some((0, Some(ShellTransferOperation::Copy)))
+                )),
+                _ => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                )),
+            }
+        }
+        env.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+}
+
 fn music_source_for_test(app: &App, path: PathBuf) -> MusicAnalysisSource {
     MusicAnalysisSource {
         owner_context_id: app.projected_viewer_context_id(),
@@ -1582,7 +1749,14 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     assert!(size_of::<PdfPasswordRequestOwner>() < 32);
     assert!(size_of::<PdfEnumeratePending>() < 1_200);
     assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
-    assert!(size_of::<App>() < 110_000);
+    // Organize destinations also live in PreferencesState's Settings drafts. Keep
+    // a small explicit budget for that settings growth, and keep the rare request
+    // payload on the heap instead of storing it inline in every App.
+    assert!(
+        size_of::<crate::ui_dialogs::file_organize::FileOrganizeRequest>()
+            <= 2 * size_of::<usize>()
+    );
+    assert!(size_of::<App>() < 110_128);
 }
 
 #[cfg(all(windows, feature = "test-script"))]
