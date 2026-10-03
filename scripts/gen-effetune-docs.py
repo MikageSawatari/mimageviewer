@@ -80,6 +80,37 @@ def heading_id(text):
     return re.sub(r'\s', '-', re.sub(r'[^\w\s-]', '', text))
 
 
+def select_sections(source, rule):
+    """Select exact Markdown headings before parsing platform-only README HTML.
+
+    Each selected heading includes its descendants, ending at the next heading
+    of the same or higher level. Missing, duplicate and overlapping selections
+    fail rather than silently losing instructions when the snapshot changes.
+    """
+    if 'sections' not in rule:
+        return source
+    headings = list(re.finditer(r'^(#{1,6}) (.+)$', source, re.M))
+    selected, spans = [], []
+    for name in rule['sections']:
+        matches = [h for h in headings if h[2] == name]
+        if len(matches) != 1:
+            raise ConversionError(f'Selected heading must match once: {name}')
+        match = matches[0]
+        end = next((h.start() for h in headings if h.start() > match.start()
+                    and len(h[1]) <= len(match[1])), len(source))
+        if any(match.start() < b and a < end for a, b in spans):
+            raise ConversionError(f'Overlapping selected heading: {name}')
+        spans.append((match.start(), end))
+        # Selected subsections now belong directly beneath the guide's h1.
+        section = source[match.start():end].strip()
+        selected.append(re.sub(r'^(#{1,6}) ',
+                               lambda h: '#' * (len(h[1]) - len(match[1]) + 2) + ' ',
+                               section, flags=re.M))
+    if not selected or not rule.get('title'):
+        raise ConversionError('Section selection requires sections and a title')
+    return '# ' + rule['title'] + '\n\n' + '\n\n'.join(selected)
+
+
 class ImageTag(HTMLParser):
     def __init__(self, rewrite):
         super().__init__(convert_charrefs=True)
@@ -586,6 +617,7 @@ def generate(snapshot, version):
         path = source_dir / page
         meta, source = front_matter(path.read_text(encoding='utf-8'))
         source = expand_liquid(source, path.parent, source_dir, (path.resolve(),))
+        source = select_sections(source, selection[page])
         converter = Converter(page, published, known, images)
         body = converter.render(source)
         body = apply_overrides(body, overrides.get(path.stem, []), converter)

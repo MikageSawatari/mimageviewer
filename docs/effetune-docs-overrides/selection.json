@@ -1,5 +1,19 @@
 {
-  "README.md": {"include": false, "reason": "Web/PWA/desktop installation, audio setup and player overview; replaced by the mIV EffeTune page."},
+  "README.md": {
+    "include": true,
+    "reason": "Select VST-applicable operations by exact heading; platform-only clauses corrected in README.json.",
+    "title": "基本操作 - EffeTune",
+    "sections": [
+      "Visualizerで音を表示する",
+      "エフェクトチェーンの作成",
+      "プリセットの使用",
+      "保存データのバックアップと復元",
+      "セクション機能の使用方法",
+      "ABパイプライン機能の使用",
+      "エフェクト選択とキーボードショートカット",
+      "よく使われるエフェクトの組み合わせ"
+    ]
+  },
   "index.md": {"include": false, "reason": "Jekyll include of README; replaced by a generated mIV-specific index."},
   "browser-extension.md": {"include": false, "reason": "Chrome/Edge extension installation and tab processing, outside bundled VST UI."},
   "controller-mapping.md": {"include": false, "reason": "Its config device-section opener is hidden by vst-bootstrap.js:33-35; no supported bundled UI entry."},

@@ -42,6 +42,20 @@ class ConverterTests(unittest.TestCase):
                 docs.front_matter(text)
         self.assertEqual(docs.front_matter('---\n---\n本文'), ({}, '本文'))
 
+    def test_section_selection_preserves_children_and_rejects_stale_rules(self):
+        source = '# Upstream\n\n<div>Web only</div>\n\n## Setup\n\nInstall\n\n## Use\n\n### Chain\n\nDrag\n\n#### Detail\n\nFine control\n\n### Presets\n\nSave\n\n## Browser\n\nWeb only'
+        rule = {'title': 'Basic operations', 'sections': ['Chain', 'Presets']}
+        selected = docs.select_sections(source, rule)
+        self.assertEqual(selected, '# Basic operations\n\n## Chain\n\nDrag\n\n### Detail\n\nFine control\n\n## Presets\n\nSave')
+        self.assertEqual(docs.select_sections(source, {}), source)
+        for sections in [['Missing'], ['Chain', 'Chain'], ['Use', 'Chain'], []]:
+            with self.subTest(sections=sections), self.assertRaises(docs.ConversionError):
+                docs.select_sections(source, {'title': 'Basic operations', 'sections': sections})
+        with self.assertRaises(docs.ConversionError):
+            docs.select_sections(source + '\n\n### Chain\nDuplicate', rule)
+        with self.assertRaises(docs.ConversionError):
+            docs.select_sections(source, {'sections': ['Chain']})
+
     def test_inline_escaping_formatting_and_nested_image_link(self):
         value = self.converter().inline('**強調** *斜体* `x < y & z` [![図](../../../../images/bus_function.png)](https://example.com/?a=1&b=2)')
         self.assertIn('<strong>強調</strong> <em>斜体</em>', value)
@@ -141,7 +155,7 @@ class GenerationTests(unittest.TestCase):
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
         output = docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1')
-        self.assertEqual(len(output), 130)  # 18 category/guide/index/license + 108 plugin pages + 4 images
+        self.assertEqual(len(output), 131)  # 19 category/guide/index/license + 108 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
                 self.assertEqual((docs.MANUAL / 'effetune/v0.11.1' / name).read_bytes(), data)
@@ -186,6 +200,26 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('mImageViewer のデータフォルダ', output['reverb-ir-reverb.html'])
         self.assertIn('bus-function.html', output)
         self.assertIn('visualizer.html', output)
+
+    def test_readme_basic_operations_keep_vst_features_and_exclude_other_platforms(self):
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1').items() if name.endswith('.html')}
+        body = output['README.html'].split('<main class="content">')[1].split('</main>')[0]
+        for heading in ['Visualizerで音を表示する', 'エフェクトチェーンの作成', 'プリセットの使用', '保存データのバックアップと復元', 'セクション機能の使用方法', 'ABパイプライン機能の使用', 'エフェクト選択とキーボードショートカット', 'よく使われるエフェクトの組み合わせ']:
+            self.assertIn(heading, body)
+        for retained in ['上から下へ順番に処理', 'ON/OFF状態やルーティングは変わりません', 'A → B', 'B → A', 'Ctrl + Z', 'Shift+', '256 MB', '既定のブラウザ', 'EffeTune 固有のキー操作', 'href="bus-function.html"', 'href="control.html"', 'href="visualizer.html"']:
+            self.assertIn(retained, body)
+        for excluded in ['Webアプリを開く', 'PWA', 'セットアップガイド', 'Music Library', 'モバイル', 'macOS', 'ブラインドテスト', 'プレイヤー使用時', 'MIDI、ゲームパッド', 'オーディオファイルの処理', '周波数特性測定と補正', '推奨サンプルレート']:
+            self.assertNotIn(excluded, body)
+        for tag in ['ul', 'ol', 'li']:
+            self.assertEqual(body.count('<' + tag + '>') + body.count('<' + tag + ' '), body.count('</' + tag + '>'))
+        self.assertNotIn('<ul>\n</ul>', body)
+        self.assertNotIn('???', body)
+        self.assertIn('ファイルの上限は256 MBです', body)
+        self.assertIn('共有前に選択内容を確認してください', body)
+        self.assertNotIn('デバイス設定', body)
+        self.assertNotIn('URLルール', body)
+        self.assertIn('href="README.html">基本操作', output['index.html'])
+        self.assertIn('href="README.html"', output['eq-15band-geq.html'])
 
     def test_entry_redirect(self):
         text = docs.entry_page('v0.11.1').decode()

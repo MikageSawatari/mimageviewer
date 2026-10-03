@@ -1190,7 +1190,8 @@
       <li><span class="label">OS</span><span>Windows 11（64bit）</span></li>
       <li><span class="label">GPU</span><span>DirectX 12 対応グラフィックカード（最新のグラフィックドライバを推奨）</span></li>
       <li><span class="label">メモリ</span><span>4GB 以上（8GB 以上推奨）</span></li>
-      <li><span class="label">ランタイム</span><span>不要（単体 exe、インストール不要）</span></li>
+      <li><span class="label">CPU</span><span>x86-64（Intel / AMD）。音響調整 (EffeTune) には AVX2 と FMA の両方への対応が必要です。</span></li>
+      <li><span class="label">ランタイム</span><span>EPUB の変換と音響調整 (EffeTune) の画面表示には Microsoft Edge WebView2 Runtime が必要です（Windows 11 に標準で含まれます）。</span></li>
     </ul>
     <p style="margin-top:0.9rem; font-size:0.82rem; color:#888; line-height:1.7;">
       ※ 動作確認は主に NVIDIA GeForce 環境で行っています。Intel / AMD など他の GPU でも動作しますが、不具合がありましたらご連絡ください。
@@ -1425,7 +1426,8 @@
       単体exe版・インストーラ版の音響調整には EffeTune Mixwright（MIT License、
       Copyright (c) 2025-2026 Yoshiyuki Kobayashi）を同梱しています。
       VST3 対応には Steinberg VST3 SDK（MIT License、Steinberg Media Technologies GmbH）を使用しています。
-      EffeTune と同梱ライブラリの通知全文は、アプリの「バージョン情報」で確認できます。
+      EffeTune の同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate / setImmediate / pako (zlib)、CHOC、および通知に記載されたその他のライブラリ）には、それぞれのライセンスが適用されます。
+      通知全文は、アプリの「ソフトウェア情報」（バージョン情報）の EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。
       ポータブル版は EffeTune と VST3 ホストを同梱しません。
     </p>
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（FFmpeg / LGPL）</h3>

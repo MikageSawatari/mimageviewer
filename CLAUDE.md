@@ -1241,8 +1241,10 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 (https://github.com/steinbergmedia/vst3sdk) under the MIT License.
 ```
 
-**VST トレードマーク (ロゴ) は使わない**。「VST3 プラグインをサポート」テキスト表記のみで運用
-(= トレードマークガイドライン回避)。
+**VST トレードマークについての採用方針**: VST3 プラグインへの対応を文字で説明し、
+VST のロゴは使用しない。名称の文字表記も商標ガイドラインの対象となり得るため、
+文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
+示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
 
 ## Markdown / テキストファイルのエンコーディング (BOM 必須ケース)
 

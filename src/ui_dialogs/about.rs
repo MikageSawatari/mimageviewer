@@ -30,6 +30,11 @@ const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
             "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
         ),
     ),
+    (
+        "EffeTune 補足通知 全文",
+        "supplemental/NOTICES.txt",
+        include_str!("../../third_party/effetune-mixwright/supplemental/NOTICES.txt"),
+    ),
 ];
 
 impl App {
@@ -274,6 +279,27 @@ mod tests {
         assert!(main_notice.contains("Steinberg Media Technologies GmbH"));
         assert!(main_notice.contains("MIT License"));
         assert!(EFFETUNE_NOTICES[2].2.contains("PFFFT"));
+        assert_eq!(EFFETUNE_NOTICES.len(), 4);
+        let supplemental = EFFETUNE_NOTICES[3].2;
+        for attribution in [
+            "lie v3.3.0",
+            "Calvin Metcalf, Jordan Harband",
+            "immediate v3.0.6",
+            "Brian Cavalier",
+            "setImmediate v1.0.5",
+            "Donavon West, and Domenic Denicola",
+            "pako v1.0.11 - code derived from zlib",
+            "Jean-loup Gailly and Mark Adler",
+            "Vitaly Puzrin and Andrey Tupitsin",
+        ] {
+            assert!(supplemental.contains(attribution), "missing: {attribution}");
+        }
+        let tracked = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("third_party/effetune-mixwright/supplemental/NOTICES.txt"),
+        )
+        .expect("Supplemental EffeTune notice must be present");
+        assert_eq!(supplemental.as_bytes(), tracked);
 
         let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("vendor/effetune-mixwright/EffeTune Mixwright.vst3");
@@ -283,7 +309,8 @@ mod tests {
         let vendor_version = std::fs::read_to_string(vendor.parent().unwrap().join("VERSION"))
             .expect("EffeTune vendor VERSION must be present");
         assert_eq!(vendor_version.trim(), "v0.11.1");
-        for &(_, relative_path, embedded) in EFFETUNE_NOTICES {
+        // The fourth notice is mIV's supplement, outside the unchanged upstream bundle.
+        for &(_, relative_path, embedded) in &EFFETUNE_NOTICES[..3] {
             let source = std::fs::read(vendor.join(relative_path))
                 .expect("EffeTune vendor notice must be present");
             assert_eq!(
