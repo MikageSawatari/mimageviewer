@@ -150,29 +150,31 @@ class ConverterTests(unittest.TestCase):
 
 class GenerationTests(unittest.TestCase):
     def test_snapshot_cannot_be_silently_relabelled_for_new_bundle(self):
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with Mixwright v0.11.1, not v0.12.0'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with Mixwright v0.12.0, not v0.13.0'):
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0')
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1')
-        self.assertEqual(len(output), 131)  # 19 category/guide/index/license + 108 plugin pages + 4 images
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0')
+        self.assertEqual(len(output), 135)  # 20 category/guide/index/license + 111 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
-                self.assertEqual((docs.MANUAL / 'effetune/v0.11.1' / name).read_bytes(), data)
+                self.assertEqual((docs.MANUAL / 'effetune/v0.12.0' / name).read_bytes(), data)
                 if name.endswith('.html'):
                     text = data.decode()
                     self.assertNotIn('sidebar-section', text)
                     self.assertIn('href="../../style.css"', text)
                     self.assertIn('href="license.html"', text)
-                    self.assertIn('f3189f3d9c6a4d692c5709107131f3e1c50a710c', text)
+                    self.assertIn('03bffda352287f4f438d063d9660aad7864e553a', text)
                     self.assertNotIn('{%', text)
+                    self.assertNotIn('<p></p>', text)
+                    self.assertNotIn('<li></li>', text)
         license_text = (docs.DEFAULT_SOURCE / 'LICENSE').read_text(encoding='utf-8')
         self.assertIn(docs.html.escape(license_text), output['license.html'].decode())
         for path in (docs.DEFAULT_SOURCE / 'images').iterdir():
             self.assertEqual(output['images/' + path.name], path.read_bytes())
 
     def test_snapshot_split_navigation_index_and_override_survival(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0').items() if name.endswith('.html')}
         eq = output['eq.html'].split('<main class="content">')[1]
         self.assertIn('id="スペクトラムオーバーレイ"', eq)
         self.assertIn('href="eq-15band-geq.html"', eq)
@@ -185,7 +187,7 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('href="lofi-bit-crusher.html" class="sub"', geq)
         self.assertIn('rel="next" href="eq-15band-peq.html"', geq)
         self.assertNotIn('rel="prev"', geq)
-        self.assertIn('rel="prev" href="eq-tilt-eq.html"', output['eq-tone-control.html'])
+        self.assertIn('rel="prev" href="eq-tonal-balance-eq.html"', output['eq-tone-control.html'])
         self.assertNotIn('rel="next"', output['eq-tone-control.html'])
         self.assertIn('<a href="index.html">EffeTune 説明書</a><span class="sep">›</span><a href="eq.html">イコライザープラグイン</a><span class="sep">›</span><span aria-current="page">15Band GEQ</span>', geq)
         self.assertIn('href="eq-15band-geq.html"', output['index.html'])
@@ -202,13 +204,13 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('visualizer.html', output)
 
     def test_readme_basic_operations_keep_vst_features_and_exclude_other_platforms(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.11.1').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0').items() if name.endswith('.html')}
         body = output['README.html'].split('<main class="content">')[1].split('</main>')[0]
         for heading in ['Visualizerで音を表示する', 'エフェクトチェーンの作成', 'プリセットの使用', '保存データのバックアップと復元', 'セクション機能の使用方法', 'ABパイプライン機能の使用', 'エフェクト選択とキーボードショートカット', 'よく使われるエフェクトの組み合わせ']:
             self.assertIn(heading, body)
         for retained in ['上から下へ順番に処理', 'ON/OFF状態やルーティングは変わりません', 'A → B', 'B → A', 'Ctrl + Z', 'Shift+', '256 MB', '既定のブラウザ', 'EffeTune 固有のキー操作', 'href="bus-function.html"', 'href="control.html"', 'href="visualizer.html"']:
             self.assertIn(retained, body)
-        for excluded in ['Webアプリを開く', 'PWA', 'セットアップガイド', 'Music Library', 'モバイル', 'macOS', 'ブラインドテスト', 'プレイヤー使用時', 'MIDI、ゲームパッド', 'オーディオファイルの処理', '周波数特性測定と補正', '推奨サンプルレート']:
+        for excluded in ['Webアプリを開く', 'PWA', 'セットアップガイド', 'Music Library', 'モバイル', 'macOS', 'ブラインドテスト', 'プレイヤー使用時', 'オーディオファイルの処理', '周波数特性測定と補正', '推奨サンプルレート']:
             self.assertNotIn(excluded, body)
         for tag in ['ul', 'ol', 'li']:
             self.assertEqual(body.count('<' + tag + '>') + body.count('<' + tag + ' '), body.count('</' + tag + '>'))
@@ -226,15 +228,50 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('デフォルトで「A」を表示', body)
         self.assertIn('href="README.html">基本操作', output['index.html'])
         self.assertIn('href="README.html"', output['eq-15band-geq.html'])
+        self.assertIn('href="controller-mapping.html"', body)
+
+    def test_new_effects_and_expanded_visualizer_keep_bundled_operations(self):
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0').items() if name.endswith('.html')}
+        for page in ['analyzer-analog-meter.html', 'analyzer-rhythm-analyzer.html', 'eq-tonal-balance-eq.html']:
+            self.assertIn(page, output)
+            self.assertIn('href="' + page + '"', output['index.html'])
+        analog = output['analyzer-analog-meter.html']
+        self.assertIn('True Peak', analog)
+        self.assertIn('左右2チャンネル', analog)
+        self.assertNotIn('非表示時は表示専用DSPをスキップ', analog)
+        rhythm = output['analyzer-rhythm-analyzer.html']
+        self.assertIn('Metronome Click', rhythm)
+        self.assertIn('リモート配信にも加わります', rhythm)
+        self.assertNotIn('処理したファイルにクリック音', rhythm)
+        tonal = output['eq-tonal-balance-eq.html']
+        self.assertIn('<strong>Reset</strong> は測定を消去し、現在の音から測定をやり直します。Target Adjustは変わりません。', tonal)
+        # The VST adapter disables the standalone silence power policy.
+        # Scan all published pages so another effect cannot inherit that guidance.
+        for name, text in output.items():
+            with self.subTest(power_policy_page=name):
+                self.assertNotIn('省電力', text)
+                self.assertNotIn('非表示時は表示専用DSPをスキップ', text)
+        body = output['visualizer.html'].split('<main class="content">')[1].split('</main>')[0]
+        for retained in ['合計50種類', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback']:
+            self.assertIn(retained, body)
+        for excluded in ['クリーンフィード', 'Macでは', 'WebAssembly 音声処理を使用する', 'ハードウェア アクセラレーションを使用', 'v0.12.0']:
+            self.assertNotIn(excluded, body)
+        self.assertIn('03bffda352287f4f438d063d9660aad7864e553a', body)
+        controller = output['controller-mapping.html'].split('<main class="content">')[1]
+        self.assertIn('mImageViewer の再生やファイル移動は操作しません', controller)
+        self.assertIn('MIDI CC', controller)
+        self.assertIn('タイマー', controller)
+        self.assertIn('次/前のプリセット', controller)
+        self.assertNotIn('Safari', controller)
 
     def test_entry_redirect(self):
-        text = docs.entry_page('v0.11.1').decode()
+        text = docs.entry_page('v0.12.0').decode()
         self.assertIn('<meta name="robots" content="noindex">', text)
-        self.assertIn('<meta http-equiv="refresh" content="0; url=v0.11.1/index.html">', text)
-        self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune/v0.11.1/index.html">', text)
-        self.assertIn('<a href="v0.11.1/index.html">', text)
-        self.assertNotEqual(docs.entry_page('v0.11.1'), docs.entry_page('v0.12.0'))
-        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.11.1'))
+        self.assertIn('<meta http-equiv="refresh" content="0; url=v0.12.0/index.html">', text)
+        self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune/v0.12.0/index.html">', text)
+        self.assertIn('<a href="v0.12.0/index.html">', text)
+        self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.13.0'))
+        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.12.0'))
 
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
@@ -243,34 +280,34 @@ class GenerationTests(unittest.TestCase):
                 def run(*args):
                     with patch('sys.argv', ['gen-effetune-docs.py', *args]):
                         return docs.main()
-                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
+                self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertFalse((root / 'manual').exists())
-                self.assertEqual(run('--version', 'v0.11.1'), 0)
-                output = root / 'manual/effetune/v0.11.1/index.html'
+                self.assertEqual(run('--version', 'v0.12.0'), 0)
+                output = root / 'manual/effetune/v0.12.0/index.html'
                 entry = root / 'manual/effetune/index.html'
-                self.assertEqual(run('--version', 'v0.11.1', '--check'), 0)
-                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.11.1'))
+                self.assertEqual(run('--version', 'v0.12.0', '--check'), 0)
+                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.12.0'))
                 entry.unlink()
-                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
+                self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertFalse(entry.exists())
-                self.assertEqual(run('--version', 'v0.11.1'), 0)
+                self.assertEqual(run('--version', 'v0.12.0'), 0)
                 entry.write_bytes(b'stale entry')
-                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
+                self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertEqual(entry.read_bytes(), b'stale entry')
-                self.assertEqual(run('--version', 'v0.11.1'), 0)
+                self.assertEqual(run('--version', 'v0.12.0'), 0)
                 output.write_bytes(b'stale')
-                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
+                self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertEqual(output.read_bytes(), b'stale')
                 output.write_bytes(b'current')
                 output.with_name('obsolete.html').write_bytes(b'extra')
-                self.assertEqual(run('--version', 'v0.11.1', '--check'), 1)
-                self.assertEqual(run('--version', 'v0.11.1'), 1)
+                self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
+                self.assertEqual(run('--version', 'v0.12.0'), 1)
                 vendor = root / 'vendor/effetune-mixwright'
                 vendor.mkdir(parents=True)
-                (vendor / 'VERSION').write_text('v0.12.0\n', encoding='utf-8')
-                self.assertEqual(run('--version', 'v0.11.1'), 0)
-                self.assertTrue((root / 'manual/effetune/v0.12.0/index.html').exists())
-                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.12.0'))
+                (vendor / 'VERSION').write_text('v0.13.0\n', encoding='utf-8')
+                self.assertEqual(run('--version', 'v0.12.0'), 0)
+                self.assertTrue((root / 'manual/effetune/v0.13.0/index.html').exists())
+                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.13.0'))
                 self.assertEqual(output.read_bytes(), b'current')  # Older version remains intact.
 
 

@@ -34,11 +34,11 @@ function Assert-MivEffetuneFileSet {
     $actual = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
     foreach ($file in $files) {
         $name = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
-        if (-not $Entries.ContainsKey($name)) { throw "[effetune] Extra unapproved file: $name. Restore the approved v0.11.1 source; do not regenerate the manifest to accept local changes." }
+        if (-not $Entries.ContainsKey($name)) { throw "[effetune] Extra unapproved file: $name. Restore the approved v0.12.0 source; do not regenerate the manifest to accept local changes." }
         $actual.Add($name, $file.FullName)
     }
     foreach ($name in $Entries.Keys) {
-        if (-not $actual.ContainsKey($name)) { throw "[effetune] Missing approved file: $name. Restore the complete approved v0.11.1 source." }
+        if (-not $actual.ContainsKey($name)) { throw "[effetune] Missing approved file: $name. Restore the complete approved v0.12.0 source." }
     }
     return ,$actual
 }
@@ -49,7 +49,7 @@ function Assert-MivEffetuneRawSource {
     $files = Assert-MivEffetuneFileSet -SourceRoot $SourceRoot -Entries $entries
     foreach ($name in $entries.Keys) {
         if ((Get-FileHash -LiteralPath $files[$name] -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entries[$name]) {
-            throw "[effetune] Approved source hash mismatch: $name. Restore the approved v0.11.1 source; do not regenerate the manifest to accept local changes."
+            throw "[effetune] Approved source hash mismatch: $name. Restore the approved v0.12.0 source; do not regenerate the manifest to accept local changes."
         }
     }
 }
@@ -92,7 +92,7 @@ function Assert-MivEffetuneSigningOnlyChange {
 function Assert-MivEffetuneStage {
     param([string] $RepoRoot, [string] $SourceRoot)
     $approved = Join-Path $RepoRoot 'vendor\effetune-mixwright'
-    $manifest = Join-Path $RepoRoot 'third_party\effetune-mixwright\v0.11.1\manifest.sha256'
+    $manifest = Join-Path $RepoRoot 'third_party\effetune-mixwright\v0.12.0\manifest.sha256'
     # A signed stage depends on the same verified original, never on an arbitrary
     # environment-provided source or on trusting a new manifest made from it.
     Assert-MivEffetuneRawSource -SourceRoot $approved -ManifestPath $manifest
@@ -129,8 +129,8 @@ function Assert-MivEffetuneSource {
     if ($version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$') {
         throw "[effetune] Invalid VERSION: $version"
     }
-    if ($version -ne 'v0.11.1') { throw '[effetune] Unsupported VERSION; restore approved v0.11.1' }
-    Assert-MivEffetuneRawSource -SourceRoot $SourceRoot -ManifestPath (Join-Path $NoticesRoot 'v0.11.1\manifest.sha256')
+    if ($version -ne 'v0.12.0') { throw '[effetune] Unsupported VERSION; restore approved v0.12.0' }
+    Assert-MivEffetuneRawSource -SourceRoot $SourceRoot -ManifestPath (Join-Path $NoticesRoot 'v0.12.0\manifest.sha256')
     $null = @(Get-MivTreeFiles -Path $SourceRoot)
     $plugin = Join-Path $bundle 'Contents\x86_64-win\EffeTune Mixwright.vst3'
     if (-not (Test-Path -LiteralPath $plugin -PathType Leaf)) {

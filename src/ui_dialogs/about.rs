@@ -13,21 +13,21 @@ const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
         "EffeTune Mixwright THIRD-PARTY-NOTICES 全文",
         "Contents/Resources/THIRD-PARTY-NOTICES.txt",
         include_str!(
-            "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+            "../../third_party/effetune-mixwright/v0.12.0/Contents/Resources/THIRD-PARTY-NOTICES.txt"
         ),
     ),
     (
         "EffeTune WebView THIRD-PARTY-NOTICES 全文",
         "Contents/Resources/webview/THIRD-PARTY-NOTICES.txt",
         include_str!(
-            "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
+            "../../third_party/effetune-mixwright/v0.12.0/Contents/Resources/webview/THIRD-PARTY-NOTICES.txt"
         ),
     ),
     (
         "EffeTune DSP NOTICE 全文",
         "Contents/Resources/webview/plugins/dsp/NOTICE.txt",
         include_str!(
-            "../../third_party/effetune-mixwright/v0.11.1/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
+            "../../third_party/effetune-mixwright/v0.12.0/Contents/Resources/webview/plugins/dsp/NOTICE.txt"
         ),
     ),
     (
@@ -279,6 +279,16 @@ mod tests {
         assert!(main_notice.contains("Steinberg Media Technologies GmbH"));
         assert!(main_notice.contains("MIT License"));
         assert!(EFFETUNE_NOTICES[2].2.contains("PFFFT"));
+        assert!(
+            EFFETUNE_NOTICES[2]
+                .2
+                .contains("fdlibm 5.3 (atan and atan2)")
+        );
+        assert!(
+            EFFETUNE_NOTICES[2]
+                .2
+                .contains("Copyright (C) 1993 by Sun Microsystems, Inc.")
+        );
         assert_eq!(EFFETUNE_NOTICES.len(), 4);
         let supplemental = EFFETUNE_NOTICES[3].2;
         for attribution in [
@@ -308,7 +318,7 @@ mod tests {
         }
         let vendor_version = std::fs::read_to_string(vendor.parent().unwrap().join("VERSION"))
             .expect("EffeTune vendor VERSION must be present");
-        assert_eq!(vendor_version.trim(), "v0.11.1");
+        assert_eq!(vendor_version.trim(), "v0.12.0");
         // The fourth notice is mIV's supplement, outside the unchanged upstream bundle.
         for &(_, relative_path, embedded) in &EFFETUNE_NOTICES[..3] {
             let source = std::fs::read(vendor.join(relative_path))

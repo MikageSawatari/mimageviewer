@@ -43,7 +43,7 @@ try {
         'Contents\Resources\webview\THIRD-PARTY-NOTICES.txt',
         'Contents\Resources\webview\plugins\dsp\NOTICE.txt'
     )) {
-        foreach ($path in @((Join-Path $bundle $relative), (Join-Path (Join-Path $noticesRoot 'v0.11.1') $relative))) {
+        foreach ($path in @((Join-Path $bundle $relative), (Join-Path (Join-Path $noticesRoot 'v0.12.0') $relative))) {
             New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
             [System.IO.File]::WriteAllText($path, "notice $relative")
         }
@@ -51,7 +51,7 @@ try {
     $hidden = Join-Path $bundle '.gitignore'
     [System.IO.File]::WriteAllText($hidden, 'resource')
     (Get-Item -LiteralPath $hidden).Attributes = [System.IO.FileAttributes]::Hidden
-    [System.IO.File]::WriteAllText((Join-Path $source 'VERSION'), 'v0.11.1')
+    [System.IO.File]::WriteAllText((Join-Path $source 'VERSION'), 'v0.12.0')
     $fakeDll = Join-Path $bundle 'not-a-pe.dll'
     [System.IO.File]::WriteAllText($fakeDll, 'MZ')
     Assert-True (Test-MivPeFile $pePath) 'missed .vst3 PE'
@@ -64,7 +64,7 @@ try {
     Remove-Item -LiteralPath $fakeDll, $badOffset
     # Fixture approval is created once, before testing any local modification.
     $sourceFull = [System.IO.Path]::GetFullPath($source)
-    $manifestPath = Join-Path $noticesRoot 'v0.11.1\manifest.sha256'
+    $manifestPath = Join-Path $noticesRoot 'v0.12.0\manifest.sha256'
     $manifestLines = @(Get-MivTreeFiles $source | ForEach-Object {
         '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.FullName.Substring($sourceFull.Length + 1).Replace('\', '/')
     })
@@ -136,7 +136,7 @@ try {
         # Nonrecursive deletion removes only the junction entry.
         [System.IO.Directory]::Delete($stage)
     }
-    $notice = Join-Path $noticesRoot 'v0.11.1\Contents\Resources\THIRD-PARTY-NOTICES.txt'
+    $notice = Join-Path $noticesRoot 'v0.12.0\Contents\Resources\THIRD-PARTY-NOTICES.txt'
     [System.IO.File]::WriteAllText($notice, 'changed')
     Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'differs from vendor'
     Remove-Item -LiteralPath (Join-Path $source 'VERSION')

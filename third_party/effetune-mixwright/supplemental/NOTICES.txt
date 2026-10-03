@@ -1,4 +1,4 @@
-Supplemental third-party notices for EffeTune Mixwright v0.11.1 as shipped with mImageViewer
+Supplemental third-party notices for EffeTune Mixwright v0.12.0 as shipped with mImageViewer
 ==========================================================================================
 
 The JSZip 3.10.2 distribution bundled in EffeTune Mixwright

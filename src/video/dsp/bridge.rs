@@ -1838,7 +1838,7 @@ mod effetune_host_handler_tests {
             "currentPipeline",
             "masterBypass",
         ] {
-            assert!(document.get(key).is_some(), "v0.11.1 codec field {key}");
+            assert!(document.get(key).is_some(), "v0.12.0 codec field {key}");
         }
         assert_eq!(
             crate::effetune::EffectiveState::from_bytes(&bytes),

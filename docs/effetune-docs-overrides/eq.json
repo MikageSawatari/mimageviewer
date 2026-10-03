@@ -38,5 +38,12 @@
     "anchor": "Room EQにはWASM DSPエンジンが必要です。利用できない場合、信号は変更されずに通過します。",
     "replacement": "",
     "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
+  },
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "tonal-balance-eq",
+    "anchor": "無音時の省電力による停止から処理が再開したときも、測定は最初からやり直しになります。",
+    "replacement": "",
+    "reason": "Codex P3 対応: bundled vst-audio-manager.js:1296 disables the standalone silence power policy in startPowerPolicyController(); retain the explicit Reset operation."
   }
 ]

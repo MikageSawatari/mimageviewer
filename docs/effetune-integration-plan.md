@@ -7,7 +7,7 @@ Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 
 
 ## 0. 目的と決定済み事項
 
-EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.11.1、WebView2 UI、AVX2/FMA 必須) を
+EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.12.0、WebView2 UI、AVX2/FMA 必須) を
 mIV の音声経路へ組み込み、エフェクト処理とビジュアライザーを使えるようにする。
 
 利用者と合意済みの方針 (2026-09-27):
@@ -370,7 +370,7 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
+- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.12.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
 - 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
@@ -525,14 +525,14 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 
 ### 10.2 v4.3.0 の配布同梱 (2026-10-01)
 
-- **単体exe版とインストーラ版に Mixwright v0.11.1 の bundle 全体を同梱する**。インストーラは
+- **単体exe版とインストーラ版に Mixwright v0.12.0 の bundle 全体を同梱する**。インストーラは
   launcher をインストールする。portable は §10.1 の決定どおり bundle と VST host を同梱しない。
 - launcher の build.rs が `vendor/effetune-mixwright/` (または `MIMV_EFFETUNE_DIR` で指定した
   staging) の VERSION と bundle を必須検証し、相対パス順に全ファイルを列挙して埋め込む。
-  v0.11.1 の bundle は 407 ファイル、38,491,437 bytes (約36.71 MiB)。bundle 外の VERSION を含む
-  入力は計408ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
+  v0.12.0 の bundle は 424 ファイル、32,320,639 bytes (約30.82 MiB)。bundle 外の VERSION を含む
+  入力は計425ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
   無ければ取得・配置の復旧手順付きで build を停止する。
-- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋407ファイルの一覧とSHA-256を
+- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋424ファイルの一覧とSHA-256を
   固定し、vendor原本の欠落・追加・改変を署名前／埋め込み前に拒否する。署名stageも全非PEが一致、
   PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
 - 起動時は `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/`
@@ -569,7 +569,7 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   単体DLL pathへfallbackせず報告し、Win32にはnative backslash wide pathを渡す。
   hostはCMakeで現trackedソースhash markerを埋め、署名前／core埋込前／bare cargo releaseのgateで照合する。
   APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは[バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)へ延期する。
-- 3種類の通知全文を `third_party/effetune-mixwright/v0.11.1/` に原文のまま追跡し、about の
+- 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
   でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
@@ -579,6 +579,27 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
 - EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
   アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
+
+### 10.3 同梱版更新 (2026-10-04、v4.3.0 公開前)
+
+- 利用者決定: 同梱 EffeTune は未リリースのため、v0.11.1 で保存した EffeTune 状態の
+  移行・互換処理は追加しない。旧版ソース確認・実機観測の記録は履歴として残す。
+- 承認元は Mixwright v0.12.0、release commit `6f4e2ee`、Windows x64 ZIP の SHA-256 は
+  `31df641d9da41aa36a5e5dc3e684282bd534e9e26ef9c5e6ff3b8c47c4f95408`。
+  vendor の bundle 全424ファイルが ZIP と一致。旧407ファイルから17追加、削除なし。
+- 新しい第三者成分は Rhythm Analyzer の fdlibm 5.3 (atan / atan2)。上流 DSP NOTICE に
+  Sun Microsystems の原文が追加済み。その他2通知と JSZip は旧版と同一。
+  lie / immediate / setImmediate / pako の zlib ヘッダーは今も上流通知に無いため補足を維持。
+- 日本語資料は external/effetune commit `03bffda352287f4f438d063d9660aad7864e553a` の
+  verbatim snapshot に更新。Analog Meter / Rhythm Analyzer / Tonal Balance EQ と Visualizer
+  拡張を収録し、今回表示されたコントローラーマッピングの設定入口も説明書に追加。
+  独立プレーヤー、Clean Feed、外部音声設定など VST で使えない説明は override で訂正。
+- 非起動 PE gate は plugin の x64 と VC import closure を確認。最長の相対名は104 UTF-16単位。
+  40文字のユーザー名、generation最大45文字を使う通常profile例の最深pathは252単位 (<260)。
+- 製品・plugin は起動しない。従来の v0.11.1 実機観測を v0.12.0 の実行結果として扱わない。
+  通常 launcher test は release core / remote / EPUB worker が未buildのため保留。
+  公開前に release lead が最終 full gate と release build、および実機確認を行う。
+
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
