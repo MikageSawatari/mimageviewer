@@ -29,6 +29,14 @@
 
 ## 1. 優先候補
 
+### 1.320 検索結果の取り込み中に UI とサムネイル処理がそろって約 0.8 秒止まる — perf smoke (2026-10-03)
+
+- 観測: v4.3.0 配布前の perf smoke 1 回目 (利用者操作、release build 6b2bc99c9)。Ctrl+G 検索の結果を受け取っている最中の frame n=1843 で update 844 ms、うち OtherWorkerPolls 817.6 ms。thread cycles は約 14 ms 分しかなく、UI スレッドは計算せず待っていた。同時刻にサムネイル worker 8 本が `load_phases` の unaccounted 791〜822 ms (decode 本体は 19〜40 ms)、perf イベント全体にも約 801 ms の空白がある。ログ: `target/release-verification/v4.3.0-perf_smoke-perf_events.jsonl`。
+- 2 回目 (起動後 1 分待ってから同じ操作、`...perf_smoke2-perf_events.jsonl`) では再現しなかった。起動時の索引照合は 1 回目でも 0.8〜0.9 秒で終わっており、起動時スキャンとの重なりではない。
+- 第二意見 (Codex xhigh、read-only): 関係する関数 (`spawn_search`、検索イベントの poll、結果の取り込み、タグ候補 SQL、通常 / perf ロガー、`load_one_cached`) は v4.2.0 から変わっておらず、e9b5f36b7 の索引所有設計に原因の根拠はない。第 1 候補は通常ロガーの共用 mutex を持ったままの同期 `write_all` + `flush` ([logger.rs:238](../src/logger.rs))。UI の結果取り込みとサムネイル成功時の両方が通るので、同時の待ちを 1 つで説明できる。次点は OS / プロセス全体の停止、結果取り込み時の同期 SQL ([global_search_ui.rs:1912](../src/global_search_ui.rs))。いずれも待ち先を記録していないため未確定。
+- 次の一手: 通常ロガーの mutex 取得待ち・保持時間・`write_all` 時間を保持者 tid 付きでメモリに記録し、OtherWorkerPolls (details_meta / 検索 events / 結果取り込み / タグ prewarm / 動画 pin) とサムネイルの未計測区間を wall time と cycles の対で分ける。再測定時は OS トレース (待機スタック・ディスク I/O・hard fault) を添える。
+- v4.3.0 は記録のうえで出荷 (1 回だけの観測で再現せず、退行の根拠なし)。
+
 ### 1.319 ui-smoke AudioTracks が「native audio control Row(0) changed before input」で毎回止まる — smoke 実行記録 (2026-10-02)
 
 - 観測: v4.3.0 の配布前 smoke (使い捨て portable、source_head 0f3399113) で 2 回続けて同じ失敗。runner の分類は `environment_failure`。証跡 `target/ui-smoke-runs/20261002T005040656Z-250924-AudioTracks-430e3e66` と `...005111110Z-75016-AudioTracks-e1d38f63`。このシナリオは §1.251 S8 で作ってから一度も実行していなかった。
