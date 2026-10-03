@@ -27,6 +27,42 @@
 
 use egui_kittest::Harness;
 
+fn snapshot_color_presets(name: &str, width: f32) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(width, 160.0))
+        .build(move |ctx| {
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                mimageviewer::os_theme::ResolvedTheme::Dark,
+            );
+            if !fonts_ready {
+                install_app_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let available = ui.available_width();
+                let response = mimageviewer::draw_color_presets_snapshot_fixture(ui);
+                assert!(response.rect.width() <= available + 0.1);
+                assert!(response.rect.height() >= 48.0);
+            });
+        });
+    harness.run();
+    harness.snapshot(name);
+}
+
+#[test]
+fn color_presets_popup_width() {
+    snapshot_color_presets("color_presets_popup_dark", 308.0);
+}
+
+#[test]
+fn color_presets_narrow_width() {
+    snapshot_color_presets("color_presets_narrow_dark", 224.0);
+}
+
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
 /// 絵文字混じりテキストの実際のレイアウトを検証できない。

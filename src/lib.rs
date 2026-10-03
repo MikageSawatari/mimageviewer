@@ -291,6 +291,8 @@ mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
 #[doc(hidden)]
+pub use ui_main::draw_color_presets_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 pub use ui_main::draw_details_icons_snapshot_fixture;
 mod ui_metadata_panel;

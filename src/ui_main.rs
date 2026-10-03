@@ -116,13 +116,15 @@ const DETAILS_COLUMN_MENU_HEIGHT_ROUNDING_SLACK_PX: f32 = 2.0;
 const DETAILS_COLUMN_MENU_INITIAL_CONTENT_HEIGHT: f32 = 420.0;
 const DETAILS_COLUMN_MENU_CONTENT_HEIGHT_ID: u64 = 0xD37A_115C_01_u64;
 const DETAILS_LAYOUT_DEBUG_ENV: &str = "MIV_DETAILS_LAYOUT_DEBUG";
-const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
+const COLOR_FILTER_PRESETS: [[u8; 3]; 14] = [
     [86, 86, 86],
     [255, 255, 255],
     [178, 178, 178],
     [185, 154, 118],
     [240, 142, 184],
     [255, 79, 79],
+    [128, 24, 40],
+    [244, 202, 177],
     [255, 181, 106],
     [255, 218, 91],
     [101, 202, 160],
@@ -130,6 +132,64 @@ const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [81, 142, 229],
     [124, 98, 232],
 ];
+
+fn draw_color_presets(ui: &mut egui::Ui, query_rgb: [u8; 3]) -> Option<[u8; 3]> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        for rgb in COLOR_FILTER_PRESETS {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(5),
+                egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+            );
+            let stroke = if query_rgb == rgb {
+                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+            } else {
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+            };
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius::same(5),
+                stroke,
+                egui::epaint::StrokeKind::Outside,
+            );
+            if response
+                .on_hover_text(crate::color_search::hex_rgb(rgb))
+                .clicked()
+            {
+                clicked = Some(rgb);
+            }
+        }
+    });
+    clicked
+}
+
+#[doc(hidden)]
+pub fn draw_color_presets_snapshot_fixture(ui: &mut egui::Ui) -> egui::Response {
+    ui.label("画像と ZIP / PDF の代表画像が対象です");
+    ui.scope(|ui| {
+        draw_color_presets(ui, [244, 202, 177]);
+    })
+    .response
+}
+
+#[cfg(test)]
+mod color_preset_tests {
+    use super::*;
+
+    #[test]
+    fn color_presets_are_distinct_from_existing_red_and_orange() {
+        let lab = crate::color_search::srgb_to_lab;
+        let distance = |a, b| crate::color_search::delta_e76(lab(a), lab(b));
+        for rgb in [[244, 202, 177], [128, 24, 40]] {
+            assert!(COLOR_FILTER_PRESETS.contains(&rgb));
+            assert!(distance(rgb, [255, 79, 79]) > 40.0);
+            assert!(distance(rgb, [255, 181, 106]) > 30.0);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum BookReorderScrollKey {
@@ -12786,7 +12846,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ui.set_min_width(292.0);
                     self.draw_image_color_picker_header(ui);
                     ui.label(
-                        egui::RichText::new("画像のみが対象です（動画・フォルダ・書庫は除外）")
+                        egui::RichText::new("画像と ZIP / PDF の代表画像が対象です")
                             .small()
                             .color(ui.visuals().weak_text_color()),
                     );
@@ -12985,35 +13045,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     fn draw_image_color_presets(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            for rgb in COLOR_FILTER_PRESETS {
-                let size = egui::vec2(24.0, 24.0);
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-                let fill = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(5), fill);
-                let selected = self.color_filter.query_rgb == rgb;
-                let stroke = if selected {
-                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
-                } else {
-                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
-                };
-                ui.painter().rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(5),
-                    stroke,
-                    egui::epaint::StrokeKind::Outside,
-                );
-                if response
-                    .on_hover_text(crate::color_search::hex_rgb(rgb))
-                    .clicked()
-                {
-                    changed |= self.set_image_color_query_from_ui(rgb);
-                }
-            }
-        });
-        changed
+        draw_color_presets(ui, self.color_filter.query_rgb)
+            .is_some_and(|rgb| self.set_image_color_query_from_ui(rgb))
     }
 
     fn draw_image_color_inputs(&mut self, ui: &mut egui::Ui) -> bool {

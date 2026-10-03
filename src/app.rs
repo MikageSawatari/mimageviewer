@@ -44963,6 +44963,9 @@ impl App {
             // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
             // 残り続けるので無視する。
             if finalized {
+                // Source decode/cache replacement advances the representative identity. Ordinary
+                // cache reads and GPU eviction do not invalidate unchanged color results.
+                self.invalidate_color_representative(i);
                 // 仮想フォルダの先頭ページ完成を親 catalog にミラー (PDFium 再レンダ
                 // 防止のための writeback)。requested の cleanup より前にやることで、
                 // cache_map から WebP データが消える前に確実に読み出せる。
@@ -69891,6 +69894,7 @@ impl App {
     /// Remove every queued/materialized form of one grid thumbnail and make it
     /// eligible for a fresh LoadRequest on the next keep-range update.
     fn evict_thumbnail_for_reload(&mut self, idx: usize) {
+        self.invalidate_color_representative(idx);
         for queue in [&self.reload_queue, &self.heavy_io_queue]
             .into_iter()
             .flatten()
