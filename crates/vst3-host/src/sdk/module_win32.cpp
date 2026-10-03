@@ -160,7 +160,7 @@ public:
 		namespace StringConvert = Steinberg::Vst::StringConvert;
 
 		filesystem::path p = miv::bundle_binary_path (inPath, archString);
-		const std::wstring wString = p.native ();
+		const std::wstring wString = miv::loader_path_from_utf8 (miv::path_to_utf8 (p)).native ();
 		HINSTANCE instance = LoadLibraryW (reinterpret_cast<LPCWSTR> (wString.data ()));
 		const DWORD loadError = instance ? ERROR_SUCCESS : GetLastError ();
 #if SMTG_CPU_ARM_64EC
@@ -179,7 +179,7 @@ public:
 	{
 		namespace StringConvert = Steinberg::Vst::StringConvert;
 
-		auto wideStr = miv::path_from_utf8 (inPath).native ();
+		auto wideStr = miv::loader_path_from_utf8 (inPath).native ();
 		HINSTANCE instance = LoadLibraryW (reinterpret_cast<LPCWSTR> (wideStr.data ()));
 		const DWORD loadError = instance ? ERROR_SUCCESS : GetLastError ();
 		if (instance == nullptr)
