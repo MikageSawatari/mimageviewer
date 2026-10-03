@@ -29,6 +29,13 @@
 
 ## 1. 優先候補
 
+### 1.319 ui-smoke AudioTracks が「native audio control Row(0) changed before input」で毎回止まる — smoke 実行記録 (2026-10-02)
+
+- 観測: v4.3.0 の配布前 smoke (使い捨て portable、source_head 0f3399113) で 2 回続けて同じ失敗。runner の分類は `environment_failure`。証跡 `target/ui-smoke-runs/20261002T005040656Z-250924-AudioTracks-430e3e66` と `...005111110Z-75016-AudioTracks-e1d38f63`。このシナリオは §1.251 S8 で作ってから一度も実行していなかった。
+- 失敗の手前までは進む: multi.mkv の再生と既定トラック (880 Hz、stream 2、Applied) の確認は通っている。止まるのは HUD の音声メニュー 1 行目を OS 入力でクリックする直前の再確認 ([native_ui_smoke.rs:1804](../src/video/native_ui_smoke.rs)) で、snapshot と入力直前とで target の token か位置が一致しない。
+- 原因は未特定。メニュー表示中に再生が進み、publish のたびに token が変わる設計なら smoke 側の前提が合っていない (推測)。製品の音声トラック切り替えは利用者が実機で確認済み (2026-09-30)。
+- v4.3.0 は他の 7 本 (MultiWindowPdf / Stills / RarNav / RatingSort / RatingSortCollection / FolderHistory / AlwaysOnTop) が PASS で、このシナリオは外して出荷する。
+
 ### 1.317 環境設定のエクスポート・インポート — 5ch >>498 からの検討 (2026-10-02)
 
 - 目的: 別環境へ移る際、普段の閲覧・表示などの設定を引き継ぎやすくする。5ch の助言を受けて開発者が採用を検討。
