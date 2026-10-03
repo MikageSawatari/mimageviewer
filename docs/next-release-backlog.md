@@ -29,12 +29,20 @@
 
 ## 1. 優先候補
 
+### 1.324 安全リミッターの先読み分 (約 5 ms) が、通常の再生終了で出力されない — v4.3.0 は割り切り (2026-10-04)
+
+- 背景: v4.3.0 で EffeTune の前に安全リミッター (別インスタンス、既定 ON) を追加した (b55403c5f)。独立レビューの P2: 通常の EOS で前段リミッターが保持する先読み分 (44.1 kHz で 221 フレーム) を出力する経路がなく、ローカル再生 (`flush_silence` は結果を捨てる) と Remote (encoder をそのまま終了) で末尾約 5 ms が欠ける。最終リミッターにも同じ末尾欠落が以前からある (VST3 / EffeTune / 手動ブースト時)。
+- 修正版は実装済み・未レビュー: branch `prelimiter-eos-drain` (47c28db2c、epubroot worktree)。EOS に serial を付けて古い EOS を拒否し、排出完了まで EOF / ループを抑止する。約 1200 行で、リリース済みの再生終端・ループ処理に触れるため、v4.3.0 では利用者判断で入れずに割り切った。
+- 次の一手: 次版で独立レビュー → 実機確認 (末尾に音がある素材のローカル / Remote 再生、ループ、シーク・停止直後)。範囲を絞れるなら、ループ処理に触れずに末尾だけ出し切る形も検討する。
+- 関連 (別件): EffeTune も VST3 も使わず音量 100% 以下のときは、安全リミッターを通らないため 0 dBFS を超えた値がそのまま WASAPI へ渡る (リリース済みの挙動)。常に通すと約 5 ms の遅れが加わる。必要かどうかを次版で検討する。
+
 ### 1.323 WebView2 ランタイムが壊れた環境で、EffeTune の画面が「12 秒以内に読み込みが終わらない」(EFFETUNE-UI-TIMEOUT) と出る — Sandbox 記録 (2026-10-03)
 
 - 観測 (サブPCの Windows Sandbox、利用者が確認、v4.3.0 配布ビルド 2 回目のインストール版): 「音響調整」で窓は出るが中身が出ず、EFFETUNE-UI-PENDING → EFFETUNE-UI-TIMEOUT。開き直しても同じ。45 秒間 msedgewebview2.exe は一度も起動しなかった (wv2-watch)。同じ Sandbox で EPUB 変換も「WebView2 Runtime が見つかりません」で失敗。
 - 環境: Sandbox 内の WebView2 登録 (EdgeUpdate Clients {F3017226-…}) は pv=152.0.4191.66 だが、フォルダには 153 / 154 しかない。サブPC本体は pv=154.0.4258.53 でフォルダと一致。ただし追加実験 (新しい Sandbox で EPUB worker を直接実行) で、登録をそのまま / 154 に修正 / キー削除の 3 状態とも `GetAvailableCoreWebView2BrowserVersionString(NULL)` が 0.1 秒で失敗 (HRESULT 0x80070002、文面は 0x80670016 STATEREPOSITORY_E_DEPENDENCY_NOT_RESOLVED)。登録のずれは原因ではなかった。Sandbox 内の WebView2 (パッケージ版の解決か EdgeWebView フォルダの中身) が使えない状態と見ている (推測)。同じ EPUB worker (配布 launcher 内のものとバイト一致) と同じ EPUB は、サブPC本体 (Windows 11 Pro 26200、WebView2 154.0.4258.53) では 1.4 秒で変換成功 (サブPCのスクリプト記録)。登録を直した Sandbox でも EffeTune は PENDING のまま (利用者が確認)。
 - mIV 側はホスト起動・同梱 CRT preload (source=bundled 14.50.35719.0)・プラグイン読み込み・createView / attached まで正常。エラー文はプラグイン自身のもので、mIV のログには出ない。
 - 原因の切り分け (2026-10-04、サブPCの自作診断 wv2diag、mIV と同じ WebView2LoaderStatic 1.0.3800.47): Sandbox では既定の探し方 (`GetAvailableCoreWebView2BrowserVersionString(NULL)` / `CreateCoreWebView2EnvironmentWithOptions(NULL, …)`) が 0x80070002 (IRestrictedErrorInfo 0x80670016) で即失敗する。`browserExecutableFolder` に `EdgeWebView\Application\154.0.4258.53` を明示すると環境・コントローラ・NavigationCompleted まで成功。`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` を設定したプロセスから起動した mIV では EffeTune の画面が出た (利用者が確認)。EPUB worker は `WEBVIEW2_*` を消すため失敗のまま。サブPC本体では既定の探し方で成功。
+- 結論 (2026-10-04、サブPC調査): 原因は `ClientState\{F3017226-…}\EBWebView` のパスが存在しない 152 のフォルダを指していること。EBWebView だけ直すと成功、pv だけ直すと失敗 (前回の「登録のずれは原因ではない」は pv だけを直した結果で、誤り)。Sandbox は EdgeUpdate が Disabled で、レジストリはベースイメージ時点のまま、ファイルはホストと共有の 153 / 154。同じ症状が WebView2Feedback #5697 (open、2026-09) に報告済みで Microsoft 側は未解決。普通の PC では更新の中断など例外的な場合だけで、WebView2 を使うアプリ全体が失敗し、ランタイムの修復で直る (Web 調査、一部コミュニティ回答)。**Sandbox の作りによるもので対処不要と判断** (利用者が判断できる根拠として記録)。
 - 予備の探し方の案 (サブPC提案、未採用): 既定で見つからないときだけ EdgeWebView\Application 配下の最新版フォルダを探して VST3 ホストの環境変数 / EPUB worker の `browserExecutableFolder` に渡す。懸念: Evergreen ランタイムのインストール先を直接指定するのは Microsoft の想定外で、更新時に旧版フォルダが消えると使用中に壊れる可能性がある (一般的な知識、要確認)。普通の PC で既定の探し方が失敗する例は未観測。
 - 改善候補 (次版以降): EPUB 変換と同じ WebView2 有無の判定を「音響調整」を押した時点で行い、無ければ mIV 側で「WebView2 Runtime が見つかりません」と案内する (TIMEOUT の文面では原因が分からないため)。EffeTune 作者へ、壊れたランタイム登録で RUNTIME ではなく TIMEOUT になる件を伝えるかも検討。
 
