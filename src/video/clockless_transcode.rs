@@ -19,7 +19,7 @@ use ffmpeg::util::frame::{Audio, Video};
 use ffmpeg_the_third as ffmpeg;
 
 use super::audio::ProcessedChunk;
-use super::audio::{EffetuneInputLimiter, SafetyLimiter};
+use super::audio::{AudioDspTail, EffetuneInputLimiter, SafetyLimiter};
 use super::stream::audio_encoder::{OpenedAacEncoder, open_aac_encoder};
 use super::stream::encoder::{
     EncoderPreference, FrameRate, H264InputFormat, SEGMENT_DURATION_SECS,
@@ -1339,6 +1339,7 @@ struct ClocklessAudioProcessor {
     effetune: Option<ClocklessVstChain>,
     effetune_output: Vec<f32>,
     limiter: SafetyLimiter,
+    tail: AudioDspTail,
     latency_reconciler: ClocklessLatencyReconciler,
     vst3_health: crate::effetune::composition::StageHealth,
     effetune_health: crate::effetune::composition::StageHealth,
@@ -1609,6 +1610,7 @@ impl ClocklessAudioProcessor {
             effetune,
             effetune_output: Vec::new(),
             limiter: SafetyLimiter::new(sample_rate, 2),
+            tail: AudioDspTail::default(),
             latency_reconciler: ClocklessLatencyReconciler::new(sample_rate),
             vst3_health: crate::effetune::composition::StageHealth::default(),
             effetune_health: crate::effetune::composition::StageHealth::default(),
@@ -1634,6 +1636,7 @@ impl ClocklessAudioProcessor {
         if self.latency_reconciler.seek_serial != Some(chunk.seek_serial) {
             self.limiter.reset();
             self.effetune_input_limiter.reset();
+            self.tail = AudioDspTail::Empty;
         }
         if (self.normalize_gain - 1.0).abs() > f32::EPSILON {
             for sample in &mut chunk.samples {
@@ -1772,13 +1775,15 @@ impl ClocklessAudioProcessor {
             user_latency_secs,
             effetune_applied,
             effetune_latency_secs,
-            None,
+            effetune_applied.then_some(0),
         );
         chunk.samples = samples;
         self.effetune_output = scratch;
         latency_secs = composition.plugin_latency_secs;
 
-        if composition.limiter_required || self.normalize_gain > 1.0 + f32::EPSILON {
+        let limiter_active =
+            composition.limiter_required || self.normalize_gain > 1.0 + f32::EPSILON;
+        if limiter_active {
             self.limiter.process_block(&mut chunk.samples);
             latency_secs += self.limiter.latency_secs();
         } else {
@@ -1787,11 +1792,88 @@ impl ClocklessAudioProcessor {
         }
         chunk.audible_pts_secs -= latency_secs;
         chunk.pdc_latency_secs_at_process = latency_secs;
+        chunk.effetune_generation = composition.effetune_generation;
+        let final_frames = if limiter_active {
+            (self.limiter.latency_secs() * self.sample_rate as f64).round() as usize
+        } else {
+            0
+        };
+        let pre_frames = if effetune_applied && self.effetune_pre_limiter_enabled {
+            final_frames
+        } else {
+            0
+        };
+        let effect_frames = if effetune_applied {
+            ((effetune_latency_secs * self.sample_rate as f64).round() as usize)
+                .saturating_sub(pre_frames)
+        } else {
+            0
+        };
+        self.tail.capture(
+            &chunk,
+            effect_frames,
+            pre_frames,
+            final_frames,
+            self.effetune_pre_limiter_enabled,
+            1.0,
+        );
+
         let total_latency_samples = (chunk.pdc_latency_secs_at_process
             * f64::from(self.latency_reconciler.sample_rate))
         .round() as i64;
         self.latency_reconciler
             .reconcile(chunk, total_latency_samples)
+    }
+
+    fn start_tail(&mut self) {
+        if let Some(serial) = self.latency_reconciler.seek_serial {
+            self.tail.start(serial);
+        }
+    }
+
+    fn tail_complete(&self) -> bool {
+        self.tail.complete()
+    }
+
+    fn process_tail(&mut self) -> Option<ProcessedChunk> {
+        let effect = self.effetune.as_ref();
+        let health = &mut self.effetune_health;
+        let chunk = self.tail.next(
+            self.sample_rate,
+            &mut self.effetune_input_limiter,
+            &mut self.limiter,
+            |_, latency_frames, input, output| {
+                let Some(chain) = effect.filter(|chain| {
+                    !chain.failed.load(Ordering::Acquire)
+                        && chain.processor.available()
+                        && chain.processor.sample_rate() == self.sample_rate
+                        && chain.processor.total_latency_samples() as usize == latency_frames
+                }) else {
+                    return false;
+                };
+                match chain.processor.process_if_available(input, output) {
+                    Ok(applied) => {
+                        if applied {
+                            health.succeeded();
+                        }
+                        applied
+                    }
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "remote-stream EffeTune EOS tail process failed: {error}"
+                        ));
+                        if health.failed() && !chain.failed.swap(true, Ordering::AcqRel) {
+                            chain.processor.report_process_failure(error);
+                            chain.status.mark_effetune_processing_failed();
+                        }
+                        false
+                    }
+                }
+            },
+            || {},
+        )?;
+        let samples = (chunk.pdc_latency_secs_at_process * self.sample_rate as f64).round() as i64;
+        self.latency_reconciler.reconcile(chunk, samples)
     }
 }
 
@@ -1984,6 +2066,11 @@ impl DriverState<'_> {
         let started = Instant::now();
         let chunk = self.audio_processor.process(chunk);
         self.times.audio_process_secs += started.elapsed().as_secs_f64();
+        self.encode_processed_audio(chunk)
+    }
+
+    fn encode_processed_audio(&mut self, chunk: Option<ProcessedChunk>) -> Result<(), String> {
+        self.checkpoint()?;
         let Some(chunk) = chunk else {
             return self.drain_mux();
         };
@@ -1999,6 +2086,21 @@ impl DriverState<'_> {
         }
         self.audio_frames = self.audio_frames.saturating_add(1);
         self.drain_mux()
+    }
+
+    fn drain_audio_tail(&mut self) -> Result<(), String> {
+        self.audio_processor.start_tail();
+        while !self.audio_processor.tail_complete() {
+            self.wait_for_capacity()?;
+            self.checkpoint()?;
+            #[cfg(windows)]
+            let _dsp_permit = self.audio_processor.shared_permit()?;
+            let started = Instant::now();
+            let chunk = self.audio_processor.process_tail();
+            self.times.audio_process_secs += started.elapsed().as_secs_f64();
+            self.encode_processed_audio(chunk)?;
+        }
+        Ok(())
     }
 
     fn drain_mux(&mut self) -> Result<(), String> {
@@ -2457,6 +2559,7 @@ fn run_clockless_stream_inner(
             if let Some(chunk) = path.flush_resampler()? {
                 state.push_audio_chunk(chunk)?;
             }
+            state.drain_audio_tail()?;
         }
     }
 
@@ -2720,6 +2823,176 @@ mod tests {
             pdc_latency_secs_at_process: 0.0,
             effetune_generation: None,
         }
+    }
+
+    struct DelayedTailProcessor {
+        sample_rate: u32,
+        frames: u32,
+        delay: Mutex<VecDeque<f32>>,
+        max_block_frames: AtomicUsize,
+    }
+
+    impl ClocklessVstProcessor for DelayedTailProcessor {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+        fn prepare(&self) -> ClocklessVstPrepareResult {
+            ClocklessVstPrepareResult {
+                active_slots: 1,
+                warning: None,
+            }
+        }
+        fn reset(&self) {
+            *self.delay.lock().unwrap() = VecDeque::from(vec![0.0; self.frames as usize * 2]);
+        }
+        fn total_latency_samples(&self) -> u32 {
+            self.frames
+        }
+        fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+            self.max_block_frames
+                .fetch_max(src.len() / 2, Ordering::AcqRel);
+            let mut delay = self.delay.lock().unwrap();
+            for (src, dst) in src.iter().zip(dst) {
+                delay.push_back(*src);
+                *dst = delay.pop_front().unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn eos_remote_releases_nonzero_pre_effetune_and_final_tail_with_unchanged_pdc() {
+        for rate in [1_000, 44_100, 48_000] {
+            for enabled in [false, true] {
+                // Also exercise a long admitted delay, split across many bridge calls.
+                let effect_frames = if rate == 1_000 { 1_500 } else { rate / 200 };
+                let effect = Arc::new(DelayedTailProcessor {
+                    sample_rate: rate,
+                    frames: effect_frames,
+                    delay: Mutex::new(VecDeque::new()),
+                    max_block_frames: AtomicUsize::new(0),
+                });
+                let config = with_unlimited_fake_effetune(
+                    ClocklessAudioProcessing::without_vst3(1.0),
+                    effect.clone(),
+                )
+                .with_effetune_preferences(&crate::settings::Settings {
+                    effetune_pre_limiter_enabled: enabled,
+                    ..Default::default()
+                });
+                let mut processor = ClocklessAudioProcessor::new(config, rate).unwrap();
+                let input = vec![0.35, -0.7].repeat(3);
+                let mut raw = audio_chunk(input.clone());
+                raw.duration_secs = 3.0 / rate as f64;
+                let first = processor.process(raw).unwrap();
+                let mut output = first.samples.clone();
+                let mut end = first.audible_pts_secs + first.duration_secs;
+                processor.start_tail();
+                while !processor.tail_complete() {
+                    if let Some(chunk) = processor.process_tail() {
+                        assert_eq!(
+                            chunk.pdc_latency_secs_at_process,
+                            first.pdc_latency_secs_at_process
+                        );
+                        assert!((chunk.audible_pts_secs - end).abs() < 1e-9);
+                        end += chunk.duration_secs;
+                        output.extend(chunk.samples);
+                    }
+                }
+                let lookahead = (0.005 * rate as f64).round() as usize;
+                let leading =
+                    (effect_frames as usize + lookahead * if enabled { 2 } else { 1 }) * 2;
+                assert_eq!(&output[..leading], vec![0.0; leading]);
+                assert_eq!(&output[leading..], input);
+                assert!(
+                    effect.max_block_frames.load(Ordering::Acquire) <= (rate as usize / 100).max(3)
+                );
+                processor.start_tail();
+                assert!(processor.process_tail().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn eos_remote_tail_survives_reconciler_drop_and_seek_discards_old_audio() {
+        let effect = Arc::new(ChangingLatencyVstProcessor {
+            sample_rate: 1_000,
+            latency_samples: AtomicU32::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let config = with_unlimited_fake_effetune(
+            ClocklessAudioProcessing::without_vst3(1.0),
+            effect.clone(),
+        )
+        .with_effetune_preferences(&Default::default());
+        let mut processor = ClocklessAudioProcessor::new(config, 1_000).unwrap();
+        let mut chunk = audio_chunk(vec![0.6; 40]);
+        chunk.duration_secs = 0.02;
+        processor.process(chunk).unwrap();
+        effect.latency_samples.store(1, Ordering::Release);
+        let mut chunk = audio_chunk(vec![0.8; 2]);
+        chunk.duration_secs = 0.001;
+        assert!(processor.process(chunk).is_none());
+        processor.start_tail();
+        let mut samples = Vec::new();
+        while !processor.tail_complete() {
+            if let Some(chunk) = processor.process_tail() {
+                samples.extend(chunk.samples);
+            }
+        }
+        assert!(
+            samples.contains(&0.8),
+            "the entirely reconciled last input must still leave its limiter tail"
+        );
+        let mut next = audio_chunk(vec![0.0; 40]);
+        next.seek_serial = 1;
+        next.duration_secs = 0.02;
+        assert!(
+            processor
+                .process(next)
+                .unwrap()
+                .samples
+                .iter()
+                .all(|x| *x == 0.0)
+        );
+        processor.start_tail();
+        while !processor.tail_complete() {
+            if let Some(chunk) = processor.process_tail() {
+                assert!(chunk.samples.iter().all(|x| *x == 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn eos_remote_first_tail_failure_preserves_existing_health_threshold() {
+        let effect = Arc::new(ChangingLatencyVstProcessor {
+            sample_rate: 1_000,
+            latency_samples: AtomicU32::new(0),
+            fail: AtomicBool::new(false),
+        });
+        let config = with_unlimited_fake_effetune(
+            ClocklessAudioProcessing::without_vst3(1.0),
+            effect.clone(),
+        )
+        .with_effetune_preferences(&Default::default());
+        let mut processor = ClocklessAudioProcessor::new(config, 1_000).unwrap();
+        let mut chunk = audio_chunk(vec![0.6; 40]);
+        chunk.duration_secs = 0.02;
+        processor.process(chunk).unwrap();
+        effect.fail.store(true, Ordering::Release);
+        processor.start_tail();
+        let tail = processor.process_tail().unwrap();
+        assert_eq!(tail.samples, vec![0.6; 10]);
+        assert!(processor.tail_complete());
+        assert_eq!(processor.effetune_health.failure_count(), 1);
+        assert!(
+            !processor
+                .effetune
+                .as_ref()
+                .unwrap()
+                .failed
+                .load(Ordering::Acquire)
+        );
     }
 
     struct ChangingLatencyVstProcessor {

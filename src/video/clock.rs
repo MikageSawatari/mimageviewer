@@ -89,6 +89,14 @@ pub(super) enum SeekRequestKind {
     FrameStep { base_secs: f64, direction: i32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioEos {
+    Decoding,
+    Decoded(u64),
+    Draining(u64),
+    Complete(u64),
+}
+
 /// 動画再生用 AV マスタークロック (facade)。
 ///
 /// Phase 2b: 内部状態は `MasterClock` (anchor 部分) と `AudioBookkeeping`
@@ -136,6 +144,9 @@ pub struct AvClock {
     /// Audio decode worker の終了通知。出力 channel に未読 frame が残り、pump が
     /// 逆圧中でも lane の喪失を検知できるようにする。
     audio_worker_exited: AtomicBool,
+    /// Decoder and pump jointly own normal EOS; quiet counters alone cannot
+    /// prove completion while a delayed DSP block is in flight.
+    audio_eos: Mutex<AudioEos>,
     /// 直近のシーク要求の世代。`request_seek` のたびに +1。
     /// 音声 RT コールバック (`fill_output`) と UI の `tick` がポーリングで読むので
     /// atomic で公開する。Mutex を取らずに「自分が処理中の世代より新しい seek が
@@ -296,6 +307,7 @@ impl AvClock {
             #[cfg(test)]
             fail_next_audio_flush: AtomicBool::new(false),
             audio_worker_exited: AtomicBool::new(false),
+            audio_eos: Mutex::new(AudioEos::Decoding),
             seek_serial,
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
@@ -767,16 +779,56 @@ impl AvClock {
         self.audio_worker_exited.load(Ordering::Acquire)
     }
 
+    pub(super) fn note_audio_decoded_eos(&self, serial: u64) {
+        let mut state = self.audio_eos.lock().unwrap();
+        if serial == self.current_seek_serial() && *state == AudioEos::Decoding {
+            *state = AudioEos::Decoded(serial);
+        }
+    }
+
+    pub(super) fn audio_decoded_eos(&self, serial: u64) -> bool {
+        let state = self.audio_eos.lock().unwrap();
+        serial == self.current_seek_serial() && *state == AudioEos::Decoded(serial)
+    }
+
+    pub(super) fn begin_audio_tail(&self, serial: u64) -> bool {
+        let mut state = self.audio_eos.lock().unwrap();
+        if serial == self.current_seek_serial() && *state == AudioEos::Decoded(serial) {
+            *state = AudioEos::Draining(serial);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn complete_audio_tail(&self, serial: u64) {
+        let mut state = self.audio_eos.lock().unwrap();
+        if serial == self.current_seek_serial() && *state == AudioEos::Draining(serial) {
+            *state = AudioEos::Complete(serial);
+        }
+    }
+
+    pub(super) fn audio_tail_complete(&self) -> bool {
+        let state = self.audio_eos.lock().unwrap();
+        *state == AudioEos::Complete(self.current_seek_serial())
+    }
+
+    fn begin_seek_audio_eos(&self, target_secs: f64) -> u64 {
+        let mut state = self.audio_eos.lock().unwrap();
+        self.demux_exhausted.store(false, Ordering::Release);
+        let serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
+        *state = AudioEos::Decoding;
+        self.seek_override_serial.store(serial, Ordering::Release);
+        self.seek_target_override_bits
+            .store(target_secs.to_bits(), Ordering::Release);
+        serial
+    }
+
     fn request_seek_with_before_publish(&self, target_secs: f64, before_publish: impl FnOnce()) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
-        self.demux_exhausted.store(false, Ordering::Release);
-        let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
-        self.seek_override_serial
-            .store(new_serial, Ordering::Release);
-        self.seek_target_override_bits
-            .store(clamped.to_bits(), Ordering::Release);
+        let new_serial = self.begin_seek_audio_eos(clamped);
         before_publish();
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
@@ -812,12 +864,7 @@ impl AvClock {
         let seek_start = seek_start_secs.max(0.0);
         let base = base_secs.max(0.0);
         let direction = direction.signum();
-        self.demux_exhausted.store(false, Ordering::Release);
-        let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
-        self.seek_override_serial
-            .store(new_serial, Ordering::Release);
-        self.seek_target_override_bits
-            .store(base.to_bits(), Ordering::Release);
+        let new_serial = self.begin_seek_audio_eos(base);
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
             target_secs: seek_start,
@@ -1198,6 +1245,31 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn eos_completion_is_once_per_seek_and_stale_publications_are_rejected() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert!(!clock.audio_tail_complete());
+        clock.note_audio_decoded_eos(0);
+        assert!(clock.audio_decoded_eos(0));
+        assert!(clock.begin_audio_tail(0));
+        assert!(!clock.begin_audio_tail(0));
+        assert!(!clock.audio_tail_complete());
+        clock.complete_audio_tail(0);
+        assert!(clock.audio_tail_complete());
+        clock.note_audio_decoded_eos(0);
+        assert!(!clock.begin_audio_tail(0));
+        clock.request_seek(1.0);
+        clock.note_audio_decoded_eos(0);
+        clock.complete_audio_tail(0);
+        assert!(!clock.audio_tail_complete());
+        assert!(!clock.audio_decoded_eos(0));
+        clock.note_audio_decoded_eos(1);
+        assert!(clock.begin_audio_tail(1));
+        clock.request_frame_step_seek(0.0, 1.0, 1);
+        clock.complete_audio_tail(1);
+        assert!(!clock.audio_tail_complete());
+    }
 
     #[test]
     fn speed_change_invalidates_old_audio_tx_accounting_epoch() {

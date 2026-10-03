@@ -1187,6 +1187,139 @@ impl EffetuneInputLimiter {
     }
 }
 
+/// Only normal EOS drains these delays. Seek/stop discard the owner along with
+/// the limiter state. Metadata is captured before trimming/reconciliation so a
+/// short last block can still release its held audio with the original PDC.
+#[derive(Default)]
+pub(crate) enum AudioDspTail {
+    #[default]
+    Empty,
+    Armed(AudioDspTailPlan),
+    Draining(AudioDspTailPlan),
+}
+
+pub(crate) struct AudioDspTailPlan {
+    chunk: ProcessedChunk,
+    upstream_frames: usize,
+    effetune_frames: usize,
+    final_frames: usize,
+    pre_enabled: bool,
+    gain: f32,
+}
+
+impl AudioDspTail {
+    pub(crate) fn capture(
+        &mut self,
+        chunk: &ProcessedChunk,
+        effetune_frames: usize,
+        pre_frames: usize,
+        final_frames: usize,
+        pre_enabled: bool,
+        gain: f32,
+    ) {
+        let metadata = ProcessedChunk {
+            samples: Vec::new(),
+            audible_pts_secs: chunk.audible_pts_secs
+                + chunk.duration_secs * chunk.source_secs_per_output_sec,
+            duration_secs: 0.0,
+            source_secs_per_output_sec: chunk.source_secs_per_output_sec,
+            seek_serial: chunk.seek_serial,
+            pdc_latency_secs_at_process: chunk.pdc_latency_secs_at_process,
+            effetune_generation: chunk.effetune_generation,
+        };
+        *self = Self::Armed(AudioDspTailPlan {
+            chunk: metadata,
+            upstream_frames: effetune_frames + pre_frames,
+            effetune_frames,
+            final_frames,
+            pre_enabled,
+            gain,
+        });
+    }
+
+    pub(crate) fn start(&mut self, serial: u64) {
+        let previous = std::mem::take(self);
+        *self = match previous {
+            Self::Armed(plan) if plan.chunk.seek_serial == serial => Self::Draining(plan),
+            Self::Draining(plan) if plan.chunk.seek_serial == serial => Self::Draining(plan),
+            _ => Self::Empty,
+        };
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Draining(plan) => plan.upstream_frames == 0 && plan.final_frames == 0,
+            Self::Armed(_) => false,
+        }
+    }
+
+    fn discard_stale(&mut self, serial: u64) {
+        if matches!(self, Self::Armed(plan) | Self::Draining(plan) if plan.chunk.seek_serial != serial)
+        {
+            *self = Self::Empty;
+        }
+    }
+
+    pub(crate) fn next(
+        &mut self,
+        sample_rate: u32,
+        pre: &mut EffetuneInputLimiter,
+        final_limiter: &mut SafetyLimiter,
+        mut process_effetune: impl FnMut(u64, usize, &[f32], &mut [f32]) -> bool,
+        mut ceiling_hit: impl FnMut(),
+    ) -> Option<ProcessedChunk> {
+        let Self::Draining(plan) = self else {
+            return None;
+        };
+        // Match ordinary small audio blocks; one bridge deadline must never cover
+        // the whole admitted (up to two seconds) plugin delay.
+        let block_frames = (sample_rate as usize / 100).max(1);
+        let mut samples;
+        if plan.upstream_frames > 0 {
+            let frames = plan.upstream_frames.min(block_frames);
+            let zeros = vec![0.0; frames * 2];
+            let generation = plan
+                .chunk
+                .effetune_generation
+                .expect("upstream tail has an EffeTune stage");
+            let (input, _) = pre.prepare(&zeros, generation, plan.pre_enabled);
+            samples = vec![0.0; zeros.len()];
+            if process_effetune(generation, plan.effetune_frames, input, &mut samples) {
+                plan.upstream_frames -= frames;
+                if plan.gain > 1.0 {
+                    for sample in &mut samples {
+                        *sample *= plan.gain;
+                    }
+                }
+            } else {
+                // A disabled/replaced/failed stage cannot receive old-generation
+                // audio. Retain only the final limiter's already processed tail.
+                pre.reset();
+                plan.upstream_frames = 0;
+                let frames = plan.final_frames.min(block_frames);
+                plan.final_frames -= frames;
+                samples = vec![0.0; frames * 2];
+            }
+        } else {
+            let frames = plan.final_frames.min(block_frames);
+            plan.final_frames -= frames;
+            samples = vec![0.0; frames * 2];
+        }
+        if samples.is_empty() {
+            return None;
+        }
+        if final_limiter.process_block(&mut samples) {
+            ceiling_hit();
+        }
+        let mut chunk = plan.chunk.clone();
+        chunk.samples = samples;
+        chunk.duration_secs = chunk.samples.len() as f64 / (sample_rate as f64 * 2.0);
+        plan.chunk.audible_pts_secs += chunk.duration_secs * chunk.source_secs_per_output_sec;
+        Some(chunk)
+    }
+}
+
 /// preroll (測定前待機) が解除された最初のブロックか判定する (前ブロック suspended かつ
 /// 今ブロック released)。true のブロックで normalize gain を snap し、確定 gain で即再生
 /// 開始することで 4 秒 ramp (`NORMALIZE_GAIN_RAMP_SECS`) を回避する。中盤再生中の gain 変更
@@ -1631,6 +1764,16 @@ fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
     clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
 }
 
+#[cfg(windows)]
+fn local_tail_dsp_allowed(
+    dsp_allowed: bool,
+    serial: u64,
+    clock: &AvClock,
+    cancel: &AtomicBool,
+) -> bool {
+    dsp_allowed && !cancel.load(Ordering::Acquire) && clock.current_seek_serial() == serial
+}
+
 /// audio-pump スレッドの Windows 優先度を `THREAD_PRIORITY_ABOVE_NORMAL` に上げる。
 ///
 /// `audio-pump` は decoder → (VST3 bridge IPC) → cpal ring buffer の橋渡しを担うので、
@@ -1732,8 +1875,8 @@ fn run_pump(
     let samples_per_sec = (sample_rate as f64) * 2.0;
     let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
-    #[cfg(windows)]
     let mut effetune_input_limiter = EffetuneInputLimiter::new(sample_rate);
+    let mut dsp_tail = AudioDspTail::default();
     let mut time_stretcher = TimeStretcher::new(sample_rate);
     let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
     let mut last_processed_normalize_stream: Option<usize> = None;
@@ -1929,6 +2072,7 @@ fn run_pump(
                 seen_valid_audio_frame = true;
                 // 新 seek 世代: target / activate を reset
                 safety_limiter.reset();
+                dsp_tail = AudioDspTail::Empty;
                 #[cfg(windows)]
                 effetune_input_limiter.reset();
                 // AV seek ではここで reset。1.0x bypass 境界の reset は
@@ -2070,6 +2214,7 @@ fn run_pump(
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     clock.zero_audio_tx_queued_secs();
+                    buf.pump_seek_serial = cur_clock_serial;
                     publish_buffer_secs(&buf, &clock);
                     Some(old_serial)
                 } else {
@@ -2078,6 +2223,9 @@ fn run_pump(
             };
 
             if let Some(old_serial) = cleared_pump_serial {
+                safety_limiter.reset();
+                effetune_input_limiter.reset();
+                dsp_tail = AudioDspTail::Empty;
                 seek_target_secs = None;
                 pump_anchor_target_secs = None;
                 activated = false;
@@ -2156,6 +2304,9 @@ fn run_pump(
         // 2. process_block (no lock)
         // 3. lock → seek_serial check → push processed → unlock
         loop {
+            if cancel.load(Ordering::Acquire) {
+                break;
+            }
             #[cfg(windows)]
             let block_mode = dsp_control
                 .as_ref()
@@ -2200,40 +2351,36 @@ fn run_pump(
             };
 
             let _ = current_processed_secs; // 計測用に取得、未使用なら drop
-            let raw = match raw_chunk_opt {
-                Some(r) => r,
-                None => break,
-            };
-
-            let Some(normalize_gain) = clock.normalize_gain_for_stream(raw.stream_index) else {
-                // A toggle may have reset the table between the head check and this load.
-                let mut buf = buffer.lock().unwrap();
-                if raw.seek_serial == buf.pump_seek_serial {
-                    buf.raw_pending.push_front(raw);
+            let untrimmed = if let Some(raw) = raw_chunk_opt {
+                let Some(normalize_gain) = clock.normalize_gain_for_stream(raw.stream_index) else {
+                    // A toggle may have reset the table between the head check and this load.
+                    let mut buf = buffer.lock().unwrap();
+                    if raw.seek_serial == buf.pump_seek_serial {
+                        buf.raw_pending.push_front(raw);
+                    }
+                    break;
+                };
+                if snap_next_normalize_gain
+                    || last_processed_normalize_stream != Some(raw.stream_index)
+                    || pending_normalize_stream == Some(raw.stream_index)
+                {
+                    normalize_gain_ramp.snap_to_target(normalize_gain as f32);
+                    snap_next_normalize_gain = false;
                 }
-                break;
-            };
-            if snap_next_normalize_gain
-                || last_processed_normalize_stream != Some(raw.stream_index)
-                || pending_normalize_stream == Some(raw.stream_index)
-            {
-                normalize_gain_ramp.snap_to_target(normalize_gain as f32);
-                snap_next_normalize_gain = false;
-            }
-            last_processed_normalize_stream = Some(raw.stream_index);
-            pending_normalize_stream = None;
+                last_processed_normalize_stream = Some(raw.stream_index);
+                pending_normalize_stream = None;
 
-            // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
-            let playback_speed = clock.playback_speed();
-            let mut stretched =
-                time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
-            // 音量ノーマライズの線形ゲイン (Phase 2-A): VST3 入力前に掛ける。
-            // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
-            // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
-            // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
-            let max_normalize_gain_in_block =
-                normalize_gain_ramp.apply_to_samples(&mut stretched.samples, normalize_gain as f32);
-            #[cfg(windows)]
+                // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
+                let playback_speed = clock.playback_speed();
+                let mut stretched =
+                    time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
+                // 音量ノーマライズの線形ゲイン (Phase 2-A): VST3 入力前に掛ける。
+                // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
+                // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
+                // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
+                let max_normalize_gain_in_block = normalize_gain_ramp
+                    .apply_to_samples(&mut stretched.samples, normalize_gain as f32);
+                #[cfg(windows)]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
                 f64,
@@ -2319,144 +2466,270 @@ fn run_pump(
                 vst3_consecutive_successes = 0;
                 (stretched.samples.clone(), 0.0, false)
             };
-            #[cfg(not(windows))]
+                #[cfg(not(windows))]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
                 f64,
                 bool,
             ) = (stretched.samples.clone(), 0.0, false);
 
-            #[cfg(windows)]
-            let mut effetune_applied = false;
-            #[cfg(windows)]
-            let user_latency_secs = current_pdc_latency_secs;
-            #[cfg(windows)]
-            let mut applied_effetune_latency_secs = 0.0;
-            #[cfg(windows)]
-            let mut effetune_generation = None;
-            #[cfg(windows)]
-            if dsp_allowed && let Some(slot) = effetune_slot.as_ref() {
-                if let Some((generation, bridge)) = slot.snapshot() {
-                    if effetune_reset_failed_serial != Some(raw.seek_serial) {
-                        let effetune_latency_secs =
-                            bridge.total_latency_samples() as f64 / sample_rate as f64;
-                        match crate::effetune::composition::admit_effetune(
-                            current_pdc_latency_secs,
-                            effetune_latency_secs,
-                        ) {
-                            Err(total_secs) => {
-                                slot.report_failure_once(
-                                    generation,
-                                    crate::effetune::EffetuneFailure::LatencyExceeded {
-                                        total_secs,
-                                    },
-                                );
-                            }
-                            Ok(()) => {
-                                effetune_out.resize(output_samples.len(), 0.0);
-                                let (input, input_latency_secs) = effetune_input_limiter.prepare(
-                                    &output_samples,
-                                    generation,
-                                    effetune_pre_limiter_enabled,
-                                );
-                                match bridge.process_block(input, &mut effetune_out) {
-                                    Ok(()) => {
-                                        effetune_applied = true;
-                                        effetune_generation = Some(generation);
-                                        effetune_health.succeeded();
-                                        applied_effetune_latency_secs =
-                                            effetune_latency_secs + input_latency_secs;
-                                    }
-                                    Err(error) => {
-                                        let threshold_reached = effetune_health.failed();
-                                        let failures = effetune_health.failure_count();
-                                        if failures == 1 || failures % 10 == 0 {
-                                            crate::logger::log(format!(
-                                                "EffeTune process_block failed (consecutive #{}): {error}",
-                                                failures
-                                            ));
+                #[cfg(windows)]
+                let mut effetune_applied = false;
+                #[cfg(windows)]
+                let user_latency_secs = current_pdc_latency_secs;
+                #[cfg(windows)]
+                let mut applied_effetune_latency_secs = 0.0;
+                #[cfg(windows)]
+                let mut effetune_generation = None;
+                #[cfg(windows)]
+                if dsp_allowed && let Some(slot) = effetune_slot.as_ref() {
+                    if let Some((generation, bridge)) = slot.snapshot() {
+                        if effetune_reset_failed_serial != Some(raw.seek_serial) {
+                            let effetune_latency_secs =
+                                bridge.total_latency_samples() as f64 / sample_rate as f64;
+                            match crate::effetune::composition::admit_effetune(
+                                current_pdc_latency_secs,
+                                effetune_latency_secs,
+                            ) {
+                                Err(total_secs) => {
+                                    slot.report_failure_once(
+                                        generation,
+                                        crate::effetune::EffetuneFailure::LatencyExceeded {
+                                            total_secs,
+                                        },
+                                    );
+                                }
+                                Ok(()) => {
+                                    effetune_out.resize(output_samples.len(), 0.0);
+                                    let (input, input_latency_secs) = effetune_input_limiter
+                                        .prepare(
+                                            &output_samples,
+                                            generation,
+                                            effetune_pre_limiter_enabled,
+                                        );
+                                    match bridge.process_block(input, &mut effetune_out) {
+                                        Ok(()) => {
+                                            effetune_applied = true;
+                                            effetune_generation = Some(generation);
+                                            effetune_health.succeeded();
+                                            applied_effetune_latency_secs =
+                                                effetune_latency_secs + input_latency_secs;
                                         }
-                                        if threshold_reached {
-                                            slot.report_failure_once(
-                                                generation,
-                                                crate::effetune::EffetuneFailure::ProcessFailed(
-                                                    error,
-                                                ),
-                                            );
+                                        Err(error) => {
+                                            let threshold_reached = effetune_health.failed();
+                                            let failures = effetune_health.failure_count();
+                                            if failures == 1 || failures % 10 == 0 {
+                                                crate::logger::log(format!(
+                                                    "EffeTune process_block failed (consecutive #{}): {error}",
+                                                    failures
+                                                ));
+                                            }
+                                            if threshold_reached {
+                                                slot.report_failure_once(
+                                                    generation,
+                                                    crate::effetune::EffetuneFailure::ProcessFailed(
+                                                        error,
+                                                    ),
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                    } else {
+                        effetune_health = crate::effetune::composition::StageHealth::default();
                     }
-                } else {
-                    effetune_health = crate::effetune::composition::StageHealth::default();
                 }
-            }
 
-            #[cfg(windows)]
-            if !effetune_applied {
-                effetune_input_limiter.reset();
-            }
-
-            #[cfg(windows)]
-            let (mut output_samples, reusable_effetune_out, composition) =
-                crate::effetune::composition::compose_samples(
-                    output_samples,
-                    effetune_out,
-                    vst_chain_active,
-                    user_latency_secs,
-                    effetune_applied,
-                    applied_effetune_latency_secs,
-                    effetune_generation,
-                );
-            #[cfg(windows)]
-            {
-                effetune_out = reusable_effetune_out;
-                current_pdc_latency_secs = composition.plugin_latency_secs;
-            }
-
-            let pre_limiter_gain = clock.pre_limiter_gain();
-            if pre_limiter_gain > 1.0 {
-                for sample in &mut output_samples {
-                    *sample *= pre_limiter_gain;
-                }
-            }
-            // Phase 2-B: normalize gain が +側 (>1.0) のときも safety_limiter を通す。
-            // VST3 無効 + 音量0dB以下 + normalize +20dB のケースで clip を防ぐ。
-            // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
-            let normalize_boost_active = max_normalize_gain_in_block > 1.0 + f32::EPSILON;
-            #[cfg(windows)]
-            let limiter_active =
-                composition.limiter_required || pre_limiter_gain > 1.0 || normalize_boost_active;
-            #[cfg(not(windows))]
-            let limiter_active =
-                vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
-            if limiter_active {
-                if safety_limiter.process_block(&mut output_samples) {
-                    clock.mark_limiter_ceiling_hit();
-                }
-                current_pdc_latency_secs += safety_limiter.latency_secs();
-            } else {
-                safety_limiter.reset();
                 #[cfg(windows)]
-                effetune_input_limiter.reset();
-            }
+                if !effetune_applied {
+                    effetune_input_limiter.reset();
+                }
 
-            // ── chunk metadata 計算 ──
-            // latency は output 秒で発生するため、source timeline に換算する。
-            let duration_secs = output_samples.len() as f64 / samples_per_sec;
-            let source_secs_per_output_sec = if duration_secs > 0.0 {
-                stretched.source_secs_per_output_sec
+                #[cfg(windows)]
+                let (mut output_samples, reusable_effetune_out, composition) =
+                    crate::effetune::composition::compose_samples(
+                        output_samples,
+                        effetune_out,
+                        vst_chain_active,
+                        user_latency_secs,
+                        effetune_applied,
+                        applied_effetune_latency_secs,
+                        effetune_generation,
+                    );
+                #[cfg(windows)]
+                {
+                    effetune_out = reusable_effetune_out;
+                    current_pdc_latency_secs = composition.plugin_latency_secs;
+                }
+
+                let pre_limiter_gain = clock.pre_limiter_gain();
+                if pre_limiter_gain > 1.0 {
+                    for sample in &mut output_samples {
+                        *sample *= pre_limiter_gain;
+                    }
+                }
+                // Phase 2-B: normalize gain が +側 (>1.0) のときも safety_limiter を通す。
+                // VST3 無効 + 音量0dB以下 + normalize +20dB のケースで clip を防ぐ。
+                // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
+                let normalize_boost_active = max_normalize_gain_in_block > 1.0 + f32::EPSILON;
+                #[cfg(windows)]
+                let limiter_active = composition.limiter_required
+                    || pre_limiter_gain > 1.0
+                    || normalize_boost_active;
+                #[cfg(not(windows))]
+                let limiter_active =
+                    vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
+                if limiter_active {
+                    if safety_limiter.process_block(&mut output_samples) {
+                        clock.mark_limiter_ceiling_hit();
+                    }
+                    current_pdc_latency_secs += safety_limiter.latency_secs();
+                } else {
+                    safety_limiter.reset();
+                    #[cfg(windows)]
+                    effetune_input_limiter.reset();
+                }
+
+                // ── chunk metadata 計算 ──
+                // latency は output 秒で発生するため、source timeline に換算する。
+                let duration_secs = output_samples.len() as f64 / samples_per_sec;
+                let source_secs_per_output_sec = if duration_secs > 0.0 {
+                    stretched.source_secs_per_output_sec
+                } else {
+                    playback_speed
+                };
+                current_pdc_latency_secs += stretched.stretcher_latency_output_secs;
+                let (audible_pts_secs, current_latency_source_secs) = audible_pts_after_latency(
+                    raw.pts_secs,
+                    current_pdc_latency_secs,
+                    source_secs_per_output_sec,
+                );
+
+                let full_chunk = ProcessedChunk {
+                    samples: output_samples,
+                    audible_pts_secs,
+                    duration_secs,
+                    source_secs_per_output_sec,
+                    seek_serial: raw.seek_serial,
+                    pdc_latency_secs_at_process: current_latency_source_secs,
+                    #[cfg(windows)]
+                    effetune_generation: composition.effetune_generation,
+                    #[cfg(not(windows))]
+                    effetune_generation: None,
+                };
+                #[cfg(windows)]
+                let (effect_frames, pre_frames, pre_enabled) = if effetune_applied {
+                    let pre_frames = if effetune_pre_limiter_enabled {
+                        effetune_input_limiter.limiter.lookahead_frames
+                    } else {
+                        0
+                    };
+                    (
+                        ((applied_effetune_latency_secs * sample_rate as f64).round() as usize)
+                            .saturating_sub(pre_frames),
+                        pre_frames,
+                        effetune_pre_limiter_enabled,
+                    )
+                } else {
+                    (0, 0, false)
+                };
+                #[cfg(not(windows))]
+                let (effect_frames, pre_frames, pre_enabled) = (0, 0, false);
+                dsp_tail.capture(
+                    &full_chunk,
+                    effect_frames,
+                    pre_frames,
+                    if limiter_active {
+                        safety_limiter.lookahead_frames
+                    } else {
+                        0
+                    },
+                    pre_enabled,
+                    pre_limiter_gain,
+                );
+                full_chunk
             } else {
-                playback_speed
+                if current_processed_secs >= TARGET_PROCESSED_SECS {
+                    break;
+                }
+                // Read completion before checking the channel: after Decoded, this
+                // generation cannot send another real frame. A seek resets the owner.
+                let eos_serial = clock.current_seek_serial();
+                dsp_tail.discard_stale(eos_serial);
+                if clock.audio_decoded_eos(eos_serial)
+                    && rx.is_empty()
+                    && deferred_frame.is_none()
+                    && buffer.lock().unwrap().raw_pending.is_empty()
+                {
+                    if clock.begin_audio_tail(eos_serial) {
+                        dsp_tail.start(eos_serial);
+                    }
+                }
+                let next = dsp_tail.next(
+                    sample_rate,
+                    &mut effetune_input_limiter,
+                    &mut safety_limiter,
+                    |generation, latency_frames, input, output| {
+                        #[cfg(windows)]
+                        {
+                            if !local_tail_dsp_allowed(dsp_allowed, eos_serial, &clock, &cancel) {
+                                return false;
+                            }
+                            let Some(slot) = effetune_slot.as_ref() else {
+                                return false;
+                            };
+                            let Some((live_generation, bridge)) = slot.snapshot() else {
+                                return false;
+                            };
+                            if live_generation != generation
+                                || !bridge.is_enabled()
+                                || bridge.active_slot_count() == 0
+                                || bridge.total_latency_samples() as usize != latency_frames
+                            {
+                                return false;
+                            }
+                            match bridge.process_block(input, output) {
+                                Ok(()) => {
+                                    effetune_health.succeeded();
+                                    true
+                                }
+                                Err(error) => {
+                                    let threshold_reached = effetune_health.failed();
+                                    crate::logger::log(format!(
+                                        "EffeTune EOS tail process failed: {error}"
+                                    ));
+                                    if threshold_reached {
+                                        slot.report_failure_once(
+                                            generation,
+                                            crate::effetune::EffetuneFailure::ProcessFailed(error),
+                                        );
+                                    }
+                                    false
+                                }
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = (generation, latency_frames, input, output);
+                            false
+                        }
+                    },
+                    || clock.mark_limiter_ceiling_hit(),
+                );
+                let Some(chunk) = next else {
+                    if dsp_tail.complete() {
+                        clock.complete_audio_tail(eos_serial);
+                    }
+                    break;
+                };
+                chunk
             };
-            current_pdc_latency_secs += stretched.stretcher_latency_output_secs;
-            let (audible_pts_secs, current_latency_source_secs) = audible_pts_after_latency(
-                raw.pts_secs,
-                current_pdc_latency_secs,
-                source_secs_per_output_sec,
-            );
+            let current_latency_source_secs = untrimmed.pdc_latency_secs_at_process;
+            let audible_pts_secs = untrimmed.audible_pts_secs;
+            let duration_secs = untrimmed.duration_secs;
+            let source_secs_per_output_sec = untrimmed.source_secs_per_output_sec;
 
             // ── pre-target trim (Codex P1-1: PDC plugin で早すぎる BufferReady 防止) ──
             //
@@ -2468,7 +2741,7 @@ fn run_pump(
             // 対策: pre_target_trim_decision で DropAll / TrimFront / KeepAll を判定。
             // 最初の post-target chunk (= TrimFront or KeepAll で push 成功) が
             // 出来た時点で seek_target_secs を None にする (= 以降は無条件 push)。
-            let mut samples = output_samples;
+            let mut samples = untrimmed.samples;
             let mut chunk_audible_pts = audible_pts_secs;
             if let Some(target) = seek_target_secs {
                 match pre_target_trim_decision(
@@ -2505,12 +2778,9 @@ fn run_pump(
                 audible_pts_secs: chunk_audible_pts,
                 duration_secs: chunk_duration,
                 source_secs_per_output_sec,
-                seek_serial: raw.seek_serial,
+                seek_serial: untrimmed.seek_serial,
                 pdc_latency_secs_at_process: current_latency_source_secs,
-                #[cfg(windows)]
-                effetune_generation: composition.effetune_generation,
-                #[cfg(not(windows))]
-                effetune_generation: None,
+                effetune_generation: untrimmed.effetune_generation,
             };
             #[cfg(feature = "test-script")]
             let processed_frequency_hz =
@@ -2537,12 +2807,14 @@ fn run_pump(
             let mut latency_change = None;
             let commit = || {
                 let mut buf = buffer.lock().unwrap();
-                if !processed_chunk_matches_live_seek(
-                    chunk.seek_serial,
-                    target_serial,
-                    buf.pump_seek_serial,
-                    clock.current_seek_serial(),
-                ) {
+                if cancel.load(Ordering::Acquire)
+                    || !processed_chunk_matches_live_seek(
+                        chunk.seek_serial,
+                        target_serial,
+                        buf.pump_seek_serial,
+                        clock.current_seek_serial(),
+                    )
+                {
                     return false;
                 }
                 // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
@@ -3538,6 +3810,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn eos_local_tail_host_admission_rechecks_permit_seek_and_cancel() {
+        let clock = make_clock();
+        let cancel = AtomicBool::new(false);
+        assert!(local_tail_dsp_allowed(true, 0, &clock, &cancel));
+        assert!(!local_tail_dsp_allowed(false, 0, &clock, &cancel));
+        cancel.store(true, Ordering::Release);
+        assert!(!local_tail_dsp_allowed(true, 0, &clock, &cancel));
+        cancel.store(false, Ordering::Release);
+        clock.request_seek(1.0);
+        assert!(!local_tail_dsp_allowed(true, 0, &clock, &cancel));
+        assert!(local_tail_dsp_allowed(true, 1, &clock, &cancel));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn dry_pump_block_cannot_commit_after_concurrent_grant() {
         use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
 
@@ -3943,6 +4230,207 @@ mod tests {
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
             effetune_generation: None,
+        }
+    }
+
+    #[test]
+    fn eos_tail_releases_pre_and_final_limiter_through_delayed_effetune() {
+        for rate in [1_000, 44_100, 48_000] {
+            for enabled in [false, true] {
+                for frames in [3, rate as usize / 50] {
+                    let mut pre = EffetuneInputLimiter::new(rate);
+                    let mut final_limiter = SafetyLimiter::new(rate, 2);
+                    let pre_frames = if enabled {
+                        final_limiter.lookahead_frames
+                    } else {
+                        0
+                    };
+                    let effect_frames = rate as usize / 200;
+                    let mut delay = std::collections::VecDeque::from(vec![0.0; effect_frames * 2]);
+                    let mut effect =
+                        |generation, latency_frames, input: &[f32], output: &mut [f32]| {
+                            assert_eq!(generation, 7);
+                            assert_eq!(latency_frames, effect_frames);
+                            for (src, dst) in input.iter().zip(output) {
+                                delay.push_back(*src);
+                                *dst = delay.pop_front().unwrap();
+                            }
+                            true
+                        };
+                    let input = vec![0.35, -0.7].repeat(frames);
+                    let (limited, _) = pre.prepare(&input, 7, enabled);
+                    let mut samples = vec![0.0; input.len()];
+                    effect(7, effect_frames, limited, &mut samples);
+                    final_limiter.process_block(&mut samples);
+                    let mut chunk = make_chunk(samples.clone(), 10.0, rate as f64 * 2.0);
+                    chunk.effetune_generation = Some(7);
+                    chunk.source_secs_per_output_sec = 2.0;
+                    chunk.pdc_latency_secs_at_process =
+                        (pre_frames + effect_frames + final_limiter.lookahead_frames) as f64
+                            / rate as f64
+                            * 2.0;
+                    let mut tail = AudioDspTail::default();
+                    tail.capture(
+                        &chunk,
+                        effect_frames,
+                        pre_frames,
+                        final_limiter.lookahead_frames,
+                        enabled,
+                        1.0,
+                    );
+                    tail.start(0);
+                    let mut end_pts = chunk.audible_pts_secs + chunk.duration_secs * 2.0;
+                    while !tail.complete() {
+                        let next = tail
+                            .next(rate, &mut pre, &mut final_limiter, &mut effect, || {
+                                panic!("no reduction expected")
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            next.pdc_latency_secs_at_process,
+                            chunk.pdc_latency_secs_at_process
+                        );
+                        assert!((next.audible_pts_secs - end_pts).abs() < 1e-9);
+                        assert!(next.samples.len() <= (rate as usize / 100).max(1) * 2);
+                        end_pts += next.duration_secs * 2.0;
+                        samples.extend(next.samples);
+                    }
+                    let leading = (pre_frames + effect_frames + final_limiter.lookahead_frames) * 2;
+                    assert_eq!(&samples[..leading], vec![0.0; leading]);
+                    assert_eq!(&samples[leading..], input);
+                    // Repeated EOS cannot emit the same lookahead twice.
+                    tail.start(0);
+                    assert!(
+                        tail.next(rate, &mut pre, &mut final_limiter, &mut effect, || {})
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eos_tail_stale_generation_or_failed_stage_discards_upstream_audio() {
+        let rate = 1_000;
+        let mut pre = EffetuneInputLimiter::new(rate);
+        let mut final_limiter = SafetyLimiter::new(rate, 2);
+        let input = vec![0.6; 40];
+        let (limited, _) = pre.prepare(&input, 7, true);
+        let mut output = limited.to_vec();
+        final_limiter.process_block(&mut output);
+        let mut chunk = make_chunk(output, 0.0, 2_000.0);
+        chunk.effetune_generation = Some(7);
+        let mut tail = AudioDspTail::default();
+        tail.capture(&chunk, 0, 5, 5, true, 1.0);
+        tail.start(0);
+        let next = tail
+            .next(
+                rate,
+                &mut pre,
+                &mut final_limiter,
+                |_, _, _, _| false,
+                || {},
+            )
+            .unwrap();
+        assert_eq!(next.samples, vec![0.6; 10]);
+        assert!(tail.complete());
+        tail.capture(&chunk, 0, 5, 5, true, 1.0);
+        tail.discard_stale(1);
+        tail.start(1);
+        assert!(
+            tail.next(
+                rate,
+                &mut pre,
+                &mut final_limiter,
+                |_, _, _, _| panic!("stale stage"),
+                || {}
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn eos_local_pump_commits_nonzero_final_tail_once_and_only_on_normal_eos() {
+        for (normal_eos, frames) in [(false, 20), (true, 3), (true, 20)] {
+            let clock = make_clock();
+            clock.set_volume(2.0);
+            let buffer = make_buffer(1_000);
+            let (tx, rx) = bounded(2);
+            let (shutdown_tx, shutdown_rx) = bounded(1);
+            let (event_tx, _event_rx) = bounded(8);
+            let event_tx = crate::video::EngineEventSender::new(
+                event_tx,
+                Arc::new(crate::video::VideoUiWake::default()),
+            );
+            let (_tap_tx, tap_rx) = unbounded();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let (clock, buffer, cancel) = (clock.clone(), buffer.clone(), cancel.clone());
+                std::thread::spawn(move || {
+                    run_pump(
+                        rx,
+                        shutdown_rx,
+                        buffer,
+                        cancel,
+                        clock,
+                        event_tx,
+                        playing_state(),
+                        make_diag(),
+                        tap_rx,
+                        #[cfg(windows)]
+                        None,
+                        #[cfg(windows)]
+                        None,
+                    )
+                })
+            };
+            tx.send(AudioFrame {
+                samples: vec![0.25; frames * 2],
+                pts_secs: 1.0,
+                duration_secs: frames as f64 / 1_000.0,
+                seek_serial: 0,
+                stream_index: 0,
+                seek_target_secs: None,
+                queued_wall_secs: frames as f64 / 1_000.0,
+                audio_tx_accounting_epoch: 0,
+            })
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            if !normal_eos {
+                while buffer.lock().unwrap().processed.is_empty()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert!(!buffer.lock().unwrap().processed.is_empty());
+            }
+            if normal_eos {
+                clock.note_audio_decoded_eos(0);
+                while !clock.audio_tail_complete() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert!(clock.audio_tail_complete());
+                clock.note_audio_decoded_eos(0);
+            }
+            cancel.store(true, Ordering::Release);
+            let _ = shutdown_tx.send(());
+            worker.join().unwrap();
+            let samples: Vec<_> = buffer
+                .lock()
+                .unwrap()
+                .processed
+                .iter()
+                .flat_map(|chunk| chunk.samples.clone())
+                .collect();
+            assert_eq!(
+                samples.len(),
+                if normal_eos {
+                    frames * 2
+                } else {
+                    (frames - 5) * 2
+                }
+            );
+            assert_eq!(samples, vec![0.5; samples.len()]);
         }
     }
 

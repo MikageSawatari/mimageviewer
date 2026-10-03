@@ -1775,6 +1775,17 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   seek / 非適用 / EffeTune 世代変更では前段 delay を reset。Remote 世代ごとの再作成も初期化する。
   HUD ピーク表示は最終 limiter のみ。詳細と検証記録は `effetune-integration-plan.md` §13。
 
+- 通常 EOS は `AudioDspTail` が前段 limiter の保持音声を同じ EffeTune generation へ流し、
+  最終 limiter の保持音声も出力する。上流段の排出（前段 lookahead + EffeTune の報告遅延）と、
+  最終 limiter に直接無音を入れる排出を分け、最大 10ms 相当のブロックで処理する。
+  local は既存の processed cap / permit / trim / seek 確認 / tap / commit を使い、Remote は
+  decoder・resampler drain 後、AAC encoder finish 前に同じ処理を行う。PDC は最後の実ブロックの
+  値を維持し、audible PTS を連続させる。ユーザー VST3 / stretch / 任意長の残響は排出しない。
+  seek / cancel / stop / Remote source-limit は保持音声を捨てる。
+  audio packet EOF は demux serial 付きで stale EOF を拒否し、`AvClock` が所有する `AudioEos` の
+  Decoding → Decoded → Draining → Complete を共有する。native / 非 native の EOF・loop 判定は、
+  音声 lane がある限り Complete と出力 drain を待つ（lane 喪失は既存の例外）。
+
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
 - AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)

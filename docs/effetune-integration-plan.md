@@ -945,3 +945,54 @@ normal feature set / dev-runtime、core 9m36s、Remote / EPUB worker も成功�
 設定ファイル・build script は変更せず、コマンド終了時に env を元へ戻した。
 `target/dev-runtime/mimageviewer-core.exe` を利用者確認用に用意し、起動はしていない。
 この normal build は既定で実利用中の `%APPDATA%/mimageviewer` を使う。
+
+### Codex P2 対応: 通常 EOS の保持音声排出（2026-10-04、v4.3.0 公開前）
+
+独立レビュー指摘: `b55403c5f` では前段 limiter の lookahead が通常 EOS に出力されず、
+設定 ON で 44.1kHz の 221 / 48kHz の 240 frames が追加で失われていた。
+local pump は EOS 後も seek を待つため、終了時の `flush_silence` の結果を使う修正では届かない。
+
+- `AudioDspTail` に最後の適用済み段・遅延・boost・連続 PTS を trim/reconcile 前に保存する。
+  通常 EOS のみ、ユーザー VST3 後へ無音を入れ、前段 → 同じ EffeTune → 最終 limiter を通す。
+  前段 lookahead + EffeTune の報告遅延を排出後、最終 limiter へ直接無音を入れてその 5ms も排出する。
+  同じ仕組みで安全に出せるため、最終 limiter の既存の末尾欠落も修正する（前段 OFF / EffeTune 不在でも適用）。
+- PDC は最後の実ブロックと同じ値を保持し、audible PTS は連続。normalize / stretch /
+  ユーザー VST3 を再適用しない。前段だけの低減は HUD に反映せず、最終段の従来の判定を使う。
+  任意長の EffeTune 残響やユーザー VST3 / stretch の tail、local resampler の既存の微小欠落は対象外。
+- local は decoded EOS の後に rx / deferred / raw を出し切り、既存 refill の最大 10ms ブロックで
+  processed cap・所有 permit・seek 確認・pre-target trim・tap・queue commit を維持する。
+  Remote は decoder / resampler drain 後、AAC finish 前に checkpoint / permit / mux 経由で排出する。
+  cancel / stop / seek / Remote source-limit は排出しない。段の置換・無効化・失敗時は前段保持音声を捨て、
+  既に最終 limiter が保持する出力だけを排出する。
+- 設計の簡素化: channel 全体を新 enum に変えず、時計上の短い mutex 内の typed `AudioEos`
+  （Decoding / Decoded / Draining / Complete）を decoder・pump・tick の単一完了所有者にする。
+  seek serial 更新と EOS reset/publication を同じ lock で直列化し、IPC や buffer lock を保持しない。
+  audio packet EOF も demux serial 付きにして、優先 Flush 後の古い EOF を拒否する。
+  native / 非 native tick は tail commit 完了まで EOF/loop に進まない。
+  長い plugin delay を一括 IPC に渡さず、通常の小ブロックへ分ける。
+- 独立設計レビュー（GPT-6.1 Sol / xhigh）: amended design ACCEPT。
+
+完了時の独立コードレビューも ACCEPT。空の新 seek 世代で EOS になった場合は、pump の stale clear で
+buffer owner を現 serial へ進め、両 limiter / tail を捨てて完了できるようにした。
+排出の IPC 直前にも seek / cancel / permit を確認し、失敗時は通常の StageHealth 閾値を維持する。
+
+| follow-up 検証 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib video::audio::tests` | 56 passed。非ゼロ末尾、ON/OFF、44.1/48kHz、短い入力の trim、cancel、世代、host admission | `target/eos-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 36 passed / 実ホスト用 1 ignored。長い plugin delay の分割、reconcile が全削除した末尾、failure 閾値 | `target/eos-clockless.log` |
+| 同上 `video::clock::tests` / `video::decoder::demux_serial_tests` | 14 / 5 passed。世代付き EOS と完了 state | `target/eos-clock.log` / `target/eos-demux.log` |
+| 同上 `eos_tick` / `eos_empty_audio_seek` | 各 1 passed。native/headless の in-flight gate、空 seek の実 pump → tick | `target/eos-tick.log` / `target/eos-empty-seek.log` |
+| 同上 `video::tests::native_tick_` / `reaches_eof_with_real_pump` | 4 / 2 passed。既存 deadline と実 decoder の動画・audio-only EOF | `target/eos-native-tick.log` / `target/eos-real-pump-eof.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/eos-check.log` / `target/eos-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0。UI・snapshot は変更なし | `target/eos-glyphs.log` |
+
+製品 exe は未起動。任意長の effect tail と local resampler の既存の微小欠落は引き続き対象外。
+
+follow-up の確認用 build も `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功
+（exit 0、normal feature set、core 10m21s、Remote / EPUB worker 成功、PE runtime=4 / pe=3）。
+今回の process 内だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を設定し、終了時に戻した。
+ログは `target/eos-build-dev.log`（stdout の build/staging 記録）。
+`target/dev-runtime/mimageviewer-core.exe` を更新したが起動せず、確認は利用者へ引き渡す。
+最終の `cargo fmt` / `cargo fmt --check` / `git diff --check` も exit 0。
+コミットせず、follow-up 専用メッセージを `target/prelimiter-msg.txt` に UTF-8 / BOM なしで上書きした。

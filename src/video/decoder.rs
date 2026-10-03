@@ -1332,7 +1332,7 @@ enum AudioPacketMsg {
     /// EOF 到達通知。audio decode thread は内部 decoder を flush して残フレームを
     /// drain (= 末尾の音声を出し切る)、その後次の `Flush` か `Packet` か
     /// channel disconnect を待つ。
-    Eof,
+    Eof { serial: u64 },
 }
 
 /// seek Flush は packet queue とは別の control channel で送る。
@@ -3805,7 +3805,9 @@ fn run_decoder(
             if audio_stream_idx_for_demux.is_some() {
                 let _ = send_demux_msg_cancel_aware(
                     &audio_pkt_tx,
-                    AudioPacketMsg::Eof,
+                    AudioPacketMsg::Eof {
+                        serial: demux_serial.packet_serial(&clock),
+                    },
                     &cancel,
                     "audio",
                     "eof",
@@ -6086,7 +6088,10 @@ fn run_audio_decode(
                 current_seek_target_secs = seek_target_secs;
                 next_audio_pts_secs = None;
             }
-            AudioDecodeInput::Packet(AudioPacketMsg::Eof) => {
+            AudioDecodeInput::Packet(AudioPacketMsg::Eof { serial }) => {
+                if !packet_matches_seek(serial, current_seek_serial, &clock) {
+                    continue;
+                }
                 // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
                 // 残サンプルを最後まで取り出して送る。これにより末尾の数十 ms が
                 // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
@@ -6123,6 +6128,8 @@ fn run_audio_decode(
                         break 'outer;
                     }
                 }
+                // Publish only after the last decoded frame has reached the pump channel.
+                clock.note_audio_decoded_eos(serial);
                 // EOF 後 decoder を flush して次回の Packet/Flush に備える。
                 setup.decoder.flush();
             }
@@ -9982,6 +9989,36 @@ mod demux_serial_tests {
             trim_before_secs: trim,
             replace_setup: None,
         }
+    }
+
+    #[test]
+    fn eos_packet_queued_before_prioritized_seek_flush_remains_stale() {
+        let clock = clock();
+        let (pkt_tx, pkt_rx) = bounded(1);
+        let (ctl_tx, ctl_rx) = bounded(1);
+        let demux_serial = DemuxSerial(0);
+        pkt_tx
+            .send(AudioPacketMsg::Eof {
+                serial: demux_serial.packet_serial(&clock),
+            })
+            .unwrap();
+        clock.request_seek(1.0);
+        ctl_tx.send(audio_flush(1, Some(1.0))).unwrap();
+        let input = recv_audio_decode_input(&ctl_rx, &pkt_rx).unwrap();
+        let AudioDecodeInput::Control(AudioControlMsg::Flush {
+            serial: decoder_serial,
+            ..
+        }) = input
+        else {
+            panic!("control must have priority")
+        };
+        let input = recv_audio_decode_input(&ctl_rx, &pkt_rx).unwrap();
+        let AudioDecodeInput::Packet(AudioPacketMsg::Eof { serial }) = input else {
+            panic!("queued EOS")
+        };
+        assert!(!packet_matches_seek(serial, decoder_serial, &clock));
+        clock.note_audio_decoded_eos(serial);
+        assert!(!clock.audio_decoded_eos(1));
     }
 
     #[test]

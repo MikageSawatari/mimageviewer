@@ -8699,6 +8699,11 @@ impl VideoPlayer {
     #[cfg(all(test, windows))]
     pub(crate) fn notify_demux_exhausted_for_test(&self) {
         self.clock.notify_demux_exhausted();
+        // These timing fixtures have no running decode/pump workers.
+        let serial = self.clock.current_seek_serial();
+        self.clock.note_audio_decoded_eos(serial);
+        self.clock.begin_audio_tail(serial);
+        self.clock.complete_audio_tail(serial);
     }
 
     #[cfg(all(test, windows))]
@@ -11750,12 +11755,17 @@ impl VideoPlayer {
             //   (publish processed) と段階を経るので、その handoff window 中に 3 counter が
             //   全て 0 を読む race がある。重めの VST3 plugin で 1 frame の処理が ~10-30ms
             //   かかる場合があるため、48ms 連続で quiet を観測してから seek する。
-            // 完全な解決には pump 側から「EOF drain 完了 / in-flight 数」を publish する形が
-            // 良いが、連続観測ラッチで実用上は十分。VST/stretch が 48ms 超ブロックする状況は
-            // UI 不応答相当 (= 通常運用ではほぼ起きない) なので、その race で末尾 1 frame が
-            // 切れる確率は許容範囲とする。
+            // AudioEos の Complete は decoder drain → raw 処理 → DSP 末尾の queue commit
+            // までを保証する。48ms quiet はその後の出力/presenter drain にだけ使い、
+            // IPC 中に counter が全て 0 でも EOF/loop を先行させない。
             const EOF_DRAIN_AUDIO_QUIET_TOL: f64 = 0.020;
-            let audio_drained = self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+            let audio_active_for_eof =
+                self.audio.is_some() && self.info.as_ref().is_some_and(|i| i.has_audio);
+            let audio_drained = (!audio_active_for_eof
+                || self.clock.audio_lane_lost()
+                || self.clock.audio_worker_exited()
+                || self.clock.audio_tail_complete())
+                && self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
             let channels_drained = self.audio_rx_len() == 0 && self.video_rx_len() == 0;
@@ -11976,7 +11986,10 @@ impl VideoPlayer {
         let audio_active_for_eof =
             self.audio.is_some() && self.info.as_ref().map(|i| i.has_audio).unwrap_or(false);
         let audio_drained = !audio_active_for_eof
-            || (self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+            || ((self.clock.audio_lane_lost()
+                || self.clock.audio_worker_exited()
+                || self.clock.audio_tail_complete())
+                && self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.audio_rx_len() == 0);
@@ -15372,6 +15385,72 @@ mod tests {
         player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
         let _ = player.tick(&egui::Context::default());
         assert!(player.current_seek_serial() > serial_before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eos_tick_waits_for_in_flight_audio_tail_on_native_and_headless_paths() {
+        for native in [false, true] {
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                std::path::PathBuf::from("eos-tail.mp4"),
+            );
+            player.configure_native_timing_for_test(30.0, 30.0, true, false);
+            if !native {
+                player.native_output = None;
+            }
+            player.set_loop_enabled(true);
+            let serial = player.current_seek_serial();
+            player.clock.notify_demux_exhausted();
+            player.clock.note_audio_decoded_eos(serial);
+            assert!(player.clock.begin_audio_tail(serial));
+            // All counters/channels are quiet, and the old quiet interval has
+            // expired, but DSP still owns a tail block (including a slow IPC).
+            player.backdate_eof_quiet_for_test(std::time::Duration::from_secs(1));
+            let _ = player.tick(&egui::Context::default());
+            assert_eq!(player.current_seek_serial(), serial);
+            assert!(player.is_playing());
+            assert!(player.eof_loop_quiet_since.is_none());
+            player.clock.complete_audio_tail(serial);
+            let _ = player.tick(&egui::Context::default());
+            player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+            let _ = player.tick(&egui::Context::default());
+            assert!(player.current_seek_serial() > serial);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eos_empty_audio_seek_completes_through_real_pump_and_tick() {
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("eos-empty-seek.mp4"),
+        );
+        player.configure_native_timing_for_test(30.0, 30.0, true, false);
+        player.set_loop_enabled(true);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            rx,
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.clock.request_seek(30.0);
+        let serial = player.current_seek_serial();
+        player.clock.clear_seek_target_override(serial);
+        player.clock.notify_demux_exhausted();
+        player.clock.note_audio_decoded_eos(serial);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !player.clock.audio_tail_complete() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            player.clock.audio_tail_complete(),
+            "EOF after a seek can contain no AudioFrame"
+        );
+        let _ = player.tick(&egui::Context::default());
+        player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+        let _ = player.tick(&egui::Context::default());
+        assert!(player.current_seek_serial() > serial);
     }
 
     #[cfg(windows)]
