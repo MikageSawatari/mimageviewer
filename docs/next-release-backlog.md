@@ -29,6 +29,12 @@
 
 ## 1. 優先候補
 
+### 1.322 初回起動直後に Windows のメモリ使用量の報告 (RADAR_PRE_LEAK_64) が出る — Sandbox 記録 (2026-10-03)
+
+- 観測 (サブPCの Windows Sandbox、利用者が確認): v4.3.0 の単体exe版を日本語を含む APPDATA で初回起動した約 26 秒後に WER 1001 `RADAR_PRE_LEAK_64` (P1 mimageviewer-core.exe 4.3.0.0、ダンプなし)。クラッシュ・ハングではなく、mIV は応答を続けて正常終了。インストール版の初回起動では出ていない。
+- 推測: 初回の展開 (AI モデル・ONNX Runtime・EffeTune など) と起動処理が重なって、確保済みメモリがしきい値を超えた。発生条件の違いは未確認。
+- 次の一手: 初回起動直後のメモリ使用量 (private bytes / working set) を perf ログに記録し、どの段階で増えるかを見る。必要なら展開や初期化を遅らせる。
+
 ### 1.321 search_metadata_e2e が全体テストの負荷下で「初回スキャンを 10 秒待っても終わらない」と 9 件そろって落ちる — build-dist 記録 (2026-10-03)
 
 - 観測: v4.3.0 の 3 回目の配布ビルド (master a924081e5/ebb86ebb7) の全体テストで、`tests/search_metadata_e2e.rs` の 9 件が `tests/common/mod.rs:294` の `wait_until timed out after 10s: initial scan for favorite ...` で同時に失敗。同じファイルを単独で回すと 14 件すべて 6 秒で通った。1 時間前の配布ビルド (6b2bc99c9) でも通っていた。差分は告知と文書だけで、索引の処理は変えていない。
