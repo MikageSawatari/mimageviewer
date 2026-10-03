@@ -243,6 +243,14 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('Metronome Click', rhythm)
         self.assertIn('リモート配信にも加わります', rhythm)
         self.assertNotIn('処理したファイルにクリック音', rhythm)
+        tonal = output['eq-tonal-balance-eq.html']
+        self.assertIn('<strong>Reset</strong> は測定を消去し、現在の音から測定をやり直します。Target Adjustは変わりません。', tonal)
+        # The VST adapter disables the standalone silence power policy.
+        # Scan all published pages so another effect cannot inherit that guidance.
+        for name, text in output.items():
+            with self.subTest(power_policy_page=name):
+                self.assertNotIn('省電力', text)
+                self.assertNotIn('非表示時は表示専用DSPをスキップ', text)
         body = output['visualizer.html'].split('<main class="content">')[1].split('</main>')[0]
         for retained in ['合計50種類', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback']:
             self.assertIn(retained, body)

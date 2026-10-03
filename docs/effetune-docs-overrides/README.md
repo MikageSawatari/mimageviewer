@@ -104,6 +104,9 @@ Tonal Balance EQ の3ページと、設定入口が表示されたコントロ�
 旧版の生成フォルダーは公開前のため削除し、入口・基本操作リンクを更新する。
 
 - `analyzer.json`: ステレオ制約、独立版の省電力説明、ファイル処理の説明を訂正。
+- `eq.json`: Tonal Balance EQ の独立版の無音時省電力による測定再開説明を除外。
+  同梱 VST の `startPowerPolicyController()` はそのポリシーを無効化する（Codex P3 対応）。
+  Reset による測定のやり直しは維持する。
 - `controller-mapping.json`: EffeTune の窓固有の割り当てと明記。mIVのプレーヤー操作には
   接続されないことを説明し、対応するエフェクト・A/B・プリセット操作を残す。
 - `visualizer.json`: 50レイアウト、新しいグラフ、編集・複製・共有リンク・読み込みを維持。
