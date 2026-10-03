@@ -2342,6 +2342,9 @@ impl App {
     }
 
     fn schedule_collection_grid_snapshot(&mut self) {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         if !self.collection_grid_root_materialize_active() {
             return;
         }
@@ -2476,6 +2479,9 @@ impl App {
         installed: Option<Arc<CollectionPreparedSnapshot>>,
         mut lease: crate::collection_store::CollectionReadLease,
     ) {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         let exact_revision = snapshot.revision();
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
@@ -2553,6 +2559,9 @@ impl App {
     /// Delayed polling only for the mounted root. A parked child/fullscreen leaf may keep a
     /// request owner, but it must not keep the UI awake while its presentation is protected.
     pub(crate) fn collection_grid_poll_delay(&self) -> Option<Duration> {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         if !self.collection_grid_root_materialize_active() || self.collection_grid_stamp().is_none()
         {
             return None;
@@ -2625,6 +2634,9 @@ impl App {
 
     /// Drained before viewport/fullscreen early returns. No branch blocks the UI thread.
     pub(crate) fn poll_collection_grid(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         // A duplicated/parked viewer context carries the immutable prepared result, but each
         // context needs its own fan-out receiver. Reattach lazily after the context becomes
         // current instead of copying a single-consumer receiver across viewports.
@@ -10088,8 +10100,8 @@ mod tests {
             .clone();
         let installed_generation = app.items_generation;
         let stamp = app.collection_grid_stamp().unwrap();
-        let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        let started = Instant::now();
+        let _clock = crate::collection_store::TestReadClock::long_elapsed_since(started);
 
         let (snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
         let snapshot_lease = crate::collection_store::CollectionReadLease::new(

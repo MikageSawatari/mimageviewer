@@ -2383,6 +2383,9 @@ impl App {
     }
 
     pub(crate) fn poll_collection_ui(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         let events = self
             .collection_ui
             .events
@@ -2663,6 +2666,9 @@ impl App {
     /// Also queried at the App frame tail: UI controls can create a read demand after this
     /// module's poll has already run in the same pass.
     pub(crate) fn collection_ui_poll_delay(&self) -> Option<Duration> {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         let now = Instant::now();
         let read_delay = [
             self.collection_ui.catalog_request.retry_delay(now),
@@ -5366,8 +5372,8 @@ mod tests {
     #[test]
     fn runtime_starting_remains_one_owner_after_a_long_observation() {
         let mut app = crate::app::setup_app_for_test();
-        let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        let started = Instant::now();
+        let _clock = crate::collection_store::TestReadClock::long_elapsed_since(started);
         app.collection_ui.phase = CollectionRuntimePhase::Starting;
         app.collection_ui.runtime_observation =
             Some(crate::collection_store::CollectionReadLease::new(
@@ -5435,8 +5441,9 @@ mod tests {
         let installed = app.collection_ui.catalog.clone().unwrap();
         let installed_snapshot = app.collection_ui.snapshot.clone().unwrap();
         let (sender, receiver) = crossbeam_channel::bounded(1);
-        let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        let started = Instant::now();
+        let _clock = crate::collection_store::TestReadClock::long_elapsed_since(started);
+        let now = crate::collection_store::TestReadClock::now();
         let current = crate::collection_store::CollectionReadLease::new(
             crate::collection_store::CollectionReadScope::app_global("manager_catalog"),
             started,
