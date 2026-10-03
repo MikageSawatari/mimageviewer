@@ -18,12 +18,6 @@
     "reason": "VST external links open in the system browser."
   },
   {
-    "operation": "replace_html",
-    "anchor": "<li><p>MIDI、ゲームパッド、キーボードでエフェクトを操作する</p></li>",
-    "replacement": "",
-    "reason": "Controller mapping device-section is hidden by vst-bootstrap.js:33-35."
-  },
-  {
     "operation": "replace_inline",
     "anchor": "Ctrl+S（macOSではCmd+S）",
     "replacement": "Ctrl+S",

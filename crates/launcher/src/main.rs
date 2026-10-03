@@ -669,6 +669,29 @@ mod tests {
     }
 
     #[test]
+    fn embedded_effetune_fits_long_user_profile_generation_path() {
+        // Exercise every real bundle path and the longest permitted generation
+        // basename without creating directories or loading the plugin.
+        let profile = format!(r"C:\Users\{}", "a".repeat(40));
+        let generation = format!("{}-{}", "a".repeat(12), "b".repeat(32));
+        let root = std::path::PathBuf::from(profile)
+            .join(r"AppData\Roaming\mimageviewer\runtime\4.3.0\effetune")
+            .join(generation);
+        let deepest = super::EFFETUNE_FILES
+            .iter()
+            .map(|file| {
+                root.join(file.name)
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(deepest, 252);
+        assert!(deepest < 260);
+    }
+
+    #[test]
     fn embedded_effetune_extracts_complete_bundle_beside_core() {
         let temp = tempfile::tempdir().unwrap();
         let root = super::effetune_bundle::ensure_bundle(

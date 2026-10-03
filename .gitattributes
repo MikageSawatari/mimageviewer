@@ -26,3 +26,5 @@ htdocs/mimageviewer/manual/effetune/**/*.html text eol=lf
 third_party/effetune-mixwright/** -text
 # mIV supplemental notices are also verbatim license copies, outside the bundle.
 third_party/effetune-mixwright/supplemental/NOTICES.txt -text
+# Japanese upstream documentation and referenced images are verbatim snapshots.
+third_party/effetune-docs/** -text

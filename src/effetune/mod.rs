@@ -1583,11 +1583,12 @@ mod tests {
         controller.set_remote_session(false);
     }
 
-    // Fixture shape: Frieve-A/effetune-mixwright v0.11.1,
-    // src/bridge/state_codec.cpp, StateCodec::encode. Confirmed against bytes
-    // returned by the bundled v0.11.1 plug-in through the real host handler.
+    // Fixture shape: Frieve-A/effetune-mixwright v0.12.0,
+    // src/bridge/state_codec.cpp, StateCodec::encode. The formatVersion=1
+    // shape was observed with v0.11.1; appVersion is informational to mIV.
+    // No v0.12.0 product/plugin launch is claimed by this fixture.
     fn fixture(a: &str, b: &str, current: &str, bypass: bool) -> Vec<u8> {
-        format!(r#"{{"appVersion":"0.11.1","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
+        format!(r#"{{"appVersion":"0.12.0","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
     }
 
     #[test]
