@@ -574,6 +574,9 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
   でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
   一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+  2026-10-03 の公開前レビュー対応で、JSZip 内の lie / immediate / setImmediate と
+  pako の zlib 由来コードの原文を `supplemental/NOTICES.txt` として第4の折り畳み通知に
+  埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
 - EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
   アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
 

@@ -24,3 +24,5 @@ htdocs/mimageviewer/manual/effetune/**/*.html text eol=lf
 # Verbatim EffeTune notices and VERSION must match vendor bytes even when
 # core.autocrlf=true. Their committed blobs are LF; never convert on checkout.
 third_party/effetune-mixwright/** -text
+# mIV supplemental notices are also verbatim license copies, outside the bundle.
+third_party/effetune-mixwright/supplemental/NOTICES.txt -text
