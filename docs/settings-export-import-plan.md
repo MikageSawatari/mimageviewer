@@ -1,0 +1,431 @@
+# §1.317 環境設定のエクスポート・インポート設計案
+
+作成: 2026-10-04。対象: `next-file-ops` / `C:\home\mimageviewer-fileops`。
+状態: **設計担当へ返す提案。未実装・未検収**。
+要件の正本は [next-release-backlog.md §1.317](next-release-backlog.md)。
+前段 `e189fbe86` (§1.256)、`c608f0822` (§1.263) を含むツリーで調査した。
+今回の変更は本書だけ。製品コード・他文書の変更、コミット、製品起動、実装テストは行わない。
+以下は推奨案であり、実装着手前に設計担当が §7 の範囲・判断を確定する。
+
+## 1. 現状のコード事実と採用する境界
+
+| 根拠 (調査時の file:line) | 事実 / 設計への意味 |
+| --- | --- |
+| `src/settings.rs:4115`、`:5702` | Settings は pub(crate) を含む 432 フィールド。利用データ、パス、互換 carrier、runtime 状態が混在する。Settings 全体の JSON 化・DB 複製は転送形式に使わない。 |
+| `src/settings.rs:4265`、`src/ui_dialogs/preferences/pages.rs:8632` | ファイル整理先は環境設定で編集するが名前・パス・ID を持つ PC 固有情報。全体を除外する。 |
+| `src/settings.rs:7145`、`src/settings_db.rs:20` | Default / serde(default) は欠落を既定値で補う。今回の「欠落は現在値を保持」と異なるので、ファイルを Settings へ deserialize しない。 |
+| `src/settings_db.rs:48`、`:892`、`:937`、`:954` | DB schema family は 1。save_full は複合値と KV を既存 transaction に保存する。転送ファイル版は DB schema と独立。新テーブル・DB migration は不要。 |
+| `src/ui_dialogs/preferences.rs:722`、`:1278`、`src/settings.rs:8382` | PreferencesState.settings が draft。生成時は preferences_snapshot() が、お気に入り overlay を外した共通設定を渡す。転送元もこの draft にする。 |
+| `src/ui_dialogs/preferences.rs:1892`、`:1944`、`:1977`、`:2473`、`:2617` | OK は prepare_preferences_state_settings_for_commit → install_preferences_settings → 既存副作用 → save_checked。runtime / 利用データの移送、共通表示値の routing、保存失敗の通知を再利用する。 |
+| `src/settings.rs:9692`、`src/ui_dialogs/preferences.rs:1898` | overwrite_non_preferences_from は環境設定外の live 値を引き継ぐ関数。転送対象判定ではない。標準表示値は呼出前に退避し route_preferences_view_state へ通る。 |
+| `src/ui_dialogs/preferences.rs:1959`、`src/settings.rs:8393` | 再生位置・音声トラックは最新 live map を維持する。お気に入り専用の表示値を維持し、draft の表示値だけを標準へ反映する。import が map や clear_requested を触る必要はない。 |
+| `src/ui_dialogs/preferences.rs:2603` | reading_history_limit の変更で prune が走る。履歴保持の要件に合わせ保持件数は初期対象から外す (§7)。 |
+| `src/ui_dialogs/preferences.rs:2323`、`:2333` | OK はフォント準備、LUT コピー、整理先の検証も待つ。import 後もこの判定を維持する。 |
+| `src/operation_customize_share.rs:22`、`:26`、`:57`、`:93`、`:141` | 既存共有は JSON / format / format_version と、keymap、ring_shortcuts、通常・右クリックメニュー、gamepad_enabled を転送する。環境設定内に同じ項目があっても今回には含めない。版相違警告は参考にするが欠落の既定補完は流用しない。 |
+| `src/ui_dialogs/settings_restore.rs:1221`、`:1269`、`:1671`、`:1717` | 既存共有は rfd の JSON ファイル選択、worker で read/parse/write、メッセージ欄、取り込み確認を使う。形を揃える。世代選択・比較・取り込み前バックアップ・即時適用は持ち込まない。 |
+| `src/ui_dialogs/preferences/pages.rs:33`、`:91`、`:128`、`:1448` | 全体設定・ビューワモード・サムネイルのカテゴリ表示順は環境設定で変更する。sort_order (名前・日付等) と grid_display_order (カテゴリの行構成) は別。後者は対象。 |
+| `src/ui_dialogs/preferences/pages.rs:8960` | exif_hidden_tags は任意文字列のカスタム追加もある。Vec<String> を無条件転送すると個人情報・パスなしを保証できない。初期範囲では全体除外を推奨 (§7)。 |
+| `src/settings.rs:6218`、`:8436`、`:8447`、`:8478` | バー固定の owner は BottomBarLock。静止画の列固定は列表示も含意。動画の固定 ON は非表示のストリップを last_choice で復元し、環境設定外の状態も変える。動画下部固定 2 フィールドは初期除外を推奨 (§7)。 |
+| `src/ui_dialogs/preferences/pages.rs:7726`、`src/settings.rs:10000` | video_loop / archive_convert_without_dialog は現在の enum から導出する互換値。独立項目として転送しない。 |
+
+読み合わせた運用根拠: `CLAUDE.md:111` (状態の組合せ削減)、`:132` (まれな失敗)、
+`:509` (IME)、`:1722` (製品ページと privacy の照合)、`:1739` (マニュアル)、
+`:1786` (出荷済み形式の互換)、`docs/architecture-overview.md` の永続化ストア一覧、
+`docs/spec.md` §8、`docs/preferences-layout-guidelines.md`、`docs/ui-responsiveness.md` §4、
+`docs/keymap-spec.md`、`docs/key-customization-impl-plan.md`。
+
+採用案は **小さい純粋な変換モジュール + PreferencesState 所有のファイル処理**。
+取込完了で対象値だけを draft へ一度に載せ、画面で確認して OK。キャンセルなら draft を破棄する。
+直接 Settings / SQLite / 他 DB を更新する案は、確認できず新しい確定経路も要るため採用しない。
+既存 OK の viewer 終了・再表示、一覧再読込、native presenter 更新を使い、
+import 専用の live rebuild や detached 述語・viewport 経路を新設しない。
+それらの修正が必要になれば detached-rework-plan §2 の合意・§11 記録を別途行う。
+
+## 2. 全フィールドの分類と分類漏れ防止
+
+### 2.1 分類表 (この調査時点の全 432 フィールド)
+
+同じ判定・根拠の項目をグループ化した。各セルは **実名の列挙** であり、prefix で将来の
+フィールドを自動分類する仕様ではない。各行の定義は先頭フィールドの位置。
+「出す」は §3 の検証に通る値だけ、「除く」は入出力両方で対象外。
+除外は移行先を初期化する意味ではない。実装時の唯一の実行分類表は §2.2 の policy。
+本表はその初期仕様で、別の allowlist / denylist を手書きして二重管理しない。
+
+| 判定 | フィールド (Rust 名) | 理由 / UI の根拠 | 定義 |
+| --- | --- | --- | --- |
+| 出す | `ui_theme`, `text_contrast`, `ai_feature_mode` | 全体設定のテーマ・文字と AI 利用範囲 (pages.rs:33 / 57 / 91)。性能の手動 tuning とは分ける。 | `src/settings.rs:5047` |
+| 出す | `detached_viewer_open_images_in_window`, `auto_fullscreen_zip_pdf`, `auto_fullscreen_image_folders`, `fullfeature_media_window` | 全体設定の閲覧モード (pages.rs:128)。実効値ではなく保存された選択値を出す。 | `src/settings.rs:5625` |
+| 出す | `restore_last_cursor`, `startup_window_state` | 起動時の振舞いだけ (pages.rs:409 / 476)。実際の場所・座標は出さない。 | `src/settings.rs:4288` |
+| 出す | `grid_click_selection_mode`, `grid_open_selected_item_on_click`, `grid_cursor_wrap`, `remember_favorite_view_state`, `grid_display_order`, `video_thumbnail_indicator`, `thumb_show_media_duration`, `thumb_show_book_resume_meter`, `selection_info_display_mode`, `details_selection_bar_mode` | 表示→サムネイルの操作・情報表示 (pages.rs:1362–1641)。カテゴリの行構成は環境設定内、名前等のソートは対象外。 | `src/settings.rs:4121` |
+| 出す | `thumb_tooltip_show_filename`, `thumb_tooltip_show_image_dimensions`, `thumb_tooltip_show_video_duration`, `thumb_tooltip_show_kind`, `thumb_tooltip_show_page_count`, `thumb_tooltip_show_file_size`, `thumb_tooltip_show_modified`, `thumb_tooltip_show_created`, `thumb_tooltip_show_video_dimensions`, `thumb_tooltip_show_video_codec`, `thumb_tooltip_show_location`, `thumb_tooltip_show_full_location` | 表示項目の bool のみ (pages.rs:1581)。名前・場所・履歴の実データを含めない。 | `src/settings.rs:4500` |
+| 出す | `thumb_tooltip_show_reading_history_last_read`, `thumb_tooltip_show_reading_history_progress` | 同上。閲覧履歴の内容ではなく表示するかどうか。 | `src/settings.rs:4536` |
+| 出す | `show_windows_context_menu_inline`, `skip_recycle_bin_delete_confirmation` | エクスプローラ連携の表示・削除確認方針 (pages.rs:1194 / 1329)。Shell 登録そのものは移さない。 | `src/settings.rs:4660` |
+| 出す | `rating_sort_unrated_position`, `slideshow_interval_secs`, `slideshow_continuous_wait_secs`, `slideshow_continuous_scroll_secs`, `slideshow_continuous_scroll_percent`, `slideshow_end_action` | 未評価位置・スライドショー方針 (pages.rs:1427 / 1652)。評価値やソート選択とは別。 | `src/settings.rs:4357` |
+| 出す | `capture_format`, `bake_stage_book`, `bake_stage_export`, `bake_stage_export_batch`, `bake_stage_external_tool` | キャプチャ形式・各出力の焼き込み方針 (pages.rs:1753 / 1845)。ツール登録、画像、保存先を含めない。 | `src/settings.rs:4725` |
+| 出す | `archive_file_handling`, `epub_file_handling`, `show_hidden_files`, `folder_thumb_sort`, `folder_thumb_depth`, `folder_skip_limit`, `edit_restore_prompt_enabled`, `sidecar_backup_enabled`, `tag_sidecar_backup_enabled`, `stack_script_enabled`, `skip_zip_if_folder_exists`, `skip_archive_if_zip_exists` | ファイル処理・代表選定・バックアップの方針 (pages.rs:7286 / 8637 / 8820)。実データ・パス・script 本体を含めない。 | `src/settings.rs:4442` |
+| 出す | `skip_epub_if_pdf_exists`, `skip_image_if_video_exists`, `skip_duplicate_images`, `image_ext_priority` | 同名ファイルの扱いと拡張子の優先順 (pages.rs:8837 / 8868)。拡張子列は組込み候補だけ (§3)。 | `src/settings.rs:4690` |
+| 出す | `minimize_to_tray_on_close`, `pause_indexer_while_minimized`, `write_rating_to_xmp`, `reading_history_enabled` | 常駐・索引一時停止・記録方針 (pages.rs:7444 / 7463 / 7503 / 10149)。保持件数・全件クリアを含めない。 | `src/settings.rs:5344` |
+| 出す | `default_spread_mode`, `follow_document_reading_direction`, `default_reading_flow`, `default_reading_direction`, `final_cover_spread_enabled`, `singleton_spread_first_enabled`, `singleton_spread_last_enabled`, `page_after_cover_alone_enabled`, `last_page_alone_enabled`, `spread_page_gap_px`, `continuous_reading_gap_px`, `fullscreen_image_margin_color` | 表示→閲覧表示の標準設定 (pages.rs:9405–9795)。本別設定・読書位置・補正を含めない。 | `src/settings.rs:4851` |
+| 出す | `fullscreen_fit_mode`, `fullscreen_fit_no_upscale`, `fullscreen_fit_no_downscale`, `fullscreen_side_panel_mode`, `fullscreen_boundary_notice_visible`, `fullscreen_processing_status_visible`, `fullscreen_prefetch_status_visible`, `panorama_projection`, `fullscreen_top_bar_locked`, `fullscreen_fixed_bar_gap_px`, `fullscreen_seek_direction`, `fullscreen_horizontal_cursor_direction` | 同上。表示モード・クローム・カーソル方向。 | `src/settings.rs:4887` |
+| 出す | `fullscreen_page_number_overlay`, `fullscreen_keep_on_app_switch`, `fullscreen_cursor_hide_delay_secs`, `fullscreen_jump_mode`, `fullscreen_jump_percent`, `fullscreen_fixed_jump_count`, `continuous_reading_wheel_scroll_percent`, `continuous_reading_key_scroll_percent`, `continuous_reading_gamepad_scroll_percent_per_sec` | 同上。表示・ジャンプ・連結スクロール量。 | `src/settings.rs:4991` |
+| 出す | `fullscreen_seek_bar_locked`, `still_seek_strip_locked`, `still_seek_strip_visible`, `still_seek_strip_height`, `still_seek_strip_height_values`, `still_seek_preview_size`, `still_seek_preview_size_values`, `still_seek_hover_preview_mode`, `still_seek_bar_with_strip` | 静止画シーク UI (pages.rs:9324 / 9564)。先頭 3 フィールドは論理項目 still_bottom_chrome にまとめる (§3)。 | `src/settings.rs:4938` |
+| 出す | `video_volume`, `video_seek_small_secs`, `video_seek_medium_secs`, `video_seek_large_secs`, `video_seek_thumbnail_tolerance_secs`, `video_seek_strip_min_interval_secs`, `video_seek_strip_waveform_span_secs`, `video_seek_strip_height`, `video_seek_preview_size`, `video_seek_preview_size_values`, `video_seek_strip_height_values`, `video_seek_strip_cycle` | 動画ページの表示・再生方針 (pages.rs:7594–7917 / 9140)。音量はアプリ内 gain、OS 音声デバイスの設定ではない。 | `src/settings.rs:5433` |
+| 出す | `video_top_bar_locked`, `video_seek_hover_preview_mode`, `video_seek_bar_with_strip`, `video_loop_mode`, `video_start_muted`, `video_thumb_use_sidecar_image` | 同上。ループ旧 bool は導出値。バー/プレビュー表示の選択値だけ。 | `src/settings.rs:5486` |
+| 出す | `video_grid_open_starts_from_beginning`, `video_nav_resume`, `book_open_resume`, `book_nav_resume`, `music_open_resume`, `music_nav_resume` | 履歴と復元の 6 セル (pages.rs:10023)。前回位置ではなく復元するかどうかの方針。 | `src/settings.rs:5563` |
+| 除く | `startup_folder_mode`, `startup_folder_path`, `capture_output_dir`, `book_root`, `export_last_directory`, `export_batch_directory`, `file_organize_destinations` | 起動・保存・整理先の PC 固有パス。startup_folder_mode も Specific とパスが一組なので保持する。 | `src/settings.rs:4280` |
+| 除く | `ui_font`, `external_tools`, `creative_luts`, `susie_enabled`, `susie_allow_parallel`, `vst3_enabled`, `vst3_plugins`, `vst3_plugin_path`, `vst3_plugin_state`, `vst3_chain_slots` | フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存。ON/OFF や微調整も一組で保持。 | `src/settings.rs:5059` |
+| 除く | `parallelism`, `pdf_worker_count`, `prefetch_back`, `prefetch_forward`, `thumb_prev_pages`, `thumb_next_pages`, `gpu_memory_percent`, `ai_upscale_prefetch_back`, `ai_upscale_prefetch_forward`, `retained_final_ai_cache_max_entries`, `retained_final_ai_cache_max_mib`, `ai_upscale_skip_px` | CPU/GPU/メモリ/ドライバ/速度の tuning。移行先で設定する (§7)。 | `src/settings.rs:4334` |
+| 除く | `ai_denoise_skip_px`, `ai_upscale_size_limit`, `ai_denoise_size_limit`, `ai_backend`, `video_hw_decode`, `anime_upscale_source_limit`, `indexer_speed_profile`, `skip_offline_change_scan` | 同上。旧 AI サイズ carrier、処理上限・backend・索引の速度/scan 方針も含む。 | `src/settings.rs:5261` |
+| 除く | `cache_policy`, `cache_threshold_ms`, `cache_size_threshold_bytes`, `cache_videos_always`, `cache_webp_always`, `cache_pdf_always`, `cache_zip_always`, `edit_preview_cache_enabled`, `edit_preview_cache_max_bytes`, `archive_cache_max_bytes`, `batch_cache_zip_contents`, `batch_cache_pdf_contents` | キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外。キャッシュ実体も別ストア (§7)。 | `src/settings.rs:4410` |
+| 除く | `thumb_idle_upgrade` | 同上。サムネイルの idle 品質更新は性能方針として除外。 | `src/settings.rs:4488` |
+| 除く | `remote_service_enabled`, `remote_video_streaming_enabled`, `remote_video_encoder`, `remote_video_quality_default`, `remote_video_segment_window`, `remote_video_mute_local_output`, `remote_video_hide_local_output`, `update_check_enabled` | 接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持。接続情報は Settings 外も転送しない。 | `src/settings.rs:5397` |
+| 除く | `reading_history_limit`, `exif_hidden_tags`, `video_seek_bar_locked`, `video_seek_strip_locked`, `video_deinterlace` | 保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning。推奨初期除外 (§7)。 | `src/settings.rs:5590` |
+| 除く | `keymap`, `ring_shortcuts`, `menu_layout`, `context_menu_layout`, `gamepad_enabled` | 既存の操作カスタマイズ共有が正本。環境設定にも編集入口があっても重複転送しない。 | `src/settings.rs:5198` |
+| 除く | `favorites`, `smart_folders`, `tags`, `recent_folders`, `quick_folder_recent_folders`, `quick_folder_slots`, `quick_folder_drive_current_dirs`, `last_folder`, `last_cursor_name`, `last_cursor_rows_above`, `search_index_checks`, `active_book_name` | 利用データ・登録先・履歴・検索対象。名前や ID も含めない。 | `src/settings.rs:4262` |
+| 除く | `pinned_books`, `pinned_collections`, `toolbar_collection_target_id`, `video_resume_positions`, `video_audio_track_choices` | 同上。本棚・コレクション参照・再生位置・音声トラック選択。 | `src/settings.rs:4752` |
+| 除く | `favorite_view_overlay`, `window_pos`, `window_size`, `window_maximized`, `detached_viewer_window_placement`, `effetune_gui_pos`, `effetune_gui_size`, `vst3_panel_pos` | runtime overlay / PC のウィンドウ配置。serde(skip) も明示分類。 | `src/settings.rs:4273` |
+| 除く | `first_setup_completed`, `touch_still_chrome_learned`, `touch_video_chrome_learned`, `last_seen_version`, `update_check_dismissed_version`, `network_data_dir_notice_dismissed_for`, `perf_log_enabled` | 初回/学習/通知/保存版の内部記録。診断ログは移行先で明示有効化。 | `src/settings.rs:5063` |
+| 除く | `archive_convert_without_dialog`, `video_loop` | 現行 enum の互換 mirror。転送せず既存の OK/保存で enum から導出。独立した設定ではない。 | `src/settings.rs:4450` |
+| 除く | `grid_cols`, `grid_view_mode`, `details_sort_key`, `details_page_count_sort_stash`, `details_place_sort_stash`, `details_sort_ascending`, `details_size_display_mode`, `details_timestamp_show_seconds`, `details_row_style` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4117` |
+| 除く | `details_column_order`, `details_column_widths`, `details_rated_at_width`, `details_page_count_column_index_stash`, `details_page_count_column_width_stash`, `details_place_column_index_stash`, `details_place_column_width_stash`, `details_selection_bar_place_column_index_stash`, `details_selection_bar_place_column_width_stash` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4144` |
+| 除く | `details_show_preview`, `details_show_rating`, `details_show_rated_at`, `details_show_tags`, `details_show_kind`, `details_show_page_count`, `details_show_place`, `details_show_size`, `details_show_modified` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4166` |
+| 除く | `details_show_created`, `details_show_state`, `details_show_image_dimensions`, `details_show_video_duration`, `details_show_video_dimensions`, `details_show_video_codec`, `details_name_width_auto`, `details_name_width`, `details_selection_bar_column_order` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4184` |
+| 除く | `details_selection_bar_column_widths`, `details_selection_bar_rated_at_width`, `details_selection_bar_show_preview`, `details_selection_bar_show_rating`, `details_selection_bar_show_rated_at`, `details_selection_bar_show_tags`, `details_selection_bar_show_kind`, `details_selection_bar_show_page_count`, `details_selection_bar_show_place` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4210` |
+| 除く | `details_selection_bar_show_size`, `details_selection_bar_show_modified`, `details_selection_bar_show_created`, `details_selection_bar_show_state`, `details_selection_bar_show_image_dimensions`, `details_selection_bar_show_video_duration`, `details_selection_bar_show_video_dimensions`, `details_selection_bar_show_video_codec`, `details_selection_bar_name_width_auto` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4229` |
+| 除く | `details_selection_bar_name_width`, `facet_filter`, `thumb_aspect`, `thumb_aspect_auto`, `always_on_top`, `sort_order`, `rating_view_sort`, `subfolder_expansion_order`, `subfolder_expansion_max_depth` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4249` |
+| 除く | `subfolder_expansion_filter_kinds`, `subfolder_expansion_filter_date_preset`, `subfolder_expansion_filter_size_preset`, `stack_separator`, `thumb_px`, `text_preview_scale`, `text_smart_snap_enabled`, `thumb_quality`, `show_toolbar_favorites` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4367` |
+| 除く | `show_toolbar_smart_folders`, `show_toolbar_tags`, `folder_tree_pane_visible`, `folder_tree_sort_order`, `folder_tree_pane_width_ratio`, `show_toolbar_folder`, `show_toolbar_folder_tree_button`, `show_toolbar_effetune`, `show_toolbar_bookshelf` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4552` |
+| 除く | `show_toolbar_collections`, `show_address_bar_history_nav`, `show_address_bar_quick_folders`, `show_toolbar_parent_button`, `show_toolbar_prev_folder`, `show_toolbar_next_folder`, `show_toolbar_vst3`, `show_toolbar_rating`, `show_toolbar_facet_filter` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4579` |
+| 除く | `show_address_bar_favorite_button`, `show_address_bar_history_menu`, `show_address_bar_folder_pin`, `show_address_bar_stack_toggle`, `show_address_bar_omitted_entries`, `show_location_drive_list`, `show_location_reading_history`, `show_location_rating`, `show_location_bookshelf` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4610` |
+| 除く | `show_location_desktop`, `show_location_pictures`, `show_location_downloads`, `show_location_drive_roots`, `use_native_shell_context_menu`, `rating_filter`, `conceal_type`, `conceal_mosaic_tile_mode`, `conceal_mosaic_boundary` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4641` |
+| 除く | `conceal_fill_opacity_percent`, `conceal_fill_edge`, `conceal_blur_radius_px`, `conceal_blur_mode`, `conceal_blur_feather`, `conceal_brush_radius`, `conceal_line_width`, `conceal_presets`, `export_embed_metadata` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4771` |
+| 除く | `export_fallback_format`, `export_default_scale`, `export_batch_selection`, `export_batch_template`, `export_batch_format`, `export_batch_scale`, `sns_split_target`, `sns_split_count`, `sns_split_seam_permille` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4811` |
+| 除く | `sns_split_frame_ratio`, `downscale_smoothing_percent`, `fullscreen_left_panel_tab`, `adjustment_settings_tab`, `fullscreen_navigator_visible`, `fullscreen_navigator_corner`, `fullscreen_navigator_size`, `margin_fit_enabled`, `ui_scale_factor` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:4846` |
+| 除く | `toolbar_cols_items`, `toolbar_cols_20_options_migrated`, `toolbar_cols_details_visible`, `toolbar_aspect_items`, `toolbar_aspect_auto_visible`, `toolbar_cols_display`, `toolbar_aspect_display`, `toolbar_sort_display`, `toolbar_favorites_display` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5072` |
+| 除く | `toolbar_smart_folders_display`, `toolbar_tags_display`, `toolbar_bookshelf_display`, `toolbar_collections_display`, `toolbar_favorites_collapsed`, `toolbar_smart_folders_collapsed`, `toolbar_tags_collapsed`, `toolbar_bookshelf_collapsed`, `toolbar_collections_collapsed` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5101` |
+| 除く | `toolbar_sort_items`, `toolbar_sort_size_options_migrated`, `toolbar_sort_name_numeric_desc_options_migrated`, `toolbar_sort_rating_options_migrated`, `toolbar_facet_filter_items`, `toolbar_facet_name_filter_index_stash`, `facet_name_filter_width`, `toolbar_section_order`, `show_toolbar_cols` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5129` |
+| 除く | `show_toolbar_aspect`, `show_toolbar_sort`, `toolbar_section_new_row`, `toolbar_section_drag_enabled`, `recent_open_with_apps`, `custom_open_with_apps`, `ai_upscale_enabled`, `ai_upscale_model_override`, `erase_inpaint_mono_tolerance` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5168` |
+| 除く | `global_preset`, `preset_slots`, `post_filter_global_preset_stash`, `post_filter_preset_slot_stashes`, `colorize_preset_slots`, `metadata_export_recursive`, `video_playback_speed`, `video_seek_strip_state`, `video_seek_strip_last_choice` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5290` |
+| 除く | `video_seek_strip_span`, `video_autoplay`, `video_autoplay_mode`, `video_continuous_mode`, `video_muted`, `video_adjustments`, `video_scale_filter`, `video_downscale_smoothing_percent`, `video_anime4k_budget` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5467` |
+| 除く | `video_anime4k_measurement`, `video_preset_slots`, `video_tile_columns`, `video_in_window_mode`, `detached_viewer_enabled`, `vst3_gui_visible`, `vst3_video_compact`, `audio_normalize_enabled`, `audio_normalize_target_lufs_milli` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5544` |
+
+現時点の内訳: 出す 132 フィールド / 除く 300 フィールド。
+
+### 2.2 実装時の唯一の policy と強制テスト
+
+新規 `src/settings_transfer.rs` (仮称) に、全フィールドを一度ずつ記す policy macro を置く。
+各行は `export(field, wire_key, validator)` または `exclude(field, reason)`。
+論理的に一体の値だけは `export_group([fields...], wire_key, validator, draft_setter)`。
+型定義を生成する巨大な Settings macro への改造、reflection 用の全体シリアライズ、
+DB の COMPLEX_FIELDS からの対象推定はしない。
+
+policy から、(a) 分類メタデータ、(b) 対象値だけの projection、(c) 検証済み項目の
+draft setter、(d) **全 Settings フィールドの、`..` のない分解パターン**を生成する。
+分解は `&Settings` を借りるだけ。exclude の値を clone / serialize しない。
+同じ field の重複列挙もコンパイル時に失敗する。Rust 側のフィールド名と wire_key は区別し、
+serde rename (`gpu_memory_percent` → `thumb_vram_cap_percent` 等) や skip に依存しない。
+
+`settings_transfer::tests::all_settings_fields_are_classified` は生成された全列挙関数を使い、
+重複分類・wire_key の重複・空の除外理由・setter の未対応を検査する。
+Settings に新規フィールドを足して policy に足さないと **このテストを含む target の
+コンパイルが失敗する**。既定値の JSON キー集合だけを比較する方法は、skip / 空値 /
+carrier を見落とすので主 gate にしない。必要な serde 特性の確認は補助テストで行う。
+テストを無視して製品 target だけ build しても同じ exhaustive pattern が compile gate になる。
+
+新規フィールドの統合は、同じ policy に対象と検証または除外理由を 1 行足すだけ。
+予定の `show_facet_sort`、`toolbar_folder_section_migrated` とフォルダバーのツールバー区画は
+環境設定外 / 内部移行として除外する。「..」行の表示設定は、実名と環境設定 UI、
+既存の OK 経路を確認して bool の export 行を足す。分類前は build/test が失敗する。
+現在の 432 という件数だけに依存するテストにはしない。次の追加でも明示判断を必須にする。
+
+### 2.3 対象外保持の意味
+
+import は対象外フィールドに setter を持たず、未知キーとして受け取っても読み替えない。
+対象外を含む既存 draft 全体、PreferencesState の各入力 buffer、プラグイン候補、
+LUT transaction、フォント準備、clear_requested、インストール要求を作り直さない。
+
+OK の既存副作用で生じる **導出状態**は区別する。video_loop / archive_convert_without_dialog
+の同期、details_selection_bar_mode を Dedicated にしたときの既存セット A→C 複製
+(`preferences.rs:1909`)、表示用キャッシュの失効や viewer の閉鎖は、同じ設定を手で
+変更した場合と同じでよい。これを「除外された設定の取り込み」に置き換えない。
+利用者が保持した列構成や開いた別窓に影響する点は結果説明・§6 で確認する。
+★・編集・タグ・コレクション・履歴行等の利用データを消す副作用は認めない。
+
+## 3. ファイル形式・版・検証規則
+
+### 3.1 形式と互換
+
+推奨名は `preferences.mivprefs.json`、UTF-8 (BOM なし) の pretty JSON + 終端改行。
+import は UTF-8 の BOM も許容する。拡張子ではなく format で識別する。
+
+```json
+{
+  "format": "mimageviewer.preferences",
+  "format_version": 1,
+  "app_version": "4.3.0",
+  "preferences": {
+    "ui_theme": "Dark",
+    "show_hidden_files": true,
+    "video_seek_small_secs": 3,
+    "still_bottom_chrome": { "lock": "BarOnly", "visible": true }
+  }
+}
+```
+
+例は一部だけ。通常 export は全対象の現在 draft 値を出す。
+app_version は build の定数から生成し、import の参考表示だけに用いる。
+ラベル、ユーザー名、PC 名、生成元 data-dir、ファイルパス、自由記述、時刻は埋め込まない。
+PreferencesState の UI 状態、Settings の保存メタ、DB の版番号も入れない。
+
+format / format_version / preferences は必須。preferences は object、
+format_version は正の u32 整数で v1 だけ対応。app_version は任意で欠落可。
+他のトップレベルキーは無視する。app_version が違うだけでは拒否しない。
+v1 のまま項目を追加・削除してよいが、既存キーの型・意味を変更したり名前を再利用しない。
+
+| 入力 | 扱い |
+| --- | --- |
+| 古いアプリが書いた v1 / 新しいアプリが書いた v1 | 既知で正しい項目だけ draft に載せる。未知キーは無視し件数を知らせる。欠落は取り込み直前の draft 値を保持。 |
+| v1 の未知 enum variant / 現行 UI にない値 | その論理項目だけ無視し、現在 draft 値を保持。既定値へ置換しない。 |
+| format_version = 0、欠落、型違い、負数、v2 以上 | ファイル全体を拒否して draft 不変。未来の破壊的形式を推測して読まない。 |
+| 別 format、Settings 全体の JSON、操作カスタマイズ JSON、SQLite | 全体を拒否。自動変換や DB open をしない。 |
+| 新版で項目を廃止した v1 を旧アプリで取り込む | 欠落なので旧アプリのその設定を維持。新アプリが知らない旧キーは無視。 |
+
+形式 v1 は本機能で初めて導入する未出荷形式。旧 DB / JSON migration は変更しない。
+初回出荷後の互換 v1 fixture は残す。将来、破壊的変更で版を上げる場合は、
+旧版の読替えと fixtures を別の設計で決める。今は移行エンジンを作らない。
+
+### 3.2 項目の検証・適用単位
+
+worker がサイズ上限 **1 MiB** + 1 byte まで bounded read して超過を拒否する。
+serde_json の標準深さ制限を維持し、JSON の不正構文・不正 UTF-8 は全体エラー。
+同一 object 内の重複キーは、どの値を採用するか曖昧にせず全体エラーにする
+(小さい duplicate-key 検査 visitor)。未知キーにもサイズ・深さ・重複の制限が効く。
+
+ファイル全体の parse と各項目の検証を完了してから、検証済み値の集合と結果を返す。
+UI はそれを一度に draft に載せる。検証中の順次適用、途中保存、再試行、
+部分適用 transaction、ロールバック、完了済み項目の永続 journal は作らない。
+「正しい項目だけを採用」は **未確定の draft 編集** であり DB への部分適用ではない。
+
+bool は JSON bool のみ。数値・文字列の型変換はしない。整数に小数・負数・overflow を
+受け入れず、浮動小数は finite のみ。null は今回の対象で許容しない。
+enum は現在 UI の候補 (ALL / all() 等) に入るものだけ。Settings の Deserialize /
+sanitize に未知値を既定値へ落とす型があっても、その挙動を取り込みに使わない。
+範囲外は clamp せず、その論理項目を丸ごと無視する。
+
+| 対象 | 許容値 / 根拠 |
+| --- | --- |
+| 各 bool / enum | 現行 UI と同じ型・候補。旧 UiTheme::Standard のような UI にない値は無視。 |
+| slideshow_interval_secs / continuous_wait_secs / continuous_scroll_secs / continuous_scroll_percent | 0.5–30 / 0.1–30 / 0–5 秒 / 1–100 % (pages.rs:1652–1688 の Slider 範囲)。 |
+| folder_thumb_sort / depth / folder_skip_limit | UI の 4 種 FileName / Numeric / DateAsc / DateDesc、0–10、1–30 (pages.rs:8651–8698)。 |
+| spread_page_gap_px / continuous_reading_gap_px / fullscreen_fixed_bar_gap_px | 0–200 / 0–200 / 0–FULLSCREEN_FIXED_BAR_GAP_MAX_PX (pages.rs:9644 / 9740 / 9752)。 |
+| fullscreen_jump_percent / fixed_jump_count / cursor_hide_delay_secs | Settings の MIN / MAX 定数。現行 1–100 / 1–100 / 0.1–5.0 (`settings.rs:6785`)。 |
+| continuous_reading_wheel_scroll_percent / key_scroll_percent / gamepad_scroll_percent_per_sec | 1–100 / 1–100 / 10–300 (pages.rs:9766–9784)。 |
+| video_volume | 0–VIDEO_VOLUME_MAX の finite gain。現行 0–7.943282347242816 (`settings.rs:5770`)。 |
+| video_seek_small / medium / large_secs | VIDEO_SEEK_SECONDS_MIN..MAX、現行 1–600 (`settings.rs:6174`)。UI と同じく大小の順序条件を新設しない。 |
+| video_seek_thumbnail_tolerance / strip_min_interval / strip_waveform_span_secs | 各 MIN / MAX 定数。現行 0–30 / 0.1–1800 / 5–10800 (`settings.rs:6199`)。 |
+| *_seek_preview_size_values / *_seek_strip_height_values | smallest / small / medium / large / maximum の 5 整数が必須。各 UI と同じ MIN_POINTS / MAX_POINTS (`settings.rs:6354`、`:6374`、`video/seek_strip_layout.rs:44`)。値の大小関係は新設しない。 |
+| fullscreen_image_margin_color | ちょうど 3 個の u8。文字列や第 4 要素を許容しない。 |
+| grid_display_order | ちょうど 4 行の配列で各組込みカテゴリがちょうど 1 回。空行は保持。重複・欠落・未知カテゴリ・不正行数は項目全体を無視。GridDisplayOrder の寛容な Deserialize による補完は使わない (`settings.rs:2387`)。 |
+| video_seek_strip_cycle | thumbnails_window / thumbnails_whole / waveform_window / waveform_whole の 4 bool が必須で、少なくとも 1 個が true。全 false / 欠落 / 型違いは項目全体を無視し、normalized() による既定補完を使わない (`video/seek_strip_layout.rs:284`、`:341`)。 |
+| image_ext_priority | 組込み default_image_ext_priority() の候補の重複なし完全な並べ替えのみ。余分な任意文字列、パス、URL、Susie 固有拡張子が入る列は項目全体を無視。 |
+
+複合項目の欠落した **トップレベルキー** は現在値を保持。キーが存在する複合値では
+必須子値の欠落・不正を項目全体のエラーにする。未知子キーだけは無視する。
+子値ごとの欠落補完や部分更新を新設しない。enum 表現は現行 serde 表現を基本にするが、
+export 前の検証と厳密な専用読取により寛容な deserialize の fallback を迂回する。
+
+静止画下部の 3 フィールドは `still_bottom_chrome` の一項目へまとめる。
+lock は None / BarOnly / BarAndStrip、visible は bool。BarAndStrip + visible=false は
+項目全体を無視し、移行先の 3 値を全部保持する。妥当な値を
+set_still_bottom_lock + set_still_seek_strip_visible の既存 owner へ通し、
+操作順に左右される二つの bool の個別 setter を作らない。
+独立キー fullscreen_seek_bar_locked / still_seek_strip_locked / still_seek_strip_visible を
+ファイルに混在させず、これらを偽造しても未知キーとして無視する。
+
+archive_file_handling の export は archive_file_handling_resolved() の値を使う
+(`settings.rs:8521`)。Default の Legacy はファイルへ出さず、UI と同じ Ask / Convert /
+Ignore に解決する。import はこの 3 値に限定し set_archive_file_handling を通す。
+video_loop_mode は UI と同様に互換 video_loop を同期する。
+setter が対象以外に触れるのは分類表で明示した互換 mirror だけ。
+PreferencesState の補助入力値を同期する必要が生じた場合は対象 field の setter に集約し、
+PreferencesState 全体の new() や draft 全体の sanitize() を呼ばない。
+
+export も同じ validator を使う。既存 draft に不正値や許容外の任意文字列があれば
+該当項目を省いて一覧で知らせ、除外値を補充しない。
+出力 key 集合が policy の export wire_key 以下であることをテストする。
+正常な状態なら全項目を出す。不正を理由に任意の文字列をそのまま通知・ログへ埋め込まない。
+項目表示名・理由だけを使い、未知キーは件数中心で表示する。
+
+## 4. UI・非同期所有・OK / キャンセル
+
+環境設定の **「全体設定」ページ末尾**に「設定の持ち運び」欄を追加する。
+右ペイン共通 ScrollArea を使い、新ページやフッターの固定高は増やさない。
+`ui.horizontal_wrapped` に「書き出し…」「取り込み…」を置く。
+説明: 「この画面の移行できる設定をファイルに保存します。保存先や利用データ、操作カスタマイズは含みません。」
+「操作カスタマイズは設定メニューの専用画面から書き出せます」の案内も置く。
+検索索引に「持ち運び / 移行 / エクスポート / インポート」を登録する。
+
+書き出しは **現在の draft** を使う。「この画面の未確定の変更も含みます」を明記。
+rfd の JSON filter と既定名 preferences.mivprefs.json を使い、同名の上書き確認は
+既存の保存ダイアログに任せる。保存先の記憶を Settings に追加しない。
+書き出しはアプリ設定を確定しない。後で環境設定をキャンセルしても書き出したファイルは残る。
+
+取り込みは rfd の open_file で 1 ファイル選択。別の差分承認画面は作らず、
+正常項目を draft へ載せた後に結果欄を表示する。
+「N 項目を読み込みました。OK で保存します。キャンセルで今回の変更を取り消します。」
+変更なしの有効項目数と実際に変わった項目数は区別できるようにする。
+折りたたみの一覧で、変わった項目の日本語名・不正項目の名と理由・未知項目の件数を表示。
+未知キーや値の原文を大量表示しない。利用者は通常のページへ移動して値を確認・再編集できる。
+有効項目が 0 の場合も成功したように見せず「取り込める項目がありませんでした」。
+ファイル全体エラーは赤のメッセージ欄 + ログ、draft を変更しない。
+
+**組合せ削減の採用**: ファイル選択後の read/parse/write は短いモーダル処理にする。
+PreferencesState に `Idle / Importing(receiver) / Exporting(receiver)` の一つの job owner
+(型名は実装時確定) を置き、同時処理や後続 job の queue を作らない。
+処理中は環境設定の編集・ページ操作・OK・キャンセル・×・Escape を無効にし、
+その job が完了/失敗してから戻す。結果受信は try_recv、worker 終了で repaint を要求する。
+ファイル I/O、JSON parse/serialize、flush、置換は worker 上。UI で DB open / stat /
+ファイル読込 / 同期 join をしない。既存のフォント/LUT等の処理中は transfer 開始も待つ。
+
+環境設定に対する既存の背面入力ブロックを使い、処理中に別の open/navigation/
+設定共有/別窓切替が新しい job を開始できないことを入力経路で確認する。
+不足があれば common_modal_dialog_open / 共通入力 owner に接続し、二重の一覧を作らない。
+既存の裏で動く再生位置保存等は止めず、OK の live merge で維持する。
+通常の設定操作は Idle で従来どおり。長時間待ち対策の retry / sleep / supersession /
+resume / 保存中のキャンセル後 rollback は追加しない。
+
+App の終了等で PreferencesState が drop された場合は receiver も消えるので、
+完了値は別のダイアログへ到達しない。worker は Settings / App / DB の参照を保持せず、
+export では捕捉済み対象値だけ、import ではファイルと結果だけを所有する。
+export はアプリ終了後でも選択済みファイルへの書き出しを完了し得る。
+その理由だけで実設定の保存や次のセッションへの pending 復元を作らない。
+
+OK は手編集と同じ prepare → install → 副作用 → save_checked の一経路。
+Cancel / × は今回の import とそれ以前の未確定手編集をまとめて取り消す。
+import を始める前の draft に戻す専用ボタン・履歴・部分 rollback は設けない。
+ファイル選択の Cancel は draft と既存の結果欄を変更しない。
+独自ショートカットは追加しない。Enter / Escape は dialog_enter_pressed /
+dialog_escape_pressed を使い、IME 変換中の入力で import・OK・閉鎖が発火しない。
+
+### 4.1 まれな失敗の範囲
+
+読込・検証・worker 起動失敗は通知して draft / live / DB を変えない。
+書き込み失敗は通知して成功扱いにしない。既存の選択先ファイルを途中で truncate
+しないため、同じ親の一時ファイルへ完成 JSON を書き flush/sync 後、一度だけ置換する。
+既存 `archive_converter::replace_file_atomic` (`src/archive_converter.rs:726`) を使える。
+共有 helper の大規模移動は不要。失敗時は既存 destination を維持し、
+自分の一時ファイルだけ best-effort 除去する。除去失敗は log のみ。
+これは単一ファイルの通常保存で、復旧 journal・世代管理・自動 retry・終了後回収は作らない。
+
+OK 時の DB 保存失敗は、既存通りメモリには確定済み、永続化は未完了の可能性がある
+(`preferences.rs:2617`)。既存の通知を出す。「何もしない」は転送の I/O / 構文失敗を
+指し、既存の OK 保存失敗まで巻き戻す仕様にはしない。
+import 専用の DB rollback、バックアップ復旧、再起動時の自動再適用は追加しない。
+利用者の設定や既存書き出しファイルを削除する割り切りも採用しない。
+
+## 5. 製品ページ・privacy の突き合わせ
+
+次の二か所を実際に照合した。
+
+| 文書と位置 | 現状 / 影響 |
+| --- | --- |
+| `htdocs/mimageviewer/index.html:1203`「安心して使えます」、`:1212`、`:1234` | 通信は更新確認・任意 component 取得・Remote の 3 場面、設定や履歴は PC に保存と記載。新しいアプリ通信先・認証・自動送信は増えない。利用者が指定したファイルへの設定保存は説明を足す。 |
+| `htdocs/mimageviewer/privacy.html:135`「端末内に保存されるデータ」、`:151`、`:198`「ネットワーク通信」 | Settings は既存の data-dir に保存と記載。利用者指定の書き出しファイルは data-dir 外にも置けるので保存先の説明を両文書で補足する。通信の列挙は変更不要。 |
+
+実装時に両文書へ同じ事実を記す:
+「環境設定のうち移行できる項目は、利用者が選んだファイルにも保存できます。
+ファイルに閲覧履歴・登録先・接続情報は含めず、アプリから外部へ送信しません。」
+「全設定のバックアップ」「機密情報が必ず全て消える」など本範囲以上の保証はしない。
+
+アプリ独自の HTTP / IPC 転送、Telemetry、アップロードはない。
+ファイル選択で UNC / ネットワーク共有 / 同期フォルダを指定した場合は、その保存先の
+OS・同期ソフトによる通信があり得る。「物理的にローカルディスクだけ」とは保証せず、
+利用者が選んだファイルの read/write という既存のモデルに揃える。
+取り込みにより Remote / 更新確認の有効値を変えず、追加ダウンロードや接続を始めない。
+URL、実行ファイル、LUT、プラグインの読み込み指定として JSON を解釈する経路もない。
+
+## 6. 実装後のテスト・検証・文書更新計画
+
+### 6.1 自動テスト (実装担当が所有)
+
+| 層 | 必須確認 |
+| --- | --- |
+| 分類 / projection | 全 432 フィールドを一回分類、wire_key 唯一、skip/carrier も含む。新フィールド未分類で target がコンパイル失敗することを一時的な追加で確認して戻す。出力キーは export policy だけ。 |
+| 個人情報・パス漏れ | 除外される PathBuf / String / ネストした利用データへ、ユーザー名・絶対パス・UNC・URL・PIN風文字列・タグ/本/コレクション名の固有 sentinel を入れた Settings から出力して、一つも含まれないことを確認。全対象値は妥当な非既定値。EXIF の任意文字列は除外、image_ext_priority のパス混入はその項目を出さない。serde(skip) の runtime overlay にも sentinel を置く。 |
+| 保持 / 差分 | 複数対象と複数対象外を異なる非既定値で埋めた移行先 draft に apply。対象が復元し、それ以外の全フィールドが不変 (互換 mirror の明示例外だけ別 assertion)。JSON の全体比較だけでなく skip フィールドも比較する生成テスト projection を使う。 |
+| 不正値 | 一つの型違い・範囲外・null・overflow・未知 enum と正常項目を同居させ、正常項目だけ draft 更新、不正項目は元値 + 警告一覧。範囲の両端/直外、複合欠落・重複・余分な配列要素も確認。 |
+| 全体不正 / 互換 | 空・壊れた JSON・不正 UTF-8・サイズ/深さ超過・重複キー・別 format・版欠落/0/未来 v2 は draft/live/DB 不変。旧アプリ v1 の項目欠落、新アプリ v1 の未知キー、未知 enum は単純規則どおり。初回出荷 v1 fixture を保持。 |
+| 状態 owner | still_bottom_chrome 全到達状態と不正状態、複合キー欠落による 3 値保持。ファイルで独立 bool キーを偽造しても不変。loop と archive の enum/互換 mirror の通し。Default の Legacy は export で Ask、旧 mirror=true の Legacy は Convert として出力し、import の Legacy は無視。 |
+| ファイル保存 | 一時 data-dir 外の tempfile へ書いて読める。既存 export に対する write/置換失敗で既存ファイル保持、通知あり。失敗 cleanup を再帰 recovery にしない。 |
+| 非同期 lifecycle | job 二重開始なし、処理中の OK/Cancel/×/Enter/Escape 無効、spawn失敗・channel切断で Idle に戻り通知、state drop の結果が次の PreferencesState に届かない。App/DB を worker が所有しない。 |
+| draft / 実際の OK | 既存 PreferencesTestApp と handler-level/headless UI を利用 (`preferences.rs:3619`、`:3692` の整理先テストが precedent)。取込直後の live / DB 不変、OK → install → save_checked → DB 再読込 → 環境設定再 open で同値。Cancel は import と既存手編集を破棄。export は draft の変更を含み live を確定しない。 |
+| 別 data-dir 往復 | TempDir A/B に独立 DB を用意。A の対象を export、B は異なるパス・整理先・フォント・Susie/VST/LUT・操作共有・利用データを持たせ import→OK→save→再読込。対象だけが A に一致し B の対象外が保持される。global data-dir を使う試験は既存 guard / 直列化を使い APPDATA に触らない。 |
+| 利用データ / 全設定の通し | ★・編集・本棚・タグ・コレクション・履歴・読書位置・normalize 等の DB と cache 行を B に用意し、import で削除/変更されないこと。read-only 比較と既存の fixture API を使う。reading_history_limit 不変で prune なし、clear_requested/インストール要求なし。対象設定による既存表示 cache の失効は別 assertion。 |
+| 標準/専用値・再生 | お気に入り overlay 適用中に export は標準値だけ。import→OK で標準だけ更新、favorite の専用値/記録と live 再生位置・音声トラック更新を維持。Dedicated 切替は既存 A→C 複製を検証し他列を reset しない。 |
+| 共有 / 回帰 | keymap、ring、menu、context menu、gamepad は出力にも setter にもない。既存操作共有テストを再利用。通常画像/ZIP/PDF/動画、main/detached/Remote の設定反映は既存 OK の検証を再利用し、import 固有の経路がないことを確認。 |
+| UI / IME | 全体設定の新欄、結果/不正一覧、処理中状態の snapshot。既定幅/狭幅、明暗テーマ、長いメッセージの折返し。IME fake-input で変換確定が OK/取り込み/キャンセルを起こさない。既存 EXIF 入力をついでに変更しない。 |
+
+実行順は純粋 `cargo test -p mimageviewer --lib settings_transfer`、関連 preferences/
+settings/operation_customize_share の狭い filter、core check、fmt / glyph check、
+共有 OK 経路と多数の設定を扱うため最終 `.\scripts\test-full.ps1`。
+cold compile は 10 分以上、broad/full test は 15 分以上の実行枠を確保する。
+有効な既存結果を再利用し、変更がない領域の検証を重ねない。
+その後、実装時には `.\scripts\build-dev.ps1` で確認用 core を用意する。
+**本設計書作成段階では cargo / build / 製品起動を実施しない。**
+
+### 6.2 後の対話検証と更新する文書
+
+実アプリ確認は別の承認済み検証枠に残す。具体的な予定は disposable portable / 独立
+A/B data-dir とテスト画像のみで 10–15 分、ファイルダイアログ・環境設定の画面確認、
+import→Cancel / import→OK→再起動、暗/明テーマ・狭幅、IME 中の Enter/Escape。
+デスクトップ/input を使う承認を得てから prepare-portable-smoke.ps1 のコピーだけを起動する。
+実データ・通常 APPDATA を agent が起動・変更しない。
+
+実装後のユーザー向け handoff は
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常 APPDATA を使い設定/データを更新し得ること、共通 single-instance mutex のため
+インストール済み/トレイ常駐の mIV を先に終了することを伝える。
+別 data-dir 往復、import の確認・OK/Cancel、対象外の整理先/操作設定保持を確認項目にする。
+実機結果や独立レビューの完了を、未実施のまま済みと記録しない。
+
+実装時の文書更新先:
+
+- `docs/spec.md` §8: 対象の境界、draft/OK、ファイル形式・互換・不正項目の規則。
+- `docs/architecture-overview.md`: 変換モジュールと PreferencesState ownership、
+  永続化ストア一覧に利用者指定の JSON (正本 DB ではない) を追加。
+- `docs/README.md` と本書: 索引、確定判断、実装/検証/独立レビューの記録。
+- `htdocs/mimageviewer/manual/settings.html`: 「全体設定 → 設定の持ち運び」の操作、
+  未確定値の export、import 後の OK/Cancel、非対象、操作カスタマイズ共有への案内。
+- `htdocs/mimageviewer/index.html` と `privacy.html`: §5 の同一事実を同時更新。
+- `docs/keymap-spec.md`: ボタン操作・dialog helper の固定入力を必要な範囲で記録。
+  新規 KeyAction / keymap.ini の変更は不要。
+- backlog §1.317 は検収後に既存運用で整理する。今回は消さない。
+
+マニュアル・製品ページには「vX で追加」等の版固有記述を置かない。
+JSON の形式版は技術仕様の本書/spec に記録する。実装・独立レビューは別 context で、
+範囲と不変条件を本書から渡す。検証結果の所有は実装担当、検収は設計担当。
+
+## 7. 利用者・設計担当の判断事項 (推奨案)
+
+この段で回答待ちにせず、以下の推奨案を設計担当へ返す。既存機能を削除・制限する
+製品変更は提案しておらず、転送する初期範囲についての判断である。
+
+| 判断 | 推奨案 / 代案とコスト |
+| --- | --- |
+| 現在の draft を書き出すか | draft を出す。未確定も含むと表示。確定済み値だけにする案は画面で見ている値とファイルが違うため採らない。 |
+| CPU/GPU/AI/キャッシュ tuning | §2 表の手動並列数・先読み・容量・backend 等は一組で除外。AI 利用範囲 ai_feature_mode は閲覧機能の選択として含め、性能注意は既存 UI で確認できる。tuning まで移すなら移行先性能の影響と対象分類を再検討する。 |
+| 接続・自動通信 | Remote 全関連値と update_check_enabled は除外して移行先を保持。「取り込みで自動的に通信を有効化しない」を簡単に守る。更新確認まで移す代案は通信 opt-in の扱いを別途説明する必要がある。 |
+| 起動フォルダのモードだけ移すか | パスと一組で除外。Specific だけ載せると移行先の古い specific path が採用されるので、部分移行をしない。 |
+| 履歴保持件数 | 除外。取り込みの OK が移行先の履歴を prune しない。含める代案は「既存履歴が減る」仕様の明示承認が必要で、保存経路に import 専用例外を足す案は推奨しない。 |
+| EXIF 非表示タグ | 任意文字列を含むため field 全体を初期除外。組込みタグだけ移す代案は custom tag を保持して既知 subset だけ合成する仕様/検証が増える。全任意文字列の無検証転送は採らない。 |
+| 画像拡張子の優先順 | 組込み候補の完全な順序だけ含める。不正/追加候補があれば field 全体を省いて知らせる。Susie 固有候補まで移す案はインストール依存になり初期要件から外れる。 |
+| 動画下部バー・ストリップ固定 | 2 フィールドとも初期除外。固定 ON が scope 外のストリップ state を復元するため。含めるなら既存 setter のこの付随変更を仕様上許容するか判断し、scope 外の既存値保持に例外を明記して回帰を追加する。状態を直接書き換えて setter を迂回する案は採らない。 |
+| デインターレース | 移行先で性能を見て選ぶ tuning として除外。見え方の好みとして含めたい場合は enum の export 1 行とテストを追加できる。 |
+| 未来の形式版 | 同じ v1 の未知項目は無視、破壊的な未来 v2 は全体拒否。未来版を読み取れる限り読む案は意味変更の推測を要するので採らない。 |
+| 結果確認 / 不正 / まれな失敗 | 正常値だけ draft に載せ、不正項目一覧を見て OK または Cancel。書込み/全体読込失敗は通知して転送の設定変更なし。DB 保存失敗は既存通知に委ねる。backup世代選択・途中保存・rollback・retry・journal は追加しない。 |
+| ファイル保存 | 同じ親の temp → 一度だけ既存 atomic replace helper。既存共有と同じ UI に揃えつつ、既存 export の truncate は避ける。失敗時の temp cleanup は best-effort、追加 recovery は設計しない。 |
+
+受入条件は、(1) 全フィールドの分類 gate、(2) 個人情報・パスが出力されない、
+(3) 対象外と利用データを保持、(4) draft → 既存 OK の一経路、
+(5) 壊れた入力/未来の破壊的形式は変更なし、(6) 通信・自動有効化を増やさない、の六点。
+実装指示へ進む前に、上記の初期除外と既存 OK の明示した導出副作用を設計担当が検収する。
