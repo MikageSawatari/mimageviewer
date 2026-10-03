@@ -67,7 +67,8 @@ mIV の音声経路へ組み込み、エフェクト処理とビジュアライ�
 ## 2. 構成
 
 ```
-decode → normalize → [ユーザー VST3 チェーン: dsp_bridge] → [EffeTune: 専用 bridge]
+decode → normalize → [ユーザー VST3 チェーン: dsp_bridge] → [任意の EffeTune 前段リミッター]
+       → [EffeTune: 専用 bridge]
        → 手動ブースト → 安全リミッター → 出力
 ```
 
@@ -140,6 +141,7 @@ enum EffetuneFailure {
 - 終了時の `flush_silence` を EffeTune 段にも行う。
 - **遅延 (PDC)**: チャンクごとに「実際に適用した段」の遅延だけを合算して記録する。
   - プラグイン遅延の合計 = ユーザーチェーン (適用時) + EffeTune (適用時)。
+    §13 の前段 limiter を通した場合はその実遅延も PDC へ加算する。
   - **2 秒上限はプラグイン遅延の合計に掛ける** (リミッター・time stretch の遅延は上限の外)。
     優先順位は **ユーザーチェーン優先**。ユーザーチェーンは既存どおり自分の中で上限を守る。
   - EffeTune 段を **適用する前に** 「ユーザーチェーンの遅延 + EffeTune の現在の遅延」を確認し、
@@ -887,3 +889,80 @@ EffeTune の controller が持つ bridge) をそのまま使う**。
   これにより切り替えが素通しの一時停止 seek へ変わらず、旧表示フレームの位置へ戻らない。
 - §12.9 の旧 P5 の保持 player 再 seek テストは廃止。取得 barrier の全 viewer close テストと、
   player 破棄後も残る pump permit が返るまで Remote の最初の host 操作を待つ調停者テストで確認する。
+
+
+## 13. 2026-10-04 v4.3.0 リリース前: EffeTune 入力のピーク保護
+
+### 原因・承認済み仕様
+
+利用者の 2 台で、加工なし・音量 100% の AAC 音楽動画でも Level Meter が OVERLOAD を表示。
+デコード後 sample peak は +2.04 / +2.10 dBFS。mIV は f32 をそのまま渡し、Mixwright
+v0.11.1 の meter は `|sample| > 1.0` を検出する（true peak ではない）。ユーザーの
+Pro-L 2 を前段で有効にすると消えるため、EffeTune 入力の sample peak が原因。
+利用者承認に従い、音量を全体的に下げる pre-gain は加えず、ユーザー VST3 後・EffeTune 前に
+独立 SafetyLimiter（0 dBFS、5 ms、100 ms release、ceiling へ clamp）を追加。
+既存最終 limiter は順序・有効化条件・HUD 通知を維持する。前段の低減で HUD は点灯させない。
+
+### 所有境界・単純化・遅延
+
+- `EffetuneInputLimiter` は各 local pump / clockless processor が所有し、scratch にコピーして処理。
+  原本は `compose_samples` の fallback 用に保持。成功時だけ前段 + EffeTune latency を採用し、
+  failure / Ok(false) / 無効 / admission 不成立 / permit なしでは原本とユーザー側 latency を維持。
+- admission は従来の plugin 合計 2 秒という契約を維持。前段 5 ms は最終 limiter 同様に上限外。
+  PDC には実際の lookahead frame 数 / sample rate を足す（44.1 kHz の丸めも一致）。
+- local seek serial 更新、段の非適用、EffeTune generation 変更、最終 limiter reset に合わせて前段を reset。
+  Remote は seek serial 変更と非適用で reset、新 worker / generation は初期 state から開始。
+- 簡素化を検討: 再生中の設定反映に新しい atomic / 遅延切り替えを足す代わりに、既存の開始時
+  snapshot を採用。`effetune_pre_limiter_enabled` は player 作成 / Remote 配信受付時に取り、
+  Remote の seek・画質変更世代では維持。画面を閉じて開き直す／配信終了後の再開で反映する。
+  pause/resume・既存 player の再利用では変えない。新再生の limiter は必ず空で始まる。
+- 独立設計レビュー（GPT-6.1 Sol / xhigh）: ACCEPT、blocking finding なし。
+
+### 設定・UI・経路確認
+
+既定 ON、serde `default_true`。settings_db は残り全 field を settings_kv へ保存するため
+schema / allow-list 変更不要。runtime 所有の GUI rect と異なり preferences-owned field とし、
+`overwrite_non_preferences_from` に加えない。動画ページに音響調整節を追加し portable の描画と検索を除外。
+ラベル案: 「EffeTune に渡す前に 0dB を超える音を抑える」。説明は全体音量を下げないこと、
+可視化時の OVERLOAD、OFF と最終出力保護、閉じて開き直す／配信再開の反映時点。
+
+確認した producer / consumer:
+- `App::local_audio_dsp_chain` → 動画 builder / 音楽 builder → `audio.rs` pump（動画の音声表示モードも同じ）。
+- Remote 動画 / 音楽 → `remote_clockless_audio_processing` → shared bridge adapter → `ClocklessAudioProcessor`。
+- RemoteHeadless metadata player は音声 DSP chain を持たず、配信は clockless worker のみが処理。
+- `SharedEffeTuneProcessor` の process は上記 clockless consumer 経由のみ。
+- 終了時の `flush_silence` はゼロ入力で、メディア音声の迂回経路ではない。
+
+### 検証記録
+
+本 worktree の未コミット差分で実施（製品 exe は起動していない）:
+
+| コマンド / 対象 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/prelimiter-check.log` |
+| 同上 `--features portable` | exit 0 | `target/prelimiter-check-portable.log` |
+| `cargo test -p mimageviewer --lib effetune_pre_limiter` | 7 passed / exit 0。設定 UI→checkbox→OK→保存→再読込→local consumer / Remote admission、上限、OFF、遅延、reset | `target/prelimiter-unit.log` |
+| 同上 `video::audio::tests` | 52 passed / exit 0 | `target/prelimiter-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 33 passed、実ホスト profile 用 1 ignored / exit 0。前段 ON の AAC fallback 連続性も確認 | `target/prelimiter-clockless.log` |
+| 同上 `effetune::composition::tests` | 3 passed / exit 0 | `target/prelimiter-compose.log` |
+| 同上 `settings_db::tests` | 120 passed / exit 0 | `target/prelimiter-settings-db.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 60 passed / exit 0 | `target/prelimiter-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | `target/prelimiter-glyphs.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+
+追加した画像は `preferences_effetune_input_limit_dark.png` のみ。既存画像は変更せず、
+新規画像の日本語・行の収まりを目視確認した。AAC fixture は前段＋最終＋plugin 遅延を
+先頭 block 内に収めるため 512→1024 frames とし、既存の部分 trim 検証の意味を維持。
+独立完了レビューも ACCEPT（文書の encoding 指摘は修正して再確認済み）。
+
+`test-full.ps1` は vendor の `mimageviewer-vst3-host.exe` を起動する handler test を含むため、
+利用者の `mimageviewer*.exe` 起動禁止に従い未実施。全体 gate と実機の Level Meter / A/V sync / seek / OFF / Remote 確認は
+リリース担当の検証枠に残す。
+
+確認用 build は `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功（exit 0、
+normal feature set / dev-runtime、core 9m36s、Remote / EPUB worker も成功、VCRT PE check は runtime=4 / pe=3）。
+初回は turbojpeg-sys の並列 MSBuild が失敗したため、当該依存を単一ジョブでビルド後、
+今回の invocation のみ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を指定した。
+設定ファイル・build script は変更せず、コマンド終了時に env を元へ戻した。
+`target/dev-runtime/mimageviewer-core.exe` を利用者確認用に用意し、起動はしていない。
+この normal build は既定で実利用中の `%APPDATA%/mimageviewer` を使う。

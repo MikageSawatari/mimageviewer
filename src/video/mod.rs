@@ -12693,6 +12693,7 @@ mod tests {
             AudioDspChain {
                 user: None,
                 effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                effetune_pre_limiter_enabled: true,
                 coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
             },
             true,
@@ -12940,6 +12941,7 @@ mod tests {
             AudioDspChain {
                 user: None,
                 effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                effetune_pre_limiter_enabled: true,
                 coordinator: std::sync::Arc::clone(&coordinator),
             },
             true,
@@ -13607,6 +13609,7 @@ mod tests {
             AudioDspChain {
                 user: None,
                 effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                effetune_pre_limiter_enabled: true,
                 coordinator,
             },
             false,
@@ -13665,6 +13668,7 @@ mod tests {
                 AudioDspChain {
                     user: None,
                     effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                    effetune_pre_limiter_enabled: true,
                     coordinator: std::sync::Arc::clone(&coordinator),
                 },
                 true,
@@ -13716,6 +13720,7 @@ mod tests {
             AudioDspChain {
                 user: None,
                 effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                effetune_pre_limiter_enabled: true,
                 coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
             },
             true,
@@ -13760,6 +13765,7 @@ mod tests {
             AudioDspChain {
                 user: None,
                 effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                effetune_pre_limiter_enabled: true,
                 coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
             },
             false,
@@ -13791,6 +13797,7 @@ mod tests {
             AudioDspChain {
                 user: None,
                 effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                effetune_pre_limiter_enabled: true,
                 coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
             },
             false,

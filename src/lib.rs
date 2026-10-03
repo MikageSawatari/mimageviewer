@@ -270,6 +270,7 @@ mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
 mod ui_sns_split;
+pub use ui_dialogs::preferences::draw_effetune_input_limit_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;
 #[doc(hidden)]

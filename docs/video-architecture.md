@@ -1763,6 +1763,18 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 短い park 後の `Buffering` 中でも stale audio frame が `audio_tx` を塞ぎ続けない。
 
 #### `audio.rs`
+
+- EffeTune 適用時の DSP 順序は normalize → ユーザー VST3 → 任意の EffeTune 前段
+  SafetyLimiter → EffeTune → 既存の boost / 最終 SafetyLimiter → 出力音量。
+  前段は別 instance の ceiling 0 dBFS / lookahead 5 ms / release 100 ms で、
+  `effetune_pre_limiter_enabled`（既定 ON）を再生開始時に取得する。音楽も同じ pump、
+  Remote 動画・音楽は `ClocklessAudioProcessor` が同じ順序で処理する。
+  原音を保持した scratch だけを制限するため、EffeTune 失敗時はユーザー VST3 後へ戻り、
+  前段・EffeTune の遅延をともに除外する。成功時だけ前段の実サンプル数による遅延を PDC に加算。
+  2 秒 admission は従来どおり plugin のみ（両 limiter と stretch は上限外）。
+  seek / 非適用 / EffeTune 世代変更では前段 delay を reset。Remote 世代ごとの再作成も初期化する。
+  HUD ピーク表示は最終 limiter のみ。詳細と検証記録は `effetune-integration-plan.md` §13。
+
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
 - AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)

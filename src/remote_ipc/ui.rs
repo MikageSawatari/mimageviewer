@@ -1288,7 +1288,7 @@ impl crate::app::App {
         })
     }
 
-    fn remote_clockless_audio_processing(
+    pub(crate) fn remote_clockless_audio_processing(
         &self,
         normalize_gain: f64,
     ) -> crate::video::clockless_transcode::ClocklessAudioProcessing {
@@ -1336,6 +1336,7 @@ impl crate::app::App {
                 user_warning,
                 effetune_warning,
             )
+            .with_effetune_preferences(&self.settings)
         }
     }
 

@@ -1059,6 +1059,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "リモート端末への動画配信を有効にする",
         ["リモート", "remote", "配信", "ストリーミング"]
     ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-input-limit",
+        Video,
+        "EffeTune に渡す前に 0dB を超える音を抑える",
+        ["音響調整", "OVERLOAD", "ピーク", "EffeTune"]
+    ),
     entry!(
         "video/normalize-cache",
         Video,
