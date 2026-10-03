@@ -31,6 +31,24 @@
   },
   {
     "operation": "replace_paragraph",
+    "anchor": "既存の `.effetune_preset` ファイルの読み込み、書き出し、共有は、引き続きエフェクトチェーン全体のプリセットとして機能します。",
+    "replacement": "既存の `.effetune_preset` ファイルは、EffeTune の窓へドラッグ＆ドロップすると読み込めます。mImageViewer の EffeTune では、現在のチェーンを `.effetune_preset` ファイルとして書き出すことはできません。名前を付けて残すには **パイプラインプリセット** の **保存**、保存済みデータをファイルにまとめるには **設定 > バックアップ / 復元** を使います。チェーンを URL で共有するには、**Effect Pipeline** エリアの右上にある **共有** ボタンを押します。現在選択しているチェーンの設定を含む EffeTune Web アプリの URL がクリップボードへコピーされます。",
+    "reason": "VST onExportPreset is eventNoop (vst-bootstrap.js:354). Preset drops are loaded by ui/pipeline/ui-event-handler.js:469-520, named saves by ui/pipeline/preset-manager.js:213-240, backups by vst-bootstrap.js:192-224, and URL sharing by ui-manager.js:1389-1406."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "起動時はパイプラインAのみが読み込まれ、パイプラインBは必要に応じて作成されます",
+    "replacement": "初回はAのみがあり、パイプラインBは必要に応じて作成されます。次回以降の起動時は、保存されたA/B両方の内容と、どちらを選択していたかが復元されます",
+    "reason": "app.js:914-995 restores saved pipelineA, pipelineB and currentPipeline; app.js:1059-1065 assigns B and restores the selection instead of always choosing A."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "デフォルトで「A」を表示（パイプラインAがアクティブ）",
+    "replacement": "初回は「A」を表示します。次回以降は、復元された選択状態に応じて「A」または「B」を表示します",
+    "reason": "app.js:1070 refreshes the toggle after restoring currentPipeline; ui-manager.js updatePipelineToggleButton displays audioManager.currentPipeline."
+  },
+  {
+    "operation": "replace_paragraph",
     "anchor": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果を、ウェブ版、デスクトップ版、ブラウザ拡張の間で移行できます。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットに必要なデータも選択されます。必要なデータの選択を外すと、それを使うプリセットも選択から外れます。",
     "replacement": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果をバックアップまたは復元できます。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットに必要なデータも選択されます。必要なデータの選択を外すと、それを使うプリセットも選択から外れます。",
     "reason": "Native backup/export is implemented in vst-bootstrap.js:190-224; remove platform migration claims."
