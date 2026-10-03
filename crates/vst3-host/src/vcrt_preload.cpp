@@ -68,7 +68,8 @@ bool preload_vcrt() {
         // until process exit. All dependencies are already explicitly selected;
         // restrict any remaining lookup to System32, never CWD/PATH/legacy host.
         for (size_t index = 0; index < names.size(); ++index) {
-            const auto path = directory / names[index];
+            // Plugins can also inspect the filenames of preloaded CRT modules.
+            const auto path = loader_path_from_utf8(path_to_utf8(directory / names[index]));
             const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
             if (!module) {
                 const DWORD error = GetLastError();

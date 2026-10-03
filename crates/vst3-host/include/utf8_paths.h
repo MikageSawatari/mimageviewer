@@ -62,6 +62,24 @@ inline std::filesystem::path path_from_utf8(std::string_view text) {
 inline std::string path_to_utf8(const std::filesystem::path& path) {
     return utf16_to_utf8(path.native());
 }
+// Loader paths are observable by plugins through GetModuleFileNameW. Prefer
+// normal absolute Win32 syntax below MAX_PATH (UTF-16 units, excluding NUL):
+// plugins may append forward-slash asset names, which fail under \\?\ syntax
+// (EffeTune missing-assets, v4.3.0). Host-only inspection keeps extended paths.
+inline std::filesystem::path loader_path_from_utf8(std::string_view text) {
+    const auto extended = path_from_utf8(text).native();
+    std::wstring normal;
+    if (extended.rfind(LR"(\\?\UNC\)", 0) == 0)
+        normal = LR"(\\)" + extended.substr(8);
+    else if (extended.size() >= 7 && extended.rfind(LR"(\\?\)", 0) == 0 &&
+             ((extended[4] >= L'A' && extended[4] <= L'Z') ||
+              (extended[4] >= L'a' && extended[4] <= L'z')) &&
+             extended[5] == L':' && extended[6] == L'\\')
+        normal = extended.substr(4);
+    // Other device namespaces have no equivalent drive/UNC form.
+    if (!normal.empty() && normal.size() < MAX_PATH) return std::filesystem::path(normal);
+    return std::filesystem::path(extended);
+}
 inline std::filesystem::path bundle_binary_path(std::string_view text, std::string_view architecture) {
     const auto bundle = path_from_utf8(text);
     return bundle / L"Contents" / std::filesystem::path(utf8_to_utf16(architecture)) / bundle.filename();

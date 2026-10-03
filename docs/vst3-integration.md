@@ -232,6 +232,33 @@ System32の全4本が存在・版数読取可能で各DLLのfile versionが同�
 Windows SDK hosting moduleは `crates/vst3-host/src/sdk/` のMIT原文付きcopyを使い、IPCのUTF-8
 pathを明示的にUTF-16へ変換してwide APIでload／探索する。ACP manifestは変更しない。
 directory checkはNotFound以外のerrorを報告して停止し、Win32へnative backslash pathを渡す。
+2026-10-03 v4.3.0 release checkではEffeTuneのmissing-assets画面を調査し、pluginから観測できる
+load pathを `loader_path_from_utf8` に統一した。通常Win32絶対形式 (`C:\...` / `\\server\share\...`) の
+長さがMAX_PATH (260、NULを除くUTF-16単位) 未満なら通常形式、260以上だけ `\\?\` / `\\?\UNC\` を使う。
+入力のforward slashはbackslashへ正規化し、日本語・emojiとstrict UTF-8変換を維持する。
+host内の探索・bundle検査・resource検査は従来どおり拡張形式を使う。EffeTuneはlauncherが
+最深file pathの260以上を公開前に拒否するため、plugin binaryのloadは必ず通常形式となる。
+
+非製品の専用DLLによる回帰テストで、`LoadLibraryW` の拡張pathを `GetModuleFileNameW` がそのまま返すこと、
+存在するassetに `/css/effetune.css` を付加すると通常pathの `GetFileAttributesW` は成功し、拡張pathは
+ERROR_INVALID_NAME (123) になることを確認した。EffeTune PEは両APIをimportし、fallback HTMLと
+forward slash付きasset名を含む。ただしplugin内部のasset root組立てと実機UI復旧は推定／未確認であり、
+signed v4.3.0の完全bundleから音響調整を開くrelease確認を必要とする。製品／pluginはこの調査では起動しない。
+
+path境界の監査範囲:
+
+- package／legacy DLL load (`src/sdk/module_win32.cpp`) は最終binary pathへ上記規則を適用。
+- CRT preload (`src/vcrt_preload.cpp`) もpluginがmodule filenameを観測可能なので同じ規則を適用。
+  選択元・依存順・System32限定の依存検索は維持する。
+- probe／通常load／chain追加はすべて `Module::create` を通る。
+- `IHostApplication` はhost名と空のmessage／attribute listを返すのみ。component／controllerのinitialize、
+  factory host context、editor attachにはpathを渡さない。state／presetは `MemoryStream` のopaque bytesでpath属性なし。
+- module discovery／`Module::getPath`、moduleinfo、bundle validation、snapshot／PNGはhost側の情報でpluginへ渡さない。
+  IPC shared-memory名もfilesystem pathではない。その他のplugin向けbundle／resource path APIは実装していない。
+
+`ctest --test-dir crates/vst3-host/build -C Release --verbose` は `vst3-path-boundaries` を実行し、
+日本語＋emoji、短いlocal／UNC、slash正規化、259／260境界、長いlocal／UNC、strict変換、
+専用DLLの短い通常／拡張loadと長い拡張loadを検査する。`gui_visibility.cpp` はbuild時のstatic_assert検査。
 host PE内のsourcehash markerを現在のCMakeLists／include／src／testsと照合する。releaseは古いAPPDATA等の
 hostをimportせず、現vendor hostが一致しなければCMakeで再buildする。bare cargo releaseにも同じgateがある。
 state／presetデータはopaque bytesでありhostによるnarrow pathファイル操作はない。

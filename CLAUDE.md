@@ -1190,6 +1190,9 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 
 Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
 明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
+2026-10-03 v4.3.0 release check: pluginが観測するmodule／CRT load pathは、通常絶対pathが
+260 UTF-16単位未満なら通常Win32形式、260以上だけ拡張形式にする。host内FS検査は拡張形式を維持する。
+`GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
 現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
 identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
