@@ -29,6 +29,12 @@
 
 ## 1. 優先候補
 
+### 1.321 search_metadata_e2e が全体テストの負荷下で「初回スキャンを 10 秒待っても終わらない」と 9 件そろって落ちる — build-dist 記録 (2026-10-03)
+
+- 観測: v4.3.0 の 3 回目の配布ビルド (master a924081e5/ebb86ebb7) の全体テストで、`tests/search_metadata_e2e.rs` の 9 件が `tests/common/mod.rs:294` の `wait_until timed out after 10s: initial scan for favorite ...` で同時に失敗。同じファイルを単独で回すと 14 件すべて 6 秒で通った。1 時間前の配布ビルド (6b2bc99c9) でも通っていた。差分は告知と文書だけで、索引の処理は変えていない。
+- 推測: 全体を並列で回しているときの負荷で、固定 10 秒の待ちが足りない。待ちを伸ばすだけで済ませず、どの段階で待っているか (スキャン開始・走査・commit) を記録して原因を確かめる。
+- v4.3.0 では、この 9 件以外の全テストが通っていたこと、単独で通ることを確認したうえで、`-SkipRustTests` で配布物を作り直した (例外扱い)。
+
 ### 1.320 検索結果の取り込み中に UI とサムネイル処理がそろって約 0.8 秒止まる — perf smoke (2026-10-03)
 
 - 観測: v4.3.0 配布前の perf smoke 1 回目 (利用者操作、release build 6b2bc99c9)。Ctrl+G 検索の結果を受け取っている最中の frame n=1843 で update 844 ms、うち OtherWorkerPolls 817.6 ms。thread cycles は約 14 ms 分しかなく、UI スレッドは計算せず待っていた。同時刻にサムネイル worker 8 本が `load_phases` の unaccounted 791〜822 ms (decode 本体は 19〜40 ms)、perf イベント全体にも約 801 ms の空白がある。ログ: `target/release-verification/v4.3.0-perf_smoke-perf_events.jsonl`。
