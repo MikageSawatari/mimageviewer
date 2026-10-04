@@ -525,6 +525,7 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) item_identity: String,
     pub(crate) selected_item_identity: String,
     pub(crate) page_ready: bool,
+    pub(crate) edit_ready: bool,
     pub(crate) viewport_rendered: bool,
     pub(crate) viewport_revision: u64,
     pub(crate) paint_matches_current_page: bool,
@@ -676,6 +677,7 @@ impl TestScriptWindowSnapshot {
             self.selected_item_identity.clone().into(),
         );
         map.insert("page_ready".into(), self.page_ready.into());
+        map.insert("edit_ready".into(), self.edit_ready.into());
         map.insert("viewport_rendered".into(), self.viewport_rendered.into());
         map.insert(
             "viewport_revision".into(),
@@ -8348,6 +8350,7 @@ mod tests {
             item_identity: item.to_string(),
             selected_item_identity: String::new(),
             page_ready: true,
+            edit_ready: true,
             viewport_rendered: false,
             viewport_revision: 0,
             paint_matches_current_page: false,
@@ -8362,6 +8365,17 @@ mod tests {
             seek_strip: TestScriptSeekStripSnapshot::closed(),
             audio_track: TestScriptAudioTrackSnapshot::absent(),
         }
+    }
+
+    #[test]
+    fn preview_readiness_and_developed_edit_readiness_are_distinct_in_script_snapshot() {
+        let mut snapshot = window_snapshot(window_identity(7, 11, 13), 17, 2, "camera.dng");
+        snapshot.edit_ready = false;
+        let map = snapshot.to_rhai_map();
+        assert!(map["page_ready"].as_bool().unwrap());
+        assert!(!map["edit_ready"].as_bool().unwrap());
+        snapshot.edit_ready = true;
+        assert!(snapshot.to_rhai_map()["edit_ready"].as_bool().unwrap());
     }
 
     #[test]

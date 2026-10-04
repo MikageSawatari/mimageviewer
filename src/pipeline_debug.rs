@@ -300,6 +300,9 @@ impl App {
                     page.push_missing("00_fs_raw", "animated current frame pixels are missing");
                 }
             }
+            Some(FsCacheEntry::RawPreview { .. }) => {
+                page.push_missing("00_fs_raw", "RAW development pending");
+            }
             Some(FsCacheEntry::Failed) => {
                 page.push_missing("00_fs_raw", "fs_cache is Failed");
             }

@@ -1604,6 +1604,7 @@ mod tests {
             item_identity: item_identity.to_string(),
             selected_item_identity: String::new(),
             page_ready: true,
+            edit_ready: true,
             viewport_rendered: true,
             viewport_revision: 1,
             paint_matches_current_page: true,

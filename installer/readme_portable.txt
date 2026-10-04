@@ -67,6 +67,9 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   models\                         AI 用モデル
   LICENSE-ffmpeg.txt              FFmpeg のライセンス本文
   UNRAR-LICENSE.txt               UnRAR のライセンス本文
+  LIBRAW-LICENSE.txt              RAW 表示・現像のライセンス本文
+  ZLIB-LICENSE.txt                zlib のライセンス本文
+  LIBJPEG-TURBO-LICENSE.txt        libjpeg-turbo のライセンス本文
   egui-LICENSE-MIT.txt            egui の MIT ライセンス本文
   egui-LICENSE-APACHE.txt         egui の Apache-2.0 ライセンス本文
   readme.txt                      このファイル
@@ -98,9 +101,16 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
 追加ソフト: EPUB の変換には Microsoft Edge WebView2 Runtime が必要です。
           Windows 11 には標準で含まれています。
 
+RAW は追加インストールなしで表示・現像できます。
 AI 機能は DirectML（Microsoft 公式、Windows 11 標準同梱）を、
-HEIC / AVIF / JPEG XL / RAW 表示は Windows Imaging Component（WIC）を
-利用します。いずれも Windows 11 に標準で含まれています。
+HEIC / AVIF / JPEG XL 表示は Windows Imaging Component（WIC）を
+利用します。いずれも Windows 11 に標準で含まれていますが、画像形式に
+応じて Microsoft Store から次の追加機能が必要な場合があります:
+  - HEIC / HEIF: HEIF 画像表示オプション
+    HEIC は、HEVC に対応していない PC では HEVC ビデオ拡張機能も必要です。
+    HEVC ビデオ拡張機能は有料の場合があります。
+  - AVIF: AV1 ビデオ拡張機能
+  - JPEG XL: JPEG XL 画像表示オプション
 
 本ソフトウェアが外部と通信するのは次の場合だけです。利用状況の送信・
 広告・アカウント登録は一切ありません。画像・動画そのものを外部へ送る
@@ -130,7 +140,14 @@ HEIC / AVIF / JPEG XL / RAW 表示は Windows Imaging Component（WIC）を
   - PDFium (BSD-3-Clause): Google Chrome の PDF エンジン
   - ONNX Runtime (MIT): Microsoft
   - DirectML (Microsoft 独自ライセンス): Microsoft
-  - libjpeg-turbo (BSD-3-Clause / zlib)
+  - LibRaw (CDDL-1.0): LibRaw LLC
+    ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
+    対応ソース: https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz
+  - zlib 1.3.1 (zlib): Jean-loup Gailly and Mark Adler
+    ライセンス全文: ZLIB-LICENSE.txt
+  - libjpeg-turbo (IJG / BSD-3-Clause / zlib)
+    ライセンス全文: LIBJPEG-TURBO-LICENSE.txt
+    This software is based in part on the work of the Independent JPEG Group.
   - eframe / egui (MIT OR Apache-2.0): Emil Ernerfeldt and contributors
     同梱の egui-LICENSE-MIT.txt / egui-LICENSE-APACHE.txt を参照してください。
   - FFmpeg (LGPLv3-or-later): FFmpeg project

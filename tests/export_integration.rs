@@ -184,6 +184,7 @@ fn request(
         entries,
         include_metadata: false,
         local_ai_activity: None,
+        raw: None,
     }
 }
 
@@ -684,6 +685,7 @@ fn export_zip_source_no_path() {
         entries: vec![entry("current", 0)],
         include_metadata: true,
         local_ai_activity: None,
+        raw: None,
     };
     let events = collect(spawn_export_worker(export).unwrap());
 
@@ -727,6 +729,7 @@ fn export_zip_di2_orientation_canonical_after_display_rotation() {
         entries: vec![entry("current", 0)],
         include_metadata: true,
         local_ai_activity: None,
+        raw: None,
     };
     let events = collect(spawn_export_worker(export).unwrap());
 
@@ -756,6 +759,7 @@ fn metadata_copy_still_uses_the_original_source() {
         entries: vec![entry("current", 0)],
         include_metadata: true,
         local_ai_activity: None,
+        raw: None,
     };
     export.include_metadata = true;
     let pending = spawn_export_worker(export).unwrap();
@@ -908,6 +912,7 @@ fn batch_export_still_uses_the_shared_composite_writer() {
             local_ai_activity: mimageviewer::LocalAiActivityLease::new(Arc::new(
                 std::sync::atomic::AtomicUsize::new(0),
             )),
+            raw: None,
         },
     )
     .unwrap();
@@ -952,6 +957,7 @@ fn batch_export_keeps_going_after_a_missing_source() {
             local_ai_activity: mimageviewer::LocalAiActivityLease::new(Arc::new(
                 std::sync::atomic::AtomicUsize::new(0),
             )),
+            raw: None,
         },
     )
     .unwrap();

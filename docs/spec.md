@@ -101,6 +101,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 - ZIP / PDF ページと Stack、動画の `CurrentFrame`、見開きの
   `Merged` / `BothPages` / `MainPageOnly` は materializer の実体化対象。
 - 環境設定は左ツリー上部の検索欄で項目名・関連語・ページ名・カテゴリ名を AND 部分一致検索でき、結果を選ぶと該当ページの項目へスクロールして一時的に強調表示する。
+- 環境設定「ファイル処理 → RAW 現像」（「Susie プラグイン」の直後）に「同時現像数」(`raw_develop_parallelism`: 1〜10、既定 3) と「明るさ」(`raw_brightness: RawBrightness`: `MatchPreview` = プレビューに合わせる / `None` = 補正しない、既定 MatchPreview) を置く。「並列読み込み」には通常画像と PDF の設定を置く。検索は RAW・現像・同時現像数・明るさ・プレビューなどから専用ページへ移動する。現像数は executor の変更が成功したときだけ設定へ反映し、途中の worker 起動失敗では以前の上限を維持して画面へエラーを返す。明るさ変更は全 viewer context の RAW 入力を再現像し、サムネイルと非 RAW ページは保持する。未リリース設定なので migration は作らない。
 - v2.7.0では「メタ情報をエクスポート / インポート」を安定化のため一時非表示にしたが、
   v2.8.0の継続開発で再表示する。実フォルダ表示中だけ使用できる。既存の自動
   sidecar `mimageviewer.dat` とは別に、対象フォルダ直下の `mimageviewer.meta.miv`
@@ -1368,15 +1369,26 @@ identity としたまま変換 cache ZIP の先頭画像または内部 pin を�
 | WebP | .webp |
 | BMP | .bmp |
 
+#### RAW（内蔵 LibRaw）
+
+対応拡張子（`src/raw_format.rs` の 23 種）: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS。
+追加の Store 拡張は不要。フルスクリーンは埋め込みプレビューを先に表示し、現像後に
+差し替える。使えるプレビューがなければ現像完了を待つ。編集は現像後に有効になる。
+Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応で、使える埋め込みプレビューのみ表示する。
+拡張子だけでは全カメラ・圧縮方式の現像対応を保証しない。Remote は PC 側でフル現像し、
+表示位置から先読みする。未編集 RAW の製本は元ファイルをそのまま格納し、編集時は焼き込む。
+設定は「ファイル処理 → RAW 現像」（同時現像数 1〜10、既定 3 / 明るさは
+「プレビューに合わせる」既定・「補正しない」）を使う。詳細は §1 の設定と
+[raw-libraw-plan.md](raw-libraw-plan.md) を参照。
+
 #### WIC 経由（Windows Imaging Component）
 
 | フォーマット | 拡張子 | 必要なコーデック |
 |------------|--------|----------------|
-| HEIC / HEIF | .heic, .heif | HEIF 画像拡張機能 |
-| AVIF | .avif | AV1 Video Extension |
-| JPEG XL | .jxl | JPEG XL Image Extension |
+| HEIC / HEIF | .heic, .heif | HEIF 画像表示オプション。HEIC は HEVC 非対応の PC では HEVC ビデオ拡張機能も必要（有料の場合あり） |
+| AVIF | .avif | AV1 ビデオ拡張機能 |
+| JPEG XL | .jxl | JPEG XL 画像表示オプション |
 | TIFF | .tiff, .tif | 標準搭載 |
-| RAW（各社カメラ） | .dng, .cr2, .cr3, .nef, .nrw, .arw, .srf, .sr2, .raf, .orf, .rw2, .pef, .ptx, .rwl, .iiq | Raw Image Extension |
 
 #### 動画（サムネイル表示 + フルスクリーンインライン再生）
 
@@ -2166,7 +2178,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `skip_epub_if_pdf_exists` | bool | true | 同じフォルダに同名の PDF がある EPUB をグリッド・スマートフォルダ・Ctrl+↑↓ の候補から非表示にする。名前の大小文字は区別しない |
 | `skip_image_if_video_exists` | bool | true | 同名動画がある画像をスキップ（画像は動画サムネイルとして使用） |
 | `skip_duplicate_images` | bool | true | 同名で複数拡張子がある画像を優先度でフィルタ |
-| `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先） |
+| `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先）。設定ロード時は、現在の既定リストにある未登録の拡張子を末尾へ補完する（大文字・小文字を区別しない）。既存の順序・表記・独自項目は維持する |
 
 #### 検索クエリ構文（Ctrl+F / Ctrl+G / Ctrl+S 共通）
 
@@ -2599,7 +2611,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - [x] 非ソリッド・入れ子なし・暗号化なし RAR / CBR を UnRAR で直接閲覧。ソリッド・入れ子あり・暗号化 RAR と 7z / LZH は無圧縮 ZIP キャッシュへ変換（分割 RAR は先頭パートのみ表示）
 - [x] 変換メニューから RAR / CBR / 7z / CB7 / LZH / LHA と同じフォルダへ同名 ZIP を明示作成
 - [x] ZIP/PDF ファイルのサムネイル＋バッジ表示（フォルダ一覧で 1 枚目/1 ページ目を表示、キャッシュ対応）
-- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF / RAW）
+- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF）と内蔵 LibRaw による RAW 表示・現像
 - [x] 動画サムネイル（Windows Shell API 経由）
 - [x] アニメーション再生（GIF / APNG / WebP）
 - [x] AppleDouble メタデータファイル自動除外
@@ -2848,6 +2860,7 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 ## 11. セキュリティ方針
 
 - 画像デコードは `image` クレート（純粋Rust・メモリ安全）を基本とする
-- HEIC / AVIF / JXL / TIFF / RAW は Windows の WIC (Windows Imaging Component) 経由でデコード。
+- RAW は他の decoder より先に LibRaw へ振り分け、FFI は `crates/libraw-sys` に局所化。
+- HEIC / AVIF / JXL / TIFF は Windows の WIC (Windows Imaging Component) 経由でデコード。
   WIC 呼び出しは `unsafe` ブロックに局所化（`src/wic_decoder.rs`）
 - NVIDIA NGX 呼び出し部分も `unsafe` ブロックに局所化（Phase 2、未実装）

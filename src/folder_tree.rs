@@ -85,20 +85,21 @@ impl Default for FolderTreeOptions {
 /// 標準サポートする画像拡張子。
 ///
 /// 前半は `image` クレートで直接デコードできる形式。
-/// 後半は WIC (Windows Imaging Component) でデコードする形式で、
-/// 対応コーデックが Microsoft Store からインストールされている必要がある:
+/// 中盤は WIC (Windows Imaging Component) でデコードする形式で、
+/// 対応コーデックが Microsoft Store からインストールされている必要がある。
+/// 末尾のカメラ RAW 形式は LibRaw でデコードする:
 /// - heic/heif → HEIF Image Extensions
 /// - avif      → AV1 Video Extensions
 /// - jxl       → JPEG XL Image Extensions
-/// - cr2/nef/arw 等 → Raw Image Extension
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // image クレートで直接デコード
     "jpg", "jpeg", "png", "webp", "bmp", "gif", // WIC 経由 (モダン形式)
     "heic", "heif", "avif", "jxl",
     // WIC 経由 (TIFF: image クレートも対応するが WIC の方が高機能)
-    "tiff", "tif", // WIC 経由 (カメラ RAW)
+    "tiff", "tif",
+    // LibRaw 経由 (カメラ RAW)。raw_format::RAW_EXTENSIONS と一致させる。
     "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
-    "rwl", "iiq",
+    "rwl", "iiq", "crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos",
 ];
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 

@@ -257,6 +257,172 @@ mod folder_mtime_rescan_tests {
 }
 
 #[cfg(windows)]
+#[test]
+fn latest_seek_during_raw_development_supersedes_waiting_pages_and_promotes_raw() {
+    let mut app = setup_app_for_test();
+    app.items = (0..3)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.fullscreen_idx = Some(2);
+    let owner = app.fs_page_load_context_serial();
+    let scheduler = Arc::new(FsPageLoadScheduler::with_limits(1, 0));
+    app.fs_page_load_scheduler = Arc::clone(&scheduler);
+
+    let fs_ticket = scheduler.request(
+        owner,
+        2,
+        FsPageLoadPriority::Normal,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    drop(fs_ticket.waiter().acquire_cancellable().unwrap());
+    let blocker = scheduler.request(
+        owner + 1,
+        0,
+        FsPageLoadPriority::High,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    let blocker_permit = blocker.waiter().acquire_cancellable().unwrap();
+    let older = scheduler.request(
+        owner,
+        1,
+        FsPageLoadPriority::Normal,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    assert_eq!(scheduler.stats().waiting, 1);
+
+    let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let _raw_blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let (result_tx, _result_rx) = std::sync::mpsc::channel();
+    let raw_ticket = Arc::new(executor.submit_thumbnail_half(
+        crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+        crate::raw::RawPriority::Normal,
+        result_tx,
+    ));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let pending = FsPendingValue::scheduled(fs_ticket, rx, 0, FsLoadPurpose::Prefetch);
+    app.fs_pending.insert(2, pending);
+    let source = RawSourceIdentity {
+        item_key: app.page_path_key(2).unwrap(),
+        path: PathBuf::from("page-2.dng"),
+        size: 1,
+        mtime_ticks: 1,
+    };
+    app.raw_pages.pages.insert(
+        2,
+        RawPageRecord::Page(RawPageState {
+            source,
+            developed_dims: Some([10, 10]),
+            stage: RawInstalledStage::PreviewAbsent,
+            preview: RawPreviewPhase::Absent,
+            develop: Arc::new(Mutex::new(RawDevelopPhase::Submitted {
+                request_id: 1,
+                ticket: Arc::clone(&raw_ticket),
+                brightness: crate::raw::RawBrightness::None,
+            })),
+            preview_started_at: std::time::Instant::now(),
+            develop_started_at: std::time::Instant::now(),
+            presented: RawPresentation::Nothing,
+        }),
+    );
+
+    app.apply_fs_page_load_contract(2, FsPageLoadContract::LatestSeek);
+    assert!(
+        older.is_cancelled(),
+        "LatestSeek must supersede the older waiting page"
+    );
+    assert_eq!(scheduler.stats().waiting, 0);
+    assert_eq!(
+        executor.queued_priority_for_test(&raw_ticket),
+        Some(crate::raw::RawPriority::High)
+    );
+
+    app.discard_fs_page(2);
+    release_tx.send(()).unwrap();
+    drop(blocker_permit);
+}
+
+fn raw_half_followup_for_prune(idx: usize) -> crate::thumb_loader::LoadRequest {
+    crate::thumb_loader::LoadRequest {
+        idx,
+        input_seq: 42,
+        items_gen: 7,
+        raw_source: crate::thumb_loader::LoadRequestSource::RawHalfDeveloped {
+            image: image::DynamicImage::new_rgb8(2, 2),
+            developed_dims: [2, 2],
+            decode_ms: 0.0,
+            folder_selection_proof: None,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
+    let mut app = setup_app_for_test();
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.keep_set = [0, 1].into_iter().collect();
+    app.reload_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(0)]),
+        Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Condvar::new(),
+    )));
+    app.requested.insert(0, false);
+    app.requested.insert(1, false);
+
+    app.install_thumbnail_keep_projection(thumbnail_keep_projection(2, [], [], None, [], []), true);
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 2);
+    assert!(!app.requested.contains_key(&0) && !app.requested.contains_key(&1));
+    let mut canceled = [app.rx.try_recv().unwrap(), app.rx.try_recv().unwrap()].map(|msg| {
+        assert!(msg.canceled && !msg.finalized);
+        assert_eq!((msg.input_seq, msg.items_gen), (42, 7));
+        msg.idx
+    });
+    canceled.sort();
+    assert_eq!(canceled, [0, 1]);
+}
+
+#[test]
+fn grid_queue_prune_counts_queued_raw_followup() {
+    let mut app = setup_app_for_test();
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.image_metas = vec![None; 2];
+    app.visible_indices = vec![0];
+    app.reload_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+    app.requested.insert(1, false);
+
+    app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 1);
+    assert!(!app.requested.contains_key(&1));
+    let msg = app.rx.try_recv().unwrap();
+    assert_eq!((msg.idx, msg.input_seq, msg.items_gen), (1, 42, 7));
+    assert!(msg.canceled && !msg.finalized);
+}
+
+#[cfg(windows)]
 fn send_activation_open_path(app: &App, path: PathBuf) {
     app.activation_open_path_tx
         .send(crate::single_instance::ActivationOpenPath::received(
@@ -9776,6 +9942,7 @@ impl App {
                 crate::settings::SettingsLoadMeta::default(),
                 || {},
                 config.similar_feature_capability,
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
             );
         // 起動時 purge-retry worker はテストハーネスでは既定オフにする。本番の既定は true
         // (app.rs:9667) だが、テストで有効だと `App::update` を回す並列テストがこの worker を
@@ -16622,7 +16789,7 @@ mod phase_c_key_tests {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &cache_map,
             &tx,
             Some(&drive_list_db),
@@ -16637,6 +16804,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             app.folder_thumb_pin_db.as_deref(),
+            None,
             None,
             None,
         );
@@ -16785,7 +16953,7 @@ mod phase_c_key_tests {
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &map,
             &tx,
             Some(&drive_catalog),
@@ -16800,6 +16968,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             Some(pins.as_ref()),
+            None,
             None,
             None,
         );
@@ -16851,7 +17020,7 @@ mod phase_c_key_tests {
         };
         let (writer_tx, writer_rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &writer_request,
+            &mut writer_request.clone(),
             &std::sync::RwLock::new(std::collections::HashMap::new()),
             &writer_tx,
             Some(&parent),
@@ -16866,6 +17035,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             app.folder_thumb_pin_db.as_deref(),
+            None,
             None,
             None,
         );
@@ -16896,7 +17066,7 @@ mod phase_c_key_tests {
         let load = || {
             let (tx, rx) = std::sync::mpsc::channel();
             crate::thumb_loader::process_load_request(
-                &req,
+                &mut req.clone(),
                 &std::sync::RwLock::new(std::collections::HashMap::new()),
                 &tx,
                 None,
@@ -16911,6 +17081,7 @@ mod phase_c_key_tests {
                 &std::sync::Arc::new(AtomicUsize::new(1)),
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );
@@ -17118,7 +17289,7 @@ mod phase_c_key_tests {
             req.items_gen = app.items_generation;
             let (tx, rx) = std::sync::mpsc::channel();
             crate::thumb_loader::process_load_request(
-                &req,
+                &mut req.clone(),
                 map,
                 &tx,
                 None,
@@ -17133,6 +17304,7 @@ mod phase_c_key_tests {
                 &std::sync::Arc::new(AtomicUsize::new(1)),
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );
@@ -17596,7 +17768,7 @@ mod phase_c_key_tests {
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &map,
             &tx,
             Some(&drive_list_db),
@@ -17611,6 +17783,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             Some(pins.as_ref()),
+            None,
             None,
             None,
         );
@@ -17663,7 +17836,7 @@ mod phase_c_key_tests {
         assert!(req.epub_pin_fallback.is_some());
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &std::sync::RwLock::new(std::collections::HashMap::new()),
             &tx,
             None,
@@ -17676,6 +17849,7 @@ mod phase_c_key_tests {
             None,
             &std::sync::Arc::new(AtomicUsize::new(0)),
             &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
             None,
             None,
             None,
@@ -17764,7 +17938,7 @@ mod phase_c_key_tests {
         .expect("drive-list folder pin should create a cache-only request");
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &cache_map,
             &tx,
             Some(&drive_list_db),
@@ -17779,6 +17953,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             app.folder_thumb_pin_db.as_deref(),
+            None,
             None,
             None,
         );
@@ -31933,7 +32108,7 @@ mod favorite_adjustment_defaults_tests {
         let done = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &app.tx,
             None,
@@ -31946,6 +32121,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &app.keep_start_shared,
             &app.keep_end_shared,
+            None,
             None,
             None,
             None,
@@ -31996,7 +32172,7 @@ mod favorite_adjustment_defaults_tests {
         };
 
         crate::thumb_loader::process_load_request(
-            &next_request,
+            &mut next_request.clone(),
             &cache_map,
             &app.tx,
             None,
@@ -32009,6 +32185,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &app.keep_start_shared,
             &app.keep_end_shared,
+            None,
             None,
             None,
             None,
@@ -37679,7 +37856,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -37692,6 +37869,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -37723,7 +37901,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -37736,6 +37914,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -38967,7 +39146,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -38980,6 +39159,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -40858,6 +41038,10 @@ mod favorite_adjustment_defaults_tests {
                 entries,
                 include_metadata: false,
                 local_ai_activity: None,
+                raw: Some(crate::raw::RawDecodeContext::new(
+                    Arc::clone(&app.raw_develop_executor),
+                    app.settings.raw_brightness,
+                )),
             })
             .expect("start export worker");
         let cancel = std::sync::Arc::clone(&pending.cancel);
@@ -43026,7 +43210,7 @@ mod favorite_adjustment_defaults_tests {
             let keep_start = Arc::new(AtomicUsize::new(0));
             let keep_end = Arc::new(AtomicUsize::new(1));
             crate::thumb_loader::process_load_request(
-                &request,
+                &mut request.clone(),
                 &cache_map,
                 &tx,
                 Some(&catalog),
@@ -43041,6 +43225,7 @@ mod favorite_adjustment_defaults_tests {
                 &keep_end,
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );
@@ -50189,6 +50374,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/scan.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -50243,6 +50429,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/old.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -50305,6 +50492,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/scan.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,

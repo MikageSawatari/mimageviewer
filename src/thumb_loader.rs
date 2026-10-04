@@ -10,7 +10,7 @@
 //! 引数で必要な情報をすべて受け取る純粋な関数として設計されている。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 // -----------------------------------------------------------------------
@@ -493,6 +493,260 @@ pub struct LoadRequest {
     /// `pdf_loader::current_render_context_epoch()` を焼き付ける (TOCTOU 防止)。
     /// 0 = epoch チェック対象外 (background 経路の sentinel)。`Default::default()` は 0。
     pub context_epoch: u64,
+    /// A follow-up from RawDevelopExecutor. Only the thumbnail worker may
+    /// resize, cache, count, and signal this image.
+    pub raw_source: LoadRequestSource,
+}
+
+fn raw_image_error(error: crate::raw::RawError) -> image::ImageError {
+    image::ImageError::IoError(std::io::Error::other(error))
+}
+
+pub(crate) struct RawThumbnailRaster {
+    pub image: image::DynamicImage,
+    pub developed_dims: (u32, u32),
+}
+
+/// Cache creator and other dedicated workers may wait for Background half
+/// development. The grid thumbnail pool uses `RawThumbHandoff` instead.
+pub(crate) fn decode_raw_thumbnail_on_worker(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    let info = crate::raw::raw_decoder::info(source.as_source())?;
+    let dims = (info.developed_dims[0], info.developed_dims[1]);
+    let threshold = display_px.min(dims.0.max(dims.1));
+    match crate::raw::raw_decoder::preview(source.as_source()) {
+        Ok(preview) if preview.image.width().max(preview.image.height()) >= threshold => {
+            return Ok(RawThumbnailRaster {
+                image: preview.image,
+                developed_dims: dims,
+            });
+        }
+        Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {}
+        Err(error) => return Err(error),
+    }
+    if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support {
+        return Err(crate::raw::RawError::Unsupported(reason));
+    }
+    let (tx, rx) = mpsc::channel();
+    let _ticket = executor.submit_thumbnail_half(source, crate::raw::RawPriority::Background, tx);
+    let output = rx.recv().map_err(|_| crate::raw::RawError::Cancelled)??;
+    Ok(RawThumbnailRaster {
+        image: output.image,
+        developed_dims: dims,
+    })
+}
+
+#[derive(Clone, Default)]
+pub enum LoadRequestSource {
+    #[default]
+    Original,
+    RawHalfDeveloped {
+        image: image::DynamicImage,
+        developed_dims: [u32; 2],
+        /// Prior executor wait/develop time, retained for cache decisions and stats.
+        /// This is outside the re-enqueued thumbnail worker's diagnostic span.
+        decode_ms: f64,
+        folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
+    },
+}
+
+/// Shared handles are scoped to one viewer context and its thumbnail workers.
+#[derive(Clone)]
+pub struct RawThumbLocalHandoff {
+    pub(crate) executor: Arc<crate::raw::RawDevelopExecutor>,
+    pub(crate) queue: Arc<crate::app::NotifyQueue>,
+    pub(crate) tickets:
+        Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawThumbUnavailable {
+    NeedsHalfDevelopment,
+}
+
+#[derive(Clone)]
+pub enum RawThumbHandoff {
+    Local(RawThumbLocalHandoff),
+    RemotePreviewOnly(mpsc::Sender<RawThumbUnavailable>),
+}
+
+/// One outstanding half development owned by the same context as `requested`.
+pub(crate) struct RawThumbPending {
+    ticket: crate::raw::RawTicket,
+    submission_id: u64,
+    idx: usize,
+    input_seq: u64,
+    items_gen: u64,
+    tx: mpsc::Sender<ThumbMsg>,
+    gen_done: Arc<AtomicUsize>,
+}
+
+static NEXT_RAW_THUMB_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn take_matching_raw_thumb_pending(
+    map: &mut crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>,
+    idx: usize,
+    submission_id: u64,
+) -> Option<RawThumbPending> {
+    if map
+        .get(&idx)
+        .is_some_and(|pending| pending.submission_id == submission_id)
+    {
+        map.remove(&idx)
+    } else {
+        None
+    }
+}
+
+impl RawThumbPending {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        ticket: crate::raw::RawTicket,
+        tx: mpsc::Sender<ThumbMsg>,
+        gen_done: Arc<AtomicUsize>,
+        items_gen: u64,
+    ) -> Self {
+        Self {
+            ticket,
+            submission_id: NEXT_RAW_THUMB_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed),
+            idx: 0,
+            input_seq: 0,
+            items_gen,
+            tx,
+            gen_done,
+        }
+    }
+
+    pub(crate) fn cancel(self) {
+        self.ticket.cancel();
+        let _ = self.tx.send(ThumbMsg {
+            idx: self.idx,
+            image: None,
+            origin: ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
+            source_dims: None,
+            layout_dims: None,
+            canceled: true,
+            finalized: false,
+            input_seq: self.input_seq,
+            items_gen: self.items_gen,
+        });
+        self.gen_done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn cancel_raw_thumb_tickets(
+    tickets: &Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+) {
+    let pending: Vec<_> = tickets.lock().unwrap().drain().map(|(_, p)| p).collect();
+    for job in pending {
+        job.cancel();
+    }
+}
+
+pub(crate) fn cancel_raw_thumb_tickets_outside_keep(
+    tickets: &Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+    keep: &std::collections::HashSet<usize>,
+) {
+    let exited: Vec<_> = {
+        let mut tickets = tickets.lock().unwrap();
+        let indices: Vec<_> = tickets
+            .keys()
+            .copied()
+            .filter(|idx| !keep.contains(idx))
+            .collect();
+        indices
+            .into_iter()
+            .filter_map(|idx| tickets.remove(&idx))
+            .collect()
+    };
+    for pending in exited {
+        pending.cancel();
+    }
+}
+
+/// Remote decides this before consulting the catalog. It accepts any usable
+/// embedded preview, regardless of the PC thumbnail size threshold.
+pub(crate) enum RemoteRawThumbRequirement {
+    NotRaw,
+    PreviewAvailable,
+    CatalogOnly,
+}
+
+pub(crate) fn remote_raw_thumbnail_requirement(
+    req: &LoadRequest,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> RemoteRawThumbRequirement {
+    let mut path = req.path.clone();
+    let mut cached_pin_source = false;
+    if let Some(sort) = req.folder_thumb_sort
+        && path.is_dir()
+    {
+        match resolve_folder_thumb_image(&path, sort, req.folder_thumb_depth, pin_db) {
+            Some(FolderThumbResolution::Image(selected)) => path = selected,
+            Some(FolderThumbResolution::CachedPinned(cached)) => {
+                path = cached.source_path;
+                cached_pin_source = true;
+            }
+            None => return RemoteRawThumbRequirement::NotRaw,
+        }
+    }
+
+    let selected_entry = if let Some(entry) = req.zip_entry.as_deref() {
+        Some(entry.to_owned())
+    } else if let Some(prefix) = req.zip_dir_prefix.as_deref() {
+        let Ok(entries) = crate::zip_loader::enumerate_image_entries(&path) else {
+            return RemoteRawThumbRequirement::NotRaw;
+        };
+        crate::zip_tree::ZipTree::build(path.clone(), entries)
+            .representative_for_prefix_str(
+                prefix,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+            )
+            .map(|entry| entry.entry_name.clone())
+    } else if req
+        .cache_key_override
+        .as_deref()
+        .is_some_and(|key| key.starts_with(CACHE_KEY_ZIP))
+        || (cached_pin_source
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
+                }))
+    {
+        crate::zip_loader::read_first_image_bytes(&path).map(|(entry, _)| entry)
+    } else {
+        None
+    };
+    let bytes = if let Some(entry) = selected_entry {
+        if !crate::raw_format::is_raw_path(Path::new(&entry)) {
+            return RemoteRawThumbRequirement::NotRaw;
+        }
+        match crate::zip_loader::read_entry_bytes(&path, &entry) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => return RemoteRawThumbRequirement::CatalogOnly,
+        }
+    } else if crate::raw_format::is_raw_path(&path) {
+        None
+    } else {
+        return RemoteRawThumbRequirement::NotRaw;
+    };
+    let source = bytes.as_deref().map_or(
+        crate::raw::RawSource::Path(&path),
+        crate::raw::RawSource::Bytes,
+    );
+    if crate::raw::raw_decoder::preview(source).is_ok() {
+        RemoteRawThumbRequirement::PreviewAvailable
+    } else {
+        RemoteRawThumbRequirement::CatalogOnly
+    }
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -614,7 +868,23 @@ pub fn resize_to_display_color_image(
 
 /// 画像ファイルをデコードし、指定サイズにリサイズした ColorImage を返す。
 /// 動画の同名画像サムネイルオーバーライド用。
-pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option<egui::ColorImage> {
+pub fn decode_image_for_thumb(
+    path: &std::path::Path,
+    display_px: u32,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+) -> Result<Option<egui::ColorImage>, crate::raw::RawError> {
+    if crate::raw_format::is_raw_path(path) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(path.to_owned()),
+            display_px,
+            raw_executor,
+        )?;
+        return Ok(Some(resize_to_display_color_image(
+            &raster.image,
+            display_px,
+            Some(raster.developed_dims),
+        )));
+    }
     // JPEG なら TurboJPEG で DCT scale 付き高速デコードを試す。
     // この関数は cache 用 thumb_px を持たないので target = display_px を使う。
     let (turbo_img, source_dims): (Option<image::DynamicImage>, Option<(u32, u32)>) =
@@ -627,7 +897,7 @@ pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option
                     crate::logger::log(format!(
                         "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
                     ));
-                    return None;
+                    return Ok(None);
                 }
                 Err(DctDecodeError::Fallback(_)) => (None, None),
             }
@@ -636,8 +906,8 @@ pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option
         };
     let img = turbo_img
         .or_else(|| image::open(path).ok())
-        .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
-    Some(resize_to_display_color_image(&img, display_px, source_dims))
+        .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path));
+    Ok(img.map(|img| resize_to_display_color_image(&img, display_px, source_dims)))
 }
 
 /// EXIF Orientation に基づいて画像を回転・反転する。
@@ -1001,6 +1271,9 @@ fn decode_zip_chain(
     cancel: Option<Arc<AtomicBool>>,
     decode_source: &mut crate::stats::DecodeSource,
 ) -> Result<image::DynamicImage, image::ImageError> {
+    if crate::raw_format::is_raw_path(Path::new(entry_name)) {
+        return Err(raw_image_error(crate::raw::RawError::Internal(-2)));
+    }
     // Susie 専用拡張子の高速パス (image / WIC で確実に失敗する分を省略)
     if is_susie_only_ext(&ext_lower_str(entry_name)) {
         return match crate::susie_loader::decode_bytes(entry_name, bytes, priority, cancel) {
@@ -1013,7 +1286,10 @@ fn decode_zip_chain(
     }
     match image::load_from_memory(bytes) {
         Ok(img) => Ok(img),
-        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes) {
+        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+            bytes,
+            &ext_lower_str(entry_name),
+        ) {
             Some(img) => {
                 *decode_source = crate::stats::DecodeSource::Wic;
                 Ok(img)
@@ -1381,7 +1657,7 @@ fn send_pinned_child_folder_cached(
 ///   (`ThumbLoadOrigin::SourceGenerated`、段階 E のアップグレード経路)
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
-    req: &LoadRequest,
+    req: &mut LoadRequest,
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     // **v1.0.0**: `Arc` 経由で受け取る (= 内部の WebP cache hit catch-up worker が
@@ -1404,7 +1680,60 @@ pub fn process_load_request(
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     edit_preview_db: Option<&Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
+    raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    if matches!(req.raw_source, LoadRequestSource::RawHalfDeveloped { .. }) {
+        let raw_source = std::mem::take(&mut req.raw_source);
+        let proof = match &raw_source {
+            LoadRequestSource::RawHalfDeveloped {
+                folder_selection_proof,
+                ..
+            } => folder_selection_proof.clone(),
+            LoadRequestSource::Original => unreachable!(),
+        };
+        let pinned_adjustment = req
+            .pinned_page_adjustment_key
+            .as_deref()
+            .and_then(|key| adjustment_db.and_then(|db| db.get_page_params(key)))
+            .filter(|params| !params.is_color_identity());
+        load_one_cached(
+            &req.path,
+            req.zip_entry.as_deref(),
+            None,
+            None,
+            req.pdf_page,
+            None,
+            req.pdf_password.as_deref(),
+            req.cache_key_override.as_deref(),
+            req.idx,
+            tx,
+            catalog.map(|arc| arc.as_ref()),
+            Some(cache_map),
+            req.mtime,
+            req.file_size,
+            gen_done,
+            thumb_px,
+            thumb_quality,
+            display_px,
+            cache_decision,
+            stats,
+            cancel,
+            req.priority,
+            req.input_seq,
+            req.items_gen,
+            req.context_epoch,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            req.force_cache,
+            true,
+            pinned_adjustment.as_ref(),
+            req.folder_thumb_provenance,
+            proof.as_ref(),
+            raw_source,
+            None,
+            None,
+        );
+        return;
+    }
     if let Some(pin) = req.pinned_only.as_ref() {
         if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done, pin_db) {
             send_thumb_failed(req, tx, gen_done);
@@ -1414,8 +1743,9 @@ pub fn process_load_request(
 
     let fallback_or_fail = || {
         if let Some(fallback) = req.epub_pin_fallback.as_deref() {
+            let mut fallback = fallback.clone();
             process_load_request(
-                fallback,
+                &mut fallback,
                 cache_map,
                 tx,
                 catalog,
@@ -1432,6 +1762,7 @@ pub fn process_load_request(
                 pin_db,
                 edit_preview_db,
                 adjustment_db,
+                raw_handoff,
             );
         } else {
             send_thumb_failed(req, tx, gen_done);
@@ -1470,7 +1801,7 @@ pub fn process_load_request(
     let epub_read = resolved_request.as_ref().map(|(_, read)| read);
     let req = resolved_request
         .as_ref()
-        .map_or(req, |(stamped, _)| stamped);
+        .map_or(&*req, |(stamped, _)| stamped);
 
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
     let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
@@ -2078,6 +2409,8 @@ pub fn process_load_request(
         None => None,
     };
 
+    let deferred_req = matches!(req.raw_source, LoadRequestSource::Original).then(|| req.clone());
+    let raw_source = req.raw_source.clone();
     load_one_cached(
         load_path,
         zip_entry_ref,
@@ -2110,6 +2443,9 @@ pub fn process_load_request(
         pinned_page_adjustment.as_ref(),
         req.folder_thumb_provenance,
         folder_selection_proof.as_ref(),
+        raw_source,
+        raw_handoff,
+        deferred_req,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -3510,8 +3846,11 @@ fn resolve_folder_thumb_image_inner(
 /// この計装が唯一守ろうとしている信号なので、足せない形にしておく。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct ThumbLoadPhases {
-    /// デコード全体。PDF では render 往復と orientation を含む。
+    /// Decode within this worker span, including PDF render and orientation.
     decode_ms: f64,
+    /// Prior RAW executor wait/develop, outside this span and its thread cycles.
+    /// Diagnostic detail only; never add to or subtract from the worker total.
+    raw_async_decode_ms: Option<f64>,
     display_ms: f64,
     send_display_ms: f64,
     cache_encode_ms: f64,
@@ -3626,6 +3965,9 @@ pub fn load_one_cached(
     pinned_page_adjustment: Option<&crate::adjustment::AdjustParams>,
     folder_provenance: Option<crate::catalog::FolderThumbProvenance>,
     folder_selection_proof: Option<&crate::catalog::FolderSelectionProof>,
+    raw_source: LoadRequestSource,
+    raw_handoff: Option<&RawThumbHandoff>,
+    deferred_req: Option<LoadRequest>,
 ) {
     let total_started = std::time::Instant::now();
     let total_cycles_started = crate::perf::stall::TotalCycles::start();
@@ -3654,7 +3996,8 @@ pub fn load_one_cached(
     // 1. ZIP エントリ:    ZIP を開いてエントリのバイト列を取り出してから image クレートで decode
     //                     失敗時は WIC (SHCreateMemStream + CreateDecoderFromStream) にフォールバック
     // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
-    //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
+    //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL 等)
+    // RAW は上記より先に LibRaw の preview または half 現像へ分岐する。
     //
     // どのデコーダ経路で成功したかを `decode_source` に記録し、後段の統計に渡す。
     // JPEG パスでは TurboJPEG DCT scale も試み、成功時は `dct_stats` を立てて
@@ -3667,7 +4010,177 @@ pub fn load_one_cached(
     let mut byte_orientation: u16 = 1;
     let mut render_ms: Option<f64> = None;
     let has_verified_source = verified_source_bytes.is_some();
-    let img_result = if let Some(page_num) = pdf_page {
+    let is_raw = zip_entry
+        .map(|entry| crate::raw_format::is_raw_path(Path::new(entry)))
+        .unwrap_or_else(|| crate::raw_format::is_raw_path(path));
+    let mut raw_developed_dims = None;
+    let mut raw_decode_ms = None;
+    enum RawHandoffControl {
+        Continue,
+        Deferred,
+    }
+    let mut raw_handoff_control = RawHandoffControl::Continue;
+    let img_result = if let LoadRequestSource::RawHalfDeveloped {
+        image,
+        developed_dims,
+        decode_ms,
+        ..
+    } = raw_source
+    {
+        decode_source = crate::stats::DecodeSource::Raw;
+        raw_developed_dims = Some((developed_dims[0], developed_dims[1]));
+        raw_decode_ms = Some(decode_ms);
+        Ok(image)
+    } else if is_raw {
+        decode_source = crate::stats::DecodeSource::Raw;
+        let source_result: Result<crate::raw::RawOwnedSource, image::ImageError> =
+            if let Some(bytes) = verified_source_bytes {
+                Ok(crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            } else if let Some(entry_name) = zip_entry {
+                match preloaded_zip_bytes {
+                    Some(bytes) => Ok(bytes),
+                    None => crate::zip_loader::read_entry_bytes(path, entry_name)
+                        .map_err(image::ImageError::IoError),
+                }
+                .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            } else {
+                Ok(crate::raw::RawOwnedSource::Path(path.to_owned()))
+            };
+        source_result.and_then(|source| {
+            let info =
+                crate::raw::raw_decoder::info(source.as_source()).map_err(raw_image_error)?;
+            let developed_dims = info.developed_dims;
+            raw_developed_dims = Some((developed_dims[0], developed_dims[1]));
+            let preview = crate::raw::raw_decoder::preview(source.as_source());
+            let threshold = display_px.min(developed_dims[0].max(developed_dims[1]));
+            match preview {
+                Ok(preview)
+                    if matches!(raw_handoff, Some(RawThumbHandoff::RemotePreviewOnly(_)))
+                        || preview.image.width().max(preview.image.height()) >= threshold =>
+                {
+                    Ok(preview.image)
+                }
+                Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {
+                    if let Some(RawThumbHandoff::RemotePreviewOnly(notify)) = raw_handoff {
+                        let _ = notify.send(RawThumbUnavailable::NeedsHalfDevelopment);
+                        return Err(raw_image_error(crate::raw::RawError::NoUsablePreview(
+                            crate::raw::RawPreviewUnavailableReason::NoSupportedCandidate,
+                        )));
+                    }
+                    if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support
+                    {
+                        return Err(raw_image_error(crate::raw::RawError::Unsupported(reason)));
+                    }
+                    let handoff = match raw_handoff {
+                        Some(RawThumbHandoff::Local(handoff)) => handoff,
+                        Some(RawThumbHandoff::RemotePreviewOnly(_)) => unreachable!(),
+                        None => return Err(raw_image_error(crate::raw::RawError::Internal(-1))),
+                    };
+                    let Some(mut next_req) = deferred_req else {
+                        return Err(raw_image_error(crate::raw::RawError::Internal(-1)));
+                    };
+                    if !priority {
+                        let _ = tx.send(ThumbMsg {
+                            idx,
+                            image: None,
+                            origin: ThumbLoadOrigin::SourceIntrinsic,
+                            from_edit_preview: false,
+                            edit_preview_adjustment: None,
+                            source_dims: None,
+                            layout_dims: None,
+                            canceled: true,
+                            finalized: false,
+                            input_seq,
+                            items_gen,
+                        });
+                        gen_done.fetch_add(1, Ordering::Relaxed);
+                        raw_handoff_control = RawHandoffControl::Deferred;
+                        return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                    }
+                    next_req.path = path.to_owned();
+                    next_req.zip_entry = zip_entry.map(str::to_owned);
+                    next_req.source_policy = LoadSourcePolicy::SourceOnly;
+                    let tickets = Arc::clone(&handoff.tickets);
+                    let callback_tickets = Arc::clone(&tickets);
+                    let queue = Arc::clone(&handoff.queue);
+                    let tx = tx.clone();
+                    let pending_tx = tx.clone();
+                    let gen_done = Arc::clone(gen_done);
+                    let pending_gen_done = Arc::clone(&gen_done);
+                    let start = std::time::Instant::now();
+                    let folder_selection_proof = folder_selection_proof.cloned();
+                    let mut map = tickets.lock().unwrap();
+                    if !map.accepts_generation(idx, items_gen) {
+                        return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                    }
+                    let submission_id =
+                        NEXT_RAW_THUMB_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed);
+                    let ticket = handoff
+                        .executor
+                        .submit_thumbnail_half_with_completion(
+                            source,
+                            crate::raw::RawPriority::Normal,
+                            move |result| {
+                                let mut map = callback_tickets.lock().unwrap();
+                                if take_matching_raw_thumb_pending(&mut map, idx, submission_id)
+                                    .is_none()
+                                {
+                                    return;
+                                }
+                                match result {
+                                    Ok(output) => {
+                                        next_req.raw_source = LoadRequestSource::RawHalfDeveloped {
+                                            image: output.image,
+                                            developed_dims,
+                                            decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+                                            folder_selection_proof,
+                                        };
+                                        let (lock, wake) = &*queue;
+                                        lock.lock().unwrap().push(next_req);
+                                        wake.notify_one();
+                                    }
+                                    Err(error) => {
+                                        let _ = tx.send(ThumbMsg {
+                                            idx,
+                                            image: None,
+                                            origin: ThumbLoadOrigin::SourceIntrinsic,
+                                            from_edit_preview: false,
+                                            edit_preview_adjustment: None,
+                                            source_dims: None,
+                                            layout_dims: None,
+                                            canceled: error == crate::raw::RawError::Cancelled,
+                                            finalized: false,
+                                            input_seq,
+                                            items_gen,
+                                        });
+                                        gen_done.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            },
+                        )
+                        .map_err(raw_image_error)?;
+                    map.insert_for_generation(
+                        idx,
+                        items_gen,
+                        RawThumbPending {
+                            ticket,
+                            submission_id,
+                            idx,
+                            input_seq,
+                            items_gen,
+                            tx: pending_tx,
+                            gen_done: pending_gen_done,
+                        },
+                    );
+                    // A submitted half job produces no ThumbMsg here. Its completion
+                    // returns to the existing queue after the executor slot is free.
+                    raw_handoff_control = RawHandoffControl::Deferred;
+                    return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                }
+                Err(error) => Err(raw_image_error(error)),
+            }
+        })
+    } else if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
         // (Critical) 用に空けておく。cancel_policy は caller (process_load_request)
@@ -3781,8 +4294,8 @@ pub fn load_one_cached(
         match bytes_result {
             Err(e) => Err(e),
             Ok(bytes) => {
-                // ZIP 内 RAW/WIC 系の orientation は rexif で読めないため 1 扱いになる。
-                // JPEG 等、rexif が読める EXIF は通常ファイルと同じ向きに揃える。
+                // 非 RAW の ZIP entry は EXIF を読む。RAW は上の LibRaw 分岐で
+                // 向きが適用済みなので、ここには来ない。
                 byte_orientation = read_exif_orientation_from_bytes(&bytes);
                 // JPEG なら TurboJPEG DCT scale で高速デコードを試す
                 if is_jpeg_entry(entry_name) {
@@ -3868,7 +4381,7 @@ pub fn load_one_cached(
                     .decode()
             });
             // image クレートが失敗した場合に WIC → Susie プラグインの順にフォールバック
-            // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため WIC、
+            // (HEIC / AVIF / JPEG XL 等は image クレート非対応のため WIC、
             //  PI / MAG / Q0 / PIC / MAKI 等のレトロ形式は Susie プラグインで対応)
             match primary {
                 Ok(img) => Ok(img),
@@ -3890,6 +4403,9 @@ pub fn load_one_cached(
         }
     };
 
+    if matches!(raw_handoff_control, RawHandoffControl::Deferred) {
+        return;
+    }
     let img = match img_result {
         Ok(i) => i,
         Err(e) => {
@@ -3967,8 +4483,9 @@ pub fn load_one_cached(
     };
 
     // EXIF Orientation に基づいて自動回転。
-    // ZIP はエントリのバイト列から読み、PDF はレンダ済みページなので常に 1。
-    let orientation: u16 = if pdf_page.is_some() {
+    // ZIP の非 RAW はエントリのバイト列から読む。RAW は LibRaw が orientation
+    // をすでに適用しており、PDF もレンダ済みなので追加回転をしない。
+    let orientation: u16 = if is_raw || pdf_page.is_some() {
         1
     } else if zip_entry.is_some() || has_verified_source {
         byte_orientation
@@ -3979,7 +4496,14 @@ pub fn load_one_cached(
     let img = apply_orientation(img, orientation);
     let orientation_ms = orientation_started.elapsed().as_secs_f64() * 1000.0;
 
-    let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let decode_ms = raw_decode_ms.unwrap_or_else(|| t.elapsed().as_secs_f64() * 1000.0);
+    // Keep the existing cache/stat timing above. A RAW continuation's earlier
+    // executor wait/develop belongs outside this worker's wall/cycle window.
+    let diagnostic_decode_ms = if raw_decode_ms.is_some() && crate::perf::is_enabled() {
+        t.elapsed().as_secs_f64() * 1000.0
+    } else {
+        decode_ms
+    };
 
     // source_dims は常にピクセル座標系。PDF page box の正確な比率は layout_dims に
     // 分離し、リリース済みの source_* 契約を別の単位で上書きしない。
@@ -3987,7 +4511,9 @@ pub fn load_one_cached(
     // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
     // 非 DCT 経路 (image::open / WIC / Susie / ZIP image::load_from_memory)
     // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
-    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
+    let source_dims: Option<(u32, u32)> = if let Some(dims) = raw_developed_dims {
+        Some(dims)
+    } else if let Some(stats) = dct_stats {
         Some(stats.source_dims_after_exif(orientation))
     } else {
         Some((img.width(), img.height()))
@@ -4221,7 +4747,8 @@ pub fn load_one_cached(
         let total_cycles = total_cycles_started.map(|start| start.finish());
         let total_ms = total_ended.duration_since(total_started).as_secs_f64() * 1000.0;
         let phases = ThumbLoadPhases {
-            decode_ms,
+            decode_ms: diagnostic_decode_ms,
+            raw_async_decode_ms: raw_decode_ms,
             display_ms,
             send_display_ms,
             cache_encode_ms,
@@ -4303,6 +4830,9 @@ pub fn load_one_cached(
         if let Some(cycles) = total_cycles {
             extras.push(("total_cycles", cycles.into()));
         }
+        if let Some(ms) = phases.raw_async_decode_ms {
+            extras.push(("raw_async_decode_ms", ms.into()));
+        }
         crate::perf::event("thumb", "load_phases", Some(&key), input_seq, &extras);
     }
 }
@@ -4321,6 +4851,529 @@ mod tests {
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[cfg(windows)]
+    #[test]
+    fn late_old_raw_completion_cannot_remove_new_same_idx_submission() {
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (old_ticket, old_result) =
+            executor.block_one_slot_with_result_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut map = crate::items_generation_cache::ItemsGenerationMap::new("raw_overlap_test");
+        map.set_items_generation(1);
+        let old = RawThumbPending::for_test(old_ticket, tx.clone(), Arc::clone(&done), 1);
+        let old_id = old.submission_id;
+        map.insert(0, old);
+        map.set_items_generation(2);
+        let (result_tx, _result_rx) = mpsc::channel();
+        let new_ticket = executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            result_tx,
+        );
+        let new = RawThumbPending::for_test(new_ticket, tx, done, 2);
+        let new_id = new.submission_id;
+        map.insert(0, new);
+        release_tx.send(()).unwrap();
+        old_result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        // This is the old completion callback after the newer submission exists.
+        assert!(take_matching_raw_thumb_pending(&mut map, 0, old_id).is_none());
+        assert_eq!(map.get(&0).unwrap().submission_id, new_id);
+        let current = take_matching_raw_thumb_pending(&mut map, 0, new_id).unwrap();
+        current.ticket.cancel();
+    }
+
+    #[cfg(windows)]
+    fn raw_thumb_request(
+        path: &Path,
+        zip_entry: Option<&str>,
+        cache_map: &std::sync::RwLock<
+            std::collections::HashMap<String, crate::catalog::CacheEntry>,
+        >,
+        tx: &mpsc::Sender<ThumbMsg>,
+        catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+        gen_done: &Arc<AtomicUsize>,
+        stats: &Arc<Mutex<crate::stats::ThumbStats>>,
+        handoff: &RawThumbHandoff,
+    ) {
+        let metadata = std::fs::metadata(path).unwrap();
+        let mut request = LoadRequest {
+            idx: 0,
+            path: path.to_owned(),
+            zip_entry: zip_entry.map(str::to_owned),
+            mtime: 123,
+            file_size: metadata.len() as i64,
+            priority: true,
+            input_seq: 7,
+            items_gen: 1,
+            force_cache: catalog.is_some(),
+            source_policy: LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        process_load_request(
+            &mut request,
+            cache_map,
+            tx,
+            catalog,
+            512,
+            75,
+            2048,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            gen_done,
+            stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            Some(handoff),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_half_handoff_releases_executor_slot_then_sends_both_signals_and_gen_done() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let queue: Arc<crate::app::NotifyQueue> =
+            Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let tickets = Arc::new(Mutex::new(
+            crate::items_generation_cache::ItemsGenerationMap::new("raw_thumb_test"),
+        ));
+        tickets.lock().unwrap().set_items_generation(1);
+        let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+            executor: Arc::clone(&executor),
+            queue: Arc::clone(&queue),
+            tickets: Arc::clone(&tickets),
+        });
+        raw_thumb_request(
+            &path,
+            None,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            &gen_done,
+            &stats,
+            &handoff,
+        );
+        assert!(rx.try_recv().is_err(), "submit must send no ThumbMsg");
+        assert_eq!(gen_done.load(Ordering::Relaxed), 0);
+        let (lock, wake) = &*queue;
+        let mut queued = lock.lock().unwrap();
+        while queued.is_empty() {
+            let (next, timeout) = wake
+                .wait_timeout(queued, std::time::Duration::from_secs(180))
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "RAW half completion did not enqueue follow-up"
+            );
+            queued = next;
+        }
+        let mut followup = queued.pop().unwrap();
+        drop(queued);
+        assert!(matches!(
+            followup.raw_source,
+            LoadRequestSource::RawHalfDeveloped { .. }
+        ));
+        assert_eq!(
+            executor.running_jobs_for_test(),
+            0,
+            "executor slot must be free before resize/cache"
+        );
+        assert!(!tickets.lock().unwrap().contains_key(&0));
+        process_load_request(
+            &mut followup,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            512,
+            75,
+            2048,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let finalized = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(display.image.is_some() && !display.finalized && !display.canceled);
+        assert!(finalized.image.is_none() && finalized.finalized && !finalized.canceled);
+        let developed = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&path))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(display.source_dims, Some((developed[0], developed[1])));
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        assert!(catalog.load_one("1018.cr2").unwrap().is_some());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.count_raw, 1);
+        assert_eq!(stats.count_wic, 0);
+        assert_eq!(stats.count_susie, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_cr2_preview_is_available_from_zip_bytes() {
+        use std::io::Write;
+
+        let path = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(path).unwrap();
+        let path_preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(path))
+            .expect("path preview");
+        let bytes_preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Bytes(&bytes))
+            .expect("ZIP bytes preview");
+        assert_eq!(
+            (path_preview.image.width(), path_preview.image.height()),
+            (bytes_preview.image.width(), bytes_preview.image.height())
+        );
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("chapter/page.cr2", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let first = crate::zip_loader::read_first_image_bytes(&archive).unwrap();
+        assert_eq!(first.0, "chapter/page.cr2");
+        assert_eq!(first.1, bytes);
+        let metadata = std::fs::metadata(&archive).unwrap();
+        let mut request = LoadRequest {
+            path: archive,
+            mtime: crate::ui_helpers::mtime_secs(&metadata),
+            file_size: metadata.len() as i64,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            cache_key_override: Some("zipthumb:book.zip".to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            remote_raw_thumbnail_requirement(&request, None),
+            RemoteRawThumbRequirement::PreviewAvailable
+        ));
+        let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        let (raw_unavailable_tx, raw_unavailable_rx) = mpsc::channel();
+        let raw_handoff = RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        process_load_request(
+            &mut request,
+            &cache_map,
+            &tx,
+            None,
+            2048,
+            80,
+            2048,
+            CacheDecision::without_thumbnail(),
+            &done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(usize::MAX)),
+            None,
+            None,
+            None,
+            None,
+            Some(&raw_handoff),
+        );
+        assert!(raw_unavailable_rx.try_recv().is_err());
+        drop(tx);
+        assert!(rx.into_iter().any(|message| message.image.is_some()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_raw_thumbnail_uses_libraw_preview_and_developed_dimensions() {
+        use std::io::Write;
+        let source = Path::new("vendor/raw-samples/885.dng");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(source).unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pages.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        writer
+            .start_file("chapter/page.dng", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        let portrait = std::fs::read("vendor/raw-samples/1230.cr2").unwrap();
+        writer
+            .start_file(
+                "chapter/portrait.cr2",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(&portrait).unwrap();
+        writer.finish().unwrap();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let queue = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let tickets = Arc::new(Mutex::new(
+            crate::items_generation_cache::ItemsGenerationMap::new("zip_raw_thumb_test"),
+        ));
+        tickets.lock().unwrap().set_items_generation(1);
+        let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+            executor,
+            queue: Arc::clone(&queue),
+            tickets,
+        });
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        raw_thumb_request(
+            &path,
+            Some("chapter/page.dng"),
+            &cache_map,
+            &tx,
+            None,
+            &gen_done,
+            &stats,
+            &handoff,
+        );
+        let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(display.image.is_some() && !display.canceled);
+        assert_eq!(display.source_dims, Some((dims[0], dims[1])));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .finalized
+        );
+        assert!(
+            queue.0.lock().unwrap().is_empty(),
+            "sufficient preview must not queue development"
+        );
+        assert_eq!(stats.lock().unwrap().count_raw, 1);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        for (idx, strategy, prefix) in [
+            (1, ResolveStrategy::ZipFirstImage, None),
+            (2, ResolveStrategy::ZipDirRepresentative, Some("chapter/")),
+        ] {
+            let mut request = LoadRequest {
+                idx,
+                path: path.clone(),
+                zip_dir_prefix: prefix.map(str::to_owned),
+                resolve_override: Some(strategy),
+                cache_key_override: Some(format!("zipthumb:{idx}")),
+                priority: true,
+                items_gen: 1,
+                source_policy: LoadSourcePolicy::SourceOnly,
+                ..Default::default()
+            };
+            process_load_request(
+                &mut request,
+                &cache_map,
+                &tx,
+                None,
+                512,
+                75,
+                2048,
+                make_decision(CachePolicy::Off, 25, 2_000_000),
+                &gen_done,
+                &stats,
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(3)),
+                None,
+                None,
+                None,
+                None,
+                Some(&handoff),
+            );
+            let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(display.idx, idx);
+            assert!(display.image.is_some() && !display.canceled);
+            assert_eq!(display.source_dims, Some((dims[0], dims[1])));
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .finalized
+            );
+        }
+        assert_eq!(stats.lock().unwrap().count_raw, 3);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 3);
+        let portrait_dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&portrait))
+            .unwrap()
+            .developed_dims;
+        let mut portrait_request = LoadRequest {
+            idx: 3,
+            path,
+            zip_entry: Some("chapter/portrait.cr2".to_owned()),
+            priority: true,
+            items_gen: 1,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        process_load_request(
+            &mut portrait_request,
+            &cache_map,
+            &tx,
+            None,
+            512,
+            75,
+            512,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(4)),
+            None,
+            None,
+            None,
+            None,
+            Some(&handoff),
+        );
+        let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            display.source_dims,
+            Some((portrait_dims[0], portrait_dims[1]))
+        );
+        let image = display.image.unwrap();
+        assert!(
+            image.size[1] > image.size[0],
+            "LibRaw flip 5 keeps portrait orientation"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .finalized
+        );
+        assert_eq!(stats.lock().unwrap().count_raw, 4);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_half_ticket_exiting_keep_or_context_cancels_and_clears_requested() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        for context_exit in [false, true] {
+            let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let _blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let queue: Arc<crate::app::NotifyQueue> =
+                Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+            let tickets = Arc::new(Mutex::new(
+                crate::items_generation_cache::ItemsGenerationMap::new("raw_thumb_cancel_test"),
+            ));
+            tickets.lock().unwrap().set_items_generation(1);
+            let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+                executor: Arc::clone(&executor),
+                queue,
+                tickets: Arc::clone(&tickets),
+            });
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = mpsc::channel();
+            let gen_done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            raw_thumb_request(
+                &path, None, &cache_map, &tx, None, &gen_done, &stats, &handoff,
+            );
+            executor.wait_for_queued_job_for_test();
+            assert!(tickets.lock().unwrap().contains_key(&0));
+            assert!(rx.try_recv().is_err());
+            if context_exit {
+                cancel_raw_thumb_tickets(&tickets);
+            } else {
+                cancel_raw_thumb_tickets_outside_keep(&tickets, &std::collections::HashSet::new());
+            }
+            let canceled = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(canceled.canceled && !canceled.finalized && canceled.image.is_none());
+            assert_eq!(canceled.idx, 0);
+            assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+            assert!(!tickets.lock().unwrap().contains_key(&0));
+            release_tx.send(()).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_sidecar_and_cache_creator_use_libraw_for_path_and_zip() {
+        use std::io::Write;
+
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(
+            cr2.is_file() && dng.is_file(),
+            "Run .\\scripts\\setup-raw-samples.ps1"
+        );
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let cr2_info = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&cr2)).unwrap();
+        let expected_dims = (cr2_info.developed_dims[0], cr2_info.developed_dims[1]);
+        let sidecar = decode_image_for_thumb(&cr2, 2048, &executor)
+            .unwrap()
+            .unwrap();
+        assert!(sidecar.size[0].max(sidecar.size[1]) <= 2048);
+        assert!(
+            sidecar.size[0].max(sidecar.size[1]) > 1536,
+            "the small CR2 preview must not win"
+        );
+
+        let temp = TempDir::new().unwrap();
+        let misleading = temp.path().join("misleading.dng");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .save_with_format(&misleading, image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_image_for_thumb(&misleading, 512, &executor).is_err());
+        let catalog = crate::catalog::CatalogDb::open(temp.path(), temp.path()).unwrap();
+        assert!(build_and_save_one(&cr2, &catalog, 11, 12, 2048, 75, &executor).is_some());
+        assert_eq!(
+            catalog.load_one("1018.cr2").unwrap().unwrap().source_dims,
+            Some(expected_dims)
+        );
+
+        let zip_path = temp.path().join("pages.zip");
+        let bytes = std::fs::read(&dng).unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.dng", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let dng_dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        assert!(
+            build_and_save_one_zip(&zip_path, "page.dng", &catalog, 13, 14, 512, 75, &executor,)
+                .is_some()
+        );
+        assert_eq!(
+            catalog.load_one("page.dng").unwrap().unwrap().source_dims,
+            Some((dng_dims[0], dng_dims[1])),
+        );
+    }
 
     #[test]
     fn edit_preview_origin_is_cache_final_and_requires_the_exact_epoch() {
@@ -4356,6 +5409,79 @@ mod tests {
         };
 
         assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+    }
+
+    #[test]
+    fn raw_async_decode_is_outside_the_thumbnail_worker_span() {
+        let phases = ThumbLoadPhases {
+            decode_ms: 1.0,
+            raw_async_decode_ms: Some(500.0),
+            orientation_ms: 0.5,
+            display_ms: 5.0,
+            ..ThumbLoadPhases::default()
+        };
+        assert_eq!(phases.disjoint_total_ms(), 6.0);
+        assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+        assert_eq!(
+            phases.unaccounted_ms(10.0),
+            ThumbLoadPhases {
+                raw_async_decode_ms: None,
+                ..phases
+            }
+            .unaccounted_ms(10.0)
+        );
+    }
+
+    #[test]
+    fn raw_async_decode_still_drives_cache_policy_and_load_statistics() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let mut request = LoadRequest {
+            path: tmp.path().join("half.cr2"),
+            file_size: 1, // Below the size heuristic; only decode time should trigger cache.
+            priority: true,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            raw_source: LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(8, 8),
+                developed_dims: [16, 16],
+                decode_ms: 500.0,
+                folder_selection_proof: None,
+            },
+            ..Default::default()
+        };
+        process_load_request(
+            &mut request,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            32,
+            75,
+            32,
+            make_decision(CachePolicy::Auto, 250, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let display = rx.try_recv().unwrap();
+        let finalized = rx.try_recv().unwrap();
+        assert!(display.image.is_some() && !display.finalized);
+        assert!(finalized.finalized && !finalized.canceled);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        assert!(catalog.load_one("half.cr2").unwrap().is_some());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.count_raw, 1);
+        assert!(stats.time_raw >= 500.0);
     }
 
     /// これが落ちたら、`decode_ms` の内側にある区間が合計へ入っている。
@@ -4860,6 +5986,9 @@ mod tests {
             None,
             None,
             None,
+            LoadRequestSource::Original,
+            None,
+            None,
         );
 
         let entry = catalog
@@ -4908,7 +6037,7 @@ mod tests {
                 ..Default::default()
             };
             process_load_request(
-                &req,
+                &mut req.clone(),
                 &cache_map,
                 &tx,
                 None,
@@ -4925,6 +6054,7 @@ mod tests {
                 None,
                 None,
                 Some(&adjustment_db),
+                None,
             );
             rx.try_iter()
                 .find_map(|msg| msg.image)
@@ -6349,7 +7479,7 @@ mod tests {
         let gen_done = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
         process_load_request(
-            &req,
+            &mut req.clone(),
             &cache_map,
             &tx,
             None,
@@ -6362,6 +7492,7 @@ mod tests {
             None,
             &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicUsize::new(1)),
+            None,
             None,
             None,
             None,
@@ -6413,7 +7544,7 @@ mod tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         process_load_request(
-            &req,
+            &mut req.clone(),
             &cache_map,
             &tx,
             None,
@@ -6426,6 +7557,7 @@ mod tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -6504,7 +7636,27 @@ pub fn build_and_save_one(
     file_size: i64,
     thumb_px: u32,
     thumb_quality: u8,
+    raw_executor: &crate::raw::RawDevelopExecutor,
 ) -> Option<usize> {
+    if crate::raw_format::is_raw_path(path) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(path.to_owned()),
+            thumb_px,
+            raw_executor,
+        )
+        .ok()?;
+        let name = path.file_name()?.to_str()?;
+        return encode_and_save_with_source_dims(
+            &raster.image,
+            Some(raster.developed_dims),
+            name,
+            catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        );
+    }
     // JPEG なら TurboJPEG DCT scale を先に試す (load_one_cached と同じ方針)。
     // cache creator は UI セルサイズに依存しない bulk worker なので target は thumb_px。
     let mut dct_stats: Option<ScaleStats> = None;
@@ -6666,8 +7818,27 @@ pub fn build_and_save_one_zip(
     file_size: i64,
     thumb_px: u32,
     thumb_quality: u8,
+    raw_executor: &crate::raw::RawDevelopExecutor,
 ) -> Option<usize> {
     let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
+    if crate::raw_format::is_raw_path(Path::new(entry_name)) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)),
+            thumb_px,
+            raw_executor,
+        )
+        .ok()?;
+        return encode_and_save_with_source_dims(
+            &raster.image,
+            Some(raster.developed_dims),
+            entry_name,
+            catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        );
+    }
     // JPEG なら DCT scale を試す + 元寸法を source_dims に保存
     let orientation = read_exif_orientation_from_bytes(&bytes);
     let (img, source_dims) = if is_jpeg_entry(entry_name) {

@@ -428,6 +428,7 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) erase_inpaint_mono_tolerance: u8,
     pub(crate) retained_final_ai_cache_max_entries: usize,
     pub(crate) retained_final_ai_cache_max_mib: u64,
+    pub(crate) raw_brightness: crate::raw::RawBrightness,
 }
 
 impl AdjustmentRenderSettings {
@@ -445,6 +446,7 @@ impl AdjustmentRenderSettings {
             erase_inpaint_mono_tolerance: settings.erase_inpaint_mono_tolerance,
             retained_final_ai_cache_max_entries: settings.retained_final_ai_cache_max_entries,
             retained_final_ai_cache_max_mib: settings.retained_final_ai_cache_max_mib,
+            raw_brightness: settings.raw_brightness,
         }
     }
 }
@@ -802,6 +804,9 @@ impl SettingsDb {
                     "retained_final_ai_cache_max_mib",
                     || defaults.retained_final_ai_cache_max_mib,
                 )?,
+                raw_brightness: read_settings_kv_typed(&inner.conn, "raw_brightness", || {
+                    defaults.raw_brightness
+                })?,
             },
             lock_wait_ms,
         ))
@@ -820,6 +825,7 @@ impl SettingsDb {
         for (key, raw) in read_remote_listing_settings(&inner.conn)? {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
+        crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
         Ok(settings)
     }
 
@@ -5567,11 +5573,42 @@ mod tests {
             .unwrap()
             .apply_to(&mut startup_snapshot);
 
+        crate::settings::normalize_image_ext_priority(&mut live.image_ext_priority);
         assert_eq!(
             RemoteListingSettings::from_settings(&startup_snapshot),
             RemoteListingSettings::from_settings(&live)
         );
         assert_eq!(startup_snapshot.thumb_quality, 17);
+    }
+
+    #[test]
+    fn image_ext_priority_remote_overlay_completes_old_lists_without_writing() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let original = vec!["MOS".into(), "custom".into(), "png".into()];
+        let old = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        db.save_full(&old).unwrap();
+        let mut mirror = Settings::default();
+        db.load_remote_listing_settings(&mirror)
+            .unwrap()
+            .apply_to(&mut mirror);
+        assert_eq!(&mirror.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            mirror.image_ext_priority.len(),
+            crate::settings::default_image_ext_priority().len() + 1
+        );
+        assert!(
+            !mirror
+                .image_ext_priority
+                .iter()
+                .any(|extension| extension == "mos")
+        );
+        assert_eq!(
+            db.load_into_settings().unwrap().image_ext_priority,
+            original
+        );
     }
 
     #[test]
@@ -5791,6 +5828,7 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::BlackFill;
         settings.conceal_fill_opacity_percent = 73;
         settings.erase_inpaint_mono_tolerance = 9;
+        settings.raw_brightness = crate::raw::RawBrightness::MatchPreview;
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
@@ -5799,6 +5837,10 @@ mod tests {
         assert_eq!(first.favorites[0].path, favorite.path);
         assert_eq!(first.global_preset.brightness, 11.0);
         assert_eq!(first.erase_inpaint_mono_tolerance, 9);
+        assert_eq!(
+            first.raw_brightness,
+            crate::raw::RawBrightness::MatchPreview
+        );
         assert_eq!(first.creative_luts, settings.creative_luts);
         assert_eq!(
             first.conceal_preset,
@@ -5811,12 +5853,14 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::Blur;
         settings.conceal_blur_radius_px = 41.0;
         settings.erase_inpaint_mono_tolerance = 27;
+        settings.raw_brightness = crate::raw::RawBrightness::None;
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
         assert_eq!(second.erase_inpaint_mono_tolerance, 27);
+        assert_eq!(second.raw_brightness, crate::raw::RawBrightness::None);
         assert!(second.creative_luts.is_empty());
         assert_eq!(
             second.conceal_preset,

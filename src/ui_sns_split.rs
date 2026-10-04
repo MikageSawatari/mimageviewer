@@ -42,12 +42,14 @@ const SNS_SPLIT_INSTAGRAM_RATIO_REASON: &str = "Instagram はこの比率を切�
 pub(crate) enum SnsSplitEntryError {
     Rotated,
     ImageLoading,
+    RawDevelopmentPending,
 }
 
 impl SnsSplitEntryError {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::Rotated => SNS_SPLIT_ROTATION_DISABLED_REASON,
+            Self::RawDevelopmentPending => "RAW の現像が終わると編集できます",
             Self::ImageLoading => "[SNS 分割] 画像読み込み待ち",
         }
     }
@@ -667,6 +669,10 @@ impl App {
     }
 
     pub(crate) fn enter_sns_split_mode(&mut self, fs_idx: usize) -> Result<(), SnsSplitEntryError> {
+        let (raw_target_idx, _) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(raw_target_idx) {
+            return Err(SnsSplitEntryError::RawDevelopmentPending);
+        }
         if self.sns_split.is_some() {
             if let Some(error) = self.sns_split_rotation_error(fs_idx) {
                 return Err(error);

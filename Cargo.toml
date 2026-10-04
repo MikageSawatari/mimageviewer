@@ -5,6 +5,7 @@ members = [
     "crates/susie-crash-plugin",
     "crates/launcher",
     "crates/local-adjust-core",
+    "crates/libraw-sys",
     "crates/comic-core",
     "crates/music-core",
     "crates/remote-ipc",
@@ -91,6 +92,13 @@ required-features = ["dev-tools"]
 [[bin]]
 name = "bench_dupe"
 path = "src/bin/bench_dupe.rs"
+test = true # D11 RAW decode routing regression runs only with --features dev-tools --bin bench_dupe.
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_raw"
+path = "src/bin/bench_raw.rs"
 test = false
 bench = false
 required-features = ["dev-tools"]
@@ -267,6 +275,7 @@ bench = false
 required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
+libraw-sys = { path = "crates/libraw-sys" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

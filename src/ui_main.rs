@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use eframe::egui;
@@ -9056,6 +9057,7 @@ impl App {
                     }
                     let tx = tx.clone();
                     let key_for_worker = key.clone();
+                    let raw_executor = Arc::clone(&self.raw_develop_executor);
                     let spawn_result = std::thread::Builder::new()
                         .name("book-reorder-thumb".into())
                         .spawn(move || {
@@ -9064,9 +9066,17 @@ impl App {
                                     crate::thumb_loader::decode_image_for_thumb(
                                         &path,
                                         BOOK_REORDER_THUMB_DECODE_PX,
+                                        &raw_executor,
                                     )
                                 })) {
-                                    Ok(image) => image,
+                                    Ok(Ok(image)) => image,
+                                    Ok(Err(error)) => {
+                                        crate::logger::log(format!(
+                                            "book reorder RAW thumbnail decode failed {}: {error}",
+                                            path.display()
+                                        ));
+                                        None
+                                    }
                                     Err(_) => {
                                         crate::logger::log(format!(
                                             "book reorder thumbnail decode panicked: {}",

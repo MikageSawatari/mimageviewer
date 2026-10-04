@@ -34,6 +34,7 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 ┌───────────────▼──────────────────────────────────────────────┐
 │  非同期ワーカー層                                              │
 │   - サムネイルワーカー (通常/重 I/O の 2 系統)                 │
+│   - RAW 現像 executor (App 共有、優先度付き 1〜10 threads)     │
 │   - フルスクリーンロードスレッド (1 画像ごとに spawn)          │
 │   - PDF ワーカープロセス (--pdf-worker、設定 3〜10、既定 5)     │
 │   - EPUB → PDF 変換プロセス (1 冊につき 1 子プロセス)          │
@@ -50,7 +51,8 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 ┌───────────────▼──────────────────────────────────────────────┐
 │  データソース                                                  │
 │   - ファイルシステム (画像 / ZIP / PDF)                        │
-│   - image crate + turbojpeg (JPEG) + WIC (HEIC/AVIF/JXL/RAW)   │
+│   - image crate + turbojpeg (JPEG) + WIC (HEIC/AVIF/JXL/TIFF)  │
+│   - LibRaw (RAW の preview / half / Full)                      │
 │   - PDFium (pdfium-render、別プロセス)                         │
 │   - SQLite DB 群 (catalog / rotation / adjustment / mask /     │
 │     conceal / spread / pdf_passwords)                          │
@@ -72,6 +74,9 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
+| `raw_format.rs` | 23 種の RAW 拡張子の単一リスト。フォルダ列挙はこれを含み、WIC はこの集合を拒否する |
+| `raw/{raw_decoder,executor,brightness}.rs` | LibRaw の安全な info / preview / Full・half 現像、固定明るさ処理、優先度と取消を持つ App 共有の現像 executor。RAW は各入口で他の画像デコーダより先に分岐する |
+| `crates/libraw-sys` | vendored LibRaw との Windows FFI 境界と native build。非 Windows は safe API の Unsupported を返す |
 | `cut_clipboard.rs` | Windows の現在の file clipboard を App 単位で観測し、実ファイル / 実フォルダの cut 表示 snapshot を所有する。message-only window の通知 thread と OLE reader threadを分離し、UI は正規化済み `Arc<HashSet>` を可視項目の実パスと照合するだけにする。mIV の cut data object は private token と Shell の完了 format を同じ reducer へ返し、古い通知・読取・callback が新しい clipboard を上書きしない。viewer context やファイル / DB には cut 状態を保存しない |
 | `app/viewer_context_registry.rs` | main / detached / parked viewer context の唯一の bundle 保管先。`ViewerContextId`、`ContextResidence`、window binding の双方向表と、mount / build / fork / retire / promote の 5 transaction を所有する。`App` の viewer field 群は常に registry が選んだ 1 context の投影であり、active / parked は bundle の保管場所ではなく detached window runtime state が表す。窓 ID は App / bundle に保存せず、mounted binding（build 中は非公開の予約）から導出するため、一覧差し替えや表示終了で所有窓が変わらない |
 | `app/vram_accounting.rs` | `App` が所有する全 GPU テクスチャキャッシュを、実寸・mip chain・`TextureId` 重複排除で横断集計する。サブシステム別会計、モード判定、共有予算の参照、1 秒間隔の perf 計装を担当する |
@@ -152,7 +157,7 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | `filename_stack.rs` | ファイル名 prefix スタック (v2.0.0) の純ロジック。`StackMember`/`StackGroup`/`StackView` + `group_media` (末尾区切り文字の前でグループ化、動画は単独固定) / `materialize_aggregated` (集約グリッド) / `materialize_flat` (フラット読書フルスクリーン) / flat-index 写像 / `stack_jump_target` (Shift+↓↑)。I/O 無しで unit test 容易 |
 | `filename_stack_ui.rs` | 上記の App グルー (bin-only)。トグル / 集約⇔フラットのビュー切替 (`swap_stack_view_items`) / `stack_try_open_from_grid` (集約セル → フラットフルスクリーン) / `stack_reconcile_after_fullscreen_close` (閉じたら集約へ戻す)。集約構築は `load_folder_with_scan` hook 経由。詳細は [filename-stack-plan.md](filename-stack-plan.md) |
 | `thumb_loader.rs` | サムネイル並列ロード (WebP キャッシュ生成含む)。Folder 自動代表の再帰探索では子の非 Image pin を元ソースから生成せず、直上 catalog に完全一致の pin WebP がある場合だけ上位へ伝播する。再利用 WebP は完成済み cache origin として idle source upgrade を抑止する |
-| `catalog.rs` | フォルダ単位の SQLite catalog。サムネイル WebP、PDF メタデータ、ZIP / 画像のみフォルダのページ数、動画・音声の長さ / 解像度 / コーデック / 確定読取失敗 (`video_meta`) を保持する。ページ数 cache は種別・mtime・file size・判定設定 fingerprint の完全一致時だけ再利用する。動画・音声は mtime / file size 一致で再利用し、取消 / timeout は保存しない。再帰 pin の cache-only lookup 用に、DB が存在するときだけ schema 変更なしで read-only open する経路を持つ |
+| `catalog.rs` | フォルダ単位の SQLite catalog。サムネイル WebP、PDF メタデータ、ZIP / 画像のみフォルダのページ数、動画・音声の長さ / 解像度 / コーデック / 確定読取失敗 (`video_meta`) を保持する。ページ数 cache は種別・mtime・file size・判定設定 fingerprint の完全一致時だけ再利用する。fingerprint はフォルダ走査が使うネイティブ対応拡張子集合も含み、保存済みの拡張子優先度が変わらなくても形式追加時に再取得する。動画・音声は mtime / file size 一致で再利用し、取消 / timeout は保存しない。再帰 pin の cache-only lookup 用に、DB が存在するときだけ schema 変更なしで read-only open する経路を持つ |
 | `folder_thumb_pins.rs` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン DB (`%APPDATA%/mimageviewer/folder_thumb_pins.db`)。`apply_folder_thumb_pin` が cache key に `#pin:{source_id}` suffix を載せて pin の identity を表現し、子の Folder / ZIP / PDF / ZipDir が持つ代表 pin を最終 leaf まで連鎖解決する。cascade の source_id は経路 hash + leaf identity。固定 leaf が Image / ZipEntry / PdfPage なら canonical page key も親要求へ渡し、編集 preview を優先する。Video ピンは `seed_folder_video_pin_thumbs` で `video_pins` から WebP を catalog に seed する。RAR/7z/LZH 変換キャッシュ閲覧中は元アーカイブパスを root key にする |
 
 ### 仮想フォルダ (ZIP/PDF) / フォーマット
@@ -160,10 +165,10 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | モジュール | 役割 |
 | --- | --- |
 | `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) は再帰列挙し (表示は `zip_tree` でツリー化)、内側 ZIP バイト列は 256MB LRU キャッシュに保持。非 ZIP アーカイブ (RAR/7z/LZH) のエントリは `has_foreign_archives` フラグで検出して変換提案へつなぐ (v1.3.0)。読み戻しは literal フルネーム一致 → ネスト境界分割の順 (変換キャッシュのフラットエントリ対応)。画像判定は `folder_tree::is_recognized_image_ext` に委譲 (ネイティブ + WIC + Susie) |
-| `canonical_image_loader.rs` | fullscreen と remote AI が共有する静止画 canonical decoder。通常 file / verified bytes / ZIP・CBZ entry（nested ZIP を含む）を typed source で受け、image crate → WIC → Susie の順、EXIF 適用、GIF/APNG/WebP の既存 Animated 分類、通常 static の 8192 clamp を一箇所に置く。panorama 用 native tee は呼び出し側の従来位置に残し、raster PDF は `pdf_loader` の canonical renderer が担当する |
+| `canonical_image_loader.rs` | fullscreen と remote AI が共有する静止画 canonical decoder。通常 file / verified bytes / ZIP・CBZ entry（nested ZIP を含む）を typed source で受け、RAW は拡張子で先に LibRaw へ分岐し、その他は image crate → WIC → Susie の順に試す。ソース解決とデコードを分け、fullscreen の RAW Full 待機前には fs scheduler permit を返す。EXIF 適用、GIF/APNG/WebP の既存 Animated 分類、通常 static の 8192 clamp を一箇所に置く。panorama 用 native tee は呼び出し側の従来位置に残し、raster PDF は `pdf_loader` の canonical renderer が担当する |
 | `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング。EPUB の世代解決と使用は本ごとの読取リースを保持し、キャッシュの即時削除と順序付ける |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
-| `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
+| `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF のデコード (Windows Imaging Component)。RAW 拡張子は path / bytes の入口で拒否する |
 | `save_with_metadata.rs` | JPEG/PNG/WebP のエンコードと EXIF/XMP/PNG text/WebP metadata の転記。Ctrl+E エクスポートから呼ばれ、出力は `create_new` で上書きしない |
 | `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング。32bit ワーカー exe は本体に `include_bytes!` で埋め込み、初回起動時に `%APPDATA%\mimageviewer\mimageviewer-susie32.exe` へ自動展開 |
 | `archive_converter.rs` | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP → 無圧縮 ZIP 変換 (unrar / sevenz-rust2 / delharc / zip)。入れ子アーカイブは一時ファイル経由で再帰展開し (深さ上限 8)、`"inner.rar/p01.jpg"` 形式のフラットなエントリ名で出力する (v1.3.0)。RAR はパスワード付きにも対応するが、入力パスワード自体は保存しない。画像判定は `is_recognized_image_ext` 経由 (Susie 対応拡張子も含む) |

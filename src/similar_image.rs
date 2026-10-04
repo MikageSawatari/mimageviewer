@@ -52,6 +52,7 @@ pub enum SimilarImageFormat {
     Bmp = 5,
     Tiff = 6,
     Pdf = 7,
+    Raw = 8,
 }
 
 impl SimilarImageFormat {
@@ -61,6 +62,9 @@ impl SimilarImageFormat {
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        if crate::raw_format::is_raw_ext(&extension) {
+            return Self::Raw;
+        }
         match extension.as_str() {
             "jpg" | "jpeg" | "jpe" | "jfif" => Self::Jpeg,
             "png" => Self::Png,
@@ -82,6 +86,7 @@ impl SimilarImageFormat {
             5 => Self::Bmp,
             6 => Self::Tiff,
             7 => Self::Pdf,
+            8 => Self::Raw,
             _ => Self::Other,
         }
     }
@@ -96,6 +101,7 @@ impl SimilarImageFormat {
             Self::Bmp => "BMP",
             Self::Tiff => "TIFF",
             Self::Pdf => "PDF",
+            Self::Raw => "RAW",
         }
     }
 }
@@ -107,6 +113,8 @@ pub enum DecodeMethod {
     Wic,
     Susie,
     Raster,
+    RawPreview,
+    RawHalf,
 }
 
 impl DecodeMethod {
@@ -117,6 +125,8 @@ impl DecodeMethod {
             Self::Wic => "wic_full",
             Self::Susie => "susie_full",
             Self::Raster => "raster",
+            Self::RawPreview => "libraw_preview",
+            Self::RawHalf => "libraw_half",
         }
     }
 }
@@ -139,6 +149,8 @@ pub enum ProxyError {
     Io(std::io::Error),
     Decode(String),
     Cancelled,
+    Raw(crate::raw::RawError),
+    RawExecutorUnavailable,
 }
 
 impl std::fmt::Display for ProxyError {
@@ -147,6 +159,8 @@ impl std::fmt::Display for ProxyError {
             Self::Io(error) => write!(formatter, "source read failed: {error}"),
             Self::Decode(error) => write!(formatter, "image decode failed: {error}"),
             Self::Cancelled => write!(formatter, "image decode cancelled"),
+            Self::Raw(error) => write!(formatter, "RAW decode failed: {error}"),
+            Self::RawExecutorUnavailable => write!(formatter, "RAW executor unavailable"),
         }
     }
 }
@@ -157,6 +171,14 @@ impl std::error::Error for ProxyError {}
 pub fn proxy_from_source(
     source: ProxySource<'_>,
     cancel: Option<&Arc<AtomicBool>>,
+) -> Result<CanonicalProxy, ProxyError> {
+    proxy_from_source_with_raw(source, cancel, None)
+}
+
+pub fn proxy_from_source_with_raw(
+    source: ProxySource<'_>,
+    cancel: Option<&Arc<AtomicBool>>,
+    raw_executor: Option<&Arc<crate::raw::RawDevelopExecutor>>,
 ) -> Result<CanonicalProxy, ProxyError> {
     let started = std::time::Instant::now();
     if is_cancelled(cancel) {
@@ -189,12 +211,18 @@ pub fn proxy_from_source(
                     &owned
                 }
             };
-            decode_encoded(path.to_string_lossy().as_ref(), Some(path), bytes, cancel)
+            decode_encoded(
+                path.to_string_lossy().as_ref(),
+                Some(path),
+                bytes,
+                cancel,
+                raw_executor,
+            )
         }
         ProxySource::Encoded {
             filename_hint,
             bytes,
-        } => decode_encoded(filename_hint, None, bytes, cancel),
+        } => decode_encoded(filename_hint, None, bytes, cancel, raw_executor),
     }?;
     result.decode_ms = started.elapsed().as_secs_f64() * 1000.0 - result.proxy_ms;
     Ok(result)
@@ -205,11 +233,58 @@ fn decode_encoded(
     file_path: Option<&Path>,
     bytes: &[u8],
     cancel: Option<&Arc<AtomicBool>>,
+    raw_executor: Option<&Arc<crate::raw::RawDevelopExecutor>>,
 ) -> Result<CanonicalProxy, ProxyError> {
     if is_cancelled(cancel) {
         return Err(ProxyError::Cancelled);
     }
     let format = SimilarImageFormat::from_filename(filename_hint);
+    if format == SimilarImageFormat::Raw {
+        let info = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(bytes))
+            .map_err(ProxyError::Raw)?;
+        let required = JPEG_DCT_TARGET_EDGE.min(info.developed_dims[0].max(info.developed_dims[1]));
+        match crate::raw::raw_decoder::preview(crate::raw::RawSource::Bytes(bytes)) {
+            Ok(preview) if preview.image.width().max(preview.image.height()) >= required => {
+                return Ok(finish(
+                    &preview.image,
+                    (info.developed_dims[0], info.developed_dims[1]),
+                    format,
+                    DecodeMethod::RawPreview,
+                    1,
+                    1,
+                    None,
+                ));
+            }
+            Err(crate::raw::RawError::NoUsablePreview(_)) => {}
+            Err(error) => return Err(ProxyError::Raw(error)),
+            Ok(_) => {}
+        }
+        let executor = raw_executor.ok_or(ProxyError::RawExecutorUnavailable)?;
+        let (send, receive) = std::sync::mpsc::channel();
+        let ticket = executor.submit_thumbnail_half_with_cancel_flag(
+            crate::raw::RawOwnedSource::Bytes(bytes.to_vec().into()),
+            crate::raw::RawPriority::Background,
+            send,
+            cancel.cloned(),
+        );
+        let output = receive
+            .recv()
+            .map_err(|_| ProxyError::Raw(crate::raw::RawError::Cancelled))?
+            .map_err(ProxyError::Raw)?;
+        if is_cancelled(cancel) {
+            ticket.cancel();
+            return Err(ProxyError::Cancelled);
+        }
+        return Ok(finish(
+            &output.image,
+            (info.developed_dims[0], info.developed_dims[1]),
+            format,
+            DecodeMethod::RawHalf,
+            1,
+            1,
+            None,
+        ));
+    }
     if format == SimilarImageFormat::Jpeg {
         match decode_jpeg_turbo_scaled_from_bytes(bytes, JPEG_DCT_TARGET_EDGE) {
             Ok((image, stats)) => {
@@ -262,7 +337,15 @@ fn decode_full(
             }
             let wic = file_path
                 .and_then(crate::wic_decoder::decode_to_dynamic_image)
-                .or_else(|| crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes));
+                .or_else(|| {
+                    crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                        bytes,
+                        Path::new(filename_hint)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or(""),
+                    )
+                });
             if let Some(image) = wic {
                 (
                     image,
@@ -346,6 +429,35 @@ mod tests {
     use super::*;
     use image::{ImageFormat, RgbaImage};
     use std::io::Cursor;
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_dng_preview_and_cr2_half_proxies_use_libraw() {
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        for (file, expected_method) in [
+            ("885.dng", DecodeMethod::RawPreview),
+            ("1018.cr2", DecodeMethod::RawHalf),
+        ] {
+            let path = Path::new("vendor/raw-samples").join(file);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let info = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&path)).unwrap();
+            let proxy = proxy_from_source_with_raw(
+                ProxySource::File {
+                    path: &path,
+                    verified_bytes: None,
+                },
+                None,
+                Some(&executor),
+            )
+            .unwrap();
+            assert_eq!(proxy.format, SimilarImageFormat::Raw);
+            assert_eq!(proxy.method, expected_method);
+            assert_eq!(
+                proxy.source_dims,
+                (info.developed_dims[0], info.developed_dims[1])
+            );
+        }
+    }
 
     #[test]
     fn normal_zip_and_pdf_sources_share_the_proxy_builder() {

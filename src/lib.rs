@@ -26,6 +26,11 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+#[cfg(feature = "dev-tools")]
+pub mod raw;
+#[cfg(not(feature = "dev-tools"))]
+pub(crate) mod raw;
+pub mod raw_format;
 /// 一括書き出しの要求が必ず伴う借用。`app` module 自体は非公開なのでここで出す。
 pub use app::LocalAiActivityLease;
 pub use app::draw_collection_placeholder_snapshot_fixture;
@@ -271,6 +276,12 @@ mod ui_adjustment_panel;
 mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
+mod ui_raw;
+#[doc(hidden)]
+pub use ui_raw::{
+    draw_raw_blocked_preview_snapshot_fixture, draw_raw_progress_snapshot_fixture,
+    draw_raw_settings_snapshot_fixture,
+};
 pub mod ui_dialogs;
 mod ui_sns_split;
 pub use ui_dialogs::preferences::draw_effetune_input_limit_snapshot_fixture;
@@ -1346,17 +1357,24 @@ pub fn run() -> eframe::Result {
     // App 所有ハンドルを使うため、型付き queue と repaint wakeup 経由で UI thread に渡す。
     // guard は run_native が戻るまで保持し、Drop で listener と worker を閉じる。
     let remote_service_status = remote_ipc::RemoteServiceStatus::stopped();
-    let mut remote_ipc_server =
-        match remote_ipc::RemoteIpcServer::start(saved.clone(), collection_remote_producer.clone())
-        {
-            Ok(server) => Some(server),
-            Err(error) => {
-                eprintln!("remote IPC を開始できません: {error}");
-                logger::log(format!("remote_ipc: startup failed: {error}"));
-                remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
-                None
-            }
-        };
+    saved.raw_develop_parallelism = saved.raw_develop_parallelism.clamp(1, 10);
+    let raw_develop_executor = Arc::new(
+        raw::RawDevelopExecutor::new(saved.raw_develop_parallelism as usize)
+            .expect("RAW develop worker startup"),
+    );
+    let mut remote_ipc_server = match remote_ipc::RemoteIpcServer::start(
+        saved.clone(),
+        collection_remote_producer.clone(),
+        Arc::clone(&raw_develop_executor),
+    ) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!("remote IPC を開始できません: {error}");
+            logger::log(format!("remote_ipc: startup failed: {error}"));
+            remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
+            None
+        }
+    };
     let remote_session_handle = remote_ipc_server
         .as_ref()
         .map(remote_ipc::RemoteIpcServer::session_handle);
@@ -1436,10 +1454,11 @@ pub fn run() -> eframe::Result {
             // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
             let repaint_ctx = cc.egui_ctx.clone();
-            let mut app = app::App::new_from_settings_with_load_meta_and_book_query_repaint(
+            let mut app = app::App::new_from_settings_with_load_meta_and_raw_executor(
                 saved.clone(),
                 settings_load_meta.clone(),
                 move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
+                Arc::clone(&raw_develop_executor),
             );
             match collection_install.clone() {
                 Ok((client, events)) => {

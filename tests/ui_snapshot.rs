@@ -25,7 +25,91 @@
 //! - [egui_kittest docs](https://docs.rs/egui_kittest/)
 //! - mimageviewer 側のポリシー: [docs/ui-snapshot-policy.md](../docs/ui-snapshot-policy.md)
 
-use egui_kittest::Harness;
+use egui_kittest::{Harness, kittest::Queryable};
+
+#[test]
+fn raw_license_information_light() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_license_information_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 340.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_license_information_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_license_information_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 340.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_license_information_expanded_dark() {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "raw_license_information_expanded_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 920.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+        |harness| {
+            for title in [
+                "LibRaw ライセンス・著作権表記 全文",
+                "zlib License 全文",
+                "libjpeg-turbo ライセンス・著作権表記 全文",
+            ] {
+                harness.get_by_label(title).click();
+                harness.run();
+            }
+            harness.remove_cursor();
+            harness.run();
+        },
+    );
+}
+
+#[test]
+fn raw_settings_light() {
+    // Render the actual dedicated preferences page, including its heading.
+    snapshot_with_theme(
+        "raw_settings_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_raw_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_settings_dark() {
+    snapshot_with_theme(
+        "raw_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_raw_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_progress_dark() {
+    snapshot_with_theme(
+        "raw_progress_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_raw_progress_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_blocked_preview_notice_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_blocked_preview_notice_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(800.0, 120.0),
+        mimageviewer::draw_raw_blocked_preview_snapshot_fixture,
+    );
+}
 
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
@@ -78,30 +162,63 @@ fn snapshot_with_theme_and_contrast(
     name: &str,
     resolved: mimageviewer::os_theme::ResolvedTheme,
     contrast: mimageviewer::settings::TextContrast,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_contrast_and_size(
+        name,
+        resolved,
+        contrast,
+        egui::vec2(480.0, 360.0),
+        build_ui,
+    );
+}
+
+fn snapshot_with_theme_contrast_and_size(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        resolved,
+        contrast,
+        size,
+        build_ui,
+        |_| {},
+    );
+}
+
+fn snapshot_with_theme_contrast_and_size_with_interaction(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
     mut build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(480.0, 360.0))
-        .build(move |ctx| {
-            mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
-            if !fonts_ready {
-                install_app_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    egui::Frame::central_panel(ui.style())
-                        .outer_margin(8.0)
-                        .inner_margin(0.0)
-                        .show(ui, |ui| build_ui(ui));
-                });
-        });
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                egui::Frame::central_panel(ui.style())
+                    .outer_margin(8.0)
+                    .inner_margin(0.0)
+                    .show(ui, |ui| build_ui(ui));
+            });
+    });
 
     harness.run();
+    interact(&mut harness);
     harness.snapshot(name);
 }
 

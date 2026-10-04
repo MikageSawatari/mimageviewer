@@ -1550,6 +1550,16 @@ GPT-6.1 Sol/xhighが確認した。表示挙動を修正するbackend設計へ�
 時計・世代・配送snapshotの意味と採取方法は
 [§1.327調査 §6](section327-startup-window-flicker-investigation.md#6-native診断の採取と読み方-2026-10-04)。
 
+**2026-10-01 RAW fullscreen page ownership (S3)**
+
+`RawPageStore` を `ContextAsyncOwner` と `ViewerContextBundle` に登録した。`fs_pending` と同じ context-owned resource で、preview / source preparation / development の要求 ID、物理 source 指紋、現像 ticket、結果 channel と需要集合を所有する。park は未完了要求を取消し、Done / Blocked を保持する。generation 差し替えと drop はその context だけを破棄し、snapshot 再構築は表示 entry と owner を原子的に移す。明るさ変更は mounted / parked の各 owner に同じ RAW source transaction を適用する。detached の述語・viewport・window lifecycle は変更しない。
+
+2026-10-04 master v4.3.0 取り込み時の追補: 両ブランチの inline state を合わせると `App` が 110,104 bytes となり、既存の stack footprint 回帰の上限 110,000 bytes を超えた。`App` と `ViewerContextBundle` の `raw_pages` は唯一の owner のまま `Box<RawPageStore>` で保管し、`App` は 109,944 bytes となった。store 全体の move / swap、park、generation、cancel、drop は既存経路を保ち、新しい状態や detached 述語・viewport 分岐は加えない。実装担当と独立 Codex レビューは、状態の所有境界を変えず保管場所だけを heap へ移す構造修正であることに合意した。上限と既存テストは変更しない。
+
+**2026-09-27 RAW thumbnail ticket ownership (S2a)**
+
+`raw_thumb_develop` は `requested` と同じ viewer context が所有する idx / items generation / submission ID 付き map として `ViewerContextBundle` に加えた。旧世代の完了は同じ idx の新しい ticket を外さない。keep range 離脱、一覧世代変更、folder 移動、mounted context の pause/park（`fs_pending` を drain する境界）、drop でその context の ticket を cancel し、既存の canceled `ThumbMsg` で requested を解放する。別の detached flag や viewport 分岐は追加しない。
+
 **2026-09-30 §1.304 Collection root 可視採用時の main context 所有境界**
 
 Collection の明示 Open、物理子から root への復帰、offscreen 履歴準備後の root 採用を、可視一覧の置換前に共通 loader・ドライブ一覧も使う `change_main_context_for_visible_grid` へ通す。動画・音声の別窓は既存の promote で旧 items 世代・player・fs_cache と共に別 context へ移し、静止画・PDF は既存の park / close 方針を使う。passive / parked sibling と F12 linked の方針は変えない。移管不可なら履歴・surface・items の変更前に理由付きで終端する。移動元の履歴地点、検索中の履歴抑止、`return_to` は移管前に捕捉する。有効な同一 Collection root の fullscreen binding だけは旧 session の `cancel_pending` で installed snapshot を保持し、`begin` と空 items install をしない。明示 Open の即時読み込み・失敗表示と記録済み履歴、履歴復元の成功時確定は維持する。

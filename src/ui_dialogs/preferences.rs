@@ -170,6 +170,7 @@ pub(crate) enum PreferencesPage {
     /// 履歴と復元 (閲覧履歴、読書/再生位置の復元)
     PlaybackResume,
     SusiePlugins,
+    RawDevelop,
     /// v0.8.0: 検索インデックスの速度プロファイル
     IndexerSpeed,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
@@ -257,6 +258,7 @@ impl PreferencesPage {
         Self::SpreadMode,
         Self::PlaybackResume,
         Self::SusiePlugins,
+        Self::RawDevelop,
         Self::IndexerSpeed,
         Self::TrayResidency,
         Self::Rating,
@@ -293,6 +295,7 @@ impl PreferencesPage {
             Self::SpreadMode => "閲覧表示",
             Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
+            Self::RawDevelop => "RAW 現像",
             Self::IndexerSpeed => "検索インデックス",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
@@ -548,6 +551,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::DuplicateFiles,
             PreferencesPage::ExifDisplay,
             PreferencesPage::SusiePlugins,
+            PreferencesPage::RawDevelop,
         ],
     },
     TreeCategory {
@@ -1960,11 +1964,29 @@ fn merge_video_media_memory_for_preferences(
 }
 
 impl App {
-    pub(crate) fn install_preferences_settings(&mut self, settings: Settings) {
+    pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
+        let old_raw_brightness = self.settings.raw_brightness;
+        let requested_raw_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
+        if requested_raw_parallelism != self.settings.raw_develop_parallelism {
+            if let Err(error) = self
+                .raw_develop_executor
+                .set_parallelism(requested_raw_parallelism as usize)
+            {
+                settings.raw_develop_parallelism = self.settings.raw_develop_parallelism;
+                self.show_feedback_toast(format!(
+                    "RAW の同時現像数を変更できませんでした: {error}"
+                ));
+            } else {
+                settings.raw_develop_parallelism = requested_raw_parallelism;
+            }
+        }
         let media_duration_changed =
             self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
+        if old_raw_brightness != self.settings.raw_brightness {
+            self.raw_brightness_changed();
+        }
         #[cfg(windows)]
         self.effetune
             .set_keep_visible_when_minimized(self.settings.effetune_keep_visible_when_minimized);
@@ -3518,6 +3540,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
+        PreferencesPage::RawDevelop => page_raw_develop(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
@@ -3531,9 +3554,148 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 
 // 個別ページ実装は `preferences/pages.rs` に分離。
 
+pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.selected = PreferencesPage::RawDevelop;
+    draw_page(ui, &mut state, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPageLoadState};
+        use crate::raw::RawBrightness;
+        use egui_kittest::{Harness, kittest::Queryable};
+        for executor_closed in [false, true] {
+            let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+            let ctx = egui::Context::default();
+            let image = std::sync::Arc::new(egui::ColorImage::filled([3, 2], egui::Color32::GRAY));
+            let tex = ctx.load_texture(
+                "raw-settings-source",
+                image.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Static {
+                    tex,
+                    pixels: image,
+                    source_dims: Some([12000, 8000]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            let page = app.raw_pages.page_mut(0).unwrap();
+            page.stage = RawInstalledStage::Developed;
+            *page.develop.lock().unwrap() = RawDevelopPhase::Done;
+            let old_parallelism = app.settings.raw_develop_parallelism;
+            app.raw_develop_executor
+                .set_parallelism(old_parallelism as usize)
+                .unwrap();
+            let old_generation = app.input_generation.get(&0).copied().unwrap_or(0);
+            assert_eq!(
+                app.raw_develop_executor.desired_parallelism_for_test(),
+                old_parallelism as usize
+            );
+            if executor_closed {
+                app.raw_develop_executor.shutdown();
+            }
+            app.open_preferences_page(PreferencesPage::RawDevelop);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1100.0, 850.0))
+                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            harness.run();
+            harness.get_by_label("補正しない").click();
+            harness.run();
+            // Select the actual RAW DragValue by its unique allowed range, focus
+            // its numeric editor, and replace the selected text. No draft writes.
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0) && node.max_numeric_value() == Some(10.0)
+                })
+                .focus();
+            harness.run();
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0) && node.max_numeric_value() == Some(10.0)
+                })
+                .type_text("1");
+            harness.run();
+            harness.get_by_label("補正しない").click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .raw_develop_parallelism,
+                1
+            );
+            assert_eq!(
+                harness.state().settings.raw_develop_parallelism,
+                old_parallelism
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .raw_develop_executor
+                    .desired_parallelism_for_test(),
+                old_parallelism as usize
+            );
+            assert_eq!(
+                harness.state().settings.raw_brightness,
+                RawBrightness::MatchPreview
+            );
+            assert_eq!(
+                harness.state().raw_pages.classify(0),
+                RawPageLoadState::Developed
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            let expected_parallelism = if executor_closed { old_parallelism } else { 1 };
+            let app = harness.state();
+            assert!(!app.show_preferences);
+            assert_eq!(app.settings.raw_develop_parallelism, expected_parallelism);
+            assert_eq!(
+                app.raw_develop_executor.desired_parallelism_for_test(),
+                expected_parallelism as usize
+            );
+            assert_eq!(app.settings.raw_brightness, RawBrightness::None);
+            assert_eq!(
+                app.raw_pages.classify(0),
+                RawPageLoadState::PreviewNotRequested
+            );
+            assert!(app.fs_cache.get(&0).is_none());
+            assert!(app.input_generation.get(&0).copied().unwrap_or(0) > old_generation);
+            let saved = crate::settings::Settings::load();
+            assert_eq!(saved.raw_brightness, RawBrightness::None);
+            assert_eq!(saved.raw_develop_parallelism, expected_parallelism);
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::RawDevelop);
+            harness.run();
+            let reopened = &harness.state().pref_state.as_ref().unwrap().settings;
+            assert_eq!(reopened.raw_brightness, saved.raw_brightness);
+            assert_eq!(
+                reopened.raw_develop_parallelism,
+                saved.raw_develop_parallelism
+            );
+        }
+    }
 
     #[test]
     fn preferences_books_root_change_submits_new_exclusion_to_name_owner() {
@@ -3610,6 +3772,25 @@ mod tests {
             0,
             0,
         )
+    }
+
+    #[test]
+    fn image_ext_priority_preferences_exposes_new_raw_entries_after_sqlite_load() {
+        use crate::settings::Settings;
+        let app = crate::app::setup_app_for_test();
+        let mut saved = app.settings.clone();
+        saved.image_ext_priority.truncate(27);
+        saved.save();
+        let loaded = Settings::load();
+        let preferences = preferences_state_for_test(&loaded);
+        assert_eq!(
+            preferences.settings.image_ext_priority,
+            crate::settings::default_image_ext_priority()
+        );
+        assert_eq!(
+            &preferences.settings.image_ext_priority[27..],
+            ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"]
+        );
     }
 
     fn saved_audio_choice_for_preferences_test(
@@ -4742,6 +4923,42 @@ mod tests {
             ),
             Some(13)
         );
+    }
+
+    #[test]
+    fn raw_develop_page_follows_susie_in_file_processing() {
+        let (label, category_idx, raw_idx) = preference_category(PreferencesPage::RawDevelop);
+        assert_eq!(label, "ファイル処理");
+        let category = &TREE[category_idx];
+        assert_eq!(
+            category.children[raw_idx - 1],
+            PreferencesPage::SusiePlugins
+        );
+        assert!(PreferencesPage::ALL.contains(&PreferencesPage::RawDevelop));
+    }
+
+    #[test]
+    fn raw_controls_only_appear_on_dedicated_page() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.selected = PreferencesPage::Parallelism;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        assert!(harness.query_by_label("プレビューに合わせる").is_none());
+        assert!(harness.query_by_label("PDF の同時処理数").is_some());
+        harness.state_mut().selected = PreferencesPage::RawDevelop;
+        harness.run();
+        assert!(harness.query_by_label("RAW 現像").is_some());
+        assert!(harness.query_by_label("プレビューに合わせる").is_some());
+        assert!(harness.query_by_label("補正しない").is_some());
+        assert!(harness.query_by_label("PDF の同時処理数").is_none());
     }
 
     #[test]

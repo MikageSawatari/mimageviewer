@@ -48,6 +48,17 @@ pub enum MaterializeSource {
 }
 
 impl MaterializeSource {
+    fn has_raw_page(&self) -> bool {
+        match self {
+            Self::File { path, image_page } => *image_page && crate::raw_format::is_raw_path(path),
+            Self::ZipEntry { entry_name, .. } => {
+                crate::raw_format::is_raw_path(Path::new(entry_name))
+            }
+            Self::MergedSpread { left, right, .. } => left.has_raw_page() || right.has_raw_page(),
+            Self::PdfPage { .. } | Self::VideoFrame { .. } => false,
+        }
+    }
+
     /// 失敗を利用者へ見せるときの名前。ZIP / PDF は「どのページか」まで出す。
     /// パスだけだと、複数ページを渡したときにどれが失敗したのか分からない。
     pub fn display_label(&self) -> String {
@@ -189,6 +200,8 @@ pub struct MaterializeRequest {
     pub policy: MaterializePolicy,
     pub page_edits: Option<MaterializePageEdits>,
     pub pdf_render_long_edge: u32,
+    /// Snapshot from the submitting UI; never read the materializer's startup choice.
+    pub raw_brightness: crate::raw::RawBrightness,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +318,7 @@ struct CacheKey {
     policy: MaterializePolicy,
     pdf_render_long_edge: u32,
     edit_fingerprint: [u8; 32],
+    raw_brightness: Option<crate::raw::RawBrightness>,
 }
 
 #[derive(Clone)]
@@ -333,9 +347,16 @@ struct MaterializerInner {
 pub struct Materializer {
     inner: Arc<MaterializerInner>,
     startup_cleanup: Option<JoinHandle<()>>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 impl Materializer {
+    pub fn new_with_raw(raw: crate::raw::RawDecodeContext) -> Self {
+        let mut materializer = Self::new();
+        materializer.raw = Some(raw);
+        materializer
+    }
+
     pub fn new() -> Self {
         #[cfg(test)]
         {
@@ -392,6 +413,7 @@ impl Materializer {
         Self {
             inner,
             startup_cleanup,
+            raw: None,
         }
     }
 
@@ -414,6 +436,7 @@ impl Materializer {
         MaterializeSession {
             inner: Arc::clone(&self.inner),
             databases: None,
+            raw: self.raw.clone(),
         }
     }
 
@@ -482,6 +505,7 @@ impl EditDatabases {
 pub struct MaterializeSession {
     inner: Arc<MaterializerInner>,
     databases: Option<EditDatabases>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 struct LoadedPageEdits {
@@ -597,6 +621,10 @@ impl MaterializeSession {
             policy: request.policy,
             pdf_render_long_edge,
             edit_fingerprint,
+            raw_brightness: request
+                .source
+                .has_raw_page()
+                .then_some(request.raw_brightness),
         };
         ensure_process_directory(&self.inner)?;
         if let Some(record) = lookup_reusable(&self.inner, &key, source_stamp) {
@@ -636,11 +664,18 @@ impl MaterializeSession {
                     {
                         decode_video_frame(path, *target_millis)?
                     } else {
+                        let raw = self.raw.as_ref().map(|raw| {
+                            crate::raw::RawDecodeContext::new(
+                                Arc::clone(&raw.executor),
+                                request.raw_brightness,
+                            )
+                        });
                         render_materialize_source(
                             &request.source,
                             loaded_edits.as_ref(),
                             pdf_render_long_edge,
                             cancel,
+                            raw.as_ref(),
                             epub_read.as_ref(),
                         )?
                     };
@@ -931,6 +966,7 @@ fn render_materialize_source(
     edits: Option<&LoadedMaterializePageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
     epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     match source {
@@ -945,9 +981,15 @@ fn render_materialize_source(
                 None => (None, None),
             };
             let left =
-                render_materialize_page(left, left_edits, pdf_render_long_edge, cancel, None)?;
-            let right =
-                render_materialize_page(right, right_edits, pdf_render_long_edge, cancel, None)?;
+                render_materialize_page(left, left_edits, pdf_render_long_edge, cancel, raw, None)?;
+            let right = render_materialize_page(
+                right,
+                right_edits,
+                pdf_render_long_edge,
+                cancel,
+                raw,
+                None,
+            )?;
             crate::capture::combine_spread_color_images(&left, &right)
         }
         _ => {
@@ -958,7 +1000,7 @@ fn render_materialize_source(
                 }
                 None => None,
             };
-            render_materialize_page(source, edits, pdf_render_long_edge, cancel, epub_read)
+            render_materialize_page(source, edits, pdf_render_long_edge, cancel, raw, epub_read)
         }
     }
 }
@@ -968,6 +1010,7 @@ fn render_materialize_page(
     edits: Option<&LoadedPageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
     epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     let source = composite_source(source)?;
@@ -975,6 +1018,7 @@ fn render_materialize_page(
         &source,
         pdf_render_long_edge,
         Arc::clone(cancel),
+        raw,
         epub_read,
     )?;
     match edits {
@@ -1707,6 +1751,92 @@ fn baked_params_and_lut(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_materialization_uses_request_brightness_and_never_reuses_old_brightness() {
+        let raw = crate::raw::RawDecodeContext::new(
+            Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+            crate::raw::RawBrightness::None,
+        );
+        let manager = Materializer::new_with_raw(raw);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let mut request = MaterializeRequest {
+            source: MaterializeSource::File {
+                path,
+                image_page: true,
+            },
+            policy: MaterializePolicy::TempEdited,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+            raw_brightness: crate::raw::RawBrightness::MatchPreview,
+        };
+        let mut session = manager.session();
+        let mut first = session.materialize(&request, &cancel, generation).unwrap();
+        first.transfer_to_process_directory(false);
+        request.raw_brightness = crate::raw::RawBrightness::None;
+        let second = session.materialize(&request, &cancel, generation).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_ne!(
+            std::fs::read(first.path()).unwrap(),
+            std::fs::read(second.path()).unwrap()
+        );
+        request.raw_brightness = crate::raw::RawBrightness::MatchPreview;
+        let old_request = session.materialize(&request, &cancel, generation).unwrap();
+        assert_eq!(old_request.path(), first.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_external_tool_materialization_uses_full_libraw_for_file_and_zip() {
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let raw = crate::raw::RawDecodeContext::new(executor, crate::raw::RawBrightness::None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(cr2.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let file = render_materialize_source(
+            &MaterializeSource::File {
+                path: cr2.clone(),
+                image_page: true,
+            },
+            None,
+            4096,
+            &cancel,
+            Some(&raw),
+            None,
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&cr2))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(file.size, [dims[0] as usize, dims[1] as usize]);
+
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(dng.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(&dng).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("pages.zip");
+        write_test_zip(&zip_path, "page.dng", &bytes);
+        let zip = render_materialize_source(
+            &MaterializeSource::ZipEntry {
+                zip_path,
+                entry_name: "page.dng".to_owned(),
+            },
+            None,
+            4096,
+            &cancel,
+            Some(&raw),
+            None,
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(zip.size, [dims[0] as usize, dims[1] as usize]);
+    }
+
     fn write_test_zip(path: &Path, entry_name: &str, bytes: &[u8]) {
         use std::io::Write as _;
         let file = std::fs::File::create(path).unwrap();
@@ -1720,6 +1850,7 @@ mod tests {
 
     fn zip_request(path: &Path, entry_name: &str) -> MaterializeRequest {
         MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::ZipEntry {
                 zip_path: path.to_path_buf(),
                 entry_name: entry_name.to_string(),
@@ -1997,6 +2128,7 @@ mod tests {
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let request = MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::MergedSpread {
                 label: "page04_page05".to_string(),
                 left: Box::new(MaterializeSource::File {
@@ -2083,13 +2215,14 @@ mod tests {
             left: loaded_stage(crate::bake_stage::BakeStage::Edits),
             right: loaded_stage(crate::bake_stage::BakeStage::Edits),
         };
-        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel, None).unwrap();
+        let plain =
+            render_materialize_source(&source, Some(&edits), 4096, &cancel, None, None).unwrap();
         let display = LoadedMaterializePageEdits::Spread {
             left: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
             right: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
         };
         let adjusted =
-            render_materialize_source(&source, Some(&display), 4096, &cancel, None).unwrap();
+            render_materialize_source(&source, Some(&display), 4096, &cancel, None, None).unwrap();
 
         assert_eq!(plain.size, adjusted.size);
         assert_ne!(plain.pixels, adjusted.pixels);
@@ -2231,6 +2364,7 @@ mod tests {
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let request = MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::PdfPage {
                 pdf_path: fixture.source.clone(),
                 page_num: 0,
@@ -2244,6 +2378,7 @@ mod tests {
         let output = manager.inner.process_dir.join("current.png");
         std::fs::write(&output, b"already rendered in this run").unwrap();
         let key = CacheKey {
+            raw_brightness: None,
             source: request.source.clone(),
             policy: request.policy,
             pdf_render_long_edge: 4096,
@@ -2357,6 +2492,7 @@ mod tests {
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let request = MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::File {
                 path: source.clone(),
                 image_page: true,
@@ -2552,6 +2688,7 @@ mod tests {
         std::fs::write(&path, b"png").unwrap();
         let stamp = file_stamp(&path).unwrap();
         let key = CacheKey {
+            raw_brightness: None,
             source: MaterializeSource::File {
                 path: temp.path().join("source.png"),
                 image_page: true,
@@ -2581,6 +2718,7 @@ mod tests {
         std::fs::write(&path, b"png").unwrap();
         let stamp = file_stamp(&path).unwrap();
         let key = CacheKey {
+            raw_brightness: None,
             source: MaterializeSource::File {
                 path: temp.path().join("source.png"),
                 image_page: true,

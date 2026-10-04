@@ -329,6 +329,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["自動", "スレッド", "CPU", "並列", "parallel"]
     ),
     entry!(
+        "raw-develop/settings",
+        RawDevelop,
+        "同時現像数:",
+        [
+            "RAW",
+            "現像",
+            "明るさ",
+            "プレビュー",
+            "補正しない",
+            "LibRaw",
+            "メモリ"
+        ]
+    ),
+    entry!(
         "parallelism/pdf",
         Parallelism,
         "PDF の同時処理数",
@@ -1168,6 +1182,7 @@ mod tests {
 
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
+    const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1300,8 +1315,17 @@ mod tests {
                     PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
                 );
             } else {
+                let title_source = if entry.anchor == "raw-develop/settings" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
+                    );
+                    RAW_SETTINGS_SOURCE
+                } else {
+                    PAGES_SOURCE
+                };
                 assert!(
-                    PAGES_SOURCE.contains(entry.title),
+                    title_source.contains(entry.title),
                     "title が pages.rs の表示文字列と一致しません: {} / {}",
                     entry.anchor,
                     entry.title
@@ -1419,6 +1443,24 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn raw_settings_search_targets_dedicated_page() {
+        for query in [
+            "raw",
+            "RAW 現像",
+            "同時現像数",
+            "RAW 明るさ",
+            "LibRaw",
+            "補正しない",
+        ] {
+            let results = search_preferences(query, test_tree_position);
+            assert!(!results.is_empty(), "no RAW settings result for {query}");
+            assert!(results.iter().all(|entry| {
+                entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
+            }));
+        }
     }
 
     #[test]

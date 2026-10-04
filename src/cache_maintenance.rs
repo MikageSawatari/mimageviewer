@@ -809,6 +809,7 @@ mod tests {
         for item_key in [removed_key.clone(), unrelated_key.clone()] {
             app.retained_final_ai_cache.insert(
                 crate::app::RetainedFinalAiKey {
+                    raw_source: None,
                     item_key: item_key.clone(),
                     edit_size: [1, 1],
                     color_ai_hash: 1,

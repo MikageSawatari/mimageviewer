@@ -317,6 +317,22 @@ impl ThumbnailEngine {
             );
         }
 
+        // Resolve a folder representative before the catalog lookup. Remote
+        // accepts any usable RAW preview, and otherwise only reads the catalog.
+        let raw_requirement = crate::thumb_loader::remote_raw_thumbnail_requirement(
+            &load_request,
+            context.folder_pin_db.as_ref(),
+        );
+        match raw_requirement {
+            crate::thumb_loader::RemoteRawThumbRequirement::NotRaw => {}
+            crate::thumb_loader::RemoteRawThumbRequirement::PreviewAvailable => {
+                load_request.source_policy = crate::thumb_loader::LoadSourcePolicy::SourceOnly;
+            }
+            crate::thumb_loader::RemoteRawThumbRequirement::CatalogOnly => {
+                load_request.source_policy = crate::thumb_loader::LoadSourcePolicy::CacheOnly;
+            }
+        }
+
         let catalog = Arc::new(
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent).map_err(
                 |error| {
@@ -342,15 +358,27 @@ impl ThumbnailEngine {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
         let effective_target = target_px.min(self.settings.thumb_px.max(1));
+        let (raw_unavailable_tx, raw_unavailable_rx) = mpsc::channel();
+        let raw_handoff =
+            crate::thumb_loader::RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
+        let cache_decision = if matches!(
+            raw_requirement,
+            crate::thumb_loader::RemoteRawThumbRequirement::NotRaw
+        ) {
+            crate::thumb_loader::CacheDecision::from_settings(&self.settings)
+        } else {
+            // A small Remote preview must not replace a PC half-developed row.
+            crate::thumb_loader::CacheDecision::without_thumbnail()
+        };
         crate::thumb_loader::process_load_request(
-            &load_request,
+            &mut load_request,
             &cache_map,
             &tx,
             Some(&catalog),
             self.settings.thumb_px,
             self.settings.thumb_quality,
             effective_target,
-            crate::thumb_loader::CacheDecision::from_settings(&self.settings),
+            cache_decision,
             &done,
             &self.stats,
             Some(&cancel),
@@ -360,14 +388,33 @@ impl ThumbnailEngine {
             context.folder_pin_db.as_ref(),
             None,
             context.adjustment_db.as_ref(),
+            Some(&raw_handoff),
         );
+        if matches!(
+            raw_unavailable_rx.try_recv(),
+            Ok(crate::thumb_loader::RawThumbUnavailable::NeedsHalfDevelopment)
+        ) {
+            return Err(error_response(
+                ThumbnailErrorCode::NoThumbnail,
+                "RAW に使えるサムネイルがありません",
+            ));
+        }
         drop(tx);
         let color_image = rx
             .into_iter()
             .find_map(|message| (!message.finalized && !message.canceled).then_some(message.image))
             .flatten()
             .ok_or_else(|| {
-                if is_folder {
+                if matches!(
+                    raw_requirement,
+                    crate::thumb_loader::RemoteRawThumbRequirement::CatalogOnly
+                        | crate::thumb_loader::RemoteRawThumbRequirement::PreviewAvailable
+                ) {
+                    error_response(
+                        ThumbnailErrorCode::NoThumbnail,
+                        "RAW に使えるサムネイルがありません",
+                    )
+                } else if is_folder {
                     // process_load_request 内の本体共通 resolve_folder_thumb_image が
                     // None を返した結果。Web 独自探索ではなく、本体 UI と同じ条件で
                     // 代表画像が無いことを 404 として区別する。
@@ -668,6 +715,161 @@ fn error_response(code: ThumbnailErrorCode, message: impl Into<String>) -> Thumb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_raw_thumbnail_uses_small_preview_without_half_development() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("remote-raw-thumbnail");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let path = folder.join("page.cr2");
+        std::fs::copy(source, &path).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = 2048;
+        let engine = ThumbnailEngine::new(settings);
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+        let preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(&path)).unwrap();
+        assert!(preview.image.width().max(preview.image.height()) < 2048);
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &folder).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let metadata = std::fs::metadata(&path).unwrap();
+        catalog
+            .save(
+                "page.cr2",
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        let bytes = engine
+            .generate_catalog_resolved(&resolved, 2048, &context)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.width().max(decoded.height()) > 8);
+        let saved = catalog.load_one("page.cr2").unwrap().unwrap();
+        let saved = image::load_from_memory(&saved.jpeg_data).unwrap();
+        assert_eq!((saved.width(), saved.height()), (8, 8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_raw_without_preview_uses_catalog_only_or_no_thumbnail() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("remote-raw-catalog-only");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("page.cr2");
+        std::fs::write(&path, b"invalid raw with no preview").unwrap();
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+        let missing = engine.generate_catalog_resolved(&resolved, 256, &context);
+        assert!(matches!(
+            missing,
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::NoThumbnail,
+                ..
+            }))
+        ));
+
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &folder).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let metadata = std::fs::metadata(&path).unwrap();
+        catalog
+            .save(
+                "page.cr2",
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        let bytes = engine
+            .generate_catalog_resolved(&resolved, 256, &context)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (8, 8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_raw_folder_representative_with_no_preview_uses_catalog() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("remote-cached-raw-folder");
+        let folder = root.join("pages");
+        std::fs::create_dir_all(&folder).unwrap();
+        let raw_path = folder.join("page.cr2");
+        std::fs::write(&raw_path, b"invalid raw with no preview").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = 2048;
+        let engine = ThumbnailEngine::new(settings);
+        let resolved = resolve_existing(folder.to_string_lossy().as_ref()).unwrap();
+        let context = WorkerContext::open();
+        assert!(matches!(
+            engine.generate_catalog_resolved(&resolved, 2048, &context),
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::NoThumbnail,
+                ..
+            }))
+        ));
+        let key = crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+            &resolved.logical,
+            false,
+            engine.settings.folder_thumb_sort,
+            engine.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let meta = std::fs::metadata(&folder).unwrap();
+        let raw_meta = std::fs::metadata(&raw_path).unwrap();
+        let proof = crate::catalog::FolderSelectionProof {
+            directories: Vec::new(),
+            pin_store: crate::catalog::PinStoreProof::NotConsulted,
+            winner: crate::catalog::FolderSelectionWinner {
+                path: raw_path,
+                mtime: crate::ui_helpers::mtime_secs(&raw_meta),
+                file_size: raw_meta.len() as i64,
+                archive_row_key: None,
+            },
+        };
+        catalog
+            .save_auto_folder_bytes(
+                &key,
+                crate::ui_helpers::mtime_secs(&meta),
+                0,
+                Some((8, 8)),
+                None,
+                &webp,
+                Some(&proof),
+            )
+            .unwrap();
+        assert!(catalog.load_one(&key).unwrap().is_some());
+        let bytes = engine
+            .generate_catalog_resolved(&resolved, 2048, &context)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (8, 8));
+    }
 
     #[test]
     fn remote_folder_pins_use_typed_seeded_and_auto_keys() {

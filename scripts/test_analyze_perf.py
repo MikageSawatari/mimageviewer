@@ -1852,6 +1852,28 @@ class HitchReportTests(unittest.TestCase):
             self.assertIn(f"{candidate}={ms:.1f}ms cycles=n/a", report)
         self.assertNotIn("cycles=0", report)
 
+    def test_raw_async_decode_is_reported_outside_continuation_span(self) -> None:
+        event = {
+            "t": 1.85, "cat": "thumb", "kind": "load_phases", "key": "raw.cr2",
+            "start_t": 1.80, "end_t": 1.81, "total_ms": 10.0,
+            "total_cycles": 30000, "decode_ms": 1.0, "display_ms": 5.0,
+            "unaccounted_ms": 4.0, "raw_async_decode_ms": 500.0,
+        }
+        report = self.report([frame(1.79, 41), frame(1.92, 42), event])
+        self.assertIn("[1.800, 1.810]s", report)
+        self.assertIn("total=10.0ms cycles=30000", report)
+        self.assertIn("decode=1.0ms cycles=n/a", report)
+        self.assertIn("unaccounted=4.0ms", report)
+        self.assertIn("区間外: raw_async_decode=500.0ms", report)
+        self.assertIn("上記の区間・total・cycles に含まない", report)
+        worker_line = next(line for line in report.splitlines() if "key=raw.cr2" in line)
+        self.assertNotIn("500.0ms", worker_line)
+        # Neither the prior executor duration nor deferred emission expands the
+        # worker span to overlap an earlier hitch.
+        earlier = self.report([frame(1.20, 41), frame(1.40, 42), event])
+        self.assertIn("thumb.load_phases 重複区間: 0 件", earlier)
+        self.assertNotIn("raw_async_decode", earlier)
+
 
 class PreGridReportTests(unittest.TestCase):
     def test_sample_jsonl_is_grouped_and_ranked_by_component(self) -> None:

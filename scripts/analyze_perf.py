@@ -2366,6 +2366,12 @@ def _print_hitch_context(events: list[dict], interval: tuple[float, float]) -> N
                 "prefill_db", "unaccounted",
             ])
         )
+        raw_async_ms = _hitch_number(event, "raw_async_decode_ms")
+        if raw_async_ms is not None:
+            print(
+                f"        区間外: raw_async_decode={raw_async_ms:.1f}ms "
+                "(先行する executor 待機/現像; 上記の区間・total・cycles に含まない)"
+            )
     if thumb_rows:
         print("      prefill_db は offer_raster の内訳 (重複加算しない)。区間重複だけでは待ち先は確定しない。")
 

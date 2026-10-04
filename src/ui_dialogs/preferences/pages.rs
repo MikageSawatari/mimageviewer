@@ -6393,6 +6393,12 @@ pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn page_raw_develop(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "raw-develop/settings", |ui, state| {
+        crate::ui_raw::draw_settings(ui, &mut state.settings);
+    });
+}
+
 pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "parallelism/mode", |ui, state| {
         let s = &mut state.settings;

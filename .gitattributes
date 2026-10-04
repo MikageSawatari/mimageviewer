@@ -1,5 +1,10 @@
 models/*.onnx filter=lfs diff=lfs merge=lfs -text
 
+# Full upstream notices: preserve the verbatim source bytes on checkout.
+LIBRAW-LICENSE.txt -text
+ZLIB-LICENSE.txt -text
+LIBJPEG-TURBO-LICENSE.txt -text
+
 # FFmpeg LGPL source mirror — keep byte-exact (no EOL conversion); the .asc GPG
 # armored signature must stay LF or signature verification breaks on checkout.
 htdocs/mimageviewer/ffmpeg-*-source.tar.xz binary

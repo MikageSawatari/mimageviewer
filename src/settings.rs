@@ -4286,6 +4286,10 @@ pub struct Settings {
     pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
+    #[serde(default = "default_raw_develop_parallelism")]
+    pub raw_develop_parallelism: u8,
+    #[serde(default)]
+    pub raw_brightness: crate::raw::RawBrightness,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
     #[serde(default = "default_pdf_worker_count")]
     pub pdf_worker_count: u32,
@@ -6957,16 +6961,37 @@ pub fn default_exif_hidden_tags() -> Vec<String> {
 }
 pub fn default_image_ext_priority() -> Vec<String> {
     // ロスレス系 > ロッシー系 > RAW 系
-    [
+    let mut priority = [
         "png", "bmp", "gif", "tiff", "tif", // ロスレス
         "webp", "jxl", "avif", "heic", "heif", // モダン (ロッシー/ロスレス混在)
         "jpg", "jpeg", // ロッシー
-        "dng", "cr2", "cr3", "nef", "nrw", "arw", // RAW (現像困難な場合が多い)
-        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect::<Vec<_>>();
+    priority.extend(
+        crate::raw_format::RAW_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string()),
+    );
+    priority
+}
+
+/// Complete saved priorities without changing user entries, their casing or their order.
+pub(crate) fn normalize_image_ext_priority(priority: &mut Vec<String>) -> bool {
+    let previous_len = priority.len();
+    for extension in default_image_ext_priority() {
+        if !priority
+            .iter()
+            .any(|saved| saved.eq_ignore_ascii_case(&extension))
+        {
+            priority.push(extension);
+        }
+    }
+    priority.len() != previous_len
+}
+fn default_raw_develop_parallelism() -> u8 {
+    3
 }
 fn default_slideshow_interval() -> f32 {
     3.0
@@ -7188,6 +7213,8 @@ impl Default for Settings {
             always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
+            raw_develop_parallelism: default_raw_develop_parallelism(),
+            raw_brightness: crate::raw::RawBrightness::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
@@ -8726,6 +8753,7 @@ impl Settings {
         let autoplay_mode_migrated =
             settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
         let video_volume_before_sanitize = settings.video_volume;
+        let image_ext_priority_len_before_sanitize = settings.image_ext_priority.len();
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let video_seek_thumbnail_tolerance_before_sanitize =
             settings.video_seek_thumbnail_tolerance_secs;
@@ -8871,6 +8899,7 @@ impl Settings {
         // 最初の 1 回」と定義されており、`load()` 内の migration/version 書き戻しで
         // rotation を消費すると次の真の user save が in-place 書込みになってしまう。
         let bootstrap_save_needed = vst3_migrated
+            || settings.image_ext_priority.len() != image_ext_priority_len_before_sanitize
             || autoplay_mode_migrated
             || video_loop_migrated
             || archive_file_handling_migrated
@@ -9254,6 +9283,7 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        normalize_image_ext_priority(&mut self.image_ext_priority);
         self.restore_post_filter_variants_after_load();
         self.restore_toolbar_name_filter_after_load();
         self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
@@ -10092,6 +10122,154 @@ mod tests {
     }
 
     use super::*;
+
+    fn released_image_ext_priority() -> Vec<String> {
+        // Literal master/v4.2.0 default: 12 other image formats and 15 RAW formats.
+        [
+            "png", "bmp", "gif", "tiff", "tif", "webp", "jxl", "avif", "heic", "heif", "jpg",
+            "jpeg", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2",
+            "pef", "ptx", "rwl", "iiq",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn image_ext_priority_released_default_appends_exactly_eight_raw_formats() {
+        let original = released_image_ext_priority();
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        apply_load_time_migrations(&mut settings);
+        assert_eq!(&settings.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            &settings.image_ext_priority[original.len()..],
+            ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"]
+        );
+        assert_eq!(settings.image_ext_priority, default_image_ext_priority());
+    }
+
+    #[test]
+    fn image_ext_priority_custom_order_and_entries_survive_completion() {
+        let original = vec![
+            "mos".into(),
+            "custom".into(),
+            "jpg".into(),
+            "png".into(),
+            "jpg".into(),
+        ];
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        apply_load_time_migrations(&mut settings);
+        assert_eq!(&settings.image_ext_priority[..original.len()], original);
+        let expected_tail: Vec<_> = default_image_ext_priority()
+            .into_iter()
+            .filter(|extension| !original.contains(extension))
+            .collect();
+        assert_eq!(
+            &settings.image_ext_priority[original.len()..],
+            expected_tail
+        );
+    }
+
+    #[test]
+    fn image_ext_priority_complete_list_is_unchanged_on_repeated_load_migrations() {
+        let mut original = default_image_ext_priority();
+        original.reverse();
+        original.push("custom".into());
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        for _ in 0..2 {
+            apply_load_time_migrations(&mut settings);
+            assert_eq!(settings.image_ext_priority, original);
+        }
+    }
+
+    #[test]
+    fn image_ext_priority_completion_compares_case_insensitively() {
+        let original = vec!["CRW".into(), "crw".into(), "PNG".into(), "mOs".into()];
+        let mut priority = original.clone();
+        assert!(normalize_image_ext_priority(&mut priority));
+        assert_eq!(&priority[..original.len()], original);
+        let expected_tail: Vec<_> = default_image_ext_priority()
+            .into_iter()
+            .filter(|extension| {
+                !original
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(extension))
+            })
+            .collect();
+        assert_eq!(&priority[original.len()..], expected_tail);
+        let completed = priority.clone();
+        assert!(!normalize_image_ext_priority(&mut priority));
+        assert_eq!(priority, completed);
+    }
+
+    #[test]
+    fn image_ext_priority_sqlite_load_persists_completion_without_version_change() {
+        let _env = setup_backup_env();
+        // Finish unrelated first-load migrations so they cannot trigger the writeback for us.
+        let mut old = Settings::load();
+        old.image_ext_priority = released_image_ext_priority();
+        crate::settings_db::with_db_result(|db| db.save_full(&old)).unwrap();
+
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.previous_last_seen_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::LoadedExistingDb
+        );
+        assert_eq!(
+            loaded.settings.image_ext_priority,
+            default_image_ext_priority()
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.image_ext_priority,
+            loaded.settings.image_ext_priority
+        );
+        assert_eq!(
+            Settings::load().image_ext_priority,
+            stored.image_ext_priority
+        );
+    }
+
+    #[test]
+    fn image_ext_priority_json_migration_persists_completion() {
+        let env = setup_backup_env();
+        let old = Settings {
+            image_ext_priority: released_image_ext_priority(),
+            ..Settings::default()
+        };
+        std::fs::write(
+            env._tmp.path().join("settings.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.image_ext_priority,
+            default_image_ext_priority()
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.image_ext_priority,
+            loaded.settings.image_ext_priority
+        );
+    }
 
     #[test]
     fn rating_view_sort_defaults_roundtrips_and_survives_preferences_merge() {

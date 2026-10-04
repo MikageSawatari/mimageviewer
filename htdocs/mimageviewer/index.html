@@ -54,7 +54,7 @@
       "サムネイルグリッド表示",
       "ZIP / CBZ / RAR / 7z / PDF の直接閲覧",
       "DRM のない EPUB を変換して閲覧",
-      "RAW・HEIC・AVIF・JPEG XL 対応",
+      "RAW 表示・現像を内蔵、HEIC・AVIF・JPEG XL 対応",
       "動画のインライン再生と一定間隔のサムネイル一覧（タイル表示）",
       "AI アップスケール（ローカル GPU 実行）",
       "非破壊の補正・注釈・消しゴム",
@@ -843,7 +843,7 @@
   <div class="usecase-card">
     <div class="uc-icon">🗂️</div>
     <div class="uc-title">種類の違うファイルを 1 つの画面で扱いたい</div>
-    <p class="uc-desc">画像・ZIP・PDF・動画・音声が同じ一覧に並び、同じ操作で開けます。種類ごとにソフトを使い分ける必要はありません。RAW・HEIC も追加インストール不要で、数十万枚のフォルダでも高速です。</p>
+    <p class="uc-desc">画像・ZIP・PDF・動画・音声が同じ一覧に並び、同じ操作で開けます。種類ごとにソフトを使い分ける必要はありません。RAW の表示・現像も内蔵し、数十万枚のフォルダでも高速です。</p>
   </div>
   <div class="usecase-card">
     <div class="uc-icon">📱</div>
@@ -1054,7 +1054,7 @@
       <div class="feature-card">
         <div class="icon">📷</div>
         <h3>RAW・HEIC・AVIF・レトロ形式対応</h3>
-        <p>各種 RAW・HEIC・AVIF・JPEG XL・TIFF を Windows の WIC で表示。Susie プラグイン（.spi）経由で PI / MAG / PIC など PC-98 / X68000 時代のレトロ画像形式も閲覧できます。</p>
+        <p>各社 RAW の表示・現像を内蔵。まず埋め込みプレビューを表示し、現像後に画像を切り替えます。HEIC・AVIF・JPEG XL・TIFF は Windows の表示機能を使います。Susie プラグイン（.spi）経由で PI / MAG / PIC など PC-98 / X68000 時代のレトロ画像形式も閲覧できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🎬</div>
@@ -1175,7 +1175,7 @@
 
   <section id="formats">
     <h2>対応フォーマット</h2>
-    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP（内蔵）／ HEIC・AVIF・JPEG XL・TIFF・各社 RAW（WIC 経由）</p>
+    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP、各社 RAW（内蔵）／ HEIC・AVIF・JPEG XL・TIFF（Windows の表示機能）。<a href="manual/formats.html#raw">RAW の対応形式と制限</a></p>
     <p><strong>アニメーション：</strong>アニメーション GIF、APNG、Animated WebP</p>
     <p><strong>動画：</strong>MP4、AVI、MOV、MKV、WMV、MPEG（サムネイル表示 + フルスクリーン再生）</p>
     <p><strong>ドキュメント：</strong>PDF（ページごとに表示、パスワード付き対応）</p>
@@ -1422,6 +1422,18 @@
       本ソフトウェアは「現状のまま」提供され、作者は一切の保証を行いません。
       詳細はライセンス全文をご確認ください。
     </p>
+
+    <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（LibRaw / CDDL）</h3>
+    <p style="font-size:0.9rem;">
+      RAW の表示・現像には <a href="https://www.libraw.org/">LibRaw</a> を CDDL-1.0 で使用しています。対応するソースコードを以下から入手できます。
+    </p>
+    <ul style="font-size:0.9rem;">
+      <li>LibRaw バージョン: 0.22.2</li>
+      <li>対応ソース: <a href="https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz">libraw-0.22.2-source.tar.gz</a>（改変していない公式ソース。<a href="https://github.com/LibRaw/LibRaw/tree/0.22.2">配布元</a>）</li>
+      <li>ライセンス全文・著作権表記: アプリの「バージョン情報」から確認できます。インストーラ版・ポータブル版には LIBRAW-LICENSE.txt（CDDL-1.0 と BSD 表記を含む）も同梱しています</li>
+      <li>zlib 1.3.1（zlib ライセンス）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には ZLIB-LICENSE.txt も同梱しています</li>
+      <li>libjpeg-turbo（IJG / BSD-3-Clause / zlib）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には LIBJPEG-TURBO-LICENSE.txt も同梱しています。This software is based in part on the work of the Independent JPEG Group.</li>
+    </ul>
 
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（EffeTune / VST3 SDK）</h3>
     <p style="font-size:0.9rem;">

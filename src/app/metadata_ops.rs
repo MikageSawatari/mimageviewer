@@ -859,9 +859,12 @@ fn run_details_meta_load_inner(
                     if !relative_page_bytes_loaded {
                         relative_page_bytes = provenance.read_verified().ok();
                     }
-                    relative_page_bytes
-                        .as_deref()
-                        .and_then(crate::fast_resize::probe_dims_from_bytes)
+                    relative_page_bytes.as_deref().and_then(|bytes| {
+                        crate::fast_resize::probe_dims_from_bytes(
+                            bytes,
+                            path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
+                        )
+                    })
                 } else {
                     crate::fast_resize::probe_dims(path)
                 }
@@ -891,7 +894,7 @@ fn run_details_meta_load_inner(
             }
             dims = zip_entry_bytes
                 .as_deref()
-                .and_then(probe_image_dims_from_bytes);
+                .and_then(|bytes| probe_image_dims_from_bytes(bytes, entry_name));
         }
 
         if target.load_image_dims
@@ -1590,7 +1593,13 @@ impl ContainerCatalogCache {
     }
 }
 
-pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8], hint: &str) -> Option<(u32, u32)> {
+    if crate::raw_format::is_raw_path(std::path::Path::new(hint)) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(bytes))
+            .ok()?
+            .developed_dims;
+        return Some((dims[0], dims[1]));
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -3608,14 +3617,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            probe_image_dims_from_bytes(&cursor.into_inner()),
+            probe_image_dims_from_bytes(&cursor.into_inner(), "sample.png"),
             Some((13, 7))
         );
     }
 
     #[test]
     fn probe_image_dims_from_bytes_rejects_invalid_data() {
-        assert_eq!(probe_image_dims_from_bytes(b"not an image"), None);
+        assert_eq!(
+            probe_image_dims_from_bytes(b"not an image", "bad.png"),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_metadata_probe_uses_libraw_developed_dimensions() {
+        for name in ["885.dng", "1018.cr2"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(path).unwrap();
+            let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+                .unwrap()
+                .developed_dims;
+            assert_eq!(
+                probe_image_dims_from_bytes(&bytes, name),
+                Some((dims[0], dims[1]))
+            );
+        }
     }
 
     #[test]

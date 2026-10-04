@@ -138,6 +138,10 @@ perf ログ有効時のみ動作し、無効時は時計を読まない:
   2回に抑える。未計測の候補別 `_cycles` は省略し、ゼロで埋めない（旧ログの値は解析器で読める）。
   `prefill_db_ms` は offer_raster 内の類似索引 DB mutex + SQL の内訳で、二重に引かない。
   catalog mutex + SQL は既存 `cache_save_ms` 内。decode 内の render / orientation も引き続き内訳扱い。
+  RAW half 現像の後続要求では `decode_ms` も再投入後の worker 区間内だけを測る。
+  先行する executor 待機・half 現像時間は `raw_async_decode_ms` に分離し、
+  `total_ms` / `total_cycles` / `unaccounted_ms` に含めない。解析器は区間外の参考値として表示し、
+  その値から worker の重複区間を広げない。キャッシュ保存判断・既存統計の decode 時間は変更しない。
 
 `python scripts/analyze_perf.py <path> hitches --ms 500` は遅い update の `n` で UI 内訳を対応させ、
 明示区間または `t-total_ms` の重なりから logger / thumbnail を表示し、全カテゴリの時刻空白も出す。

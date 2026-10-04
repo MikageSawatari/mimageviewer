@@ -94,6 +94,10 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
+        let (target_idx, _) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
         let target_idx = match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
@@ -135,6 +139,9 @@ impl App {
             return false;
         }
         let (target_idx, pivot) = self.plan_page_edit_pivot(requested_fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return false;
+        }
         let current_target =
             self.fullscreen_idx
                 .map(|idx| match self.resolve_visible_spread_pair(idx) {
@@ -295,6 +302,9 @@ impl App {
     /// 見開き隠蔽加工中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
     /// 現ページのマスクを保存してから単ページ状態のままもう一方へ入り直す。
     pub(crate) fn switch_conceal_target_in_spread(&mut self, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -2224,13 +2234,13 @@ impl App {
                                                 for &(label, target_idx) in pages.iter() {
                                                     let is_active =
                                                         self.fullscreen_idx == Some(target_idx);
-                                                    if panel_toggle_button(
+                                                    if ui.add_enabled_ui(self.raw_edit_target_gate(target_idx), |ui| panel_toggle_button(
                                                         ui,
                                                         label,
                                                         is_active,
                                                         Some(btn_size),
                                                         None,
-                                                    )
+                                                    )).inner
                                                     .clicked()
                                                         && !is_active
                                                     {

@@ -125,13 +125,17 @@ egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新�
    ├─ ヒット (`source_policy != SourceOnly`): WebP バイト → ColorImage
    ├─ ミス + `CacheOnly`: 元ソースを開かず終了
    └─ ミス or `SourceOnly`:
-        ├─ ソースデコード (JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
-        │                   HEIC/AVIF/JXL/RAW=WIC, PDF=PDFium ワーカー)
-        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes、PDF は対象外)
+        ├─ ソースデコード (RAW=LibRaw preview、必要なら executor で half 現像,
+        │                   JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
+        │                   HEIC/AVIF/JXL=WIC, PDF=PDFium ワーカー)
+        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes。RAW は LibRaw の
+        │                   flip 適用済み、PDF は対象外)
         ├─ Lanczos3 で display_px までリサイズ
         ├─ CacheDecision::should_cache でキャッシュ可否判定
         └─ 必要なら WebP エンコードして catalog.db に保存
-3. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
+3. RAW half は現像完了時に画像を持つ後続 LoadRequest を既存キューへ戻し、
+   thumbnail worker が縮小・cache 保存を続ける。画像と finalized の 2 通を送信し gen_done を進める
+4. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
    edit_preview_adjustment, source_dims, layout_dims) を送信
 ```
 
@@ -413,6 +417,20 @@ memo 化する。製本・synthetic 等の既存短絡条件を維持し、毎�
 独立レビューと回帰の結果は [v3.7.0 作業台帳](v3.7.0-priority-work.md) に記録する。
 
 ## 2. フルスクリーン表示パイプライン
+
+### 2.0 RAW の表示段 (S3)
+
+RAW は worker の info → 埋め込み preview → LibRaw フル現像の順で表示する。`RawPageStore` が context / items generation / 物理 source 指紋 / 要求 ID / 明るさを検証し、`RawPreview` を最終的に既存の Static へ置き換える。現像完了後は preview の追加保持をしない。preview より現像が先に完了した場合も、古い preview が表示段を戻さない。
+
+fullscreen に catalog サムネイルや色忠実 rendition を出せるのは、埋め込み preview の実デコードと向き検査を通った後だけ (`raw_fullscreen_fallback_allowed`)。preview 無し・壊れた JPEG・向き不一致では、half 現像由来のサムネイルが存在していても読み込み表示のまま待つ。現像も不可なら Terminal としてナビゲーションを終える。
+
+RAW の配置・fit・Original・Z・pan・回転・見開き・連結読み・座標変換の基準は全表示段で `developed_dims`。8192 clamp 後の Static や派生 final / AI texture の実寸を配置基準に戻さない。actual raster は canonical 枠へ contain し、ナビゲータ・ルーペ・capture の写像も共有 transform を使う。
+
+preview は生デコード段の表示専用で、編集・同期補正・AI・final composite の入力にしない。カラー化 / LUT の既存 gate は維持し、必要なページは検証済み preview の後だけ色忠実 rendition を表示する。ただし現像が Blocked (非対応・失敗) の RAW は処理入力が得られないため gate の対象外とし、rendition の有無にかかわらず埋め込み preview をそのまま表示して通知する。判定は owner の現像軸から導く `raw_development_blocked` に集約する。設定変更で Failed が Idle に戻れば通常の gate が再評価される (計画 7.10 K)。PreviewShown はその提示でページ送り・フォルダ lock を終えられる。PreviewAbsent は developed / complete final の提示か Terminal まで待つ。両ナビゲーション経路は RAW の分類と同じ readiness 述語を使う。編集の全入口・見開き左右・ツール内ページ切替・ボタン状態は、実際の編集対象に対する `raw_edit_target_gate` を mode / page mutation の前に確認する。
+
+明るさ変更と worker の Stale はページ単位の source transaction。既存の `capture_final_effect_source_reload_holdover` だけで提示中のユニット / 連結読み transition を退避し、入力と派生 cache を失効させる。明るさ変更では preview / 寸法の要求を残す。retained AI の source 指紋 + 明るさ key を更新し、他ページの retained epoch は変更しない。
+
+埋め込み preview texture 自体は現像軸の状態にかかわらず画面フィルターへ渡さない。paint resource の source texture と RawPreview の texture identity を照合するため、同じページの表示専用 rendition や前の通常画像の holdover は既存のフィルター処理を維持する。Full 完了時の同期補正は通常画像と同じく現在ページに限り、先読みや画面外の完了は既存の bounded final pipeline に処理を委ねる。
 
 ### 2.1 エントリポイント
 

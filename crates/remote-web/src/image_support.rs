@@ -5,8 +5,6 @@ use image::{DynamicImage, RgbImage, RgbaImage};
 
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "bmp", "gif", "heic", "heif", "avif", "jxl", "tiff", "tif",
-    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
-    "rwl", "iiq",
 ];
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 pub const SUPPORTED_AUDIO_EXTENSIONS: &[&str] =
@@ -352,6 +350,22 @@ impl Drop for ComScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_decode_extensions_are_disjoint_from_addressed_raw_extensions() {
+        assert_eq!(crate::store::REMOTE_RAW_EXTENSIONS.len(), 23);
+        for extension in crate::store::REMOTE_RAW_EXTENSIONS {
+            assert!(
+                !SUPPORTED_IMAGE_EXTENSIONS.contains(extension),
+                "{extension}"
+            );
+            assert_eq!(
+                crate::store::classify_entry(&format!("camera.{extension}"), false, true),
+                crate::store::EntryKind::Image,
+                "{extension}"
+            );
+        }
+    }
 
     #[test]
     fn passthrough_boundary_requires_full_width_identity_and_browser_format() {
