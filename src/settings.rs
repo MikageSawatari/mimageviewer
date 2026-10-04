@@ -3739,6 +3739,13 @@ where
 // StartupFolderMode (起動時に開く場所)
 // -----------------------------------------------------------------------
 
+/// Persistent identity of an A/B quick-folder workspace.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickFolderSlotId {
+    A,
+    B,
+}
+
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFolderMode {
@@ -4251,6 +4258,10 @@ pub struct Settings {
     pub quick_folder_recent_folders: [Vec<PathBuf>; 2],
     #[serde(default = "default_quick_folder_slots")]
     pub quick_folder_slots: [Option<PathBuf>; 2],
+    /// Accepted A/B workspace. Missing in older settings means A; explicit None
+    /// keeps startup navigation outside both workspaces.
+    #[serde(default = "default_active_quick_folder_slot")]
+    pub active_quick_folder_slot: Option<QuickFolderSlotId>,
     /// A/B クイックフォルダごとに保持するドライブ別の最後の場所。
     /// キーは `"C:"` のような大文字ドライブ表記。
     #[serde(default = "default_quick_folder_drive_current_dirs")]
@@ -6832,6 +6843,9 @@ fn default_active_book_name() -> String {
 fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
     [None, None]
 }
+fn default_active_quick_folder_slot() -> Option<QuickFolderSlotId> {
+    Some(QuickFolderSlotId::A)
+}
 fn default_quick_folder_recent_folders() -> [Vec<PathBuf>; 2] {
     [Vec::new(), Vec::new()]
 }
@@ -7163,6 +7177,7 @@ impl Default for Settings {
             recent_folders: Vec::new(),
             quick_folder_recent_folders: default_quick_folder_recent_folders(),
             quick_folder_slots: default_quick_folder_slots(),
+            active_quick_folder_slot: default_active_quick_folder_slot(),
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
@@ -9809,6 +9824,7 @@ impl Settings {
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
+        self.active_quick_folder_slot = src.active_quick_folder_slot;
         self.quick_folder_drive_current_dirs =
             std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;

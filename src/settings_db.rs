@@ -4490,6 +4490,60 @@ mod tests {
         assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
     }
 
+    #[test]
+    fn quick_folder_active_slot_roundtrip_and_missing_key_default() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for active in [
+            Some(crate::settings::QuickFolderSlotId::A),
+            Some(crate::settings::QuickFolderSlotId::B),
+            None,
+        ] {
+            let mut settings = Settings::default();
+            settings.active_quick_folder_slot = active;
+            let mut stale_preferences = Settings::default();
+            let mut live = settings.clone();
+            stale_preferences.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_preferences.active_quick_folder_slot, active);
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().active_quick_folder_slot,
+                active
+            );
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Settings>(json)
+                    .unwrap()
+                    .active_quick_folder_slot,
+                active
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'active_quick_folder_slot'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
+        let mut old_json = serde_json::to_value(Settings::default()).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("active_quick_folder_slot");
+        assert_eq!(
+            serde_json::from_value::<Settings>(old_json)
+                .unwrap()
+                .active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
+    }
+
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;

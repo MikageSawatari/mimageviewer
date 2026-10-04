@@ -29,11 +29,12 @@
 
 ## 1. 優先候補
 
-### 1.326 A/B クイックフォルダで B を選んだまま終了すると、次回は A で B のフォルダが開く — 利用者報告 (2026-10-04)
+### 1.326 A/B クイックフォルダで B を選んだまま終了すると、次回は A で B のフォルダが開く — 実装済み・利用者未確認 (2026-10-04)
 
 - 観測 (利用者、v4.3.0 系): B を選んだ状態で mIV を終了して再起動すると、A が選ばれた状態で、さっき B で開いていたフォルダが開いているように見える。
-- コード (ClaudeCode の読み): 現在のスロット `App::active_quick_folder_slot` は永続化されておらず、起動時は常に `Some(QuickFolderSlotId::A)` ([app.rs:17698](../src/app.rs))。起動フォルダは `Settings::last_folder` (終了時に B で開いていた場所) なので、それが A で開かれる。`update_active_quick_folder_target` ([app.rs:21055](../src/app.rs)) が A の保存先を B の場所で上書きしている可能性があり、その場合は A に保存していた場所が失われる (未確認)。
-- 方針候補: 終了時の現在スロットを設定へ保存し (serde 既定 = A、リリース済み設定への項目追加)、起動時に復元してから起動フォルダを開く。A の保存先が上書きされていないかも確認・修正する。
+- 修正前のコード (ClaudeCode の読み): 現在のスロット `App::active_quick_folder_slot` は永続化されておらず、起動時は常に `Some(QuickFolderSlotId::A)` ([app.rs:17698](../src/app.rs))。起動フォルダは `Settings::last_folder` (終了時に B で開いていた場所) なので、それが A で開かれる。`update_active_quick_folder_target` ([app.rs:21055](../src/app.rs)) が A の保存先を B の場所で上書きしている可能性があり、その場合は A に保存していた場所が失われる (未確認)。
+- source inspection: `open_default_startup_target` → 通常 load の成功採用 → `record_folder_nav_transition_from_current` が、起動時にハードコードされた A へ B の場所を記録する。A の target、MRU、同じドライブの `drive_current_dirs` が書き換わり、`sync_quick_folder_settings` と load 終端の save で永続化される経路を確認。実機での上書き再現は未実施。
+- 実装: `Settings.active_quick_folder_slot` を追加。項目欠落は `Some(A)`、明示 `None` はそのまま復元。終了 / トレイ退避で runtime の slot と両 workspace を同期し、constructor で起動 open より先に復元する。起動場所は `last_folder` / 既存の起動設定から変更しない。SQLite は通常 `settings_kv` 項目なのでスキーマ変更なし。詳細と検証記録は [folder-history-location-plan.md §13](folder-history-location-plan.md#13-ab-クイックフォルダの起動時所有復元1326)。
 - 規模 / 優先度: Small / P2 (利用者が保存した A の場所が失われ得るため)。
 
 ### 1.325 Susie の初期化待ちが、予定の 5 秒を超えて延びることがある — §1.321 のレビューで判明 (2026-10-04)
