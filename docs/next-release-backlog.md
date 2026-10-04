@@ -141,13 +141,6 @@
 - 次回の読み方: `python scripts/analyze_perf.py <log> hitches --ms 500`。フレーム番号のUI内訳、重なるlogger wait/holdと保持者tid、複数thumbのnormal_log/stats/offer_raster/prefill_db、全イベントの空白を並べて見る。通常loggerの約800 ms hold/write/flushとUI・thumbのwaitが揃うかをまず確認する。snapshotは待ち開始時だけなので交代した保持者は区間イベントで照合する。長いtag/pinなら同期SQL経路、どの計測にも出ない低cyclesの同時空白ならOS traceへ進む。行順は遅延出力で前後し得る。キュー欠落や後続書込のない終了時の未出力もあるため、診断なしを「待ちなし」と扱わない。機能変更・原因修正は未実施、再発時の検収は未完了。詳細は [UI応答性の計装一覧](ui-responsiveness.md#恒久的に使える計装)。
 - v4.3.0 は記録のうえで出荷 (1 回だけの観測で再現せず、退行の根拠なし)。
 
-### 1.319 ui-smoke AudioTracks が「native audio control Row(0) changed before input」で毎回止まる — smoke 実行記録 (2026-10-02)
-
-- 観測: v4.3.0 の配布前 smoke (使い捨て portable、source_head 0f3399113) で 2 回続けて同じ失敗。runner の分類は `environment_failure`。証跡 `target/ui-smoke-runs/20261002T005040656Z-250924-AudioTracks-430e3e66` と `...005111110Z-75016-AudioTracks-e1d38f63`。このシナリオは §1.251 S8 で作ってから一度も実行していなかった。
-- 失敗の手前までは進む: multi.mkv の再生と既定トラック (880 Hz、stream 2、Applied) の確認は通っている。止まるのは HUD の音声メニュー 1 行目を OS 入力でクリックする直前の再確認 ([native_ui_smoke.rs:1804](../src/video/native_ui_smoke.rs)) で、snapshot と入力直前とで target の token か位置が一致しない。
-- 原因は未特定。メニュー表示中に再生が進み、publish のたびに token が変わる設計なら smoke 側の前提が合っていない (推測)。製品の音声トラック切り替えは利用者が実機で確認済み (2026-09-30)。
-- v4.3.0 は他の 7 本 (MultiWindowPdf / Stills / RarNav / RatingSort / RatingSortCollection / FolderHistory / AlwaysOnTop) が PASS で、このシナリオは外して出荷する。
-
 ### 1.317 環境設定のエクスポート・インポート — 5ch >>498 からの検討 (2026-10-02)
 
 - 目的: 別環境へ移る際、普段の閲覧・表示などの設定を引き継ぎやすくする。5ch の助言を受けて開発者が採用を検討。
@@ -495,10 +488,11 @@
   再要求する形へ直し、deadline 前の別パスを挟む回帰テストを追加する。
 - 規模 / 優先度: Small / P2。Ctrl+G 本体や検索 worker は触らない。
 
-### 1.251 動画の複数音声トラックを選択できるようにする — v4.3.0 で出荷、残りは確認 2 件 — >>429 (2026-09-17)
+### 1.251 動画の複数音声トラックを選択できるようにする — v4.3.0 で出荷、残りは Remote 確認 1 件 — >>429 (2026-09-17)
 
 - 出典: >>429。設計の正本は [音声トラック選択計画](audio-track-selection-plan.md)。v4.3.0 (2026-10-04) で出荷。
-- 残り: ① 実アプリの `AudioTracks` シナリオが毎回止まる件 (§1.319)。② Remote の実機確認 (PC で選んだトラックからの開始、端末での切り替えと位置の引き継ぎ) は未実施。ローカルの再生と切り替えは利用者がサブPCで確認済み (2026-10-03)。
+- 実アプリの `AudioTracks` シナリオは smoke 側の修正後、使い捨て portable で全体 PASS (2026-10-05、`20261004T160257945Z-104608-AudioTracks-4752a5b6`、dd9678010)。経緯は [smoke 計画](ui-smoke-automation-plan.md#audiotracks-の入力対象契約-1319)。
+- 残り: Remote の実機確認 (PC で選んだトラックからの開始、端末での切り替えと位置の引き継ぎ) は未実施。ローカルの再生と切り替えは利用者がサブPCで確認済み (2026-10-03)。
 
 ### 1.243 TensorRT ワーカーの決定的な起動失敗の後も、AI 処理のたびに起動をやり直す — 修正済み、残りは確認 (2026-09-15)
 

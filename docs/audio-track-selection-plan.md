@@ -1054,6 +1054,29 @@ UI より先に入れる (UI から切り替えられるようになった時点
   限定の診断値) が新トラックの値になることを確認。一時停止中の切り替え、連続切り替え、F12 別ウィンドウでの
   切り替え、音声モードでの切り替え、開き直しで保存したトラックから始まることを含める。`capture(label)` で
   egui 側 (音声モード HUD) を保存する。
+- §1.319 (2026-10-04): native メニューの初回 sizing pass を診断上有効と誤認していたため、
+  音声行・ボタンの観測に実 `Response.enabled()` を使う。入力直前の token/area と source/host の
+  同一性検査は維持する。再生中の切り替えを pause/delay で回避しない。原因・非対話検証・
+  利用者了承後の disposable portable コマンドは [smoke 設計](ui-smoke-automation-plan.md#audiotracks-の入力対象契約-1319)。
+  旧 2 run は失敗ログを保持する。c998db1cb の利用者了承後の 2 run は再生中 440 Hz の OS クリック
+  切り替えを通過し、その後の Targeted `VideoSeekStart` の egui focus 待ちで timeout。
+  native 子が focus owner の前面親への winit Focus が省略されるため、診断の取得側で exact
+  owner／backend を検査して既存 focus claim を使う。実 focus／通常 handler の検査と製品の native
+  キー経路は維持する。全体 PASS は再実行待ちで、証跡と修正・検証の記録は同 smoke 設計に追補。
+  0072aced5 の次の live run は再開・保存行3の開き直し・detached → root F12 まで通過した。
+  root → detached の semantic action は既存 root probe が物理 Key event だけを見るため ACK 待ちで停止。
+  診断限定の read-only exact owner／backend／phase／scope probe を既存 guarded handler へ接続し、
+  run_action に30秒の有限 ACK 待ちと期限後の遅い消費禁止、wait_until に owner／snapshot 診断を加える。
+  native F12 と操作列は維持し、全体 PASS は次回の明示了承後の run で確認する。
+  ee0eedb23 の独立レビュー P2 で、worker だけの期限と Interrupt 公開前に遅い消費が可能な点を修正。
+  UI／worker が同じ request の deadline と配送 outcome を所有し、期限前の到達記録で遅い ACK を判定する。
+  acquisition も exact request を操作直前に検査し、詳細と追加回帰は同 smoke 設計の P2 追補に記録する。
+  次の利用者了承済み run `20261004T154102775Z-79036-AudioTracks-b6d55588` は root F12 を通過したが、
+  HWND 登録済みの Opening window 3 を scenario が選び、Mounted の passive activation 拒否で停止した。
+  host_ready は登録完了だけなので、共通 detached_video helper で既存 active_immediate presentation を
+  待つ。製品の F12／activation／安全検査と操作列は維持し、root cause・回帰・検証は同 smoke 設計へ記録する。
+  dd9678010 の run `20261004T160257945Z-104608-AudioTracks-4752a5b6` (2026-10-05、利用者了承範囲内) で
+  AudioTracks 全体が PASS した。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
   Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。
