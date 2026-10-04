@@ -2249,19 +2249,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   cascade identity、full-path key、seed availability、コンテナ変換、generation / cancel / viewer-context 所有を保持する。
 - 規模 / 優先度: Medium / P3。全一覧に共通の変更なので独立設計レビューと回帰を行う。今回の §1.307 では実装しない。
 
-### 1.307 コレクションの一覧で、フォルダ・ZIP・PDF の代表サムネ固定が反映されない — 修正済み (2026-09-30)
-
-- 出典: 利用者メール (2026-09-30、§1.280 と同じ報告者、v4.2.0)。開発者本人も同じ症状を確認。
-- Collection prepare がコンテナ pin を取得せず install が map を消していた原因を修正。検索・スマートフォルダの
-  一括取得と動画 leaf seed を共有し、Folder / ZIP / PDF / 変換書庫 / EPUB、入れ子固定、child→root の保持資産へ適用する。
-- コンテナ pin 成功書込 stamp と代表 sort / depth を再利用条件へ追加。表示 root は既存 prepare retry で変更・解除を反映し、
-  メタ情報 import は確定commitの既存 thumbnail-source epoch 通知で失効する。各 context の map 所有と full-path cache key を維持。
-- 別接続の同一内容ファイル編集復元も、成功した pin COMMIT を既存 epoch 通知へ渡す。変更なし / rollback は失効させない。
-- Remote は既存の Folder Image / Folder leaf 固定だけに対応する別経路で、本件では IPC / protocol とその制限を変更しない。
-- 共通 resolver の既存 UI 同期参照は他の集約一覧と同じ入力で使うことを設計担当が許容。worker 化は P3 §1.309 へ分離する。
-- 回帰テスト・検証記録: [collection-implementation-plan.md §23.18](collection-implementation-plan.md)。
-  実アプリ確認は未実施（利用者指定により起動なし）。
-
 ### 1.297 一覧の先頭に親フォルダへ戻る「..」を任意表示する — >>475 (2026-09-27)
 
 - 出典: mIV スレ >>475。矢印キーと Enter だけでフォルダ間を行き来したい。作者は、不要な利用者には邪魔になるため既定非表示のオプションとして検討すると回答。
