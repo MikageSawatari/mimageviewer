@@ -36,8 +36,6 @@ impl StageHealth {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StageComposition {
     pub plugin_latency_secs: f64,
-    pub effetune_applied: bool,
-    pub limiter_required: bool,
     pub effetune_generation: Option<u64>,
 }
 
@@ -52,7 +50,6 @@ pub fn admit_effetune(user_latency_secs: f64, effetune_latency_secs: f64) -> Res
 }
 
 pub fn compose(
-    user_applied: bool,
     user_latency_secs: f64,
     effetune_applied: bool,
     effetune_latency_secs: f64,
@@ -65,8 +62,6 @@ pub fn compose(
             } else {
                 0.0
             },
-        effetune_applied,
-        limiter_required: user_applied || effetune_applied,
         effetune_generation: effetune_applied.then_some(effetune_generation).flatten(),
     }
 }
@@ -76,7 +71,6 @@ pub fn compose(
 pub fn compose_samples(
     mut user_samples: Vec<f32>,
     mut effetune_samples: Vec<f32>,
-    user_applied: bool,
     user_latency_secs: f64,
     effetune_applied: bool,
     effetune_latency_secs: f64,
@@ -86,7 +80,6 @@ pub fn compose_samples(
         std::mem::swap(&mut user_samples, &mut effetune_samples);
     }
     let composition = compose(
-        user_applied,
         user_latency_secs,
         effetune_applied,
         effetune_latency_secs,
@@ -103,14 +96,13 @@ mod tests {
     fn user_stage_has_priority_and_fallback_keeps_its_latency() {
         assert_eq!(admit_effetune(1.5, 0.5), Ok(()));
         assert_eq!(admit_effetune(1.5, 0.51), Err(2.01));
-        let composed = compose(true, 0.3, false, 0.4, Some(8));
+        let composed = compose(0.3, false, 0.4, Some(8));
         assert_eq!(composed.plugin_latency_secs, 0.3);
-        assert!(composed.limiter_required);
         assert_eq!(composed.effetune_generation, None);
-        let composed = compose(true, 0.3, true, 0.4, Some(9));
+        let composed = compose(0.3, true, 0.4, Some(9));
         assert_eq!(composed.plugin_latency_secs, 0.7);
         assert_eq!(composed.effetune_generation, Some(9));
-        assert!(compose(false, 0.0, true, 0.0, Some(10)).limiter_required);
+        assert_eq!(compose(0.0, false, 0.4, None).plugin_latency_secs, 0.0);
     }
 
     #[test]
@@ -135,12 +127,12 @@ mod tests {
         let user = vec![0.3, -0.3];
         let effect = vec![0.9, -0.9];
         let (output, scratch, info) =
-            compose_samples(user.clone(), effect.clone(), true, 0.2, false, 0.4, Some(4));
+            compose_samples(user.clone(), effect.clone(), 0.2, false, 0.4, Some(4));
         assert_eq!(output, user);
         assert_eq!(scratch, effect);
         assert_eq!(info.plugin_latency_secs, 0.2);
         let (output, scratch, info) =
-            compose_samples(user, effect.clone(), true, 0.2, true, 0.4, Some(5));
+            compose_samples(user, effect.clone(), 0.2, true, 0.4, Some(5));
         assert_eq!(output, effect);
         assert_eq!(scratch, vec![0.3, -0.3]);
         assert_eq!(info.effetune_generation, Some(5));

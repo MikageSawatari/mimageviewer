@@ -15406,14 +15406,34 @@ mod tests {
             // All counters/channels are quiet, and the old quiet interval has
             // expired, but DSP still owns a tail block (including a slow IPC).
             player.backdate_eof_quiet_for_test(std::time::Duration::from_secs(1));
-            let _ = player.tick(&egui::Context::default());
+            let (ctx, requests) = repaint_probe();
+            let in_flight_deadline = player.tick(&ctx);
+            if native {
+                assert_eq!(in_flight_deadline, None);
+            }
             assert_eq!(player.current_seek_serial(), serial);
             assert!(player.is_playing());
             assert!(player.eof_loop_quiet_since.is_none());
-            player.clock.complete_audio_tail(serial);
-            let _ = player.tick(&egui::Context::default());
+            requests.lock().unwrap().clear();
+            super::audio::complete_audio_tail_and_wake(
+                &player.clock,
+                serial,
+                &player.engine_event_tx,
+            );
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.viewport_id == egui::ViewportId::ROOT && r.delay.is_zero())
+            );
+            let quiet_deadline = player
+                .tick(&ctx)
+                .expect("completion wake must start the quiet timer");
+            assert!(quiet_deadline <= super::EOF_DRAIN_QUIET_DURATION);
+
             player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
-            let _ = player.tick(&egui::Context::default());
+            let _ = player.tick(&ctx);
             assert!(player.current_seek_serial() > serial);
         }
     }

@@ -472,9 +472,11 @@ thumbnail を含めない。
   pointer-up の 1 回だけ発行する。設定値を選ぶ通常の slider はこの seek 固有の tap/drag owner の対象外とする
 - 先読み窓を埋めた有限素材では、次の frame/chunk の capacity 待ちが demux の EOF 観測より先に
   起き、未公開の終端を端末が取得して release することもできない循環があった。advertised target
-  の外に公開可能な working fragment 1 本を有界に許可し、ring は target + working + terminal の
-  2 予約 slot を持つ。working fragment が公開されれば通常の取得で再開でき、EOF 観測後の codec
-  drain は従来どおり terminal slot で完了する
+  の外に公開可能な working fragment 1 本を有界に許可する。working fragment が公開されれば
+  通常の取得で再開できる。ring は従来の working / codec 終端用 2 slot に DSP 排出用 2 slot を
+  加えた target + 4 を保持し、EOF 後の排出は取得待ちへ戻らず完了する。最大 plugin 遅延 2秒と
+  両 limiter 約 10ms は audio-only の約 2.005秒 fragment を超え、作成中の fragment の位置によって
+  2 境界を越えるため。metadata / A/V / audio-only は同じ保持数を使う（公開済み v4.3.0 には未収録）。
 - 動画 surface は静止画の transform owner を通らず、tap zone が再生 / ±10 秒 command を所有する。
   動画に拡大状態は設けない。連続 tap と pinch は Safari の native page zoom を明示的に抑止し、
   静止画 viewer の拡大・reset 操作には影響させない
@@ -1028,12 +1030,12 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
   playhead を報告する
 - **一時停止 / seek / 終端**: 一時停止中も ring 上限まで生成して park する。seek は現在の
   generation 交換規約を再利用し、旧 worker を段境界 cancel、新 generation は独立 open + seek
-  で開始する。終端は decoder、resampler、H.264/AAC encoder、A/V mux、既存
+  で開始する。終端は decoder、resampler、音声 DSP tail、H.264/AAC encoder、A/V mux、既存
   `Fmp4Segmenter::finish()` の順に flush し、最終 fragment を ring に記録してから `Ended` と
   session 側の `#EXT-X-ENDLIST` を公開する。単なる ring 満杯とは区別する。live 30 本とは別に
-  EOF を観測するための working fragment 1 slot と terminal fragment 1 slot を ring に予約する。
-  working fragment は公開・取得可能にし、入力 EOF を観測した後の有限な codec drain は未公開
-  fragment の取得待ちへ入れない
+  EOF を観測する working fragment と codec 終端用の 2 slot に、最大 DSP tail が越える
+  2 境界分を加えた計 4 slot を ring に予約する。working fragment は公開・取得可能にし、
+  EOF 後の有限な DSP / codec drain は未公開 fragment の取得待ちへ入れない。
 - **世代資源の排他**: generation worker の auxiliary decoder / FFmpeg 所有 D3D11 device / H.264
   encoder の全寿命を process-wide lease で直列化する。seek や start が旧 handle の非同期 join より
   先に到着しても、旧 worker が戻り FFmpeg context が drop されるまでは次世代を open しない。

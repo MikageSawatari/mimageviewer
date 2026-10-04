@@ -1053,8 +1053,8 @@ impl ClocklessTranscodeControl {
         }
     }
 
-    /// EOF has already been observed, so only bounded decoder/encoder delay and the final
-    /// fragment remain. They use the output ring's dedicated terminal slot instead of waiting
+    /// EOF has already been observed, so only bounded decoder/DSP/encoder delay and the final
+    /// fragment remain. They use the output ring's terminal reserve instead of waiting
     /// for a browser request that cannot name the unpublished final fragment yet.
     fn begin_finishing(&self) {
         let mut state = self.inner.state.lock().unwrap();
@@ -1645,7 +1645,6 @@ impl ClocklessAudioProcessor {
         }
 
         let mut latency_secs = 0.0;
-        let mut vst3_applied = false;
         if let Some(chain) = self.vst3.as_ref()
             && !chain.processor.available()
             && !chain.failed.swap(true, Ordering::AcqRel)
@@ -1676,7 +1675,6 @@ impl ClocklessAudioProcessor {
                         std::mem::swap(&mut chunk.samples, &mut self.vst3_output);
                         latency_secs += chain.processor.total_latency_samples() as f64
                             / f64::from(chain.processor.sample_rate().max(1));
-                        vst3_applied = true;
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -1771,7 +1769,6 @@ impl ClocklessAudioProcessor {
         let (samples, scratch, composition) = crate::effetune::composition::compose_samples(
             chunk.samples,
             std::mem::take(&mut self.effetune_output),
-            vst3_applied,
             user_latency_secs,
             effetune_applied,
             effetune_latency_secs,
@@ -1781,23 +1778,12 @@ impl ClocklessAudioProcessor {
         self.effetune_output = scratch;
         latency_secs = composition.plugin_latency_secs;
 
-        let limiter_active =
-            composition.limiter_required || self.normalize_gain > 1.0 + f32::EPSILON;
-        if limiter_active {
-            self.limiter.process_block(&mut chunk.samples);
-            latency_secs += self.limiter.latency_secs();
-        } else {
-            self.limiter.reset();
-            self.effetune_input_limiter.reset();
-        }
+        self.limiter.process_block(&mut chunk.samples);
+        latency_secs += self.limiter.latency_secs();
         chunk.audible_pts_secs -= latency_secs;
         chunk.pdc_latency_secs_at_process = latency_secs;
         chunk.effetune_generation = composition.effetune_generation;
-        let final_frames = if limiter_active {
-            (self.limiter.latency_secs() * self.sample_rate as f64).round() as usize
-        } else {
-            0
-        };
+        let final_frames = (self.limiter.latency_secs() * self.sample_rate as f64).round() as usize;
         let pre_frames = if effetune_applied && self.effetune_pre_limiter_enabled {
             final_frames
         } else {
@@ -2499,7 +2485,7 @@ fn run_clockless_stream_inner(
     // Capacity belongs at the packet/frame production boundary, not before demux. Otherwise a
     // final full segment can fill the live window and park the worker before it observes EOF.
     // Once EOF is known, the remaining codec delay and final fragment are bounded and use the
-    // ring's reserved terminal slot after the bounded working fragment.
+    // ring's reserved terminal capacity after the bounded working fragment.
     let ahead = state.control.snapshot();
     crate::logger::log(format!(
         "remote-stream clockless {} reached: generation={} transition=Producing->Finishing produced_segments={} released_segments={}",
@@ -2705,9 +2691,19 @@ fn validate_options(
 }
 
 fn retained_segment_capacity(segment_capacity: usize) -> Result<usize, String> {
-    segment_capacity.checked_add(2).ok_or_else(|| {
-        "segment capacity leaves no room for the working and terminal fragments".to_owned()
-    })
+    // Preserve the existing working + codec/final-fragment reserve. In addition,
+    // an admitted EffeTune delay plus both limiter lookaheads can cross two
+    // fragment boundaries from an arbitrary working-fragment position. Both the
+    // segment byte ring and output metadata use this same retention budget.
+    let dsp_tail_fragments = ((crate::effetune::composition::MAX_PLUGIN_LATENCY_SECS
+        + 2.0 * super::audio::SAFETY_LIMITER_LOOKAHEAD_SECS)
+        / f64::from(SEGMENT_DURATION_SECS))
+    .ceil() as usize;
+    segment_capacity
+        .checked_add(2 + dsp_tail_fragments)
+        .ok_or_else(|| {
+            "segment capacity leaves no room for the working and terminal DSP fragments".to_owned()
+        })
 }
 
 fn stream_start_secs(stream: &ffmpeg::Stream<'_>) -> f64 {
@@ -3511,9 +3507,9 @@ mod tests {
         .unwrap();
         let chunk = processor
             .process(ProcessedChunk {
-                samples: vec![1.0, -0.5],
+                samples: vec![1.0, -0.5].repeat(241),
                 audible_pts_secs: 10.0,
-                duration_secs: 1.0 / f64::from(AUDIO_OUTPUT_RATE),
+                duration_secs: 241.0 / f64::from(AUDIO_OUTPUT_RATE),
                 source_secs_per_output_sec: 1.0,
                 seek_serial: SEEK_SERIAL,
                 pdc_latency_secs_at_process: 0.0,
@@ -3521,9 +3517,39 @@ mod tests {
             })
             .unwrap();
 
-        assert!((chunk.samples[0] - 0.579).abs() < 1.0e-6);
-        assert!((chunk.samples[1] + 0.2895).abs() < 1.0e-6);
-        assert_eq!(chunk.audible_pts_secs, 10.0);
+        assert_eq!(&chunk.samples[..480], vec![0.0; 480]);
+        assert!((chunk.samples[480] - 0.579).abs() < 1.0e-6);
+        assert!((chunk.samples[481] + 0.2895).abs() < 1.0e-6);
+        assert_eq!(chunk.pdc_latency_secs_at_process, 0.005);
+        assert_eq!(chunk.audible_pts_secs, 9.995);
+    }
+
+    #[test]
+    fn final_limiter_remote_keeps_delay_across_gain_changes_and_drains_without_effects() {
+        let mut processor =
+            ClocklessAudioProcessor::new(ClocklessAudioProcessing::without_vst3(0.5), 1_000)
+                .unwrap();
+        let mut previous_gain = 0.0;
+        let mut end = 10.0 - 0.005;
+        for (index, gain) in [0.5, 2.0, 0.5, 1.0].into_iter().enumerate() {
+            processor.normalize_gain = gain;
+            let mut raw = audio_chunk(vec![0.25; 12]);
+            raw.audible_pts_secs = 10.0 + index as f64 * 0.006;
+            raw.duration_secs = 0.006;
+            let chunk = processor.process(raw).unwrap();
+            assert_eq!(chunk.pdc_latency_secs_at_process, 0.005);
+            assert!((chunk.audible_pts_secs - end).abs() < 1e-9);
+            assert_eq!(&chunk.samples[..10], vec![0.25 * previous_gain; 10]);
+            assert_eq!(&chunk.samples[10..], vec![0.25 * gain; 2]);
+            previous_gain = gain;
+            end += chunk.duration_secs;
+        }
+        processor.start_tail();
+        let tail = processor.process_tail().unwrap();
+        assert_eq!(tail.samples, vec![0.25; 10]);
+        assert_eq!(tail.pdc_latency_secs_at_process, 0.005);
+        assert!((tail.audible_pts_secs - end).abs() < 1e-9);
+        assert!(processor.tail_complete());
     }
 
     #[test]
@@ -3546,16 +3572,20 @@ mod tests {
         let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 1, None);
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
+        let chunk = processor
+            .process(audio_chunk(vec![0.4, -0.2].repeat(241)))
+            .unwrap();
 
-        assert_eq!(chunk.samples, vec![0.2, -0.1]);
+        assert_eq!(&chunk.samples[..480], vec![0.0; 480]);
+        assert_eq!(&chunk.samples[480..], &[0.2, -0.1]);
+        assert_eq!(chunk.pdc_latency_secs_at_process, 0.005);
         for _ in 0..2 {
             assert_eq!(
                 processor
-                    .process(audio_chunk(vec![0.4, -0.2]))
+                    .process(audio_chunk(vec![0.4, -0.2].repeat(241)))
                     .unwrap()
                     .samples,
-                vec![0.2, -0.1]
+                vec![0.2, -0.1].repeat(241)
             );
         }
         let status = status.snapshot();
@@ -3577,9 +3607,13 @@ mod tests {
         let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 0, None);
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
+        let chunk = processor
+            .process(audio_chunk(vec![0.4, -0.2].repeat(241)))
+            .unwrap();
 
-        assert_eq!(chunk.samples, vec![0.2, -0.1]);
+        assert_eq!(&chunk.samples[..480], vec![0.0; 480]);
+        assert_eq!(&chunk.samples[480..], &[0.2, -0.1]);
+        assert_eq!(chunk.pdc_latency_secs_at_process, 0.005);
         assert_eq!(host.reset_count.load(Ordering::Acquire), 0);
         assert!(host.inputs.lock().unwrap().is_empty());
         let status = status.snapshot();
@@ -3658,10 +3692,13 @@ mod tests {
         let first = processor.process(audio_chunk(vec![0.8; 40])).unwrap();
         assert_eq!(first.pdc_latency_secs_at_process, 0.010);
         effect.fail.store(true, Ordering::Release);
-        let dry = vec![1.2; 40];
+        let dry = vec![0.6; 40];
         let failed = processor.process(audio_chunk(dry.clone())).unwrap();
-        assert_eq!(failed.pdc_latency_secs_at_process, 0.0);
-        assert_eq!(&failed.samples[failed.samples.len() - dry.len()..], dry);
+        assert_eq!(failed.pdc_latency_secs_at_process, 0.005);
+        // Removing only the pre-stage inserts 5ms; the final delay keeps its old audio.
+        assert_eq!(&failed.samples[..10], vec![0.0; 10]);
+        assert_eq!(&failed.samples[10..20], vec![0.8; 10]);
+        assert_eq!(&failed.samples[20..], vec![0.6; 30]);
         effect.fail.store(false, Ordering::Release);
         let success = processor.process(audio_chunk(vec![0.0; 40])).unwrap();
         assert_eq!(success.pdc_latency_secs_at_process, 0.010);
@@ -3697,8 +3734,9 @@ mod tests {
             ClocklessAudioProcessor::new(ClocklessAudioProcessing::without_vst3(1.0), 1_000)
                 .unwrap();
         let result = disabled.process(audio_chunk(vec![1.28; 40])).unwrap();
-        assert_eq!(result.pdc_latency_secs_at_process, 0.0);
-        assert!(result.samples.iter().all(|sample| *sample == 1.28));
+        assert_eq!(result.pdc_latency_secs_at_process, 0.005);
+        assert_eq!(&result.samples[..10], vec![0.0; 10]);
+        assert!(result.samples[10..].iter().all(|sample| *sample == 1.0));
     }
 
     #[test]
@@ -3724,6 +3762,9 @@ mod tests {
                 + processor.effetune_input_limiter.prepare(&[], 0, true).1)
                 * f64::from(RATE))
             .round() as usize;
+            let final_samples =
+                (processor.limiter.latency_secs() * f64::from(RATE)).round() as usize;
+            let removed_samples = 128 + limiter_samples - final_samples;
             let mut encoder = open_aac_encoder(
                 RATE,
                 96_000,
@@ -3751,10 +3792,13 @@ mod tests {
             let fallback = processor
                 .process(timed_audio_chunk(RATE, FRAMES, FRAMES, SEEK_SERIAL))
                 .unwrap();
-            assert_eq!(fallback.pdc_latency_secs_at_process, 0.0);
-            assert_eq!(fallback.samples.len() / 2, FRAMES + 128 + limiter_samples);
+            assert_eq!(
+                fallback.pdc_latency_secs_at_process,
+                processor.limiter.latency_secs()
+            );
+            assert_eq!(fallback.samples.len() / 2, FRAMES + removed_samples);
             assert!(
-                fallback.samples[..(128 + limiter_samples) * 2]
+                fallback.samples[..removed_samples * 2]
                     .iter()
                     .all(|sample| *sample == 0.0)
             );
@@ -3766,7 +3810,10 @@ mod tests {
                 .process(timed_audio_chunk(RATE, 2 * FRAMES, FRAMES, SEEK_SERIAL))
                 .unwrap();
             assert_eq!(third.samples.len() / 2, FRAMES);
-            assert_eq!(third.pdc_latency_secs_at_process, 0.0);
+            assert_eq!(
+                third.pdc_latency_secs_at_process,
+                processor.limiter.latency_secs()
+            );
             assert!((third.audible_pts_secs - fallback_end).abs() < 1.0e-10);
             let third_end = third.audible_pts_secs + third.duration_secs;
             packets.extend(encoder.push_chunk(third).unwrap());
@@ -3785,7 +3832,7 @@ mod tests {
             );
             assert_eq!(
                 encoder.stats().input_samples_per_channel,
-                ((3 + usize::from(!cap_exceeded)) * FRAMES) as u64
+                ((3 + usize::from(!cap_exceeded)) * FRAMES - final_samples) as u64
             );
             assert!(status.snapshot().warning.unwrap().contains("音響調整"));
         }
@@ -4270,6 +4317,115 @@ mod tests {
             output.segment(output.metrics().latest_sequence.unwrap()),
             ClocklessSegmentBytes::Found(_)
         ));
+    }
+
+    #[test]
+    fn eos_maximum_dsp_tail_preserves_full_manual_audio_only_ring() {
+        const RATE: u32 = 48_000;
+        let mut options = ClocklessTranscodeOptions::benchmark("terminal-ring-fixture.wav", 0);
+        options.segment_capacity = 1;
+        options.max_source_secs = None;
+        let control = ClocklessTranscodeControl::manual(options.segment_capacity).unwrap();
+        let output = ClocklessStreamOutput::new(options.segment_capacity, 0.0).unwrap();
+        let timeline = StreamTimeline::new(0.0).unwrap();
+        let audio_encoder = open_aac_encoder(RATE, 96_000, SEEK_SERIAL, timeline).unwrap();
+        let segmenter = Fmp4Segmenter::audio_only_with_capacity(
+            &audio_encoder.encoder,
+            retained_segment_capacity(options.segment_capacity).unwrap(),
+        )
+        .unwrap();
+        let info = ClocklessOutputInfo {
+            video: None,
+            audio_stream_index: Some(0),
+            audio_bitrate_bps: audio_encoder.effective_bitrate_bps(),
+            codecs: segmenter.codecs().to_owned(),
+        };
+        output.install(segmenter, info, 0.0);
+        let effect = Arc::new(DelayedTailProcessor {
+            sample_rate: RATE,
+            frames: 2 * RATE,
+            delay: Mutex::new(VecDeque::new()),
+            max_block_frames: AtomicUsize::new(0),
+        });
+        let config = with_unlimited_fake_effetune(ClocklessAudioProcessing::default(), effect)
+            .with_effetune_preferences(&Default::default());
+        let mut state = DriverState {
+            options: &options,
+            control: &control,
+            frame_rate: None,
+            video: None,
+            video_tap: None,
+            video_rx: None,
+            audio_encoder,
+            output: output.clone(),
+            audio_processor: ClocklessAudioProcessor::new(config, RATE).unwrap(),
+            mux: ClocklessMux::default(),
+            scale_profiler: None,
+            times: Default::default(),
+            packets: 0,
+            video_frames: 0,
+            audio_frames: 0,
+            scale_profile_samples: 0,
+            completed_segments: 0,
+            max_source_pts: 0.0,
+        };
+        // AAC fragments round two seconds up to 94 packets (96,256 frames).
+        // One last decoded block fills two unread fragments plus a nearly full
+        // working fragment; no consumer has released the advertised live window.
+        let frames = 3 * 94 * 1_024;
+        let raw = ProcessedChunk {
+            samples: vec![0.25; frames * 2],
+            audible_pts_secs: 2.010,
+            duration_secs: frames as f64 / RATE as f64,
+            source_secs_per_output_sec: 1.0,
+            seek_serial: SEEK_SERIAL,
+            pdc_latency_secs_at_process: 0.0,
+            effetune_generation: None,
+        };
+        state.push_audio_chunk(raw).unwrap();
+        assert_eq!(control.snapshot().produced_segments, 2);
+        assert_eq!(control.snapshot().released_segments, 0);
+        assert_eq!(output.metrics().earliest_sequence, Some(0));
+        control.begin_finishing();
+        state.drain_audio_tail().unwrap();
+        finish_transcode(
+            state,
+            None,
+            0.0,
+            Instant::now(),
+            "pcm".to_owned(),
+            0,
+            0,
+            "fixture".to_owned(),
+            false,
+            "audio-only".to_owned(),
+            OutputDimensions {
+                width: 0,
+                height: 0,
+            },
+            Some("aac".to_owned()),
+        )
+        .unwrap();
+        assert!(output.metrics().ended);
+        assert_eq!(control.snapshot().released_segments, 0);
+        let latest = output.metrics().latest_sequence.unwrap();
+        assert!(
+            latest >= 4,
+            "tail + finish must exercise multiple terminal fragments, latest={latest}"
+        );
+        assert_eq!(output.metrics().earliest_sequence, Some(0));
+        for sequence in 0..=latest {
+            assert!(
+                matches!(output.segment(sequence), ClocklessSegmentBytes::Found(_)),
+                "unread segment {sequence} was evicted"
+            );
+        }
+        assert!(
+            output
+                .media_playlist()
+                .unwrap()
+                .ends_with("#EXT-X-ENDLIST\n")
+        );
     }
 
     #[test]

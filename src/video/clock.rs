@@ -801,10 +801,13 @@ impl AvClock {
         }
     }
 
-    pub(super) fn complete_audio_tail(&self, serial: u64) {
+    pub(super) fn complete_audio_tail(&self, serial: u64) -> bool {
         let mut state = self.audio_eos.lock().unwrap();
         if serial == self.current_seek_serial() && *state == AudioEos::Draining(serial) {
             *state = AudioEos::Complete(serial);
+            true
+        } else {
+            false
         }
     }
 
