@@ -25,8 +25,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -52,12 +52,22 @@ use mimageviewer::settings::{FavoriteEntry, IndexerSpeedProfile};
 /// CI の CPU 割当が薄い環境も想定して余裕を持たせる。
 pub const FS_EVENT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 初期スキャン + Tantivy commit が済むまでの最大時間。少数ファイルなら 1 秒以内だが、
-/// 共有 writer のロック待ちで若干膨らむ可能性を見て 10 秒。
+/// 初期スキャン + Tantivy commit / reader reload の停止検出用上限。
+/// アプリ起動時の依存初期化は fixture 作成時に済ませ、fallback の実時間待ちを含めない。
 pub const INITIAL_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ポーリング間隔。細かくすると notify-rs のイベントを速く拾えるが CPU を焼く。
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// These binaries exercise native formats, with Susie explicitly disabled, like app startup.
+/// Integration tests link the library without cfg(test): omitting init_pool would make the
+/// first scan fingerprint / unknown extension wait for the production 5s fallback. Install
+/// the immutable empty pool once per test process, before any scan workers can observe it.
+/// This neither reads real settings nor starts/extracts a Susie worker.
+fn initialize_search_test_runtime() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| mimageviewer::susie_loader::init_pool(false, false));
+}
 
 // -----------------------------------------------------------------------
 // FixtureRoot
@@ -71,6 +81,8 @@ pub struct FixtureRoot {
 
 impl FixtureRoot {
     pub fn new() -> Self {
+        // Also covers tests that call the bulk scanner / supervisor directly.
+        initialize_search_test_runtime();
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path().to_path_buf();
         Self {
@@ -182,6 +194,7 @@ pub fn make_favorite(name: &str, path: &Path) -> FavoriteEntry {
 /// `speed` は Low で 1 permit にしておくと、テストで多スレッドが並ぶときも
 /// I/O の順序が決まりやすく flake が減る。
 pub fn start_indexer_at(data_dir: &Path, favorites: &[FavoriteEntry]) -> IndexerManager {
+    initialize_search_test_runtime();
     // テストでは idle 閾値 0ms にして wait_until_idle を即抜けさせる (活動ゲートの影響を排除)。
     let gate = std::sync::Arc::new(mimageviewer::activity_gate::ActivityGate::new(0));
     IndexerManager::new_at(
@@ -206,6 +219,7 @@ pub fn start_name_index_at(
     data_dir: &Path,
     favorite: &FavoriteEntry,
 ) -> (Arc<SearchIndexDb>, NameIndexSupervisorHandle) {
+    initialize_search_test_runtime();
     std::fs::create_dir_all(data_dir).ok();
     let db = Arc::new(
         SearchIndexDb::open_at(&data_dir.join("search_index.db")).expect("SearchIndexDb::open_at"),
@@ -222,13 +236,20 @@ pub fn start_name_index_at(
 
 /// 名前索引の初期バルクスキャンが完了するまで待つ。
 pub fn wait_name_scan_done(handle: &NameIndexSupervisorHandle) {
-    wait_until(
+    wait_until_with_diagnostics(
         || handle.snapshot_stats().initial_scan_done,
         INITIAL_SCAN_TIMEOUT,
         &format!(
             "name index initial scan for favorite {}",
             handle.favorite_id
         ),
+        || format!("name index stats={:?}", handle.snapshot_stats()),
+    );
+    assert_eq!(
+        handle.snapshot_stats().last_full_scan,
+        Some(name_index_supervisor::NameFullScanOutcome::Complete),
+        "name initial scan ended without completing: {:?}",
+        handle.snapshot_stats(),
     );
 }
 
@@ -281,9 +302,18 @@ where
 // -----------------------------------------------------------------------
 
 /// `cond()` が true を返すまで `timeout` まで polling。タイムアウトで panic。
-pub fn wait_until<F>(mut cond: F, timeout: Duration, desc: &str)
+pub fn wait_until<F>(cond: F, timeout: Duration, desc: &str)
 where
     F: FnMut() -> bool,
+{
+    wait_until_with_diagnostics(cond, timeout, desc, String::new);
+}
+
+/// Read diagnostics only on failure, so successful polling adds no DB / search work.
+fn wait_until_with_diagnostics<F, D>(mut cond: F, timeout: Duration, desc: &str, diagnostics: D)
+where
+    F: FnMut() -> bool,
+    D: FnOnce() -> String,
 {
     let deadline = Instant::now() + timeout;
     loop {
@@ -291,15 +321,20 @@ where
             return;
         }
         if Instant::now() >= deadline {
-            panic!("wait_until timed out after {:?}: {desc}", timeout);
+            panic!(
+                "wait_until timed out after {:?}: {desc}; {}",
+                timeout,
+                diagnostics(),
+            );
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// 指定 favorite の initial scan が完了するまで待つ。
+/// Wait for the supervisor's initial terminal, then require successful observation/writes.
+/// Ingest completion already includes synchronous Tantivy commit + reader reload.
 pub fn wait_scan_done(mgr: &IndexerManager, favorite_id: Uuid) {
-    wait_until(
+    wait_until_with_diagnostics(
         || {
             mgr.all_stats()
                 .into_iter()
@@ -309,7 +344,41 @@ pub fn wait_scan_done(mgr: &IndexerManager, favorite_id: Uuid) {
         },
         INITIAL_SCAN_TIMEOUT,
         &format!("initial scan for favorite {favorite_id}"),
+        || metadata_scan_diagnostics(mgr, favorite_id),
     );
+    let stats = mgr
+        .all_stats()
+        .into_iter()
+        .find(|s| s.favorite_id == favorite_id)
+        .expect("initial supervisor remains owned by manager")
+        .stats;
+    assert_eq!(
+        stats.last_full_outcome,
+        Some(mimageviewer::indexer_supervisor::FullScanOutcome::Complete),
+        "initial scan ended without completing: {}",
+        metadata_scan_diagnostics(mgr, favorite_id),
+    );
+}
+
+fn metadata_scan_diagnostics(mgr: &IndexerManager, favorite_id: Uuid) -> String {
+    let stats = mgr
+        .all_stats()
+        .into_iter()
+        .find(|s| s.favorite_id == favorite_id);
+    let stage = match stats.as_ref().map(|s| &s.stats) {
+        None => "waiting_for_supervisor (startup cleanup/reconciliation/adoption)",
+        Some(s) if s.initial_scan_done => "initial_terminal",
+        Some(s) if !s.in_full_scan => "before_walk (watch registration/scan fingerprint)",
+        Some(_) => "walk_or_ingest (see current_activity/eta)",
+    };
+    format!(
+        "stage={stage}; reconciling={}; startup={:?}; susie_pool_present={}; reader_visible_docs={}; stats={:?}",
+        mgr.is_reconciling(),
+        mgr.startup_diag(),
+        mimageviewer::susie_loader::try_get_pool().is_some(),
+        mgr.clone_fts_index().searcher().num_docs(),
+        stats.map(|s| s.stats),
+    )
 }
 
 /// `fts_meta.db` に指定 path (正規化済み) の行が現れるまで待つ。
@@ -393,9 +462,8 @@ fn drain_rx(rx: &Receiver<SearchStreamEvent>, _cancel: &Arc<AtomicBool>) -> Vec<
     }
 }
 
-/// 初期スキャン完了 (= walker + ingest flush 済み) 直後でも Tantivy Reader は
-/// `ReloadPolicy::OnCommitWithDelay` で reload されるまでラグがある。
-/// 繰り返し `spawn_search` して `predicate` が満たされるまで待つ。
+/// Ingest flush includes reader reload; initial scan results are immediately searchable.
+/// Watcher tests poll search hits to await asynchronous FS event delivery and ingest.
 ///
 /// 返り値は predicate が満たされた時点の hits。`timeout` を超えたら panic。
 pub fn wait_for_search_hits<F>(
@@ -449,5 +517,57 @@ pub fn run_search_expecting_done(
             Ok(SearchStreamEvent::Batch { .. }) => continue,
             Err(_) => panic!("search rx disconnected"),
         }
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_fixtures_install_same_disabled_susie_pool_before_workers() {
+        std::thread::scope(|scope| {
+            let workers = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _fixture = FixtureRoot::new();
+                        let pool = mimageviewer::susie_loader::try_get_pool()
+                            .expect("fixture must initialize Susie before scans, without fallback");
+                        assert!(pool.extensions().is_empty());
+                        assert!(Arc::ptr_eq(&pool, &mimageviewer::susie_loader::get_pool()));
+                        pool
+                    })
+                })
+                .collect::<Vec<_>>();
+            let pools = workers
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(pools.iter().all(|p| Arc::ptr_eq(p, &pools[0])));
+        });
+    }
+
+    #[test]
+    fn timeout_includes_observed_state_and_success_does_not_read_diagnostics() {
+        wait_until_with_diagnostics(
+            || true,
+            Duration::ZERO,
+            "done",
+            || panic!("unexpected diagnostic read"),
+        );
+        let failure = std::panic::catch_unwind(|| {
+            wait_until_with_diagnostics(
+                || false,
+                Duration::ZERO,
+                "initial scan",
+                || "stage=before_walk; susie_pool_present=false; reader_visible_docs=0".to_owned(),
+            );
+        })
+        .unwrap_err();
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("initial scan"));
+        assert!(message.contains("stage=before_walk"));
+        assert!(message.contains("susie_pool_present=false"));
+        assert!(message.contains("reader_visible_docs=0"));
     }
 }
