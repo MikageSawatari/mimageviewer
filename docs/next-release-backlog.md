@@ -67,7 +67,7 @@
   足りるかもしれない (mIV との組み合わせは未確認) こと、件数上限 10 とコマンドライン長の制限も伝えた。
 - 規模 / 優先度: Small〜Medium / P3。
 
-### 1.329 `fs_page_load_scheduler::tests::slow_read_and_decode_stay_within_process_budget` が全体実行でまれに落ちる — テスト側の同期不足 (2026-10-04)
+### 1.330 `fs_page_load_scheduler::tests::slow_read_and_decode_stay_within_process_budget` が全体実行でまれに落ちる — テスト側の同期不足 (2026-10-04)
 
 - 観測: §1.312 の作業中、`cargo test -p mimageviewer --lib` 全体 (10,247 件) でこのテストだけ 1 回失敗 (`peak == 3` の期待に対して 2、line 678)。単独で再実行すると成功。§1.312 の変更とは無関係 (実装担当の調査と独立レビューで確認)。
 - 原因 (コードの読み): stats が Running の許可を 3 つ出した時点で、worker が active / peak を更新する前にテストがゲートを開けてしまう。上限 (許可数) の違反ではない。
