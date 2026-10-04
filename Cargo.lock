@@ -4022,6 +4022,7 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-dpapi",
  "windows-numerics 0.2.0",
+ "windows-sys 0.61.2",
  "winreg",
  "winresource",
  "zip",

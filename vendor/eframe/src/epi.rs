@@ -666,6 +666,9 @@ pub struct Frame {
     /// Raw platform display handle for window
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) raw_display_handle: Result<RawDisplayHandle, HandleError>,
+    /// Replaces the native integration's old `is_first_frame` flag.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) native_window_visible_commit_completed: bool,
 }
 
 // Implementing `Clone` would violate the guarantees of `HasWindowHandle` and `HasDisplayHandle`.
@@ -704,6 +707,8 @@ impl Frame {
             raw_display_handle: Err(HandleError::NotSupported),
             #[cfg(not(target_arch = "wasm32"))]
             raw_window_handle: Err(HandleError::NotSupported),
+            #[cfg(not(target_arch = "wasm32"))]
+            native_window_visible_commit_completed: false,
             storage: None,
             #[cfg(feature = "wgpu")]
             wgpu_render_state: None,
@@ -721,6 +726,23 @@ impl Frame {
     /// Information about the integration.
     pub fn info(&self) -> &IntegrationInfo {
         &self.info
+    }
+
+    /// Whether the root's initial post-paint `set_visible(true)` call has returned.
+    ///
+    /// This historical receipt is not the current visibility (e.g. after tray hide),
+    /// nor proof of a successful GPU present. It is false during the initial update.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn native_window_visible_commit_completed(&self) -> bool {
+        self.native_window_visible_commit_completed
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn commit_initial_native_visibility(&mut self, show: impl FnOnce()) {
+        if !self.native_window_visible_commit_completed {
+            show();
+            self.native_window_visible_commit_completed = true;
+        }
     }
 
     /// A place where you can store custom data in a way that persists when you restart the app.
@@ -922,3 +944,29 @@ pub fn set_value<T: serde::Serialize>(storage: &mut dyn Storage, key: &str, valu
 
 /// [`Storage`] key used for app
 pub const APP_KEY: &str = "app";
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native_initial_visibility_tests {
+    use super::Frame;
+
+    #[test]
+    fn visible_commit_receipt_is_set_only_after_show_returns_and_show_runs_once() {
+        let mut frame = Frame::_new_kittest();
+        assert!(!frame.native_window_visible_commit_completed());
+        let mut shows = 0;
+        frame.commit_initial_native_visibility(|| shows += 1);
+        assert!(frame.native_window_visible_commit_completed());
+        frame.commit_initial_native_visibility(|| shows += 1);
+        assert_eq!(shows, 1);
+    }
+
+    #[test]
+    fn interrupted_show_does_not_publish_a_visible_commit_receipt() {
+        let mut frame = Frame::_new_kittest();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frame.commit_initial_native_visibility(|| panic!("show did not return"));
+        }));
+        assert!(result.is_err());
+        assert!(!frame.native_window_visible_commit_completed());
+    }
+}
