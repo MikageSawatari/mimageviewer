@@ -2336,7 +2336,7 @@ def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
         if e.get("cat") == "log" and e.get("kind") == "diagnostic_dropped"
     )
     if dropped:
-        print(f"logger 診断欠落: {dropped:.0f} 件 (queue 飽和、待ち先の証拠は不完全)")
+        print(f"logger 診断欠落: {dropped:.0f} 件 (queue 競合/飽和等、待ち先の証拠は不完全)")
     frames = sorted(
         [e for e in events if e.get("cat") == "frame" and e.get("kind") == "begin"
          and _hitch_number(e, "t") is not None],
@@ -2364,31 +2364,70 @@ def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
         print(f"  [{start:.3f}, {end:.3f}]s gap={(end - start) * 1000.0:.1f}ms 直前 nav: {tags_str}")
         _print_hitch_context(events, (start, end))
 
-    updates = [e for e in events if e.get("cat") == "ui" and e.get("kind") == "update_breakdown"]
-    known_numbers = {e.get("n") for e in updates if e.get("n") is not None}
-    # The current begin reports the previous update. Keep the previous n.
+    inner_updates = [e for e in events if e.get("cat") == "ui" and e.get("kind") == "update_breakdown"]
+    outer_updates = []
+    # The current begin reports the previous outer App::update, including work
+    # outside update_frame and end-of-frame perf writes. Keep the previous n;
+    # an inner breakdown measures only a portion of that same update.
     for previous, current in zip(frames, frames[1:]):
         ms = _hitch_number(current, "prev_update_ms")
-        if previous.get("n") not in known_numbers and ms is not None:
-            updates.append({
-                "n": previous.get("n"), "start_t": previous["t"],
-                "end_t": previous["t"] + ms / 1000.0, "total_ms": ms,
+        if ms is not None:
+            start = _hitch_number(current, "prev_update_start_t")
+            end = _hitch_number(current, "prev_update_end_t")
+            approximate = start is None or end is None or end < start
+            if approximate:
+                # Legacy/missing endpoints: begin.t is recorded after update
+                # starts, so this fallback and its overlap evidence are approximate.
+                start, end = previous["t"], previous["t"] + ms / 1000.0
+            outer_updates.append({
+                "n": previous.get("n"), "start_t": start,
+                "end_t": end, "total_ms": ms,
                 "total_cycles": current.get("prev_update_cycles"),
                 "outside_ms": current.get("prev_outside_ms"),
+                "interval_approximate": approximate,
             })
-    slow_updates = [e for e in updates if (_hitch_number(e, "total_ms") or 0) >= threshold_ms]
+    outer_by_number = {e["n"]: e for e in outer_updates if e.get("n") is not None}
+    inner_numbers = {e["n"] for e in inner_updates if e.get("n") is not None}
+    updates = [
+        {"inner": e, "outer": outer_by_number.get(e.get("n"))}
+        for e in inner_updates
+    ]
+    updates.extend(
+        {"inner": None, "outer": e}
+        for e in outer_updates if e.get("n") is None or e["n"] not in inner_numbers
+    )
+
+    def update_ms(row: dict) -> float:
+        return max(
+            (_hitch_number(e, "total_ms") or 0)
+            for e in (row["outer"], row["inner"]) if e is not None
+        )
+
+    slow_updates = [row for row in updates if update_ms(row) >= threshold_ms]
     print(f"\nupdate >= {threshold_ms}ms: {len(slow_updates)} 件 (上位 10 件)")
     if not updates:
         print("  (update 計測なし: フレーム間隔は idle/present 等も含む)")
     subevents = [e for e in events if e.get("cat") == "ui"
                  and e.get("kind") == "other_worker_polls_breakdown"]
-    for event in sorted(slow_updates, key=lambda e: -e["total_ms"])[:10]:
+    for row in sorted(slow_updates, key=lambda row: -update_ms(row))[:10]:
+        outer, inner = row["outer"], row["inner"]
+        event = outer if outer is not None else inner
         span = _hitch_interval(event)
         span_text = f"[{span[0]:.3f}, {span[1]:.3f}]s" if span else "[区間不明]"
-        print(f"  n={event.get('n', '?')} {span_text} " + _hitch_measurements(event, ["total"]))
-        stages = [field[:-3] for field in event if field.endswith("_ms") and field != "total_ms"]
-        stages.sort(key=lambda field: -(_hitch_number(event, field + "_ms") or 0))
-        print("    update 段 (上位 3): " + _hitch_measurements(event, stages[:3]))
+        scope = "outer App::update" if outer is not None else "inner update_frame のみ (部分計測; outer 未計測)"
+        if outer is not None and outer["interval_approximate"]:
+            scope += "; 区間と logger/thumb 重複判定は概算 (frame.begin 起点)"
+        print(f"  n={event.get('n', '?')} {span_text} " + _hitch_measurements(event, ["total"]) + f" ({scope})")
+        if outer is not None and _hitch_number(outer, "outside_ms") is not None:
+            print("    フレーム間の update 外: " + _hitch_measurements(outer, ["outside"]))
+        if outer is not None and inner is not None:
+            inner_span = _hitch_interval(inner)
+            inner_text = f"[{inner_span[0]:.3f}, {inner_span[1]:.3f}]s" if inner_span else "[区間不明]"
+            print("    inner update_frame " + inner_text + " " + _hitch_measurements(inner, ["total"]))
+        stage_event = inner if inner is not None else {}
+        stages = [field[:-3] for field in stage_event if field.endswith("_ms") and field != "total_ms"]
+        stages.sort(key=lambda field: -(_hitch_number(stage_event, field + "_ms") or 0))
+        print("    update 段 (上位 3): " + _hitch_measurements(stage_event, stages[:3]))
         matching = [e for e in subevents if event.get("n") is not None and e.get("n") == event["n"]]
         if not matching:
             print("    (other_worker_polls 内訳なし: 旧ログまたは未計測)")

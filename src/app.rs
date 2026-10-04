@@ -59918,6 +59918,20 @@ impl App {
     }
 
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
+        let mut details_perf_section = None;
+        if self.details_meta_pending.is_some()
+            || matches!(
+                self.details_image_dims_state,
+                LazyColumnState::NotRequested
+                    | LazyColumnState::Loading { .. }
+                    | LazyColumnState::Reconciling { .. }
+            )
+        {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
+        }
         self.refresh_thumbnail_details_stage(ctx);
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
@@ -59929,6 +59943,10 @@ impl App {
         }
 
         if matches!(self.details_image_dims_state, LazyColumnState::Disabled) {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
@@ -59953,6 +59971,10 @@ impl App {
                 && self.details_visible_stage_needs_load())
                 || self.selection_info_needs_lazy_meta_request())
         {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         }
@@ -60056,6 +60078,10 @@ impl App {
                 )
             });
             if pending_is_stale {
+                crate::perf::stall::PollSection::ensure(
+                    &mut details_perf_section,
+                    crate::perf::stall::PollPart::DetailsMeta,
+                );
                 if let Some(pending) = self.details_meta_pending.take() {
                     pending.cancel.store(true, Ordering::Relaxed);
                 }
@@ -60072,6 +60098,10 @@ impl App {
                         | LazyColumnState::Reconciling { .. }
                 )
             {
+                crate::perf::stall::PollSection::ensure(
+                    &mut details_perf_section,
+                    crate::perf::stall::PollPart::DetailsMeta,
+                );
                 self.details_lazy_visible_revision =
                     self.details_lazy_visible_revision.wrapping_add(1);
                 self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -60161,6 +60191,10 @@ impl App {
         }
 
         if matches!(self.details_image_dims_state, LazyColumnState::NotRequested) {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
             self.start_details_meta_load(ctx);
         }
     }
@@ -65202,9 +65236,14 @@ impl App {
         };
         // このフレームで届いた分だけ drain。
         let mut rating_hydrations: Vec<(PathBuf, u8, u64)> = Vec::new();
+        let mut tag_perf_section = None;
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
+                    crate::perf::stall::PollSection::ensure(
+                        &mut tag_perf_section,
+                        crate::perf::stall::PollPart::TagPrewarm,
+                    );
                     // XMP から rating > 0 が読めたらハイドレート候補に積む
                     // (DB を UI スレッドで触らないように後段でまとめて書く)。
                     if let Some(stars) = res.rating {
@@ -83978,6 +84017,12 @@ impl App {
             }
             self.perf_last_frame_begin = Some(frame_begin_now);
             let prev_update_ms = self.perf_prev_update_ms.unwrap_or(0.0);
+            // frame.begin is emitted partway through update_frame. Reuse the
+            // previous outer endpoint instead of treating that event as its start.
+            let prev_update_end_t = self.perf_last_update_end.map(crate::perf::stall::seconds);
+            let prev_update_start_t = prev_update_end_t
+                .zip(self.perf_prev_update_ms)
+                .map(|(end, ms)| end - ms / 1000.0);
             let prev_outside_ms = self
                 .perf_last_update_end
                 .map(|end| frame_begin_now.saturating_duration_since(end).as_secs_f64() * 1000.0)
@@ -83992,6 +84037,14 @@ impl App {
                     // The previous frame, split: what App::update spent, and what eframe
                     // spent rendering and presenting after it returned.
                     ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
+                    (
+                        "prev_update_start_t",
+                        serde_json::Value::from(prev_update_start_t),
+                    ),
+                    (
+                        "prev_update_end_t",
+                        serde_json::Value::from(prev_update_end_t),
+                    ),
                     ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
                     (
                         "prev_update_cycles",
@@ -84306,7 +84359,13 @@ impl App {
         }
         self.poll_metadata_load();
         mark_update_perf(&mut update_perf, UpdatePerfStage::SearchAndMetadataPolls);
-        let other_worker_scope = crate::perf::stall::OtherWorkerScope::start(self.frame_counter);
+        let other_worker_scope = update_perf.as_ref().map(|perf| {
+            crate::perf::stall::OtherWorkerScope::start_at(
+                self.frame_counter,
+                perf.last_mark_at,
+                perf.last_mark_cycles,
+            )
+        });
         // スタックスクリプトは items generation を差し替える。復旧中は receiver を保持し、
         // terminal 後に既存 poll へ一度だけ戻す。
         if !self.sidecar_restore_active() {
@@ -84314,21 +84373,13 @@ impl App {
         }
         self.poll_subfolder_expansion(ctx);
         self.poll_smart_folder(ctx);
-        {
-            let _section =
-                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::DetailsMeta);
-            self.poll_details_meta_load(ctx);
-        }
+        self.poll_details_meta_load(ctx);
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
         // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み
         // 2. settle 静止検出 + render spawn + 結果ポーリング
         self.poll_pano_high_res(ctx);
         self.update_pano_refinement(ctx);
-        {
-            let _section =
-                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::TagPrewarm);
-            self.poll_tag_prewarm_results();
-        }
+        self.poll_tag_prewarm_results();
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_epub_batch_convert();
@@ -84371,17 +84422,8 @@ impl App {
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
-        {
-            let _section = crate::perf::stall::PollSection::start(
-                crate::perf::stall::PollPart::SearchDebounce,
-            );
-            self.poll_global_search_debounce(ctx);
-        }
-        {
-            let _section =
-                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::SearchEvents);
-            self.poll_global_search_events(ctx);
-        }
+        self.poll_global_search_debounce(ctx);
+        self.poll_global_search_events(ctx);
         if self.global_search.is_searching() {
             // Ctrl+G の検索そのものもインタラクティブ操作として扱う。
             // 入力イベントの bump だけだと DEFAULT_QUIET_MS 経過後にインデクサが
@@ -84429,7 +84471,9 @@ impl App {
         }
         let t_background_polls = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::OtherWorkerPolls);
-        drop(other_worker_scope);
+        if let (Some(scope), Some(perf)) = (other_worker_scope, update_perf.as_ref()) {
+            scope.finish_at(perf.last_mark_at, perf.last_mark_cycles);
+        }
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {

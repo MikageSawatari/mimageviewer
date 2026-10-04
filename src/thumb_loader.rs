@@ -3628,6 +3628,7 @@ pub fn load_one_cached(
     folder_selection_proof: Option<&crate::catalog::FolderSelectionProof>,
 ) {
     let total_started = std::time::Instant::now();
+    let total_cycles_started = crate::perf::stall::TotalCycles::start();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと。
     // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
@@ -4217,6 +4218,7 @@ pub fn load_one_cached(
 
     if crate::perf::is_enabled() {
         let total_ended = std::time::Instant::now();
+        let total_cycles = total_cycles_started.map(|start| start.finish());
         let total_ms = total_ended.duration_since(total_started).as_secs_f64() * 1000.0;
         let phases = ThumbLoadPhases {
             decode_ms,
@@ -4289,19 +4291,17 @@ pub fn load_one_cached(
         ];
         // New disjoint intervals shrink unaccounted. prefill_db is a nested detail
         // of offer_raster, and cache_save already includes catalog mutex + SQL.
-        for (ms_key, cycles_key, timing) in [
-            (
-                "offer_raster_ms",
-                "offer_raster_cycles",
-                phases.offer_raster,
-            ),
-            ("stats_ms", "stats_cycles", phases.stats),
-            ("normal_log_ms", "normal_log_cycles", phases.normal_log),
-            ("perf_log_ms", "perf_log_cycles", phases.perf_log),
-            ("prefill_db_ms", "prefill_db_cycles", phases.prefill_db),
+        for (ms_key, timing) in [
+            ("offer_raster_ms", phases.offer_raster),
+            ("stats_ms", phases.stats),
+            ("normal_log_ms", phases.normal_log),
+            ("perf_log_ms", phases.perf_log),
+            ("prefill_db_ms", phases.prefill_db),
         ] {
             extras.push((ms_key, timing.ms.into()));
-            extras.push((cycles_key, timing.cycles.into()));
+        }
+        if let Some(cycles) = total_cycles {
+            extras.push(("total_cycles", cycles.into()));
         }
         crate::perf::event("thumb", "load_phases", Some(&key), input_seq, &extras);
     }

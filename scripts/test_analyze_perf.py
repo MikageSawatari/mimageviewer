@@ -1679,7 +1679,118 @@ class HitchReportTests(unittest.TestCase):
         self.assertIn("other_worker_polls 内訳なし", report)
         self.assertIn("apply_end=3.0ms", report)
         self.assertIn("cycles=1000", report)
+        self.assertIn("区間と logger/thumb 重複判定は概算 (frame.begin 起点)", report)
         self.assertNotIn("n=10 [", report)
+
+    def test_outer_endpoints_capture_leading_logger_stall_and_exclude_next_frame(self) -> None:
+        events = [
+            frame(1.4, 41),
+            {"t": 1.43, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 20.0, "grid_ms": 19.0},
+            {**frame(2.0, 42), "prev_update_ms": 820.0,
+             "prev_update_start_t": 1.0, "prev_update_end_t": 1.82},
+            {"t": 1.39, "cat": "log", "kind": "slow_io", "logger": "perf",
+             "start_t": 1.0, "end_t": 1.39, "call_site": "leading-stall",
+             "wait_ms": 390.0},
+            {"t": 2.1, "cat": "log", "kind": "slow_io", "logger": "perf",
+             "start_t": 2.0, "end_t": 2.1, "call_site": "next-frame",
+             "wait_ms": 100.0},
+        ]
+        report = self.report(events, 500.0)
+        updates = report.split("\nupdate >= 500.0ms:", 1)[1].split("\n全カテゴリ", 1)[0]
+        self.assertIn("n=41 [1.000, 1.820]s total=820.0ms", updates)
+        self.assertIn("inner update_frame [1.410, 1.430]s total=20.0ms", updates)
+        self.assertIn("logger 重複区間: 1 件", updates)
+        self.assertIn("site=leading-stall", updates)
+        self.assertNotIn("site=next-frame", updates)
+        self.assertNotIn("概算", updates)
+        self.assertNotIn("n=42 [", updates)
+        self.assertEqual(report, self.report(list(reversed(events)), 500.0))
+
+    def test_missing_or_malformed_outer_endpoints_keep_approximate_legacy_span(self) -> None:
+        for start, end in [(None, 1.82), (1.0, None), ("invalid", 1.82),
+                           (1.82, 1.0), (float("nan"), 1.82)]:
+            with self.subTest(start=start, end=end):
+                report = self.report([
+                    frame(1.4, 41),
+                    {**frame(2.3, 42), "prev_update_ms": 820.0,
+                     "prev_update_start_t": start, "prev_update_end_t": end},
+                ], 500.0)
+                self.assertIn("n=41 [1.400, 2.220]s total=820.0ms", report)
+                self.assertIn("区間と logger/thumb 重複判定は概算 (frame.begin 起点)", report)
+                self.assertNotIn("n=42 [", report)
+
+    def test_outer_and_inner_measurements_coexist_by_previous_frame_number(self) -> None:
+        events = [
+            frame(1.0, 41),
+            {"t": 1.6, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 600.0, "total_cycles": 6000, "grid_ms": 590.0},
+            {**frame(1.9, 42), "prev_update_ms": 820.0,
+             "prev_update_cycles": 8200, "prev_outside_ms": 80.0},
+            {"t": 2.5, "cat": "ui", "kind": "update_breakdown", "n": 42,
+             "total_ms": 600.0, "total_cycles": 4200, "grid_ms": 599.0},
+        ]
+        report = self.report(events, 500.0)
+        self.assertIn("update >= 500.0ms: 2 件", report)
+        self.assertIn("n=41 [1.000, 1.820]s total=820.0ms cycles=8200", report)
+        self.assertIn("inner update_frame [1.000, 1.600]s total=600.0ms cycles=6000", report)
+        self.assertIn("grid=590.0ms", report)
+        self.assertIn("outside=80.0ms", report)
+        self.assertIn("n=42 [1.900, 2.500]s total=600.0ms cycles=4200", report)
+        self.assertNotIn("n=42 [1.000, 1.820]s", report)
+        self.assertEqual(report, self.report(list(reversed(events)), 500.0))
+
+    def test_short_inner_breakdown_keeps_outer_hitch_and_end_of_frame_logger_stall(self) -> None:
+        events = [
+            frame(1.0, 41),
+            {"t": 1.02, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 20.0, "grid_ms": 19.0},
+            {**frame(1.9, 42), "prev_update_ms": 820.0, "prev_update_cycles": 8200},
+            {"t": 1.91, "cat": "ui", "kind": "update_breakdown", "n": 42,
+             "total_ms": 10.0, "grid_ms": 9.0},
+            # Deferred logger record describes work after the inner breakdown.
+            {"t": 1.82, "cat": "log", "kind": "slow_io", "logger": "perf",
+             "start_t": 1.02, "end_t": 1.82, "call_site": "end-of-frame",
+             "wait_ms": 800.0},
+        ]
+        report = self.report(events, 500.0)
+        updates = report.split("\nupdate >= 500.0ms:", 1)[1].split("\n全カテゴリ", 1)[0]
+        self.assertIn("1 件", updates)
+        self.assertIn("n=41 [1.000, 1.820]s total=820.0ms", updates)
+        self.assertIn("inner update_frame [1.000, 1.020]s total=20.0ms", updates)
+        self.assertIn("grid=19.0ms", updates)
+        self.assertIn("logger 重複区間: 1 件", updates)
+        self.assertIn("site=end-of-frame", updates)
+        self.assertNotIn("n=42", updates)
+        self.assertEqual(report, self.report(list(reversed(events)), 500.0))
+
+    def test_inner_only_last_frame_remains_partial_without_outer_measurement(self) -> None:
+        events = [
+            frame(1.0, 41),
+            {"t": 1.6, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 600.0, "grid_ms": 590.0},
+        ]
+        report = self.report(events, 500.0)
+        self.assertIn("update >= 500.0ms: 1 件", report)
+        self.assertIn("n=41 [1.000, 1.600]s total=600.0ms", report)
+        self.assertIn("inner update_frame のみ (部分計測; outer 未計測)", report)
+        self.assertIn("grid=590.0ms", report)
+
+    def test_missing_begin_or_inner_endpoint_does_not_invent_outer_interval(self) -> None:
+        # A current begin cannot identify the absent previous frame's start or n.
+        events = [
+            {**frame(1.9, 42), "prev_update_ms": 820.0},
+            {"cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 600.0, "grid_ms": 590.0},
+        ]
+        report = self.report(events, 500.0)
+        self.assertIn("update >= 500.0ms: 1 件", report)
+        self.assertIn("n=41 [区間不明] total=600.0ms", report)
+        self.assertIn("inner update_frame のみ (部分計測; outer 未計測)", report)
+        self.assertNotIn("total=820.0ms", report)
+        self.assertNotIn("n=42 [", report)
+        events[1]["total_ms"] = 20.0
+        self.assertIn("update >= 500.0ms: 0 件", self.report(events, 500.0))
 
     def test_update_number_wins_over_adjacent_timestamp(self) -> None:
         events = [
@@ -1721,7 +1832,24 @@ class HitchReportTests(unittest.TestCase):
             {"t": 2.0, "cat": "log", "kind": "diagnostic_dropped", "count": 3},
         ])
         self.assertIn("logger 診断欠落: 5 件", report)
+        self.assertIn("queue 競合/飽和等", report)
         self.assertIn("待ち先の証拠は不完全", report)
+
+    def test_thumb_total_cycles_do_not_fabricate_candidate_cycles(self) -> None:
+        report = self.report([
+            frame(1.0, 41), frame(1.9, 42),
+            {"t": 1.85, "cat": "thumb", "kind": "load_phases",
+             "start_t": 1.01, "end_t": 1.85, "total_ms": 840.0,
+             "total_cycles": 30000000, "offer_raster_ms": 2.0, "stats_ms": 1.0,
+             "normal_log_ms": 801.0, "perf_log_ms": 1.0, "prefill_db_ms": 0.5},
+        ])
+        self.assertIn("total=840.0ms cycles=30000000", report)
+        for candidate, ms in [
+            ("offer_raster", 2.0), ("stats", 1.0), ("normal_log", 801.0),
+            ("perf_log", 1.0), ("prefill_db", 0.5),
+        ]:
+            self.assertIn(f"{candidate}={ms:.1f}ms cycles=n/a", report)
+        self.assertNotIn("cycles=0", report)
 
 
 class PreGridReportTests(unittest.TestCase):

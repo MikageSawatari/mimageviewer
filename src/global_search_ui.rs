@@ -2227,6 +2227,8 @@ impl App {
             ctx.request_repaint_after(debounce - elapsed);
             return;
         }
+        let _section =
+            crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::SearchDebounce);
         self.spawn_global_search(ctx);
     }
 
@@ -2367,8 +2369,16 @@ impl App {
         let mut events_processed = 0;
         let mut changed = false;
         let mut stats_changed = false;
+        let mut search_perf_section = None;
         while events_processed < MAX_EVENTS_PER_FRAME {
-            match rx.try_recv() {
+            let event = rx.try_recv();
+            if !matches!(event, Err(crossbeam_channel::TryRecvError::Empty)) {
+                crate::perf::stall::PollSection::ensure(
+                    &mut search_perf_section,
+                    crate::perf::stall::PollPart::SearchEvents,
+                );
+            }
+            match event {
                 Ok(SearchStreamEvent::Batch {
                     hits,
                     scanned_candidates,
@@ -2458,6 +2468,7 @@ impl App {
         };
         let mut rebuild = false;
         let mut writes_after_read = Vec::new();
+        let mut search_perf_section = None;
         for _ in 0..MAX_EVENTS_PER_FRAME {
             #[cfg(test)]
             if prepare.hold_ready_for_test && prepare.held_ready_for_test.is_some() {
@@ -2475,11 +2486,19 @@ impl App {
                 Ok(output) => output,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    crate::perf::stall::PollSection::ensure(
+                        &mut search_perf_section,
+                        crate::perf::stall::PollPart::SearchEvents,
+                    );
                     prepare.in_flight = None;
                     prepare.desired = None;
                     break;
                 }
             };
+            crate::perf::stall::PollSection::ensure(
+                &mut search_perf_section,
+                crate::perf::stall::PollPart::SearchEvents,
+            );
             match output {
                 SearchPrepareOutput::RatedBatch(sequence, hits) => {
                     if sequence == prepare.rated_batch_sequence.wrapping_add(1) {
@@ -2625,6 +2644,10 @@ impl App {
         }
         if self.global_search.active && prepare.in_flight.is_none() && !rebuild {
             if let Some(wish) = prepare.desired.as_mut() {
+                crate::perf::stall::PollSection::ensure(
+                    &mut search_perf_section,
+                    crate::perf::stall::PollPart::SearchEvents,
+                );
                 prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
                 wish.sequence = prepare.next_sequence;
                 wish.source_generation = self.items_generation;

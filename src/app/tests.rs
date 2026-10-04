@@ -8067,6 +8067,33 @@ fn update_perf_cycle_event_fields_pair_with_wall_clock_fields() {
 }
 
 #[test]
+fn idle_other_worker_polls_do_not_add_cycle_reads() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.details_meta_pending = None;
+    app.selected = None;
+    app.global_search.active = false;
+    app.global_search.done = true;
+    app.global_search.pending = None;
+    app.global_search.page_edit_prepare = None;
+    // A resident but empty tag worker must also skip instrumentation samples.
+    app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+    let reads = crate::perf::stall::count_poll_reads(|| {
+        for n in 0..10 {
+            let at = std::time::Instant::now();
+            let scope = crate::perf::stall::OtherWorkerScope::start_at(n, at, 1_000);
+            app.poll_details_meta_load(&ctx);
+            app.poll_tag_prewarm_results();
+            app.poll_global_search_debounce(&ctx);
+            app.poll_global_search_events(&ctx);
+            scope.finish_at(at + std::time::Duration::from_millis(1), 1_100);
+        }
+    });
+    assert_eq!(reads, 0);
+}
+
+#[test]
 fn update_perf_stages_plus_unaccounted_equal_total() {
     let started_at = std::time::Instant::now();
     let started_cycles = 1_000;
