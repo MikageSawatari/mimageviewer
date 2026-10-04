@@ -1455,6 +1455,25 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-04 §1.319 root fullscreen の semantic action 入口と有限 ACK 待ち**
+
+0072aced5 の live smoke は focus を回復し、detached → root の F12 まで通過した。
+root → detached は既存 `handle_fullscreen_root_key_input` の event-only probe が semantic request
+を検出せず、native backdrop の early return により他 consumer にも届かないため停止した。
+`src/ui_fullscreen.rs` の既存 root probe に test-script 限定で読み取り専用 PendingAction 照会を足す。
+`src/test_script.rs` で exact owner／active backend／AwaitingPass／未 ACK／Press scope を照合し、
+既存の focus／modal／IME／edit guard と既存 handler でのみ消費する。新しい event 無し入口は
+既存 KeyboardOwner の text／FocusedUi block projection も照合する（PendingFocus の互換仕様は維持）。
+probe は ACK を発行しない。既存 physical-event 入口／他 semantic consumer の text 判定順は変更しない。
+run_action の finite deadline と既存 Interrupt による遅い未配送操作の拒否は診断 lifecycle の境界で扱う。
+製品の native F12、manager intent、mount、host／viewport／placement、切り替え reducer は変更しない。
+
+所有中の semantic request を既存 router が認識する構造修正であり、F12 専用の新 consumer、
+native VK 捏造、geometry 捕捉、retry／delay／新しい detached state は加えない。
+modal 化・窓の閉鎖／再開・pause は入口欠落を解消せず、既存操作列を狭めるため採用しない。
+実装担当と bounded 独立 Codex（gpt-6.1-sol / xhigh）は設計・実装に合意した。
+この round の ClaudeCode 検収・構造判断と利用者了承後の全体 live PASS は引き継ぎ事項。
+
 **2026-10-04 §1.319 test-script Targeted action の keyboard focus 取得**
 
 c998db1cb の AudioTracks 実行は native HUD の OS クリックを通過した後、semantic
@@ -1471,8 +1490,10 @@ geometry 捕捉、delay／再試行、新規 detached state で競合を隠す�
 要求の対象取得境界を OS の focus 所有に合わせる構造修正である。modal 化・pause・窓の閉鎖／再開は
 入力取得の誤った前提を解消せず、AudioTracks が検証する再生中切り替えを狭めるため採用しない。
 実装担当と bounded 独立 Codex レビュー（gpt-6.1-sol / xhigh）はこの設計と実装に合意した。
-ClaudeCode によるこの round の検収・構造判断と利用者了承後の live PASS は引き継ぎ事項であり、
-確認済みとしては記録しない。
+この focus 修正は 0072aced5 として ClaudeCode がコミットし、独立レビューは structural／test-script
+限定として承認した。利用者了承後の `20261004T135833517Z-11688-AudioTracks-352e9a51` は
+focus 回復後の再開・開き直し・detached → root F12 まで通過。全体 PASS は次の root semantic
+probe 欠落で未了（上記第3 round）。
 
 **2026-09-30 §1.304 Collection root 可視採用時の main context 所有境界**
 

@@ -1063,6 +1063,11 @@ UI より先に入れる (UI から切り替えられるようになった時点
   native 子が focus owner の前面親への winit Focus が省略されるため、診断の取得側で exact
   owner／backend を検査して既存 focus claim を使う。実 focus／通常 handler の検査と製品の native
   キー経路は維持する。全体 PASS は再実行待ちで、証跡と修正・検証の記録は同 smoke 設計に追補。
+  0072aced5 の次の live run は再開・保存行3の開き直し・detached → root F12 まで通過した。
+  root → detached の semantic action は既存 root probe が物理 Key event だけを見るため ACK 待ちで停止。
+  診断限定の read-only exact owner／backend／phase／scope probe を既存 guarded handler へ接続し、
+  run_action に30秒の有限 ACK 待ちと期限後の遅い消費禁止、wait_until に owner／snapshot 診断を加える。
+  native F12 と操作列は維持し、全体 PASS は次回の明示了承後の run で確認する。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
   Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。

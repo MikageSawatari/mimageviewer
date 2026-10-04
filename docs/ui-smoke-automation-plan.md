@@ -136,6 +136,79 @@ build/test 方針の再利用条件に従い、前 round の本体・snapshot・
 live 全体 PASS は未了。通常 profile の `build-dev.ps1` は診断専用変更の確認 binary としては
 対象外で、修正入りの診断 portable は次の準備 command で再ビルドする。実装担当は起動していない。
 
+#### root native fullscreen の semantic probe と待機期限 (2026-10-04 第3 round)
+
+0072aced5 は独立レビューで structural／test-script 限定として承認され、利用者了承後に
+ClaudeCode が `target/ui-smoke-runs/20261004T135833517Z-11688-AudioTracks-352e9a51` を実行した。
+再生中・停止中の切り替え、再開、保存行3からの開き直し、detached → root の F12 まで通過した。
+次の root → detached は 2.267 s に focus ready となり、その後は native backdrop の heartbeat と
+動画ループが続き 240秒 timeout。同 run と `target/portable-smoke/data/logs/mimageviewer.log` を照合した。
+
+停止は `run_action` の consumer ACK 待ちで、後続の30秒 `wait_until` は未実行だった。
+backdrop の早期 return より前にある既存 `handle_fullscreen_root_key_input` の入口 probe が
+egui `Event::Key` しか見ず、semantic PendingAction では `handle_fs_key_input` →
+`handle_video_input` に入らない。後段の main F12 handler にも届かない。root fullscreen の
+seek／音声モードなども同じ入口を使う。製品の native F12 は Global／Press の
+`ToggleDetachedViewerMode` から共通 `toggle_detached_viewer_mode` に届く。media を別窓で開く
+設定では root → `DetachedWindow` を一時要求し、既定 open 方針を保存変更しない。
+シナリオの期待は製品経路と一致し、この実行は製品の実キー不動作を示していない。
+
+修正は既存 root probe に test-script 限定の読み取り専用照会を接続する。exact current owner／
+active backend witness、`AwaitingPass`、未 ACK の Press action と active command scope を照合する。
+probe は consume／peek／ACK を発行せず、既存の focus／modal／IME／edit guard を通った
+本来の handler だけが消費する。実キーイベントがない新入口では既存 KeyboardOwner の
+`blocks_legacy_keymap_shortcuts` も照合し、Focused TextInput／FocusedUi を拒否する。
+S3 の互換仕様通り PendingFocus だけではブロックしない。既存の実キーイベントがある入口や
+他の semantic consumer は変更しない。実キーと semantic action が同じ pass に混在したとき、
+Keymap の先行 semantic consume が text 判定を迂回する既存挙動は今回の修正範囲外である。
+Legacy、native VK、製品の F12 routing と scenario 列は変更しない。
+専用 F12 consumer／handler 直呼び／新しい detached state は加えない。
+
+`run_action(name)` は受付から consumer ACK まで monotonic 30秒の予算を持つ。
+`run_action(name, timeout_ms)` でも指定でき、0／負数は拒否する。phase ごとに期限を延長しない。
+UI が処理しなくても worker が期限を検出し、既存 Interrupt を失敗へ移して `environment_failure`
+にする。consume／peek／probe／detached activation 照会は直ちに拒否し、ROOT の Cancel 到着前の
+遅い child pass でも未配送要求を消費しない。既に consumer に届いた処理を rollback はしない。
+UI 更新で既存終了処理が pending を解放する。診断は action・exact selected owner、取得 phase、
+publishing pass owner／eligible、snapshot frame、fullscreen／fs_idx、focus／登録、modal／IME／text／popup。
+snapshot は frame 冒頭の観測であり、直後の handler 結果とは扱わない。consumer ACK と操作結果は別のまま。
+
+`wait_until` の既存期限にも owner／snapshot 診断を加える。正の予算を過ぎて戻った predicate の
+true は失敗とし、0 は一回の即時判定を維持する。任意の native API 内を強制中断する機能ではなく、
+Rhai の既存 operation limit／Interrupt も維持する。実 HWND の新 detached 生成と全体 PASS は
+次回、利用者の明示了承を得た run で確認する。
+
+非対話検証 (2026-10-04、`next-audiotracks-smoke`、base `0072aced5` 上の未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features test-script test_script`: 112 passed
+  (`target/atsmoke-root-script-tests.log`)。新規5件は exact phase／scope の非消費 probe、
+  3 action × focus／modal／Focused TextEdit／IME／edit と通常 handler の配送、取得中各 phase と
+  UI 未受付の ACK 期限、期限後 consume／peek／probe／activation 拒否、wait_until の診断を検査する。
+  handler の初期 fixture は main HWND が無く、次の fixture は非 blocking の PendingFocus を
+  blocking と誤認して失敗した。実 backend witness／main HWND と Focused TextEdit に直し、
+  狭い handler 再実行も 1 passed (`target/atsmoke-root-handler-tests.log`)。期待値は緩和していない。
+- 同 command の `native_ui_smoke`: 47 passed (`target/atsmoke-root-native-smoke-tests.log`)。
+  入力前の exact target 再検査は不変。
+- 同 command の `root_f12`: 4 passed、`native_video_f12`: 3 passed、`always_new_media_f12`: 2 passed
+  (`target/atsmoke-root-f12-tests.log` / `target/atsmoke-root-native-f12-tests.log` /
+  `target/atsmoke-root-media-f12-tests.log`)。実キー入口と一時的な別窓切り替えの既存回帰。
+- `cargo test -p mimageviewer --lib test_script`: 86 passed
+  (`target/atsmoke-root-normal-script-tests.log`)。feature 無しでも deadline／診断の単体回帰を確認。
+- `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features
+  --features wgpu,miv-test-script-window-witness --lib`: 20 passed
+  (`target/atsmoke-root-witness-tests.log`)。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`、
+  `--features portable,test-script`: すべて exit 0 (`target/atsmoke-root-check-normal.log` /
+  `target/atsmoke-root-check-portable.log` / `target/atsmoke-root-check-diagnostic.log`)。
+- `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-root-fmt.log`)。
+
+独立 Codex（gpt-6.1-sol / xhigh）は scoped probe／deadline と追加 text fixture／guard を承認した。
+混在キー pass を含む既存 consumer の text 判定順は上記の限定通り文書へ記録した。
+通常 feature の product 入力・切り替え state と依存／fixture は不変のため、前 round の有効な
+本体・snapshot・Susie・vendor gate を再利用し、変更した診断 suite は今回再実行した。
+通常 profile の `build-dev.ps1` は診断専用差分の確認 binary 対象外。製品／runner は起動していない。
+ClaudeCode の検収と新しい実 HWND の生成・全体 live PASS は未了。
+
 準備だけなら起動・入力は行わない:
 
 ```powershell

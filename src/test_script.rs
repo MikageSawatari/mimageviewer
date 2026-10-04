@@ -21,13 +21,14 @@ use crate::key_input::SyntheticKeyCommandKind;
 use crate::key_input::{
     SyntheticInputIssue, SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey,
 };
-use crate::keymap::{KeyAction, KeyTrigger};
+use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 
 mod capture;
 pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RUN_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_ITEM_ROWS_IN_SNAPSHOT: usize = 16;
 const EXIT_NOT_SET: i32 = -1;
 
@@ -1020,6 +1021,8 @@ pub(crate) struct TestScriptSnapshot {
     /// Root UI pass that published this snapshot. A selection barrier must observe a later
     /// pass because the snapshot is captured before grid input is applied in that pass.
     pub(crate) snapshot_frame: i64,
+    /// Read-only acquisition state from the publishing pass, not a handler acknowledgement.
+    pub(crate) action_wait_diagnostic: String,
     /// Raw index in `item_names`/the mounted grid, or -1 when nothing is selected.
     pub(crate) selected_index: i64,
     pub(crate) item_names: Vec<String>,
@@ -1146,6 +1149,7 @@ impl Default for TestScriptSnapshot {
             target_rendered: false,
             items_len: 0,
             snapshot_frame: 0,
+            action_wait_diagnostic: String::new(),
             selected_index: -1,
             item_names: Vec::new(),
             item_ratings: Vec::new(),
@@ -1841,6 +1845,71 @@ impl RunnerBridge {
             .read()
             .map(|snapshot| snapshot.clone())
             .map_err(|_| "test-script snapshot is poisoned".to_string())
+    }
+
+    fn wait_diagnostic(&self, selection: &TestScriptActionSelection) -> String {
+        let owner = match selection {
+            TestScriptActionSelection::LegacyImplicit => "legacy_implicit".to_string(),
+            TestScriptActionSelection::Targeted(owner) => owner.describe(),
+        };
+        match self.latest_snapshot() {
+            Ok(s) => format!(
+                "owner={owner} snapshot_frame={} fullscreen={} fs_idx={} target_registered={} focused={} modal={} ime={} text={} popup={} acquisition=[{}]",
+                s.snapshot_frame,
+                s.is_fullscreen,
+                s.fs_idx,
+                s.target_registered,
+                s.focused,
+                s.modal_open,
+                s.ime_active,
+                s.text_input_or_pending_focus,
+                s.popup_open,
+                s.action_wait_diagnostic,
+            ),
+            Err(error) => format!("owner={owner} snapshot_error={error}"),
+        }
+    }
+
+    fn run_action(&self, action: KeyAction, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("run_action timeout_ms must be greater than zero".into());
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("run_action timeout is too large")?;
+        let selection = self.action_selection()?;
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        self.send(UiCommand::RunAction {
+            action,
+            selection: selection.clone(),
+            applied,
+        })?;
+        loop {
+            self.interrupt.check()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Observe an acknowledgement already queued at the boundary before failing.
+                if let Ok(result) = acknowledgement.try_recv() {
+                    return result;
+                }
+                let message = format!(
+                    "run_action timed out after {} ms awaiting consumer acknowledgement: action={} {}",
+                    timeout.as_millis(),
+                    action.ini_name(),
+                    self.wait_diagnostic(&selection),
+                );
+                // Stop child consumption even before ROOT can drain the queued Cancel.
+                self.interrupt.fail(message.clone());
+                return Err(message);
+            }
+            match acknowledgement.recv_timeout(remaining.min(WAIT_POLL_INTERVAL)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("run_action apply acknowledgement disconnected".into());
+                }
+            }
+        }
     }
 
     fn require_key_target(&self) -> Result<(), String> {
@@ -3047,26 +3116,22 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         "run_action",
         move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             let action = parse_action(&name)?;
-            let selection = action_bridge.action_selection().map_err(rhai_error)?;
-            let (applied_tx, applied_rx) = mpsc::sync_channel(1);
             action_bridge
-                .send(UiCommand::RunAction {
-                    action,
-                    selection,
-                    applied: applied_tx,
-                })
-                .map_err(rhai_error)?;
-            loop {
-                action_bridge.interrupt.check().map_err(rhai_error)?;
-                match applied_rx.recv_timeout(WAIT_POLL_INTERVAL) {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(message)) => return Err(rhai_error(message)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(rhai_error("run_action apply acknowledgement disconnected"));
-                    }
-                }
-            }
+                .run_action(action, RUN_ACTION_TIMEOUT)
+                .map_err(rhai_error)
+        },
+    );
+
+    let action_bridge = bridge.clone();
+    engine.register_fn(
+        "run_action",
+        move |name: ImmutableString, timeout_ms: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+            action_bridge
+                .run_action(
+                    parse_action(&name)?,
+                    checked_duration(timeout_ms, "run_action timeout_ms")?,
+                )
+                .map_err(rhai_error)
         },
     );
 
@@ -3090,7 +3155,11 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             loop {
                 wait_bridge.interrupt.check().map_err(rhai_error)?;
                 let snapshot = wait_bridge.latest_snapshot().map_err(rhai_error)?;
-                if condition.call_within_context::<bool>(&ctx, (snapshot.to_rhai_map(),))? {
+                let satisfied =
+                    condition.call_within_context::<bool>(&ctx, (snapshot.to_rhai_map(),))?;
+                let elapsed = started.elapsed();
+                // Preserve timeout=0 as one immediate predicate evaluation.
+                if satisfied && (timeout.is_zero() || elapsed < timeout) {
                     wait_bridge
                         .send(UiCommand::Precondition(PreconditionTrace {
                             name: "wait_until",
@@ -3104,7 +3173,6 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                         .map_err(rhai_error)?;
                     return Ok(());
                 }
-                let elapsed = started.elapsed();
                 if elapsed >= timeout {
                     let _ =
                         wait_bridge.send_unchecked(UiCommand::Precondition(PreconditionTrace {
@@ -3116,8 +3184,10 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                             focused: Some(snapshot.focused),
                         }));
                     return Err(rhai_error(format!(
-                        "wait_until timed out after {} ms",
-                        timeout.as_millis()
+                        "wait_until timed out after {} ms: {}",
+                        timeout.as_millis(),
+                        wait_bridge
+                            .wait_diagnostic(&wait_bridge.action_selection().map_err(rhai_error)?)
                     )));
                 }
                 wait_interruptibly(
@@ -3678,6 +3748,21 @@ impl UiRuntime {
     fn publish_snapshot(&mut self, mut snapshot: TestScriptSnapshot) -> Result<(), String> {
         self.replace_authoritative_windows(std::mem::take(&mut snapshot.windows));
         snapshot.windows = self.joined_windows();
+        let pending = self
+            .pending_actions
+            .iter()
+            .map(|pending| {
+                format!(
+                    "action={} dispatch={:?} awaiting_ack={}",
+                    pending.action.ini_name(),
+                    pending.dispatch,
+                    pending.applied.is_some()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        snapshot.action_wait_diagnostic =
+            format!("{} pending=[{pending}]", snapshot.action_wait_diagnostic);
         self.snapshot
             .write()
             .map(|mut published| *published = snapshot)
@@ -3900,7 +3985,54 @@ impl UiRuntime {
         }
     }
 
+    fn actions_are_live(&self) -> bool {
+        self.finish.is_none() && !self.cancel_requested && self.interrupt.check().is_ok()
+    }
+
+    fn probe_targeted_action(
+        &self,
+        owner: &TestScriptWindowIdentity,
+        active_scopes: &[CommandScope],
+    ) -> Option<KeyAction> {
+        if !self.actions_are_live()
+            || !self
+                .authoritative_windows
+                .iter()
+                .any(|w| w.identity.as_ref() == Some(owner))
+        {
+            return None;
+        }
+        self.pending_actions.iter().find_map(|pending| {
+            (pending.applied.is_some()
+                && matches!(&pending.dispatch, PendingActionDispatch::Targeted { .. })
+                && action_matches_owner(&pending.dispatch, Some(owner))
+                && command_catalog().any(|spec| {
+                    spec.action == pending.action
+                        && spec.trigger == KeyTrigger::Press
+                        && active_scopes.contains(&spec.scope)
+                }))
+            .then_some(pending.action)
+        })
+    }
+
+    fn consume_action(
+        &mut self,
+        owner: Option<&TestScriptWindowIdentity>,
+        action: KeyAction,
+    ) -> bool {
+        self.actions_are_live()
+            && consume_pending_action_from(&mut self.pending_actions, owner, action)
+    }
+
+    fn peek_action(&mut self, owner: Option<&TestScriptWindowIdentity>, action: KeyAction) -> bool {
+        self.actions_are_live()
+            && peek_pending_action_from(&mut self.pending_actions, owner, action)
+    }
+
     fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+        if !self.actions_are_live() {
+            return None;
+        }
         self.pending_actions
             .iter()
             .find_map(|pending| match &pending.dispatch {
@@ -4400,6 +4532,17 @@ pub(crate) fn finish_action_pass(ctx: &egui::Context) {
     runtime.finish_target_pass(&owner, observation.eligible, frame_key(ctx));
 }
 
+/// Read-only entry probe. A semantic action has no egui Key event to wake the
+/// root fullscreen router; only the ordinary handler may consume or acknowledge it.
+pub(crate) fn probe_targeted_action(
+    ctx: &egui::Context,
+    active_scopes: &[CommandScope],
+) -> Option<KeyAction> {
+    let owner = action_pass_observation_for_active_backend(ctx)?.owner?;
+    let guard = runtime().lock().ok()?;
+    guard.as_ref()?.probe_targeted_action(&owner, active_scopes)
+}
+
 pub(crate) fn consume_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
     let owner =
         action_pass_observation_for_active_backend(ctx).and_then(|observation| observation.owner);
@@ -4409,7 +4552,7 @@ pub(crate) fn consume_pending_action(ctx: &egui::Context, action: KeyAction) -> 
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    consume_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+    runtime.consume_action(owner.as_ref(), action)
 }
 
 pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
@@ -4421,7 +4564,7 @@ pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> boo
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    peek_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+    runtime.peek_action(owner.as_ref(), action)
 }
 
 pub(crate) fn pending_targeted_detached_owner() -> Option<TestScriptWindowIdentity> {
@@ -4510,7 +4653,7 @@ pub(crate) fn capture_pending_for(viewport_id: egui::ViewportId) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bool {
+pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -> bool {
     let frame = frame_key(ctx);
     let issues = crate::key_input::take_synthetic_input_issues(ctx);
     let Ok(mut guard) = runtime().lock() else {
@@ -4530,6 +4673,9 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
+    if let Err(error) = runtime.interrupt.check() {
+        runtime.fail_environment(error, frame);
+    }
     if let Some(capture) = runtime.capture.as_mut() {
         capture.receive_events(ctx);
         capture.poll();
@@ -4543,6 +4689,14 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         runtime.last_frame = Some(frame);
     }
     emit_perf_level_reads(&snapshot.keymap_level_observations);
+    snapshot.action_wait_diagnostic = action_pass_observation_for_active_backend(ctx)
+        .map(|pass| {
+            format!(
+                "publishing_pass={} owner={:?} eligible={}",
+                pass.pass, pass.owner, pass.eligible
+            )
+        })
+        .unwrap_or_else(|| "publishing_pass_owner=unobserved".into());
     if let Err(error) = runtime.publish_snapshot(snapshot) {
         runtime.fail_environment(error, frame);
     }
@@ -5959,6 +6113,95 @@ mod tests {
     }
 
     #[test]
+    fn run_action_deadline_reports_each_acquisition_phase_and_blocks_late_consumers() {
+        for (owner, focused, phase) in [
+            (root_identity(0, 0x101), false, "AwaitingFocus"),
+            (root_identity(0, 0x101), true, "AwaitingPass"),
+            (window_identity(7, 0, 1), false, "AwaitingDetachedOwner"),
+        ] {
+            let mut snapshot = ready_snapshot();
+            snapshot.is_fullscreen = true;
+            snapshot.fs_idx = 0;
+            snapshot.snapshot_frame = 17;
+            snapshot.windows = vec![window_snapshot(owner.clone(), 1, 0, "video")];
+            let (bridge, rx, _) = runner_bridge(snapshot.clone());
+            *bridge.action_selection.lock().unwrap() =
+                TestScriptActionSelection::Targeted(owner.clone());
+            let mut active = local_runtime();
+            active.snapshot = bridge.snapshot.clone();
+            active.interrupt = bridge.interrupt.clone();
+            active.publish_snapshot(snapshot.clone()).unwrap();
+            spawn_script_source(
+                "run_action(\"ToggleDetachedViewerMode\", 50); log(\"unreachable\");".into(),
+                bridge,
+            )
+            .unwrap();
+            let UiCommand::RunAction {
+                action,
+                selection,
+                applied,
+            } = rx.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("expected action")
+            };
+            active.queue_action(action, selection, applied, focused);
+            active.publish_snapshot(snapshot).unwrap();
+            let commands = receive_through_finished(&rx);
+            assert!(
+                matches!(commands.last(), Some(UiCommand::Finished(ScriptOutcome { kind: ScriptOutcomeKind::EnvironmentFailure, message }))
+                if message.contains("run_action timed out") && message.contains(phase) && message.contains("ToggleDetachedViewerMode") && message.contains("snapshot_frame=17") && message.contains(&owner.describe()))
+            );
+            assert!(!commands.iter().any(|c| matches!(c, UiCommand::Log(_))));
+            assert!(!active.consume_action(Some(&owner), action));
+            assert!(!active.peek_action(Some(&owner), action));
+            assert!(
+                active
+                    .probe_targeted_action(&owner, &[CommandScope::Global])
+                    .is_none()
+            );
+            assert!(active.pending_targeted_detached_owner().is_none());
+        }
+    }
+
+    #[test]
+    fn run_action_deadline_also_fails_when_ui_never_receives_the_command() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("run_action(\"VideoSeekStart\", 20);".into(), bridge).unwrap();
+        let commands = receive_through_finished(&rx); // Retain the sender, but do not acknowledge.
+        assert!(
+            matches!(commands.last(), Some(UiCommand::Finished(ScriptOutcome { kind: ScriptOutcomeKind::EnvironmentFailure, message }))
+            if message.contains("run_action timed out") && message.contains("awaiting consumer acknowledgement"))
+        );
+    }
+
+    #[test]
+    fn wait_until_reports_snapshot_state_and_rejects_late_true_but_keeps_zero_probe() {
+        for (source, succeeds) in [
+            ("wait_until(|s| true, 0);", true),
+            ("wait_until(|s| false, 0);", false),
+            ("wait_until(|s| { sleep(20); true }, 5);", false),
+        ] {
+            let mut snapshot = ready_snapshot();
+            snapshot.snapshot_frame = 31;
+            let (bridge, rx, _) = runner_bridge(snapshot);
+            spawn_script_source(source.into(), bridge).unwrap();
+            let commands = receive_through_finished(&rx);
+            match commands.last().unwrap() {
+                UiCommand::Finished(outcome) if succeeds => {
+                    assert_eq!(outcome.kind, ScriptOutcomeKind::Success)
+                }
+                UiCommand::Finished(outcome) => {
+                    assert_eq!(outcome.kind, ScriptOutcomeKind::ScriptFailure);
+                    assert!(outcome.message.contains("wait_until timed out"));
+                    assert!(outcome.message.contains("snapshot_frame=31"));
+                    assert!(outcome.message.contains("focused="));
+                }
+                _ => panic!("expected completion"),
+            }
+        }
+    }
+
+    #[test]
     fn run_action_translates_ini_name_and_waits_for_ui_acknowledgement() {
         let (bridge, rx, wakes) = runner_bridge(ready_snapshot());
         let action = KeyAction::FsClose;
@@ -6773,6 +7016,216 @@ mod tests {
                 .unwrap_err()
                 .contains("already finishing")
         );
+    }
+
+    #[test]
+    fn targeted_semantic_probe_is_read_only_and_checks_owner_phase_and_scope() {
+        let owner = root_identity(0, 0x101);
+        let sibling = root_identity(1, 0x102);
+        let mut active = local_runtime();
+        active
+            .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+            .unwrap();
+        let (applied, acknowledged) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::ToggleDetachedViewerMode,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            applied,
+            false,
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global])
+                .is_none()
+        );
+        active.promote_focused_action_targets(|_| true);
+        assert!(
+            active
+                .probe_targeted_action(&sibling, &[CommandScope::Global])
+                .is_none()
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::FsVideo])
+                .is_none()
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                active.probe_targeted_action(&owner, &[CommandScope::Global]),
+                Some(KeyAction::ToggleDetachedViewerMode)
+            );
+            assert!(matches!(
+                acknowledged.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+        assert!(active.consume_action(Some(&owner), KeyAction::ToggleDetachedViewerMode));
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global])
+                .is_none()
+        );
+        let (applied, _ack) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::GridMoveFirst,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            applied,
+            true,
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global, CommandScope::FsVideo])
+                .is_none()
+        );
+        let (applied, _ack) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::VideoSeekStart,
+            TestScriptActionSelection::LegacyImplicit,
+            applied,
+            true,
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global, CommandScope::FsVideo])
+                .is_none()
+        );
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn root_fullscreen_semantic_actions_reach_guarded_handlers_without_key_events() {
+        let _serial = crate::key_input::lock_test_input();
+        struct ResetRuntime;
+        impl Drop for ResetRuntime {
+            fn drop(&mut self) {
+                runtime().lock().unwrap().take();
+            }
+        }
+        for action in [
+            KeyAction::ToggleDetachedViewerMode,
+            KeyAction::VideoSeekStart,
+            KeyAction::VideoToggleAudioMode,
+        ] {
+            for guard in ["none", "focus", "modal", "text", "ime", "edit"] {
+                let ctx = egui::Context::default();
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+                let _scope = fixture.enter(&ctx, egui::ViewportId::ROOT, 0x1234);
+                let owner = TestScriptWindowIdentity::Root {
+                    context_serial: 0,
+                    hwnd: 0x1234,
+                    backend_token: eframe::miv_test_script_window_witness::active()
+                        .unwrap()
+                        .token(),
+                };
+                let mut app = crate::app::setup_app_for_test();
+                app.main_hwnd = Some(0x1234);
+                let path = PathBuf::from(r"C:\clips\semantic-root.mkv");
+                app.items
+                    .push(crate::grid_item::GridItem::Video(path.clone()));
+                app.thumbnails
+                    .push(crate::grid_item::ThumbnailState::Pending);
+                app.fullscreen_idx = Some(0);
+                app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+                app.settings.detached_viewer_enabled = false;
+                app.settings.detached_viewer_open_images_in_window = false;
+                let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+                player.set_position_for_test(100.0);
+                app.fs_cache.insert(
+                    0,
+                    crate::fs_animation::FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+                let mut input = egui::RawInput {
+                    focused: guard != "focus",
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .focused = Some(guard != "focus");
+                if guard == "ime" {
+                    input.events.extend([
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                    ]);
+                }
+                if guard == "modal" {
+                    app.show_about_dialog = true;
+                }
+                if guard == "edit" {
+                    app.erase_mode = true;
+                }
+                let field_id = egui::Id::new("semantic-action-text-owner");
+                let mut text = String::new();
+                let mut request_focus = true;
+                let draw_field = |ctx: &egui::Context,
+                                  text: &mut String,
+                                  request_focus: &mut bool| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::ime_focus::add_singleline(ui, text, Some(request_focus), |edit| {
+                            edit.id(field_id)
+                        });
+                    });
+                };
+                if guard == "text" {
+                    ctx.begin_pass(Default::default());
+                    draw_field(&ctx, &mut text, &mut request_focus);
+                    let _ = ctx.end_pass();
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(field_id));
+                }
+                ctx.begin_pass(input);
+                if guard == "text" {
+                    draw_field(&ctx, &mut text, &mut request_focus);
+                    assert!(ctx.wants_keyboard_input());
+                }
+                let mut active = local_runtime();
+                active
+                    .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+                    .unwrap();
+                let (applied, acknowledged) = mpsc::sync_channel(1);
+                active.queue_action(
+                    action,
+                    TestScriptActionSelection::Targeted(owner.clone()),
+                    applied,
+                    true,
+                );
+                assert!(runtime().lock().unwrap().replace(active).is_none());
+                let _reset = ResetRuntime;
+                publish_action_pass_owner(&ctx, Some(owner.clone()));
+                assert!(ctx.input(|i| i.events.is_empty()) || guard == "ime");
+                app.handle_fullscreen_root_key_input(&ctx);
+                if guard == "none" {
+                    assert_eq!(
+                        acknowledged.try_recv(),
+                        Ok(Ok(())),
+                        "action={action:?} guard={guard}"
+                    );
+                    if action == KeyAction::ToggleDetachedViewerMode {
+                        assert!(app.settings.detached_viewer_enabled);
+                    }
+                    if action == KeyAction::VideoSeekStart {
+                        let crate::fs_animation::FsCacheEntry::Video { player, .. } =
+                            app.fs_cache.get(&0).unwrap()
+                        else {
+                            panic!("video")
+                        };
+                        assert_eq!(player.user_seek_base_secs_for_test(), 0.0);
+                    }
+                    assert!(!consume_pending_action(&ctx, action));
+                } else {
+                    assert!(
+                        matches!(acknowledged.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                        "guard={guard} action={action:?}"
+                    );
+                }
+                let _ = ctx.end_pass();
+            }
+        }
     }
 
     #[test]
