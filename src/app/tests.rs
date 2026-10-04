@@ -18020,6 +18020,158 @@ mod folder_pane_open_nav_tests {
 }
 
 #[cfg(test)]
+mod quick_folder_restart_tests {
+    use super::*;
+
+    #[test]
+    fn quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership() {
+        let mut env = phase_c_support::setup_app();
+        let pdf = env.tmp.path().join("cold-password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        for (idx, name) in ["slot-a", "slot-b"].into_iter().enumerate() {
+            let path = env.tmp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let key = drive_current_key_for_path(&path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path);
+        }
+        env.active_quick_folder_slot = None;
+        env.sync_quick_folder_settings();
+        env.settings.last_folder = Some(pdf.clone());
+        env.settings.save();
+        drop(env.app);
+        env.app = App::new_from_settings(crate::settings::Settings::load());
+        assert_eq!(env.active_quick_folder_slot, None);
+        let before = env.quick_folder_workspaces.clone();
+
+        env.open_default_startup_target();
+        assert!(matches!(
+            env.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+            Some(PdfOpenPhase::ColdCandidate { .. })
+        ));
+        // Inject the worker's typed password result; use the production startup,
+        // prompt cancellation, exit, and settings reload paths around that seam.
+        env.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        env.poll_pdf_enumerate();
+        assert!(matches!(
+            env.pdf_password_request
+                .as_ref()
+                .map(|request| &request.owner),
+            Some(PdfPasswordRequestOwner::Direct(_))
+        ));
+        assert!(env.cancel_pdf_password_dialog_request());
+        assert!(env.pdf_password_request.is_none());
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, None);
+        assert_eq!(saved.last_folder.as_ref(), Some(&pdf));
+        env.app = App::new_from_settings(saved);
+        assert_eq!(env.active_quick_folder_slot, None);
+
+        // A later successful open must still have no workspace owner.
+        let folder = env.tmp.path().join("after-cancel");
+        std::fs::create_dir(&folder).unwrap();
+        env.load_folder(folder);
+        assert_eq!(env.active_quick_folder_slot, None);
+        assert_eq!(env.quick_folder_workspaces, before);
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
+    fn exit_and_restart(
+        active: Option<QuickFolderSlotId>,
+        exiting_folder: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) {
+        let mut env = phase_c_support::setup_app();
+        let a = env.tmp.path().join("slot-a");
+        let b = env.tmp.path().join("slot-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let previous = if active == Some(QuickFolderSlotId::A) {
+            &a
+        } else {
+            &b
+        };
+        for (idx, path) in [&a, &b].into_iter().enumerate() {
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            let key = drive_current_key_for_path(path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path.clone());
+        }
+        // Do not sync after setting active: exit must capture switches that did
+        // not load a folder (same-path / drive-list switches).
+        env.sync_quick_folder_settings();
+        env.active_quick_folder_slot = active;
+        env.settings.last_folder = Some(previous.clone());
+        env.current_folder = exiting_folder(previous);
+        let before = env.quick_folder_workspaces.clone();
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, active);
+        assert_eq!(saved.last_folder.as_ref(), Some(previous));
+        env.app = App::new_from_settings(saved);
+        // Constructor must restore ownership before the first startup open.
+        assert_eq!(env.active_quick_folder_slot, active);
+        env.open_default_startup_target();
+        assert_eq!(env.current_folder.as_ref(), Some(previous));
+        assert_eq!(env.active_quick_folder_slot, active);
+        for (idx, workspace) in before.iter().enumerate() {
+            assert_eq!(env.quick_folder_workspaces[idx].target, workspace.target);
+            assert_eq!(
+                env.quick_folder_workspaces[idx].recent_folders,
+                workspace.recent_folders
+            );
+            assert_eq!(
+                env.quick_folder_workspaces[idx].drive_current_dirs,
+                workspace.drive_current_dirs
+            );
+        }
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
+    #[test]
+    fn quick_folder_restart_after_b_exit_preserves_a_workspace() {
+        exit_and_restart(Some(QuickFolderSlotId::B), |path| Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_a_exit_preserves_b_workspace() {
+        exit_and_restart(Some(QuickFolderSlotId::A), |path| Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_exit_keeps_both_workspaces() {
+        exit_and_restart(None, |_| Some(search_results_synthetic_path()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_collection_exit_keeps_both_workspaces() {
+        // Collection roots have no physical current_folder.
+        exit_and_restart(None, |_| None);
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_smart_folder_exit_keeps_both_workspaces() {
+        exit_and_restart(None, |_| {
+            Some(smart_folder::smart_folder_synthetic_path(uuid::Uuid::nil()))
+        });
+    }
+}
+
+#[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
         App, FolderHistoryDirection, FolderNavHistoryState, FolderNavHistoryTarget,

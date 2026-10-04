@@ -1970,6 +1970,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
+| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所の選択は従来の `last_folder` / 起動設定のまま |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |

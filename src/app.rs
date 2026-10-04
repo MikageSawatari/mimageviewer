@@ -649,11 +649,7 @@ impl PartialEq<PathBuf> for FolderNavHistoryTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuickFolderSlotId {
-    A,
-    B,
-}
+pub(crate) use crate::settings::QuickFolderSlotId;
 
 impl QuickFolderSlotId {
     pub(crate) const ALL: [Self; 2] = [Self::A, Self::B];
@@ -17239,6 +17235,7 @@ impl App {
                 drive_current_dirs: settings.quick_folder_drive_current_dirs[idx].clone(),
             }
         });
+        let active_quick_folder_slot = settings.active_quick_folder_slot;
         let keymap = if cfg!(test) {
             crate::keymap::Keymap::empty()
         } else {
@@ -17695,7 +17692,7 @@ impl App {
             suppress_folder_nav_record_once: false,
             folder_nav_subfolder_restore: None,
             quick_folder_workspaces,
-            active_quick_folder_slot: Some(QuickFolderSlotId::A),
+            active_quick_folder_slot,
             quick_folder_switch_sequence: 0,
             suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
@@ -20870,6 +20867,7 @@ impl App {
     }
 
     fn sync_quick_folder_settings(&mut self) {
+        self.settings.active_quick_folder_slot = self.active_quick_folder_slot;
         self.settings.quick_folder_slots =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
         self.settings.quick_folder_recent_folders =
@@ -21549,9 +21547,9 @@ impl App {
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
         self.quick_folder_workspaces = snapshot.quick_folder_workspaces;
-        self.active_quick_folder_slot = snapshot
-            .active_quick_folder_slot
-            .or(Some(QuickFolderSlotId::A));
+        // Preserve the snapshot's owner, including no active slot. The legacy
+        // A default belongs to settings deserialization, not rollback.
+        self.active_quick_folder_slot = snapshot.active_quick_folder_slot;
         self.sync_quick_folder_settings();
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
         self.tag_view.nav_stack = snapshot.tag_view_nav_stack;
@@ -70267,6 +70265,9 @@ impl App {
     }
 
     pub(crate) fn persist_window_state_and_flush(&mut self, scope: PersistScope) {
+        // Slot switches can finish without a folder load (same path / drive list).
+        // Capture the accepted slot, including None, before the exit/tray save.
+        self.sync_quick_folder_settings();
         // カーソル名と行位置は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
         // ただではないし (backlog §1.0b)、次回起動が要るのは終了時点の 1 つだけ。
         // **対で書き、対で捨てる。** 片方だけ残ると、名前は前回のもので位置は前々回、
