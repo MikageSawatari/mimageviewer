@@ -4477,6 +4477,46 @@ mod tests {
     }
 
     #[test]
+    fn effetune_minimized_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_keep_visible_when_minimized);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_keep_visible_when_minimized");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_keep_visible_when_minimized);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_keep_visible_when_minimized: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_keep_visible_when_minimized'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_keep_visible_when_minimized
+        );
+    }
+
+    #[test]
     fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

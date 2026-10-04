@@ -7885,6 +7885,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-input-limit", |ui, state| {
         draw_effetune_input_limit_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-minimized", |ui, state| {
+        draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
@@ -8027,6 +8031,22 @@ pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &m
              変更後は動画・音声の画面を閉じて開き直してください。リモート配信は終了してから始め直してください。",
         );
     }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_minimized_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_keep_visible_when_minimized,
+        "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+    )
+    .on_hover_text(
+        "表示していた音響調整の窓を、メインウィンドウの最小化中も残します。初期値は OFF です。\n\
+         OK を押すと反映します。最小化中でも切り替わります。自分で閉じた窓は開きません。\n\
+         リモート閲覧で操作している間は、この設定にかかわらず隠れます。\n\
+         タスクトレイへの格納だけでは窓は隠れません。",
+    );
     #[cfg(feature = "portable")]
     let _ = (ui, settings);
 }

@@ -22,6 +22,9 @@ public:
         if (active) reasons_ |= bit;
         else reasons_ &= ~bit;
     }
+    constexpr void reconcile_main(bool main_exists, bool minimized, bool keep_visible) {
+        suppress(GuiSuppression::Minimized, !main_exists || (minimized && !keep_visible));
+    }
     constexpr bool should_show(bool unowned, bool app_active) const {
         return requested_ && (unowned ? reasons_ == 0 : app_active);
     }
