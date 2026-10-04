@@ -50,6 +50,7 @@ import json
 import math
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
@@ -1712,8 +1713,21 @@ def cmd_memory(events: list[dict]) -> None:
     if not samples:
         print("(process_memory イベントなし — 初回起動から --perf-log で採取してください)")
         return
+    session = next((e for e in events if e.get("cat") == "session" and e.get("kind") == "start"), {})
+    has_clock = "wall_unix_ms" in session and "wall_t" in session
+
+    def utc_time(unix_ms: float) -> str:
+        return datetime.fromtimestamp(unix_ms / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
     print("core プロセスメモリ時系列 (MiB; private = commit、pagefile = commit charge):")
-    print(f"{'t(s)':>8} {'pid':>7} {'private':>10} {'working':>10} {'peak WS':>10} {'pagefile':>10}  kind / stage")
+    if has_clock:
+        print(f"session pid={session.get('pid', '?')} wall={utc_time(session['wall_unix_ms'])} at t={session['wall_t']:.6f}s")
+        if "process_start_unix_ms" in session:
+            print(f"core process creation (UTC): {utc_time(session['process_start_unix_ms'])}")
+    else:
+        print("(UTC 対応情報なし — 旧ログは相対時刻のみ表示)")
+    utc_heading = f"{'UTC':<24} " if has_clock else ""
+    print(f"{utc_heading}{'t(s)':>8} {'pid':>7} {'private':>10} {'working':>10} {'peak WS':>10} {'pagefile':>10}  kind / stage")
     for event in samples:
         values = [
             f"{float(event[field]) / (1024 * 1024):10.2f}" if field in event else f"{'-':>10}"
@@ -1722,7 +1736,11 @@ def cmd_memory(events: list[dict]) -> None:
         detail = f"{event.get('kind', '?')} / {event.get('stage', '?')}"
         if event.get("kind") == "query_failed":
             detail += f" (Win32 error={event.get('error', '?')})"
-        print(f"{event.get('t', 0.0):8.3f} {str(event.get('pid', '-')):>7} {' '.join(values)}  {detail}")
+        utc_prefix = ""
+        if has_clock:
+            unix_ms = session["wall_unix_ms"] + (event.get("t", 0.0) - session["wall_t"]) * 1000
+            utc_prefix = utc_time(unix_ms) + " "
+        print(f"{utc_prefix}{event.get('t', 0.0):8.3f} {str(event.get('pid', '-')):>7} {' '.join(values)}  {detail}")
 
 
 def cmd_startup(events: list[dict]) -> None:

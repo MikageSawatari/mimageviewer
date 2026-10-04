@@ -26,7 +26,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod memory;
 pub(crate) mod stall;
@@ -88,13 +88,17 @@ pub fn init_with_path(
                 // A same-session witness lets external release gates reject a stale perf log
                 // or a different mimageviewer-core process while still allowing a correctly
                 // sleeping measurement window to contain no frame events.
-                event(
-                    "session",
-                    "start",
-                    None,
-                    0,
-                    &[("pid", Value::from(std::process::id()))],
-                );
+                let mut extras = vec![("pid", Value::from(std::process::id()))];
+                #[cfg(windows)]
+                if let Some(created) = process_start_unix_ms() {
+                    extras.push(("process_start_unix_ms", created.into()));
+                }
+                // Pair wall time with the monotonic log clock; session init can
+                // happen well after t=0 (for example, when enabled in settings).
+                if let Some(anchor) = wall_clock_anchor(SystemTime::now(), start.elapsed()) {
+                    extras.extend(anchor);
+                }
+                event("session", "start", None, 0, &extras);
                 flush();
                 memory::emit("perf_enabled", "milestone");
                 memory::start_sampler();
@@ -108,6 +112,48 @@ pub fn init_with_path(
             );
             crate::logger::log(format!("perf: init failed: {e}"));
         }
+    }
+}
+
+fn wall_clock_anchor(wall: SystemTime, elapsed: Duration) -> Option<[(&'static str, Value); 2]> {
+    let unix_ms = u64::try_from(wall.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()?;
+    Some([
+        ("wall_unix_ms", unix_ms.into()),
+        ("wall_t", elapsed.as_secs_f64().into()),
+    ])
+}
+
+#[cfg(any(windows, test))]
+fn filetime_to_unix_ms(ticks: u64) -> Option<u64> {
+    // FILETIME counts 100 ns since 1601-01-01; Unix time starts at 1970-01-01.
+    ticks
+        .checked_sub(116_444_736_000_000_000)
+        .map(|v| v / 10_000)
+}
+
+#[cfg(windows)]
+fn process_start_unix_ms() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    unsafe {
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit = std::mem::zeroed();
+        let mut kernel = std::mem::zeroed();
+        let mut user = std::mem::zeroed();
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return None;
+        }
+        filetime_to_unix_ms(
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+        )
     }
 }
 
@@ -260,5 +306,44 @@ pub fn flush() {
                 p.finish(ended, 0.0, flush_ms, diagnostic_ms);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_clock_pairs_wall_time_with_nonzero_log_time() {
+        let anchor = wall_clock_anchor(
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_123),
+            Duration::from_millis(5_250),
+        )
+        .unwrap();
+        assert_eq!(
+            anchor[0],
+            ("wall_unix_ms", Value::from(1_700_000_000_123_u64))
+        );
+        assert_eq!(anchor[1], ("wall_t", Value::from(5.25)));
+    }
+
+    #[test]
+    fn process_creation_filetime_converts_epoch_and_truncates_submilliseconds() {
+        let epoch = 116_444_736_000_000_000;
+        assert_eq!(filetime_to_unix_ms(epoch), Some(0));
+        assert_eq!(filetime_to_unix_ms(epoch + 12_345_678), Some(1234));
+        assert_eq!(filetime_to_unix_ms(epoch - 1), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn process_creation_time_is_available_for_the_current_test_process() {
+        let created = process_start_unix_ms().expect("current process creation time");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert!(created > 0);
+        assert!(u128::from(created) <= now);
     }
 }

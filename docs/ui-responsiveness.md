@@ -586,6 +586,14 @@ launcher や PDF / Susie / VST / TensorRT 子プロセスのメモリは合算�
 成功レコードには `pid`、`stage`、`kind` (`milestone` / `begin` / `end` / `sample`) と、
 既存共通属性 `t` (core 起動から秒) が付く。取得失敗は `kind=query_failed`、`stage` と
 Win32 `error` で記録する。
+`session.start` は既存の core `pid` に加え、`wall_unix_ms` (UTC Unix milliseconds) と
+その取得時点の相対秒 `wall_t` を記録する。`memory` 解析器は
+`wall_unix_ms + (sample.t - wall_t) * 1000` から各 sample の UTC を表示する。
+perf 有効化が遅れても session の `t` を起動時刻とみなさない。
+`GetProcessTimes` が成功すれば `process_start_unix_ms` (OS のプロセス作成時刻) も付く。
+共通 `t=0` は core の `run()` 入口で取得した Instant で、OS の StartTime や launcher 起動時刻とは異なる。
+壁時計との対応は session で1回取得するため、採取中に OS 時計を変更しない。
+時刻属性のない旧ログは従来どおり相対時刻だけ表示する。
 既存の全 `startup.*` イベント (モデル / Susie worker 展開、設定読込、DB、first_frame など)
 でメモリを 1 回取得する。AI runtime init worker、Susie init、PDF pool spawn、
 EffeTune bundle resolve / load には begin/end が付く。これらの span は開始が core 起動後
@@ -597,6 +605,10 @@ sample も記録する。周期の基準は perf 有効化時ではなく core �
 遅れた tick をまとめて出す catch-up や repaint はない。perf 無効時は thread を作らず、
 追加の時計読み・メモリ API 呼出しも行わない。Span と共通 helper で既存の初期化順を維持し、
 ログのための待機状態や launcher との受け渡しは追加していない。
+sampler は強制 flush を行わない。既存の `App::update` 内の約1秒ごとの flush で通常は
+ディスクへ出力し、UI 更新のない間はバッファに残りうる。正常終了時は UI ループと既存の
+shutdown 処理が終わった共通経路で1回 flush し、全カテゴリの末尾を保存する。
+強制終了・クラッシュ時の保存は保証しない。
 
 初回起動を採取するには、起動前に単体 exe に `--perf-log` を付ける。
 launcher の `cmd.args(&user_args)` が core へ転送することをコードで確認した。
@@ -605,12 +617,24 @@ launcher の `cmd.args(&user_args)` が core へ転送することをコード�
 core の private bytes に含まれない。WER の P1 が core だった利用者記録の調査対象も core に限定する。
 
 ```powershell
-# 利用者が初回環境で単体 exe を起動し、60 秒以上経過後に終了してログを回収する
+# 利用者が初回環境で単体 exe を起動する
 .\mimageviewer.exe --perf-log
+# launcher の展開完了後、core が起動してから別の PowerShell で記録する
+$Core = Get-Process -Name mimageviewer-core | Select-Object -First 1
+$CoreStart = $Core.StartTime
+$Core | Select-Object Id, @{Name='StartTimeUtc'; Expression={$_.StartTime.ToUniversalTime().ToString('o')}}
+# core の StartTime から少なくとも60秒待ち、アプリを正常終了してログを回収する
+# launcher 起動から60秒では、展開にかかった時間だけ core の採取区間が短くなる
+Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Windows Error Reporting'; Id=1001; StartTime=$CoreStart} |
+    Select-Object @{Name='TimeCreatedUtc'; Expression={$_.TimeCreated.ToUniversalTime().ToString('o')}}, Id, Message
 $Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
-python scripts\analyze_perf.py $Perf memory  # byte 値を MiB に換算、時刻順に PID / stage と表示
+python scripts\analyze_perf.py $Perf memory  # UTC / 相対秒 / PID / MiB / stage を時刻順に表示
 python scripts\analyze_perf.py $Perf startup
 ```
+
+core の PID / StartTime と JSONL の session を同一実行として照合し、WER 1001 の
+`TimeCreated` (UTC)・本文 (P1 / RADAR_PRE_LEAK_64) を保存する。WER が出なかった場合もその旨を記録する。
+launcher 起動からの利用者観測の秒数を、そのまま JSONL の `t` に当てはめない。
 
 この計装は原因の特定やメモリリークの判定自体を行うものではない。
 利用者の Sandbox 再採取と WER 時刻との照合は未実施。

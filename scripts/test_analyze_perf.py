@@ -1909,6 +1909,34 @@ class PreGridReportTests(unittest.TestCase):
 
 
 class MemoryTimelineTests(unittest.TestCase):
+    def test_session_anchor_maps_samples_before_and_after_late_perf_init_to_utc(self):
+        events = [
+            {"t": 7.0, "cat": "session", "kind": "start", "pid": 42,
+             "wall_unix_ms": 1_700_000_000_123, "wall_t": 5.25,
+             "process_start_unix_ms": 1_699_999_990_000},
+            {"t": 5.5, "cat": "process_memory", "kind": "sample", "stage": "later", "pid": 42},
+            {"t": 1.0, "cat": "process_memory", "kind": "milestone", "stage": "earlier", "pid": 42},
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory(events)
+        report = output.getvalue()
+        self.assertIn("session pid=42 wall=2023-11-14T22:13:20.123Z at t=5.250000s", report)
+        self.assertIn("core process creation (UTC): 2023-11-14T22:13:10.000Z", report)
+        self.assertRegex(report, r"2023-11-14T22:13:15\.873Z\s+1\.000.*milestone / earlier")
+        self.assertRegex(report, r"2023-11-14T22:13:20\.373Z\s+5\.500.*sample / later")
+
+    def test_legacy_session_header_still_prints_relative_samples(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory([
+                {"t": 5.0, "cat": "session", "kind": "start", "pid": 42},
+                {"t": 6.0, "cat": "process_memory", "kind": "sample", "stage": "legacy", "pid": 42},
+            ])
+        report = output.getvalue()
+        self.assertIn("UTC 対応情報なし", report)
+        self.assertRegex(report, r"6\.000\s+42.*sample / legacy")
+
     def test_timeline_sorts_samples_converts_bytes_and_keeps_stages_and_pid(self):
         samples = [
             {"t": 2.0, "cat": "process_memory", "kind": "end", "stage": "ai_runtime_init", "pid": 42,

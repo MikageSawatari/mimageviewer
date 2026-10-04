@@ -91,7 +91,6 @@ pub(super) fn start_sampler() {
                     break;
                 }
                 emit("startup_sampler", "sample");
-                super::flush();
             }
         })
     {
