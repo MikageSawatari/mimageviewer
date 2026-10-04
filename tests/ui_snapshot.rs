@@ -27,14 +27,99 @@
 
 use egui_kittest::Harness;
 
-/// Fix the flexible-section contract before attaching the application handlers.
+/// The status label must yield a row to the minimum-width field, and may itself
+/// wrap within that row. Persist only the two distinct inline/stacked layouts.
 #[test]
-fn folder_toolbar_flexible_snapshots() {
+fn folder_toolbar_snapshot_status_label() {
+    use egui_kittest::kittest::Queryable;
     use mimageviewer::ui_toolbar_layout as layout;
     let mut snapshots = egui_kittest::SnapshotResults::default();
+    for width in [240.0, 360.0, 960.0] {
+        for zoom in [1.0, 1.5] {
+            for changed in [false, true] {
+                let label = if changed {
+                    "(スナップショット中 674件 / filter 変更後)"
+                } else {
+                    "(スナップショット中 674件)"
+                };
+                let mut fonts_ready = false;
+                let mut path = String::from(r"C:\Pictures\日本語フォルダ");
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(width * zoom, 120.0 * zoom))
+                    .build(move |ctx| {
+                        ctx.set_zoom_factor(zoom);
+                        mimageviewer::os_theme::apply_resolved(
+                            ctx,
+                            mimageviewer::os_theme::ResolvedTheme::Dark,
+                        );
+                        if !fonts_ready {
+                            install_app_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        let panel = egui::TopBottomPanel::top("folder").show(ctx, |ui| {
+                            let input = layout::address_input(
+                                ui,
+                                Some(
+                                    egui::RichText::new(label)
+                                        .color(egui::Color32::from_rgb(58, 110, 165))
+                                        .into(),
+                                ),
+                                |ui| {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::TextEdit::singleline(&mut path)
+                                            .desired_width(f32::INFINITY),
+                                    )
+                                    .rect
+                                },
+                            );
+                            assert!(input.inner.width() >= layout::ADDRESS_INPUT_MIN_WIDTH);
+                            input.response.rect
+                        });
+                        assert!(panel.response.rect.expand(0.5).contains_rect(panel.inner));
+                    });
+                harness.run();
+                let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+                let label_rect = harness.get_by_label(label).rect();
+                if width == 240.0 || (width == 360.0 && changed) {
+                    assert!(
+                        label_rect.bottom() <= input.top(),
+                        "width={width} zoom={zoom} changed={changed}: {label_rect:?} {input:?}"
+                    );
+                } else if width == 960.0 {
+                    assert!(label_rect.right() <= input.left());
+                    assert!(label_rect.top() < input.bottom() && input.top() < label_rect.bottom());
+                } else {
+                    assert!(
+                        label_rect.bottom() <= input.top() || label_rect.right() <= input.left()
+                    );
+                }
+                for rect in [input, label_rect] {
+                    assert!(rect.left() >= 0.0 && rect.right() <= width * zoom);
+                }
+                if changed && zoom == 1.0 && width >= 360.0 {
+                    harness.snapshot(format!(
+                        "folder_toolbar_snapshot_label_{}",
+                        if width == 360.0 { "stacked" } else { "inline" }
+                    ));
+                    snapshots.extend(harness.take_snapshot_results());
+                }
+            }
+        }
+    }
+}
+
+/// Actual control styles, including the reported count and omitted-entry badge.
+/// All positions/row settings get geometry checks; persist only unique pixels.
+#[test]
+fn folder_toolbar_flexible_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    let mut unique = std::collections::HashSet::new();
     for (size, width, zoom) in [
         ("normal", 1120.0, 1.0),
-        ("narrow", 720.0, 1.0),
+        ("narrow", 360.0, 1.0),
         ("dpi150", 1080.0, 1.5),
     ] {
         for (position, before) in [("first", 0), ("middle", 1), ("last", 2)] {
@@ -43,7 +128,7 @@ fn folder_toolbar_flexible_snapshots() {
                     let mut fonts_ready = false;
                     let mut path = String::from(r"C:\Pictures\日本語フォルダ");
                     let mut harness = Harness::builder()
-                        .with_size(egui::vec2(width, 220.0 * zoom))
+                        .with_size(egui::vec2(width, 240.0 * zoom))
                         .build(move |ctx| {
                             ctx.set_zoom_factor(zoom);
                             mimageviewer::os_theme::apply_resolved(
@@ -57,127 +142,209 @@ fn folder_toolbar_flexible_snapshots() {
                                 return;
                             }
                             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
-                                        .iter()
-                                        .take(before)
-                                    {
-                                        let _ = ui.button(*text);
-                                    }
-                                    let mut measured = layout::FolderBarWidth::new(ui);
-                                    measured.label(ui, "フォルダ:");
-                                    for text in [
-                                        "←",
-                                        "→",
-                                        "A",
-                                        "B",
-                                        "⬆",
-                                        "▲",
-                                        "▼",
-                                        "場所▼",
-                                        "スタック",
-                                        "サブ展開",
-                                        "📌",
-                                        "履歴▼",
-                                        "♡",
-                                    ]
-                                    .into_iter()
-                                    .filter(|text| buttons || *text == "場所▼")
-                                    {
-                                        measured.button(ui, text, 0.0);
-                                    }
-                                    measured.label(ui, "(25/120)");
-                                    let slot = layout::flexible_section(
-                                        ui,
-                                        measured.minimum(),
-                                        new_row,
-                                        |ui, compact| {
-                                            layout::folder_controls(ui, compact, |ui| {
-                                                ui.label("フォルダ:");
-                                                for text in
-                                                    ["←", "→", "A", "B", "⬆", "▲", "▼", "場所▼"]
-                                                        .into_iter()
-                                                        .filter(|text| buttons || *text == "場所▼")
-                                                {
-                                                    let _ = ui.button(text);
-                                                }
-                                                if compact {
-                                                    ui.end_row();
-                                                }
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    )
-                                                    .with_main_wrap(compact),
-                                                    |ui| {
-                                                        let last = ui.label("(25/120)").rect;
-                                                        for text in [
-                                                            "スタック",
-                                                            "サブ展開",
-                                                            "📌",
-                                                            "履歴▼",
-                                                            "♡",
-                                                        ]
-                                                        .into_iter()
-                                                        .filter(|_| buttons)
-                                                        {
-                                                            let _ = ui.button(text);
-                                                        }
-                                                        layout::address_input(ui, compact, |ui| {
-                                                            let input = ui.add(
-                                                                egui::TextEdit::singleline(
-                                                                    &mut path,
-                                                                )
-                                                                .desired_width(f32::INFINITY),
-                                                            );
-                                                            assert!(
-                                                            input.rect.width()
-                                                                >= layout::ADDRESS_INPUT_MIN_WIDTH
-                                                        );
-                                                            assert!(
-                                                                input.rect.right()
-                                                                    <= ui.clip_rect().right() + 0.5
-                                                            );
-                                                            assert!(!input.rect.intersects(last));
-                                                        });
-                                                    },
-                                                );
-                                            });
-                                        },
-                                    )
-                                    .response
-                                    .rect;
-                                    for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
-                                        .iter()
-                                        .skip(before)
-                                    {
-                                        let following = ui.button(*text).rect;
-                                        assert!(
-                                            following.top() >= slot.bottom(),
-                                            "subsequent sections need their own row"
-                                        );
-                                    }
-                                });
+                                draw_folder_toolbar_fixture(
+                                    ui, before, new_row, buttons, &mut path,
+                                );
                             });
                         });
                     harness.run();
-                    // All 36 combinations still run the geometry assertions above.
-                    // At the first position a row break has no effect; at smaller
-                    // widths the full controls force a break even with new_row OFF.
-                    // Keep only the 26 distinct images as persistent PNG baselines.
-                    let duplicate = !new_row && (before == 0 || (size != "normal" && buttons));
+                    // Verify the alias policy with pixels too, so a regression
+                    // cannot silently turn a required baseline into a duplicate.
+                    // First position: no preceding row. Narrow: every combination
+                    // wraps. Full controls also wrap at the last normal position
+                    // and both non-first positions at 150% DPI.
+                    let duplicate = !new_row
+                        && (before == 0
+                            || size == "narrow"
+                            || (buttons && (size == "dpi150" || before == 2)));
+                    let pixels = harness.render().unwrap();
+                    assert_eq!(
+                        unique.insert((pixels.width(), pixels.height(), pixels.into_raw())),
+                        !duplicate,
+                        "unexpected snapshot alias: {size} {position} row={new_row} buttons={buttons}"
+                    );
                     if !duplicate {
-                        harness.snapshot(format!(
+                        let name = format!(
                             "folder_toolbar_{size}_{position}_{}{}",
                             if new_row { "row" } else { "inline" },
                             if buttons { "" } else { "_minimal" }
-                        ));
+                        );
+                        println!("folder baseline: {name}");
+                        harness.snapshot(name);
                         snapshots.extend(harness.take_snapshot_results());
                     }
                 }
             }
         }
     }
+}
+
+fn draw_folder_toolbar_fixture(
+    ui: &mut egui::Ui,
+    before: usize,
+    new_row: bool,
+    buttons: bool,
+    path: &mut String,
+) {
+    use mimageviewer::ui_toolbar_layout as layout;
+    ui.horizontal_wrapped(|ui| {
+        for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
+            .iter()
+            .take(before)
+        {
+            let _ = ui.button(*text);
+        }
+        let count = if buttons { "(674/674)" } else { "(25/120)" };
+        let mut measured = layout::FolderBarWidth::with_input();
+        measured.label(ui, "フォルダ:");
+        if buttons {
+            for text in ["←", "→"] {
+                measured.button(ui, text, 0.0);
+            }
+            for text in ["A", "B"] {
+                measured.button(ui, egui::RichText::new(text).monospace(), 24.0);
+            }
+            measured.space(6.0 + ui.spacing().item_spacing.x);
+            for text in ["⬆", "▲", "▼"] {
+                measured.button(ui, text, 0.0);
+            }
+            measured.space(6.0 + ui.spacing().item_spacing.x);
+        }
+        measured.button(ui, "場所▼", 0.0);
+        measured.space(4.0 + 6.0 + ui.spacing().item_spacing.x);
+        let mut right_width = layout::FolderBarWidth::controls();
+        if buttons {
+            right_width.button(
+                ui,
+                egui::RichText::new("非表示 321 件").small().strong(),
+                0.0,
+            );
+            right_width.space(4.0);
+        }
+        right_width.label(ui, egui::RichText::new(count).size(11.0).monospace());
+        right_width.space(4.0);
+        if buttons {
+            for text in ["スタック", "サブ展開", "📌", "履歴▼", "♡"] {
+                right_width.button_with_frame(ui, text, 0.0, !matches!(text, "📌" | "♡"));
+                right_width.space(4.0);
+            }
+        }
+        let minimum = (measured.width() + right_width.width()).ceil();
+        let slot = layout::flexible_section(ui, minimum, new_row, |ui, compact| {
+            layout::folder_controls(ui, compact, |ui| {
+                let mut left = vec![ui.label("フォルダ:").rect];
+                if buttons {
+                    for text in ["←", "→"] {
+                        left.push(ui.button(text).rect);
+                    }
+                    for text in ["A", "B"] {
+                        left.push(
+                            ui.add(
+                                egui::Button::new(egui::RichText::new(text).monospace())
+                                    .min_size(egui::vec2(24.0, 20.0)),
+                            )
+                            .rect,
+                        );
+                    }
+                    ui.separator();
+                    for text in ["⬆", "▲", "▼"] {
+                        left.push(ui.button(text).rect);
+                    }
+                    ui.separator();
+                }
+                left.push(layout::folder_menu_button(ui, true, "場所▼", |_| {}).rect);
+                ui.add_space(4.0);
+                ui.separator();
+                let mut right = Vec::new();
+                let mut input = None;
+                layout::folder_tail(
+                    ui,
+                    layout::FolderBarWidth::with_input().width(),
+                    right_width.width(),
+                    |ui, part| match part {
+                        layout::FolderTailPart::RightControls => {
+                            if buttons {
+                                right.push(
+                                    egui::containers::menu::MenuButton::new(
+                                        egui::RichText::new("非表示 321 件").small().strong(),
+                                    )
+                                    .ui(ui, |_| {})
+                                    .0
+                                    .rect,
+                                );
+                                ui.add_space(4.0);
+                            }
+                            right.push(
+                                ui.label(
+                                    egui::RichText::new(count)
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .rect,
+                            );
+                            ui.add_space(4.0);
+                            if buttons {
+                                right.push(ui.selectable_label(false, "スタック").rect);
+                                ui.add_space(4.0);
+                                right
+                                    .push(ui.add(egui::Button::selectable(false, "サブ展開")).rect);
+                                ui.add_space(4.0);
+                                right.push(ui.add(egui::Button::new("📌").frame(false)).rect);
+                                ui.add_space(4.0);
+                                right.push(
+                                    layout::folder_menu_button(ui, true, "履歴▼", |_| {}).rect,
+                                );
+                                ui.add_space(4.0);
+                                right.push(ui.add(egui::Button::new("♡").frame(false)).rect);
+                                ui.add_space(4.0);
+                            }
+                        }
+                        layout::FolderTailPart::Input => {
+                            layout::address_input(ui, None, |ui| {
+                                input = Some(
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut *path)
+                                            .desired_width(f32::INFINITY),
+                                    )
+                                    .rect,
+                                );
+                            });
+                        }
+                    },
+                );
+                let input = input.unwrap();
+                let precedes = |a: egui::Rect, b: egui::Rect| {
+                    a.bottom() <= b.top() + 0.5
+                        || (a.right() <= b.left() + 0.5
+                            && a.top() < b.bottom()
+                            && b.top() < a.bottom())
+                };
+                assert!(
+                    left.iter().all(|rect| precedes(*rect, input)),
+                    "left/input order: {left:?} {input:?}"
+                );
+                assert!(
+                    right.iter().all(|rect| precedes(input, *rect)),
+                    "input/right order: {input:?} {right:?}"
+                );
+                assert!(input.width() >= layout::ADDRESS_INPUT_MIN_WIDTH);
+                assert!(input.right() <= ui.clip_rect().right() + 0.5);
+            });
+        })
+        .response
+        .rect;
+        for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
+            .iter()
+            .skip(before)
+        {
+            let following = ui.button(*text).rect;
+            assert!(
+                following.top() >= slot.bottom(),
+                "subsequent sections need their own row"
+            );
+        }
+    });
 }
 
 fn snapshot_color_presets(name: &str, width: f32) {

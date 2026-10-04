@@ -13834,8 +13834,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .flatten();
         let mut open_preferences = None;
         // Measure the same visible controls in the folder bar's normal style.
-        // Frame-less buttons are conservatively budgeted with padding as well.
-        let mut widths = crate::ui_toolbar_layout::FolderBarWidth::new(ui);
+        let mut widths = crate::ui_toolbar_layout::FolderBarWidth::with_input();
         widths.label(ui, "フォルダ:");
         let show_history_nav = self.settings.show_address_bar_history_nav;
         let show_quick_folders = self.settings.show_address_bar_quick_folders;
@@ -13868,20 +13867,21 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         widths.button(ui, "場所▼", 0.0);
         widths.space(4.0 + 6.0 + ui.spacing().item_spacing.x);
+        let mut right_widths = crate::ui_toolbar_layout::FolderBarWidth::controls();
         if let Some(label) = omitted_counts.and_then(omitted_entries_chip_label) {
-            widths.button(ui, label, 0.0);
-            widths.space(4.0);
+            right_widths.button(ui, egui::RichText::new(label).small().strong(), 0.0);
+            right_widths.space(4.0);
         }
         if (1..=5).contains(&folder_rating) {
-            widths.label(
+            right_widths.label(
                 ui,
                 egui::RichText::new(format!("📁{}", "★".repeat(folder_rating as usize))).strong(),
             );
-            widths.space(4.0);
+            right_widths.space(4.0);
         }
         if let Some(count) = thumbnail_count.as_ref() {
-            widths.label(ui, egui::RichText::new(count).size(11.0).monospace());
-            widths.space(4.0);
+            right_widths.label(ui, egui::RichText::new(count).size(11.0).monospace());
+            right_widths.space(4.0);
         }
         for (visible, text) in [
             (stack_available, "スタック"),
@@ -13891,14 +13891,32 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             (self.settings.show_address_bar_favorite_button, "♥"),
         ] {
             if visible {
-                widths.button(ui, text, 0.0);
-                widths.space(4.0);
+                let framed = !matches!(text, "📌" | "♥");
+                let label = if text == "♥" {
+                    egui::RichText::new(if current_is_favorite { "♥" } else { "♡" })
+                } else {
+                    egui::RichText::new(text)
+                };
+                let label = if (text == "♥" && current_is_favorite)
+                    || (text == "📌"
+                        && pin_button_info
+                            .as_ref()
+                            .is_some_and(|info| info.matches_current_pin))
+                {
+                    label.strong()
+                } else {
+                    label
+                };
+                right_widths.button_with_frame(ui, label, 0.0, framed);
+                right_widths.space(4.0);
             }
         }
+        let mut input_widths = crate::ui_toolbar_layout::FolderBarWidth::with_input();
         if let Some(suffix) = self.snapshot_path_suffix() {
-            widths.label(ui, suffix);
+            widths.label(ui, suffix.clone());
+            input_widths.label(ui, suffix);
         }
-        let minimum_width = widths.minimum();
+        let minimum_width = (widths.width() + right_widths.width()).ceil();
         // Preserve the interior margins of the former two panels and the toolbar's
         // trailing padding when the folder bar is explicitly on a separate row.
         let separate_row_padding =
@@ -14250,356 +14268,381 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
 
                     let place_nav_enabled = !search_active && !snapshot_active;
-                    ui.add_enabled_ui(place_nav_enabled, |ui| {
-                        let place_response = ui
-                            .menu_button("場所▼", |ui| {
-                                ui.set_min_width(220.0);
-                                let location_entries =
-                                    crate::known_folders::location_menu_entries(&self.settings);
-                                for entry in location_entries {
-                                    match entry {
-                                        crate::known_folders::LocationMenuEntry::DriveList => {
-                                            if ui.button("ドライブ一覧").clicked() {
-                                                result = Some(AddressBarNav::DriveList(None));
-                                                ui.close();
-                                            }
-                                        }
-                                        crate::known_folders::LocationMenuEntry::ReadingHistory => {
-                                            if ui.button("閲覧履歴").clicked() {
-                                                result = Some(AddressBarNav::ReadingHistory);
-                                                ui.close();
-                                            }
-                                        }
-                                        crate::known_folders::LocationMenuEntry::Bookmarks => {
-                                            if ui.button("ブックマーク").clicked() {
-                                                self.open_bookmark_browser();
-                                                ui.close();
-                                            }
-                                        }
-                                        crate::known_folders::LocationMenuEntry::Rating {
-                                            stars,
-                                        } => {
-                                            ui.menu_button("レーティング", |ui| {
-                                                for stars in stars {
-                                                    if ui
-                                                        .button(rating_view_menu_label(
-                                                            stars,
-                                                            rating_counts,
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        self.enter_rating_view_from_menu(stars);
-                                                        ui.close();
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        crate::known_folders::LocationMenuEntry::Bookshelf => {
-                                            if ui
-                                                .button("本棚フォルダ")
-                                                .hover_tip(
-                                                    self.book_root_path()
-                                                        .to_string_lossy()
-                                                        .to_string(),
-                                                )
-                                                .clicked()
-                                            {
-                                                result = Some(AddressBarNav::BooksRoot);
-                                                ui.close();
-                                            }
-                                        }
-                                        crate::known_folders::LocationMenuEntry::Separator => {
-                                            ui.separator();
-                                        }
-                                        crate::known_folders::LocationMenuEntry::QuickLocation(
-                                            location,
-                                        ) => {
-                                            let full = location.path.to_string_lossy().to_string();
-                                            if ui.button(location.label).hover_tip(&full).clicked()
-                                            {
-                                                if let Some(resolved) =
-                                                    resolve_folder_bar_nav_path(&location.path)
-                                                {
-                                                    result = Some(AddressBarNav::Direct(resolved));
-                                                }
-                                                ui.close();
-                                            }
-                                        }
-                                        crate::known_folders::LocationMenuEntry::DriveRoot(
-                                            drive,
-                                        ) => {
-                                            let label = drive.to_string_lossy().to_string();
-                                            if ui
-                                                .button(egui::RichText::new(&label).monospace())
-                                                .hover_tip(&label)
-                                                .clicked()
-                                            {
-                                                if let Some(resolved) =
-                                                    resolve_folder_bar_nav_path(&drive)
-                                                {
-                                                    result = Some(AddressBarNav::Direct(resolved));
-                                                }
-                                                ui.close();
-                                            }
+                    let place_response = crate::ui_toolbar_layout::folder_menu_button(
+                        ui,
+                        place_nav_enabled,
+                        "場所▼",
+                        |ui| {
+                            ui.set_min_width(220.0);
+                            let location_entries =
+                                crate::known_folders::location_menu_entries(&self.settings);
+                            for entry in location_entries {
+                                match entry {
+                                    crate::known_folders::LocationMenuEntry::DriveList => {
+                                        if ui.button("ドライブ一覧").clicked() {
+                                            result = Some(AddressBarNav::DriveList(None));
+                                            ui.close();
                                         }
                                     }
-                                }
-                            })
-                            .response
-                            .hover_tip(if snapshot_active {
-                                "★固定中は場所ジャンプを使用できません"
-                            } else if search_active {
-                                "検索中は場所ジャンプを使用できません"
-                            } else {
-                                "デスクトップ / 主要フォルダ / ドライブへ移動"
-                            });
-                        show_sticky_context_menu(&place_response, |ui| {
-                            self.draw_folder_bar_settings_menu(ui);
-                        });
-                    });
-                    ui.add_space(4.0);
-                    ui.separator();
-
-                    if compact {
-                        ui.end_row();
-                    }
-                    // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
-                    // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
-                    // TextEdit は available width いっぱいに広がる。
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(compact), |ui| {
-                        if let Some(counts) = omitted_counts {
-                            if let Some(page) = draw_omitted_entries_chip(ui, counts) {
-                                open_preferences = Some(page);
-                            }
-                            if omitted_entries_chip_label(counts).is_some() {
-                                ui.add_space(4.0);
-                            }
-                        }
-                        if folder_rating >= 1 && folder_rating <= 5 {
-                            let stars = "★".repeat(folder_rating as usize);
-                            ui.label(
-                                egui::RichText::new(format!("📁{stars}"))
-                                    .color(egui::Color32::from_rgb(130, 170, 220))
-                                    .strong(),
-                            )
-                            .hover_tip(folder_rating_tooltip(&self.keymap));
-                            ui.add_space(4.0);
-                        }
-                        if let Some(count) = thumbnail_count.as_ref() {
-                            ui.label(
-                                egui::RichText::new(count.as_str())
-                                    .size(11.0)
-                                    .monospace()
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .hover_tip("表示中のサムネイル数 / 全サムネイル数");
-                            ui.add_space(4.0);
-                        }
-                        // ファイル名スタック表示トグル (v2.0.0)。サムネ枚数 (12/345) の左側に置く
-                        // (実機フィードバック 2026-06-20)。通常フォルダ表示のときだけ出す
-                        // (検索 / ZIP ツリー / ドライブ一覧では無効)。
-                        if stack_available {
-                            let resp = ui.selectable_label(stack_on, "スタック").hover_tip(
-                                "似たファイルを自動で分類して 1 つに畳んで表示 [トグル]。スタックを開くと \
-                                 ↓↑ で全画像送り・Shift+↓↑ で次/前のスタックへ (分類ルールはヘルプ参照)",
-                            );
-                            if resp.clicked() {
-                                stack_toggle = true;
-                            }
-                            ui.add_space(4.0);
-                        }
-                        if subfolder_expansion_available {
-                            let depth_choice =
-                                crate::app::SubfolderExpansionDepthChoice::from_setting(
-                                    self.settings.subfolder_expansion_max_depth,
-                                );
-                            let mut tooltip = if subfolder_expansion_pending {
-                                subfolder_expansion_pending_tooltip
-                                    .clone()
-                                    .unwrap_or_else(|| "サブフォルダを走査中".to_string())
-                            } else if subfolder_expansion_on {
-                                "サブ展開を解除して元のフォルダへ戻る".to_string()
-                            } else {
-                                self.subfolder_expansion_action_tooltip()
-                            };
-                            if subfolder_expansion_pending || subfolder_expansion_on {
-                                tooltip.push_str(&format!(
-                                    "\n走査階層: {}",
-                                    depth_choice.label()
-                                ));
-                            }
-
-                            let resp = ui
-                                .add_enabled(
-                                    !subfolder_expansion_pending,
-                                    egui::Button::selectable(
-                                        subfolder_expansion_on || subfolder_expansion_pending,
-                                        "サブ展開",
-                                    ),
-                                )
-                                .hover_tip(tooltip);
-                            if resp.clicked() {
-                                subfolder_expansion_button_clicked = true;
-                            }
-                            ui.add_space(4.0);
-                        }
-                        // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
-                        if let Some(info) = pin_button_info.as_ref() {
-                            let label = if info.matches_current_pin {
-                                egui::RichText::new("📌")
-                                    .color(egui::Color32::from_rgb(230, 180, 90))
-                                    .strong()
-                            } else {
-                                egui::RichText::new("📌")
-                            };
-                            let btn = egui::Button::new(label).frame(false);
-                            let resp = ui.add_enabled(info.enabled, btn);
-                            let resp = resp.hover_tip(info.tooltip.as_str());
-                            if info.enabled {
-                                if resp.clicked() {
-                                    pin_click = PinButtonClick::Toggle;
-                                } else if resp.secondary_clicked() {
-                                    pin_click = PinButtonClick::Remove;
-                                }
-                            }
-                            ui.add_space(4.0);
-                        }
-
-                        if self.settings.show_address_bar_history_menu {
-                            // 検索 (Ctrl+G / Ctrl+S) 中は履歴メニューを無効化する
-                            // (検索は透明な一時オーバーレイで履歴の概念が適用されない)。
-                            // Codex 3rd P3 fix: snapshot 中も同様に無効化。
-                            ui.add_enabled_ui(!search_active && !snapshot_active, |ui| {
-                                ui.menu_button("履歴▼", |ui| {
-                                    let menu_width =
-                                        (ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0);
-                                    ui.set_min_width(menu_width);
-                                    let mut shown = 0usize;
-                                    for path in &recent_folders {
-                                        if effective_folder.as_ref().is_some_and(|cur| {
-                                            crate::folder_tree::path_eq(cur, path)
-                                        }) {
-                                            continue;
+                                    crate::known_folders::LocationMenuEntry::ReadingHistory => {
+                                        if ui.button("閲覧履歴").clicked() {
+                                            result = Some(AddressBarNav::ReadingHistory);
+                                            ui.close();
                                         }
-                                        let full = path.to_string_lossy().to_string();
-                                        let button = egui::Button::new(
-                                            egui::RichText::new(&full).monospace(),
-                                        )
-                                        .wrap_mode(egui::TextWrapMode::Extend);
-                                        if ui.add(button).hover_tip(&full).clicked() {
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Bookmarks => {
+                                        if ui.button("ブックマーク").clicked() {
+                                            self.open_bookmark_browser();
+                                            ui.close();
+                                        }
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Rating { stars } => {
+                                        ui.menu_button("レーティング", |ui| {
+                                            for stars in stars {
+                                                if ui
+                                                    .button(rating_view_menu_label(
+                                                        stars,
+                                                        rating_counts,
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    self.enter_rating_view_from_menu(stars);
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Bookshelf => {
+                                        if ui
+                                            .button("本棚フォルダ")
+                                            .hover_tip(
+                                                self.book_root_path().to_string_lossy().to_string(),
+                                            )
+                                            .clicked()
+                                        {
+                                            result = Some(AddressBarNav::BooksRoot);
+                                            ui.close();
+                                        }
+                                    }
+                                    crate::known_folders::LocationMenuEntry::Separator => {
+                                        ui.separator();
+                                    }
+                                    crate::known_folders::LocationMenuEntry::QuickLocation(
+                                        location,
+                                    ) => {
+                                        let full = location.path.to_string_lossy().to_string();
+                                        if ui.button(location.label).hover_tip(&full).clicked() {
                                             if let Some(resolved) =
-                                                resolve_folder_bar_nav_path(path)
+                                                resolve_folder_bar_nav_path(&location.path)
                                             {
                                                 result = Some(AddressBarNav::Direct(resolved));
                                             }
                                             ui.close();
                                         }
-                                        shown += 1;
-                                        if shown >= 20 {
-                                            break;
+                                    }
+                                    crate::known_folders::LocationMenuEntry::DriveRoot(drive) => {
+                                        let label = drive.to_string_lossy().to_string();
+                                        if ui
+                                            .button(egui::RichText::new(&label).monospace())
+                                            .hover_tip(&label)
+                                            .clicked()
+                                        {
+                                            if let Some(resolved) =
+                                                resolve_folder_bar_nav_path(&drive)
+                                            {
+                                                result = Some(AddressBarNav::Direct(resolved));
+                                            }
+                                            ui.close();
                                         }
                                     }
-                                    if shown == 0 {
-                                        ui.label(egui::RichText::new("履歴はありません").weak());
-                                    }
-                                })
-                                .response
-                                .hover_tip(if search_active {
-                                    "検索中は履歴メニューを使用できません"
-                                } else {
-                                    "最近開いたフォルダ"
-                                });
-                            });
-                            ui.add_space(4.0);
-                        }
-
-                        if self.settings.show_address_bar_favorite_button {
-                            let (label, tooltip) = if current_is_favorite {
-                                (
-                                    egui::RichText::new("♥")
-                                        .color(egui::Color32::from_rgb(230, 110, 130))
-                                        .strong(),
-                                    "このフォルダのお気に入り設定を開く",
-                                )
-                            } else if favorite_target.is_none() {
-                                (
-                                    egui::RichText::new("♡").weak(),
-                                    "お気に入りに追加できるのは実フォルダのみです",
-                                )
-                            } else {
-                                (egui::RichText::new("♡"), "このフォルダをお気に入りに追加…")
-                            };
-                            if ui
-                                .add_enabled(
-                                    favorite_target.is_some(),
-                                    egui::Button::new(label).frame(false),
-                                )
-                                .hover_tip(tooltip)
-                                .clicked()
-                            {
-                                favorite_click = if current_is_favorite {
-                                    FavoriteButtonClick::Edit
-                                } else {
-                                    FavoriteButtonClick::Add
-                                };
-                            }
-                            ui.add_space(4.0);
-                        }
-
-                        crate::ui_toolbar_layout::address_input(ui, compact, |ui| {
-                            // snapshot 中はフォルダパス入力を disabled にする (= §4.4)。
-                            // suffix は TextEdit の **左** に colored_label として置く
-                            // (= 旧版で右に置くと TextEdit が desired_width(INFINITY) で残り幅を
-                            // 全消費するため履歴プルダウン等に重なる事故が起きていた、ユーザー報告)。
-                            let snap_suffix = self.snapshot_path_suffix();
-                            let is_snap_active = snap_suffix.is_some();
-                            if let Some(suffix) = snap_suffix {
-                                ui.colored_label(egui::Color32::from_rgb(58, 110, 165), suffix);
-                            }
-                            let resp = if is_snap_active {
-                                ui.add_enabled(
-                                    false,
-                                    egui::TextEdit::singleline(&mut self.address)
-                                        .id(egui::Id::new("folder_address_input")).desired_width(f32::INFINITY),
-                                )
-                            } else {
-                                let mut output = crate::ime_focus::show_singleline(
-                                    ui,
-                                    &mut self.address,
-                                    None,
-                                    |edit| edit.id(egui::Id::new("folder_address_input")).desired_width(f32::INFINITY),
-                                );
-                                crate::ui_helpers::singleline_text_edit_context_menu(
-                                    ui,
-                                    &mut output,
-                                    &mut self.address,
-                                );
-                                output.response
-                            };
-                            self.address_has_focus = resp.has_focus();
-                            if !is_snap_active && resp.lost_focus() && enter_pressed {
-                                let address_text = self.address.trim();
-                                if address_text.is_empty() {
-                                    result = Some(AddressBarNav::DriveList(None));
-                                } else if address_text == "本棚" {
-                                    result = Some(AddressBarNav::Direct(self.book_root_path()));
-                                } else if let Some(book_name) =
-                                    address_text.strip_prefix("本棚 > ")
-                                {
-                                    result = Some(AddressBarNav::Direct(
-                                        crate::books::book_folder(
-                                            &self.book_root_path(),
-                                            book_name.trim(),
-                                        ),
-                                    ));
-                                } else if let Some(resolved) =
-                                    resolve_folder_bar_nav_path(&PathBuf::from(&self.address))
-                                {
-                                    result = Some(AddressBarNav::Direct(resolved));
                                 }
                             }
-                        });
+                        },
+                    )
+                    .hover_tip(if snapshot_active {
+                        "★固定中は場所ジャンプを使用できません"
+                    } else if search_active {
+                        "検索中は場所ジャンプを使用できません"
+                    } else {
+                        "デスクトップ / 主要フォルダ / ドライブへ移動"
                     });
+                    show_sticky_context_menu(&place_response, |ui| {
+                        self.draw_folder_bar_settings_menu(ui);
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    crate::ui_toolbar_layout::folder_tail(
+                        ui,
+                        input_widths.width(),
+                        right_widths.width(),
+                        |ui, part| {
+                            match part {
+                                crate::ui_toolbar_layout::FolderTailPart::RightControls => {
+                                    if let Some(counts) = omitted_counts {
+                                        if let Some(page) = draw_omitted_entries_chip(ui, counts) {
+                                            open_preferences = Some(page);
+                                        }
+                                        if omitted_entries_chip_label(counts).is_some() {
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                    if folder_rating >= 1 && folder_rating <= 5 {
+                                        let stars = "★".repeat(folder_rating as usize);
+                                        ui.label(
+                                            egui::RichText::new(format!("📁{stars}"))
+                                                .color(egui::Color32::from_rgb(130, 170, 220))
+                                                .strong(),
+                                        )
+                                        .hover_tip(folder_rating_tooltip(&self.keymap));
+                                        ui.add_space(4.0);
+                                    }
+                                    if let Some(count) = thumbnail_count.as_ref() {
+                                        ui.label(
+                                            egui::RichText::new(count.as_str())
+                                                .size(11.0)
+                                                .monospace()
+                                                .color(ui.visuals().weak_text_color()),
+                                        )
+                                        .hover_tip("表示中のサムネイル数 / 全サムネイル数");
+                                        ui.add_space(4.0);
+                                    }
+                                    // ファイル名スタック表示トグル (v2.0.0)。サムネ枚数 (12/345) の左側に置く
+                                    // (実機フィードバック 2026-06-20)。通常フォルダ表示のときだけ出す
+                                    // (検索 / ZIP ツリー / ドライブ一覧では無効)。
+                                    if stack_available {
+                                        let resp = ui.selectable_label(stack_on, "スタック").hover_tip(
+                                "似たファイルを自動で分類して 1 つに畳んで表示 [トグル]。スタックを開くと \
+                                 ↓↑ で全画像送り・Shift+↓↑ で次/前のスタックへ (分類ルールはヘルプ参照)",
+                            );
+                                        if resp.clicked() {
+                                            stack_toggle = true;
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                    if subfolder_expansion_available {
+                                        let depth_choice =
+                                            crate::app::SubfolderExpansionDepthChoice::from_setting(
+                                                self.settings.subfolder_expansion_max_depth,
+                                            );
+                                        let mut tooltip = if subfolder_expansion_pending {
+                                            subfolder_expansion_pending_tooltip
+                                                .clone()
+                                                .unwrap_or_else(|| {
+                                                    "サブフォルダを走査中".to_string()
+                                                })
+                                        } else if subfolder_expansion_on {
+                                            "サブ展開を解除して元のフォルダへ戻る".to_string()
+                                        } else {
+                                            self.subfolder_expansion_action_tooltip()
+                                        };
+                                        if subfolder_expansion_pending || subfolder_expansion_on {
+                                            tooltip.push_str(&format!(
+                                                "\n走査階層: {}",
+                                                depth_choice.label()
+                                            ));
+                                        }
+
+                                        let resp = ui
+                                            .add_enabled(
+                                                !subfolder_expansion_pending,
+                                                egui::Button::selectable(
+                                                    subfolder_expansion_on
+                                                        || subfolder_expansion_pending,
+                                                    "サブ展開",
+                                                ),
+                                            )
+                                            .hover_tip(tooltip);
+                                        if resp.clicked() {
+                                            subfolder_expansion_button_clicked = true;
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                    // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
+                                    if let Some(info) = pin_button_info.as_ref() {
+                                        let label = if info.matches_current_pin {
+                                            egui::RichText::new("📌")
+                                                .color(egui::Color32::from_rgb(230, 180, 90))
+                                                .strong()
+                                        } else {
+                                            egui::RichText::new("📌")
+                                        };
+                                        let btn = egui::Button::new(label).frame(false);
+                                        let resp = ui.add_enabled(info.enabled, btn);
+                                        let resp = resp.hover_tip(info.tooltip.as_str());
+                                        if info.enabled {
+                                            if resp.clicked() {
+                                                pin_click = PinButtonClick::Toggle;
+                                            } else if resp.secondary_clicked() {
+                                                pin_click = PinButtonClick::Remove;
+                                            }
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+
+                                    if self.settings.show_address_bar_history_menu {
+                                        // 検索 (Ctrl+G / Ctrl+S) 中は履歴メニューを無効化する
+                                        // (検索は透明な一時オーバーレイで履歴の概念が適用されない)。
+                                        // Codex 3rd P3 fix: snapshot 中も同様に無効化。
+                                        crate::ui_toolbar_layout::folder_menu_button(
+                                            ui,
+                                            !search_active && !snapshot_active,
+                                            "履歴▼",
+                                            |ui| {
+                                                let menu_width = (ctx.content_rect().width()
+                                                    * 0.72)
+                                                    .clamp(560.0, 1100.0);
+                                                ui.set_min_width(menu_width);
+                                                let mut shown = 0usize;
+                                                for path in &recent_folders {
+                                                    if effective_folder.as_ref().is_some_and(
+                                                        |cur| {
+                                                            crate::folder_tree::path_eq(cur, path)
+                                                        },
+                                                    ) {
+                                                        continue;
+                                                    }
+                                                    let full = path.to_string_lossy().to_string();
+                                                    let button = egui::Button::new(
+                                                        egui::RichText::new(&full).monospace(),
+                                                    )
+                                                    .wrap_mode(egui::TextWrapMode::Extend);
+                                                    if ui.add(button).hover_tip(&full).clicked() {
+                                                        if let Some(resolved) =
+                                                            resolve_folder_bar_nav_path(path)
+                                                        {
+                                                            result = Some(AddressBarNav::Direct(
+                                                                resolved,
+                                                            ));
+                                                        }
+                                                        ui.close();
+                                                    }
+                                                    shown += 1;
+                                                    if shown >= 20 {
+                                                        break;
+                                                    }
+                                                }
+                                                if shown == 0 {
+                                                    ui.label(
+                                                        egui::RichText::new("履歴はありません")
+                                                            .weak(),
+                                                    );
+                                                }
+                                            },
+                                        )
+                                        .hover_tip(
+                                            if search_active {
+                                                "検索中は履歴メニューを使用できません"
+                                            } else {
+                                                "最近開いたフォルダ"
+                                            },
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+
+                                    if self.settings.show_address_bar_favorite_button {
+                                        let (label, tooltip) = if current_is_favorite {
+                                            (
+                                                egui::RichText::new("♥")
+                                                    .color(egui::Color32::from_rgb(230, 110, 130))
+                                                    .strong(),
+                                                "このフォルダのお気に入り設定を開く",
+                                            )
+                                        } else if favorite_target.is_none() {
+                                            (
+                                                egui::RichText::new("♡").weak(),
+                                                "お気に入りに追加できるのは実フォルダのみです",
+                                            )
+                                        } else {
+                                            (
+                                                egui::RichText::new("♡"),
+                                                "このフォルダをお気に入りに追加…",
+                                            )
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                favorite_target.is_some(),
+                                                egui::Button::new(label).frame(false),
+                                            )
+                                            .hover_tip(tooltip)
+                                            .clicked()
+                                        {
+                                            favorite_click = if current_is_favorite {
+                                                FavoriteButtonClick::Edit
+                                            } else {
+                                                FavoriteButtonClick::Add
+                                            };
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                                crate::ui_toolbar_layout::FolderTailPart::Input => {
+                                    // snapshot 中の説明は入力欄の前に置く。幅が不足すれば
+                                    // 共通 helper が説明を上の行へ送り、入力最小幅を保つ。
+                                    let snap_suffix = self.snapshot_path_suffix();
+                                    let is_snap_active = snap_suffix.is_some();
+                                    let label = snap_suffix.map(|suffix| {
+                                        egui::RichText::new(suffix)
+                                            .color(egui::Color32::from_rgb(58, 110, 165))
+                                            .into()
+                                    });
+                                    crate::ui_toolbar_layout::address_input(ui, label, |ui| {
+                                        // snapshot 中はフォルダパス入力を disabled にする (= §4.4)。
+                                        let resp = if is_snap_active {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::TextEdit::singleline(&mut self.address)
+                                                    .id(egui::Id::new("folder_address_input"))
+                                                    .desired_width(f32::INFINITY),
+                                            )
+                                        } else {
+                                            let mut output = crate::ime_focus::show_singleline(
+                                                ui,
+                                                &mut self.address,
+                                                None,
+                                                |edit| {
+                                                    edit.id(egui::Id::new("folder_address_input"))
+                                                        .desired_width(f32::INFINITY)
+                                                },
+                                            );
+                                            crate::ui_helpers::singleline_text_edit_context_menu(
+                                                ui,
+                                                &mut output,
+                                                &mut self.address,
+                                            );
+                                            output.response
+                                        };
+                                        self.address_has_focus = resp.has_focus();
+                                        if !is_snap_active && resp.lost_focus() && enter_pressed {
+                                            let address_text = self.address.trim();
+                                            if address_text.is_empty() {
+                                                result = Some(AddressBarNav::DriveList(None));
+                                            } else if address_text == "本棚" {
+                                                result = Some(AddressBarNav::Direct(
+                                                    self.book_root_path(),
+                                                ));
+                                            } else if let Some(book_name) =
+                                                address_text.strip_prefix("本棚 > ")
+                                            {
+                                                result = Some(AddressBarNav::Direct(
+                                                    crate::books::book_folder(
+                                                        &self.book_root_path(),
+                                                        book_name.trim(),
+                                                    ),
+                                                ));
+                                            } else if let Some(resolved) =
+                                                resolve_folder_bar_nav_path(&PathBuf::from(
+                                                    &self.address,
+                                                ))
+                                            {
+                                                result = Some(AddressBarNav::Direct(resolved));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        },
+                    );
                 });
                 ui.add_space(3.0);
                 // pin ボタンクリックは closure 抜けてから処理する (App ミュータブル借用が必要)
@@ -26680,6 +26723,237 @@ mod section207_tests {
         }
         app.settings.show_toolbar_folder = true;
         app.settings.show_toolbar_folder_tree_button = true;
+    }
+
+    #[test]
+    fn section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds() {
+        for width in [360.0, 720.0, 1200.0] {
+            for zoom in [1.0, 1.5] {
+                for new_row in [true, false] {
+                    for changed in [false, true] {
+                        let mut app = crate::app::setup_app_for_test();
+                        only_folder_and_tree(&mut app);
+                        let folder = app.tmp.path().join("snapshot-label");
+                        std::fs::create_dir_all(&folder).unwrap();
+                        std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
+                        app.load_folder_with_scan(folder, None);
+                        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                        if changed {
+                            app.settings.rating_filter = [false; 6];
+                        }
+                        let suffix = app.snapshot_path_suffix().unwrap();
+                        app.settings.toolbar_section_order = vec![TS::FolderTree, TS::Folder];
+                        app.settings.toolbar_section_new_row =
+                            if new_row { vec![TS::Folder] } else { vec![] };
+                        let render = Rc::new(RefCell::new(app));
+                        let state = render.clone();
+                        let fonts = Cell::new(false);
+                        let mut harness = Harness::builder()
+                            .with_size(egui::vec2(width * zoom, 400.0 * zoom))
+                            .build(move |ctx| {
+                                ctx.set_zoom_factor(zoom);
+                                if !fonts.replace(true) {
+                                    crate::ui_fonts::configure_fonts(ctx);
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                render.borrow_mut().render_toolbar(ctx);
+                            });
+                        harness.run();
+                        let field = harness.get_by_role(egui::accesskit::Role::TextInput);
+                        assert!(
+                            field.accesskit_node().is_disabled(),
+                            "snapshot input must stay disabled"
+                        );
+                        let input = field.rect();
+                        let label = harness.get_by_label(&suffix).rect();
+                        let left = harness.get_by_label("場所▼").rect();
+                        let right = harness.get_by_label("履歴▼").rect();
+                        let panel = state.borrow().toolbar_content_rect.unwrap();
+                        let panel = egui::Rect::from_min_max(panel.min * zoom, panel.max * zoom);
+                        let case =
+                            format!("width={width} zoom={zoom} row={new_row} changed={changed}");
+                        if width == 360.0 && zoom == 1.0 && new_row {
+                            let dir = std::path::Path::new("target/section207-snapshot-label");
+                            std::fs::create_dir_all(dir).unwrap();
+                            harness
+                                .render()
+                                .unwrap()
+                                .save(dir.join(if changed {
+                                    "narrow_changed.png"
+                                } else {
+                                    "narrow.png"
+                                }))
+                                .unwrap();
+                        }
+                        assert!(input.width() >= 160.0 * zoom, "{case}: {input:?}");
+                        let precedes = |a: egui::Rect, b: egui::Rect| {
+                            a.bottom() <= b.top() + 0.5
+                                || (a.right() <= b.left() + 0.5
+                                    && a.top() < b.bottom()
+                                    && b.top() < a.bottom())
+                        };
+                        assert!(
+                            precedes(left, label),
+                            "{case}: left/label: {left:?} {label:?}"
+                        );
+                        assert!(
+                            precedes(input, right),
+                            "{case}: input/right: {input:?} {right:?}"
+                        );
+                        assert!(
+                            label.bottom() <= input.top() + 0.5
+                                || (label.right() <= input.left() + 0.5
+                                    && label.top() < input.bottom()
+                                    && input.top() < label.bottom()),
+                            "{case}: label/input order: {label:?} {input:?}"
+                        );
+                        for rect in [left, label, input, right] {
+                            assert!(
+                                panel.expand(0.5).contains_rect(rect),
+                                "{case}: {panel:?} {rect:?}"
+                            );
+                            assert!(
+                                rect.left() >= 0.0 && rect.right() <= width * zoom,
+                                "{case}: {rect:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section207_reported_controls_keep_left_input_right_order() {
+        for (width, zoom) in [
+            (1487.0, 2.0),
+            (1487.0, 1.5),
+            (720.0, 1.0),
+            (360.0, 1.0),
+            (960.0, 1.0),
+            (1200.0, 1.0),
+        ] {
+            for new_row in [true, false] {
+                let mut env = crate::app::setup_app_for_test();
+                only_folder_and_tree(&mut env);
+                let folder = env.tmp.path().join("reported-controls");
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
+                env.load_folder_with_scan(folder.clone(), None);
+                let item = env.items[0].clone();
+                env.items.resize(674, item);
+                env.visible_indices = (0..674).collect();
+                env.selected = Some(0);
+                env.current_folder_rating_cache = Some(0);
+                env.normal_folder_omitted_entries = Some(crate::app::NormalFolderOmittedEntries {
+                    folder,
+                    counts: crate::app::OmittedFolderEntryCounts {
+                        unsupported: 321,
+                        ..Default::default()
+                    },
+                });
+                env.settings.show_address_bar_history_nav = true;
+                env.settings.show_address_bar_quick_folders = true;
+                env.settings.show_toolbar_parent_button = true;
+                env.settings.show_toolbar_prev_folder = true;
+                env.settings.show_toolbar_next_folder = true;
+                env.settings.show_address_bar_history_menu = true;
+                env.settings.show_address_bar_favorite_button = true;
+                env.settings.show_address_bar_stack_toggle = true;
+                env.settings.show_address_bar_omitted_entries = true;
+                env.settings.toolbar_section_order = vec![TS::FolderTree, TS::Folder];
+                env.settings.toolbar_section_new_row =
+                    if new_row { vec![TS::Folder] } else { vec![] };
+                let render = Rc::new(RefCell::new(env));
+                let fonts = Cell::new(false);
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(width, 400.0 * zoom))
+                    .build(move |ctx| {
+                        ctx.set_zoom_factor(zoom);
+                        if !fonts.replace(true) {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            ctx.request_repaint();
+                            return;
+                        }
+                        render.borrow_mut().render_toolbar(ctx);
+                    });
+                harness.run();
+                let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+                let left = harness.get_by_label("場所▼").rect();
+                let precedes = |a: egui::Rect, b: egui::Rect| {
+                    a.bottom() <= b.top() + 0.5
+                        || (a.right() <= b.left() + 0.5
+                            && a.top() < b.bottom()
+                            && b.top() < a.bottom())
+                };
+                let favorite = harness.get_by_label("♡").rect();
+                if width / zoom >= 950.0 {
+                    assert!(
+                        left.top() < input.bottom() && input.top() < left.bottom(),
+                        "all controls fit on one row"
+                    );
+                    assert!(
+                        favorite.top() < input.bottom() && input.top() < favorite.bottom(),
+                        "right controls fit too"
+                    );
+                } else if width / zoom >= 700.0 {
+                    assert!(
+                        left.bottom() <= input.top(),
+                        "left controls need a separate row"
+                    );
+                    assert!(
+                        favorite.top() < input.bottom() && input.top() < favorite.bottom(),
+                        "input and right controls fit together"
+                    );
+                } else {
+                    assert!(left.bottom() <= input.top());
+                    assert!(
+                        input.bottom() <= favorite.top(),
+                        "input comes before right controls on separate rows"
+                    );
+                }
+                assert!(
+                    left.height() <= input.height() + 0.5,
+                    "place caption must not wrap internally: {left:?}"
+                );
+                assert!(left.left() >= 0.0 && left.right() <= width);
+                assert!(precedes(left, input), "left/input: {left:?} {input:?}");
+                for label in [
+                    "♡",
+                    "履歴▼",
+                    "📌",
+                    "サブ展開",
+                    "スタック",
+                    "(674/674)",
+                    "非表示 321 件",
+                ] {
+                    let right = harness.get_by_label(label).rect();
+                    assert!(
+                        right.height() <= input.height() + 0.5,
+                        "right caption must not wrap internally: {label} {right:?}"
+                    );
+                    assert!(
+                        right.left() >= 0.0 && right.right() <= width,
+                        "right control escaped the panel: {label} {right:?}"
+                    );
+                    assert!(
+                        precedes(input, right),
+                        "width={width} zoom={zoom} row={new_row} input/right={label}: {input:?} {right:?}"
+                    );
+                }
+                assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH * zoom);
+                if new_row {
+                    let evidence = std::path::Path::new("target/section207-wrap-rendering");
+                    std::fs::create_dir_all(evidence).unwrap();
+                    harness
+                        .render()
+                        .unwrap()
+                        .save(evidence.join(format!("after_{width}_{zoom}.png")))
+                        .unwrap();
+                }
+            }
+        }
     }
 
     #[test]
