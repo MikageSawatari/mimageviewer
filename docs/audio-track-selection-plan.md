@@ -1054,6 +1054,11 @@ UI より先に入れる (UI から切り替えられるようになった時点
   限定の診断値) が新トラックの値になることを確認。一時停止中の切り替え、連続切り替え、F12 別ウィンドウでの
   切り替え、音声モードでの切り替え、開き直しで保存したトラックから始まることを含める。`capture(label)` で
   egui 側 (音声モード HUD) を保存する。
+- §1.319 (2026-10-04): native メニューの初回 sizing pass を診断上有効と誤認していたため、
+  音声行・ボタンの観測に実 `Response.enabled()` を使う。入力直前の token/area と source/host の
+  同一性検査は維持する。再生中の切り替えを pause/delay で回避しない。原因・非対話検証・
+  利用者了承後の disposable portable コマンドは [smoke 設計](ui-smoke-automation-plan.md#audiotracks-の入力対象契約-1319)。
+  旧 2 run は失敗ログを保持し、修正後の実アプリ PASS は未確認。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
   Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。

@@ -19,6 +19,82 @@
 | S1 stills | 画像フォルダとZIPを2窓で開き、rootのsidecar取り込み・detached ZIPの読込、右寄せsingletonのactive/parked paint形状を確認 | draw時のmesh・出所、最終合成の安定化、入力desktop事前検査。単窓一覧遷移はT2 |
 | S2 | 静止画の列の押下・ドラッグ・release | egui pointer timeline、描画ownerの名前付き矩形、frame acknowledgment |
 | S3 | 動画canvasのzoomとstrip/panel/modalとの入力優先順位 | 実OSマウス入力、exact native target/矩形、実配送と処理の観測 |
+| AudioTracks | 再生中・一時停止中の音声切り替え、保存・F12・音声モード HUD | native Response の有効性と入力前の同一性、desired/applied と pump 周波数 |
+
+### AudioTracks の入力対象契約 (§1.319)
+
+`scripts/ui-smoke/audio-tracks.rhai` の再生中の切り替えは維持する。一時停止や固定 delay で
+メニュー初回表示を回避しない。`egui::Area` の初回 sizing pass は非表示・無効だが Response を
+生成し、仮サイズによる画面内補正と次回の実サイズによる補正で行の位置が変わり得る。
+診断投影は `Response.enabled()` を反映し、この pass をクリック候補として公開しない。
+音声ボタン・行と上部 panorama ボタンで同じ契約を使い、上部の明示 enabled と click sense も維持する。
+
+音声 control token は publish 回数ではなく owner、名前、Response の rect/interact rect/clip/layer/sense、
+有効性、DPI・client 寸法の同一性を表す。同一内容の commit では token を維持し、非表示・無効化・
+再出現・位置変更で更新する。commit serial は毎 commit で進むが、通常再生 tick だけでは
+control token を失効させない。クリック直前は唯一の候補の token・area・点に加え、既存の
+source/generation、host request/epoch/windows、overlay owner、canvas geometry/version の検査を通す。
+移動・置換された対象は `environment_failure` として入力前に停止し、再取得で黙って別対象を押さない。
+
+2026-10-02 の MAIN repo の 2 run は既定 880 Hz の確認後、Row(0) の入力前検査で停止した。
+保存ログには old/fresh の token・rect の対は無く、その実行時の差分値は復元できない。
+2026-10-04 の source 調査と実描画関数の headless テストで、初回 sizing pass の誤った
+enabled 投影と次回の位置変化を調べた。修正後の実アプリ PASS は利用者了承後の確認待ち。
+証跡の source `0f3399113` と今回の base `a0aea7fe2` の間で、調査対象の
+`native_ui_smoke.rs` / `native_presenter/render_core.rs` / `native_presenter/overlay_draw.rs` は同一。
+
+非対話検証 (2026-10-04、`next-audiotracks-smoke`、base `a0aea7fe2` 上の未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features portable,test-script native_ui_smoke`: 47 passed。
+  `target/atsmoke-native-tests.log`。うち新規 2 本は入力前再検査の許可・拒否を直接検査する。
+- 同 feature の `audio_track_smoke`: 1 passed (`target/atsmoke-menu-tests.log`)。
+  実描画関数で初回の無効性・次回の位置変更・その後の矩形安定を検査する。
+- 同 feature の `native_top_panorama`: 6 passed (`target/atsmoke-panorama-tests.log`)。
+  明示無効・初回 sizing・有効表示と既存 click attribution/API を維持する。
+- 同 feature の `audio_tracks_scenario_compiles_with_the_registered_api`: 1 passed
+  (`target/atsmoke-scenario-tests.log`)。実シナリオの操作列は変更なし。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`:
+  exit 0 (`target/atsmoke-check-normal.log` / `target/atsmoke-check-portable.log`)。
+- `cargo fmt --all --check`: exit 0 (`target/atsmoke-fmt.log`)。
+- `.\scripts\test-full.ps1 -SuppressCrashDialogs`: 初回 exit 1
+  (`target/atsmoke-full-tests.log`)。本体 10,225 passed / 51 ignored、UI snapshot 60 passed、
+  他 workspace target は成功し、失敗は `susie_integration` の 3 件だけ。ワークツリーには
+  plugin README しかなく、`ifpi.spi` / `ifmag.spi` が無いため loaded 0 だった。
+- MAIN のテスト素材から上記 2 SPI と `retro-images/formats/{pi,mag,bmp}/C165.*` の計 5 実ファイルを
+  ワークツリー内の同じ `testdata` パスへコピーし、reparse point 無し・既存ファイル非上書き・
+  source/destination SHA256 一致を検査した。すべて gitignore 対象で、製品コード・通常設定は変更なし。
+  `cargo test -p mimageviewer --test susie_integration -- --test-threads=1`: 8 passed / exit 0
+  (`target/atsmoke-susie-tests.log`)。
+- 初回ゲートが未到達だった vendor gate を同じ command で実行: `cargo test --manifest-path
+  vendor/egui/Cargo.toml --lib` は 25 passed、`cargo test --manifest-path vendor/egui-wgpu/Cargo.toml
+  --features winit --lib` は 9 passed、`cargo test --manifest-path vendor/eframe/Cargo.toml
+  --no-default-features --features wgpu --lib` は 16 passed。すべて exit 0
+  (`target/atsmoke-vendor-egui.log` / `target/atsmoke-vendor-egui-wgpu.log` / `target/atsmoke-vendor-eframe.log`)。
+  素材補完に影響されるのは Susie 統合テストだけと source で照合し、コード不変の本体・snapshot・
+  他 workspace の成功結果を再利用した。全項目の検証証拠は揃ったが、初回 script の非ゼロを
+  PASS に書き換えず、script 全体の再実行成功とは区別する。
+
+変更は `test-script` 診断とその headless テスト・文書に限定するため、通常 profile の確認用
+`build-dev.ps1` は今回の検証対象ではない。製品/runner の起動は実施していない。
+
+準備だけなら起動・入力は行わない:
+
+```powershell
+Set-Location C:\home\mimageviewer-epubroot
+.\scripts\prepare-portable-smoke.ps1 -TestScript
+```
+
+ClaudeCode は AudioTracks 1 回、起動後上限 240 秒（準備 build は別）、前面窓・マウス・キー入力と
+音声再生を使用すること、データは `target\portable-smoke\data`、証跡は `target\ui-smoke-runs` に
+限定することを説明し、利用者の明示了承後に実行する:
+
+```powershell
+Set-Location C:\home\mimageviewer-epubroot
+.\scripts\ui-smoke.ps1 -Scenario AudioTracks -SkipBuild -TimeoutSeconds 240 -InteractiveApproved
+```
+
+runner は `prepare-portable-smoke.ps1 -TestScript -SkipBuild` を内部でも呼び、生成証跡と exe の一致を
+検査して使い捨て data を作り直す。通常 profile の起動・停止や設定コピーは不要。
 
 ## S0: 配布物と診断成果物の分離
 
@@ -678,7 +754,7 @@ overlay自身がArc markerを所有し、catalog/準備済みtargetはWeakで同
 利用不可、同値なら元stamp/frameを保ったまま公開できる。旧sourceのframeを新sourceへ付け替えない。
 bind後の再描画待ちだけではpaused/cleanが固着するため、bootstrap/resizeを含む全render入口を覆う。
 
-位置は実Responseから採取し、明示enabled引数・actual click sense・rect/interact rect/layer/clipを保持する。
+位置は実Responseから採取し、明示enabled引数とResponse.enabled()の論理積・actual click sense・rect/interact rect/layer/clipを保持する。
 既存button helperは無効時にSense::hoverへ変えるので、Response.enabled()だけでは不十分である。
 対象状態の比較は寸法/ppp、Unknown/Panorama/NonPanorama、audio、pose/zoomの存在、
 実chrome・dim・modal・重なりの入力条件に絞る。右固定配置に無関係な時刻・filename・
@@ -693,7 +769,7 @@ App/current-source receiptと実OS point/layer確認は後続層であり、Resp
 2026-09-10にhover-onlyの最初の閉じた単位を実装した。`test-script` feature内で
 Canvas・TopHoverActivationを別のpoint/containment型としてprepareからpump/render receiptまで
 維持し、上端36ptのMouseMove完了後に、同じowner/source/hostでenabledになった実
-`native_top_panorama` Responseを待つ。Responseは`ui.interact`直後の明示enabled、sense、
+`native_top_panorama` Responseを待つ。Responseは`ui.interact`直後の明示enabledとResponse.enabled()の論理積、sense、
 rect/interact rect/layer/clipを保持する。final logical passだけをsurface present成功後にcommitし、
 ctor bootstrap・通常/overlay-only resize・event batch・tickは同じcommitted inventoryを更新する。
 source切替は旧inventoryを新epochへ結合する前に失効させ、overlay ctorの各試行は別Arc markerを持つ。

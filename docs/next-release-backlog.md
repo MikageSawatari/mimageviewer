@@ -110,8 +110,10 @@
 ### 1.319 ui-smoke AudioTracks が「native audio control Row(0) changed before input」で毎回止まる — smoke 実行記録 (2026-10-02)
 
 - 観測: v4.3.0 の配布前 smoke (使い捨て portable、source_head 0f3399113) で 2 回続けて同じ失敗。runner の分類は `environment_failure`。証跡 `target/ui-smoke-runs/20261002T005040656Z-250924-AudioTracks-430e3e66` と `...005111110Z-75016-AudioTracks-e1d38f63`。このシナリオは §1.251 S8 で作ってから一度も実行していなかった。
-- 失敗の手前までは進む: multi.mkv の再生と既定トラック (880 Hz、stream 2、Applied) の確認は通っている。止まるのは HUD の音声メニュー 1 行目を OS 入力でクリックする直前の再確認 ([native_ui_smoke.rs:1804](../src/video/native_ui_smoke.rs)) で、snapshot と入力直前とで target の token か位置が一致しない。
-- 原因は未特定。メニュー表示中に再生が進み、publish のたびに token が変わる設計なら smoke 側の前提が合っていない (推測)。製品の音声トラック切り替えは利用者が実機で確認済み (2026-09-30)。
+- 失敗の手前までは進む: multi.mkv の再生と既定トラック (880 Hz、stream 2、Applied) の確認は通っている。止まるのは HUD の音声メニュー 1 行目を OS 入力でクリックする直前の再確認 ([native_ui_smoke.rs の click_native_audio_control](../src/video/native_ui_smoke.rs)) で、snapshot と入力直前とで target の token か位置が一致しない。
+- 原因調査 (2026-10-04、コードと headless 描画テスト): `egui::Area` 初回の sizing pass は非表示・無効だが、音声メニューの診断投影は `enabled: true` を記録していた。Area が仮サイズを画面内へ収めた位置と、次回に実サイズを収めた位置は異なる。1920×1140 の headless 条件では Row(0) の上端が 746 → 980 points に移動し、実矩形変更により `NEXT_NAMED_TARGET_TOKEN` が進む。同一 owner/name/Response/area の commit は元から token を維持し、publish ごとの世代増加という仮説は該当しない。commit serial は毎 commit、target version は対象集合の変化時だけ進み、入力前検査はそれらを control token として比較していない。旧 2 run のログには比較前後の token/rect 値が無いため、当時の数値までは復元不可。製品の音声トラック切り替えは利用者が実機で確認済み (2026-09-30)。
+- 修正実装 (2026-10-04、実アプリ未検証): 音声行・ボタンの診断投影を実 `Response.enabled()` に合わせ、既存の候補待ちで初回 sizing pass を除外する。同じ潜在問題を持つ上部 panorama ボタンも明示 enabled と Response.enabled の両方を使う。token/area 一致は弱めず、音声クリックの再確認をテスト可能な helper にまとめ、source/generation・host request/epoch/windows・overlay owner・geometry/version の既存検査も適用する。再生中切り替えのシナリオは維持し、pause・delay・変更後の再取得は追加しない。
+- 検証: 初回 sizing → 表示 → 同一描画、同一 commit、無関係な control 追加、移動・同じ中心での resize・clip/layer・非表示再出現・無効化・DPI・source/host/owner 置換・候補重複の非対話回帰を追加。関連テストと check の結果は [smoke 設計](ui-smoke-automation-plan.md#audiotracks-の入力対象契約-1319) に記録する。ClaudeCode による独立レビューと利用者了承後の disposable portable `AudioTracks` 1 回が未完了。準備・実行コマンドは同節参照。実アプリ PASS までは完了扱いにしない。
 - v4.3.0 は他の 7 本 (MultiWindowPdf / Stills / RarNav / RatingSort / RatingSortCollection / FolderHistory / AlwaysOnTop) が PASS で、このシナリオは外して出荷する。
 
 ### 1.317 環境設定のエクスポート・インポート — 5ch >>498 からの検討 (2026-10-02)
