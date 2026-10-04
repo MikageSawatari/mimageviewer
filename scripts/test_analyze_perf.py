@@ -26,6 +26,7 @@ from analyze_perf import (
     cmd_idle_health,
     cmd_hitches,
     cmd_metadata_search,
+    cmd_memory,
     cmd_page_turn,
     cmd_pre_grid,
     cmd_remote_page,
@@ -1905,6 +1906,40 @@ class PreGridReportTests(unittest.TestCase):
         with contextlib.redirect_stdout(filtered_output):
             cmd_pre_grid(events, min_ms=15.0)
         self.assertIn("frames=1 / 2", filtered_output.getvalue())
+
+
+class MemoryTimelineTests(unittest.TestCase):
+    def test_timeline_sorts_samples_converts_bytes_and_keeps_stages_and_pid(self):
+        samples = [
+            {"t": 2.0, "cat": "process_memory", "kind": "end", "stage": "ai_runtime_init", "pid": 42,
+             "private_bytes": 5 * 1024 * 1024, "working_set_bytes": 3 * 1024 * 1024,
+             "peak_working_set_bytes": 4 * 1024 * 1024, "pagefile_bytes": 6 * 1024 * 1024},
+            {"t": 1.0, "cat": "process_memory", "kind": "sample", "stage": "startup_sampler", "pid": 42},
+            {"t": 0.0, "cat": "startup", "kind": "settings_load"},
+            {"t": 3.0, "cat": "process_memory", "kind": "query_failed", "stage": "pdf_pool_spawn", "error": 5},
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory(samples)
+        report = output.getvalue()
+        self.assertLess(report.index("startup_sampler"), report.index("ai_runtime_init"))
+        self.assertIn("42", report)
+        self.assertRegex(report, r"5\.00\s+3\.00\s+4\.00\s+6\.00\s+end / ai_runtime_init")
+        self.assertIn("Win32 error=5", report)
+        self.assertNotIn("settings_load", report)
+
+    def test_old_logs_and_memory_cli(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory([{"cat": "startup", "kind": "first_frame"}])
+        self.assertIn("process_memory イベントなし", output.getvalue())
+        with mock.patch.object(sys, "argv", ["analyze_perf.py", "unused.jsonl", "memory"]), \
+                mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch("analyze_perf.load_events", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch("analyze_perf.cmd_memory") as command:
+            main()
+        command.assert_called_once_with([])
 
 
 if __name__ == "__main__":

@@ -692,6 +692,7 @@ static INIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// `get_pool()` の待機者は INIT_TIMEOUT (= 5s) 後に empty_pool を取って先へ進める。
 /// 後で hang が解けた場合は swap が走り、それ以降の `get_pool()` 呼び出しは real pool を見る。
 pub fn init_pool(enabled: bool, parallel: bool) {
+    let _memory = crate::perf::memory::span("susie_pool_init");
     use std::sync::atomic::Ordering;
     // Step 0: 世代スナップショット (Codex P2 v14c 2026-05-14)。
     let my_gen = INIT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;

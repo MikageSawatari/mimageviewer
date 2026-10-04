@@ -99,7 +99,10 @@
 - 観測 (サブPCの Windows Sandbox、利用者が確認): v4.3.0 の単体exe版を日本語を含む APPDATA で初回起動した約 26 秒後に WER 1001 `RADAR_PRE_LEAK_64` (P1 mimageviewer-core.exe 4.3.0.0、ダンプなし)。クラッシュ・ハングではなく、mIV は応答を続けて正常終了。インストール版の初回起動では出ていない。
 - 2 回目の配布ビルド (告知修正後) でもサブPCの自動計測で再度出た: 日本語 APPDATA の単体exe版を起動して約 29 秒後に 1 件、Fault bucket は前回と同じ 2116605665071906769 (type 5)、ダンプなし (WER\Temp は収集時点で消えていた)。初回・2 回目のインストール版起動では両ビルドとも出ていない。mIV は応答を続け 1.0 秒で正常終了。
 - 推測: 初回の展開 (AI モデル・ONNX Runtime・EffeTune など) と起動処理が重なって、確保済みメモリがしきい値を超えた。発生条件の違いは未確認。
-- 次の一手: 初回起動直後のメモリ使用量 (private bytes / working set) を perf ログに記録し、どの段階で増えるかを見る。必要なら展開や初期化を遅らせる。
+- 設計決定 (2026-10-05、利用者指定): core のみを計測する。EffeTune / DLL / exe の launcher 展開は core 起動前で、core の private bytes には含まれない。launcher logger / ログ受け渡しは追加しない。上記のメモリ増加原因は推測のままで、計装を追加しても RADAR の原因特定・修正とは扱わない。
+- 実装済み (2026-10-05、独立レビュー待ち): core の startup milestone と AI runtime / EffeTune / PDF pool / Susie init の begin/end に `process_memory` を追加。private commit / working set / peak working set / pagefile commit charge、PID、stage を記録し、perf 有効時だけ起動する 1 秒周期 sampler は core 起動から 60 秒で終了。初期化順・機能は変えない。正本は [ui-responsiveness.md §6.2](ui-responsiveness.md#62-core-の起動メモリ診断-1322)。
+- 自動検証: `perf::memory::tests` 2 件、AI runtime `init_owner_` 6 件、`python scripts/test_analyze_perf.py` 64 件成功。通常 / portable の core `cargo check`、`cargo fmt --check`、`git diff --check` 成功。メモリ API テストの計測対象は unit test process で、製品の起動観測ではない。
+- 次の一手: 利用者の初回 Sandbox 環境で単体 exe を `.\mimageviewer.exe --perf-log` として起動し、60 秒以上経過後に終了。launcher が `--perf-log` を core に転送することをコードで確認済み。`%APPDATA%\mimageviewer\logs\perf_events.jsonl` を回収し、`python scripts/analyze_perf.py <log> memory` と `startup` で WER 時刻と stage を照合する。設定の性能ログ ON はモデル / Susie worker 展開後の有効化なので、初回の全区間を採取するには CLI を使う。今回の実装担当は製品起動・RADAR 再現を行っていない。
 
 ### 1.321 search_metadata_e2e の負荷時失敗 — 初期化漏れ修正済み、強負荷での別失敗は未解決 (2026-10-04)
 

@@ -570,6 +570,51 @@ JIT コンパイル + 初回テクスチャアップロードがある。`t=0.98
 
 ---
 
+### 6.2 core の起動メモリ診断 (§1.322)
+
+perf 有効時の `process_memory` イベントは、core 自身の
+`GetProcessMemoryInfo` / `PROCESS_MEMORY_COUNTERS_EX` を次の byte 値で記録する。
+launcher や PDF / Susie / VST / TensorRT 子プロセスのメモリは合算しない。
+
+| 属性 | Win32 の値 / 意味 |
+| --- | --- |
+| `private_bytes` | `PrivateUsage`、core の private commit |
+| `working_set_bytes` | `WorkingSetSize`、現在の working set |
+| `peak_working_set_bytes` | `PeakWorkingSetSize`、プロセス起動以来の peak working set |
+| `pagefile_bytes` | `PagefileUsage`、commit charge (実際の pagefile 上の使用量とは異なる) |
+
+成功レコードには `pid`、`stage`、`kind` (`milestone` / `begin` / `end` / `sample`) と、
+既存共通属性 `t` (core 起動から秒) が付く。取得失敗は `kind=query_failed`、`stage` と
+Win32 `error` で記録する。
+既存の全 `startup.*` イベント (モデル / Susie worker 展開、設定読込、DB、first_frame など)
+でメモリを 1 回取得する。AI runtime init worker、Susie init、PDF pool spawn、
+EffeTune bundle resolve / load には begin/end が付く。これらの span は開始が core 起動後
+60 秒未満の場合だけ採取し、end は完了時に記録する (失敗・早期 return も含む)。
+UI 上の milestone は 1 回のメモリ情報取得だけで、列挙や待機を追加しない。
+
+perf 有効化時の baseline と、専用 `startup-memory-sampler` thread による約 1 秒周期の
+sample も記録する。周期の基準は perf 有効化時ではなく core 起動時で、60 秒で thread は終了。
+遅れた tick をまとめて出す catch-up や repaint はない。perf 無効時は thread を作らず、
+追加の時計読み・メモリ API 呼出しも行わない。Span と共通 helper で既存の初期化順を維持し、
+ログのための待機状態や launcher との受け渡しは追加していない。
+
+初回起動を採取するには、起動前に単体 exe に `--perf-log` を付ける。
+launcher の `cmd.args(&user_args)` が core へ転送することをコードで確認した。
+保存設定の性能ログ ON はモデル / Susie worker 展開と設定読込の後に適用されるため、
+初回の全区間の採取には使えない。launcher の展開は core がまだ存在しない段階で行われ、
+core の private bytes に含まれない。WER の P1 が core だった利用者記録の調査対象も core に限定する。
+
+```powershell
+# 利用者が初回環境で単体 exe を起動し、60 秒以上経過後に終了してログを回収する
+.\mimageviewer.exe --perf-log
+$Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
+python scripts\analyze_perf.py $Perf memory  # byte 値を MiB に換算、時刻順に PID / stage と表示
+python scripts\analyze_perf.py $Perf startup
+```
+
+この計装は原因の特定やメモリリークの判定自体を行うものではない。
+利用者の Sandbox 再採取と WER 時刻との照合は未実施。
+
 ## 7. 測定手順
 
 起動時 + ナビゲーションを計測する標準手順。

@@ -35,6 +35,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     startup             起動時間のフェーズ別 breakdown (data_dir / models /
                         susie_worker / settings / icon / fonts / theme / app_default /
                         creator_enter/exit / first_frame) を表示
+    memory              core の起動後 60 秒のプロセスメモリ時系列 (MiB) を表示
     av_drift [--plot]   動画再生中の音声・映像同期 (A/V drift) と audio underrun /
                         audio_pts_jump / Norm 操作 を時系列で集計する。
                         --plot で matplotlib グラフを開く
@@ -1701,6 +1702,28 @@ def cmd_nav(events: list[dict]) -> None:
 # -----------------------------------------------------------------------
 # startup — 起動時間のフェーズ別 breakdown
 # -----------------------------------------------------------------------
+
+def cmd_memory(events: list[dict]) -> None:
+    """Core PROCESS_MEMORY_COUNTERS_EX samples; keep stage and PID visible."""
+    samples = sorted(
+        (e for e in events if e.get("cat") == "process_memory"),
+        key=lambda e: e.get("t", 0.0),
+    )
+    if not samples:
+        print("(process_memory イベントなし — 初回起動から --perf-log で採取してください)")
+        return
+    print("core プロセスメモリ時系列 (MiB; private = commit、pagefile = commit charge):")
+    print(f"{'t(s)':>8} {'pid':>7} {'private':>10} {'working':>10} {'peak WS':>10} {'pagefile':>10}  kind / stage")
+    for event in samples:
+        values = [
+            f"{float(event[field]) / (1024 * 1024):10.2f}" if field in event else f"{'-':>10}"
+            for field in ("private_bytes", "working_set_bytes", "peak_working_set_bytes", "pagefile_bytes")
+        ]
+        detail = f"{event.get('kind', '?')} / {event.get('stage', '?')}"
+        if event.get("kind") == "query_failed":
+            detail += f" (Win32 error={event.get('error', '?')})"
+        print(f"{event.get('t', 0.0):8.3f} {str(event.get('pid', '-')):>7} {' '.join(values)}  {detail}")
+
 
 def cmd_startup(events: list[dict]) -> None:
     """main() 入口から first_frame までの各フェーズ経過時間を表示する。
@@ -3513,6 +3536,7 @@ def main() -> None:
     subs.add_parser("colorize")
     subs.add_parser("nav")
     subs.add_parser("startup")
+    subs.add_parser("memory")
     subs.add_parser("collection")
     p_pre_grid = subs.add_parser("pre-grid")
     p_pre_grid.add_argument(
@@ -3608,6 +3632,8 @@ def main() -> None:
         cmd_nav(events)
     elif args.cmd == "startup":
         cmd_startup(events)
+    elif args.cmd == "memory":
+        cmd_memory(events)
     elif args.cmd == "collection":
         cmd_collection(events)
     elif args.cmd == "pre-grid":

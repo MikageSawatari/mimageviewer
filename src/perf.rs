@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+pub(crate) mod memory;
 pub(crate) mod stall;
 static HOLDER: stall::Holder = stall::Holder::new();
 
@@ -95,6 +96,8 @@ pub fn init_with_path(
                     &[("pid", Value::from(std::process::id()))],
                 );
                 flush();
+                memory::emit("perf_enabled", "milestone");
+                memory::start_sampler();
                 crate::logger::log(format!("perf: JSONL log enabled at {}", log_path.display()));
             }
         }
@@ -225,6 +228,11 @@ pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str
         if let (Some(p), Some(ended)) = (probe, ended) {
             p.finish(ended, write_ms, 0.0, diagnostic_ms);
         }
+    }
+    // One process-memory query per startup marker, after releasing the log lock.
+    // Memory events use their own category so they cannot recurse into this hook.
+    if cat == "startup" {
+        memory::emit(kind, "milestone");
     }
 }
 
