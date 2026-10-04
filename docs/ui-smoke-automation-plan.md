@@ -19,6 +19,324 @@
 | S1 stills | 画像フォルダとZIPを2窓で開き、rootのsidecar取り込み・detached ZIPの読込、右寄せsingletonのactive/parked paint形状を確認 | draw時のmesh・出所、最終合成の安定化、入力desktop事前検査。単窓一覧遷移はT2 |
 | S2 | 静止画の列の押下・ドラッグ・release | egui pointer timeline、描画ownerの名前付き矩形、frame acknowledgment |
 | S3 | 動画canvasのzoomとstrip/panel/modalとの入力優先順位 | 実OSマウス入力、exact native target/矩形、実配送と処理の観測 |
+| AudioTracks | 再生中・一時停止中の音声切り替え、保存・F12・音声モード HUD | native Response の有効性と入力前の同一性、desired/applied と pump 周波数 |
+
+### AudioTracks の入力対象契約 (§1.319)
+
+`scripts/ui-smoke/audio-tracks.rhai` の再生中の切り替えは維持する。一時停止や固定 delay で
+メニュー初回表示を回避しない。`egui::Area` の初回 sizing pass は非表示・無効だが Response を
+生成し、仮サイズによる画面内補正と次回の実サイズによる補正で行の位置が変わり得る。
+診断投影は `Response.enabled()` を反映し、この pass をクリック候補として公開しない。
+音声ボタン・行と上部 panorama ボタンで同じ契約を使い、上部の明示 enabled と click sense も維持する。
+
+音声 control token は publish 回数ではなく owner、名前、Response の rect/interact rect/clip/layer/sense、
+有効性、DPI・client 寸法の同一性を表す。同一内容の commit では token を維持し、非表示・無効化・
+再出現・位置変更で更新する。commit serial は毎 commit で進むが、通常再生 tick だけでは
+control token を失効させない。クリック直前は唯一の候補の token・area・点に加え、既存の
+source/generation、host request/epoch/windows、overlay owner、canvas geometry/version の検査を通す。
+移動・置換された対象は `environment_failure` として入力前に停止し、再取得で黙って別対象を押さない。
+
+2026-10-02 の MAIN repo の 2 run は既定 880 Hz の確認後、Row(0) の入力前検査で停止した。
+保存ログには old/fresh の token・rect の対は無く、その実行時の差分値は復元できない。
+2026-10-04 の source 調査と実描画関数の headless テストで、初回 sizing pass の誤った
+enabled 投影と次回の位置変化を調べた。修正 c998db1cb は独立レビュー済みで、
+利用者了承後の 2 run で再生中 440 Hz への OS クリック切り替えが成功した（次項）。
+証跡の source `0f3399113` と今回の base `a0aea7fe2` の間で、調査対象の
+`native_ui_smoke.rs` / `native_presenter/render_core.rs` / `native_presenter/overlay_draw.rs` は同一。
+
+非対話検証 (2026-10-04、`next-audiotracks-smoke`、base `a0aea7fe2` 上の未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features portable,test-script native_ui_smoke`: 47 passed。
+  `target/atsmoke-native-tests.log`。うち新規 2 本は入力前再検査の許可・拒否を直接検査する。
+- 同 feature の `audio_track_smoke`: 1 passed (`target/atsmoke-menu-tests.log`)。
+  実描画関数で初回の無効性・次回の位置変更・その後の矩形安定を検査する。
+- 同 feature の `native_top_panorama`: 6 passed (`target/atsmoke-panorama-tests.log`)。
+  明示無効・初回 sizing・有効表示と既存 click attribution/API を維持する。
+- 同 feature の `audio_tracks_scenario_compiles_with_the_registered_api`: 1 passed
+  (`target/atsmoke-scenario-tests.log`)。実シナリオの操作列は変更なし。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`:
+  exit 0 (`target/atsmoke-check-normal.log` / `target/atsmoke-check-portable.log`)。
+- `cargo fmt --all --check`: exit 0 (`target/atsmoke-fmt.log`)。
+- `.\scripts\test-full.ps1 -SuppressCrashDialogs`: 初回 exit 1
+  (`target/atsmoke-full-tests.log`)。本体 10,225 passed / 51 ignored、UI snapshot 60 passed、
+  他 workspace target は成功し、失敗は `susie_integration` の 3 件だけ。ワークツリーには
+  plugin README しかなく、`ifpi.spi` / `ifmag.spi` が無いため loaded 0 だった。
+- MAIN のテスト素材から上記 2 SPI と `retro-images/formats/{pi,mag,bmp}/C165.*` の計 5 実ファイルを
+  ワークツリー内の同じ `testdata` パスへコピーし、reparse point 無し・既存ファイル非上書き・
+  source/destination SHA256 一致を検査した。すべて gitignore 対象で、製品コード・通常設定は変更なし。
+  `cargo test -p mimageviewer --test susie_integration -- --test-threads=1`: 8 passed / exit 0
+  (`target/atsmoke-susie-tests.log`)。
+- 初回ゲートが未到達だった vendor gate を同じ command で実行: `cargo test --manifest-path
+  vendor/egui/Cargo.toml --lib` は 25 passed、`cargo test --manifest-path vendor/egui-wgpu/Cargo.toml
+  --features winit --lib` は 9 passed、`cargo test --manifest-path vendor/eframe/Cargo.toml
+  --no-default-features --features wgpu --lib` は 16 passed。すべて exit 0
+  (`target/atsmoke-vendor-egui.log` / `target/atsmoke-vendor-egui-wgpu.log` / `target/atsmoke-vendor-eframe.log`)。
+  素材補完に影響されるのは Susie 統合テストだけと source で照合し、コード不変の本体・snapshot・
+  他 workspace の成功結果を再利用した。全項目の検証証拠は揃ったが、初回 script の非ゼロを
+  PASS に書き換えず、script 全体の再実行成功とは区別する。
+
+変更は `test-script` 診断とその headless テスト・文書に限定するため、通常 profile の確認用
+`build-dev.ps1` は確認 binary の対象ではない。上記の初回修正・非対話検証では実装担当による
+製品/runner の起動は実施していない。
+
+#### native HUD クリック後の Targeted action の focus (2026-10-04 追補)
+
+ClaudeCode が利用者の明示了承後に c998db1cb で実行した証跡は
+`target/ui-smoke-runs/20261004T100833327Z-53356-AudioTracks-ce2c6702` と
+`.../20261004T101801866Z-44908-AudioTracks-966f668f`。2 回とも再生中の
+440 Hz 切り替えが通り、後者は 2.088 s に確認した。その直後の `VideoSeekStart` は
+`AwaitingDetachedOwner` → `action target ready` まで進み、viewport `5361` の
+`Focus` 前後が `has_focus=false` のまま 240 秒で timeout。後者の app log は
+`target/portable-smoke/data/logs/mimageviewer.log` とも照合した。
+
+native presenter は通常の keyboard/IME owner で、egui viewport の focus=false は単独では
+異常ではない。`WM_KEYDOWN` → Window event → native handler で `VideoSeekStart` も処理する。
+この証跡は実キーの紛失を記録したものではない。一方 `run_action` は S1b の semantic action で、
+egui handler の focus/owner guard を通す契約である。Windows winit 0.30.13 の
+`focus_window` は target HWND が既に `GetForegroundWindow()` なら処理を省くため、
+前面の親と keyboard focus を持つ native 子を区別できず、取得要求が満たされない。
+クリック直前の native 検査は presenter の `GA_ROOT` と foreground が owner に一致することを要求し、
+ログにも presenter の focus 取得がある。ただし選択後の `GetFocus()` 値自体は旧ログにない。
+
+診断の Targeted focus 取得を共通 helper に揃える。full current identity と backend witness を
+再確認し、target HWND が既に foreground の場合だけ既存 `claim_foreground` で親の
+keyboard focus を取得する。他 HWND が foreground なら従来の `ViewportCommand::Focus` を使う。
+root の受付と detached の active／通常 activation 完了の 3 経路で同じ処理を使う。
+claim の成功を配送許可とせず、従来通り実 egui focus・foreground・backend identity と通常
+handler の eligible pass／consumer ack を待つ。音声切り替え後の製品 focus 方針、native
+キー配送、シナリオ操作列は変更しない。native へ直接 action を投げる案は S1b の検査経路を
+別実装にするため採用せず、pause／delay／再試行も加えない。
+
+回帰は headless／fake focus request で、root／detached の前面親への claim 順序、別の前面窓への
+強制 claim 禁止、logical identity／backend 置換時の入力禁止、focus 未観測時の待機、兄弟 handler
+拒否・exact owner の一回だけの ack を検査する。native Window event の handler テストは
+egui focus=false で既定 W と remap F15 の seek、および repeat 抑止を検査する。
+実 HWND の focus 回復と AudioTracks 全体の PASS は次回、利用者の明示了承を得た run で確認する。
+
+この round の非対話検証 (2026-10-04、c998db1cb 上の未コミット差分、すべて exit 0):
+
+- `cargo test -p mimageviewer --lib --features portable,test-script targeted_focus`: 新規 4 passed
+  (`target/atsmoke-focus-tests.log`)。以下の 107 件にも含まれる。
+- 同 command の filter `test_script`: 107 passed (`target/atsmoke-focus-script-tests.log`)。
+  `configurable_video_seek_dispatch_tests`: 15 passed (`target/atsmoke-focus-native-key-tests.log`)。
+  `native_ui_smoke`: 47 passed (`target/atsmoke-focus-native-controls.log`)。
+- `cargo test -p mimageviewer --lib native_seek_start_window_event_works_without_egui_viewport_focus`:
+  1 passed、通常 feature でも新規 native handler 回帰を検査 (`target/atsmoke-focus-native-key-normal.log`)。
+- `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features
+  --features wgpu,miv-test-script-window-witness --lib`: 20 passed (`target/atsmoke-focus-witness-tests.log`)。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と `--features portable`:
+  exit 0 (`target/atsmoke-focus-check-normal.log` / `target/atsmoke-focus-check-portable.log`)。
+  `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-focus-fmt.log`)。
+
+通常製品の変更はなく、新しい native handler テストだけは通常 feature でも再実行した。
+build/test 方針の再利用条件に従い、前 round の本体・snapshot・Susie・vendor の有効な証拠を
+再利用し、今回は `test-full.ps1` を再実行していない。前 round の初回 script exit 1 と
+素材補完後の個別 gate 成功という区別は上記の記録通り維持する。
+独立 Codex（gpt-6.1-sol / xhigh）の設計・実装レビューは承認済み。ClaudeCode の検収と
+live 全体 PASS は未了。通常 profile の `build-dev.ps1` は診断専用変更の確認 binary としては
+対象外で、修正入りの診断 portable は次の準備 command で再ビルドする。実装担当は起動していない。
+
+#### root native fullscreen の semantic probe と待機期限 (2026-10-04 第3 round)
+
+0072aced5 は独立レビューで structural／test-script 限定として承認され、利用者了承後に
+ClaudeCode が `target/ui-smoke-runs/20261004T135833517Z-11688-AudioTracks-352e9a51` を実行した。
+再生中・停止中の切り替え、再開、保存行3からの開き直し、detached → root の F12 まで通過した。
+次の root → detached は 2.267 s に focus ready となり、その後は native backdrop の heartbeat と
+動画ループが続き 240秒 timeout。同 run と `target/portable-smoke/data/logs/mimageviewer.log` を照合した。
+
+停止は `run_action` の consumer ACK 待ちで、後続の30秒 `wait_until` は未実行だった。
+backdrop の早期 return より前にある既存 `handle_fullscreen_root_key_input` の入口 probe が
+egui `Event::Key` しか見ず、semantic PendingAction では `handle_fs_key_input` →
+`handle_video_input` に入らない。後段の main F12 handler にも届かない。root fullscreen の
+seek／音声モードなども同じ入口を使う。製品の native F12 は Global／Press の
+`ToggleDetachedViewerMode` から共通 `toggle_detached_viewer_mode` に届く。media を別窓で開く
+設定では root → `DetachedWindow` を一時要求し、既定 open 方針を保存変更しない。
+シナリオの期待は製品経路と一致し、この実行は製品の実キー不動作を示していない。
+
+修正は既存 root probe に test-script 限定の読み取り専用照会を接続する。exact current owner／
+active backend witness、`AwaitingPass`、未 ACK の Press action と active command scope を照合する。
+probe は consume／peek／成功 ACK を発行せず、既存の focus／modal／IME／edit guard を通った
+本来の handler だけが消費する。実キーイベントがない新入口では既存 KeyboardOwner の
+`blocks_legacy_keymap_shortcuts` も照合し、Focused TextInput／FocusedUi を拒否する。
+S3 の互換仕様通り PendingFocus だけではブロックしない。既存の実キーイベントがある入口や
+他の semantic consumer は変更しない。実キーと semantic action が同じ pass に混在したとき、
+Keymap の先行 semantic consume が text 判定を迂回する既存挙動は今回の修正範囲外である。
+Legacy、native VK、製品の F12 routing と scenario 列は変更しない。
+専用 F12 consumer／handler 直呼び／新しい detached state は加えない。
+
+`run_action(name)` は受付から consumer 到達まで monotonic 30秒の予算を持つ。
+`run_action(name, timeout_ms)` でも指定でき、0／負数は拒否する。phase ごとに期限を延長しない。
+同じ deadline を共有 ActionRequest で UI に渡す。短い request lock 内の時計読取を確定点として、
+Undelivered から Delivered（到達時刻 < deadline）か Rejected（期限切れ／handler 拒否）の一方へ移す。
+worker と UI の consume／最初の pressed-action peek／probe／activation 取得が同じ outcome を照合し、
+worker が遅れたり Interrupt がまだ未公開でも、期限後の未配送要求を消費しない。
+UI が処理しなくても worker は診断取得前に期限切れを確定してから、既存 Interrupt を失敗へ移し
+`environment_failure` にする。ACK channel は通知だけで、成功通知単独を配送の証明としない。
+期限前の Delivered は ACK の観測が遅れても成功で、同 pass の後続 peek も維持する。
+consumer に届いた処理を rollback はしない。
+UI 更新で既存終了処理が pending を解放する。診断は action・exact selected owner、取得 phase、
+publishing pass owner／eligible、snapshot frame、fullscreen／fs_idx、focus／登録、modal／IME／text／popup。
+snapshot は frame 冒頭の観測であり、直後の handler 結果とは扱わない。consumer ACK と操作結果は別のまま。
+
+`wait_until` の既存期限にも owner／snapshot 診断を加える。正の予算を過ぎて戻った predicate の
+true は失敗とし、0 は一回の即時判定を維持する。任意の native API 内を強制中断する機能ではなく、
+Rhai の既存 operation limit／Interrupt も維持する。実 HWND の新 detached 生成と全体 PASS は
+次回、利用者の明示了承を得た run で確認する。
+
+非対話検証 (2026-10-04、`next-audiotracks-smoke`、base `0072aced5` 上の未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features test-script test_script`: 112 passed
+  (`target/atsmoke-root-script-tests.log`)。新規5件は exact phase／scope の非消費 probe、
+  3 action × focus／modal／Focused TextEdit／IME／edit と通常 handler の配送、取得中各 phase と
+  UI 未受付の ACK 期限、期限後 consume／peek／probe／activation 拒否、wait_until の診断を検査する。
+  handler の初期 fixture は main HWND が無く、次の fixture は非 blocking の PendingFocus を
+  blocking と誤認して失敗した。実 backend witness／main HWND と Focused TextEdit に直し、
+  狭い handler 再実行も 1 passed (`target/atsmoke-root-handler-tests.log`)。期待値は緩和していない。
+- 同 command の `native_ui_smoke`: 47 passed (`target/atsmoke-root-native-smoke-tests.log`)。
+  入力前の exact target 再検査は不変。
+- 同 command の `root_f12`: 4 passed、`native_video_f12`: 3 passed、`always_new_media_f12`: 2 passed
+  (`target/atsmoke-root-f12-tests.log` / `target/atsmoke-root-native-f12-tests.log` /
+  `target/atsmoke-root-media-f12-tests.log`)。実キー入口と一時的な別窓切り替えの既存回帰。
+- `cargo test -p mimageviewer --lib test_script`: 86 passed
+  (`target/atsmoke-root-normal-script-tests.log`)。feature 無しでも deadline／診断の単体回帰を確認。
+- `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features
+  --features wgpu,miv-test-script-window-witness --lib`: 20 passed
+  (`target/atsmoke-root-witness-tests.log`)。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`、
+  `--features portable,test-script`: すべて exit 0 (`target/atsmoke-root-check-normal.log` /
+  `target/atsmoke-root-check-portable.log` / `target/atsmoke-root-check-diagnostic.log`)。
+- `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-root-fmt.log`)。
+
+独立 Codex（gpt-6.1-sol / xhigh）は scoped probe／deadline と追加 text fixture／guard を承認した。
+混在キー pass を含む既存 consumer の text 判定順は上記の限定通り文書へ記録した。
+通常 feature の product 入力・切り替え state と依存／fixture は不変のため、前 round の有効な
+本体・snapshot・Susie・vendor gate を再利用し、変更した診断 suite は今回再実行した。
+通常 profile の `build-dev.ps1` は診断専用差分の確認 binary 対象外。製品／runner は起動していない。
+ClaudeCode の検収と新しい実 HWND の生成・全体 live PASS は未了。
+
+#### ee0eedb23 の期限競合 P2 追補 (2026-10-05)
+
+独立レビューは routing／cfg 隔離／probe の owner・phase・scope 照合と detached 記録を承認したが、
+worker 内だけの期限と Interrupt 公開に依存した拒否へ P2 を指摘した。worker が遅れた場合や、
+期限を検出して snapshot 診断を集めている間には UI が未配送要求を消費でき、期限後の ACK を
+無条件に成功へ読み替える分岐もあった。上の期限契約はこの追補の共有 request 修正後のもの。
+
+request は immutable deadline と typed outcome を一つだけ所有し、PendingAction の ACK Option を
+置き換える。最初の terminal transition の勝者だけが lock 解放後に通知を送る。
+lock 内には診断・channel send・App／OS 操作・待機を入れない。worker は通常受信・期限到達・
+channel 切断のすべてで outcome を正本とし、期限切れ確定後に診断を取得する。
+timeout 診断の snapshot は一回の try_read とし、競合なら unavailable を記録して待たない。
+
+detached acquisition は exact request Arc を含む handle を返す。初期 root focus、active detached の
+focus、passive activation の queue 直前、完了後の focus、phase promotion／完了で期限を照合する。
+同じ owner の別 request へ完了を再結合しない。取得の開始 admission は配送 ACK と別であり、
+期限前に開始した focus／queue+commit が後から完了することは許すが、後続 consumer の到達期限は
+延長しない。timeout 後の rollback／新しい manager intent／in-flight state は加えない。
+modal 化や pause は worker と UI の期限所有のずれを解消しないため採用しない。
+
+旧 112 件の検証は Interrupt 公開後の拒否を確認していたが、公開前の競合を覆っていなかった。
+今回の追加回帰は診断取得を一時停止した gap、worker 未実行、request lock 取得後の時計読取、
+期限前到達の遅い ACK と同 pass の peek、期限後の未証明成功 ACK、同 owner の request 置換、
+snapshot writer 競合を検査する。新しい live は未実施で、全体 PASS は未確認。
+
+非対話検証 (2026-10-05、`next-audiotracks-smoke`、base `ee0eedb23` 上の P2 未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features test-script test_script`: 118 passed
+  (`target/atsmoke-p2-script-tests.log`)。上記6新規回帰と既存 owner／scope／handler guard を検査。
+- `cargo test -p mimageviewer --lib test_script`: 92 passed (`target/atsmoke-p2-normal-tests.log`)。
+  新規6件は通常 feature の単体回帰でも実行した。
+- 同 feature 付き command の `native_ui_smoke`: 47 passed、`root_f12`: 4 passed、
+  `native_video_f12`: 3 passed、`always_new_media_f12`: 2 passed
+  (`target/atsmoke-p2-native-smoke-tests.log` / `target/atsmoke-p2-root-f12-tests.log` /
+  `target/atsmoke-p2-native-f12-tests.log` / `target/atsmoke-p2-media-f12-tests.log`)。
+- `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features
+  --features wgpu,miv-test-script-window-witness --lib`: 20 passed (`target/atsmoke-p2-witness-tests.log`)。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`、
+  `--features portable,test-script`: exit 0 (`target/atsmoke-p2-check-normal.log` /
+  `target/atsmoke-p2-check-portable.log` / `target/atsmoke-p2-check-diagnostic.log`)。
+- `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-p2-fmt.log`)。
+
+すべて正常終了。独立 Codex（gpt-6.1-sol / xhigh）は設計と最終実装を承認した。
+通常 product の入力・state／依存／fixture は不変で、既存の広い gate の有効な証拠は再利用する。
+通常 profile の確認 binary は診断限定差分の対象外。実装担当は製品／runner を起動していない。
+ClaudeCode の P2 検収と新たな明示了承後の live 全体 PASS は引き継ぐ。
+
+#### F12 の Opening host と active presentation の区別 (2026-10-05 第5 round)
+
+利用者了承後の `20261004T154102775Z-79036-AudioTracks-b6d55588` は root F12 の旧停止点を
+通過し、約4秒で ScriptFailure（exit 1、runner timeout ではない）になった。
+保存した manifest の `source_head` と調査 worktree の HEAD は `e1ffd0c25`。
+`logs/mimageviewer.log` と `screenshots/01-failure-root.png` を source と照合した。
+2.053秒の `[fs-key] source=root ... semantic:ToggleDetachedViewerMode`、2.054秒の
+`bundle_fullscreen_idx=Some(0) video_cache_entries=1` と presentation transition 2 の開始は、
+root が開いている動画の F12 切り替えを処理した証拠である。画面の grid／ON toast は移行中の
+root 表示で、動画なしの grid で既定設定だけを切り替えたことを意味しない。
+共通 `toggle_detached_viewer_mode` はこの動画を新しい DetachedWindow presentation へ移す。
+
+window 3 は正当な新しい移行先である。2.068秒には HWND／backend が登録されるが、窓は
+非表示、lifecycle は `Opening`、active session は None のまま。`host_ready` は exact host
+identity が存在するという診断であり、presentation の完了を表さない。
+旧 `detached_video(s)` は role／host_ready／media_kind だけを見たため、30秒 wait は既に true と
+なり、2.083秒に移行中の owner を選択した。2.085秒の `VideoSeekStart` は active session の
+経路に入れず、通常の passive activation が `Mounted` context を拒否している。
+これは正しい ownership 検査で、Mounted 全般を許可したり activation を重ねてはならない。
+native presenter の準備はその後も進み、2.163秒に initial composition ready、2.215秒に
+シナリオ失敗に伴う終了で transition が取消される。製品の移行失敗を示すログではない。
+
+シナリオの `detached_video` に既存 `presentation == "active_immediate"` を要求する。
+native reducer の exact `NativeCommitted` → `ApplyPresentation` が active session を開始し、
+その session の実 viewport render だけが Opening／Resuming → Active を昇格させる。
+HWND 登録と active presentation を区別する既存 lifecycle の契約を使い、固定 delay／retry、
+新しい状態、activation の変更は追加しない。初回 open・開き直し・F12 のすべてが同じ helper
+で readiness を確認する。音声／周波数の確認と全操作列、exact owner／backend／focus／handler／
+deadline、native control の入力前検査は維持する。製品コードは変更しない。
+
+回帰は実 `.rhai` から helper 関数だけを実行し、registered Mounted Opening と parked／終了中、
+未登録／別 role／別 media の除外、および同じ Mounted owner の Active 後の選択を検査する。
+App の読み取り専用 presentation 投影も Opening／Resuming／Closing と Active を区別する。
+非対話検証結果は以下に記録する。製品／runner は実装担当が起動せず、全体 live PASS は未確認。
+通常 profile の確認 binary はシナリオとテストだけの差分のため対象外。
+
+非対話検証 (2026-10-05、`next-audiotracks-smoke`、base `e1ffd0c25` 上の未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features test-script audio_tracks_scenario`: 2 passed
+  (`target/atsmoke-opening-scenario-tests.log`)。新テストの最初の compile は型別名 `INT` の未修飾で
+  exit 1。`rhai::INT` に修正後に再実行した。製品・テスト期待値の変更による回避はない。
+- `cargo test -p mimageviewer --lib --features test-script test_script`: 120 passed
+  (`target/atsmoke-opening-script-tests.log`)。新規2件と既存 deadline／owner／scope／handler 回帰を検査。
+- 同 feature 付き command の `native_ui_smoke`: 47 passed、`root_f12`: 4 passed、
+  `native_video_f12`: 3 passed、`always_new_media_f12`: 2 passed
+  (`target/atsmoke-opening-native-smoke-tests.log` / `target/atsmoke-opening-root-f12-tests.log` /
+  `target/atsmoke-opening-native-f12-tests.log` / `target/atsmoke-opening-media-f12-tests.log`)。
+- `cargo test -p mimageviewer --lib test_script`: 92 passed
+  (`target/atsmoke-opening-normal-script-tests.log`)。新規2件は feature 限定で、通常 suite は不変。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`、
+  `--features portable,test-script`: すべて exit 0 (`target/atsmoke-opening-check-normal.log` /
+  `target/atsmoke-opening-check-portable.log` / `target/atsmoke-opening-check-diagnostic.log`)。
+- `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-opening-fmt.log` /
+  `target/atsmoke-opening-diff-check.log`)。
+
+通常 product の code／依存／build 設定／fixture と backend witness は不変で、既存の有効な広い gate と
+witness 検証は再利用する。今回の独立レビューと ClaudeCode 検収、明示了承後の全体 live PASS は未了。
+
+準備だけなら起動・入力は行わない:
+
+```powershell
+Set-Location C:\home\mimageviewer-epubroot
+.\scripts\prepare-portable-smoke.ps1 -TestScript
+```
+
+ClaudeCode は AudioTracks 1 回、起動後上限 240 秒（準備 build は別）、前面窓・マウス・キー入力と
+音声再生を使用すること、データは `target\portable-smoke\data`、証跡は `target\ui-smoke-runs` に
+限定することを説明し、利用者の明示了承後に実行する:
+
+```powershell
+Set-Location C:\home\mimageviewer-epubroot
+.\scripts\ui-smoke.ps1 -Scenario AudioTracks -SkipBuild -TimeoutSeconds 240 -InteractiveApproved
+```
+
+runner は `prepare-portable-smoke.ps1 -TestScript -SkipBuild` を内部でも呼び、生成証跡と exe の一致を
+検査して使い捨て data を作り直す。通常 profile の起動・停止や設定コピーは不要。
 
 ## S0: 配布物と診断成果物の分離
 
@@ -176,6 +494,9 @@ Targetedがstale・未登録・不適合の場合にLegacyへfallbackしては�
   区別しない。inventoryではなく実mounted contextとidentityの一致を観測する。
 - Targeted Rootは既存`ViewportCommand::Focus`を要求し、既存gridのfocus/permit/text/modal等の
   guardを通った実handlerのeligible passを待つ。専用のguard迂回は加えない。
+  root／detached とも native 子が keyboard focus を持つ前面親には、exact identity／backend を
+  再確認して既存 `claim_foreground` を先に使う。winit が前面親の Focus を省くケースを取得側で
+  扱い、実 viewport focus の観測と通常 handler の許可は省略しない（§1.319 追補）。
 - passive detachedのactivationは、既存`queue_deferred_detached_window_activation`と
   `commit_pending_deferred_detached_window_activation`を使う。既存intentはwindow IDだけを
   保持し、commitは全pendingの最小IDを選ぶため、直前queueだけでは対象commitを保証しない。
@@ -678,7 +999,7 @@ overlay自身がArc markerを所有し、catalog/準備済みtargetはWeakで同
 利用不可、同値なら元stamp/frameを保ったまま公開できる。旧sourceのframeを新sourceへ付け替えない。
 bind後の再描画待ちだけではpaused/cleanが固着するため、bootstrap/resizeを含む全render入口を覆う。
 
-位置は実Responseから採取し、明示enabled引数・actual click sense・rect/interact rect/layer/clipを保持する。
+位置は実Responseから採取し、明示enabled引数とResponse.enabled()の論理積・actual click sense・rect/interact rect/layer/clipを保持する。
 既存button helperは無効時にSense::hoverへ変えるので、Response.enabled()だけでは不十分である。
 対象状態の比較は寸法/ppp、Unknown/Panorama/NonPanorama、audio、pose/zoomの存在、
 実chrome・dim・modal・重なりの入力条件に絞る。右固定配置に無関係な時刻・filename・
@@ -693,7 +1014,7 @@ App/current-source receiptと実OS point/layer確認は後続層であり、Resp
 2026-09-10にhover-onlyの最初の閉じた単位を実装した。`test-script` feature内で
 Canvas・TopHoverActivationを別のpoint/containment型としてprepareからpump/render receiptまで
 維持し、上端36ptのMouseMove完了後に、同じowner/source/hostでenabledになった実
-`native_top_panorama` Responseを待つ。Responseは`ui.interact`直後の明示enabled、sense、
+`native_top_panorama` Responseを待つ。Responseは`ui.interact`直後の明示enabledとResponse.enabled()の論理積、sense、
 rect/interact rect/layer/clipを保持する。final logical passだけをsurface present成功後にcommitし、
 ctor bootstrap・通常/overlay-only resize・event batch・tickは同じcommitted inventoryを更新する。
 source切替は旧inventoryを新epochへ結合する前に失効させ、overlay ctorの各試行は別Arc markerを持つ。

@@ -28058,7 +28058,18 @@ impl App {
         } else {
             FS_IMAGE_ACTIVE_SCOPES
         };
-        let Some(keys) = fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes) else {
+        let keys = fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes);
+        #[cfg(all(windows, feature = "test-script"))]
+        let keys = keys.or_else(|| {
+            // Semantic actions have no egui Key event. Preserve the ordinary
+            // keymap's text/focused-UI ownership gate at this probe boundary.
+            if _owner.blocks_legacy_keymap_shortcuts() {
+                return None;
+            }
+            crate::test_script::probe_targeted_action(ctx, active_scopes)
+                .map(|action| format!("semantic:{}", action.ini_name()))
+        });
+        let Some(keys) = keys else {
             return false;
         };
 
@@ -28369,6 +28380,7 @@ impl App {
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
             items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
             snapshot_frame: i64::try_from(ctx.cumulative_frame_nr()).unwrap_or(i64::MAX),
+            action_wait_diagnostic: String::new(),
             selected_index: self
                 .selected
                 .map_or(-1, |index| i64::try_from(index).unwrap_or(i64::MAX)),

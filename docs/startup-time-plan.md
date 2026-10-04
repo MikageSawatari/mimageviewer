@@ -10,7 +10,10 @@
   オープン 30ms」で説明が付く。**画像を 1 枚も読んでいない時間**が支配的。
 - eframe は **最初のフレームを描くまでウィンドウを表示しない**
   (`vendor/eframe/src/native/epi_integration.rs:309` の `post_rendering` →
-  `set_visible(true)`)。つまり現状は「約 1 秒間なにも出ない」。MangaMeeya が
+  `set_visible(true)`)。これはeframe層の要求順であり、winit/Win32の初期化副作用まで
+  保証するものではない。2026-10-04の利用者録画では初回描画前と推測される白窓があり、
+  [§1.327調査](section327-startup-window-flicker-investigation.md)でnative表示境界を別途調べている。
+  当時の計測では「約 1 秒間なにも出ない」。MangaMeeya が
   瞬時に見える最大の理由はここ。
 - 遅延・並行化・順序変更だけで **ウィンドウ出現 ~50–100ms / UI 描画 ~400ms** まで
   短縮できる見込み。GPU 初期化そのものは消せないが、**直列区間から外せる**。

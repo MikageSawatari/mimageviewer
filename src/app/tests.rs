@@ -8233,6 +8233,33 @@ fn update_perf_cycle_event_fields_pair_with_wall_clock_fields() {
 }
 
 #[test]
+fn idle_other_worker_polls_do_not_add_cycle_reads() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.details_meta_pending = None;
+    app.selected = None;
+    app.global_search.active = false;
+    app.global_search.done = true;
+    app.global_search.pending = None;
+    app.global_search.page_edit_prepare = None;
+    // A resident but empty tag worker must also skip instrumentation samples.
+    app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+    let reads = crate::perf::stall::count_poll_reads(|| {
+        for n in 0..10 {
+            let at = std::time::Instant::now();
+            let scope = crate::perf::stall::OtherWorkerScope::start_at(n, at, 1_000);
+            app.poll_details_meta_load(&ctx);
+            app.poll_tag_prewarm_results();
+            app.poll_global_search_debounce(&ctx);
+            app.poll_global_search_events(&ctx);
+            scope.finish_at(at + std::time::Duration::from_millis(1), 1_100);
+        }
+    });
+    assert_eq!(reads, 0);
+}
+
+#[test]
 fn update_perf_stages_plus_unaccounted_equal_total() {
     let started_at = std::time::Instant::now();
     let started_cycles = 1_000;
@@ -18191,6 +18218,158 @@ mod folder_pane_open_nav_tests {
         );
         assert!(pane_tx.send(Ok(empty_scan())).is_ok());
         app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+    }
+}
+
+#[cfg(test)]
+mod quick_folder_restart_tests {
+    use super::*;
+
+    #[test]
+    fn quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership() {
+        let mut env = phase_c_support::setup_app();
+        let pdf = env.tmp.path().join("cold-password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        for (idx, name) in ["slot-a", "slot-b"].into_iter().enumerate() {
+            let path = env.tmp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let key = drive_current_key_for_path(&path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path);
+        }
+        env.active_quick_folder_slot = None;
+        env.sync_quick_folder_settings();
+        env.settings.last_folder = Some(pdf.clone());
+        env.settings.save();
+        drop(env.app);
+        env.app = App::new_from_settings(crate::settings::Settings::load());
+        assert_eq!(env.active_quick_folder_slot, None);
+        let before = env.quick_folder_workspaces.clone();
+
+        env.open_default_startup_target();
+        assert!(matches!(
+            env.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+            Some(PdfOpenPhase::ColdCandidate { .. })
+        ));
+        // Inject the worker's typed password result; use the production startup,
+        // prompt cancellation, exit, and settings reload paths around that seam.
+        env.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        env.poll_pdf_enumerate();
+        assert!(matches!(
+            env.pdf_password_request
+                .as_ref()
+                .map(|request| &request.owner),
+            Some(PdfPasswordRequestOwner::Direct(_))
+        ));
+        assert!(env.cancel_pdf_password_dialog_request());
+        assert!(env.pdf_password_request.is_none());
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, None);
+        assert_eq!(saved.last_folder.as_ref(), Some(&pdf));
+        env.app = App::new_from_settings(saved);
+        assert_eq!(env.active_quick_folder_slot, None);
+
+        // A later successful open must still have no workspace owner.
+        let folder = env.tmp.path().join("after-cancel");
+        std::fs::create_dir(&folder).unwrap();
+        env.load_folder(folder);
+        assert_eq!(env.active_quick_folder_slot, None);
+        assert_eq!(env.quick_folder_workspaces, before);
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
+    fn exit_and_restart(
+        active: Option<QuickFolderSlotId>,
+        exiting_folder: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) {
+        let mut env = phase_c_support::setup_app();
+        let a = env.tmp.path().join("slot-a");
+        let b = env.tmp.path().join("slot-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let previous = if active == Some(QuickFolderSlotId::A) {
+            &a
+        } else {
+            &b
+        };
+        for (idx, path) in [&a, &b].into_iter().enumerate() {
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            let key = drive_current_key_for_path(path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path.clone());
+        }
+        // Do not sync after setting active: exit must capture switches that did
+        // not load a folder (same-path / drive-list switches).
+        env.sync_quick_folder_settings();
+        env.active_quick_folder_slot = active;
+        env.settings.last_folder = Some(previous.clone());
+        env.current_folder = exiting_folder(previous);
+        let before = env.quick_folder_workspaces.clone();
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, active);
+        assert_eq!(saved.last_folder.as_ref(), Some(previous));
+        env.app = App::new_from_settings(saved);
+        // Constructor must restore ownership before the first startup open.
+        assert_eq!(env.active_quick_folder_slot, active);
+        env.open_default_startup_target();
+        assert_eq!(env.current_folder.as_ref(), Some(previous));
+        assert_eq!(env.active_quick_folder_slot, active);
+        for (idx, workspace) in before.iter().enumerate() {
+            assert_eq!(env.quick_folder_workspaces[idx].target, workspace.target);
+            assert_eq!(
+                env.quick_folder_workspaces[idx].recent_folders,
+                workspace.recent_folders
+            );
+            assert_eq!(
+                env.quick_folder_workspaces[idx].drive_current_dirs,
+                workspace.drive_current_dirs
+            );
+        }
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
+    #[test]
+    fn quick_folder_restart_after_b_exit_preserves_a_workspace() {
+        exit_and_restart(Some(QuickFolderSlotId::B), |path| Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_a_exit_preserves_b_workspace() {
+        exit_and_restart(Some(QuickFolderSlotId::A), |path| Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_exit_keeps_both_workspaces() {
+        exit_and_restart(None, |_| Some(search_results_synthetic_path()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_collection_exit_keeps_both_workspaces() {
+        // Collection roots have no physical current_folder.
+        exit_and_restart(None, |_| None);
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_smart_folder_exit_keeps_both_workspaces() {
+        exit_and_restart(None, |_| {
+            Some(smart_folder::smart_folder_synthetic_path(uuid::Uuid::nil()))
+        });
     }
 }
 
@@ -94635,26 +94814,6 @@ fn the_overflow_button_closes_the_panel_it_opened() {
         FsOverflowPanelState::Closed,
         "a second press must close it"
     );
-}
-
-/// 起動時のウィンドウ状態 (§1.116)。最大化で起動したときに、初回フレームの
-/// mixed-DPI 補正が最大化を打ち消さないことを固定する。
-#[test]
-fn the_startup_size_correction_waits_while_the_window_is_maximized() {
-    use crate::app::deferred_initial_size_ready;
-
-    // 通常起動は従来どおり初回フレームで補正する。egui がまだ viewport を報告して
-    // いなくても待たない (待つと補正が永久に届かない環境がある)。
-    assert!(deferred_initial_size_ready(false, None));
-    assert!(deferred_initial_size_ready(false, Some(false)));
-
-    // 最大化起動では、報告が無い間は保留する。None を「最大化ではない」と読むと
-    // 初回フレームで InnerSize を送ってしまい、最大化が解けてしまう。
-    assert!(!deferred_initial_size_ready(true, None));
-    assert!(!deferred_initial_size_ready(true, Some(true)));
-
-    // 最大化が解けたと明示的に報告されたフレームで、はじめて補正を流す。
-    assert!(deferred_initial_size_ready(true, Some(false)));
 }
 
 /// 最小化中の maximized は当てにならないので、最後に見えていた状態を保つ。

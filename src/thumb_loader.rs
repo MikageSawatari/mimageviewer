@@ -3851,6 +3851,12 @@ struct ThumbLoadPhases {
     cache_encode_ms: f64,
     cache_save_ms: f64,
     cache_map_ms: f64,
+    offer_raster: crate::perf::stall::Timing,
+    stats: crate::perf::stall::Timing,
+    normal_log: crate::perf::stall::Timing,
+    perf_log: crate::perf::stall::Timing,
+    /// Nested in offer_raster; mutex acquisition plus similar prefill SQL.
+    prefill_db: crate::perf::stall::Timing,
     /// 以下は `decode_ms` の内訳。合計には入れない。
     render_ms: Option<f64>,
     orientation_ms: f64,
@@ -3865,11 +3871,26 @@ impl ThumbLoadPhases {
             + self.cache_encode_ms
             + self.cache_save_ms
             + self.cache_map_ms
+            + self.offer_raster.ms
+            + self.stats.ms
+            + self.normal_log.ms
+            + self.perf_log.ms
     }
 
     /// 名前の付いていない時間。負にはしない (計測誤差で負値を出さない)。
     fn unaccounted_ms(&self, total_ms: f64) -> f64 {
         (total_ms - self.disjoint_total_ms()).max(0.0)
+    }
+}
+
+#[track_caller]
+fn measured_thumbnail_log(message: String, total: &mut crate::perf::stall::Timing) {
+    let at = crate::perf::stall::Span::start();
+    crate::logger::log(message);
+    if let Some(at) = at {
+        let timing = at.finish();
+        total.ms += timing.ms;
+        total.cycles += timing.cycles;
     }
 }
 
@@ -3944,6 +3965,7 @@ pub fn load_one_cached(
     deferred_req: Option<LoadRequest>,
 ) {
     let total_started = std::time::Instant::now();
+    let total_cycles_started = crate::perf::stall::TotalCycles::start();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと。
     // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
@@ -4489,7 +4511,8 @@ pub fn load_one_cached(
     // 保存済み thumbnail ではなく、この元 source decode buffer を prefill 候補にする。
     // 索引側が実寸を見て正準サイズ未満の raster を拒否するため、ここで decode target を
     // 引き上げてはならない。背景索引が全件を保証し、prefill は既存 decode の再利用だけ行う。
-    crate::similar_index::offer_thumbnail_raster(
+    let offer_started = crate::perf::stall::Span::start();
+    let prefill_db = crate::similar_index::offer_thumbnail_raster(
         path,
         zip_entry,
         pdf_page,
@@ -4498,9 +4521,11 @@ pub fn load_one_cached(
         &img,
         source_dims.unwrap_or((img.width(), img.height())),
     );
+    let offer_raster = offer_started.map(|at| at.finish()).unwrap_or_default();
 
     // DCT スケール経由なら perf event を発火 (`thumb/dct_scale`)。
     // `decode_ms` を含めることで analyze_perf.py で scale_num 別の所要時間を集計可能。
+    let perf_log_started = crate::perf::stall::Span::start();
     if let Some(stats) = dct_stats {
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -4519,6 +4544,7 @@ pub fn load_one_cached(
             );
         }
     }
+    let perf_log = perf_log_started.map(|at| at.finish()).unwrap_or_default();
 
     // (A) 表示用パス: 元画像から直接セルサイズにリサイズして UI へ送信
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
@@ -4554,6 +4580,7 @@ pub fn load_one_cached(
     let send_display_ms = send_display_started.elapsed().as_secs_f64() * 1000.0;
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマット・デコーダ経路を記録
+    let stats_started = crate::perf::stall::Span::start();
     {
         // 拡張子の取得元: PDF ページなら "pdf"、ZIP エントリならエントリ名、通常ならファイルパス
         let ext_source: &str = if pdf_page.is_some() {
@@ -4573,6 +4600,7 @@ pub fn load_one_cached(
             );
         }
     }
+    let stats_timing = stats_started.map(|at| at.finish()).unwrap_or_default();
 
     // (B) キャッシュ保存判定 (段階 C)
     //     catalog 未指定時は保存不可
@@ -4582,6 +4610,7 @@ pub fn load_one_cached(
     let mut cache_encode_ms = 0.0;
     let mut cache_save_ms = 0.0;
     let mut cache_map_ms = 0.0;
+    let mut normal_log = crate::perf::stall::Timing::default();
 
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
@@ -4613,7 +4642,10 @@ pub fn load_one_cached(
                 );
                 cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
                 if let Err(e) = save_result {
-                    crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
+                    measured_thumbnail_log(
+                        format!("    idx={idx:>4} catalog save: {e}"),
+                        &mut normal_log,
+                    );
                 } else if let Some(cm) = cache_map {
                     // DB 保存成功 → in-memory cache_map にも反映する。
                     // Evicted → 再ロード時にキャッシュヒットさせるために必要。
@@ -4655,18 +4687,27 @@ pub fn load_one_cached(
                 } else {
                     ""
                 };
-                crate::logger::log(format!(
-                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
-                ));
+                measured_thumbnail_log(
+                    format!(
+                        "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
+                    ),
+                    &mut normal_log,
+                );
             }
             None => {
-                crate::logger::log(format!("    idx={idx:>4} WebP encode FAIL  {display_name}"));
+                measured_thumbnail_log(
+                    format!("    idx={idx:>4} WebP encode FAIL  {display_name}"),
+                    &mut normal_log,
+                );
             }
         }
     } else {
-        crate::logger::log(format!(
-            "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {display_name}"
-        ));
+        measured_thumbnail_log(
+            format!(
+                "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {display_name}"
+            ),
+            &mut normal_log,
+        );
     }
 
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
@@ -4690,7 +4731,9 @@ pub fn load_one_cached(
     });
 
     if crate::perf::is_enabled() {
-        let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
+        let total_ended = std::time::Instant::now();
+        let total_cycles = total_cycles_started.map(|start| start.finish());
+        let total_ms = total_ended.duration_since(total_started).as_secs_f64() * 1000.0;
         let phases = ThumbLoadPhases {
             decode_ms,
             display_ms,
@@ -4698,6 +4741,11 @@ pub fn load_one_cached(
             cache_encode_ms,
             cache_save_ms,
             cache_map_ms,
+            offer_raster,
+            stats: stats_timing,
+            normal_log,
+            perf_log,
+            prefill_db,
             render_ms,
             orientation_ms,
         };
@@ -4719,7 +4767,9 @@ pub fn load_one_cached(
         if let Some(render_ms) = phases.render_ms {
             decode_parts.insert("render_ms".into(), serde_json::Value::from(render_ms));
         }
-        let extras = vec![
+        let mut extras = vec![
+            ("start_t", crate::perf::stall::seconds(total_started).into()),
+            ("end_t", crate::perf::stall::seconds(total_ended).into()),
             ("total_ms", serde_json::Value::from(total_ms)),
             ("decode_ms", serde_json::Value::from(phases.decode_ms)),
             ("display_ms", serde_json::Value::from(phases.display_ms)),
@@ -4753,6 +4803,20 @@ pub fn load_one_cached(
             ("idx", serde_json::Value::from(idx)),
             ("input_seq", serde_json::Value::from(input_seq)),
         ];
+        // New disjoint intervals shrink unaccounted. prefill_db is a nested detail
+        // of offer_raster, and cache_save already includes catalog mutex + SQL.
+        for (ms_key, timing) in [
+            ("offer_raster_ms", phases.offer_raster),
+            ("stats_ms", phases.stats),
+            ("normal_log_ms", phases.normal_log),
+            ("perf_log_ms", phases.perf_log),
+            ("prefill_db_ms", phases.prefill_db),
+        ] {
+            extras.push((ms_key, timing.ms.into()));
+        }
+        if let Some(cycles) = total_cycles {
+            extras.push(("total_cycles", cycles.into()));
+        }
         crate::perf::event("thumb", "load_phases", Some(&key), input_seq, &extras);
     }
 }
@@ -5362,6 +5426,22 @@ mod tests {
         };
 
         assert_eq!(phases.unaccounted_ms(5.0), 0.0);
+    }
+
+    #[test]
+    fn known_stall_candidates_shrink_unaccounted_without_double_counting_prefill() {
+        let timing = |ms| crate::perf::stall::Timing { ms, cycles: 10 };
+        let phases = ThumbLoadPhases {
+            decode_ms: 20.0,
+            offer_raster: timing(5.0),
+            prefill_db: timing(4.0),
+            stats: timing(1.0),
+            normal_log: timing(800.0),
+            perf_log: timing(2.0),
+            ..ThumbLoadPhases::default()
+        };
+        assert_eq!(phases.disjoint_total_ms(), 828.0);
+        assert_eq!(phases.unaccounted_ms(830.0), 2.0);
     }
 
     #[cfg(windows)]

@@ -496,17 +496,18 @@ impl App {
     /// activation, and commits that queue immediately so a lower window id cannot
     /// be selected in between those steps.
     pub(crate) fn test_script_drive_targeted_activation(&mut self, ctx: &egui::Context) -> bool {
-        let Some(owner) = crate::test_script::pending_targeted_detached_owner() else {
+        let Some(target) = crate::test_script::pending_targeted_detached_action() else {
             return false;
         };
+        let owner = target.owner.clone();
         let crate::test_script::TestScriptWindowIdentity::Detached {
             window_id,
             viewport_id,
             ..
         } = &owner
         else {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err("only a detached target may require activation".to_string()),
             );
             return false;
@@ -521,14 +522,19 @@ impl App {
 
         if self.active_detached_window_id() == Some(window_id) {
             if test_script_active_detached_target_matches(self, window_id, viewport_id, &owner) {
-                crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
-                if !crate::test_script::action_target_is_focused(ctx, &owner) {
-                    ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                crate::test_script::finish_targeted_detached_action(&target, Ok(()));
+                if !crate::test_script::action_target_is_focused(ctx, &owner) && target.is_live() {
+                    crate::test_script::request_action_target_focus(
+                        ctx,
+                        &owner,
+                        self.test_script_window_identity(window_id, viewport_id)
+                            .as_ref(),
+                    );
                 }
                 ctx.request_repaint_of(viewport_id);
             } else {
-                crate::test_script::finish_targeted_detached_owner(
-                    &owner,
+                crate::test_script::finish_targeted_detached_action(
+                    &target,
                     Err(format!(
                         "run_action active target host changed: {}",
                         owner.describe()
@@ -539,8 +545,8 @@ impl App {
         }
 
         let Some((_, residence)) = self.locate_window_context(window_id) else {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target has no current viewer context: {}",
                     owner.describe()
@@ -549,8 +555,8 @@ impl App {
             return false;
         };
         if self.test_script_window_identity(window_id, viewport_id) != Some(owner.clone()) {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target host changed before activation: {}",
                     owner.describe()
@@ -560,8 +566,8 @@ impl App {
         }
 
         if residence != ContextResidence::AtRest || !self.detached_window_can_activate(window_id) {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target cannot be activated: {} residence={residence:?}",
                     owner.describe()
@@ -570,6 +576,11 @@ impl App {
             return false;
         }
 
+        // This exact request admits acquisition immediately before it starts.
+        // The queue+commit may finish later; it does not acknowledge delivery.
+        if !target.is_live() {
+            return false;
+        }
         self.queue_deferred_detached_window_activation(window_id, "test_script_targeted_action");
         let committed = self.commit_pending_deferred_detached_window_activation(ctx);
         let actual_owner = self
@@ -577,14 +588,14 @@ impl App {
             .filter(|active| *active == window_id)
             .and_then(|_| self.test_script_window_identity(window_id, viewport_id));
         if committed && actual_owner.as_ref() == Some(&owner) {
-            crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
-            if !crate::test_script::action_target_is_focused(ctx, &owner) {
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            crate::test_script::finish_targeted_detached_action(&target, Ok(()));
+            if !crate::test_script::action_target_is_focused(ctx, &owner) && target.is_live() {
+                crate::test_script::request_action_target_focus(ctx, &owner, actual_owner.as_ref());
             }
             ctx.request_repaint_of(viewport_id);
         } else {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target activation did not establish the selected owner: expected={} actual={actual_owner:?}",
                     owner.describe()
@@ -758,6 +769,35 @@ mod tests {
         assert_eq!(
             test_script_detached_host_ids([7, 9], Some(11)),
             vec![7, 9, 11]
+        );
+    }
+
+    #[test]
+    fn registered_opening_detached_presentation_is_not_active() {
+        for state in [
+            DetachedWindowState::Opening,
+            DetachedWindowState::Resuming,
+            DetachedWindowState::Closing,
+        ] {
+            assert_eq!(
+                test_script_window_presentation(
+                    Some(3),
+                    Some(state),
+                    ContextResidence::Mounted,
+                    false,
+                ),
+                TestScriptWindowPresentation::Other,
+                "{state:?}",
+            );
+        }
+        assert_eq!(
+            test_script_window_presentation(
+                Some(3),
+                Some(DetachedWindowState::Active),
+                ContextResidence::Mounted,
+                false,
+            ),
+            TestScriptWindowPresentation::ActiveImmediate,
         );
     }
 

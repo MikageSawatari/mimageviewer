@@ -28,6 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+pub(crate) mod stall;
+static HOLDER: stall::Holder = stall::Holder::new();
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
 static FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
@@ -79,6 +82,7 @@ pub fn init_with_path(
                 .set(Mutex::new(BufWriter::with_capacity(64 * 1024, f)))
                 .is_ok()
             {
+                stall::init();
                 ENABLED.store(true, Ordering::Release);
                 // A same-session witness lets external release gates reject a stale perf log
                 // or a different mimageviewer-core process while still allowing a correctly
@@ -171,6 +175,7 @@ pub fn emit_ms(cat: &str, kind: &str, seq: u64, t0: Instant) {
 ///
 /// `key` と `seq` はそれぞれ省略可能 (None / 0)。
 /// `extras` は serde_json 可能な任意キー/値ペア。
+#[track_caller]
 pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str, Value)]) {
     if !is_enabled() {
         return;
@@ -204,19 +209,48 @@ pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str
         Err(_) => return,
     };
 
+    let mut probe = stall::IoProbe::start("perf", "event", &HOLDER);
     if let Ok(mut f) = file.lock() {
+        if let Some(p) = probe.as_mut() {
+            p.acquired(&HOLDER);
+        }
+        let at = stall::timer(&probe);
+        stall::drain(&mut *f);
+        let diagnostic_ms = stall::elapsed(at);
+        let at = stall::timer(&probe);
         let _ = writeln!(f, "{line}");
+        let write_ms = stall::elapsed(at);
+        let ended = stall::retire(&HOLDER, &probe);
+        drop(f);
+        if let (Some(p), Some(ended)) = (probe, ended) {
+            p.finish(ended, write_ms, 0.0, diagnostic_ms);
+        }
     }
 }
 
 /// `BufWriter` を明示的にフラッシュする。フレーム境界で定期的に呼ぶ。
+#[track_caller]
 pub fn flush() {
     if !is_enabled() {
         return;
     }
-    if let Some(file) = FILE.get()
-        && let Ok(mut f) = file.lock()
-    {
-        let _ = f.flush();
+    if let Some(file) = FILE.get() {
+        let mut probe = stall::IoProbe::start("perf", "flush", &HOLDER);
+        if let Ok(mut f) = file.lock() {
+            if let Some(p) = probe.as_mut() {
+                p.acquired(&HOLDER);
+            }
+            let at = stall::timer(&probe);
+            stall::drain(&mut *f);
+            let diagnostic_ms = stall::elapsed(at);
+            let at = stall::timer(&probe);
+            let _ = f.flush();
+            let flush_ms = stall::elapsed(at);
+            let ended = stall::retire(&HOLDER, &probe);
+            drop(f);
+            if let (Some(p), Some(ended)) = (probe, ended) {
+                p.finish(ended, 0.0, flush_ms, diagnostic_ms);
+            }
+        }
     }
 }

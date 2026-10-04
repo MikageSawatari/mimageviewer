@@ -4483,6 +4483,46 @@ mod tests {
     }
 
     #[test]
+    fn effetune_minimized_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_keep_visible_when_minimized);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_keep_visible_when_minimized");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_keep_visible_when_minimized);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_keep_visible_when_minimized: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_keep_visible_when_minimized'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_keep_visible_when_minimized
+        );
+    }
+
+    #[test]
     fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
@@ -4494,6 +4534,60 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert_eq!(loaded.grid_cols, 20);
         assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+    }
+
+    #[test]
+    fn quick_folder_active_slot_roundtrip_and_missing_key_default() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for active in [
+            Some(crate::settings::QuickFolderSlotId::A),
+            Some(crate::settings::QuickFolderSlotId::B),
+            None,
+        ] {
+            let mut settings = Settings::default();
+            settings.active_quick_folder_slot = active;
+            let mut stale_preferences = Settings::default();
+            let mut live = settings.clone();
+            stale_preferences.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_preferences.active_quick_folder_slot, active);
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().active_quick_folder_slot,
+                active
+            );
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Settings>(json)
+                    .unwrap()
+                    .active_quick_folder_slot,
+                active
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'active_quick_folder_slot'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
+        let mut old_json = serde_json::to_value(Settings::default()).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("active_quick_folder_slot");
+        assert_eq!(
+            serde_json::from_value::<Settings>(old_json)
+                .unwrap()
+                .active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
     }
 
     fn sample_settings() -> Settings {

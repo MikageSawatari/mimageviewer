@@ -1070,7 +1070,9 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   CPU (= D3D11 → CPU 転送 + bwdif + swscale + CPU upload) になる。
 - 動画音量は既定 0dB。下部 HUD / Shift+↑↓ / 環境設定から -∞dB〜+18dB の
   dB フェーダーで手動調整でき、音量バーの右クリックまたはダブルクリックで 0dB に戻せる。
-  0dB 超の boost 部分は HUD で黄色表示し、音声ポンプ側の safety limiter を通す。
+  0dB 超の boost 部分は HUD で黄色表示する。音声ポンプ側の最終 safety limiter は
+  動画・音楽・Remote の全音声で常時有効とし、約 5ms の先読みを常に PDC / A/V sync へ含める。
+  常時適用と通常 EOS の末尾排出は公開済み v4.3.0 には未収録の follow-up。
   safety limiter のゲインリダクション量が 1dB 以上に達した場合は音量表示右側に
   赤いインジケータを約 500ms 表示する (ceiling に触れただけ・タイムストレッチ由来の
   微小オーバーでは点かない)。
@@ -1280,8 +1282,9 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   から次へ進む (末尾切れ防止)。
 - **ブックマーク**: 動画と同じ path-keyed の DB を共有し、音声 / 動画で相互に見える。既存
   ブックマークの ±1 秒以内への追加は拒否する。
-- **VST3**: 動画と同一チェーンを共有 (デコード → ノーマライズ gain → VST3 → 出力リミッタ →
-  cpal)。動画→音声モードでも VST は引き継がれ、音声モード中も VST GUI を表示できる。
+- **VST3**: 動画と同一チェーンを共有 (デコード → ノーマライズ gain → VST3 → 任意の
+  EffeTune 前段 limiter → EffeTune → 手動 boost → 常時有効の最終 limiter → cpal)。
+  動画→音声モードでも VST は引き継がれ、音声モード中も VST GUI を表示できる。
 
 #### 解析ワーカー
 
@@ -1979,6 +1982,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
+| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所の選択は従来の `last_folder` / 起動設定のまま |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |
@@ -2102,7 +2106,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
 | `music_open_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 一覧から開く」。既定 FromStart=最初から / Resume=続き。位置は動画と同じ `video_resume_positions` に path キーで保存 |
 | `music_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 移動 (↓↑/ホイールの前後ファイル移動 + Ctrl+↑↓/キー)」。既定 FromStart=最初から (誤って別曲へ行って戻っても頭から) |
-| `effetune_pre_limiter_enabled` | bool | true | EffeTune へ渡す前に 0 dBFS 超のピークを抑える。ユーザー VST3 後・EffeTune 前に独立した SafetyLimiter を通す。動画・音楽は player 作成時、Remote は配信受付時に取得（世代更新は保持）、変更後は画面を閉じて開き直す／配信を終了して再開。portable では設定 UI と検索候補を非表示。欠落 field は ON、最終出力 limiter は変更不可 |
+| `effetune_pre_limiter_enabled` | bool | true | EffeTune へ渡す前に 0 dBFS 超のピークを抑える。ユーザー VST3 後・EffeTune 前に独立した SafetyLimiter を通す。動画・音楽は player 作成時、Remote は配信受付時に取得（世代更新は保持）、変更後は画面を閉じて開き直す／配信を終了して再開。portable では設定 UI と検索候補を非表示。欠落 field は ON、最終出力 limiter は常時有効・変更不可 |
+| `effetune_keep_visible_when_minimized` | bool | false | メイン最小化中も表示希望のある音響調整の窓を残す。Preferences OK で即時反映（最小化中も切替）。host の `Minimized` 理由だけを無効にし、`RemoteSession`・user-hidden・未表示 open の最小化取消・非アクティブ復帰は維持。tray-only `SW_HIDE` は最小化ではなく、両設定とも既存どおり窓を残す。ownerless tool window・非 TOPMOST。released settings の欠落 field / DB key は serde default false、既存 `settings_kv` で保存し schema 変更なし。portable の UI・検索候補は非表示 |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズの全体 ON/OFF。ON のとき、選択中の音声トラックの測定値を使い -14 LUFS 相当の音量にする。測定結果はトラックごとに保存し、再生開始前から適用する。未測定のトラックは再生前に自動測定し、長い動画では途中の測定値で再生を始めて、測定完了後に音量を徐々に合わせる。測定を中止したトラックは、同じ動画を表示している間は自動で測り直さず、Norm ボタンから再開できる。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |

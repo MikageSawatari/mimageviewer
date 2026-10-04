@@ -276,6 +276,16 @@ required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
 libraw-sys = { path = "crates/libraw-sys" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 windows-core = "0.61"
 # wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
 # 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle

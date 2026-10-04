@@ -651,11 +651,7 @@ impl PartialEq<PathBuf> for FolderNavHistoryTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuickFolderSlotId {
-    A,
-    B,
-}
+pub(crate) use crate::settings::QuickFolderSlotId;
 
 impl QuickFolderSlotId {
     pub(crate) const ALL: [Self; 2] = [Self::A, Self::B];
@@ -13651,19 +13647,9 @@ pub struct App {
     pub(crate) last_window_title: Option<String>,
     /// 現在のウィンドウの DPI スケール（論理→物理変換に使用）
     pub(crate) last_pixels_per_point: f32,
-    /// 初回フレームで適用する inner_size（egui#4918 / winit#923 対策）。
-    /// ViewportBuilder 段階では マルチモニタ DPI 混在時に サイズを誤って設定する
-    /// ケースがあるため、DPI 確定後の初回フレームで再適用する。
-    ///
-    /// 最大化起動のときは**最大化が解けるまで保留する**。最大化中に InnerSize を
-    /// 送ると通常サイズへ戻ってしまい、利用者が選んだ起動状態を初回フレームで
-    /// 打ち消す。保留した値は最大化を解いた最初のフレームで 1 回だけ適用され、
-    /// mixed-DPI で壊れた復元矩形をそこで矯正する (§1.116)。
-    pub(crate) pending_initial_size: Option<[f32; 2]>,
-    /// ウィンドウを最大化状態で作ったか (`ViewportBuilder::with_maximized`)。
-    /// `pending_initial_size` を保留すべきかの判断にだけ使う起動時の事実で、
-    /// 現在最大化されているかを表す `last_window_maximized` とは別物。
-    pub(crate) created_maximized: bool,
+    /// Normal size correction and one optional maximize after ROOT's visible commit.
+    /// The startup owner replaces pending_initial_size / created_maximized (1.327).
+    pub(crate) startup_window_geometry: crate::startup_window_geometry::StartupWindowGeometry,
 
     /// キャッシュ生成進捗：新規デコードが必要だった画像の総数
     pub(crate) cache_gen_total: usize,
@@ -17626,6 +17612,7 @@ impl App {
                 drive_current_dirs: settings.quick_folder_drive_current_dirs[idx].clone(),
             }
         });
+        let active_quick_folder_slot = settings.active_quick_folder_slot;
         let keymap = if cfg!(test) {
             crate::keymap::Keymap::empty()
         } else {
@@ -17709,8 +17696,7 @@ impl App {
             last_window_maximized: false,
             last_window_title: None,
             last_pixels_per_point: 1.0,
-            pending_initial_size: None,
-            created_maximized: false,
+            startup_window_geometry: Default::default(),
             cache_gen_total: 0,
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
@@ -18086,7 +18072,7 @@ impl App {
             suppress_folder_nav_record_once: false,
             folder_nav_subfolder_restore: None,
             quick_folder_workspaces,
-            active_quick_folder_slot: Some(QuickFolderSlotId::A),
+            active_quick_folder_slot,
             quick_folder_switch_sequence: 0,
             suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
@@ -18961,6 +18947,8 @@ impl App {
                 .set_hud_raise_hook(std::sync::Arc::new(move || {
                     hud_raise_pending.store(true, std::sync::atomic::Ordering::Release);
                 }));
+            app.effetune
+                .set_keep_visible_when_minimized(app.settings.effetune_keep_visible_when_minimized);
         }
 
         if app
@@ -21269,6 +21257,7 @@ impl App {
     }
 
     fn sync_quick_folder_settings(&mut self) {
+        self.settings.active_quick_folder_slot = self.active_quick_folder_slot;
         self.settings.quick_folder_slots =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
         self.settings.quick_folder_recent_folders =
@@ -21948,9 +21937,9 @@ impl App {
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
         self.quick_folder_workspaces = snapshot.quick_folder_workspaces;
-        self.active_quick_folder_slot = snapshot
-            .active_quick_folder_slot
-            .or(Some(QuickFolderSlotId::A));
+        // Preserve the snapshot's owner, including no active slot. The legacy
+        // A default belongs to settings deserialization, not rollback.
+        self.active_quick_folder_slot = snapshot.active_quick_folder_slot;
         self.sync_quick_folder_settings();
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
         self.tag_view.nav_stack = snapshot.tag_view_nav_stack;
@@ -50873,34 +50862,79 @@ impl App {
         }
     }
 
-    /// 起動直後の InnerSize 補正 (egui#4918 / winit#923) を適用する。
-    ///
-    /// ViewportBuilder 段階ではマルチモニタ DPI 混在時に論理/物理ピクセルを取り違えて
-    /// 異常サイズのウィンドウが作られるので、DPI が確定してから意図したサイズを
-    /// 再適用して矯正する。通常起動なら初回フレームで終わる。
-    ///
-    /// 最大化起動のときは保留する。最大化中に InnerSize を送ると通常サイズへ戻り、
-    /// 利用者が選んだ起動状態を打ち消してしまうため。保留した値は最大化が解けた
-    /// 最初のフレームで 1 回だけ適用され、そこで復元矩形を矯正する。最大化のまま
-    /// 終了した場合は使われずに捨てられる (矯正すべき通常矩形が画面に無いので実害なし)。
+    /// Correct the normal restore size before the optional post-visible maximize.
+    /// Run even while the startup overlay owns the rest of the update.
     fn apply_deferred_initial_size(&mut self, ctx: &egui::Context) {
-        let Some([w, h]) = self.pending_initial_size else {
+        let Some([w, h]) = self.startup_window_geometry.take_normal_size() else {
             return;
         };
-        let (ppp, reported_maximized) = ctx.input(|i| (i.pixels_per_point, i.viewport().maximized));
-        if !deferred_initial_size_ready(self.created_maximized, reported_maximized) {
-            return;
-        }
-        self.pending_initial_size = None;
         let viewport_size = egui::vec2(
             crate::settings::window_geometry_to_viewport_points(w, self.settings.ui_scale_factor),
             crate::settings::window_geometry_to_viewport_points(h, self.settings.ui_scale_factor),
         );
         crate::logger::log(format!(
-            "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2} created_maximized={}",
-            self.created_maximized
+            "[viewport] deferred normal InnerSize apply: {w:.0}x{h:.0}",
         ));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
+        #[cfg(windows)]
+        crate::startup_windows_diag::mark(
+            "app.deferred_initial_size.command",
+            self.main_hwnd.unwrap_or(0) as usize,
+            || serde_json::json!({"viewport_size": [viewport_size.x, viewport_size.y], "command": "InnerSize"}),
+        );
+    }
+
+    /// Called after the UI's tray/close handling, so a just-hidden root stays hidden.
+    fn maximize_startup_window_after_visible_commit(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+    ) {
+        if !self.startup_window_geometry.awaiting_visible_maximize()
+            || !frame.native_window_visible_commit_completed()
+        {
+            return;
+        }
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        #[cfg(windows)]
+        let (visible, minimized) = {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+            let Some(hwnd) = self.main_hwnd else { return };
+            let hwnd = HWND(hwnd as *mut _);
+            unsafe {
+                (
+                    self.window_visible && IsWindowVisible(hwnd).as_bool(),
+                    minimized || IsIconic(hwnd).as_bool(),
+                )
+            }
+        };
+        #[cfg(not(windows))]
+        let visible = self.window_visible;
+        if !visible || minimized {
+            return;
+        }
+        // This input still describes the corrected normal window. Capture its restore
+        // rect before marking MAX queued, including overlay-only startup frames.
+        self.track_window_rect(ctx);
+        if self.startup_window_geometry.take_post_visible_maximize(
+            frame.native_window_visible_commit_completed(),
+            visible,
+            minimized,
+            ctx.cumulative_frame_nr(),
+        ) {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::Maximized(true),
+            );
+            self.last_window_maximized = true;
+            #[cfg(windows)]
+            crate::startup_windows_diag::mark(
+                "app.startup_maximize.command",
+                self.main_hwnd.unwrap_or(0) as usize,
+                || serde_json::json!({"command": "Maximized(true)", "visible_commit_completed": true}),
+            );
+        }
     }
 
     /// ウィンドウの矩形を記録する。**2 つの値を別々に持つ。**
@@ -50948,10 +50982,14 @@ impl App {
         // One resolved answer for both consumers. `maximized: None` means the platform
         // has not reported yet, which is not the same as "not maximized" — reading it
         // as false here saved the maximized geometry as the size to restore to, on
-        // every unreported frame of a maximized start. `deferred_initial_size_ready`
-        // already documents the same trap for the sibling consumer above.
-        let window_state =
-            read_window_state(self.last_window_maximized, minimized, reported_maximized);
+        // every unreported frame of a maximized start.
+        let window_state = if self.startup_window_geometry.maximize_queued() {
+            // Repeated layout passes belong to the same frame, before native commands
+            // run. Do not overwrite the MAX intent or its restore rect with stale input.
+            read_window_state(true, minimized, None)
+        } else {
+            read_window_state(self.last_window_maximized, minimized, reported_maximized)
+        };
         self.last_window_maximized = window_state.maximized;
 
         if window_state.rect_is_restorable {
@@ -60372,6 +60410,20 @@ impl App {
     }
 
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
+        let mut details_perf_section = None;
+        if self.details_meta_pending.is_some()
+            || matches!(
+                self.details_image_dims_state,
+                LazyColumnState::NotRequested
+                    | LazyColumnState::Loading { .. }
+                    | LazyColumnState::Reconciling { .. }
+            )
+        {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
+        }
         self.refresh_thumbnail_details_stage(ctx);
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
@@ -60383,6 +60435,10 @@ impl App {
         }
 
         if matches!(self.details_image_dims_state, LazyColumnState::Disabled) {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
@@ -60407,6 +60463,10 @@ impl App {
                 && self.details_visible_stage_needs_load())
                 || self.selection_info_needs_lazy_meta_request())
         {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         }
@@ -60510,6 +60570,10 @@ impl App {
                 )
             });
             if pending_is_stale {
+                crate::perf::stall::PollSection::ensure(
+                    &mut details_perf_section,
+                    crate::perf::stall::PollPart::DetailsMeta,
+                );
                 if let Some(pending) = self.details_meta_pending.take() {
                     pending.cancel.store(true, Ordering::Relaxed);
                 }
@@ -60526,6 +60590,10 @@ impl App {
                         | LazyColumnState::Reconciling { .. }
                 )
             {
+                crate::perf::stall::PollSection::ensure(
+                    &mut details_perf_section,
+                    crate::perf::stall::PollPart::DetailsMeta,
+                );
                 self.details_lazy_visible_revision =
                     self.details_lazy_visible_revision.wrapping_add(1);
                 self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -60615,6 +60683,10 @@ impl App {
         }
 
         if matches!(self.details_image_dims_state, LazyColumnState::NotRequested) {
+            crate::perf::stall::PollSection::ensure(
+                &mut details_perf_section,
+                crate::perf::stall::PollPart::DetailsMeta,
+            );
             self.start_details_meta_load(ctx);
         }
     }
@@ -65656,9 +65728,14 @@ impl App {
         };
         // このフレームで届いた分だけ drain。
         let mut rating_hydrations: Vec<(PathBuf, u8, u64)> = Vec::new();
+        let mut tag_perf_section = None;
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
+                    crate::perf::stall::PollSection::ensure(
+                        &mut tag_perf_section,
+                        crate::perf::stall::PollPart::TagPrewarm,
+                    );
                     // XMP から rating > 0 が読めたらハイドレート候補に積む
                     // (DB を UI スレッドで触らないように後段でまとめて書く)。
                     if let Some(stars) = res.rating {
@@ -70771,6 +70848,9 @@ impl App {
     }
 
     pub(crate) fn persist_window_state_and_flush(&mut self, scope: PersistScope) {
+        // Slot switches can finish without a folder load (same path / drive list).
+        // Capture the accepted slot, including None, before the exit/tray save.
+        self.sync_quick_folder_settings();
         // カーソル名と行位置は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
         // ただではないし (backlog §1.0b)、次回起動が要るのは終了時点の 1 つだけ。
         // **対で書き、対で捨てる。** 片方だけ残ると、名前は前回のもので位置は前々回、
@@ -70836,7 +70916,9 @@ impl App {
                 ));
             }
         }
-        self.settings.window_maximized = self.last_window_maximized;
+        self.settings.window_maximized = self
+            .startup_window_geometry
+            .maximized_to_save(self.last_window_maximized);
         self.settings.save();
         // **まず確定する。**保留のままの編集は、メモリにしか無いのでここで消える。
         self.commit_local_adjust_pending_edits();
@@ -84382,6 +84464,11 @@ impl App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    crate::startup_windows_diag::mark(
+                        "app.tray_main_hwnd.capture",
+                        hwnd_raw as usize,
+                        || serde_json::json!({}),
+                    );
                     crate::presentation_observer::register(
                         crate::presentation_observer::WindowRole::Main,
                         hwnd_raw as u64,
@@ -84628,6 +84715,12 @@ impl App {
             }
             self.perf_last_frame_begin = Some(frame_begin_now);
             let prev_update_ms = self.perf_prev_update_ms.unwrap_or(0.0);
+            // frame.begin is emitted partway through update_frame. Reuse the
+            // previous outer endpoint instead of treating that event as its start.
+            let prev_update_end_t = self.perf_last_update_end.map(crate::perf::stall::seconds);
+            let prev_update_start_t = prev_update_end_t
+                .zip(self.perf_prev_update_ms)
+                .map(|(end, ms)| end - ms / 1000.0);
             let prev_outside_ms = self
                 .perf_last_update_end
                 .map(|end| frame_begin_now.saturating_duration_since(end).as_secs_f64() * 1000.0)
@@ -84642,6 +84735,14 @@ impl App {
                     // The previous frame, split: what App::update spent, and what eframe
                     // spent rendering and presenting after it returned.
                     ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
+                    (
+                        "prev_update_start_t",
+                        serde_json::Value::from(prev_update_start_t),
+                    ),
+                    (
+                        "prev_update_end_t",
+                        serde_json::Value::from(prev_update_end_t),
+                    ),
                     ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
                     (
                         "prev_update_cycles",
@@ -84878,8 +84979,6 @@ impl App {
 
         self.poll_startup_open_path_resolve(ctx);
 
-        self.apply_deferred_initial_size(ctx);
-
         self.track_window_rect(ctx);
 
         // 毎フレームリセット: 選択セルが描画された時に再設定される
@@ -84956,6 +85055,13 @@ impl App {
         }
         self.poll_metadata_load();
         mark_update_perf(&mut update_perf, UpdatePerfStage::SearchAndMetadataPolls);
+        let other_worker_scope = update_perf.as_ref().map(|perf| {
+            crate::perf::stall::OtherWorkerScope::start_at(
+                self.frame_counter,
+                perf.last_mark_at,
+                perf.last_mark_cycles,
+            )
+        });
         // スタックスクリプトは items generation を差し替える。復旧中は receiver を保持し、
         // terminal 後に既存 poll へ一度だけ戻す。
         if !self.sidecar_restore_active() {
@@ -85061,6 +85167,9 @@ impl App {
         }
         let t_background_polls = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::OtherWorkerPolls);
+        if let (Some(scope), Some(perf)) = (other_worker_scope, update_perf.as_ref()) {
+            scope.finish_at(perf.last_mark_at, perf.last_mark_cycles);
+        }
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
@@ -87083,6 +87192,9 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.startup_window_geometry
+            .begin_frame(ctx.cumulative_frame_nr());
+        self.apply_deferred_initial_size(ctx);
         crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(ctx);
         crate::rating_db::RATING_WRITES.register_repaint_context(ctx);
         crate::tags_db::TAG_WRITES.register_repaint_context(ctx);
@@ -87167,6 +87279,7 @@ impl eframe::App for App {
             self.show_external_tool_modals(ctx);
             self.authorize_external_tool_launch_boundaries_after_ui();
         }
+        self.maximize_startup_window_after_visible_commit(ctx, frame);
         if let Some(t0) = update_t0 {
             let end = std::time::Instant::now();
             self.perf_prev_update_ms =
@@ -88744,21 +88857,6 @@ pub(crate) fn tracked_window_maximized(
     } else {
         reported_maximized.unwrap_or(previous)
     }
-}
-
-/// 起動直後の InnerSize 補正をこのフレームで送ってよいか。
-///
-/// 通常起動 (`created_maximized == false`) なら即座に送ってよい。最大化で起動した
-/// ときは、egui が「最大化ではない」と**明示的に**報告するまで保留する。報告がまだ
-/// 無い (`None`) 段階を「最大化ではない」と読むと、初回フレームで最大化を打ち消す。
-pub(crate) fn deferred_initial_size_ready(
-    created_maximized: bool,
-    reported_maximized: Option<bool>,
-) -> bool {
-    if !created_maximized {
-        return true;
-    }
-    reported_maximized == Some(false)
 }
 
 /// DynamicImage を egui::ColorImage に変換する (リサイズなし)。

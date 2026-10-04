@@ -946,6 +946,20 @@ impl EffetuneController {
         self.main_window.install(hwnd);
     }
 
+    pub(crate) fn set_keep_visible_when_minimized(&self, keep_visible: bool) {
+        if let Ok(gate) = self.main_window.gate() {
+            gate.set_keep_visible_when_minimized(keep_visible);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keep_visible_when_minimized(&self) -> bool {
+        self.main_window
+            .gate()
+            .unwrap()
+            .keep_visible_when_minimized()
+    }
+
     pub(crate) fn set_remote_session_source(
         &self,
         handle: Option<crate::remote_ipc::session::SessionHandle>,

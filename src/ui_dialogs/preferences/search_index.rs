@@ -1080,6 +1080,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "EffeTune に渡す前に 0dB を超える音を抑える",
         ["音響調整", "OVERLOAD", "ピーク", "EffeTune"]
     ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-minimized",
+        Video,
+        "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+        ["音響調整", "ビジュアライザー", "最小化", "EffeTune"]
+    ),
     entry!(
         "video/normalize-cache",
         Video,
@@ -1395,6 +1402,18 @@ mod tests {
             .position(|candidate| *candidate == page)
             .unwrap();
         ("カテゴリ", 0, index)
+    }
+
+    #[test]
+    fn effetune_minimized_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 最小化", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-minimized")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
     }
 
     #[test]

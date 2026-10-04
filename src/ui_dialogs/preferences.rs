@@ -24,6 +24,7 @@ use self::search_index::{PrefSearchEntry, search_preferences};
 #[doc(hidden)]
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
+    pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
 }
 
 #[doc(hidden)]
@@ -1986,6 +1987,9 @@ impl App {
         if old_raw_brightness != self.settings.raw_brightness {
             self.raw_brightness_changed();
         }
+        #[cfg(windows)]
+        self.effetune
+            .set_keep_visible_when_minimized(self.settings.effetune_keep_visible_when_minimized);
         if media_duration_changed {
             self.invalidate_details_meta_requirements();
         }
@@ -5269,6 +5273,66 @@ mod tests {
                 .remote_clockless_audio_processing(1.0)
                 .effetune_pre_limiter_enabled()
         );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_minimized_preferences_ok_publishes_saved_policy() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.effetune_keep_visible_when_minimized = true;
+        let app = crate::app::App::new_from_settings(app.settings.clone());
+        assert!(app.effetune.keep_visible_when_minimized());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for enabled in [false, true] {
+            harness
+                .state_mut()
+                .open_preferences_request(PreferencesOpenRequest::anchored(
+                    PreferencesPage::Video,
+                    "video/effetune-minimized",
+                ));
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            harness
+                .get_by_label("メインウィンドウを最小化しても音響調整の窓を表示したままにする")
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+            assert_eq!(
+                harness.state().effetune.keep_visible_when_minimized(),
+                !enabled
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness
+                    .state()
+                    .settings
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+            assert_eq!(
+                harness.state().effetune.keep_visible_when_minimized(),
+                enabled
+            );
+            assert_eq!(
+                Settings::load().effetune_keep_visible_when_minimized,
+                enabled
+            );
+        }
     }
 
     #[test]

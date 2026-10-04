@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <windows.h>
 
@@ -19,8 +20,10 @@ struct GuiGateState {
     uint64_t version;
     std::atomic<uint64_t> minimized_sequence;
     std::atomic<uint64_t> remote;
+    std::atomic<uint64_t> keep_visible_when_minimized;
 };
-static_assert(sizeof(GuiGateState) == 32);
+static_assert(sizeof(GuiGateState) == 40);
+static_assert(offsetof(GuiGateState, keep_visible_when_minimized) == 32);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 class GuiGateReader {
 public:
@@ -33,10 +36,13 @@ public:
         handle_ = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
         if (!handle_) return false;
         state_ = static_cast<const GuiGateState*>(MapViewOfFile(handle_, FILE_MAP_READ, 0, 0, sizeof(GuiGateState)));
-        return state_ && state_->magic == 0x4d49564741544501ULL && state_->version == 1;
+        return state_ && state_->magic == 0x4d49564741544501ULL && state_->version == 2;
     }
     GuiGateSnapshot snapshot() const {
         return {state_->minimized_sequence.load(std::memory_order_acquire), state_->remote.load(std::memory_order_acquire)};
+    }
+    bool keep_visible_when_minimized() const {
+        return state_->keep_visible_when_minimized.load(std::memory_order_acquire) != 0;
     }
 private:
     HANDLE handle_ = nullptr;

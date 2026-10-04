@@ -18,6 +18,7 @@ struct GateState {
     version: u64,
     minimized_sequence: AtomicU64,
     remote: AtomicU64,
+    keep_visible_when_minimized: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -66,9 +67,10 @@ impl GuiGate {
         unsafe {
             view.Value.cast::<GateState>().write(GateState {
                 magic: 0x4d49_5647_4154_4501,
-                version: 1,
+                version: 2,
                 minimized_sequence: AtomicU64::new(0),
                 remote: AtomicU64::new(0),
+                keep_visible_when_minimized: AtomicU64::new(0),
             })
         };
         Ok(Arc::new(Self {
@@ -86,6 +88,24 @@ impl GuiGate {
     }
     pub(crate) fn minimized_sequence(&self) -> u64 {
         self.state().minimized_sequence.load(Ordering::Acquire)
+    }
+    pub(crate) fn set_keep_visible_when_minimized(&self, keep_visible: bool) {
+        let previous = self
+            .state()
+            .keep_visible_when_minimized
+            .swap(u64::from(keep_visible), Ordering::AcqRel);
+        if previous != u64::from(keep_visible) {
+            if let Some(notify) = &self.notify {
+                let _ = notify.send(super::HostCommand::ReconcileVisibility);
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn keep_visible_when_minimized(&self) -> bool {
+        self.state()
+            .keep_visible_when_minimized
+            .load(Ordering::Acquire)
+            != 0
     }
     pub(crate) fn note_minimized(&self) {
         self.state()
@@ -125,7 +145,11 @@ mod tests {
     use super::*;
     #[test]
     fn source_epochs_survive_completed_suppression_intervals() {
-        assert_eq!(std::mem::size_of::<GateState>(), 32);
+        assert_eq!(std::mem::size_of::<GateState>(), 40);
+        assert_eq!(
+            std::mem::offset_of!(GateState, keep_visible_when_minimized),
+            32
+        );
         let gate = GuiGate::create(None).unwrap();
         // Host extract_string_field uses raw contents: the actual mapping name
         // must not require JSON unescaping (notably a namespace backslash).
@@ -139,5 +163,30 @@ mod tests {
         assert_eq!(gate.remote() & 1, 1);
         gate.publish_remote(Some(1), false);
         assert_ne!(permit.1, gate.remote());
+    }
+
+    #[test]
+    fn minimize_policy_notifies_only_changes_and_preserves_permit_epochs() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gate = GuiGate::create(Some(tx)).unwrap();
+        assert_eq!(gate.state().version, 2);
+        assert!(!gate.keep_visible_when_minimized());
+        gate.publish_remote(Some(3), true);
+        let _ = rx.try_recv().unwrap();
+        let epochs = (gate.minimized_sequence(), gate.remote());
+        for keep_visible in [true, false] {
+            gate.set_keep_visible_when_minimized(keep_visible);
+            assert_eq!(gate.keep_visible_when_minimized(), keep_visible);
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(super::super::HostCommand::ReconcileVisibility)
+            ));
+            gate.set_keep_visible_when_minimized(keep_visible);
+            assert!(rx.try_recv().is_err());
+            assert_eq!((gate.minimized_sequence(), gate.remote()), epochs);
+        }
+        gate.set_keep_visible_when_minimized(true);
+        gate.note_minimized();
+        assert_ne!(gate.minimized_sequence(), epochs.0);
     }
 }

@@ -1455,6 +1455,101 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-05 §1.319 AudioTracks が Opening host を選ぶ readiness 契約の修正**
+
+`20261004T154102775Z-79036-AudioTracks-b6d55588` は root fullscreen の F12 が新規 window 3 の
+native presentation transition を開始した後、hidden HWND 登録だけを完了と誤認して action を
+要求した。window 3 は Opening／Mounted、active session は None。通常 passive activation の
+Mounted 拒否を変えると進行中の移行に別の activation を重ねるため、その検査を維持する。
+scenario の `detached_video` が既存 `active_immediate` 診断を待ち、registered host と active
+session viewport の描画完了を区別する。共通 helper を初回 open／開き直し／F12 に使う。
+`src/app/test_script_support.rs` の既存 read-only 投影には lifecycle の回帰テストだけを追加する。
+product の detached 述語、manager intent／mount／host／viewport／placement／native reducer と
+activation consumer は変更しない。新 state／delay／retry／repaint／pause は不要。
+
+利用者の test-script／scenario 層という指示に沿い、既存 lifecycle の所有境界を待機条件へ反映する。
+§2 の frozen product paths を修正する症状パッチではない。実装担当の判断と検証を記録し、
+独立 Codex（gpt-6.1-sol / xhigh）はこの修正を承認した。利用者了承範囲内の
+`20261004T160257945Z-104608-AudioTracks-4752a5b6` で AudioTracks 全体が PASS した (dd9678010)。
+
+**2026-10-05 §1.319 ee0eedb23 の期限競合 P2 対応**
+
+独立レビューで承認された root routing は維持し、診断 request の配送所有境界を修正する。
+同じ immutable deadline と typed delivery outcome を worker／UI が共有し、短い request lock 内で
+期限前 Delivered か期限切れ Rejected を確定する。worker の診断取得や Interrupt 公開を UI の
+拒否条件に代用しない。遅い ACK は記録済みの到達時刻で判定する。
+`src/app/test_script_support.rs` の診断 acquisition は exact request handle を保持し、activation／focus
+開始直前と phase 完了で期限を検査する。同じ owner の別 request に完了を付け替えない。
+開始済み acquisition の rollback は行わず、後続の配送期限も延長しない。
+App の manager intent／mount／host／viewport／placement／切り替え reducer と実キー経路は不変。
+
+診断 lifecycle の単一 request owner に時間と配送の確定を集約する構造修正で、grace／delay／retry、
+新しい detached state、OS 操作中の request lock 保持は追加しない。modal 化・pause では所有のずれを
+解消できない。実装担当と bounded 独立 Codex（gpt-6.1-sol / xhigh）は設計・最終実装に合意した。
+ClaudeCode の P2 指示に沿う follow-up として実装し、検証・検収は smoke 設計の追補へ記録する。
+
+**2026-10-04 §1.319 root fullscreen の semantic action 入口と有限 ACK 待ち**
+
+0072aced5 の live smoke は focus を回復し、detached → root の F12 まで通過した。
+root → detached は既存 `handle_fullscreen_root_key_input` の event-only probe が semantic request
+を検出せず、native backdrop の early return により他 consumer にも届かないため停止した。
+`src/ui_fullscreen.rs` の既存 root probe に test-script 限定で読み取り専用 PendingAction 照会を足す。
+`src/test_script.rs` で exact owner／active backend／AwaitingPass／未 ACK／Press scope を照合し、
+既存の focus／modal／IME／edit guard と既存 handler でのみ消費する。新しい event 無し入口は
+既存 KeyboardOwner の text／FocusedUi block projection も照合する（PendingFocus の互換仕様は維持）。
+probe は ACK を発行しない。既存 physical-event 入口／他 semantic consumer の text 判定順は変更しない。
+run_action の finite deadline と既存 Interrupt による遅い未配送操作の拒否は診断 lifecycle の境界で扱う。
+製品の native F12、manager intent、mount、host／viewport／placement、切り替え reducer は変更しない。
+
+所有中の semantic request を既存 router が認識する構造修正であり、F12 専用の新 consumer、
+native VK 捏造、geometry 捕捉、retry／delay／新しい detached state は加えない。
+modal 化・窓の閉鎖／再開・pause は入口欠落を解消せず、既存操作列を狭めるため採用しない。
+実装担当と bounded 独立 Codex（gpt-6.1-sol / xhigh）は設計・実装に合意した。
+この round の ClaudeCode 検収・構造判断と利用者了承後の全体 live PASS は引き継ぎ事項。
+
+**2026-10-04 §1.319 test-script Targeted action の keyboard focus 取得**
+
+c998db1cb の AudioTracks 実行は native HUD の OS クリックを通過した後、semantic
+`VideoSeekStart` の egui focus 待ちで停止した。native 子は設計上 keyboard owner だが、
+winit の `ViewportCommand::Focus` は top-level target が既に foreground なら取得を省く。
+`src/test_script.rs` の診断 helper で full current identity と backend witness を再検証し、
+同じ HWND が foreground の場合だけ既存 `claim_foreground` を使って keyboard focus を取得する。
+root 受付と `src/app/test_script_support.rs` の active detached／通常 activation 完了を同じ取得へ通す。
+実 focus／foreground／backend の観測と実 handler の eligibility／ack は維持する。
+製品の native focus、manager の intent、mount、viewport identity、host／placement と lifecycle は
+変更しない。`src/app/native_video.rs` の追加は native key handler の headless テストだけ。
+
+geometry 捕捉、delay／再試行、新規 detached state で競合を隠す修正ではなく、明示 semantic
+要求の対象取得境界を OS の focus 所有に合わせる構造修正である。modal 化・pause・窓の閉鎖／再開は
+入力取得の誤った前提を解消せず、AudioTracks が検証する再生中切り替えを狭めるため採用しない。
+実装担当と bounded 独立 Codex レビュー（gpt-6.1-sol / xhigh）はこの設計と実装に合意した。
+この focus 修正は 0072aced5 として ClaudeCode がコミットし、独立レビューは structural／test-script
+限定として承認した。利用者了承後の `20261004T135833517Z-11688-AudioTracks-352e9a51` は
+focus 回復後の再開・開き直し・detached → root F12 まで通過。全体 PASS は次の root semantic
+probe 欠落で未了（上記第3 round）。
+
+**2026-10-04 §1.327 小規模startup maximize修正 (利用者承認の見た目変更)**
+
+利用者／ClaudeCode briefで、main rootをnormal-hiddenで作り、既存の初回visible commit後に
+appが一度だけmaximizeする案を採用。eframeの初回frame flagをFrameのroot-only receiptへ移し、
+root native handleで確認する。paint／show／output順、detached／fullscreenの述語・builder・
+host・placement owner・visible commitは変更しない。appの起動geometryだけをtyped ownerへ
+集約し、secondaryのreceiptやnative visibilityからroot startupを推測しない。
+小規模案の構造とtray／minimizeの保留、root receipt境界を独立Sol/xhighが確認した。
+detached症状へのguard／delay／再生成ではなく、mainの起動契約の変更である。大規模backend案は
+今回実装しない。受入範囲・診断は [§1.327調査 §8](section327-startup-window-flicker-investigation.md#8-採用した小規模修正-normal表示後に一度だけ最大化-2026-10-04)。
+
+**2026-10-04 §1.327 起動native window診断 (観測限定)**
+
+利用者／ClaudeCodeからのbounded brief「診断先行・修正は後」に従い、coreのopt-in
+`--diag-startup-windows` とvendor eframeの初回post_rendering直前／直後observerを追加した。
+rootのset_visible(true)を含む既存呼出・引数・順序、detached述語・viewport・host・placementの
+所有と動作は変更しない。nativeフックもCallNextHookExの戻り値とmessage引数を保持する。
+ちらつきを抑制する症状パッチではなく原因同定用の観測であることを実装担当と独立
+GPT-6.1 Sol/xhighが確認した。表示挙動を修正するbackend設計への合意ではない。
+時計・世代・配送snapshotの意味と採取方法は
+[§1.327調査 §6](section327-startup-window-flicker-investigation.md#6-native診断の採取と読み方-2026-10-04)。
+
 **2026-10-01 RAW fullscreen page ownership (S3)**
 
 `RawPageStore` を `ContextAsyncOwner` と `ViewerContextBundle` に登録した。`fs_pending` と同じ context-owned resource で、preview / source preparation / development の要求 ID、物理 source 指紋、現像 ticket、結果 channel と需要集合を所有する。park は未完了要求を取消し、Done / Blocked を保持する。generation 差し替えと drop はその context だけを破棄し、snapshot 再構築は表示 entry と owner を原子的に移す。明るさ変更は mounted / parked の各 owner に同じ RAW source transaction を適用する。detached の述語・viewport・window lifecycle は変更しない。

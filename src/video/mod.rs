@@ -5034,15 +5034,6 @@ fn run_native_video_output(
     // owner. `source.queue` remains an unpresented pacing queue and is never a
     // placement/grade fallback.
     let mut frame_output = NativeFrameOutputContext::new();
-    /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
-    /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
-    /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
-    /// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
-    /// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
-    /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
-    /// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
-    /// hidden は EOF まで decoder を進めるため全件 drain する。
-    const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
     // Inc 7 hidden presenter (動画→音声モード): pump が公開する可視状態を consume policy の
     // 唯一の正本にする。source swap はこの output-lifetime state を交換しない。
     let mut hidden_frame_scratch = Vec::with_capacity(MAX_NATIVE_SOURCE_QUEUE.saturating_mul(2));
@@ -8243,6 +8234,16 @@ fn run_native_video_output(
 /// パターン (~400ms) + HDD random read (~100-300ms) を ~800ms buffer で
 /// 吸収して UI tick の空振りを抑える (Phase 8.J)。
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
+/// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
+/// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
+/// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
+/// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
+/// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
+/// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
+/// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
+/// hidden は EOF まで decoder を進めるため全件 drain する。
+#[cfg(windows)]
+const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
 const FRAME_STEP_NO_PENDING_SEQ: u64 = u64::MAX;
 const USER_SEEK_REISSUE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
 /// The former EOF drain rule was three 16 ms UI ticks. Preserve its wall-clock meaning
@@ -8699,6 +8700,11 @@ impl VideoPlayer {
     #[cfg(all(test, windows))]
     pub(crate) fn notify_demux_exhausted_for_test(&self) {
         self.clock.notify_demux_exhausted();
+        // These timing fixtures have no running decode/pump workers.
+        let serial = self.clock.current_seek_serial();
+        self.clock.note_audio_decoded_eos(serial);
+        self.clock.begin_audio_tail(serial);
+        self.clock.complete_audio_tail(serial);
     }
 
     #[cfg(all(test, windows))]
@@ -11750,12 +11756,17 @@ impl VideoPlayer {
             //   (publish processed) と段階を経るので、その handoff window 中に 3 counter が
             //   全て 0 を読む race がある。重めの VST3 plugin で 1 frame の処理が ~10-30ms
             //   かかる場合があるため、48ms 連続で quiet を観測してから seek する。
-            // 完全な解決には pump 側から「EOF drain 完了 / in-flight 数」を publish する形が
-            // 良いが、連続観測ラッチで実用上は十分。VST/stretch が 48ms 超ブロックする状況は
-            // UI 不応答相当 (= 通常運用ではほぼ起きない) なので、その race で末尾 1 frame が
-            // 切れる確率は許容範囲とする。
+            // AudioEos の Complete は decoder drain → raw 処理 → DSP 末尾の queue commit
+            // までを保証する。48ms quiet はその後の出力/presenter drain にだけ使い、
+            // IPC 中に counter が全て 0 でも EOF/loop を先行させない。
             const EOF_DRAIN_AUDIO_QUIET_TOL: f64 = 0.020;
-            let audio_drained = self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+            let audio_active_for_eof =
+                self.audio.is_some() && self.info.as_ref().is_some_and(|i| i.has_audio);
+            let audio_drained = (!audio_active_for_eof
+                || self.clock.audio_lane_lost()
+                || self.clock.audio_worker_exited()
+                || self.clock.audio_tail_complete())
+                && self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
             let channels_drained = self.audio_rx_len() == 0 && self.video_rx_len() == 0;
@@ -11976,7 +11987,10 @@ impl VideoPlayer {
         let audio_active_for_eof =
             self.audio.is_some() && self.info.as_ref().map(|i| i.has_audio).unwrap_or(false);
         let audio_drained = !audio_active_for_eof
-            || (self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+            || ((self.clock.audio_lane_lost()
+                || self.clock.audio_worker_exited()
+                || self.clock.audio_tail_complete())
+                && self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.audio_rx_len() == 0);
@@ -12538,6 +12552,339 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    fn real_audio_tail_player(name: &str, sample_rate: u32) -> super::VideoPlayer {
+        use super::engine::state::DecoderEvent;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tail")
+            .join(name);
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.cancel = Arc::new(AtomicBool::new(false));
+        player.engine.lock().unwrap().begin_loading();
+        player.decode = super::decoder::spawn(
+            path,
+            Arc::clone(&player.clock),
+            Arc::clone(&player.cancel),
+            sample_rate,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            None,
+            Arc::clone(&player.engine_state_atomic),
+            player.engine_event_tx.clone(),
+            Arc::clone(&player.decoder_dropped_full_count),
+            Arc::clone(&player.dynamic),
+        );
+        let info = player
+            .decode
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("fixture metadata")
+            .expect("fixture opens");
+        assert!(info.has_audio);
+        assert!((info.duration_secs - 2.0).abs() < 0.001);
+        player.audio_track_selection = Some(
+            player
+                .decode
+                .audio_track_selection_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("opened fixture audio track"),
+        );
+        player
+            .engine
+            .lock()
+            .unwrap()
+            .handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: info.duration_secs,
+                has_audio: info.has_audio,
+                has_video: info.has_video,
+            });
+        player.info_event_emitted = true;
+        if !info.has_video {
+            player.native_output = None;
+        }
+        player.info = Some(info);
+        // The real pump is the sole consumer of decoder audio. The callback below consumes
+        // only its processed output; it never injects audio or completes a seek/EOS itself.
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            sample_rate,
+            player.decode.audio_rx.clone(),
+            Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            Arc::clone(&player.engine_state_atomic),
+        ));
+        player.set_loop_enabled(true); // Full loop's production default target is 0.0.
+        player.set_playing(true);
+        player
+    }
+
+    #[cfg(windows)]
+    fn assert_one_fixture_burst(samples: &[f32], rate: u32, name: &str, serial: u64) {
+        let frames = samples.len() / 2;
+        let expected_frames = rate as usize * 2;
+        assert!(
+            frames.abs_diff(expected_frames) <= 1,
+            "{name} rate={rate} serial={serial}: consumed {frames}, expected {expected_frames}"
+        );
+        let signal_frames: Vec<_> = samples
+            .chunks_exact(2)
+            .enumerate()
+            .filter_map(|(frame, pair)| pair.iter().any(|v| v.abs() > 0.01).then_some(frame))
+            .collect();
+        assert!(
+            !signal_frames.is_empty(),
+            "{name} rate={rate} serial={serial}: missing burst"
+        );
+        // Zero crossings inside the 1kHz tone are not separate bursts. A silent gap of 2ms
+        // is, including an old limiter tail replayed at the beginning of the next epoch.
+        let bursts = 1 + signal_frames
+            .windows(2)
+            .filter(|pair| pair[1] - pair[0] > rate as usize / 500)
+            .count();
+        assert_eq!(
+            bursts, 1,
+            "{name} rate={rate} serial={serial}: duplicated burst"
+        );
+        let (start, end) = if name.starts_with("mid4ms") {
+            (1.0, 1.004)
+        } else if name.starts_with("tail4ms") {
+            (1.996, 2.0)
+        } else {
+            (1.990, 2.0)
+        };
+        let first = signal_frames[0] as f64 / rate as f64;
+        let last = (*signal_frames.last().unwrap() + 1) as f64 / rate as f64;
+        // Allow the resampler's finite filter support and integer sample rounding at 44.1kHz.
+        assert!(
+            (first - start).abs() < 0.001,
+            "{name} rate={rate} serial={serial}: burst starts at {first}, expected {start}"
+        );
+        assert!(
+            (last - end).abs() < 0.001,
+            "{name} rate={rate} serial={serial}: burst ends at {last}, expected {end}"
+        );
+        assert!(
+            samples[..rate as usize / 4 * 2]
+                .iter()
+                .all(|v| v.abs() < 1e-4),
+            "{name} rate={rate} serial={serial}: new epoch has stale tail in its silent head"
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_one_device_burst(samples: &[f32], rate: u32, name: &str, serial: u64) {
+        // Preserve every callback sample, including its underrun silence. Joining only
+        // consumed PCM could hide a tail split into two separately audible clicks.
+        let signal_frames: Vec<_> = samples
+            .chunks_exact(2)
+            .enumerate()
+            .filter_map(|(frame, pair)| pair.iter().any(|v| v.abs() > 0.01).then_some(frame))
+            .collect();
+        assert!(
+            !signal_frames.is_empty(),
+            "{name} rate={rate} serial={serial}: device callback lost the burst"
+        );
+        let bursts = 1 + signal_frames
+            .windows(2)
+            .filter(|pair| pair[1] - pair[0] > rate as usize / 500)
+            .count();
+        assert_eq!(
+            bursts, 1,
+            "{name} rate={rate} serial={serial}: callback output split/duplicated the burst"
+        );
+        let span = (*signal_frames.last().unwrap() + 1 - signal_frames[0]) as f64 / rate as f64;
+        let expected_span = if name.starts_with("tail10ms") {
+            0.010
+        } else {
+            0.004
+        };
+        assert!(
+            (span - expected_span).abs() < 0.001,
+            "{name} rate={rate} serial={serial}: callback burst spans {span}s, expected {expected_span}s with at most 1ms resampler support"
+        );
+    }
+
+    #[cfg(windows)]
+    fn capture_real_eof_full_loops(name: &str, rate: u32) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let mut player = real_audio_tail_player(name, rate);
+        let ctx = egui::Context::default();
+        let mut presenter_frames = std::collections::VecDeque::new();
+        let mut presenter_last_seen_serial = player.current_seek_serial();
+        let mut presenter_waiting_for_first = true;
+        let callback_frames = rate as usize / 200;
+        let callback_period = Duration::from_secs_f64(callback_frames as f64 / rate as f64);
+        let mut callback_samples = vec![0.0; callback_frames * 2];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut next_callback = Instant::now();
+        let mut serial = 0;
+        let mut samples = Vec::new();
+        let mut device_samples = Vec::new();
+        let mut completed_epochs = Vec::new();
+        let mut last_callback_pts = 0.0;
+        while serial < 3 && Instant::now() < deadline {
+            if player.native_output.is_some() {
+                // Substitute only the display/device side of native presentation. Real decoded
+                // frames retain their serial, pacing and FirstFrameReady engine event, without
+                // creating an HWND, D3D device, CPAL device, or interacting with the desktop.
+                let clock_serial = player.current_seek_serial();
+                if clock_serial != presenter_last_seen_serial {
+                    super::native_drain_unpresented_queue(&mut presenter_frames);
+                    presenter_last_seen_serial = clock_serial;
+                    presenter_waiting_for_first = true;
+                }
+                while presenter_frames.len() < super::MAX_NATIVE_SOURCE_QUEUE {
+                    let Ok(frame) = player.decode.video_rx.try_recv() else {
+                        break;
+                    };
+                    if frame.seek_serial < clock_serial {
+                        super::native_reset_unpresented_frame(frame);
+                        continue;
+                    }
+                    presenter_frames.push_back(frame);
+                }
+                let candidates: Vec<_> = presenter_frames
+                    .iter()
+                    .map(|frame| super::frame_selection::FrameCandidate {
+                        pts_secs: frame.pts_secs,
+                        seek_serial: frame.seek_serial,
+                    })
+                    .collect();
+                let selection = super::frame_selection::select_frame_for_present(
+                    &candidates,
+                    player.clock.now_secs(),
+                    clock_serial,
+                    presenter_last_seen_serial,
+                    presenter_waiting_for_first,
+                    player.clock.is_seeking(),
+                    super::clock::DISPLAY_LEAD_TOLERANCE_SECS,
+                );
+                for action in selection.actions {
+                    let frame = presenter_frames.pop_front().unwrap();
+                    match action {
+                        super::frame_selection::PopAction::DiscardStale
+                        | super::frame_selection::PopAction::LateDrop => {
+                            super::native_reset_unpresented_frame(frame);
+                        }
+                        super::frame_selection::PopAction::Display => {
+                            if presenter_waiting_for_first {
+                                assert!(super::try_send_native_first_frame_ready(
+                                    &player.engine_event_tx,
+                                    frame.seek_serial,
+                                    frame.pts_secs,
+                                ));
+                                presenter_waiting_for_first = false;
+                            }
+                            player
+                                .last_displayed_pts_bits
+                                .store(frame.pts_secs.to_bits(), Ordering::Release);
+                            player.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                }
+            }
+            // Tick BEFORE the callback: the production EOF decision can see a partially
+            // drained final block. Tick alone creates every subsequent Full-loop seek serial.
+            player.tick(&ctx);
+            assert!(
+                player.error.is_none(),
+                "{name} rate={rate}: {:?}",
+                player.error
+            );
+            let current_serial = player.current_seek_serial();
+            if current_serial != serial {
+                assert_eq!(current_serial, serial + 1, "one seek per EOF Full-loop");
+                assert_one_device_burst(&device_samples, rate, name, serial);
+                completed_epochs.push(std::mem::take(&mut samples));
+                device_samples.clear();
+                last_callback_pts = 0.0;
+                serial = current_serial;
+                if serial == 3 {
+                    break;
+                }
+            }
+            let (consumed, audible_end) = player
+                .audio
+                .as_ref()
+                .unwrap()
+                .fill_samples_without_device_for_test(
+                    &mut callback_samples,
+                    &player.clock,
+                    &player.engine_state_atomic,
+                );
+            device_samples.extend_from_slice(&callback_samples);
+            if consumed > 0 {
+                let end = audible_end.expect("real callback consumption publishes audible PTS");
+                let start = end - consumed as f64 / rate as f64;
+                assert!(
+                    (start - last_callback_pts).abs() < 0.002,
+                    "{name} rate={rate} serial={serial}: callback timeline gap/overlap: start={start} previous_end={last_callback_pts}"
+                );
+                if serial > 0 && samples.len() < rate as usize / 4 * 2 {
+                    let head_remaining = rate as usize / 4 * 2 - samples.len();
+                    let head = &callback_samples[..(consumed * 2).min(head_remaining)];
+                    let first_nonsilent = head.iter().position(|v| v.abs() >= 1e-4);
+                    let first_pcm_frame = first_nonsilent.map(|index| (samples.len() + index) / 2);
+                    let first_device_frame = first_nonsilent
+                        .map(|index| (device_samples.len() - callback_samples.len() + index) / 2);
+                    let peak = head.iter().fold(0.0_f32, |peak, v| peak.max(v.abs()));
+                    assert!(
+                        first_nonsilent.is_none(),
+                        "{name} rate={rate} serial={serial}: post-loop callback emitted stale tail in the silent head; first_pcm_frame={first_pcm_frame:?} first_device_frame={first_device_frame:?} peak={peak}"
+                    );
+                }
+                last_callback_pts = end;
+                samples.extend_from_slice(&callback_samples[..consumed * 2]);
+            }
+            next_callback += callback_period;
+            std::thread::sleep(next_callback.saturating_duration_since(Instant::now()));
+        }
+        assert_eq!(
+            serial,
+            3,
+            "{name} rate={rate}: actual EOF Full-loop did not complete three epochs; state={} seeking={} demux_eof={} tail_complete={} processed={} raw={} audio_rx={}",
+            player.engine_state_atomic.load(Ordering::Acquire),
+            player.clock.is_seeking(),
+            player.clock.is_demux_exhausted(),
+            player.clock.audio_tail_complete(),
+            player.clock.audio_processed_secs(),
+            player.clock.audio_raw_pending_secs(),
+            player.audio_rx_len()
+        );
+        // Check exact logical lengths after capturing the loop path, so a fresh-stream
+        // resampler tail loss cannot mask stale audio emitted on a later real Flush.
+        for (serial, samples) in completed_epochs.iter().enumerate() {
+            assert_one_fixture_burst(samples, rate, name, serial as u64);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch() {
+        // These fixtures reproduce the hardware dry-loop report: no-loop is one click,
+        // Full-loop produced two for tail4ms/tail10ms, while mid4ms remained one.
+        // WAV exercises audio-only tick, MKV exercises native EOF tick; 44.1kHz additionally
+        // traverses the real FFmpeg resampler, including its Flush between loop epochs.
+        for rate in [48_000, 44_100] {
+            for name in [
+                "tail4ms.wav",
+                "tail10ms.wav",
+                "mid4ms.wav",
+                "tail4ms.mkv",
+                "tail10ms.mkv",
+                "mid4ms.mkv",
+            ] {
+                capture_real_eof_full_loops(name, rate);
+            }
+        }
+    }
+
     // Deterministic six-second stream: the decoder has read ahead while output
     // remains at 2.9/3.8 seconds. No native HWND or audio device is created.
     fn short_stream_before_end(position: f64, audio_only: bool) -> super::VideoPlayer {
@@ -15372,6 +15719,92 @@ mod tests {
         player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
         let _ = player.tick(&egui::Context::default());
         assert!(player.current_seek_serial() > serial_before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eos_tick_waits_for_in_flight_audio_tail_on_native_and_headless_paths() {
+        for native in [false, true] {
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                std::path::PathBuf::from("eos-tail.mp4"),
+            );
+            player.configure_native_timing_for_test(30.0, 30.0, true, false);
+            if !native {
+                player.native_output = None;
+            }
+            player.set_loop_enabled(true);
+            let serial = player.current_seek_serial();
+            player.clock.notify_demux_exhausted();
+            player.clock.note_audio_decoded_eos(serial);
+            assert!(player.clock.begin_audio_tail(serial));
+            // All counters/channels are quiet, and the old quiet interval has
+            // expired, but DSP still owns a tail block (including a slow IPC).
+            player.backdate_eof_quiet_for_test(std::time::Duration::from_secs(1));
+            let (ctx, requests) = repaint_probe();
+            let in_flight_deadline = player.tick(&ctx);
+            if native {
+                assert_eq!(in_flight_deadline, None);
+            }
+            assert_eq!(player.current_seek_serial(), serial);
+            assert!(player.is_playing());
+            assert!(player.eof_loop_quiet_since.is_none());
+            requests.lock().unwrap().clear();
+            super::audio::complete_audio_tail_and_wake(
+                &player.clock,
+                serial,
+                &player.engine_event_tx,
+            );
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.viewport_id == egui::ViewportId::ROOT && r.delay.is_zero())
+            );
+            let quiet_deadline = player
+                .tick(&ctx)
+                .expect("completion wake must start the quiet timer");
+            assert!(quiet_deadline <= super::EOF_DRAIN_QUIET_DURATION);
+
+            player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+            let _ = player.tick(&ctx);
+            assert!(player.current_seek_serial() > serial);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eos_empty_audio_seek_completes_through_real_pump_and_tick() {
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("eos-empty-seek.mp4"),
+        );
+        player.configure_native_timing_for_test(30.0, 30.0, true, false);
+        player.set_loop_enabled(true);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            rx,
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.clock.request_seek(30.0);
+        let serial = player.current_seek_serial();
+        player.clock.clear_seek_target_override(serial);
+        player.clock.notify_demux_exhausted();
+        player.clock.note_audio_decoded_eos(serial);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !player.clock.audio_tail_complete() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            player.clock.audio_tail_complete(),
+            "EOF after a seek can contain no AudioFrame"
+        );
+        let _ = player.tick(&egui::Context::default());
+        player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+        let _ = player.tick(&egui::Context::default());
+        assert!(player.current_seek_serial() > serial);
     }
 
     #[cfg(windows)]
