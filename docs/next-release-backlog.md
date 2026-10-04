@@ -67,27 +67,6 @@
   足りるかもしれない (mIV との組み合わせは未確認) こと、件数上限 10 とコマンドライン長の制限も伝えた。
 - 規模 / 優先度: Small〜Medium / P3。
 
-### 1.330 `fs_page_load_scheduler::tests::slow_read_and_decode_stay_within_process_budget` が全体実行でまれに落ちる — テスト側の同期不足 (2026-10-04)
-
-- 観測: §1.312 の作業中、`cargo test -p mimageviewer --lib` 全体 (10,247 件) でこのテストだけ 1 回失敗 (`peak == 3` の期待に対して 2、line 678)。単独で再実行すると成功。§1.312 の変更とは無関係 (実装担当の調査と独立レビューで確認)。
-- 原因 (コードの読み): stats が Running の許可を 3 つ出した時点で、worker が active / peak を更新する前にテストがゲートを開けてしまう。上限 (許可数) の違反ではない。
-- 方針: ゲートを開ける前に stats == 3 かつ active == 3 を待つ。assert は弱めない。
-- 実装済み (2026-10-05、独立レビュー待ち): Running / Cancelling 合計と active の両方が 3 になるまでゲートを閉じる。既存 assert は維持。同モジュールの他テストに、許可数だけで active / peak の測定ゲートを開く同型パターンはない。
-- 自動検証: `cargo test -p mimageviewer --lib fs_page_load_scheduler::tests`、9 件成功。元の全体実行での失敗は上記 §1.312 作業時の観測であり、今回の検証では再現を主張しない。
-- 規模 / 優先度: Small / P3 (全体テストのまれな偽失敗)。
-
-### 1.325 Susie の初期化待ちが、予定の 5 秒を超えて延びることがある — §1.321 のレビューで判明 (2026-10-04)
-
-- 出典: §1.321 修正 (7bbbf6dd8) の独立レビュー (Sol xhigh) の P2。製品のリリース済みの挙動で、§1.321 の修正とは独立。
-- コード: `susie_loader::get_pool` の待ち ([susie_loader.rs:719](../src/susie_loader.rs)) は、spurious wake のたびに 5 秒の相対 timeout を数え直す。fallback で `INIT_DONE` を立てるときに他の待機者へ notify しない (同 733 行)。
-- 観測 (§1.321 の診断ログ): fallback 成立が 5.411 秒、他の走査が進み出したのは約 10.411 秒。個々の wakeup は記録していない。
-- 影響の見込み (推測): Susie の初期化が遅い・終わらない環境で、起動時の索引走査など `get_pool` を待つ処理の開始が 5 秒より遅れる。UI スレッドは待たない。
-- 方針: 絶対期限で待つ、fallback 時に notify_all する。回帰テスト: 初期化しない状態で複数の待機者が 5 秒前後でそろって進むこと。
-- 実装済み (2026-10-05、独立レビュー待ち): `get_pool` の待機開始からの絶対期限を維持し、init / reload / fallback の完了公開を `notify_all` 付き共通 helper に統一。process-global pool を変更しない回帰テストで仮想 2 秒の早期 wake 後の残り 3 秒と、仮想 5 秒で 1 waiter だけを起こした fallback による全 3 waiter の解放を検証する。sleep による同期は使わない。
-- 自動検証: `cargo test -p mimageviewer --lib susie_loader::tests`、回帰を含む 14 件成功。本番の 5 秒初期化待ちや製品起動は実行していない。
-- Codex P3 対応 (2026-10-05、7dada7053 の独立レビュー指摘): 回帰テストの cleanup を検証対象 helper から独立した `done = true` / `notify_all` に変更。結果の受信と worker join の待機はそれぞれ全体 5 秒の絶対期限に限定。`complete_init` の通知を一時的に除去した対照では `[Ok(5), Err(Timeout), Err(Timeout)]` でテスト実行 5.00 秒で期待どおり失敗し、ハングしなかった。通知を復元後、Susie 14 テスト成功。製品コードの変更は残していない。
-- 規模 / 優先度: Small / P3。
-
 ### 1.324 「EffeTune に渡す前に 0dB を超える音を抑える」を再生中に反映するか — 残り 1 件 (2026-10-04)
 
 - 済み (次版、master 2b8a6d5c4、v4.3.0 には未収録): 最終安全リミッターを常に通す (利用者決定)、通常の EOS で前段・最終リミッターと resampler の保持分を出し切る、シーク / ループで codec・resampler・timeline を初期化 (44.1 kHz 出力で前周の末尾が次周の頭に再生されていた不具合)。`testdata/audio-tail/` の素材で、ループ 1 周 1 クリック・通常設定での開始ノイズ解消を利用者が実機で確認 (2026-10-04、再生デバイス 24bit / 44.1 kHz)。設計の正本は [EffeTune 計画](effetune-integration-plan.md)。
