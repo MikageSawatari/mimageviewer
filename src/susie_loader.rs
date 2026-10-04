@@ -628,6 +628,38 @@ static POOL: OnceLock<RwLock<Arc<SusieWorkerPool>>> = OnceLock::new();
 static INIT_DONE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 static INIT_COND: std::sync::Condvar = std::sync::Condvar::new();
 
+fn complete_init(done: &mut bool, changed: &Condvar) {
+    *done = true;
+    changed.notify_all();
+}
+
+// The clock and blocking operation are injectable so tests can advance a
+// five-second deadline without sleeping or touching the process-global pool.
+fn wait_for_init<'a>(
+    done: &'a Mutex<bool>,
+    changed: &Condvar,
+    timeout: std::time::Duration,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut wait: impl FnMut(
+        std::sync::MutexGuard<'a, bool>,
+        std::time::Duration,
+    ) -> std::sync::MutexGuard<'a, bool>,
+    fallback: impl FnOnce(),
+) {
+    let deadline = now() + timeout;
+    let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+    while !*done {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            // Install the fallback before publishing completion to all waiters.
+            fallback();
+            complete_init(&mut done, changed);
+            return;
+        }
+        done = wait(done, remaining);
+    }
+}
+
 /// `init_pool` / `reload` 操作の世代カウンタ (Codex P2 v14c 2026-05-14)。
 ///
 /// 各操作の入口で `fetch_add(1)` して自分の世代をスナップショットし、heavy build
@@ -686,9 +718,8 @@ pub fn init_pool(enabled: bool, parallel: bool) {
     // Step 4: signal (= swap したかどうかに関わらず、起動完了状態にする)。
     {
         let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
-        *done = true;
+        complete_init(&mut done, &INIT_COND);
     }
-    INIT_COND.notify_all();
 }
 
 /// 初期化済みプールへのハンドルを返す (アプリ全体の Susie 経路で使う)。
@@ -714,26 +745,26 @@ pub fn get_pool() -> Arc<SusieWorkerPool> {
     // テスト: 100ms (= init_pool 未呼のテスト経路で suite 全体が遅くなるのを防ぐ)
     const INIT_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 5000 };
     let timeout = std::time::Duration::from_millis(INIT_TIMEOUT_MS);
-    let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
-    while !*done {
-        let (g, result) = INIT_COND.wait_timeout(done, timeout).unwrap_or_else(|e| {
-            // poison 経路: lock の中身を取り出して timeout 扱いで継続。
-            let g = e.into_inner();
-            let result = g.1;
-            (g.0, result)
-        });
-        done = g;
-        if result.timed_out() && !*done {
+    wait_for_init(
+        &INIT_DONE,
+        &INIT_COND,
+        timeout,
+        std::time::Instant::now,
+        |done, remaining| {
+            INIT_COND
+                .wait_timeout(done, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+        },
+        || {
             // timeout: empty_pool で永続化して終わる。
             crate::logger::log(&format!(
                 "susie_loader: get_pool: init_pool not called within {INIT_TIMEOUT_MS}ms; \
                  installing empty_pool fallback"
             ));
             POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
-            *done = true;
-            break;
-        }
-    }
+        },
+    );
     let rwlock = POOL
         .get()
         .expect("POOL set by init_pool or timeout fallback");
@@ -804,9 +835,8 @@ pub fn reload(enabled: bool, parallel: bool) {
     // しておく (= init_pool が呼ばれずに reload だけのケースでも get_pool が即時返る)。
     {
         let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
-        *done = true;
+        complete_init(&mut done, &INIT_COND);
     }
-    INIT_COND.notify_all();
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1488,6 +1518,84 @@ fn parse_decode_response(data: &[u8]) -> std::io::Result<image::DynamicImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_fallback_keeps_one_deadline_and_releases_all_waiters() {
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+
+        let shared = Arc::new((Mutex::new(false), Condvar::new()));
+        let seconds = Arc::new(AtomicU64::new(0));
+        let fallbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = Instant::now();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for id in 0..3 {
+            let shared = Arc::clone(&shared);
+            let seconds = Arc::clone(&seconds);
+            let fallbacks = Arc::clone(&fallbacks);
+            let parked_tx = parked_tx.clone();
+            let finished_tx = finished_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                wait_for_init(
+                    &shared.0,
+                    &shared.1,
+                    Duration::from_secs(5),
+                    || base + Duration::from_secs(seconds.load(Ordering::SeqCst)),
+                    |done, remaining| {
+                        let entered_at = seconds.load(Ordering::SeqCst);
+                        parked_tx.send((id, remaining)).unwrap();
+                        // Ignore uncontrolled OS spurious wakes; the test explicitly
+                        // advances the clock to wake the production loop early.
+                        shared
+                            .1
+                            .wait_while(done, |done| {
+                                !*done && seconds.load(Ordering::SeqCst) == entered_at
+                            })
+                            .unwrap()
+                    },
+                    || {
+                        fallbacks.fetch_add(1, Ordering::SeqCst);
+                    },
+                );
+                finished_tx.send(seconds.load(Ordering::SeqCst)).unwrap();
+            }));
+        }
+        let receive_parks = |expected| {
+            let mut ids = HashSet::new();
+            for _ in 0..3 {
+                let (id, remaining) = parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(remaining, Duration::from_secs(expected));
+                assert!(ids.insert(id));
+            }
+        };
+        receive_parks(5);
+        {
+            // Taking this mutex also proves every worker has released it to wait.
+            let _done = shared.0.lock().unwrap();
+            seconds.store(2, Ordering::SeqCst);
+            shared.1.notify_all();
+        }
+        receive_parks(3); // An early wake must not restart a five-second timeout.
+        {
+            let _done = shared.0.lock().unwrap();
+            seconds.store(5, Ordering::SeqCst);
+            // Only one waiter reaches its deadline directly. Fallback must wake
+            // the other two even though their injected waits have no timeout.
+            shared.1.notify_one();
+        }
+        let results: Vec<_> = (0..3)
+            .map(|_| finished_rx.recv_timeout(Duration::from_secs(5)))
+            .collect();
+        // Ensure a failing assertion cannot leave test workers parked forever.
+        complete_init(&mut shared.0.lock().unwrap(), &shared.1);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(results, vec![Ok(5); 3]);
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 1);
+    }
 
     /// ワーカーが落ちたと判断してよいのは transport が切れたときだけ。
     /// プロトコル違反や画像側のエラーで作り直すと、同じ結果を繰り返す。
