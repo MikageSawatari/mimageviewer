@@ -1794,6 +1794,10 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   音声 lane がある限り Complete と出力 drain を待つ（lane 喪失は既存の例外）。
   pump は現 serial の Complete 遷移成功時に `wake_ui()` で ROOT を即時起床させる。
   in-flight 中に deadline が無くても、起床後の tick が既存の 48ms quiet timer を開始できる。
+  `audible_pts_after_latency` は負の audible PTS を trim まで保持する。0 秒開始でも先頭の
+  delay-line silence を sample 単位で除き、EOS 排出と合わせて dry chain の入出力 frames を
+  一致させる。初回・loop-to-zero・seek-to-zero で同じ pump の trim を使う
+  （2026-10-04 P3 follow-up、公開済み v4.3.0 には未収録）。
 
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み

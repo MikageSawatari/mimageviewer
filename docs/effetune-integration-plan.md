@@ -1080,3 +1080,43 @@ follow-up の確認用 build も `build-dev.ps1 -PreserveRuntime -WaitForOtherBu
 既定は実利用中の `%APPDATA%/mimageviewer`。起動前に installed / tray-resident mIV を閉じる。
 ビルド結果の要約を `target/limiter-round-build-dev.log` に記録し、this round 専用の commit message は
 `target/prelimiter-msg.txt` に UTF-8 / BOM なしで上書きした。コミットはしていない。
+
+### Codex P3 対応: 0 秒開始の初期遅延補正（2026-10-04）
+
+6bef20dd5 に対する独立再レビューで、`audible_pts_after_latency` が負の PTS を 0 に clamp し、
+初回・0 秒への seek / loop で最終 limiter の先頭無音を trim できない P3 を確認。
+20ms の 2 chunk は最初が PTS 20ms まで伸び、次が 15ms に始まり、EOS までの出力が
+入力より約 5ms 多くなる。常時 limiter により dry 再生にも影響する。この follow-up も
+公開済み v4.3.0 には未収録。
+
+- source timeline への遅延換算は保ち、`max(0.0)` のみを除く。負の audible PTS は
+  `ProcessedChunk` / `AudioDspTail` の未 trim metadata に保持し、既存 pre-target trim で除去する。
+  Remote は既に負の PTS を保持し、AAC 入口で trim するため変更しない。
+- 新しい補正フラグや開始時専用分岐は追加しない。同じ通常処理 / tail / seek reset を使う。
+- 回帰は 44.1 / 48kHz、native / headless の実 pump と callback を通す。先読みより短い入力、
+  先読みと同じ長さ、1 frame 長い入力、短い分割入力、20ms の 2 chunk をそれぞれ
+  初回 → 実 EOF tick の loop-to-zero → user seek-to-zero で再生する。
+  全 PCM の一致、入力 frames == EOS までの出力 frames、PTS の連続と終端時刻、PDC を検証する。
+
+独立 follow-up レビュー（GPT-6.1 Sol / xhigh）は ACCEPT。対象は 6bef20dd5 に対する未コミット差分。
+
+| P3 follow-up 検証 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib zero_start_pump` | 1 passed。上記 60 組み合わせを実 pump / callback で確認 | `target/p3-zero-start.log` |
+| 同上 `video::audio::` | 59 passed（新しい回帰を含む） | `target/p3-audio.log` |
+| 同上 `video::tests::native_tick_` / `eos_tick` / `eos_empty_audio_seek` / `reaches_eof_with_real_pump` | 4 / 1 / 1 / 2 passed | `target/p3-test-1.log`〜`-4.log` |
+| 同上 `video::clock::` | 14 passed。上記関連テスト計 81 passed、重複する狭い回帰を除く | `target/p3-test-5.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/p3-check.log` / `target/p3-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+
+Remote / composition / decoder の処理と UI は変更なし。前 round の有効な検証結果を再利用し、
+UI snapshot と glyph check の再実行は不要。製品 exe は未起動。実機の A/V sync / seek / loop と
+任意長の残響・ユーザー VST3 tail についての前 round の残事項は維持する。
+
+P3 の確認用 build も `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功
+（exit 0、normal features、core 3m06s、Remote / EPUB worker 成功、PE runtime=4 / pe=3）。
+この invocation 内だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` とし、終了時に復元。
+build / staging の information stream は `target/p3-build-dev.log` に記録した。
+`target/dev-runtime/mimageviewer-core.exe` を更新したが起動していない。通常 APPDATA を使うため、
+利用者の確認前に installed / tray-resident mIV を閉じる。実機確認の残事項は前 round と同じ。
+コミットせず、`target/prelimiter-msg.txt` はこの P3 follow-up のみの内容で UTF-8 / BOM なしに上書き済み。

@@ -1444,16 +1444,14 @@ fn normalize_db_to_linear(db: f32) -> f32 {
 /// output/wall 秒で測った DSP latency を source timeline 秒へ写し、先頭 sample の
 /// audible PTS を返す。time stretch、VST PDC、safety limiter の latency はすべて
 /// output 側で加算されるため、変速率を掛けてから source PTS から引く。
+/// 負の PTS も pre-target trim まで保持し、0 秒開始時の delay-line silence を除く。
 fn audible_pts_after_latency(
     input_pts_secs: f64,
     latency_output_secs: f64,
     source_secs_per_output_sec: f64,
 ) -> (f64, f64) {
     let latency_source_secs = latency_output_secs * source_secs_per_output_sec;
-    (
-        (input_pts_secs - latency_source_secs).max(0.0),
-        latency_source_secs,
-    )
+    (input_pts_secs - latency_source_secs, latency_source_secs)
 }
 
 /// 既定音声出力デバイスのサンプルレートを取得する (実際にはストリームは開かない)。
@@ -4431,6 +4429,157 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn zero_start_pump_trims_latency_and_preserves_samples_through_eos_loop_and_seek() {
+        for rate in [44_100, 48_000] {
+            let lookahead = (SAFETY_LIMITER_LOOKAHEAD_SECS * rate as f64).round() as usize;
+            for chunks in [
+                vec![3],
+                vec![lookahead],
+                vec![lookahead + 1],
+                vec![1, 2],
+                vec![rate as usize / 50; 2],
+            ] {
+                for native in [false, true] {
+                    let frames: usize = chunks.iter().sum();
+                    let duration = frames as f64 / rate as f64;
+                    let expected: Vec<f32> = (0..frames)
+                        .flat_map(|index| {
+                            let sample = 0.2 + index as f32 / frames as f32 * 0.2;
+                            [sample, -sample]
+                        })
+                        .collect();
+                    let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        "zero-start.mp4".into(),
+                    );
+                    player.configure_native_timing_for_test(0.0, duration, true, false);
+                    if !native {
+                        player.native_output = None;
+                    }
+                    player.clock.set_volume(1.0);
+                    player.clock.set_muted(false);
+                    player.clock.notify_audio_active();
+                    player.set_loop_enabled(true);
+                    let (tx, rx) = bounded(8);
+                    player.audio = Some(AudioOutput::pumping_without_device_for_test(
+                        rate,
+                        rx,
+                        player.clock.clone(),
+                        player.engine_event_tx.clone(),
+                        player.engine_state_atomic.clone(),
+                    ));
+                    let ctx = egui::Context::default();
+                    for phase in 0..3 {
+                        let serial = player.current_seek_serial();
+                        // Model the decoder's post-seek acknowledgement; the actual loop/seek
+                        // requests below create the serial and clear/reset the real pump.
+                        player.clock.notify_seek_completed(0.0);
+                        player.clock.clear_seek_target_override(serial);
+                        player.clock.set_playing(true);
+                        player
+                            .engine_state_atomic
+                            .store(state_code::PLAYING, Ordering::Release);
+                        let mut offset = 0;
+                        for count in &chunks {
+                            tx.send(AudioFrame {
+                                samples: expected[offset * 2..(offset + count) * 2].to_vec(),
+                                pts_secs: offset as f64 / rate as f64,
+                                duration_secs: *count as f64 / rate as f64,
+                                seek_serial: serial,
+                                stream_index: 0,
+                                seek_target_secs: (phase != 0).then_some(0.0),
+                                queued_wall_secs: *count as f64 / rate as f64,
+                                audio_tx_accounting_epoch: player
+                                    .clock
+                                    .audio_tx_accounting_snapshot()
+                                    .1,
+                            })
+                            .unwrap();
+                            offset += count;
+                        }
+                        player.clock.note_audio_decoded_eos(serial);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(3);
+                        while !player.clock.audio_tail_complete()
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        assert!(
+                            player.clock.audio_tail_complete(),
+                            "rate={rate} phase={phase}"
+                        );
+                        let audio = player.audio.as_ref().unwrap();
+                        {
+                            let buf = audio.buffer.lock().unwrap();
+                            let output: Vec<f32> = buf
+                                .processed
+                                .iter()
+                                .flat_map(|chunk| chunk.samples.iter().copied())
+                                .collect();
+                            assert_eq!(
+                                output.len() / 2,
+                                frames,
+                                "rate={rate} phase={phase} chunks={chunks:?}"
+                            );
+                            assert_eq!(
+                                output, expected,
+                                "no startup silence, missing samples or stale tail"
+                            );
+                            let mut end = 0.0;
+                            for chunk in &buf.processed {
+                                assert_eq!(chunk.seek_serial, serial);
+                                assert!(
+                                    (chunk.audible_pts_secs - end).abs() < 1e-12,
+                                    "overlap/gap: rate={rate} phase={phase} pts={} end={end}",
+                                    chunk.audible_pts_secs
+                                );
+                                assert!(
+                                    (chunk.pdc_latency_secs_at_process
+                                        - lookahead as f64 / rate as f64)
+                                        .abs()
+                                        < 1e-12
+                                );
+                                end += chunk.duration_secs;
+                            }
+                            assert!((end - duration).abs() < 1e-12);
+                        }
+                        let mut consumed = vec![0.0; expected.len()];
+                        fill_output(
+                            &mut consumed,
+                            &audio.buffer,
+                            &player.clock,
+                            &player.engine_state_atomic,
+                            &audio.diagnostics,
+                            None,
+                        );
+                        assert_eq!(consumed, expected);
+                        assert!(audio.buffer.lock().unwrap().processed.is_empty());
+                        player.displayed_frame_seq.fetch_add(1, Ordering::AcqRel);
+                        if phase == 0 {
+                            player.clock.notify_demux_exhausted();
+                            let _ = player.tick(&ctx);
+                            player
+                                .backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+                            let _ = player.tick(&ctx);
+                            assert!(
+                                player.current_seek_serial() > serial,
+                                "real EOF loop must seek to zero"
+                            );
+                        } else if phase == 1 {
+                            player.seek(0.0);
+                            assert!(
+                                player.current_seek_serial() > serial,
+                                "user seek to zero must be issued"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn final_limiter_local_keeps_delay_during_normalize_ramp_across_unity() {
         let clock = make_clock();
@@ -5141,7 +5290,7 @@ mod tests {
     }
 
     #[test]
-    fn audible_pts_uses_source_timeline_latency_and_clamps_at_zero() {
+    fn audible_pts_uses_source_timeline_latency_and_preserves_negative_pts() {
         let (audible, latency_source) = audible_pts_after_latency(10.0, 0.125, 1.0);
         assert!((audible - 9.875).abs() < 1.0e-12);
         assert!((latency_source - 0.125).abs() < 1.0e-12);
@@ -5150,8 +5299,8 @@ mod tests {
         assert!((audible_2x - 9.75).abs() < 1.0e-12);
         assert!((latency_source_2x - 0.25).abs() < 1.0e-12);
 
-        let (clamped, _) = audible_pts_after_latency(0.05, 0.125, 1.0);
-        assert_eq!(clamped, 0.0);
+        let (negative, _) = audible_pts_after_latency(0.05, 0.125, 1.0);
+        assert!((negative + 0.075).abs() < 1.0e-12);
     }
 
     #[test]
