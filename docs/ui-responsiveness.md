@@ -300,6 +300,36 @@ detached の述語・viewport routing・ジェスチャ・サムネイル要求�
 全 Settings writer の順序保証をまとめて扱う。「描画時の回転 read は非同期」と、
 「設定変更操作まで含めて一切同期 I/O がない」は区別する。
 
+### 2.6 外部再走査: 実サブフォルダの mtime だけでは一覧を差し替えない (v4.3.0)
+
+利用者報告 (2026-10-01、[バックログ §1.314](next-release-backlog.md#1314-サブフォルダ内の一時ファイル作成削除で親一覧がちらつく--最小設計で修正-2026-10-01)):
+ダウンローダーがサブフォルダ内の `.part` を作成・削除すると、親のグリッドが繰り返し更新される。
+設計担当のコード調査では、NTFS が子フォルダ自身の mtime を更新し、親の NonRecursive watch →
+`poll_current_folder_watch` → worker 再走査 → `apply_external_rescan` の内容シグネチャ比較が
+`load_folder_with_scan` を呼び、全サムネイルを Pending に戻してキャッシュを破棄する経路が原因。
+
+`signature_from_scan` は既存の全 stamp hash と、実 `GridItem::Folder` の mtime だけを除く
+listing hash を単一の `FolderScanSignature` に持つ。外部再走査では worker が scan と signature
+を一緒に返し、UI は既存の owner / generation / 削除中 / 失敗 / current folder 判定後に比較する。
+path・種類・ファイル mtime / size・ZIP / PDF / EPUB / 変換書庫の stamp が同じなら、適用済みの
+signature と親フォルダ mtime だけを進めて終了する。items / items generation / image_metas /
+サムネイル / sort / 遅延 metadata / cache は触らない。それ以外は既存の全面 reload を使い、
+main viewer 中は既存 `folder_refresh_pending` に先送りする。無視した走査は既存 pending を消さない。
+Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知の再予約も維持する。
+
+利用者が受け入れた仕様: 一覧を開いている間、実サブフォルダの「更新日時」列・tooltip・日付 sort は
+一覧を開いた時点の値を維持する。代表サムネ要求もその時点の stamp を使うので、画面外からの再要求は
+同じ cache row を参照する。再利用可能な cache hit では、子フォルダの mtime 変化だけを理由に
+再選定しない。既存の proof 失効／cache miss／idle 品質 upgrade による再生成は維持する。
+開き直し／「最新の情報に更新」では従来どおり最新の mtime と代表を取得する。
+無視した走査の後でもファイル追加などの実変更は listing hash 差分で reload する。
+
+簡素化の判断 (利用者、2026-10-01): per-listing session で自動代表を固定する B1 は実装しない。
+代表は PC の各ビュー・aggregate・Remote・idle upgrade・pin seeds の共有 cached product であり、
+一覧ごとの選択には共有状態が必要となる。旧 `v430-folder-refresh` の独立レビューでは組み合わせごとに
+新しい P2 が出続けた。mtime だけの再走査を無視する最小設計で、開いている一覧の代表も安定するため、
+session state／catalog／Remote・IPC の変更を避ける。
+
 ## 3. GPU テクスチャアップロード
 
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で

@@ -125,6 +125,7 @@ pub struct ImportSummary {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImportCommittedChanges {
     pub video_pins: usize,
+    pub folder_pins: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -794,6 +795,7 @@ where
     let mut batch_bytes = 0usize;
     let mut batch_applied = 0usize;
     let mut batch_video_pin_changes = 0usize;
+    let mut batch_folder_pin_changes = 0usize;
     let mut batch_started = std::time::Instant::now();
     let mut batch_active = false;
     let apply_started = std::time::Instant::now();
@@ -890,6 +892,7 @@ where
                             conn.execute_batch("RELEASE metadata_import_item")
                                 .map_err(db_error)?;
                             let video_pin_changed = outcome.video_pin_changed;
+                            let folder_pin_changed = outcome.folder_pin_changed;
                             for failure in outcome.skipped_folder_pins {
                                 crate::logger::log(format!(
                                     "metadata import: partially applied {}: {}",
@@ -914,6 +917,8 @@ where
                             batch_applied = batch_applied.saturating_add(1);
                             batch_video_pin_changes = batch_video_pin_changes
                                 .saturating_add(usize::from(video_pin_changed));
+                            batch_folder_pin_changes = batch_folder_pin_changes
+                                .saturating_add(usize::from(folder_pin_changed));
                         }
                         Err(error) => {
                             conn.execute_batch(
@@ -975,6 +980,10 @@ where
                     .committed
                     .video_pins
                     .saturating_add(batch_video_pin_changes);
+                summary.committed.folder_pins = summary
+                    .committed
+                    .folder_pins
+                    .saturating_add(batch_folder_pin_changes);
                 #[cfg(test)]
                 {
                     summary.transaction_batches += 1;
@@ -984,6 +993,7 @@ where
                 batch_bytes = 0;
                 batch_applied = 0;
                 batch_video_pin_changes = 0;
+                batch_folder_pin_changes = 0;
                 batch_started = std::time::Instant::now();
             }
             progress(TransferProgress {
@@ -1034,6 +1044,10 @@ where
             .committed
             .video_pins
             .saturating_add(batch_video_pin_changes);
+        summary.committed.folder_pins = summary
+            .committed
+            .folder_pins
+            .saturating_add(batch_folder_pin_changes);
         #[cfg(test)]
         if batch_active {
             summary.transaction_batches += 1;
@@ -4340,6 +4354,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
 struct ApplyEntryOutcome {
     skipped_folder_pins: Vec<ImportFailure>,
     video_pin_changed: bool,
+    folder_pin_changed: bool,
 }
 
 fn apply_entry(
@@ -4688,6 +4703,16 @@ fn apply_entry(
     }
     if sections.thumbnail_pins {
         if supports_container {
+            // Trigger-owned revision observes deletions and nested pins as well as inserts.
+            // This remains item-local until its SAVEPOINT and outer batch commit succeed.
+            let pin_revision =
+                || {
+                    tx.query_row(
+                "SELECT revision FROM folder_pin.folder_thumb_pin_revision WHERE singleton = 1",
+                [], |row| row.get::<_, i64>(0),
+            ).map_err(db_error)
+                };
+            let previous_pin_revision = pin_revision()?;
             let include_nested = entry.kind == PortableEntryKind::File;
             // 未知 kind は「その pin 1 件を適用しない」扱いなので、取り込み先に同じ
             // container の既存 pin があれば保持する。family 一括 DELETE の巻き添えに
@@ -4741,6 +4766,7 @@ fn apply_entry(
                     });
                 }
             }
+            outcome.folder_pin_changed = previous_pin_revision != pin_revision()?;
         }
         if entry.media_kind == PortableMediaKind::Video {
             let deleted = tx
@@ -9674,6 +9700,59 @@ mod tests {
 
         assert!(summary.applied_entries > 0);
         assert_eq!(summary.committed.video_pins, 0);
+    }
+
+    #[test]
+    fn committed_folder_pin_changes_cover_insert_removal_and_noop_import() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(source.join("album")).unwrap();
+        fs::create_dir_all(destination.join("album")).unwrap();
+        for root in [&source, &destination] {
+            fs::write(root.join("album/cover.jpg"), b"image").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let pins = FolderThumbPinDb::open_at(&source_data.join("folder_thumb_pins.db")).unwrap();
+        pins.set(
+            &source.join("album"),
+            &FolderPinSource::File {
+                rel: "cover.jpg".into(),
+                kind: FileKind::Image,
+            },
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let inserted = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(inserted.committed.folder_pins, 1);
+        assert_eq!(inserted.committed.video_pins, 0);
+        let destination_pins =
+            FolderThumbPinDb::open_at(&destination_data.join("folder_thumb_pins.db")).unwrap();
+        assert!(
+            destination_pins
+                .lookup(&destination.join("album"))
+                .is_some()
+        );
+        pins.remove(&source.join("album")).unwrap();
+        export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
+        // The fixture copier creates a new bundle directory. Replace only this TempDir bundle.
+        fs::remove_dir_all(destination.join(SIDECAR_FILENAME)).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let removed = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(removed.committed.folder_pins, 1);
+        assert!(
+            destination_pins
+                .lookup(&destination.join("album"))
+                .is_none()
+        );
+        let unchanged = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(unchanged.committed.folder_pins, 0);
     }
 
     #[test]

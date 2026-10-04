@@ -31,6 +31,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_FOLDER_PIN_DB_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// UI-owned handle identity and successful writes, without reading SQLite on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FolderPinMutationStamp {
+    instance: u64,
+    revision: u64,
+}
 
 /// ピン対象のうち通常ファイル / フォルダ系の種別。
 /// (ZipImage / PdfPage は `FolderPinSource::ZipEntry` / `PdfPage` に分離している)
@@ -286,6 +296,8 @@ impl From<rusqlite::Error> for FolderPinError {
 /// (= cascade lookups 数件程度 / フォルダロード)。
 pub struct FolderThumbPinDb {
     conn: Mutex<Connection>,
+    instance: u64,
+    mutation_revision: AtomicU64,
 }
 
 impl FolderThumbPinDb {
@@ -312,22 +324,47 @@ impl FolderThumbPinDb {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let migration_ran = Self::init_schema(&conn)?;
-        Ok((
-            Self {
-                conn: Mutex::new(conn),
-            },
-            migration_ran,
-        ))
+        Ok((Self::from_connection(conn), migration_ran))
     }
 
-    fn db_path() -> PathBuf {
+    pub(crate) fn db_path() -> PathBuf {
         crate::data_dir::get().join("folder_thumb_pins.db")
+    }
+
+    /// Prepare workers read an already initialized store; never create or migrate it here.
+    pub(crate) fn open_readonly(path: &Path) -> SqlResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self::from_connection(conn))
+    }
+
+    fn from_connection(conn: Connection) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            instance: NEXT_FOLDER_PIN_DB_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            mutation_revision: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn mutation_stamp(&self) -> FolderPinMutationStamp {
+        FolderPinMutationStamp {
+            instance: self.instance,
+            revision: self.mutation_revision.load(Ordering::Acquire),
+        }
     }
 
     fn init_schema(conn: &Connection) -> SqlResult<bool> {
         // Install the revision row and all triggers as one schema transaction.
         // A concurrent writer cannot change a pin in a gap between them.
-        let tx = conn.unchecked_transaction()?;
+        // Acquire the schema writer before no-op CREATEs read sqlite_master. Concurrent
+        // refresh workers must not deadlock while upgrading DEFERRED readers to writers.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS folder_thumb_pins (
                 container_key TEXT PRIMARY KEY,
@@ -568,6 +605,7 @@ impl FolderThumbPinDb {
                 source_page  = excluded.source_page",
             params![key, source.db_kind(), rel_norm, entry.as_deref(), page],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -582,6 +620,7 @@ impl FolderThumbPinDb {
             "DELETE FROM folder_thumb_pins WHERE container_key = ?1",
             [&key],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 }
@@ -1166,9 +1205,39 @@ mod tests {
     fn open_in_memory() -> FolderThumbPinDb {
         let conn = Connection::open_in_memory().expect("memory db");
         FolderThumbPinDb::init_schema(&conn).expect("schema");
-        FolderThumbPinDb {
-            conn: Mutex::new(conn),
-        }
+        FolderThumbPinDb::from_connection(conn)
+    }
+
+    #[test]
+    fn mutation_stamp_advances_only_for_successful_handle_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        let initial = db.mutation_stamp();
+        let source = FolderPinSource::File {
+            rel: "cover.png".into(),
+            kind: FileKind::Image,
+        };
+        let folder = Path::new("C:/album");
+        let readonly = FolderThumbPinDb::open_readonly(&path).unwrap();
+        assert_eq!(db.mutation_stamp(), initial);
+        assert!(readonly.set(folder, &source).is_err());
+        assert_eq!(db.mutation_stamp(), initial);
+        let invalid = FolderPinSource::File {
+            rel: "../bad.png".into(),
+            kind: FileKind::Image,
+        };
+        assert!(db.set(folder, &invalid).is_err());
+        assert_eq!(db.mutation_stamp(), initial);
+        db.set(folder, &source).unwrap();
+        let written = db.mutation_stamp();
+        assert_ne!(written, initial);
+        assert_eq!(readonly.lookup(folder), Some(source));
+        db.remove(folder).unwrap();
+        assert_ne!(db.mutation_stamp(), written);
+        let missing = temp.path().join("missing.db");
+        assert!(FolderThumbPinDb::open_readonly(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -2167,6 +2236,58 @@ mod tests {
             recreated.selection_revision().unwrap().instance_id,
             initial.instance_id
         );
+    }
+
+    #[test]
+    fn concurrent_refresh_opens_preserve_pin_rows_and_store_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.db");
+        let pin = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let mut original_revision = None;
+        for fresh in [true, false] {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+            let revisions = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        let path = &path;
+                        let pin = &pin;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let (db, migrated) =
+                                FolderThumbPinDb::open_at_with_migration_info(path)
+                                    .expect("concurrent refresh must acquire the schema writer");
+                            let revision = db.selection_revision().unwrap();
+                            if !fresh {
+                                assert_eq!(db.lookup(Path::new("C:/album")), Some(pin.clone()));
+                            }
+                            (revision, migrated)
+                        })
+                    })
+                    .collect();
+                barrier.wait();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                revisions.iter().filter(|(_, migrated)| *migrated).count(),
+                usize::from(fresh)
+            );
+            let revision = revisions[0].0.clone();
+            assert!(revisions.iter().all(|(other, _)| *other == revision));
+            if fresh {
+                let db = FolderThumbPinDb::open_at(&path).unwrap();
+                db.set(Path::new("C:/album"), &pin).unwrap();
+                original_revision = Some(db.selection_revision().unwrap());
+            } else {
+                assert_eq!(Some(revision), original_revision);
+            }
+        }
     }
 
     #[test]

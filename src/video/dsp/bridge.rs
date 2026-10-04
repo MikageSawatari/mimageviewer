@@ -36,7 +36,8 @@ use windows::core::{HSTRING, PCWSTR};
 /// **bump 1 → 2** (T09 round 4): 旧 bridge は version 比較を no-op で握り潰していたので
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v5: checked GUI-thread presentation outcomes and shared suppression epochs.
+pub const PROTOCOL_VERSION: u32 = 5;
 pub(crate) const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
 static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);
@@ -221,6 +222,11 @@ pub enum Event {
         container_hwnd: u64,
     },
     GuiDetached,
+    GuiVisibilityResult {
+        request_id: u64,
+        slot_id: u64,
+        outcome: GuiVisibilityOutcome,
+    },
     GuiUserHidden {
         #[serde(default)]
         slot_id: u64,
@@ -263,6 +269,64 @@ impl std::fmt::Display for ConcurrentStateError {
             Self::Interrupted(reason) | Self::HostResponse(reason) => f.write_str(reason),
             Self::HostExited => f.write_str("host stdout closed"),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuiVisibilityOutcome {
+    Shown,
+    Hidden,
+    Cancelled,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiVisibilitySignal {
+    Closed(u64),
+    Checked {
+        slot_id: u64,
+        outcome: GuiVisibilityOutcome,
+    },
+}
+
+impl GuiVisibilitySignal {
+    pub(super) fn projection(self) -> Option<(u64, bool, bool)> {
+        match self {
+            Self::Closed(slot) => Some((slot, false, true)),
+            Self::Checked {
+                slot_id,
+                outcome: GuiVisibilityOutcome::Shown,
+            } => Some((slot_id, true, false)),
+            Self::Checked {
+                slot_id,
+                outcome: GuiVisibilityOutcome::Hidden,
+            } => Some((slot_id, false, false)),
+            _ => None,
+        }
+    }
+}
+
+type PendingGuiRequests = Arc<
+    Mutex<
+        HashMap<u64, crossbeam_channel::Sender<Result<GuiVisibilityOutcome, ConcurrentStateError>>>,
+    >,
+>;
+fn finish_pending_gui_requests(pending: &PendingGuiRequests, error: ConcurrentStateError) {
+    for (_, reply) in pending.lock().unwrap().drain() {
+        let _ = reply.try_send(Err(error.clone()));
+    }
+}
+fn route_gui_result(pending: &PendingGuiRequests, request_id: u64, outcome: GuiVisibilityOutcome) {
+    if let Some(reply) = pending.lock().unwrap().remove(&request_id) {
+        let result = if outcome == GuiVisibilityOutcome::Error {
+            Err(ConcurrentStateError::HostResponse(
+                "host rejected checked GUI visibility".into(),
+            ))
+        } else {
+            Ok(outcome)
+        };
+        let _ = reply.try_send(result);
     }
 }
 
@@ -354,12 +418,13 @@ pub struct Bridge {
     /// 値は `reset_id` の世代 ID で、`wait_reset_done(expected_id)` が照合に使う
     /// (= stale ack race 防止、Codex 助言、2026-05-01)。
     reset_ack_rx: crossbeam_channel::Receiver<u64>,
-    gui_user_hidden_rx: crossbeam_channel::Receiver<u64>,
+    gui_visibility_rx: crossbeam_channel::Receiver<GuiVisibilitySignal>,
     gui_bypass_toggle_rx: crossbeam_channel::Receiver<u64>,
     /// reset_sync helper が使う世代 ID counter。`fetch_add(1)` で発行する。
     next_reset_id: AtomicU64,
-    next_state_query_id: AtomicU64,
+    next_request_id: AtomicU64,
     pending_state_queries: PendingStateQueries,
+    pending_gui_requests: PendingGuiRequests,
     #[cfg(windows)]
     shm: Option<SharedMemory>,
     #[cfg(windows)]
@@ -372,12 +437,22 @@ type GuiSignalWake = Arc<dyn Fn() + Send + Sync>;
 
 fn route_gui_signal(
     event: &Event,
-    user_hidden_tx: &crossbeam_channel::Sender<u64>,
+    user_hidden_tx: &crossbeam_channel::Sender<GuiVisibilitySignal>,
     bypass_toggle_tx: &crossbeam_channel::Sender<u64>,
     wake: Option<&GuiSignalWake>,
 ) -> bool {
     let queued = match event {
-        Event::GuiUserHidden { slot_id } => user_hidden_tx.try_send(*slot_id).is_ok(),
+        Event::GuiUserHidden { slot_id } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::Closed(*slot_id))
+            .is_ok(),
+        Event::GuiVisibilityResult {
+            slot_id, outcome, ..
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::Checked {
+                slot_id: *slot_id,
+                outcome: *outcome,
+            })
+            .is_ok(),
         Event::GuiBypassToggle { slot_id } => bypass_toggle_tx.try_send(*slot_id).is_ok(),
         _ => return false,
     };
@@ -515,10 +590,13 @@ impl Bridge {
         // `wait_reset_done(expected_id)` が照合してから受理する (= stale ack 排除)。
         // bounded(8) は十分 (= 通常 1 個ずつ即消費、複数 reset 連続でも全 ID を保持)。
         let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
-        let (gui_user_hidden_tx, gui_user_hidden_rx) = crossbeam_channel::bounded::<u64>(64);
+        let (gui_visibility_tx, gui_visibility_rx) =
+            crossbeam_channel::unbounded::<GuiVisibilitySignal>();
         let (gui_bypass_toggle_tx, gui_bypass_toggle_rx) = crossbeam_channel::bounded::<u64>(64);
         let pending_state_queries: PendingStateQueries = Arc::new(Mutex::new(HashMap::new()));
         let pending_state_queries_for_pump = Arc::clone(&pending_state_queries);
+        let pending_gui_requests: PendingGuiRequests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_gui_for_pump = Arc::clone(&pending_gui_requests);
         let cached_latency_for_pump = cached_latency.clone();
         let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
@@ -554,14 +632,18 @@ impl Bridge {
                             // (= stale ack race 防止、Codex 助言、2026-05-01)。
                             let _ = reset_ack_tx.try_send(reset_id);
                         }
-                        Ok(event @ Event::GuiUserHidden { .. })
+                        Ok(event @ Event::GuiVisibilityResult { .. })
+                        | Ok(event @ Event::GuiUserHidden { .. })
                         | Ok(event @ Event::GuiBypassToggle { .. }) => {
                             route_gui_signal(
                                 &event,
-                                &gui_user_hidden_tx,
+                                &gui_visibility_tx,
                                 &gui_bypass_toggle_tx,
                                 gui_signal_wake.as_ref(),
                             );
+                            if let Event::GuiVisibilityResult { request_id, outcome, .. } = event {
+                                route_gui_result(&pending_gui_for_pump, request_id, outcome);
+                            }
                         }
                         Ok(Event::PluginState {
                             request_id: Some(request_id),
@@ -609,8 +691,9 @@ impl Bridge {
                             };
                             finish_pending_state_queries(
                                 &pending_state_queries_for_pump,
-                                query_error,
+                                query_error.clone(),
                             );
+                            finish_pending_gui_requests(&pending_gui_for_pump, query_error);
                             let _ = event_tx.send(Err(e));
                             break;  // EOF or error
                         }
@@ -627,11 +710,12 @@ impl Bridge {
             cached_latency_samples: cached_latency,
             cached_latency_by_slot,
             reset_ack_rx,
-            gui_user_hidden_rx,
+            gui_visibility_rx,
             gui_bypass_toggle_rx,
             next_reset_id: AtomicU64::new(0),
-            next_state_query_id: AtomicU64::new(0),
+            next_request_id: AtomicU64::new(0),
             pending_state_queries,
+            pending_gui_requests,
             #[cfg(windows)]
             shm: None,
             #[cfg(windows)]
@@ -641,12 +725,8 @@ impl Bridge {
         })
     }
 
-    pub fn drain_gui_user_hidden_slots(&self) -> Vec<u64> {
-        let mut out = Vec::new();
-        while let Ok(slot_id) = self.gui_user_hidden_rx.try_recv() {
-            out.push(slot_id);
-        }
-        out
+    pub fn drain_gui_visibility(&self) -> Vec<GuiVisibilitySignal> {
+        self.gui_visibility_rx.try_iter().collect()
     }
 
     pub fn drain_gui_bypass_toggle_slots(&self) -> Vec<u64> {
@@ -858,7 +938,7 @@ impl Bridge {
         crossbeam_channel::Receiver<Result<String, ConcurrentStateError>>,
         ConcurrentStateError,
     > {
-        let id = self.next_state_query_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let id = self.next_request_id.fetch_add(1, Ordering::AcqRel) + 1;
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.pending_state_queries
             .lock()
@@ -877,7 +957,37 @@ impl Bridge {
         Ok(reply_rx)
     }
 
+    /// Worker-only; the pipe write is not a successful presentation outcome.
+    pub fn set_gui_visibility_checked(
+        &self,
+        slot_id: u64,
+        visible: bool,
+        minimized_sequence: u64,
+        remote_token: u64,
+    ) -> Result<GuiVisibilityOutcome, ConcurrentStateError> {
+        let id = self.next_request_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.pending_gui_requests.lock().unwrap().insert(id, tx);
+        let result = (|| {
+            self.send_value(&serde_json::json!({"cmd": "set_gui_visibility_checked", "request_id": id,
+                "slot_id": slot_id, "visible": u32::from(visible), "minimized_sequence": minimized_sequence, "remote_token": remote_token}))
+                .map_err(|_| ConcurrentStateError::HostExited)?;
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    ConcurrentStateError::Interrupted(format!(
+                        "checked GUI visibility ACK: {error}"
+                    ))
+                })?
+        })();
+        self.pending_gui_requests.lock().unwrap().remove(&id);
+        result
+    }
+
     pub fn abort_state_queries(&self) {
+        finish_pending_gui_requests(
+            &self.pending_gui_requests,
+            ConcurrentStateError::Interrupted("bridge shutting down".into()),
+        );
         abort_pending_state_queries(
             &self.pending_state_queries,
             "interrupted: bridge shutting down",
@@ -1334,6 +1444,40 @@ mod concurrent_state_tests {
     use super::*;
 
     #[test]
+    fn probe_and_open_preserve_utf8_windows_paths_in_ipc() {
+        let path = r"C:\Users\山田😀\音響調整\EffeTune Mixwright.vst3";
+        let commands = [
+            Cmd::Probe {
+                plugin_path: path.into(),
+            },
+            Cmd::Open {
+                plugin_path: path.into(),
+                sample_rate: 48_000,
+                block_size: 480,
+                shm_name: "shm".into(),
+                shm_size: 4096,
+                sig_in: "in".into(),
+                sig_out: "out".into(),
+                state: Some("AA==".into()),
+                strict_state: 1,
+            },
+        ];
+        for command in commands {
+            let bytes = serde_json::to_vec(&command).unwrap();
+            let json = std::str::from_utf8(&bytes).unwrap();
+            assert!(json.contains("山田😀"));
+            assert!(json.contains(r"C:\\Users\\"));
+            let decoded: Cmd = serde_json::from_slice(&bytes).unwrap();
+            match decoded {
+                Cmd::Probe { plugin_path } | Cmd::Open { plugin_path, .. } => {
+                    assert_eq!(plugin_path, path);
+                }
+                _ => panic!("path command changed"),
+            }
+        }
+    }
+
+    #[test]
     fn host_gui_user_hidden_wakes_idle_effetune_context_only() {
         use std::sync::atomic::AtomicUsize;
 
@@ -1361,7 +1505,10 @@ mod concurrent_state_tests {
             &bypass_tx,
             Some(&wake),
         ));
-        assert_eq!(hidden_rx.try_recv().unwrap(), 17);
+        assert_eq!(
+            hidden_rx.try_recv().unwrap(),
+            GuiVisibilitySignal::Closed(17)
+        );
         assert!(repaint_count.load(Ordering::SeqCst) > 0);
 
         let prior_repaints = repaint_count.load(Ordering::SeqCst);
@@ -1373,6 +1520,88 @@ mod concurrent_state_tests {
         ));
         assert_eq!(bypass_rx.try_recv().unwrap(), 18);
         assert_eq!(repaint_count.load(Ordering::SeqCst), prior_repaints);
+    }
+
+    #[test]
+    fn checked_visibility_cancel_and_close_follow_host_order_not_ack_timing() {
+        let pending: PendingGuiRequests = Arc::new(Mutex::new(HashMap::new()));
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        pending.lock().unwrap().insert(19, ack_tx);
+        let (visibility_tx, visibility_rx) = crossbeam_channel::unbounded();
+        let (bypass_tx, _) = crossbeam_channel::unbounded();
+        let outcome = Event::GuiVisibilityResult {
+            request_id: 19,
+            slot_id: 7,
+            outcome: GuiVisibilityOutcome::Cancelled,
+        };
+        assert!(route_gui_signal(&outcome, &visibility_tx, &bypass_tx, None));
+        route_gui_result(&pending, 19, GuiVisibilityOutcome::Cancelled);
+        assert_eq!(ack_rx.recv().unwrap(), Ok(GuiVisibilityOutcome::Cancelled));
+        assert!(visibility_rx.recv().unwrap().projection().is_none());
+
+        // Host shows then closes before the worker has consumed its ACK.
+        assert!(route_gui_signal(
+            &Event::GuiVisibilityResult {
+                request_id: 20,
+                slot_id: 7,
+                outcome: GuiVisibilityOutcome::Shown
+            },
+            &visibility_tx,
+            &bypass_tx,
+            None
+        ));
+        assert!(route_gui_signal(
+            &Event::GuiUserHidden { slot_id: 7 },
+            &visibility_tx,
+            &bypass_tx,
+            None
+        ));
+        assert_eq!(
+            visibility_rx.recv().unwrap().projection(),
+            Some((7, true, false))
+        );
+        assert_eq!(
+            visibility_rx.recv().unwrap().projection(),
+            Some((7, false, true))
+        );
+        assert!(route_gui_signal(
+            &Event::GuiVisibilityResult {
+                request_id: 21,
+                slot_id: 7,
+                outcome: GuiVisibilityOutcome::Hidden
+            },
+            &visibility_tx,
+            &bypass_tx,
+            None
+        ));
+        assert_eq!(
+            visibility_rx.recv().unwrap().projection(),
+            Some((7, false, false))
+        );
+    }
+
+    #[test]
+    fn checked_visibility_pending_requests_finish_on_error_exit_and_shutdown() {
+        let pending: PendingGuiRequests = Arc::new(Mutex::new(HashMap::new()));
+        for error in [
+            ConcurrentStateError::HostExited,
+            ConcurrentStateError::Interrupted("shutdown".into()),
+        ] {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            pending.lock().unwrap().insert(3, tx);
+            finish_pending_gui_requests(&pending, error.clone());
+            assert_eq!(rx.recv().unwrap(), Err(error));
+            assert!(pending.lock().unwrap().is_empty());
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        pending.lock().unwrap().insert(3, tx);
+        route_gui_result(&pending, 2, GuiVisibilityOutcome::Shown); // Unrelated reply is ignored.
+        assert!(rx.try_recv().is_err());
+        route_gui_result(&pending, 3, GuiVisibilityOutcome::Error);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Err(ConcurrentStateError::HostResponse(_))
+        ));
     }
 
     #[test]
@@ -1609,7 +1838,7 @@ mod effetune_host_handler_tests {
             "currentPipeline",
             "masterBypass",
         ] {
-            assert!(document.get(key).is_some(), "v0.11.1 codec field {key}");
+            assert!(document.get(key).is_some(), "v0.12.0 codec field {key}");
         }
         assert_eq!(
             crate::effetune::EffectiveState::from_bytes(&bytes),

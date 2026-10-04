@@ -13,10 +13,248 @@ fn music_source_for_test(app: &App, path: PathBuf) -> MusicAnalysisSource {
     }
 }
 use crate::archive_converter::ArchiveFormat;
+use crate::settings::SortOrder;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+mod folder_mtime_rescan_tests {
+    use super::phase_c_support::{AppTestEnv, setup_app};
+    use super::*;
+    use folder_scan::signature_tests::{fixture, real_changes};
+
+    fn prepare() -> (AppTestEnv, PathBuf) {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("folder_mtime_rescan");
+        std::fs::create_dir(&folder).unwrap();
+        let scan = fixture(&folder);
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(signature_from_scan(&scan));
+        app.items = scan
+            .folders
+            .iter()
+            .map(|entry| entry.item.clone())
+            .chain(scan.all_media.iter().map(|entry| match entry.kind {
+                folder_scan::ScanMediaKind::Image => GridItem::Image(entry.path.clone()),
+                folder_scan::ScanMediaKind::Video => GridItem::Video(entry.path.clone()),
+                folder_scan::ScanMediaKind::Audio => GridItem::Audio(entry.path.clone()),
+            }))
+            .collect();
+        app.image_metas = scan
+            .folders
+            .iter()
+            .map(|entry| entry.display_meta)
+            .chain(
+                scan.all_media
+                    .iter()
+                    .map(|entry| Some((entry.mtime, entry.file_size))),
+            )
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.thumbnails[0] = mutation_refresh_loaded_thumb(&egui::Context::default());
+        app.thumbnails[1] = ThumbnailState::Evicted;
+        app.thumbnails[2] = ThumbnailState::Failed;
+        app.visible_indices = vec![5, 0, 2];
+        app.details_lazy_meta.insert(
+            "sentinel".into(),
+            DetailsLazyMeta {
+                source_mtime: 10,
+                source_size: 20,
+                page_count: Some(7),
+                ..Default::default()
+            },
+        );
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                item_id: app.item_id(5),
+                items_generation: app.items_generation,
+                idx: 5,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 42,
+            bg: 0,
+        };
+        app.insert_retained_final_ai(
+            5,
+            key,
+            [1, 1],
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        );
+        assert!(
+            !app.retained_final_ai_cache.is_empty(),
+            "fixture must populate the retained cache"
+        );
+        (app, folder)
+    }
+
+    fn folder_mtime_changed(folder: &Path) -> folder_scan::ScannedDir {
+        let mut scan = fixture(folder);
+        scan.folders[0].display_meta = Some((11, 0));
+        scan.folders[0].sort_meta = crate::settings::ListingSortMetadata::new(11, None);
+        scan
+    }
+
+    #[test]
+    fn folder_mtime_only_rescan_preserves_listing_and_advances_applied_stamps() {
+        let (mut app, folder) = prepare();
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        let items_ptr = app.items.as_ptr();
+        let metas = app.image_metas.clone();
+        let metas_ptr = app.image_metas.as_ptr();
+        let thumbs_ptr = app.thumbnails.as_ptr();
+        let texture_id = match &app.thumbnails[0] {
+            ThumbnailState::Loaded { tex, .. } => tex.id(),
+            _ => unreachable!(),
+        };
+        let old_sig = app.current_folder_signature;
+        let scan = folder_mtime_changed(&folder);
+        let new_sig = signature_from_scan(&scan);
+        assert_ne!(old_sig, Some(new_sig));
+        let parent_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        app.apply_external_rescan(folder.clone(), parent_mtime, scan, new_sig);
+
+        assert_eq!(app.current_folder_signature, Some(new_sig));
+        assert_eq!(app.current_folder_last_mtime, Some(parent_mtime));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items, items);
+        assert_eq!(app.items.as_ptr(), items_ptr);
+        assert_eq!(app.image_metas, metas);
+        assert_eq!(app.image_metas.as_ptr(), metas_ptr);
+        assert_eq!(app.thumbnails.as_ptr(), thumbs_ptr);
+        assert!(
+            matches!(&app.thumbnails[0], ThumbnailState::Loaded { tex, .. } if tex.id() == texture_id)
+        );
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Evicted));
+        assert!(matches!(app.thumbnails[2], ThumbnailState::Failed));
+        assert!(
+            app.thumbnails[3..]
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::Pending))
+        );
+        assert_eq!(app.visible_indices, vec![5, 0, 2]);
+        assert_eq!(app.details_lazy_meta["sentinel"].page_count, Some(7));
+        assert_eq!(app.details_lazy_meta["sentinel"].source_mtime, 10);
+        assert!(!app.retained_final_ai_cache.is_empty());
+        assert!(app.folder_refresh_pending.is_none());
+
+        // Every real change still reloads after acknowledging the folder-only stamp.
+        let mut real = folder_mtime_changed(&folder);
+        real.all_media[0].file_size += 1;
+        let signature = signature_from_scan(&real);
+        app.apply_external_rescan(folder, parent_mtime, real, signature);
+        assert_ne!(app.items_generation, generation);
+        assert_eq!(app.current_folder_signature, Some(signature));
+        assert!(app.retained_final_ai_cache.is_empty());
+    }
+
+    #[test]
+    fn folder_mtime_rescan_real_changes_still_fully_reload() {
+        let (mut app, folder) = prepare();
+        for (label, scan) in real_changes(&folder) {
+            app.current_folder_signature = Some(signature_from_scan(&fixture(&folder)));
+            let generation = app.items_generation;
+            let signature = signature_from_scan(&scan);
+            app.apply_external_rescan(
+                folder.clone(),
+                std::time::SystemTime::now(),
+                scan,
+                signature,
+            );
+            assert_ne!(app.items_generation, generation, "{label}");
+            assert_eq!(app.current_folder_signature, Some(signature), "{label}");
+        }
+    }
+
+    #[test]
+    fn folder_mtime_rescan_keeps_existing_deferred_real_change() {
+        let (mut app, folder) = prepare();
+        let initial = app.current_folder_signature;
+        app.fullscreen_idx = Some(5);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        let mut real = fixture(&folder);
+        real.all_media[0].mtime += 1;
+        let signature = signature_from_scan(&real);
+        app.apply_external_rescan(
+            folder.clone(),
+            std::time::SystemTime::now(),
+            real,
+            signature,
+        );
+        assert_eq!(app.folder_refresh_pending, Some(folder.clone()));
+        assert_eq!(app.current_folder_signature, initial);
+        let generation = app.items_generation;
+        let scan = folder_mtime_changed(&folder);
+        let signature = signature_from_scan(&scan);
+        app.apply_external_rescan(
+            folder.clone(),
+            std::time::SystemTime::now(),
+            scan,
+            signature,
+        );
+        assert_eq!(app.current_folder_signature, Some(signature));
+        assert_eq!(app.folder_refresh_pending, Some(folder));
+        assert_eq!(app.fullscreen_idx, Some(5));
+        assert_eq!(app.items_generation, generation);
+    }
+
+    #[test]
+    fn folder_mtime_rescan_rejected_completions_do_not_advance_stamps() {
+        let (mut app, folder) = prepare();
+        let signature = app.current_folder_signature;
+        let mtime = app.current_folder_last_mtime;
+        let ctx = egui::Context::default();
+        for case in ["failed", "stale", "other owner", "other folder", "accepted"] {
+            let scan = folder_mtime_changed(&folder);
+            let new_signature = signature_from_scan(&scan);
+            let (tx, rx) = mpsc::channel();
+            tx.send(if case == "failed" {
+                None
+            } else {
+                Some((scan, new_signature))
+            })
+            .unwrap();
+            app.external_rescan_pending = Some(ExternalRescanPending {
+                owner_context_id: if case == "other owner" {
+                    ViewerContextId::for_test(u64::MAX)
+                } else {
+                    app.edit_request_owner_context()
+                },
+                folder: if case == "other folder" {
+                    folder.join("other")
+                } else {
+                    folder.clone()
+                },
+                mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+                items_generation: app.items_generation + u64::from(case == "stale"),
+                scan_options: ExternalRescanOptions {
+                    include_convertible_archives: true,
+                    include_epub: true,
+                    show_hidden_files: false,
+                },
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                restart_requested: false,
+            });
+            let generation = app.items_generation;
+            app.poll_external_rescan(&ctx);
+            assert_eq!(app.items_generation, generation, "{case}");
+            if case == "accepted" {
+                assert_eq!(app.current_folder_signature, Some(new_signature));
+                assert_ne!(app.current_folder_last_mtime, mtime);
+            } else {
+                assert_eq!(app.current_folder_signature, signature, "{case}");
+                assert_eq!(app.current_folder_last_mtime, mtime, "{case}");
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 #[test]
@@ -192,6 +430,1295 @@ fn send_activation_open_path(app: &App, path: PathBuf) {
             app.remote_session_handle(),
         ))
         .unwrap();
+}
+
+fn mutation_refresh_loaded_thumb(ctx: &egui::Context) -> ThumbnailState {
+    ThumbnailState::Loaded {
+        tex: ctx.load_texture(
+            "pin-refresh-test",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            Default::default(),
+        ),
+        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        from_edit_preview: false,
+        rendered_at_px: 1,
+        source_dims: None,
+        layout_dims: None,
+    }
+}
+
+// Manual terminal fixtures use the same worker preparation as production, with a captured owner.
+fn prepared_pin_materializations_for_test(
+    app: &App,
+    reset_indices: Vec<usize>,
+) -> pin_materialization::Prepared {
+    let mut request = app.pin_materialization_request(CurrentViewRefresh::Full);
+    for (index, item) in app.items.iter().enumerate() {
+        if let Some(target) = app.folder_pin_lookup_target_for_item(item) {
+            request
+                .rows
+                .push(app.pin_materialization_row(index, item, target.path));
+        }
+    }
+    if request.rows.is_empty() {
+        return pin_materialization::Prepared {
+            reset_indices,
+            replacement: None,
+            identity: request.identity,
+        };
+    }
+    let pin_db = app.folder_thumb_pin_db.clone();
+    let video_db_path = crate::video_pins::VideoPinDb::db_path();
+    std::thread::spawn(move || {
+        let video_db = crate::video_pins::VideoPinDb::open_readonly(&video_db_path).ok();
+        request
+            .prepare(
+                reset_indices,
+                &Default::default(),
+                pin_db.as_deref(),
+                video_db.as_ref(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+#[test]
+fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_apply() {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("worker-pin-boundary");
+    let child = folder.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let video = child.join("clip.mp4");
+    std::fs::write(&video, b"video").unwrap();
+    let mut webp = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        4,
+        4,
+        image::Rgba([48, 96, 160, 255]),
+    ))
+    .write_to(
+        &mut std::io::Cursor::new(&mut webp),
+        image::ImageFormat::WebP,
+    )
+    .unwrap();
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 1.25, &webp)
+        .unwrap();
+    assert!(app.set_folder_thumb_pin(
+        &child,
+        FolderPinSource::File {
+            rel: "clip.mp4".into(),
+            kind: FileKind::Video
+        }
+    ));
+    assert!(app.set_folder_thumb_pin(
+        &folder,
+        FolderPinSource::File {
+            rel: "child".into(),
+            kind: FileKind::Folder
+        }
+    ));
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Search(
+            top_level_grid_view::TopLevelSearchView::Tag,
+        ));
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    app.selected = Some(0);
+    app.scroll_offset_y = 42.0;
+    let base = folder_thumb_existing_keys_for(
+        &app.items[0],
+        None,
+        &Default::default(),
+        None,
+        Some(app.settings.folder_thumb_sort),
+        app.settings.folder_thumb_depth,
+        app.use_full_path_cache_keys(),
+    )[0]
+    .clone();
+    let stale = format!(
+        "{base}{}obsolete",
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
+    );
+    let catalog = Arc::new(
+        crate::catalog::CatalogDb::open(&app.tmp.path().join("boundary-cache"), &folder).unwrap(),
+    );
+    catalog.save(&stale, 1, 1, 4, 4, None, &webp).unwrap();
+    let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+    app.current_color_catalog = Some(catalog.clone());
+    app.current_color_cache_map = Some(old_map.clone());
+    let generation = app.items_generation;
+    let history = app.folder_nav_history_snapshot();
+    app.consume_folder_thumb_pin_dirty();
+    let context_id = app.projected_viewer_context_id();
+    // Receive the real worker terminal WITHOUT running a UI completion consumer.
+    let terminal = app.current_view_pin_refreshes[&context_id]
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
+    let mut result = terminal.contexts.into_iter().next().unwrap();
+    // Exhaustive destructuring pins the terminal DTO to memory-only types. Adding any
+    // database/resource field requires explicitly revisiting this thread-boundary test.
+    let pin_materialization::Prepared {
+        reset_indices,
+        replacement,
+        identity,
+    } = result.folder_pin_materializations.take().unwrap();
+    let _: &Vec<usize> = &reset_indices;
+    let _: &Option<pin_materialization::CacheMap> = &replacement;
+    let _: pin_materialization::Identity = identity;
+    assert_eq!(reset_indices, vec![0]);
+    let prepared_map = replacement.as_ref().unwrap().clone();
+    let seed = prepared_map
+        .read()
+        .unwrap()
+        .iter()
+        .find(|(key, entry)| {
+            key.contains(crate::thumb_loader::CACHE_KEY_PIN_SUFFIX) && entry.jpeg_data == webp
+        })
+        .map(|(key, _)| key.clone())
+        .unwrap();
+    assert!(!prepared_map.read().unwrap().contains_key(&stale));
+    assert!(
+        old_map.read().unwrap().contains_key(&stale),
+        "worker must not mutate the live map"
+    );
+    assert!(
+        catalog.load_one(&stale).unwrap().is_none(),
+        "DELETE happened before UI consumption"
+    );
+    assert_eq!(
+        catalog.load_one(&seed).unwrap().unwrap().jpeg_data,
+        webp,
+        "video DB read / catalog seed happened before UI consumption"
+    );
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    result.folder_pin_materializations = Some(pin_materialization::Prepared {
+        reset_indices,
+        replacement,
+        identity,
+    });
+    // All cascaded filesystem sources disappear and UI DB readers are unavailable.
+    // Prepared bytes must still be adopted, without re-stat, cascade lookup or video read.
+    std::fs::remove_file(&video).unwrap();
+    std::fs::remove_dir(&child).unwrap();
+    std::fs::remove_dir(&folder).unwrap();
+    app.folder_thumb_pin_db = None;
+    app.video_pin_db = None;
+    assert!(app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+    ));
+    app.current_view_pin_refreshes.remove(&context_id);
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &prepared_map
+    ));
+    assert_eq!(
+        app.current_color_cache_map
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()[&seed]
+            .jpeg_data,
+        webp
+    );
+    assert!(old_map.read().unwrap().contains_key(&stale));
+    assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.scroll_offset_y, 42.0);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+}
+
+#[test]
+fn mutation_refresh_synthetic_unrelated_pin_keeps_cache_and_producer_owner() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("visible");
+    std::fs::create_dir(&folder).unwrap();
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    let map = Arc::new(std::sync::RwLock::new(Default::default()));
+    app.current_color_cache_map = Some(map.clone());
+    app.current_color_catalog = Some(Arc::new(
+        crate::catalog::CatalogDb::open(&app.tmp.path().join("unrelated-cache"), &folder).unwrap(),
+    ));
+    app.reload_queue = Some(Arc::new((
+        std::sync::Mutex::new(Vec::new()),
+        std::sync::Condvar::new(),
+    )));
+    let token = app.cancel_token.clone();
+    let unrelated = app.tmp.path().join("unrelated");
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Pins {
+        folders: std::collections::HashSet::from([unrelated]),
+        videos: Default::default(),
+    });
+    let context = app.projected_viewer_context_id();
+    let result = app.current_view_pin_refreshes[&context]
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    tx.send(result).unwrap();
+    app.current_view_pin_refreshes.get_mut(&context).unwrap().rx = rx;
+    app.poll_current_view_pin_refresh();
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &map
+    ));
+    assert!(Arc::ptr_eq(&app.cancel_token, &token));
+    assert!(!token.load(Ordering::Relaxed));
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
+#[test]
+fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("seed-failure");
+    std::fs::create_dir(&folder).unwrap();
+    let video = folder.join("clip.mp4");
+    std::fs::write(&video, b"video").unwrap();
+    let webp = |red| {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([red, 96, 160, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        bytes
+    };
+    let old_bytes = webp(10);
+    let new_bytes = webp(240);
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 1.0, &old_bytes)
+        .unwrap();
+    assert!(app.set_folder_thumb_pin(
+        &folder,
+        FolderPinSource::File {
+            rel: "clip.mp4".into(),
+            kind: FileKind::Video
+        }
+    ));
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    let keys = || {
+        folder_thumb_existing_keys_for(
+            &app.items[0],
+            None,
+            &app.folder_pin_map,
+            app.folder_thumb_pin_db.as_deref(),
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+            app.use_full_path_cache_keys(),
+        )
+    };
+    let key = keys()[1].clone();
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 2.0, &new_bytes)
+        .unwrap();
+    assert_eq!(
+        keys()[1],
+        key,
+        "changing pinned frame bytes does not change the folder key"
+    );
+    let cache_dir = app.tmp.path().join("seed-failure-cache");
+    let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &folder).unwrap());
+    let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+        &folder,
+        &app.folder_pin_map[&crate::path_key::normalize_keep_drive(&folder)],
+        |path| {
+            app.folder_thumb_pin_db
+                .as_ref()
+                .and_then(|db| db.lookup(path))
+        },
+        app.settings.folder_thumb_depth as usize,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .save_seeded_folder_bytes(&key, resolved.mtime, resolved.file_size, None, &old_bytes)
+            .unwrap()
+    );
+    let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+    app.current_color_catalog = Some(catalog.clone());
+    app.current_color_cache_map = Some(old_map.clone());
+    let fault =
+        rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, &folder)).unwrap();
+    fault.execute_batch("CREATE TRIGGER reject_video_seed BEFORE INSERT ON thumbnails BEGIN SELECT RAISE(ABORT, 'seed insert rejected'); END;").unwrap();
+    app.consume_folder_thumb_pin_dirty();
+    let id = app.projected_viewer_context_id();
+    let terminal = app.current_view_pin_refreshes[&id]
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
+    let result = terminal.contexts.into_iter().next().unwrap();
+    assert!(
+        catalog.load_one(&key).unwrap().is_none(),
+        "worker cleanup removes stale same-key seed after failed INSERT"
+    );
+    assert!(
+        old_map.read().unwrap().contains_key(&key),
+        "worker leaves live map unchanged"
+    );
+    assert!(app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+    ));
+    app.current_view_pin_refreshes.remove(&id);
+    assert!(
+        !app.current_color_cache_map
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .contains_key(&key),
+        "UI cannot reload the old pinned frame"
+    );
+    assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
+#[test]
+fn mutation_refresh_synthetic_materialization_rejects_changed_cache_owner() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Folder(app.tmp.path().to_path_buf())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    let result = metadata_import_refresh::ContextResult {
+        context_id: app.projected_viewer_context_id(),
+        items_generation: app.items_generation,
+        rating_cache: None,
+        tags_cache: None,
+        current_rating: None,
+        page_state: None,
+        folder_pin_map: Some(Default::default()),
+        folder_pin_materializations: Some(prepared_pin_materializations_for_test(&app, vec![0])),
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+    };
+    let new_map = Arc::new(std::sync::RwLock::new(Default::default()));
+    app.current_color_cache_map = Some(new_map.clone());
+    assert!(!app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+    ));
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &new_map
+    ));
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
+#[test]
+fn mutation_refresh_synthetic_pin_keeps_rows_location_selection_and_history() {
+    use super::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+    for surface in [
+        TopLevelGridSurface::Search(TopLevelSearchView::Global),
+        TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
+        TopLevelGridSurface::Search(TopLevelSearchView::Tag),
+        TopLevelGridSurface::Rating { stars: 3 },
+    ] {
+        let mut app = setup_app_for_test();
+        let container = app.tmp.path().join("synthetic-pin-container");
+        std::fs::create_dir(&container).unwrap();
+        std::fs::write(container.join("page.jpg"), b"page").unwrap();
+        app.current_folder = Some(search_results_synthetic_path());
+        app.items = vec![GridItem::Folder(container.clone())];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.scroll_offset_y = 42.0;
+        app.top_level_grid_view.replace_surface(surface.clone());
+        app.items_are_global_search_view = matches!(
+            surface,
+            TopLevelGridSurface::Search(TopLevelSearchView::Global)
+        );
+        app.items_are_tag_view = matches!(
+            surface,
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag)
+        );
+        app.items_are_rating_view = matches!(surface, TopLevelGridSurface::Rating { .. });
+        if matches!(
+            surface,
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite)
+        ) {
+            app.favsearch.active = true;
+        }
+        let ctx = egui::Context::default();
+        let wake = Arc::new(AtomicBool::new(false));
+        let wake_callback = Arc::clone(&wake);
+        ctx.set_request_repaint_callback(move |_| wake_callback.store(true, Ordering::Relaxed));
+        for _ in 0..4 {
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        wake.store(false, Ordering::Relaxed);
+        app.thumbnails = vec![mutation_refresh_loaded_thumb(&ctx)];
+        app.edit_preview_repaint_ctx = Some(ctx.clone());
+        let items = app.items.clone();
+        let generation = app.items_generation;
+        let history = app.folder_nav_history_snapshot();
+        assert!(app.set_folder_thumb_pin(
+            &container,
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "page.jpg".into(),
+                kind: crate::folder_thumb_pins::FileKind::Image,
+            }
+        ));
+        app.consume_folder_thumb_pin_dirty();
+        assert!(
+            !app.current_view_pin_refreshes.is_empty(),
+            "synthetic worker must be scheduled"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Completion must wake an idle UI before it polls; do not rely on input or busy frames.
+        while !wake.load(Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pin worker did not wake idle UI"
+            );
+            std::thread::yield_now();
+        }
+        while !app.current_view_pin_refreshes.is_empty() {
+            app.consume_folder_thumb_pin_dirty();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            !matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+            "materialized pin must be invalidated"
+        );
+        assert_eq!(app.top_level_grid_view.surface(), &surface);
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 42.0);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            history.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            history.forward_stack
+        );
+        assert!(
+            app.folder_pin_map
+                .contains_key(&crate::path_key::normalize_keep_drive(&container))
+        );
+    }
+}
+
+#[test]
+fn mutation_refresh_synthetic_coalesces_sparse_pin_changes_and_rejects_stale_results() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let a = app.tmp.path().join("a");
+    let child = a.join("child");
+    let b = app.tmp.path().join("b");
+    let unrelated = app.tmp.path().join("unrelated");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Search(
+            top_level_grid_view::TopLevelSearchView::Tag,
+        ));
+    app.items = vec![
+        GridItem::Folder(a.clone()),
+        GridItem::Folder(b.clone()),
+        GridItem::Folder(unrelated),
+    ];
+    app.image_metas = vec![None; 3];
+    app.thumbnails = (0..3)
+        .map(|_| mutation_refresh_loaded_thumb(&ctx))
+        .collect();
+    app.folder_thumb_pin_dirty.insert(child.clone());
+    app.consume_folder_thumb_pin_dirty();
+    let context = app.projected_viewer_context_id();
+    let superseded = app.current_view_pin_refreshes[&context].cancel.clone();
+    app.folder_thumb_pin_dirty.insert(b.clone());
+    app.consume_folder_thumb_pin_dirty();
+    assert!(superseded.load(Ordering::Relaxed));
+    assert!(matches!(&app.current_view_pin_refreshes[&context].refresh,
+        CurrentViewRefresh::Pins { folders, .. } if folders.contains(&child) && folders.contains(&b)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.current_view_pin_refreshes.is_empty() {
+        app.consume_folder_thumb_pin_dirty();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(
+        !matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+        "automatic or cascaded ancestor must be invalidated"
+    );
+    assert!(!matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+    assert!(
+        matches!(app.thumbnails[2], ThumbnailState::Loaded { .. }),
+        "unrelated asset is retained"
+    );
+    app.thumbnails[0] = mutation_refresh_loaded_thumb(&ctx);
+    app.folder_thumb_pin_dirty.insert(child);
+    app.consume_folder_thumb_pin_dirty();
+    app.items_generation += 1;
+    while !app.current_view_pin_refreshes.is_empty() {
+        app.consume_folder_thumb_pin_dirty();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(
+        matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+        "stale asset result must not touch new rows"
+    );
+}
+
+#[test]
+fn mutation_refresh_global_video_cancels_old_producer_and_keeps_streaming_policy() {
+    let mut app = setup_app_for_test();
+    let video = app.tmp.path().join("movie.mp4");
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_global_search_view = true;
+    app.global_search.done = false;
+    app.items = vec![GridItem::Video(video.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    let old_cancel = Arc::new(AtomicBool::new(false));
+    app.search_video_thread_cancel = Some(old_cancel.clone());
+    let old_tx = app.tx.clone();
+    let previous_sidecar = app.tmp.path().join("previous-folder.jpg");
+    app.video_thumb_overrides
+        .insert("movie".into(), previous_sidecar);
+    app.video_thumb_overrides_dirty_paths.insert(video);
+    app.consume_video_thumb_overrides_dirty();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.current_view_pin_refreshes.is_empty() {
+        app.poll_current_view_pin_refresh();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(old_cancel.load(Ordering::Relaxed));
+    assert!(
+        app.search_video_thread_cancel.is_none(),
+        "streaming must not start a Shell producer for an unpinned video"
+    );
+    assert!(!app.cancel_token.load(Ordering::Relaxed));
+    // The prior producer's receiver is retired, even in a lightweight search grid.
+    assert!(
+        old_tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: None,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 320
+                },
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: None,
+                layout_dims: None,
+                canceled: true,
+                finalized: false,
+                input_seq: app.input_seq,
+                items_gen: app.items_generation
+            })
+            .is_err()
+    );
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_refresh_sibling_terminal_result_keeps_main_search_producer() {
+    let mut app = setup_app_for_test();
+    let main_cancel = Arc::new(AtomicBool::new(false));
+    app.search_video_thread_cancel = Some(main_cancel.clone());
+    let main_token = app.cancel_token.clone();
+    let sibling = app.build_window_context_for_test(9_905, |sibling| {
+        sibling.items = vec![GridItem::Folder(PathBuf::from("sibling-folder"))];
+        sibling.image_metas = vec![None];
+        sibling.thumbnails = vec![ThumbnailState::Pending];
+    });
+    app.with_viewer_context(sibling, |mounted| {
+        let old_sibling_token = mounted.cancel_token.clone();
+        let mut result = metadata_context_result(sibling, mounted.items_generation, 0);
+        result.rating_cache = None;
+        result.folder_pin_materializations =
+            Some(prepared_pin_materializations_for_test(mounted, vec![0]));
+        result.folder_pin_map = Some(Default::default());
+        assert!(mounted.apply_current_metadata_import_terminal_result(
+            result,
+            crate::metadata_transfer::ImportChangedSections {
+                thumbnail_pins: true,
+                ..Default::default()
+            },
+        ));
+        assert!(old_sibling_token.load(Ordering::Relaxed));
+        assert!(!mounted.cancel_token.load(Ordering::Relaxed));
+        assert!(!main_cancel.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            mounted.search_video_thread_cancel.as_ref().unwrap(),
+            &main_cancel
+        ));
+    })
+    .unwrap();
+    assert!(!main_token.load(Ordering::Relaxed));
+    assert!(Arc::ptr_eq(&app.cancel_token, &main_token));
+    assert!(!main_cancel.load(Ordering::Relaxed));
+}
+
+#[test]
+fn mutation_refresh_synthetic_zipdir_invalidation_follows_same_archive_dependencies() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let zip = app.tmp.path().join("books.zip");
+    let other = app.tmp.path().join("other.zip");
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_rating_view = true;
+    app.items = vec![zip.clone(), other]
+        .into_iter()
+        .map(|zip_path| GridItem::ZipDir {
+            zip_path,
+            dir_prefix: "a/".into(),
+            is_archive: false,
+            representative: None,
+        })
+        .collect();
+    app.image_metas = vec![None; 2];
+    app.thumbnails = (0..2)
+        .map(|_| mutation_refresh_loaded_thumb(&ctx))
+        .collect();
+    let a = book_container_key(&zip, "a/");
+    let b = book_container_key(&zip, "b/");
+    assert!(app.set_folder_thumb_pin(
+        &a,
+        crate::folder_thumb_pins::FolderPinSource::ZipDir {
+            zip_rel: String::new(),
+            dir_prefix: "b/".into(),
+        }
+    ));
+    // A persisted ZipDir pin may point at sibling B; B changes after A was materialized.
+    app.folder_thumb_pin_dirty.clear();
+    app.folder_thumb_pin_dirty.insert(b);
+    app.consume_folder_thumb_pin_dirty();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.current_view_pin_refreshes.is_empty() {
+        app.poll_current_view_pin_refresh();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibling() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pin-nav-owner");
+    std::fs::create_dir(&folder).unwrap();
+    let page = folder.join("page.png");
+    std::fs::write(&page, b"page").unwrap();
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+    let main_id = app.projected_viewer_context_id();
+    let main_cancel = app.current_view_pin_refreshes[&main_id].cancel.clone();
+    let sibling = app.build_window_context_for_test(9_908, |mounted| {
+        mounted.current_folder = Some(search_results_synthetic_path());
+        mounted.items_are_tag_view = true;
+        mounted.items = vec![GridItem::Folder(folder.clone())];
+        mounted.image_metas = vec![None];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+    });
+    let (sibling_cancel, sibling_generation) = app
+        .with_viewer_context(sibling, |mounted| {
+            mounted.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+            (
+                mounted.current_view_pin_refreshes[&sibling].cancel.clone(),
+                mounted.items_generation,
+            )
+        })
+        .unwrap();
+    assert!(
+        !main_cancel.load(Ordering::Relaxed),
+        "building and mounting a sibling is not navigation in main"
+    );
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    // The ordinary visible adoption path changes generation before loading/seeding its catalog.
+    app.start_loading_items(
+        folder.clone(),
+        vec![GridItem::Image(page.clone())],
+        vec![None],
+        Default::default(),
+        Vec::new(),
+        None,
+    );
+    assert!(main_cancel.load(Ordering::Relaxed));
+    assert!(!app.current_view_pin_refreshes.contains_key(&main_id));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    assert!(app.current_view_pin_refreshes.contains_key(&sibling));
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+    let successor_cancel = app.current_view_pin_refreshes[&main_id].cancel.clone();
+    app.with_viewer_context(sibling, |mounted| {
+        assert_eq!(mounted.items_generation, sibling_generation);
+        assert!(
+            !sibling_cancel.load(Ordering::Relaxed),
+            "mount alone preserves the parked owner"
+        );
+        // Prepared aggregate adoption (search / smart / collection) owns the same invalidation.
+        mounted.install_prepared_aggregate_items(vec![GridItem::Image(page)], vec![None]);
+        assert!(sibling_cancel.load(Ordering::Relaxed));
+        assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
+        assert!(!successor_cancel.load(Ordering::Relaxed));
+    })
+    .unwrap();
+    assert!(
+        !successor_cancel.load(Ordering::Relaxed),
+        "restoring main is not a new items generation"
+    );
+    assert!(app.current_view_pin_refreshes.contains_key(&main_id));
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_owners() {
+    let mut app = setup_app_for_test();
+    let root = app.tmp.path().join("pin-import-owner");
+    let folder = root.join("book");
+    let other_root = app.tmp.path().join("unaffected-pin-owner");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::create_dir(&other_root).unwrap();
+    app.current_folder = Some(root.clone());
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+    let main_id = app.projected_viewer_context_id();
+    let generation = app.items_generation;
+    let main_cancel = app.current_view_pin_refreshes[&main_id].cancel.clone();
+    let sibling = app.build_window_context_for_test(9_909, |mounted| {
+        mounted.current_folder = Some(other_root.clone());
+        mounted.items = vec![GridItem::Folder(other_root.clone())];
+        mounted.image_metas = vec![None];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+    });
+    let sibling_cancel = app
+        .with_viewer_context(sibling, |mounted| {
+            mounted.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+            mounted.current_view_pin_refreshes[&sibling].cancel.clone()
+        })
+        .unwrap();
+
+    app.quiesce_metadata_transfer_context_writers(false)
+        .unwrap();
+    app.begin_metadata_import_terminal_refresh();
+    app.abort_metadata_import_terminal_refresh();
+    assert!(!main_cancel.load(Ordering::Relaxed));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+
+    app.begin_metadata_import_terminal_refresh();
+    assert!(app.advance_metadata_import_terminal_refresh(&root, true));
+    let ratings_only = app.take_metadata_import_refresh_requests(
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(ratings_only.len(), 1);
+    assert_eq!(ratings_only[0].context_id, main_id);
+    assert!(!main_cancel.load(Ordering::Relaxed));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+
+    app.begin_metadata_import_terminal_refresh();
+    assert!(app.advance_metadata_import_terminal_refresh(&root, true));
+    let pin_requests = app.take_metadata_import_refresh_requests(
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(pin_requests.len(), 1);
+    assert_eq!(pin_requests[0].context_id, main_id);
+    assert!(matches!(
+        pin_requests[0].pin_materialization.scope,
+        CurrentViewRefresh::Full
+    ));
+    assert_eq!(pin_requests[0].pin_materialization.rows.len(), 1);
+    assert!(
+        app.folder_pin_map.is_empty(),
+        "unpin has already removed the mounted source"
+    );
+    assert!(
+        pin_requests[0]
+            .old_folder_pin_keys
+            .contains(&crate::path_key::normalize_keep_drive(&folder)),
+        "the successor must invalidate visible unpinned rows even though neither pin map contains them"
+    );
+    let data_dir = crate::data_dir::get();
+    let prepared = std::thread::spawn(move || {
+        metadata_import_refresh::run(
+            data_dir,
+            pin_requests,
+            crate::metadata_transfer::ImportChangedSections {
+                thumbnail_pins: true,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert!(prepared.errors.is_empty(), "{:?}", prepared.errors);
+    assert_eq!(
+        prepared.contexts[0]
+            .folder_pin_materializations
+            .as_ref()
+            .unwrap()
+            .reset_indices,
+        [0]
+    );
+    assert_eq!(app.items_generation, generation);
+    assert!(
+        main_cancel.load(Ordering::Relaxed),
+        "old persistence owner is retired before the import worker starts"
+    );
+    assert!(!app.current_view_pin_refreshes.contains_key(&main_id));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    assert!(app.current_view_pin_refreshes.contains_key(&sibling));
+}
+
+#[test]
+fn mutation_refresh_retired_request_is_cancelled_by_ungated_housekeeping() {
+    let mut app = setup_app_for_test();
+    let retired = ViewerContextId::for_test(99_004);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_tx, rx) = mpsc::channel();
+    let generation = app.items_generation;
+    app.current_view_pin_refreshes.insert(
+        retired,
+        CurrentViewPinRefresh {
+            rx,
+            cancel: cancel.clone(),
+            items_generation: generation,
+            refresh: CurrentViewRefresh::Full,
+        },
+    );
+    app.fullscreen_idx = Some(0);
+    app.prune_current_view_pin_refreshes();
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.current_view_pin_refreshes.is_empty());
+}
+
+#[test]
+fn mutation_refresh_rating_child_and_backing_alias_keep_parent_chain_and_history() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("rating-child");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("page.png"), b"page").unwrap();
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.active_quick_folder_slot = None;
+    app.load_folder(folder.clone());
+    let source = app.tmp.path().join("logical.7z");
+    app.archive_source_override = Some(source.clone());
+    app.rating_view_stars = 3;
+    app.rating_view_nav_stack = vec![source];
+    let location = app.folder_nav_current_target();
+    assert!(matches!(
+        location,
+        Some(FolderNavHistoryTarget::RatingPhysical(_))
+    ));
+    let chain = app.rating_view_nav_stack.clone();
+    let history = app.folder_nav_history_snapshot();
+    app.reload_current_folder_preserving_override();
+    assert_eq!(app.folder_nav_current_target(), location);
+    assert_eq!(app.rating_view_nav_stack, chain);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+}
+
+fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
+    let mut app = setup_app_for_test();
+    let parent = app.tmp.path().join("rating-sort-parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    for name in ["a.png", "b.png"] {
+        std::fs::write(child.join(name), b"page").unwrap();
+    }
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.settings.sort_order = SortOrder::FileName;
+    app.active_quick_folder_slot = None;
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_rating_view = true;
+    app.rating_view_stars = 3;
+    app.rating_view_saved_folder = Some(app.tmp.path().to_path_buf());
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 });
+    for path in [parent, child] {
+        let owner = app.rating_view_physical_load_owner(&path).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            path,
+            None,
+            OpenRequestOwner::RatingPhysical(owner)
+        ));
+    }
+    let future = app.tmp.path().join("future");
+    app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(future)];
+    assert_eq!(app.rating_view_nav_stack.len(), 2);
+    assert_eq!(app.items[0].name(), "a.png");
+    app
+}
+
+fn mutation_refresh_wait_for_order_scan(app: &mut App) -> FolderPaneOpenReady {
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            return ready;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sort scan did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn mutation_refresh_resolve_order_scan(app: &mut App, ready: FolderPaneOpenReady) {
+    #[cfg(windows)]
+    assert!(
+        app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+            .is_none()
+    );
+    #[cfg(not(windows))]
+    {
+        let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+            order,
+            reload_owner,
+        } = ready.purpose
+        else {
+            panic!("unexpected scan purpose")
+        };
+        app.apply_current_view_order_refresh(ready.path, ready.scan.unwrap(), order, *reload_owner);
+    }
+}
+
+fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) {
+    let mut app = mutation_refresh_rating_sort_fixture();
+    let location = app.folder_nav_current_target();
+    let chain = app.rating_view_nav_stack.clone();
+    let saved = app.rating_view_saved_folder.clone();
+    let history = app.folder_nav_history_snapshot();
+    assert!(!history.back_stack.is_empty());
+    assert!(!history.forward_stack.is_empty());
+    #[cfg(windows)]
+    let (sibling, sibling_generation, sibling_cancel) = {
+        let mut generation = 0;
+        let mut cancel = None;
+        let id = app.build_window_context_for_test(9_904, |sibling| {
+            sibling.current_folder = Some(PathBuf::from("sibling"));
+            sibling.items = vec![GridItem::Folder(PathBuf::from("sibling-row"))];
+            sibling.selected = Some(0);
+            sibling.scroll_offset_y = 42.0;
+            generation = sibling.items_generation;
+            cancel = Some(sibling.cancel_token.clone());
+        });
+        (id, generation, cancel.unwrap())
+    };
+    app.settings.sort_order = SortOrder::FileNameDesc;
+    match physical_mode {
+        PhysicalFolderSortReload::Immediate => app.apply_sort_change_reload(),
+        PhysicalFolderSortReload::WorkerScan => {
+            app.apply_sort_change_reload_without_ui_io();
+            let ready = mutation_refresh_wait_for_order_scan(&mut app);
+            let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                ref reload_owner, ..
+            } = ready.purpose
+            else {
+                panic!("unexpected scan purpose")
+            };
+            assert!(matches!(
+                reload_owner.as_ref(),
+                OpenRequestOwner::RatingPhysical(_)
+            ));
+            mutation_refresh_resolve_order_scan(&mut app, ready);
+        }
+    }
+    assert_eq!(app.items[0].name(), "b.png", "changed order was adopted");
+    assert_eq!(app.items[1].name(), "a.png");
+    assert_eq!(app.folder_nav_current_target(), location);
+    assert_eq!(app.rating_view_nav_stack, chain);
+    assert_eq!(app.rating_view_saved_folder, saved);
+    assert!(matches!(
+        app.resolve_return_to_parent_nav(),
+        Some(crate::ui_main::AddressBarNav::RatingViewBack)
+    ));
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+    assert_eq!(
+        app.navigate_folder_history_back(),
+        history.back_stack.last().cloned()
+    );
+    app.restore_folder_nav_history(history.clone());
+    // History rollback defaults a legacy no-slot snapshot to A; this fixture uses the
+    // legacy stacks so both navigation directions must read those same stacks.
+    app.active_quick_folder_slot = None;
+    assert_eq!(
+        app.navigate_folder_history_forward(),
+        history.forward_stack.last().cloned()
+    );
+    app.restore_folder_nav_history(history);
+    app.active_quick_folder_slot = None;
+    #[cfg(windows)]
+    app.with_viewer_context(sibling, |sibling| {
+        assert_eq!(sibling.current_folder, Some(PathBuf::from("sibling")));
+        assert_eq!(
+            sibling.items,
+            vec![GridItem::Folder(PathBuf::from("sibling-row"))]
+        );
+        assert_eq!(sibling.items_generation, sibling_generation);
+        assert!(Arc::ptr_eq(&sibling.cancel_token, &sibling_cancel));
+        assert!(!sibling_cancel.load(Ordering::Relaxed));
+        assert_eq!(sibling.selected, Some(0));
+        assert_eq!(sibling.scroll_offset_y, 42.0);
+    })
+    .unwrap();
+}
+
+#[test]
+fn mutation_refresh_rating_child_sort_immediate_keeps_parent_and_back_forward() {
+    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::Immediate);
+}
+
+#[test]
+fn mutation_refresh_rating_child_sort_worker_keeps_parent_and_back_forward() {
+    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::WorkerScan);
+}
+
+#[test]
+fn mutation_refresh_rating_child_stale_sort_owner_keeps_selection_hint() {
+    let mut app = mutation_refresh_rating_sort_fixture();
+    app.settings.sort_order = SortOrder::FileNameDesc;
+    app.apply_sort_change_reload_without_ui_io();
+    let ready = mutation_refresh_wait_for_order_scan(&mut app);
+    let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+        ref order,
+        ref reload_owner,
+    } = ready.purpose
+    else {
+        panic!("unexpected scan purpose")
+    };
+    assert!(matches!(
+        reload_owner.as_ref(),
+        OpenRequestOwner::RatingPhysical(_)
+    ));
+    assert!(order.matches(&app.settings));
+    assert_eq!(Some(&ready.path), app.current_folder.as_ref());
+    // Replace the source generation while retaining the exact same path and order.
+    app.items_generation = app.items_generation.wrapping_add(1);
+    app.selected = Some(0);
+    app.select_after_load = None;
+    let generation = app.items_generation;
+    let rows = app.items.clone();
+    let location = app.folder_nav_current_target();
+    let history = app.folder_nav_history_snapshot();
+    assert!(!app.open_request_owner_is_current(&ready.path, reload_owner));
+    mutation_refresh_resolve_order_scan(&mut app, ready);
+    assert_eq!(
+        app.select_after_load, None,
+        "stale result must not publish a cursor hint"
+    );
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.items, rows);
+    assert_eq!(app.folder_nav_current_target(), location);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let folder = app.tmp.path().join("main-folder");
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&ctx)];
+    app.folder_thumb_pin_dirty.insert(folder);
+    app.consume_folder_thumb_pin_dirty();
+    let main = app.projected_viewer_context_id();
+    let sibling = app.build_window_context_for_test(9_903, |sibling| {
+        sibling.current_folder = Some(search_results_synthetic_path());
+        sibling.items_are_tag_view = true;
+        sibling.items = vec![GridItem::Folder(PathBuf::from("sibling-folder"))];
+        sibling.image_metas = vec![None];
+        sibling.thumbnails = vec![mutation_refresh_loaded_thumb(&ctx)];
+        sibling.selected = Some(0);
+        sibling.scroll_offset_y = 22.0;
+        sibling
+            .folder_thumb_pin_dirty
+            .insert(PathBuf::from("sibling-folder"));
+        sibling.consume_folder_thumb_pin_dirty();
+    });
+    let sibling_cancel = app.current_view_pin_refreshes[&sibling].cancel.clone();
+    assert!(app.current_view_pin_refreshes.contains_key(&main));
+    // Keep the exact worker results for the production consumer, while exposing DB
+    // read failures instead of reporting only the eventual thumbnail assertion.
+    for id in [main, sibling] {
+        let pending = app.current_view_pin_refreshes.get_mut(&id).unwrap();
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let terminal = result.as_ref().expect("pin worker was cancelled");
+        assert!(
+            terminal.errors.is_empty(),
+            "pin worker errors: {:?}",
+            terminal.errors
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        pending.rx = rx;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.current_view_pin_refreshes.contains_key(&main) {
+        app.consume_folder_thumb_pin_dirty();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(app.current_view_pin_refreshes.contains_key(&sibling));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    app.with_viewer_context(sibling, |sibling| {
+        assert!(matches!(
+            sibling.thumbnails[0],
+            ThumbnailState::Loaded { .. }
+        ));
+        assert_eq!(sibling.selected, Some(0));
+        assert_eq!(sibling.scroll_offset_y, 22.0);
+        while sibling
+            .current_view_pin_refreshes
+            .contains_key(&sibling.projected_viewer_context_id())
+        {
+            sibling.consume_folder_thumb_pin_dirty();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!matches!(
+            sibling.thumbnails[0],
+            ThumbnailState::Loaded { .. }
+        ));
+    })
+    .unwrap();
+}
+
+#[test]
+fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
+    let mut app = setup_app_for_test();
+    let zip = app.tmp.path().join("book.zip");
+    app.current_folder = Some(zip.clone());
+    let mut nav = metadata_panel_test_zip_nav(zip, &["chapter/a.jpg", "chapter/b.jpg"]);
+    nav.enter("chapter/");
+    app.zip_nav = Some(nav);
+    app.zip_nav_show_current_level();
+    app.selected = Some(1);
+    app.scroll_offset_y = 53.0;
+    app.checked.insert(1);
+    app.show_search_bar = true;
+    app.search_query = "b".into();
+    let ctx = egui::Context::default();
+    app.edit_preview_repaint_ctx = Some(ctx.clone());
+    app.execute_search(&ctx);
+    assert!(app.search_pending.is_some());
+    let level = app.zip_nav.as_ref().unwrap().current().to_vec();
+    let rows = app.items.clone();
+    let history = app.folder_nav_history_snapshot();
+    let current = app.current_folder.clone().unwrap();
+    app.folder_thumb_pin_dirty.insert(current);
+    app.consume_folder_thumb_pin_dirty();
+    assert_eq!(app.zip_nav.as_ref().unwrap().current(), level);
+    assert_eq!(app.items, rows);
+    assert_eq!(app.selected, Some(1));
+    assert_eq!(app.scroll_offset_y, 53.0);
+    assert!(app.checked.contains(&1));
+    assert!(app.show_search_bar);
+    assert_eq!(app.search_query, "b");
+    assert!(
+        app.search_pending.is_some(),
+        "pending local query must be reissued"
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
 }
 
 #[test]
@@ -2270,7 +3797,7 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
             thumbnail_reset_indices: vec![0],
         }),
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -2324,7 +3851,7 @@ fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
             thumbnail_reset_indices: Vec::new(),
         }),
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -5287,7 +6814,7 @@ fn metadata_context_result(
         current_rating: Some(rating),
         page_state: None,
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -5398,17 +6925,27 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
     main.rating_cache = None;
     main.current_rating = None;
     main.folder_pin_map = Some(Default::default());
-    main.folder_pin_reset_indices = Some(vec![0]);
+    main.folder_pin_materializations = Some(prepared_pin_materializations_for_test(&app, vec![0]));
     let mut active = metadata_context_result(active_id, active_generation, 0);
     active.rating_cache = None;
     active.current_rating = None;
     active.folder_pin_map = Some(Default::default());
-    active.folder_pin_reset_indices = Some(vec![1]);
+    active.folder_pin_materializations = Some(
+        app.with_viewer_context(active_id, |mounted| {
+            prepared_pin_materializations_for_test(mounted, vec![1])
+        })
+        .unwrap(),
+    );
     let mut paused = metadata_context_result(parked_id, parked_generation, 0);
     paused.rating_cache = None;
     paused.current_rating = None;
     paused.folder_pin_map = Some(Default::default());
-    paused.folder_pin_reset_indices = Some(vec![0]);
+    paused.folder_pin_materializations = Some(
+        app.with_viewer_context(parked_id, |mounted| {
+            prepared_pin_materializations_for_test(mounted, vec![0])
+        })
+        .unwrap(),
+    );
 
     let (errors, stale) = app.apply_metadata_import_terminal_refresh(
         crate::app::metadata_import_refresh::RefreshResult {
@@ -5428,7 +6965,18 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
     assert!(previous_cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!app.cancel_token.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!std::sync::Arc::ptr_eq(&previous_cancel, &app.cancel_token));
-    assert!(!cache_map.read().unwrap().contains_key(&stale_pin_key));
+    assert!(
+        cache_map.read().unwrap().contains_key(&stale_pin_key),
+        "worker never mutates the old live map"
+    );
+    assert!(
+        !app.current_color_cache_map
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .contains_key(&stale_pin_key)
+    );
     assert!(catalog.load_one(&stale_pin_key).unwrap().is_none());
     app.with_active_viewer_context(|active| {
         assert_eq!(active.items_generation, active_generation);
@@ -5682,7 +7230,7 @@ fn metadata_refresh_context_identity_survives_closing_an_earlier_window() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests()
+        .take_metadata_import_refresh_requests(Default::default())
         .into_iter()
         .find(|request| request.context_id == target_context_id)
         .expect("the target window must have a refresh request before the earlier close");
@@ -5748,7 +7296,7 @@ fn metadata_refresh_context_identity_survives_main_promotion() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests()
+        .take_metadata_import_refresh_requests(Default::default())
         .into_iter()
         .find(|request| request.context_id == requested_context_id)
         .expect("the context bound as main at request time must have a refresh request");
@@ -5815,7 +7363,7 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
-    let requests = app.take_metadata_import_refresh_requests();
+    let requests = app.take_metadata_import_refresh_requests(Default::default());
 
     assert!(
         requests
@@ -5870,6 +7418,7 @@ fn install_snapshot_details_pending(
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -6384,7 +7933,7 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
         });
         app.effetune.runtime = EffetuneRuntime::Loading {
             origin: LoadOrigin::Startup,
-            open_gui_when_ready: false,
+            open_gui_when_ready: None,
         };
         assert!(app.media_startup_load_pending());
 
@@ -6422,7 +7971,7 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
     app.settings.vst3_enabled = false;
     app.effetune.runtime = EffetuneRuntime::Loading {
         origin: LoadOrigin::Startup,
-        open_gui_when_ready: false,
+        open_gui_when_ready: None,
     };
     assert!(app.media_startup_load_pending());
     app.effetune.set_test_startup_completion(Ok(()));
@@ -6890,7 +8439,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     assert!((1..=2_048).contains(&first_frame_items));
 
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests();
+    let requests = app.take_metadata_import_refresh_requests(Default::default());
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
     assert_eq!(requests[0].folder_pin_paths, vec![root]);
@@ -6997,7 +8546,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         current_rating: Some(5),
         page_state: None,
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -7147,7 +8696,7 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests();
+    let requests = app.take_metadata_import_refresh_requests(Default::default());
     let request = requests
         .iter()
         .find(|request| request.context_id == parked_id)
@@ -7857,7 +9406,7 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
             current_rating: Some(5),
             page_state: None,
             folder_pin_map: None,
-            folder_pin_reset_indices: None,
+            folder_pin_materializations: None,
             video_pin_blobs: None,
             video_items: None,
             container_state: None,
@@ -7990,7 +9539,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_re
         current_rating: None,
         page_state: None,
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -11128,6 +12677,7 @@ mod paused_similar_feature_tests {
         app.startup_init = Some(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
+            full_check_requested: false,
         });
         app.startup_done = false;
         app.poll_startup_init();
@@ -11182,6 +12732,7 @@ mod paused_similar_feature_tests {
         app.startup_init = Some(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
+            full_check_requested: false,
         });
         app.startup_done = false;
 
@@ -26410,7 +27961,7 @@ fn begin_detached_bookmark_media_test(
         )]),
     )));
     app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-    app.current_folder_signature = Some(0xCAFE);
+    app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0xCAFE));
 
     assert!(app.open_bookmark_media_in_detached_context(
         &egui::Context::default(),
@@ -26458,7 +28009,10 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             app.current_folder_last_mtime,
             Some(std::time::SystemTime::UNIX_EPOCH)
         );
-        assert_eq!(app.current_folder_signature, Some(0xCAFE));
+        assert_eq!(
+            app.current_folder_signature,
+            Some(folder_scan::FolderScanSignature::for_test(0xCAFE))
+        );
         app.with_active_viewer_context(|active| {
             assert!(
                 !active
@@ -38822,7 +40376,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.begin_metadata_import_terminal_refresh();
         while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
-        let requests = app.take_metadata_import_refresh_requests();
+        let requests = app.take_metadata_import_refresh_requests(Default::default());
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         let effective = crate::path_key::normalize_keep_drive(&zip_path.join("bookB").join("only"));
@@ -43522,7 +45076,8 @@ mod favorite_adjustment_defaults_tests {
         std::fs::write(&target_path, b"dummy").unwrap();
 
         app.current_folder = Some(folder.clone());
-        app.current_folder_signature = Some(0xDEAD_BEEF);
+        app.current_folder_signature =
+            Some(folder_scan::FolderScanSignature::for_test(0xDEAD_BEEF));
         app.items.push(GridItem::Image(target_path.clone()));
         app.thumbnails.push(ThumbnailState::Pending);
         app.rating_cache.insert(0, 5);
@@ -50964,7 +52519,7 @@ mod pipeline_cache_refactor_tests {
 
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
 
         // 先に画面を静止させる。起床要求が残っていると、この検査が意味を失う。
         for _ in 0..8 {
@@ -51007,7 +52562,7 @@ mod pipeline_cache_refactor_tests {
 
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
         app.items = Vec::new();
         app.thumbnails = Vec::new();
 
@@ -51041,7 +52596,7 @@ mod pipeline_cache_refactor_tests {
 
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
         app.items = Vec::new();
         app.thumbnails = Vec::new();
 
@@ -53246,6 +54801,94 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn native_seek_preview_menu_event_updates_size_independently_in_each_viewer_context() {
+        use crate::settings::VideoSeekPreviewSize;
+        use crate::video::NativeVideoOutputEvent;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let original_height = app.settings.video_seek_strip_height;
+        let path = PathBuf::from(r"C:\clips\preview-main.mp4");
+        let idx = push_video(&mut app, path.clone());
+        let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        let source_epoch = player.native_source_epoch().unwrap();
+        let generation = player.native_committed_generation().unwrap_or(0).max(1);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            NativeVideoOutputEvent::SetSeekPreviewSize {
+                size: VideoSeekPreviewSize::Medium,
+                generation,
+                expected: None,
+            },
+        );
+        assert_eq!(
+            app.settings.video_seek_preview_size,
+            VideoSeekPreviewSize::Medium
+        );
+        assert_eq!(
+            app.native_bar_lock_state().seek_preview_size,
+            VideoSeekPreviewSize::Medium
+        );
+        assert_eq!(app.settings.video_seek_strip_height, original_height);
+
+        let other = app.build_window_context_for_test(903, |mounted| {
+            let path = PathBuf::from(r"C:\clips\preview-second.mp4");
+            let idx = push_video(mounted, path.clone());
+            let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+            mounted.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            mounted.fullscreen_idx = Some(idx);
+        });
+        app.with_viewer_context(other, |mounted| {
+            let idx = mounted.fullscreen_idx.unwrap();
+            let (source_epoch, generation) = match mounted.fs_cache.get(&idx).unwrap() {
+                FsCacheEntry::Video { player, .. } => (
+                    player.native_source_epoch().unwrap(),
+                    player.native_committed_generation().unwrap_or(0).max(1),
+                ),
+                _ => unreachable!(),
+            };
+            mounted.handle_native_video_output_event(
+                &ctx,
+                idx,
+                source_epoch,
+                NativeVideoOutputEvent::SetSeekPreviewSize {
+                    size: VideoSeekPreviewSize::Small,
+                    generation,
+                    expected: None,
+                },
+            );
+            assert_eq!(
+                mounted.settings.video_seek_preview_size,
+                VideoSeekPreviewSize::Small
+            );
+            assert_eq!(mounted.settings.video_seek_strip_height, original_height);
+        })
+        .unwrap();
+        assert_eq!(
+            app.settings.video_seek_preview_size,
+            VideoSeekPreviewSize::Small
+        );
+        assert_eq!(app.settings.video_seek_strip_height, original_height);
+    }
+
+    #[test]
     fn hidden_native_video_does_not_toggle_mode_owned_by_egui_music_view() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -54185,6 +55828,22 @@ mod still_window_mode_key_tests {
         result_tx
     }
 
+    fn install_held_media_navigation_resolver(
+        app: &mut App,
+    ) -> (
+        mpsc::Receiver<MediaNavigationResolverRequest>,
+        mpsc::Sender<MediaNavigationResolverResponse>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        app.media_navigation_resolver = Some(MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 0,
+        });
+        (request_rx, result_tx)
+    }
+
     fn install_all_native_pending_for_test(
         app: &mut App,
         from_idx: usize,
@@ -54259,6 +55918,540 @@ mod still_window_mode_key_tests {
         path: &str,
     ) -> crate::app::normalize::NormalizeTargetKey {
         crate::app::normalize::NormalizeTargetKey::new(fs_idx, PathBuf::from(path), 1)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_scan_navigation_cancels_at_switch_and_discards_ready_result() {
+        use crate::video::normalize_types::{NormalizeResult, NormalizeUiState};
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("scan-nav-old.mp4");
+        let next_path = app.tmp.path().join("scan-nav-next.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        std::fs::write(&next_path, b"next video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        let next_idx = push_video(&mut app, next_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        app.selected = Some(old_idx);
+        app.settings.audio_normalize_enabled = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path.clone());
+        scan.owner_context_id = app.projected_viewer_context_id();
+        scan.was_playing = false;
+        scan.rx = rx;
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        app.normalize_ui_states.insert(
+            crate::app::normalize::NormalizeTargetKey::new(old_idx, old_path.clone(), 1),
+            NormalizeUiState::Scanning,
+        );
+        // Model a worker whose Done was queued before navigation but not yet polled.
+        tx.send(crate::app::normalize::NormalizeMessage::Done(
+            NormalizeResult {
+                gain_db: -6.0,
+                integrated_lufs: -20.0,
+                true_peak_db: -5.0,
+                target_lufs_milli: -14_000,
+            },
+        ))
+        .unwrap();
+
+        let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x26,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        app.handle_native_video_key_event(&ctx, old_idx, key); // Up at the first item
+        app.handle_native_video_key_event(
+            &ctx,
+            old_idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                virtual_key: 0x24, // Home at the first item
+                ..key
+            },
+        );
+        app.handle_native_video_key_event(
+            &ctx,
+            old_idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                ctrl: true,
+                repeat: true, // repeated folder key is not accepted
+                ..key
+            },
+        );
+        assert!(
+            app.normalize_state.is_some(),
+            "no-target keys keep scanning"
+        );
+        assert!(!cancel.load(Ordering::Acquire));
+        let (request_rx, result_tx) = install_held_media_navigation_resolver(&mut app);
+        // Down is the default VideoNextFile action; the native key gate must admit it while
+        // Scanning is still modal, before the normal navigation owner resolves the target.
+        app.handle_native_video_key_event(
+            &ctx,
+            old_idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                virtual_key: 0x28,
+                ..key
+            },
+        );
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(
+            app.normalize_state.is_some(),
+            "scan stays active while navigation resolves"
+        );
+        // A queued result may finish while navigation resolves; the target still owns no part
+        // of the previous video's scan.
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&old_path, -14_000, 1, Some(1))
+                .is_none(),
+            "unpolled scan result must not be saved"
+        );
+        let request = request_rx
+            .try_recv()
+            .expect("navigation request not queued");
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
+        assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        app.poll_normalize_scan(&ctx);
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&next_path, -14_000, 1, Some(1))
+                .is_none(),
+            "old result must not be applied to the destination"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_scan_navigation_without_openable_candidate_keeps_scan() {
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("scan-stays-old.mp4");
+        let missing_path = app.tmp.path().join("scan-stays-missing.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        push_video(&mut app, missing_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path);
+        scan.owner_context_id = app.projected_viewer_context_id();
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+
+        app.start_manual_media_navigation(
+            &ctx,
+            &[old_idx, old_idx + 1],
+            old_idx,
+            1,
+            "test_missing",
+            ManualMediaNavigationLanding::NativeVideo,
+        );
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+        assert!(app.normalize_state.is_some());
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_provisional_gain_stays_until_navigation_commits() {
+        use crate::video::normalize_types::NormalizeResult;
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("provisional-old.mp4");
+        let next_path = app.tmp.path().join("provisional-next.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        std::fs::write(&next_path, b"next video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        let next_idx = push_video(&mut app, next_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        player.set_normalize_gain_for_stream(1, 0.5);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path.clone());
+        scan.owner_context_id = app.projected_viewer_context_id();
+        scan.provisional_applied = true;
+        scan.provisional_result = Some(NormalizeResult {
+            gain_db: -6.0,
+            integrated_lufs: -20.0,
+            true_peak_db: -5.0,
+            target_lufs_milli: -14_000,
+        });
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+
+        let (request_rx, result_tx) = install_held_media_navigation_resolver(&mut app);
+        app.start_manual_media_navigation(
+            &ctx,
+            &[old_idx, next_idx],
+            old_idx,
+            1,
+            "test_provisional",
+            ManualMediaNavigationLanding::NativeVideo,
+        );
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+        assert!(!cancel.load(Ordering::Acquire));
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&old_idx).unwrap() else {
+            panic!("old player missing")
+        };
+        assert_eq!(player.normalize_gain_for_stream(1), Some(0.5));
+
+        let request = request_rx
+            .try_recv()
+            .expect("navigation request not queued");
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
+        assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_modal_key_gate_uses_dispatch_action_priority() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("overlap-old.mp4");
+        std::fs::write(&path, b"old video").unwrap();
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoNextFile = F11\n");
+        let mut scan = normalize_scan_state_for_test(idx, path);
+        scan.owner_context_id = app.projected_viewer_context_id();
+        app.normalize_state = Some(scan);
+        assert!(!app.video_presentation_transition.is_transitioning());
+
+        app.handle_native_video_key_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
+                virtual_key: 0x7A,
+                scan_code: 0,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            },
+        );
+
+        assert!(app.normalize_state.is_some());
+        assert!(
+            !app.video_presentation_transition.is_transitioning(),
+            "F11 resolves to the earlier window-mode action, which the modal scan blocks"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_modal_key_gate_preserves_video_audio_vst_exit() {
+        use std::sync::atomic::Ordering;
+
+        for conflicting_navigation_binding in [false, true] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let path = app.tmp.path().join("vst-scan.mp4");
+            std::fs::write(&path, b"video").unwrap();
+            let idx = push_video(&mut app, path.to_str().unwrap());
+            let mut player =
+                crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+            player.set_opened_audio_stream_for_test(1, 0);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            app.fullscreen_idx = Some(idx);
+            app.video_audio_mode = Some(idx);
+            app.video_audio_vst = Some(VideoAudioVstState {
+                fs_idx: idx,
+                phase: VideoAudioVstPhase::Active,
+            });
+            if conflicting_navigation_binding {
+                app.keymap = crate::keymap::Keymap::from_ini_str(
+                    "[FsVideo]\nVideoNextFile = Z\nVideoToggleAudioMode = Z\n",
+                );
+            }
+            let mut scan = normalize_scan_state_for_test(idx, path);
+            scan.owner_context_id = app.projected_viewer_context_id();
+            let cancel = scan.cancel.clone();
+            app.normalize_state = Some(scan);
+
+            app.handle_native_video_key_event(&ctx, idx, super::video_audio_native_z(false));
+
+            assert!(!app.video_audio_vst_active_for(idx));
+            assert_eq!(app.video_audio_mode, Some(idx));
+            assert!(app.normalize_state.is_some());
+            assert!(!cancel.load(Ordering::Acquire));
+            assert_eq!(app.fullscreen_idx, Some(idx));
+            assert!(app.media_navigation_pending.is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_modal_key_gate_preserves_fixed_escape_with_keymap_overlap() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("escape-scan.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoCloseFullscreen = Esc\n");
+        let mut scan = normalize_scan_state_for_test(idx, path);
+        scan.owner_context_id = app.projected_viewer_context_id();
+        app.normalize_state = Some(scan);
+
+        app.handle_native_video_key_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(2),
+                virtual_key: 0x1B,
+                scan_code: 0,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            },
+        );
+
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_scan_can_finish_during_superseded_navigation_resolution() {
+        use crate::video::normalize_types::NormalizeResult;
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("scan-finished-old.mp4");
+        let next_path = app.tmp.path().join("scan-finished-next.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        std::fs::write(&next_path, b"next video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        let next_idx = push_video(&mut app, next_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        app.settings.audio_normalize_enabled = true;
+        let (scan_tx, scan_rx) = std::sync::mpsc::channel();
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path.clone());
+        scan.owner_context_id = app.projected_viewer_context_id();
+        scan.was_playing = false;
+        scan.rx = scan_rx;
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        let (request_rx, result_tx) = install_held_media_navigation_resolver(&mut app);
+        let display_order = [old_idx, next_idx];
+        for source in ["test_first_manual", "test_superseding_manual"] {
+            app.start_manual_media_navigation(
+                &ctx,
+                &display_order,
+                old_idx,
+                1,
+                source,
+                ManualMediaNavigationLanding::NativeVideo,
+            );
+            assert_eq!(app.fullscreen_idx, Some(old_idx));
+            assert!(app.normalize_state.is_some());
+            assert!(
+                !cancel.load(Ordering::Acquire),
+                "superseded navigation requests must leave the old scan running"
+            );
+        }
+        let first_request = request_rx.try_recv().expect("first request not queued");
+        let latest_request = request_rx.try_recv().expect("second request not queued");
+        assert!(latest_request.request_id > first_request.request_id);
+        assert_eq!(
+            app.media_navigation_pending.as_ref().unwrap().request_id,
+            latest_request.request_id
+        );
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: first_request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        app.poll_media_navigation_pending(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+        assert!(app.normalize_state.is_some());
+        assert!(!cancel.load(Ordering::Acquire));
+        assert_eq!(
+            app.media_navigation_pending.as_ref().unwrap().request_id,
+            latest_request.request_id
+        );
+
+        scan_tx
+            .send(crate::app::normalize::NormalizeMessage::Done(
+                NormalizeResult {
+                    gain_db: -6.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: -14_000,
+                },
+            ))
+            .unwrap();
+        app.poll_normalize_scan(&ctx);
+        assert!(app.normalize_state.is_none());
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&old_path, -14_000, 1, Some(1))
+                .is_some()
+        );
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: latest_request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        app.poll_media_navigation_pending(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&next_path, -14_000, 1, Some(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_owner_cleanup_keeps_another_viewer_context_scan() {
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let path = app.tmp.path().join("other-window-scan.mp4");
+        std::fs::write(&path, b"other window").unwrap();
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        let mut scan = normalize_scan_state_for_test(idx, path);
+        scan.owner_context_id = ViewerContextId::for_test(999);
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+
+        app.cleanup_normalize_state_for_fs_idx(idx);
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_some());
     }
 
     #[test]
@@ -62768,6 +64961,7 @@ mod still_window_mode_key_tests {
         let (_event_tx, event_rx) = mpsc::channel();
         let (priority_tx, _priority_rx) = mpsc::channel();
         app.details_meta_pending = Some(DetailsMetaPending {
+            scan_scope: DetailsMetaScanScope::AllRequirements,
             visible_revision: app.details_lazy_visible_revision,
             selection_target_key: None,
             normal_target_keys: Default::default(),
@@ -64033,7 +66227,7 @@ mod still_window_mode_key_tests {
             vec![Some((1, 1))],
             std::collections::HashSet::new(),
             vec![],
-            Some(1),
+            Some(folder_scan::FolderScanSignature::for_test(1)),
         );
 
         assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
@@ -64097,7 +66291,7 @@ mod still_window_mode_key_tests {
             vec![Some((1, 1))],
             std::collections::HashSet::new(),
             vec![],
-            Some(1),
+            Some(folder_scan::FolderScanSignature::for_test(1)),
         );
 
         assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
@@ -65452,7 +67646,7 @@ mod still_window_mode_key_tests {
         app.image_metas.push(Some((1, 5)));
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
-        app.current_folder_signature = Some(0);
+        app.current_folder_signature = Some(folder_scan::FolderScanSignature::for_test(0));
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
@@ -89753,6 +91947,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     .unwrap();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -90009,6 +92204,7 @@ fn replacing_items_discards_incomplete_details_target_plan() {
 #[test]
 fn thumbnail_selection_info_keeps_single_target_fast_path() {
     let mut app = phase_c_support::setup_app();
+    app.settings.thumb_show_media_duration = false;
     app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
     app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
     app.settings.thumb_tooltip_show_created = false;
@@ -90157,6 +92353,7 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -90246,6 +92443,7 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
     .expect("queue old Finished event");
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -90522,7 +92720,11 @@ fn details_cell_content_revisions_follow_only_changed_cache_columns() {
         DetailsLazyMeta {
             source_mtime: 1,
             source_size: 2,
-            video_codec: Some("AV1".to_string()),
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: None,
+                dims: None,
+                codec: Some("AV1".to_string()),
+            }),
             ..Default::default()
         },
         DetailsLazyFieldFlags {
@@ -94087,5 +96289,855 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         );
         assert_eq!(state.fixed_bar_gap_px, 6);
         assert_eq!(state.seek_strip_height_values.maximum, 240);
+    }
+}
+
+fn setup_media_duration_thumbnail_app() -> phase_c_support::AppTestEnv {
+    let mut app = phase_c_support::setup_app();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.thumb_show_media_duration = true;
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::Hidden;
+    app.install_new_items(
+        vec![
+            GridItem::Video(PathBuf::from(r"C:\clips\short.mp4")),
+            GridItem::Audio(PathBuf::from(r"D:\songs\long.flac")),
+            GridItem::Image(PathBuf::from(r"C:\photos\still.jpg")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\pages.pdf")),
+            GridItem::Video(PathBuf::from(r"C:\clips\offscreen.mp4")),
+        ],
+        vec![Some((100, 2048)); 5],
+    );
+    app.selected = None;
+    app
+}
+
+#[test]
+fn media_duration_thumbnail_targets_only_near_video_and_audio() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let near = HashSet::from([0, 1, 2, 3]);
+    assert!(app.details_lazy_columns_visible());
+    assert!(!app.selection_info_only_lazy_load());
+    for idx in 0..5 {
+        let target = app.details_meta_target_for_idx(idx, &near, true);
+        if idx < 2 {
+            let target = target.expect("near media must request metadata");
+            assert!(target.load_video_meta);
+            assert!(!target.load_page_count);
+            assert!(!target.load_image_dims);
+            assert!(!target.load_created_at);
+        } else {
+            assert!(target.is_none(), "nonmedia and offscreen media remain lazy");
+        }
+    }
+    app.settings.thumb_show_media_duration = false;
+    assert!(!app.details_lazy_columns_visible());
+    for idx in 0..5 {
+        assert!(app.details_meta_target_for_idx(idx, &near, true).is_none());
+    }
+}
+
+#[test]
+fn media_duration_catalog_uses_physical_source_in_aggregate_views() {
+    let mut app = setup_media_duration_thumbnail_app();
+    for current_folder in [None, Some(PathBuf::from(r"Z:\aggregate"))] {
+        app.current_folder = current_folder;
+        app.items_are_rating_view = true;
+        for (idx, folder, key) in [(0, r"C:\clips", "short.mp4"), (1, r"D:\songs", "long.flac")] {
+            let (actual_folder, actual_key) = app.details_catalog_lookup_for_item(&app.items[idx]);
+            assert_eq!(actual_folder, Some(PathBuf::from(folder)));
+            assert_eq!(actual_key.as_deref(), Some(key));
+        }
+    }
+}
+
+fn install_fake_media_duration_pending(app: &mut App) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_tx, rx) = mpsc::channel();
+    let (priority_tx, _priority_rx) = mpsc::channel();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        scan_scope: DetailsMetaScanScope::AllRequirements,
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: app.selection_info_lazy_target_key(),
+        normal_target_keys: HashSet::new(),
+        cancel: Arc::clone(&cancel),
+        phase: DetailsMetaPendingPhase::Loading { rx, priority_tx },
+    });
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 2 };
+    cancel
+}
+
+#[test]
+fn media_duration_thumbnail_range_change_preserves_idle_gate_and_cancels_old_stage() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.keep_set = HashSet::from([0, 1]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    app.keep_set = HashSet::from([4]);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    let ctx = egui::Context::default();
+    app.refresh_thumbnail_details_stage(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert_eq!(app.details_tag_prewarm_indices, vec![0, 1]);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
+    app.refresh_thumbnail_details_stage(&ctx);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_tag_prewarm_indices, vec![4]);
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn media_duration_thumbnail_selected_nonmedia_stays_prompt_outside_stage() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::Tooltip;
+    app.keep_set = HashSet::from([0, 1]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    app.selected = Some(2);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    app.refresh_thumbnail_details_stage(&egui::Context::default());
+    assert!(cancel.load(Ordering::Relaxed));
+    assert_eq!(app.details_tag_prewarm_indices, vec![0, 1, 2]);
+    let target = app
+        .details_meta_target_for_idx(2, &HashSet::from([0, 1]), true)
+        .expect("selected image tooltip still requests dimensions");
+    assert!(target.load_image_dims);
+    assert!(!target.load_video_meta);
+}
+
+#[test]
+fn media_duration_badge_reads_memory_without_changing_details_format() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(3723.0),
+                dims: Some((1920, 1080)),
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.thumbnail_media_duration_text(0).as_deref(),
+        Some("1:02:03")
+    );
+    assert_eq!(
+        app.details_video_duration_text(0),
+        format_details_duration(3723.0)
+    );
+    assert_eq!(app.details_video_dims_text(0), "1920x1080");
+    assert_eq!(app.details_video_codec_text(0), "h264");
+    assert!(app.thumbnail_media_duration_text(2).is_none());
+    app.settings.thumb_show_media_duration = false;
+    assert!(app.thumbnail_media_duration_text(0).is_none());
+    assert_eq!(
+        app.details_video_duration_text(0),
+        format_details_duration(3723.0)
+    );
+}
+
+#[test]
+fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_ai() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    app.keep_set = HashSet::from([4]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
+    let key = app.details_lazy_cache_key(2).unwrap();
+    app.details_lazy_meta.insert(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            ai_metadata_checked: true,
+            image_dims: Some((640, 480)),
+            ..Default::default()
+        },
+    );
+    app.refresh_thumbnail_details_stage(&egui::Context::default());
+    assert!(app.details_lazy_uses_visible_stages());
+    assert!(app.details_visible_stage_needs_load());
+    let near = HashSet::from([4]);
+    assert!(
+        app.details_meta_target_for_idx(4, &near, true)
+            .unwrap()
+            .load_video_meta
+    );
+    assert!(app.details_meta_target_for_idx(2, &near, true).is_none());
+}
+
+#[test]
+fn media_duration_thumbnail_completed_ai_scan_followup_is_bounded() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 64;
+    let mut items: Vec<GridItem> = (0..count)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("C:/photos/{idx}.png"))))
+        .collect();
+    let media_idx = items.len();
+    items.push(GridItem::Video(PathBuf::from("C:/clips/new-near.mp4")));
+    app.install_new_items(items, vec![Some((100, 2048)); count + 1]);
+    app.selected = None;
+    app.ai_model_facet_requested = true;
+    for idx in 0..count {
+        let key = app.details_lazy_cache_key(idx).unwrap();
+        app.details_lazy_meta.insert(
+            key,
+            DetailsLazyMeta {
+                source_mtime: 100,
+                source_size: 2048,
+                ai_metadata_checked: true,
+                image_dims: Some((640, 480)),
+                ..Default::default()
+            },
+        );
+    }
+    app.keep_set = HashSet::from([media_idx]);
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
+    let ctx = egui::Context::default();
+    app.refresh_thumbnail_details_stage(&ctx);
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("new visible media stage");
+    assert_eq!(pending.scan_scope, DetailsMetaScanScope::VisibleStage);
+    assert!(
+        matches!(pending.phase, DetailsMetaPendingPhase::Loading { .. }),
+        "bounded stage must launch without planning thousands of cached AI items"
+    );
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Loading { done: 0, total: 1 }
+    );
+    app.cancel_details_meta_loading();
+}
+
+#[test]
+fn media_duration_preference_off_cancels_ai_pending_and_preserves_other_requirements() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    app.settings.thumb_tooltip_show_video_duration = false;
+    app.settings.thumb_tooltip_show_video_dimensions = false;
+    app.settings.thumb_tooltip_show_video_codec = false;
+    app.keep_set = HashSet::from([0, 1]);
+    app.details_tag_prewarm_indices = vec![0, 1];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let mut edited = app.settings.clone();
+    edited.thumb_show_media_duration = false;
+    app.install_preferences_settings(edited);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    let near = HashSet::from([0, 1]);
+    assert!(app.details_meta_target_for_idx(0, &near, true).is_none());
+    assert!(app.details_meta_target_for_idx(1, &near, true).is_none());
+    let image = app
+        .details_meta_target_for_idx(2, &near, true)
+        .expect("AI scan remains needed");
+    assert!(image.load_ai_metadata);
+}
+
+#[test]
+fn media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    let _cancel = install_fake_media_duration_pending(&mut app);
+    app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    app.facet_ai_model_counts_cache = Some(std::collections::BTreeMap::from([("Model".into(), 3)]));
+    app.facet_ai_tool_counts_cache = Some(std::collections::BTreeMap::from([("Tool".into(), 3)]));
+    assert!(app.ai_model_facet_ready());
+    assert!(!app.details_lazy_sort_ready());
+    let key = app.details_lazy_cache_key(0).unwrap();
+    app.apply_details_lazy_meta_patch(
+        key.clone(),
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(65.0),
+                dims: None,
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.facet_ai_model_counts_cache
+            .as_ref()
+            .unwrap()
+            .get("Model"),
+        Some(&3)
+    );
+    assert_eq!(
+        app.facet_ai_tool_counts_cache.as_ref().unwrap().get("Tool"),
+        Some(&3)
+    );
+    app.details_meta_pending = None;
+    app.details_image_dims_state = LazyColumnState::Reconciling {
+        done: 1,
+        total: 1,
+        failed: 0,
+    };
+    assert!(app.ai_model_facet_ready());
+    // A genuinely replaced source invalidates cached AI facts at their patch owner.
+    app.apply_details_lazy_meta_patch(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 101,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(70.0),
+                dims: None,
+                codec: None,
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert!(app.facet_ai_model_counts_cache.is_none());
+    assert!(app.facet_ai_tool_counts_cache.is_none());
+}
+
+#[test]
+fn media_duration_running_stage_yields_to_first_all_item_ai_request() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let cancel = install_fake_media_duration_pending(&mut app);
+    app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    assert!(!app.ai_model_facet_requested);
+    app.request_ai_model_facet_load();
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert!(!app.ai_model_facet_ready());
+}
+
+#[test]
+fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all_rows() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let items = (0..DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 2)
+        .map(|idx| GridItem::Video(PathBuf::from(format!(r"C:\clips\{idx}.mp4"))))
+        .collect::<Vec<_>>();
+    let len = items.len();
+    app.install_new_items(items, vec![Some((100, 2048)); len]);
+    app.rebuild_visible_indices();
+    assert_eq!(app.visible_indices.len(), len);
+    app.selected = None;
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    app.settings.details_show_video_duration = true;
+    app.settings.details_show_video_dimensions = true;
+    app.settings.details_show_video_codec = true;
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let (old_tx, old_rx) = mpsc::channel();
+    if let Some(pending) = app.details_meta_pending.as_mut() {
+        pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+        let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
+            panic!("expected worker receiver");
+        };
+        *rx = old_rx;
+    }
+    old_tx
+        .send(DetailsMetaEvent::Finished {
+            generation: app.items_generation,
+            failed: 0,
+        })
+        .unwrap();
+    let revision = app.details_lazy_visible_revision;
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_ne!(revision, app.details_lazy_visible_revision);
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert!(
+        old_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: app.items_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+
+    // Poll the real replacement planner, stopping before it launches a worker.
+    app.poll_details_meta_load(&egui::Context::default());
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("full fetch pending");
+    assert_eq!(pending.scan_scope, DetailsMetaScanScope::AllRequirements);
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        panic!("full fetch must still have offscreen rows to scan");
+    };
+    assert!(
+        matches!(plan.order, DetailsMetaScanOrder::CurrentGrid { len: actual, .. } if actual == len)
+    );
+    assert!(
+        plan.background_targets
+            .iter()
+            .any(|target| target.idx == 4 && target.load_video_meta)
+    );
+    assert!(!app.details_lazy_sort_ready());
+    assert_eq!(app.details_video_duration_text(len - 1), "...");
+
+    let details_cancel = Arc::clone(&pending.cancel);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Thumbnail);
+    assert!(details_cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn media_duration_timeout_retries_after_other_folder_and_reopen() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let source = GridItem::Video(PathBuf::from(r"C:\clips\short.mp4"));
+    app.install_new_items(vec![source.clone()], vec![Some((100, 2048))]);
+    app.selected = None;
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    let generation = app.items_generation;
+    let key = app.details_lazy_cache_key(0).unwrap();
+    let _cancel = install_fake_media_duration_pending(&mut app);
+    let (tx, rx) = mpsc::channel();
+    let pending = app.details_meta_pending.as_mut().unwrap();
+    pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.normal_target_keys = HashSet::from([key.clone()]);
+    let DetailsMetaPendingPhase::Loading { rx: receiver, .. } = &mut pending.phase else {
+        panic!("expected worker receiver");
+    };
+    *receiver = rx;
+    tx.send(DetailsMetaEvent::Item {
+        generation,
+        key: key.clone(),
+        meta: DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::RetryLater { generation },
+            ..Default::default()
+        },
+        loaded: DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    tx.send(DetailsMetaEvent::Finished {
+        generation,
+        failed: 1,
+    })
+    .unwrap();
+    let ctx = egui::Context::default();
+    app.poll_details_meta_load(&ctx);
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { failed: 1 }
+    );
+    assert_eq!(app.details_video_duration_text(0), "-");
+    assert!(
+        app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .is_none()
+    );
+
+    app.install_new_items(
+        vec![GridItem::Image(PathBuf::from(r"D:\other\still.jpg"))],
+        vec![Some((200, 4000))],
+    );
+    assert!(
+        app.details_lazy_meta.contains_key(&key),
+        "cache is retained across folders"
+    );
+    app.install_new_items(vec![source], vec![Some((100, 2048))]);
+    app.selected = None;
+    assert_ne!(generation, app.items_generation);
+    assert_eq!(
+        app.details_lazy_meta_for_idx(0).unwrap().media,
+        DetailsMediaMeta::RetryLater { generation }
+    );
+    let target = app
+        .details_meta_target_for_idx(0, &HashSet::from([0]), true)
+        .expect("reopening retries interrupted media");
+    assert!(target.load_video_meta);
+    assert!(!app.details_lazy_meta_satisfies_idx(0, app.details_lazy_meta_for_idx(0).unwrap()));
+    assert_eq!(app.details_video_duration_text(0), "...");
+
+    app.apply_details_lazy_meta_patch(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(5.0),
+                dims: Some((640, 360)),
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.thumbnail_media_duration_text(0).as_deref(),
+        Some("0:05")
+    );
+    assert!(
+        app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .is_none()
+    );
+}
+
+#[test]
+fn media_duration_target_preserves_known_zero_identity_and_unknown_identity() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.image_metas[0] = Some((0, 0));
+    app.image_metas[1] = None;
+    let near = HashSet::from([0, 1]);
+    assert_eq!(
+        app.details_meta_target_for_idx(0, &near, true)
+            .unwrap()
+            .source_identity,
+        Some((0, 0))
+    );
+    assert_eq!(
+        app.details_meta_target_for_idx(1, &near, true)
+            .unwrap()
+            .source_identity,
+        None
+    );
+}
+
+fn configure_dedicated_lazy_selection_info(app: &mut App) {
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
+    app.settings.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::Dedicated;
+    app.settings.details_selection_bar_show_created = false;
+    app.settings.details_selection_bar_show_page_count = false;
+    app.settings.details_selection_bar_show_image_dimensions = false;
+    app.settings.details_selection_bar_show_video_duration = false;
+    app.settings.details_selection_bar_show_video_dimensions = false;
+    app.settings.details_selection_bar_show_video_codec = false;
+    app.settings.thumb_tooltip_show_created = false;
+    app.settings.thumb_tooltip_show_page_count = false;
+    app.settings.thumb_tooltip_show_image_dimensions = false;
+    app.settings.thumb_tooltip_show_video_duration = false;
+    app.settings.thumb_tooltip_show_video_dimensions = false;
+    app.settings.thumb_tooltip_show_video_codec = false;
+}
+
+#[test]
+fn selection_info_lazy_dedicated_columns_are_independent_of_grid_columns() {
+    use crate::ui_main::DetailsColumn;
+    let mut app = phase_c_support::setup_app();
+    for column in [
+        DetailsColumn::Created,
+        DetailsColumn::PageCount,
+        DetailsColumn::ImageDimensions,
+        DetailsColumn::VideoDuration,
+        DetailsColumn::VideoDimensions,
+        DetailsColumn::VideoCodec,
+    ] {
+        configure_dedicated_lazy_selection_info(&mut app);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_created = false;
+        app.settings.details_show_page_count = column != DetailsColumn::PageCount;
+        app.settings.details_show_image_dimensions = false;
+        app.settings.details_show_video_duration = false;
+        app.settings.details_show_video_dimensions = false;
+        app.settings.details_show_video_codec = false;
+        // An unrelated lazy column ensures this is not the selection-only fast path.
+        if column == DetailsColumn::PageCount {
+            app.settings.details_show_created = true;
+        }
+        match column {
+            DetailsColumn::Created => app.settings.details_selection_bar_show_created = true,
+            DetailsColumn::PageCount => app.settings.details_selection_bar_show_page_count = true,
+            DetailsColumn::ImageDimensions => {
+                app.settings.details_selection_bar_show_image_dimensions = true
+            }
+            DetailsColumn::VideoDuration => {
+                app.settings.details_selection_bar_show_video_duration = true
+            }
+            DetailsColumn::VideoDimensions => {
+                app.settings.details_selection_bar_show_video_dimensions = true
+            }
+            DetailsColumn::VideoCodec => app.settings.details_selection_bar_show_video_codec = true,
+            _ => unreachable!(),
+        }
+        let item = match column {
+            DetailsColumn::PageCount => GridItem::PdfFile(PathBuf::from(r"C:\books\one.pdf")),
+            DetailsColumn::Created | DetailsColumn::ImageDimensions => {
+                GridItem::Image(PathBuf::from(r"C:\photos\one.jpg"))
+            }
+            _ => GridItem::Video(PathBuf::from(r"C:\clips\one.mp4")),
+        };
+        app.install_new_items(vec![item.clone(), item], vec![Some((100, 2048)); 2]);
+        app.selected = Some(0);
+        assert!(!app.selection_info_only_lazy_load());
+        assert!(app.selection_info_item_requires_lazy_meta(0));
+        let target = app
+            .details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .unwrap();
+        let requested = |target: &DetailsMetaTarget| match column {
+            DetailsColumn::Created => target.load_created_at,
+            DetailsColumn::PageCount => target.load_page_count,
+            DetailsColumn::ImageDimensions => target.load_image_dims,
+            _ => target.load_video_meta,
+        };
+        assert!(requested(&target), "dedicated column {column:?}");
+        assert!(
+            app.details_meta_target_for_idx(1, &HashSet::from([1]), true)
+                .is_none_or(|t| !requested(&t))
+        );
+        app.settings.selection_info_display_mode =
+            crate::settings::SelectionInfoDisplayMode::Hidden;
+        assert!(!app.selection_info_item_requires_lazy_meta(0));
+        assert!(
+            app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+                .is_none_or(|t| !requested(&t))
+        );
+    }
+}
+
+#[test]
+fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_only() {
+    let mut app = phase_c_support::setup_app();
+    let sources = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["selected.mp4", "next.mp4"]
+        .iter()
+        .map(|name| sources.path().join(name))
+        .collect();
+    let db = crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), sources.path())
+        .unwrap();
+    let mut stamps = Vec::new();
+    for (position, path) in paths.iter().enumerate() {
+        std::fs::write(path, b"warm catalog fixture").unwrap();
+        let stamp = crate::catalog::media_source_identity(path).unwrap();
+        assert!(
+            db.set_video_meta(
+                path,
+                path.file_name().unwrap().to_str().unwrap(),
+                stamp.0,
+                stamp.1,
+                &crate::catalog::VideoMeta::Read {
+                    duration_secs: Some(65.0 + position as f64),
+                    dims: None,
+                    codec: Some("h264".into())
+                },
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        stamps.push(Some(stamp));
+    }
+    app.install_new_items(
+        vec![
+            GridItem::Image(sources.path().join("near.jpg")),
+            GridItem::Video(paths[0].clone()),
+            GridItem::Video(paths[1].clone()),
+        ],
+        vec![Some((1, 1)), stamps[0], stamps[1]],
+    );
+    app.rebuild_visible_indices();
+    configure_dedicated_lazy_selection_info(&mut app);
+    app.settings.details_selection_bar_show_video_duration = true;
+    app.settings.details_show_page_count = true;
+    app.settings.details_show_created = false;
+    app.settings.details_show_image_dimensions = false;
+    app.settings.details_show_video_duration = false;
+    app.settings.details_show_video_dimensions = false;
+    app.settings.details_show_video_codec = false;
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.selected = Some(1);
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let (old_tx, old_rx) = mpsc::channel();
+    let pending = app.details_meta_pending.as_mut().unwrap();
+    pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
+        unreachable!()
+    };
+    *rx = old_rx;
+    old_tx
+        .send(DetailsMetaEvent::Finished {
+            generation: app.items_generation,
+            failed: 0,
+        })
+        .unwrap();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(!app.selection_info_only_lazy_load());
+    assert!(
+        old_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: app.items_generation,
+                failed: 0
+            })
+            .is_err()
+    );
+    let ctx = egui::Context::default();
+    app.poll_details_meta_load(&ctx);
+    assert_eq!(
+        app.details_meta_pending
+            .as_ref()
+            .unwrap()
+            .selection_target_key,
+        app.details_lazy_cache_key(1)
+    );
+    let await_ready = |app: &mut App| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.details_image_dims_state.is_ready() && std::time::Instant::now() < deadline {
+            app.poll_details_meta_load(&ctx);
+            app.reconcile_details_lazy_session_after_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.details_image_dims_state.is_ready());
+    };
+    await_ready(&mut app);
+    assert_eq!(app.details_video_duration_sort_value(1), Some(65000));
+    // A selected-only follow-up after full completion is bounded and keeps ready AI facets.
+    app.ai_model_facet_requested = true;
+    app.selected = Some(2);
+    app.poll_details_meta_load(&ctx);
+    assert_eq!(
+        app.details_meta_pending.as_ref().unwrap().scan_scope,
+        DetailsMetaScanScope::VisibleStage
+    );
+    assert!(app.ai_model_facet_ready());
+    await_ready(&mut app);
+    assert_eq!(app.details_video_duration_sort_value(2), Some(66000));
+}
+
+#[test]
+fn selection_info_lazy_planning_merges_passed_pdf_target_without_restarting_ai_scan() {
+    let mut app = phase_c_support::setup_app();
+    let count = DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 4 + 17;
+    install_large_details_created_list(&mut app, count);
+    let pdf_path = PathBuf::from(r"C:\books\selected.pdf");
+    app.items[0] = GridItem::PdfFile(pdf_path.clone());
+    app.items[1] = GridItem::PdfFile(PathBuf::from(r"C:\books\background.pdf"));
+    configure_dedicated_lazy_selection_info(&mut app);
+    app.settings.details_selection_bar_show_page_count = true;
+    app.ai_model_facet_requested = true;
+    app.selected = None;
+    app.details_tag_prewarm_indices = vec![0];
+    let ctx = egui::Context::default();
+    app.start_details_meta_load(&ctx);
+    let pending = app.details_meta_pending.as_ref().unwrap();
+    let revision = pending.visible_revision;
+    let cancel = Arc::clone(&pending.cancel);
+    assert_eq!(
+        details_meta_plan_progress(&app).0,
+        DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME
+    );
+    app.selected = Some(0);
+    app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    app.poll_details_meta_load(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    let pending = app.details_meta_pending.as_ref().unwrap();
+    assert_eq!(pending.visible_revision, revision);
+    assert_eq!(
+        details_meta_plan_progress(&app).0,
+        DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 2
+    );
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        unreachable!()
+    };
+    let selected: Vec<_> = plan
+        .visible_targets
+        .iter()
+        .filter(|target| target.idx == 0)
+        .collect();
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].load_created_at && selected[0].load_page_count);
+    assert_eq!(
+        selected[0].pdf_password_revision,
+        Some(app.pdf_passwords.credential_revision(&pdf_path))
+    );
+    app.selected = Some(1);
+    app.poll_details_meta_load(&ctx);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert_eq!(
+        details_meta_plan_progress(&app).0,
+        DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME * 3
+    );
+    let DetailsMetaPendingPhase::Planning(plan) = &app.details_meta_pending.as_ref().unwrap().phase
+    else {
+        unreachable!()
+    };
+    assert!(
+        plan.background_targets
+            .iter()
+            .any(|target| target.idx == 1 && target.load_created_at)
+    );
+    assert!(
+        plan.visible_targets
+            .iter()
+            .any(|target| target.idx == 1 && target.load_created_at && target.load_page_count)
+    );
+    app.cancel_details_meta_loading();
+}
+
+#[test]
+fn selection_info_lazy_loading_prioritizes_new_selection_during_full_or_ai_fetch() {
+    let mut app = setup_media_duration_thumbnail_app();
+    for (mode, badge) in [
+        (crate::settings::GridViewMode::Details, false),
+        (crate::settings::GridViewMode::Thumbnail, false),
+        (crate::settings::GridViewMode::Thumbnail, true),
+    ] {
+        configure_dedicated_lazy_selection_info(&mut app);
+        app.settings.details_selection_bar_show_video_duration = true;
+        app.settings.grid_view_mode = mode;
+        app.settings.details_show_page_count = true;
+        // Thumbnail's bottom bar uses the shared grid columns; Dedicated is Details-only.
+        app.settings.details_show_video_duration = mode == crate::settings::GridViewMode::Thumbnail;
+        app.settings.details_show_video_dimensions = false;
+        app.settings.details_show_video_codec = false;
+        app.settings.thumb_show_media_duration = badge;
+        app.ai_model_facet_requested = true;
+        app.selected = Some(0);
+        app.details_tag_prewarm_indices = vec![0];
+        let cancel = install_fake_media_duration_pending(&mut app);
+        let (events_tx, events_rx) = mpsc::channel();
+        let (priority_tx, priority_rx) = mpsc::channel();
+        app.details_meta_pending.as_mut().unwrap().phase = DetailsMetaPendingPhase::Loading {
+            rx: events_rx,
+            priority_tx,
+        };
+        let revision = app.details_lazy_visible_revision;
+        app.selected = Some(4);
+        app.last_prefetch_scroll_at = Some(std::time::Instant::now());
+        app.poll_details_meta_load(&egui::Context::default());
+        assert!(!cancel.load(Ordering::Relaxed));
+        let pending = app.details_meta_pending.as_ref().unwrap();
+        assert_eq!(pending.visible_revision, revision);
+        assert_eq!(pending.selection_target_key, app.details_lazy_cache_key(4));
+        let targets = priority_rx
+            .try_recv()
+            .expect("selection must bypass scroll idle gate");
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.idx == 4 && target.load_video_meta)
+        );
+        app.cancel_details_meta_loading();
+        drop(events_tx);
     }
 }

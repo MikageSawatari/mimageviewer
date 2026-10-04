@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
@@ -31,6 +31,12 @@ const CONTENT_IDENTITY_SCHEMA_VERSION: i64 = 1;
 /// 「復元して何か起きるか」を数えるときは**除外する**。台帳の行はその問いの
 /// 対象であって答えではない。
 pub(crate) const LEDGER_DB_FILE: &str = "content_identity.db";
+
+// Only opening and initializing the ledger is serialized. SQLite's WAL mode
+// transition can return SQLITE_BUSY immediately when two fresh connections
+// attempt it together, even with busy_timeout. Normal reads/writes and index
+// loading do not hold this mutex.
+static LEDGER_DB_INITIALIZATION: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ContentIdentityTrigger {
@@ -435,20 +441,9 @@ impl ContentIdentityDb {
     }
 
     fn open_at(path: &Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut conn = rusqlite::Connection::open(path).map_err(|error| error.to_string())?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             ",
-        )
-        .map_err(|error| error.to_string())?;
-        ensure_content_identity_schema(&mut conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: open_ledger_connection_at(path)?,
+        })
     }
 
     fn recorded_state(&self, file_key: &str) -> Result<Option<StoredRecord>, String> {
@@ -646,6 +641,37 @@ impl ContentIdentityDb {
     }
 }
 
+/// Every production ledger connection validates the released schema here. Only
+/// the short initialization sequence is serialized in this process; the
+/// returned connection is used without holding the mutex.
+pub(crate) fn open_ledger_connection_at(path: &Path) -> Result<rusqlite::Connection, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create ledger directory: {error}"))?;
+    }
+    let mut conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("open ledger database: {error}"))?;
+    {
+        // A panic releases the mutex but poisons it. SQLite rolls back the
+        // interrupted connection's transaction on drop; the next caller must
+        // validate the on-disk schema again instead of waiting forever.
+        let _initialization = LEDGER_DB_INITIALIZATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("configure ledger busy timeout: {error}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             ",
+        )
+        .map_err(|error| format!("configure ledger WAL: {error}"))?;
+        ensure_content_identity_schema(&mut conn)
+            .map_err(|error| format!("initialize ledger schema: {error}"))?;
+    }
+    Ok(conn)
+}
+
 fn with_epub_ledger_key_guard<T>(file_key: &str, action: impl FnOnce() -> T) -> T {
     if file_key.to_ascii_lowercase().ends_with(".epub") {
         crate::pdf_loader::with_epub_pin_guard(Path::new(file_key), action)
@@ -657,17 +683,21 @@ fn with_epub_ledger_key_guard<T>(file_key: &str, action: impl FnOnce() -> T) -> 
 /// 新規作成と過去 schema からの upgrade を担う唯一の入口。
 /// version 0 は A1 の unversioned schema、version 1 は現在 schema を表す。
 fn ensure_content_identity_schema(conn: &mut rusqlite::Connection) -> Result<(), String> {
-    let version = conn
-        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-        .map_err(|error| format!("read PRAGMA user_version: {error}"))?;
-    if !(0..=CONTENT_IDENTITY_SCHEMA_VERSION).contains(&version) {
-        return Err(format!(
-            "unsupported content identity schema version {version} (current {})",
-            CONTENT_IDENTITY_SCHEMA_VERSION
-        ));
+    // A current-schema open needs no writer slot. In particular, it must not
+    // wait for an unrelated long-running ledger write just to read the schema.
+    if content_identity_schema_version(conn)? == CONTENT_IDENTITY_SCHEMA_VERSION {
+        return validate_content_identity_schema(conn);
     }
 
-    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    // A DEFERRED transaction can read version 0 on two connections, then one
+    // read-to-write upgrade fails immediately with SQLITE_BUSY in WAL mode.
+    // Acquire the writer slot before re-reading the version so another process
+    // cannot make us create the same schema twice.
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("begin schema transaction: {error}"))?;
+    let version = content_identity_schema_version(&transaction)?;
+
     if version == 0 {
         if !schema_object_exists(&transaction, "table", "edit_origin")? {
             transaction
@@ -709,6 +739,19 @@ fn ensure_content_identity_schema(conn: &mut rusqlite::Connection) -> Result<(),
 
     validate_content_identity_schema(&transaction)?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn content_identity_schema_version(conn: &rusqlite::Connection) -> Result<i64, String> {
+    let version = conn
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("read PRAGMA user_version: {error}"))?;
+    if !(0..=CONTENT_IDENTITY_SCHEMA_VERSION).contains(&version) {
+        return Err(format!(
+            "unsupported content identity schema version {version} (current {})",
+            CONTENT_IDENTITY_SCHEMA_VERSION
+        ));
+    }
+    Ok(version)
 }
 
 fn schema_object_exists(
@@ -837,7 +880,10 @@ impl ContentIdentityIndexLoadPending {
                     .acquire_cancellable(crate::io_semaphore::IoPriority::Low, &worker_cancel)
                     .ok_or_else(|| "cancelled".to_string())
                     .and_then(|_permit| ContentIdentityDb::open_at(&db_path))
-                    .and_then(|db| db.load_index(&worker_cancel))
+                    .and_then(|db| {
+                        db.load_index(&worker_cancel)
+                            .map_err(|error| format!("load detection index: {error}"))
+                    })
                     .and_then(|index| index.ok_or_else(|| "cancelled".to_string()));
                 if !worker_cancel.load(Ordering::Acquire) {
                     let _ = tx.send(result);
@@ -882,6 +928,10 @@ pub(crate) struct ContentIdentityRecorder {
 
 impl ContentIdentityRecorder {
     pub(crate) fn spawn() -> Option<Self> {
+        Self::spawn_at(crate::data_dir::get().join("content_identity.db"))
+    }
+
+    fn spawn_at(db_path: PathBuf) -> Option<Self> {
         let (tx, rx) = mpsc::channel::<RecordRequest>();
         let (update_tx, update_rx) = mpsc::channel::<LedgerEntry>();
         let worker_update_tx = update_tx.clone();
@@ -889,7 +939,7 @@ impl ContentIdentityRecorder {
         let worker_shutdown = Arc::clone(&shutdown);
         match std::thread::Builder::new()
             .name("content-identity-recorder".into())
-            .spawn(move || run_worker(rx, worker_update_tx, worker_shutdown))
+            .spawn(move || run_worker(&db_path, rx, worker_update_tx, worker_shutdown))
         {
             Ok(handle) => Some(Self {
                 tx: Some(tx),
@@ -1761,11 +1811,12 @@ pub(crate) fn sort_restore_sources(sources: &mut [RestoreSourceCandidate]) {
 }
 
 fn run_worker(
+    db_path: &Path,
     rx: mpsc::Receiver<RecordRequest>,
     update_tx: mpsc::Sender<LedgerEntry>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let db = match ContentIdentityDb::open() {
+    let db = match ContentIdentityDb::open_at(db_path) {
         Ok(db) => db,
         Err(error) => {
             crate::logger::log(format!("content_identity: DB open failed: {error}"));
@@ -2163,12 +2214,13 @@ fn unix_time_millis() -> i64 {
 #[cfg(test)]
 mod tests {
 
-    /// `RECORD_SEQUENCE` はプロセス全体で 1 つなので、これを読むテストは直列化する。
-    /// 本番でも「観測中にどこかで編集が記録されたら今回は掃除しない」という粗い判定で、
-    /// per-key ではない。掃除は次のフォルダ訪問でやり直せるので、見送りは害にならない。
+    /// `RECORD_SEQUENCE` はプロセス全体で 1 つなので、直接の reader / writer と
+    /// App 編集の間接 writer を同じ lock で直列化する。AppTestEnv は data-dir override
+    /// lock を App 構築前から drop / recorder join 後まで保持するため、その lock を共有する。
+    /// ここは standalone test の入口だけで使い、App fixture / data-dir guard の中で再取得しない。
+    /// 本番の「観測中にどこかで編集が記録されたら今回は掃除しない」判定は変更しない。
     fn lock_record_sequence() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::data_dir::test_override_lock()
     }
 
     /// 「行がもう無い」という観測は store を何本も開く間に古くなる。その間に入った編集を
@@ -2547,6 +2599,132 @@ mod tests {
     }
 
     #[test]
+    fn old_two_connection_deferred_schema_open_can_fail_despite_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        drop(conn);
+
+        let both_read_schema = Arc::new(std::sync::Barrier::new(2));
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let both_read_schema = Arc::clone(&both_read_schema);
+                std::thread::spawn(move || {
+                    let mut conn = rusqlite::Connection::open(db_path).unwrap();
+                    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                    let tx = conn.transaction().unwrap();
+                    assert!(!schema_object_exists(&tx, "table", "edit_origin").unwrap());
+                    both_read_schema.wait();
+                    let result =
+                        tx.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)");
+                    tx.rollback().unwrap();
+                    result.map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<_> = attempts
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.as_ref().is_err_and(|error| error.contains("locked"))),
+            "the old read-then-create sequence should hit SQLITE_BUSY: {results:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_production_opens_create_one_empty_ledger_without_busy() {
+        for round in 0..32 {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("content_identity.db");
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let opens: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = db_path.clone();
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        ContentIdentityDb::open_at(&path).map(drop)
+                    })
+                })
+                .collect();
+            for open in opens {
+                let result = open.join().unwrap();
+                assert!(
+                    result.is_ok(),
+                    "production open failed for empty ledger in round {round}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_schema_open_succeeds_while_another_connection_is_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+
+        let mut writer = rusqlite::Connection::open(&db_path).unwrap();
+        let transaction = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO restore_declined (full_hash, target_key) VALUES ('held', 'writer')",
+                [],
+            )
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let open = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let result = ContentIdentityDb::open_at(&db_path).map(drop);
+            sender.send((start.elapsed(), result)).unwrap();
+        });
+        let outcome = receiver.recv_timeout(Duration::from_secs(7));
+        drop(transaction);
+        open.join().unwrap();
+        let (elapsed, result) = outcome.expect("open should complete within its busy timeout");
+        assert!(
+            result.is_ok(),
+            "current schema open failed while another connection held a write transaction: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "current schema open waited for a writer: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn empty_ledger_recorder_and_detection_index_start_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let recorder = ContentIdentityRecorder::spawn_at(db_path.clone()).unwrap();
+        let io_sem = Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1));
+        let pending = ContentIdentityIndexLoadPending::spawn_at(db_path, io_sem).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let index = loop {
+            match pending.try_recv() {
+                Ok(result) => break result.expect("fresh ledger and index must be usable"),
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "index load did not finish"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => panic!("index loader disconnected"),
+            }
+        };
+        assert_eq!(index.len(), 0);
+        drop(recorder);
+    }
+
+    #[test]
     fn purge_reload_removes_restore_source_exclusion_and_copy_is_candidate_again() {
         let mut app = crate::app::setup_app_for_test();
         if let Some(pending) = app.content_identity_index_load_pending.take() {
@@ -2818,6 +2996,7 @@ mod tests {
 
     #[test]
     fn restore_declined_is_filtered_after_full_hash_and_detection_cache_uses_zero_edit_time() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("content_identity.db");
         let target_path = temp.path().join("target.png");
@@ -2881,6 +3060,7 @@ mod tests {
 
     #[test]
     fn stage2_mismatch_is_cached_without_creating_a_candidate() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("content_identity.db");
         let target_path = temp.path().join("target.png");
@@ -3570,6 +3750,7 @@ mod tests {
 
     #[test]
     fn folder_backfill_then_copy_detection_produces_restore_candidate_without_gui() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("content_identity.db");
         let source_folder = temp.path().join("source");
@@ -3636,6 +3817,7 @@ mod tests {
     /// 「何も編集していないのに復元ダイアログが出る」ことになる (2026-08-25 報告)。
     #[test]
     fn an_origin_whose_edits_were_all_removed_stops_being_a_restore_source() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("content_identity.db");
         let source_folder = temp.path().join("source");
@@ -3718,6 +3900,7 @@ mod tests {
     /// 逆側。実データが残っている限り、候補から外さない。
     #[test]
     fn an_origin_that_still_has_edits_remains_a_restore_source() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("content_identity.db");
         let source_folder = temp.path().join("source");
@@ -3773,6 +3956,7 @@ mod tests {
 
     #[test]
     fn book_byte_copy_is_declined_but_explorer_copy_in_same_book_is_detected() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         let db_path = data_dir.join("content_identity.db");
@@ -3851,6 +4035,7 @@ mod tests {
 
     #[test]
     fn book_composited_page_does_not_create_a_restore_candidate() {
+        let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         let db_path = data_dir.join("content_identity.db");
@@ -4012,6 +4197,7 @@ mod tests {
 
     #[test]
     fn failed_recorder_submission_does_not_propagate_to_edit_caller() {
+        let _serial = lock_record_sequence();
         let (tx, rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         drop(rx);

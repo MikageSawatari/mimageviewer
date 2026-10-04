@@ -6,13 +6,6 @@ let collection_id = "80f58851-997b-4b80-90bc-f50bb1d2523e";
 let collection_surface = "Collection(" + collection_id + ")";
 let rating_surface = "Rating { stars: 1 }";
 
-// Rating rows keep the rating store's normalized key (lowercase, '/'), so names and paths reached
-// through the Rating view are lowercase (released behavior, backlog 1.299). This
-// smoke checks history, not casing, so every comparison ignores case.
-fn lower_names(names) { names.map(|n| n.to_lower()) }
-fn norm_path(p) { let x = p.to_lower(); x.replace("/", "\\"); x }
-fn same_path(a, b) { norm_path(a) == norm_path(b) }
-
 // run_action is acknowledged while the grid handler is still in its pass. The snapshot is
 // published at the start of that pass, so wait for a later one before sending another input.
 fn grid_move_first() {
@@ -36,8 +29,8 @@ fn state(s) {
 fn arrive(surface, path, names, label) {
     try {
         wait_until(|s| !s.startup_open_pending && !s.is_fullscreen
-            && s.grid_surface == surface && same_path(s.current_folder_path, path)
-            && lower_names(s.item_names) == lower_names(names), 30000);
+            && s.grid_surface == surface && s.current_folder_path == path
+            && s.item_names == names, 30000);
     } catch (error) {
         log("folder-history: " + label + " timed out: " + state(snapshot()));
         throw error;
@@ -71,9 +64,9 @@ select_root();
 arrive("Folder", a, ["B", "F"], "a-start");
 
 folder_history_smoke("open_rating_one");
-wait_until(|s| s.grid_surface == rating_surface && lower_names(s.item_names) == ["f"], 30000);
+wait_until(|s| s.grid_surface == rating_surface && s.item_names == ["F"], 30000);
 let rating_path = snapshot().current_folder_path;
-if rating_path == "" || same_path(rating_path, a) {
+if rating_path == "" || rating_path == a {
     fail("Rating root did not adopt its synthetic path: " + state(snapshot()));
 }
 arrive(rating_surface, rating_path, ["F"], "rating-one");

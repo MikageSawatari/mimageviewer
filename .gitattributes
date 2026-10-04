@@ -22,3 +22,14 @@ htdocs/mimageviewer/.htaccess text eol=lf
 # core.autocrlf=true rewrites it to CRLF on checkout and --check then reports the
 # file as out of date on every run.
 htdocs/sitemap.xml text eol=lf
+
+# The EffeTune snapshot converter checks generated HTML byte-for-byte.
+htdocs/mimageviewer/manual/effetune/**/*.html text eol=lf
+
+# Verbatim EffeTune notices and VERSION must match vendor bytes even when
+# core.autocrlf=true. Their committed blobs are LF; never convert on checkout.
+third_party/effetune-mixwright/** -text
+# mIV supplemental notices are also verbatim license copies, outside the bundle.
+third_party/effetune-mixwright/supplemental/NOTICES.txt -text
+# Japanese upstream documentation and referenced images are verbatim snapshots.
+third_party/effetune-docs/** -text

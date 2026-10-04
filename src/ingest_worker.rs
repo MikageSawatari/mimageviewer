@@ -111,21 +111,9 @@ impl<'a> IngestSession<'a> {
         self
     }
 
-    /// Walker の結果を適用する。
-    ///
-    /// - `to_ingest` の各候補について、メタ抽出 → IndexDoc を `batch_upserts` に蓄積、
-    ///   `(path, kind, mtime, size)` を `pending_ok_meta` に蓄積
-    /// - `to_delete` の各 path について、Tantivy delete を `batch_deletes` に蓄積
-    /// - sub-batch が `BATCH_FLUSH_COUNT` に達するか `BATCH_FLUSH_INTERVAL` 経過したら
-    ///   `dispatcher.batch(upserts, deletes, commit_after=true)` で submit
-    /// - **Tantivy commit + reader reload が成功したフレームでのみ** `fts_meta` を更新:
-    ///   `pending_ok_meta` を `upsert_meta_ok` (status=Ok) で書き、`batch_deletes` を
-    ///   `delete_paths` で物理削除
-    /// - 各 sub-batch の境界で dispatcher が Interactive キュー (タグ書き込み等) を先に拾うため、
-    ///   indexer の長時間 ingest 中もタグ操作は ~1 sub-batch (1〜2s) 以内に応答できる。
-    ///
-    /// Tantivy commit と SQLite 書き込みの間にクラッシュした場合は起動時 reconciliation
-    /// (3-way diff: FS / Tantivy / SQLite) で復旧する。
+    /// Build bounded sub-batches, commit and reload Tantivy, then publish matching SQLite rows.
+    /// Cancellation can abandon an already submitted reply; its job stays in dispatcher order.
+    /// Writer, reader reload and SQLite errors are returned rather than logged as success.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
@@ -188,21 +176,29 @@ impl<'a> IngestSession<'a> {
             // ここに来た時点で Tantivy commit + reader reload が完了している。
             // SQLite 側を Tantivy に合わせて更新する。
             for (key, kind, mtime, file_size) in &ok_meta {
-                if let Err(e) = self.meta_db.upsert_meta_ok(
-                    key,
-                    self.favorite_id,
-                    &self.favorite_root,
-                    *kind,
-                    *mtime,
-                    *file_size,
-                ) {
-                    crate::logger::log(format!("ingest: upsert_meta_ok({key}) failed: {e}"));
-                }
+                self.meta_db
+                    .upsert_meta_ok(
+                        key,
+                        self.favorite_id,
+                        &self.favorite_root,
+                        *kind,
+                        *mtime,
+                        *file_size,
+                    )
+                    .map_err(|e| {
+                        tantivy::TantivyError::SystemError(format!(
+                            "ingest: upsert_meta_ok({key}) failed: {e}"
+                        ))
+                    })?;
             }
             if !deletes_for_sqlite.is_empty() {
-                if let Err(e) = self.meta_db.delete_paths(&deletes_for_sqlite) {
-                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
-                }
+                self.meta_db
+                    .delete_paths(&deletes_for_sqlite)
+                    .map_err(|e| {
+                        tantivy::TantivyError::SystemError(format!(
+                            "ingest: delete_paths failed: {e}"
+                        ))
+                    })?;
             }
             Ok(true)
         };
@@ -483,6 +479,135 @@ mod tests {
             .unwrap();
         assert_eq!(stats.ingested_ok, 0);
         assert_eq!(stats.deleted, 0);
+    }
+
+    #[test]
+    fn cancel_interrupts_submitted_reply_without_sqlite_publication() {
+        use crate::fts_writer_dispatcher::{FtsWriterDispatcher, WriterPriority};
+        let (tmp, meta, fts) = setup();
+        let meta = std::sync::Arc::new(meta);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = FtsWriterDispatcher::start(fts.writer().unwrap(), fts.clone());
+        let (blocked, release_writer, blocker_done) =
+            writer.submit_test_block(WriterPriority::Background);
+        blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (submitted, release_submitter) = writer.test_gate_next_batch();
+        let cand = make_image_file(tmp.path(), "shutdown.jpg");
+        let key = cand.key.clone();
+        let root = tmp.path().to_path_buf();
+        let worker_meta = meta.clone();
+        let worker_cancel = cancel.clone();
+        let worker_writer = writer.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let session = IngestSession::new(Uuid::new_v4(), root, &worker_meta, &fts);
+            let stats = session
+                .apply(
+                    vec![cand],
+                    vec![],
+                    &worker_writer,
+                    &GlobalIoSemaphore::new(2),
+                    IoPriority::Low,
+                    &worker_cancel,
+                    None,
+                )
+                .unwrap();
+            done_tx.send(stats).unwrap();
+        });
+        submitted.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        release_submitter.send(()).unwrap();
+        let stats = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(stats.cancelled);
+        assert!(meta.get(&key).unwrap().is_none());
+        release_writer.send(()).unwrap();
+        blocker_done.recv_timeout(Duration::from_secs(10)).unwrap();
+        worker.join().unwrap();
+        writer.commit(true, WriterPriority::Background).unwrap();
+        assert!(meta.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn sqlite_failure_is_reported_and_allows_later_success() {
+        let (tmp, meta, fts) = setup();
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            fts.clone(),
+        );
+        let db = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_ingest BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'injected SQLite failure'); END;").unwrap();
+        let cancel = AtomicBool::new(false);
+        let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
+        let sem = GlobalIoSemaphore::new(2);
+        let failed = make_image_file(tmp.path(), "first.jpg");
+        let failed_key = failed.key.clone();
+        assert!(
+            session
+                .apply(
+                    vec![failed],
+                    vec![],
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None
+                )
+                .is_err()
+        );
+        assert!(meta.get(&failed_key).unwrap().is_none());
+        db.execute_batch("DROP TRIGGER fail_ingest;").unwrap();
+        session
+            .apply(
+                vec![make_image_file(tmp.path(), "second.jpg")],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn reader_reload_failure_prevents_sqlite_publication() {
+        let (tmp, meta, fts) = setup();
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            fts.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+        let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
+        let sem = GlobalIoSemaphore::new(2);
+        let cand = make_image_file(tmp.path(), "reload.jpg");
+        let key = cand.key.clone();
+        writer.test_set_reload_failure(true);
+        assert!(
+            session
+                .apply(
+                    vec![cand],
+                    vec![],
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None
+                )
+                .is_err()
+        );
+        assert!(meta.get(&key).unwrap().is_none());
+        writer.test_set_reload_failure(false);
+        session
+            .apply(
+                vec![make_image_file(tmp.path(), "recovered.jpg")],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
     }
 
     #[test]

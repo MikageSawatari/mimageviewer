@@ -33,6 +33,42 @@ configure が watcher 登録より先に走る欠落窓、登録失敗のログ�
 
 ## 段階と検証
 
+### 起動時の再利用 (`ReusedInitial`)
+
+`skip_offline_change_scan` ON、`scanned_once` の有効 root 集合全体の指紋一致、純粋な Initial、
+現在構成の全 watch が Ready、未修復 gap なしの場合だけ、既存 worker 内で `ReusedInitial` を
+選ぶ。UserCheck / Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair の合流は `ScannedFull`。
+再利用では Full inventory と FS 列挙に加え、有効 root 和集合の外のキーの purge も省く。
+指紋が root / 共通除外を含み、構成変更 purge の公開削除は同 transaction で印を失効させ、
+別指紋 Full も最初の書き込みより前に失効させるため、同一指紋での全キー整理は不要。
+クラッシュが変更前なら旧構成の公開データが保たれ、変更後なら旧印がない。
+非公開の prefill は残してよい。未完 build の掃除、page order 修復、メモリ読み込みは維持し、
+現在 store と array snapshot の ack が揃ってから既存の終端経路で Complete を出す。
+通常ログの `reused initial: skipped=true` に `cleanup_ms / page_order_ms / memory_ms / ack_ms`
+を出す。memory は実 loader の時間、ack は要求から受理までの時間で、非同期 load は cleanup
+や ack と重複するため4項目を合計しない。page order が現行版なら単一 metadata 行の確認だけ。
+dirty の `retain_after` と gap repair は `ScannedFull` だけに適用し、再利用中の dirty は MoreWork
+から Delta へ残す。印は完全な Full だけで立て、イベント・クラッシュでは消さない。
+
+「今すぐ確認」の全 root 要求は `UserCheck` (`reason=user_check`) とし、起動時と同じ
+`InitialMetadataTrust` を使う。Complete ZIP / PDF の kind・保存件数と公開 member 数・mtime・
+size・hash version が一致すれば開かずに既存署名を利用する。不一致・欠落・未完なら従来の
+open / decode / publish に戻る。FS と inventory の実 Full を行い、設定 ON・有効印があっても
+ReusedInitial は選ばない。prune-safe な走査と array ack 後の `ScannedFull` として、開始前の
+dirty を吸収し、Ready の gap を修復し、開始後の dirty は Delta へ残す。
+同一構成 epoch の併合は MustOpen > UserCheck > Initial とし、gap epoch は最大値を保持する。
+UserCheck 同士は1つにまとめ、MustOpen を大きい gap の軽い要求で弱めない。既存の登録単位
+`request_full` / supervisor FullRescan からの Manual は MustOpen を維持する。
+
+設定purgeで公開済み item / container を削除するときは、その transaction 内で印も消す。
+build / prefill だけの整理では公開索引を失わないため、削除件数が正でも印を保持する。
+別指紋 Full は既存の未完build掃除 transaction で旧印を失効させ、最初の走査書き込みより
+前に確定する。構成を元に戻し Full 完了前に正常終了しても再利用しない。同一指紋 Full の
+取消と no-op purge は旧印を保持する。OFF時 purge は既存どおり ActivityGate を迂回して
+無効化した範囲を検索から除くが、その後の索引作成は pause に従う。
+指紋は正規化・重複除去した有効 root 集合、整列・重複除去した共通除外、DB schema / hash /
+page order の版、走査拡張子集合を含む。構成 epoch と password revision は含めない。
+
 第一段階は上記 scheduler/増分処理/公開境界を一貫して実装し、狭域回帰と独立差分レビューを行う。
 Full 中の通知は `[Full, Delta]`、Delta 中の通知は次 Delta、overflow/root 変更だけが必要な repair Full を発生させることを決定的な barrier テストで確認する。
 baseline 前後・prune 中通知、watch 登録失敗/復旧、remove/readd/重複 root、旧 epoch、array CAS/store 交換/shutdown、rename、book↔loose、ZIP/PDF、I/O 不完全時の保護を含める。実 IndexerManager→supervisor→notifier 境界の回帰も必要。

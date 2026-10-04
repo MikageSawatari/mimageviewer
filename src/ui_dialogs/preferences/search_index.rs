@@ -11,7 +11,7 @@ pub(super) struct PrefSearchEntry {
 }
 
 macro_rules! entry {
-    ($anchor:literal, $page:ident, $title:literal, [$($keyword:literal),* $(,)?]) => {
+    ($anchor:literal, $page:ident, $title:expr, [$($keyword:literal),* $(,)?]) => {
         PrefSearchEntry {
             anchor: $anchor,
             page: PreferencesPage::$page,
@@ -899,6 +899,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再読み込み", "reload", "フォルダー", "ロード済み"]
     ),
     entry!(
+        "indexer/offline-change-scan",
+        IndexerSpeed,
+        crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL,
+        [
+            "起動",
+            "終了",
+            "スキャン",
+            "索引",
+            "今すぐ確認",
+            "検索",
+            "offline"
+        ]
+    ),
+    entry!(
         "indexer/speed",
         IndexerSpeed,
         "速度プロファイル",
@@ -1058,6 +1072,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Video,
         "リモート端末への動画配信を有効にする",
         ["リモート", "remote", "配信", "ストリーミング"]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-input-limit",
+        Video,
+        "EffeTune に渡す前に 0dB を超える音を抑える",
+        ["音響調整", "OVERLOAD", "ピーク", "EffeTune"]
     ),
     entry!(
         "video/normalize-cache",
@@ -1277,20 +1298,32 @@ mod tests {
                 entry.anchor
             );
             assert!(!entry.title.is_empty(), "title が空です: {}", entry.anchor);
-            let title_source = if entry.anchor == "raw-develop/settings" {
-                assert!(
-                    PAGES_SOURCE.contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
+            if entry.anchor == "indexer/offline-change-scan" {
+                // この項目はお気に入り編集と共有する描画 helper が表示文字列を所有する。
+                assert_eq!(
+                    entry.title,
+                    crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL
                 );
-                RAW_SETTINGS_SOURCE
+                assert!(
+                    PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
+                );
             } else {
-                PAGES_SOURCE
-            };
-            assert!(
-                title_source.contains(entry.title),
-                "title が pages.rs の表示文字列と一致しません: {} / {}",
-                entry.anchor,
-                entry.title
-            );
+                let title_source = if entry.anchor == "raw-develop/settings" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
+                    );
+                    RAW_SETTINGS_SOURCE
+                } else {
+                    PAGES_SOURCE
+                };
+                assert!(
+                    title_source.contains(entry.title),
+                    "title が pages.rs の表示文字列と一致しません: {} / {}",
+                    entry.anchor,
+                    entry.title
+                );
+            }
             let mut keywords = HashSet::new();
             for keyword in entry.keywords {
                 assert!(
@@ -1408,6 +1441,26 @@ mod tests {
             assert!(results.iter().all(|entry| {
                 entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
             }));
+        }
+    }
+
+    #[test]
+    fn offline_scan_and_full_check_keywords_open_the_indexer_setting_anchor() {
+        for query in [
+            "終了 スキャン",
+            "今すぐ確認",
+            "offline",
+            "検索インデックス 起動",
+        ] {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "indexer/offline-change-scan")
+                .unwrap();
+            assert_eq!(result.page, PreferencesPage::IndexerSpeed);
+            assert_eq!(
+                result.title,
+                crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL
+            );
         }
     }
 

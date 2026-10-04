@@ -118,6 +118,32 @@ fn install_app_fonts(ctx: &egui::Context) {
     mimageviewer::ui_fonts::configure_fonts(ctx);
 }
 
+#[test]
+fn offline_change_scan_setting_light() {
+    let mut skip = false;
+    snapshot_with_theme(
+        "offline_change_scan_setting_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        move |ui| {
+            mimageviewer::ui_helpers::draw_offline_change_scan_setting(ui, &mut skip);
+            mimageviewer::ui_helpers::draw_index_full_check_button(ui);
+        },
+    );
+}
+
+#[test]
+fn offline_change_scan_setting_dark() {
+    let mut skip = true;
+    snapshot_with_theme(
+        "offline_change_scan_setting_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        move |ui| {
+            mimageviewer::ui_helpers::draw_offline_change_scan_setting(ui, &mut skip);
+            mimageviewer::ui_helpers::draw_index_full_check_button(ui);
+        },
+    );
+}
+
 /// テストハーネスのユーティリティ: 指定テーマで UI を描画し、`name` でスナップショットを取る。
 fn snapshot_with_theme(
     name: &str,
@@ -427,6 +453,16 @@ fn preferences_video_bar_visibility_dark() {
             ui.set_width(440.0);
             mimageviewer::draw_video_bar_visibility_snapshot_fixture(ui);
         },
+    );
+}
+
+#[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_input_limit_dark() {
+    snapshot_with_theme(
+        "preferences_effetune_input_limit_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
     );
 }
 
@@ -876,6 +912,7 @@ fn cell_filename_mixed_glyphs_dark() {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    media_duration: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: Default::default(),
@@ -939,6 +976,7 @@ fn compact_file_format_badges_light() {
                         checked: false,
                         stack_count: None,
                         filter_match_count: None,
+                        media_duration: None,
                         bookmark_time: None,
                         upscaled_video: false,
                         edit_badges: Default::default(),
@@ -1052,6 +1090,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    media_duration: None,
                     bookmark_time: Some("0:25"),
                     upscaled_video: false,
                     edit_badges: Default::default(),
@@ -1082,6 +1121,128 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
     );
 }
 
+fn media_duration_badges_fixture(ui: &mut egui::Ui) {
+    use mimageviewer::thumb_overlay_layout::{
+        BadgeKind, BottomContainerInput, BottomContainerKind, EditBadgeFlags, FormatBadgeKind,
+        ThumbnailOverlayLayoutInput, layout_thumbnail_overlays,
+    };
+    let dark = ui.visuals().dark_mode;
+    let draw_cell = |ui: &mut egui::Ui,
+                     width: f32,
+                     duration: &str,
+                     count: Option<u32>,
+                     dense: bool| {
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(width, width.min(120.0)), egui::Sense::hover());
+        let cell = response.rect;
+        let inner = cell.shrink(4.0);
+        painter.rect_filled(
+            inner,
+            3.0,
+            egui::Color32::from_gray(if dark { 58 } else { 215 }),
+        );
+        let layout = layout_thumbnail_overlays(
+            ThumbnailOverlayLayoutInput {
+                cell,
+                inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: count,
+                media_duration: Some(duration),
+                bookmark_time: None,
+                upscaled_video: dense,
+                edit_badges: EditBadgeFlags {
+                    crop: dense,
+                    pin: dense,
+                    ..Default::default()
+                },
+                tags: &[],
+                bottom_container: dense.then_some(BottomContainerInput {
+                    kind: BottomContainerKind::Format(FormatBadgeKind::Video),
+                    label: "MOV",
+                }),
+                rating_text: dense.then_some("★★★"),
+                filename: dense.then_some("holiday.mp4"),
+            },
+            |text, style| {
+                mimageviewer::ui_helpers::measure_thumbnail_badge_text(&painter, text, style)
+            },
+        );
+        for placement in layout.badge_placements() {
+            match placement.kind {
+                BadgeKind::MediaDuration => {
+                    mimageviewer::ui_helpers::draw_overlay_media_duration_badge(&painter, placement)
+                }
+                BadgeKind::UpscaledVideo => {
+                    mimageviewer::ui_helpers::draw_overlay_upscaled_video_badge(&painter, placement)
+                }
+                BadgeKind::Edit(kind) => {
+                    mimageviewer::ui_helpers::draw_overlay_edit_badge(&painter, placement, kind)
+                }
+                BadgeKind::EditOverflow => {
+                    mimageviewer::ui_helpers::draw_overlay_edit_overflow_badge(&painter, placement)
+                }
+                BadgeKind::BottomContainer(BottomContainerKind::Format(kind)) => {
+                    mimageviewer::ui_helpers::draw_overlay_format_badge(&painter, placement, kind)
+                }
+                BadgeKind::Rating => {
+                    mimageviewer::ui_helpers::draw_overlay_rating_badge(&painter, placement, false)
+                }
+                BadgeKind::Filename => mimageviewer::ui_helpers::draw_cell_filename(
+                    &painter,
+                    placement,
+                    ui.visuals().text_color(),
+                    dark,
+                ),
+                BadgeKind::FilterMatchCount => {
+                    painter.rect_filled(
+                        placement.rect,
+                        3.0,
+                        egui::Color32::from_rgb(0xE6, 0x7E, 0x22),
+                    );
+                    painter.text(
+                        placement.text_pos(),
+                        egui::Align2::LEFT_TOP,
+                        &placement.text,
+                        egui::FontId::proportional(placement.style.font_size),
+                        egui::Color32::WHITE,
+                    );
+                }
+                _ => {}
+            }
+        }
+    };
+    ui.label("Media duration: short and long");
+    ui.horizontal(|ui| {
+        draw_cell(ui, 200.0, "0:07", None, false);
+        draw_cell(ui, 200.0, "100:02:03", None, false);
+    });
+    ui.label("Filter count owns the corner; small cells omit duration");
+    ui.horizontal(|ui| {
+        draw_cell(ui, 200.0, "1:02:03", Some(42), true);
+        draw_cell(ui, 100.0, "1:02:03", Some(42), true);
+        draw_cell(ui, 32.0, "1:02:03", Some(42), true);
+    });
+}
+
+#[test]
+fn media_duration_badges_dark() {
+    snapshot_with_theme(
+        "media_duration_badges_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        media_duration_badges_fixture,
+    );
+}
+
+#[test]
+fn media_duration_badges_light() {
+    snapshot_with_theme(
+        "media_duration_badges_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        media_duration_badges_fixture,
+    );
+}
+
 #[test]
 fn bookmark_time_and_tag_badges_dark() {
     snapshot_with_theme(
@@ -1108,6 +1269,7 @@ fn bookmark_time_and_tag_badges_dark() {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    media_duration: None,
                     bookmark_time: Some("12:34"),
                     upscaled_video: false,
                     edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {

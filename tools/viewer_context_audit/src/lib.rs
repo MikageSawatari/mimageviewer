@@ -192,10 +192,12 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn projected_viewer_context_id (& self) -> ViewerContextId",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn detached_viewer_window_id (& self) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn locate_window_context (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window_binding_probe (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window (& self , id : ViewerContextId) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncServicePhase { Background , Dialog , }",
@@ -1316,6 +1318,13 @@ impl<'ast> Visit<'ast> for TestApiVisitor<'_> {
         visit::visit_expr_block(self, node);
         self.cfg_test_depth -= usize::from(is_test);
     }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        let is_test = node.attrs.iter().any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_local(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
 }
 
 #[derive(Default)]
@@ -2120,6 +2129,20 @@ mod tests {
         "#;
         let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
         assert!(!has_rule(&violations, Rule::A6), "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_honors_cfg_test_on_a_local_binding_without_masking_the_next_call() {
+        let source = r#"
+            fn production(app: &mut App) {
+                #[cfg(test)]
+                let injected = app.helper_for_test();
+                let unexpected = app.helper_for_test();
+            }
+        "#;
+        let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].rule, Rule::A6);
     }
 
     #[test]

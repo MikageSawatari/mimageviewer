@@ -2,11 +2,12 @@
 
 状態: 設計第 5 版 (2026-09-27)。第 1 版 (REVISE、P1×5 / P2×4 / P3×1) と第 2 版 (REVISE、P1×4 / P2×2) への
 Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 / P3×1) を第 4 版で、第 4 版への指摘 (REVISE、P1×2 / P3×1) を第 5 版で反映。第 5 版は ACCEPT WITH CHANGES (P3×1、テストの記述) で、その修正を反映済み。
-サンプル版 (試験用) の範囲を定める。配布版で決めることは §10。
+サンプル版 (試験用) の設計記録と、v4.3.0 配布版の決定をまとめる。配布の同梱・署名・通知と
+ポータブル版の範囲は §10 に確定。残る対象外事項も同節に記録する。
 
 ## 0. 目的と決定済み事項
 
-EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.11.1、WebView2 UI、AVX2/FMA 必須) を
+EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.12.0、WebView2 UI、AVX2/FMA 必須) を
 mIV の音声経路へ組み込み、エフェクト処理とビジュアライザーを使えるようにする。
 
 利用者と合意済みの方針 (2026-09-27):
@@ -66,7 +67,8 @@ mIV の音声経路へ組み込み、エフェクト処理とビジュアライ�
 ## 2. 構成
 
 ```
-decode → normalize → [ユーザー VST3 チェーン: dsp_bridge] → [EffeTune: 専用 bridge]
+decode → normalize → [ユーザー VST3 チェーン: dsp_bridge] → [任意の EffeTune 前段リミッター]
+       → [EffeTune: 専用 bridge]
        → 手動ブースト → 安全リミッター → 出力
 ```
 
@@ -139,6 +141,7 @@ enum EffetuneFailure {
 - 終了時の `flush_silence` を EffeTune 段にも行う。
 - **遅延 (PDC)**: チャンクごとに「実際に適用した段」の遅延だけを合算して記録する。
   - プラグイン遅延の合計 = ユーザーチェーン (適用時) + EffeTune (適用時)。
+    §13 の前段 limiter を通した場合はその実遅延も PDC へ加算する。
   - **2 秒上限はプラグイン遅延の合計に掛ける** (リミッター・time stretch の遅延は上限の外)。
     優先順位は **ユーザーチェーン優先**。ユーザーチェーンは既存どおり自分の中で上限を守る。
   - EffeTune 段を **適用する前に** 「ユーザーチェーンの遅延 + EffeTune の現在の遅延」を確認し、
@@ -167,15 +170,59 @@ enum EffetuneFailure {
 
 - ツールバーに `ToolbarSectionId::EffeTune` を追加 (既存 `FolderTree` の toggle に倣う)。既定で表示。
   - ランプ (selectable の active) = `Running` かつ 最新の判定が `Effective`。
-  - クリック: `Idle` → `Loading { UserButton, open_gui_when_ready: true }` /
-    `Running` → GUI の表示・非表示 / `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。
+  - クリック: `Idle` → `Loading { UserButton, open_gui_when_ready: Some(ShowPermit) }` /
+    `Running` → 非表示なら表示・アクティブ化、表示中で手前なら非表示、背面なら手前へ出してアクティブ化 /
+    `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。ただしR2の
+    `Unavailable(BundlePreparationFailed)`だけはクリックでworker再解決→ロードを試す。
   - ツールチップに状態と理由 (Failed の理由、判定が古い可能性、Unparseable の理由) を出す。
   - 実装事実 (2026-09-28): 利用不可・失敗・判定不能のツールチップには短い日本語の理由を出し、
     enum 名、host の詳細エラー、bundle の絶対パスは表示しない。診断詳細は log に残す。
-- **GUI の owner はメインウィンドウに固定**。`DspBridge` に GUI owner 方針
-  (`GuiOwnerPolicy::FixedMain` / 既存の `Auto`) を持たせ、EffeTune の bridge は `FixedMain`。
-  attach と再表示のたびに main HWND が有効か確認し、無効なら表示しない (理由を log)。
-  fullscreen owner は設定しない。TOPMOST にもしない。
+- **GUI は owner のない tool window** (`GuiOwnerPolicy::Unowned`、利用者決定 2026-09-30)。
+  `FixedMain` の owned popup は Windows の規則でメインより常に手前になり、メインをクリックしても
+  裏へ回せないため変更した。owner HWND は常に 0、タスクバーのボタンは増やさない。ユーザー VST は
+  既存の `Auto`。fullscreen owner は設定しない。TOPMOST にもしない。
+  main HWND は owner と分けた参照として DPI と最小化の確認にだけ使う。初期位置・保存済み rect は
+  従来どおり。host の `set_owner` とドラッグ終了による owner 復元で再所有させない。
+- **「手前」の判定は foreground window のルートから owner chain を辿ると、当該 editor に到達するか**
+  の 1 つにする。editor 自身とその popup を含め、別のユーザー VST は含めない。
+  メインへの primary click は `WM_MOUSEACTIVATE` → `WM_LBUTTONDOWN` の組で、メインが手前になる前の
+  foreground を採取する。次のクリックで置き換え、キーボードによるボタン操作は現在の foreground を使う。
+  タッチ／ペンも `WM_POINTERACTIVATE` と primary `WM_POINTERDOWN`、legacy `WM_TOUCH` の primary down
+  から同じ入力状態を通す。非 client・別ボタン・取消し・非アクティブ化で未完了の activation を破棄する。
+  明示的な表示／背面からの復帰だけで foreground を許可し、host GUI thread でアクティブ化する。
+- **mIV による一時非表示は host の `GuiVisibility` が単独で所有**する。表示希望と非表示理由の集合
+  (`Minimized` / `RemoteSession`) を持ち、理由がすべて解除され、表示希望が残るときだけ非アクティブで戻す。
+  最小化や Remote による hide で `user_hidden`、設定保存、state capture、音声の実行状態を変えない。
+  最小化はメインの `WM_SIZE` で共有 atomic の連番を更新し、worker に通知する。
+  WndProc は bridge を参照せず、`DspBridge.inner` のロック・列挙・IPC は worker 側だけで行う。
+  実際の表示直前にも現在の `IsIconic(main)` を確認する。
+  アプリの非アクティブ化では窓を隠したり手前へ戻したりしない。mIV 終了時は既存の bridge teardown で消す。
+- **Remote が操作権を持つ間は窓を隠す** (利用者決定 2026-10-01)。音の look-ahead による反映遅延と
+  端末より先行するビジュアライザーで PC 上の編集が紛らわしいため。
+  正本は `remote_session_blocks_local_control()` (取得中・所有中・drain 中を含む、音声トラック計画 §9B)。
+  「音響調整」は無効表示し、ツールチップで理由と復帰を説明する。取得時に未完了の自動 GUI open 意図を取消す。
+  初回 attach は非表示で行い、専用 host-control worker が完了時の Remote 状態を確認してから表示する。
+  Remote または最小化中に attach が完了した窓は隠したままで、解除時に新しく開かない。
+  worker はイベントに載った古い Remote 値を再生せず、現在の `SessionHandle` の phase を読む。
+  UI 側の直前通知値は重複通知の抑制だけに使い、最小化から復帰したときに UI frame より前でも
+  新しい Remote 取得を検出する。handle の登録・切り離しと同じ境界で参照を更新する。
+  未表示の open 要求は `ShowPermit` (native 最小化イベント連番と既存 Remote 取得連番) を利用者の
+  open 要求時 (Loading 中の要求を含む) に採取し、attach 前後で照合する。
+  attach 中に最小化／Remote の開始と終了が両方済んだ場合も取消し、
+  まだ表示していなかった窓を「復帰」として開かない。時間窓や独自 Remote revision は使わない。
+  **配送後の取消しも host の GUI thread で確定する** (2026-10-01 review fix1)。
+  32 byte の専用共有 mapping は native 最小化連番と Remote の取得連番・phase の read-only projection
+  だけを運ぶ。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
+  worker に復帰判定を通知する。worker は source を weak に参照し、通知 sender の循環で残留しない。
+  `set_gui_visibility_checked` は request ID と発行時の連番を運び、GUI thread が共有値と最小化を
+  表示・アクティブ化の直前に照合する。取消しは未表示の窓の表示希望を作らず、既に表示希望のある
+  窓の希望は保存する。判定後に始まる最小化／Remote は通常の一時非表示として扱う。
+  `Shown` / `Hidden` / `Cancelled` / `Error` を返し、Rust は pipe 書き込みだけで表示を公開しない。
+  ACK と native close は 1 本の FIFO signal を通り、`pump_gui_signals` が Rust の表示情報を更新する。
+  5 秒の ACK 待ち・mapping 作成／検証失敗は GUI failure として扱い、未検査の表示へ代替しない。
+  背面からの明示的な前面化も同じ検査と GUI task を通る。自動復帰は従来どおり非アクティブ。
+  単純化として GUI 操作を既存 worker に直列化し、初回 hidden attach と理由集合を使う。
+  モーダル化や editor の破棄・再生成は、再生・ビジュアライザー・設定画面の通常操作を妨げるため採らない。
 - 既存のフルスクリーン関連の VST GUI 操作 (owner 付け替え、全 GUI 表示／非表示、TOPMOST、HUD の
   allowlist、フォーカスの受け渡し) は `self.dsp_bridge` のみを対象のまま変えない。
 - **EffeTune の窓には、host の container が付けるタイトルバーの電源 (bypass) ボタンを出さない**。
@@ -323,19 +370,22 @@ enum EffectiveState {
   - 配信中に EffeTune の設定を変えても、そのセッションには反映しない (次のセッションの受け付け時に
     取り直す)。
 
-## 7. bundle の配置 (サンプル版)
+## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
+- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.12.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
-- 実行時は **EffeTune モジュール自身の解決関数** で `<実行中 exe のディレクトリ>\effetune\EffeTune Mixwright.vst3`
-  を探す。`native_assets` は使わない (ポータブル版の DLL 解決専用に `#[cfg(feature = "portable")]` で
-  閉じられており、公開範囲を広げない。実装時に判明、2026-09-27)。通常版・ポータブル版で同じ規則。
-  `current_exe()` が失敗したら `.` に逃がさず `Unavailable(BundleMissing(理由))`。
-  bundle が無ければ `Unavailable(BundleMissing)`。
+- 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
+  `<exe_dir>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3` として一度だけ解決し、
+  controllerの生存中は固定する。launcher経由でない通常版はcurrent pointerから同じ規則で選ぶ。
+  修復不能時の専用envはUnavailableと詳細logへ反映し、別世代へ黙ってfallbackしない。
+- build-devのpointer不在時だけ従来の `<exe_dir>/effetune/EffeTune Mixwright.vst3` を使う。
+  portableはこの従来経路を維持しbundleを同梱しない。`native_assets` のportable専用公開範囲は広げない。
+  `current_exe()`失敗時も `.` へfallbackしない。bundle不在はUnavailable(BundleMissing)。
 - `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` が偽なら
   `Unavailable(CpuUnsupported)`。
-- release / portable / launcher への埋め込みはしない。build.rs の必須チェックにも入れない。
+- サンプル版では release / portable / launcher への埋め込みを行わず、build.rs の必須チェックにも
+  入れなかった。v4.3.0 配布版の launcher 対応は §10.2。
 
 ## 8. テスト
 
@@ -344,7 +394,8 @@ enum EffectiveState {
   fixture は Mixwright v0.11.1 の上流ソース (`src/bridge/state_codec.cpp` の encode) の出力形から作り、
   出典 (タグと関数) をテストに書く。実機の状態は §5.2 の log で後から集める。
 - controller の遷移: Idle→Loading→Running、Running から戻らない、各 `EffetuneFailure` が
-  `fail()` の 1 か所を通りスロットが空になる、Unavailable ではクリックで何も起きない、
+  `fail()` の 1 か所を通りスロットが空になる、Unavailableでは準備失敗だけworkerで再試行し、
+  拒否された同世代を使わず別の公開世代を固定する（他のUnavailableはクリック不可）、
   起動時条件 (Effective / Unparseable で起動、Inert・ファイルなしで起動しない)。
 - 起動時ゲート: 完了順 2 通り、ユーザー VST 無効、どちらかが失敗・worker 切断、遅延中の動画／音声の
   オープンが 1 回だけ再開される。
@@ -372,6 +423,17 @@ enum EffectiveState {
   切れでは host を終了しない、見張りの上限超過でだけ専用 host が終了し `HostLost` になる、終了処理との交錯。
 - settings: 新フィールドが `overwrite_non_preferences_from` で保持される。
 - GUI signal: `vst3_enabled=false` でも EffeTune の `GuiUserHidden` が処理される。
+- owner / ボタン: 実際の EffeTune bridge は main / fullscreen HWND があっても owner 0、ユーザー VST は
+  `Auto` のまま。非表示・表示中かつ手前・表示中かつ背面の 3 分岐、editor の popup owner chain、
+  マウス／タッチの activation と次の press、キーボードによる古い snapshot の破棄を単体で固定する。
+- 一時非表示: `crates/vst3-host/tests/gui_visibility.cpp` の compile-time テストで、理由を両順序で
+  解除して最後だけ復帰する、非表示だった窓は開かない、同じ理由の重複通知は集合として扱う、
+  owned の従来動作を固定する。Rust 側では Remote 取得〜drain 完了まで表示要求を拒否し、
+  UI 通知前の正本の取得と、Loading / attach 中に完了した最小化・Remote 区間でも open が取消されることを確認する。
+- 配送後: Rust の最終検査後〜GUI task 実行前の最小化／Remote と、その区間が既に終了した場合を
+  host の permit 判定で検査する。取消し後の復帰で未表示の窓が開かない、取消した raise で前の
+  表示希望を消さない、ACK／native close の FIFO 順序、request ID の照合と EOF／shutdown、
+  native size の通知経路が bridge のロックを取得しないことを回帰テストで固定する。
 - 共有メモリ: 同時に 2 本 `open_audio_pipe` しても名前が衝突しない。既存オブジェクトを開いた場合
   (`ERROR_ALREADY_EXISTS`) は失敗として扱う。
 
@@ -430,21 +492,39 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 共有メモリ・イベント名に process 内の atomic 連番を足す。`CreateFileMappingW` /
   `CreateEventW` で `ERROR_ALREADY_EXISTS` を失敗として扱う (bridge.rs)。
 - host の `query_state_concurrent` と `strict_state` (§5.2、§5.4)。
-- `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain`) と latency (`AutoBypass` / `ReportOnly`)。
+- `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain` / `Unowned`) と latency (`AutoBypass` / `ReportOnly`)。
   既存の bridge は既定値で従来どおり動く。
 
-## 10. サンプル版の範囲外 (配布版で決める)
+## 10. 決定済みの配布方針と残る対象外事項
 
-- release / portable / インストーラへの同梱方法、Mixwright の署名、THIRD-PARTY-NOTICES の転載、商標注記
-- マニュアル・製品ページ・privacy (Mixwright の WebView データの保存先が mIV の data_dir の外になる点)
+- 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
+- **Windows Sandbox では音響調整 (と EPUB 変換) が動かない — 対処しない (2026-10-04 利用者判断)。** Sandbox では
+  `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\EBWebView` が
+  存在しない旧版フォルダ (152.0.4191.66) を指し、実フォルダはホストと共有の 153 / 154。EdgeUpdate が無効なのでずれが直らない。
+  WebView2 の既定の探し方が 0x80070002 で失敗し、EffeTune は PENDING → TIMEOUT、EPUB は「WebView2 Runtime が見つかりません」になる。
+  EBWebView だけを直すと成功、pv だけでは失敗 (サブPCの診断ツール wv2diag による実験、記録は サブPC `C:\miv-sandbox\wv2-diag\out\`)。
+  同じ症状は [WebView2Feedback #5697](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5697) に未解決で報告されている。
+  普通の PC では更新の中断などの例外時だけで、WebView2 を使うアプリ全体が失敗し、ランタイムの修復で直る (Web 調査、一部コミュニティ回答)。
+  予備の探し方 (EdgeWebView\Application の最新版を `browserExecutableFolder` / `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` で明示) は
+  Evergreen を想定した使い方ではなく、更新通知が来なくなるため採らない。壊れた環境向けの案内表示も追加しない (利用者判断)。
+
+- v4.3.0 の同梱・署名・ライセンス通知は §10.2 に確定。商標注記の追加要否は別途確認する。
+- マニュアル・製品ページ・privacy には、Mixwright の WebView データの保存先が mIV の data_dir の
+  外になる点を記載済み。installer/readme.txt も共有データと Remote の残存フォルダを明記する。
 - フルスクリーン中の EffeTune ウィンドウの扱い・フォーカス受け渡し (detached リワークの手続きが必要)
 - 配信中の起動のリモート反映 (設定変更は第 6〜9 版の bridge 共有で配信中も反映される。配信中の
   起動は次の配信から、§12.4)
 - 作者への連絡
 
-### 10.1 ポータブル版 (利用者決定 2026-09-28)
+### 10.1 ポータブル版 (利用者決定 2026-09-28、UI方針追記 2026-10-01)
 
 - ポータブル版は **ユーザー VST も音響調整 (EffeTune) も無効のまま** (vst3-host.exe を同梱しない現状を維持)。
+- **利用者決定 2026-10-01**: portable は EffeTune のツールバーボタンとカスタマイズ候補を表示しない。
+  v4.3.0 の「重要な変更点」からも、同ボタン追加の必読告知と EffeTune 新機能の紹介を除く。
+  通常版の表示・告知は維持し、Remote 接続・音声トラック選択・長さ表示の告知は両版に残す。
+- 除外条件は `portable` build flavor とする。通常版で bundle が見つからない場合は配布／展開の
+  不具合として扱い、ボタンと「必要なファイルが見つかりません」の表示を維持する。
+  portable の保存済みツールバーレイアウトから EffeTune 項目を削除せず、表示と編集用の投影だけで除外する。
 - 理由: Mixwright は mIV の data_dir に関係なく `%APPDATA%` に書く (上流 v0.11.1 で確認:
   プリセット = `%APPDATA%\effetune\` か `%APPDATA%\Frieve\EffeTunePlugin\`、config.json も同所、
   WebView の保存領域 = CHOC `getUserDataFolder()` により `%APPDATA%\<ホスト exe 名>\`)。
@@ -452,7 +532,85 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 参考: 過去のポータブル版の誤検知の原因は未署名の vst3-host.exe そのもので、フォルダ走査 (core の
   `src/video/dsp/scanner.rs`) ではなかった。
 - Mixwright のパイプライン プリセットは DAW やデスクトップ版 EffeTune と共有される (作者の設計)。
-  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を追記する。
+  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を記載済み。
+
+### 10.2 v4.3.0 の配布同梱 (2026-10-01)
+
+- **単体exe版とインストーラ版に Mixwright v0.12.0 の bundle 全体を同梱する**。インストーラは
+  launcher をインストールする。portable は §10.1 の決定どおり bundle と VST host を同梱しない。
+- launcher の build.rs が `vendor/effetune-mixwright/` (または `MIMV_EFFETUNE_DIR` で指定した
+  staging) の VERSION と bundle を必須検証し、相対パス順に全ファイルを列挙して埋め込む。
+  v0.12.0 の bundle は 424 ファイル、32,320,639 bytes (約30.82 MiB)。bundle 外の VERSION を含む
+  入力は計425ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
+  無ければ取得・配置の復旧手順付きで build を停止する。
+- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋424ファイルの一覧とSHA-256を
+  固定し、vendor原本の欠落・追加・改変を署名前／埋め込み前に拒否する。署名stageも全非PEが一致、
+  PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
+- 起動時は `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/`
+  へ新しい世代を構築する。全ファイルのhashと一覧を検証してから、小さな `effetune/current`
+  pointerだけをatomicに更新する。公開済みtreeは使用中の読手から見えるため一切移動・削除しない。
+  旧世代のcleanupは起動経路では行わない。修復は別世代の公開でありin-placeの置換ではない。
+  正常stampの一覧・サイズ・更新時刻・作成時刻が一致するときは全量再hashもwrite lockも不要。
+  metadataを保持したままの内容改変は通常起動での検出対象外。書込不能／publisher busyなどで
+  repairできなくてもcoreは起動する。失敗理由と拒否世代を専用envからUnavailable UI／ログへ伝え、古いtreeを
+  黙って代用しない。成功時のgenerationもlauncherがenvで指定し、coreがそのpathを一度解決・固定する。
+- `build-dist.ps1` が呼ぶ `build-release.ps1 -Sign` は vendor 原本を変更せず target の staging に
+  bundle をコピーし、拡張子が
+  `.vst3` の plugin PE を含む全 PE を **launcher の埋め込み前に署名**する。
+  launcher build 時に `MIMV_EFFETUNE_DIR` を staging に向け、PE dependency gate も同じ
+  staging の bundle を明示的な検査入力にする。
+- VST hostは `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` へ展開し、
+  CRT4本は非検索subdir `vcrt/` に置く。System32の全4本が存在・版数読取可能で各DLLの
+  file versionが同梱セット以上なら全4本System32、他は全4本同梱。一度選び依存順でpreloadし、混在させない。
+  旧host／旧CRTを触らず、成功のみcacheして抽出失敗の再試行を許す。basenameは維持するので
+  WebViewの `%APPDATA%/mimageviewer-vst3-host.exe/` 保存先は変わらない。
+- SDK Windows hosting moduleはMIT原文を保持したtracked copyでUTF-8→UTF-16／wide APIを使う。
+  IPCのWindows backslash／Unicode escapeもdecodeする。pluginのANSI APIに影響する
+  activeCodePage manifestは使わない。stateはopaque IPC bytesで、hostにstate/preset path I/Oはない。
+- **R3補正 (2026-10-02、利用者決定)**: System32は4本それぞれが同梱版以上の場合だけ
+  選ぶ。1本でも古い／読取不能なら全4本同梱へ統一する。直接起動用vendor hostも必須CRTセットを
+  保持し、CMakeが公式正本を `vendor/vst3-host/vcrt/` に毎回配置する。必須条件の緩和はしない。
+- **R2簡素化 (2026-10-02、利用者決定)**: CRTはDLLごとの組み合わせを作らず一組で選ぶ。
+  publisher競合は最大60秒のOS lock待機で起動を直列化する（try_lock＋sleepループは使わない）。
+  timeout／修復失敗時は既存Loading／pending_loadに再解決とロードを統合し、新しい待機stateを追加しない。
+  準備失敗だけ音響調整ボタンを再試行可能にし、workerでcurrent pointerを再読する。整合性検査が拒否した
+  同じ世代は不可、別の公開済み世代だけを固定する。pointer不在時のdev fallbackはretryには使わない。
+  generationはcontent hash先頭12桁＋nonceに短縮するが、stampはfull manifestを比較する。最深file pathの
+  UTF-16長が260以上なら公開せず、UIにパスが長すぎる理由を示す。SDK directory checkのNotFound以外のerrorも
+  単体DLL pathへfallbackせず報告し、Win32にはnative backslash wide pathを渡す。
+  hostはCMakeで現trackedソースhash markerを埋め、署名前／core埋込前／bare cargo releaseのgateで照合する。
+  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは[バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)へ延期する。
+- 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
+  EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
+  `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
+  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
+  一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+  2026-10-03 の公開前レビュー対応で、JSZip 内の lie / immediate / setImmediate と
+  pako の zlib 由来コードの原文を `supplemental/NOTICES.txt` として第4の折り畳み通知に
+  埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
+- EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
+  アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
+
+### 10.3 同梱版更新 (2026-10-04、v4.3.0 公開前)
+
+- 利用者決定: 同梱 EffeTune は未リリースのため、v0.11.1 で保存した EffeTune 状態の
+  移行・互換処理は追加しない。旧版ソース確認・実機観測の記録は履歴として残す。
+- 承認元は Mixwright v0.12.0、release commit `6f4e2ee`、Windows x64 ZIP の SHA-256 は
+  `31df641d9da41aa36a5e5dc3e684282bd534e9e26ef9c5e6ff3b8c47c4f95408`。
+  vendor の bundle 全424ファイルが ZIP と一致。旧407ファイルから17追加、削除なし。
+- 新しい第三者成分は Rhythm Analyzer の fdlibm 5.3 (atan / atan2)。上流 DSP NOTICE に
+  Sun Microsystems の原文が追加済み。その他2通知と JSZip は旧版と同一。
+  lie / immediate / setImmediate / pako の zlib ヘッダーは今も上流通知に無いため補足を維持。
+- 日本語資料は external/effetune commit `03bffda352287f4f438d063d9660aad7864e553a` の
+  verbatim snapshot に更新。Analog Meter / Rhythm Analyzer / Tonal Balance EQ と Visualizer
+  拡張を収録し、今回表示されたコントローラーマッピングの設定入口も説明書に追加。
+  独立プレーヤー、Clean Feed、外部音声設定など VST で使えない説明は override で訂正。
+- 非起動 PE gate は plugin の x64 と VC import closure を確認。最長の相対名は104 UTF-16単位。
+  40文字のユーザー名、generation最大45文字を使う通常profile例の最深pathは252単位 (<260)。
+- 製品・plugin は起動しない。従来の v0.11.1 実機観測を v0.12.0 の実行結果として扱わない。
+  通常 launcher test は release core / remote / EPUB worker が未buildのため保留。
+  公開前に release lead が最終 full gate と release build、および実機確認を行う。
+
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
@@ -740,3 +898,80 @@ EffeTune の controller が持つ bridge) をそのまま使う**。
   これにより切り替えが素通しの一時停止 seek へ変わらず、旧表示フレームの位置へ戻らない。
 - §12.9 の旧 P5 の保持 player 再 seek テストは廃止。取得 barrier の全 viewer close テストと、
   player 破棄後も残る pump permit が返るまで Remote の最初の host 操作を待つ調停者テストで確認する。
+
+
+## 13. 2026-10-04 v4.3.0 リリース前: EffeTune 入力のピーク保護
+
+### 原因・承認済み仕様
+
+利用者の 2 台で、加工なし・音量 100% の AAC 音楽動画でも Level Meter が OVERLOAD を表示。
+デコード後 sample peak は +2.04 / +2.10 dBFS。mIV は f32 をそのまま渡し、Mixwright
+v0.11.1 の meter は `|sample| > 1.0` を検出する（true peak ではない）。ユーザーの
+Pro-L 2 を前段で有効にすると消えるため、EffeTune 入力の sample peak が原因。
+利用者承認に従い、音量を全体的に下げる pre-gain は加えず、ユーザー VST3 後・EffeTune 前に
+独立 SafetyLimiter（0 dBFS、5 ms、100 ms release、ceiling へ clamp）を追加。
+既存最終 limiter は順序・有効化条件・HUD 通知を維持する。前段の低減で HUD は点灯させない。
+
+### 所有境界・単純化・遅延
+
+- `EffetuneInputLimiter` は各 local pump / clockless processor が所有し、scratch にコピーして処理。
+  原本は `compose_samples` の fallback 用に保持。成功時だけ前段 + EffeTune latency を採用し、
+  failure / Ok(false) / 無効 / admission 不成立 / permit なしでは原本とユーザー側 latency を維持。
+- admission は従来の plugin 合計 2 秒という契約を維持。前段 5 ms は最終 limiter 同様に上限外。
+  PDC には実際の lookahead frame 数 / sample rate を足す（44.1 kHz の丸めも一致）。
+- local seek serial 更新、段の非適用、EffeTune generation 変更、最終 limiter reset に合わせて前段を reset。
+  Remote は seek serial 変更と非適用で reset、新 worker / generation は初期 state から開始。
+- 簡素化を検討: 再生中の設定反映に新しい atomic / 遅延切り替えを足す代わりに、既存の開始時
+  snapshot を採用。`effetune_pre_limiter_enabled` は player 作成 / Remote 配信受付時に取り、
+  Remote の seek・画質変更世代では維持。画面を閉じて開き直す／配信終了後の再開で反映する。
+  pause/resume・既存 player の再利用では変えない。新再生の limiter は必ず空で始まる。
+- 独立設計レビュー（GPT-6.1 Sol / xhigh）: ACCEPT、blocking finding なし。
+
+### 設定・UI・経路確認
+
+既定 ON、serde `default_true`。settings_db は残り全 field を settings_kv へ保存するため
+schema / allow-list 変更不要。runtime 所有の GUI rect と異なり preferences-owned field とし、
+`overwrite_non_preferences_from` に加えない。動画ページに音響調整節を追加し portable の描画と検索を除外。
+ラベル案: 「EffeTune に渡す前に 0dB を超える音を抑える」。説明は全体音量を下げないこと、
+可視化時の OVERLOAD、OFF と最終出力保護、閉じて開き直す／配信再開の反映時点。
+
+確認した producer / consumer:
+- `App::local_audio_dsp_chain` → 動画 builder / 音楽 builder → `audio.rs` pump（動画の音声表示モードも同じ）。
+- Remote 動画 / 音楽 → `remote_clockless_audio_processing` → shared bridge adapter → `ClocklessAudioProcessor`。
+- RemoteHeadless metadata player は音声 DSP chain を持たず、配信は clockless worker のみが処理。
+- `SharedEffeTuneProcessor` の process は上記 clockless consumer 経由のみ。
+- 終了時の `flush_silence` はゼロ入力で、メディア音声の迂回経路ではない。
+
+### 検証記録
+
+本 worktree の未コミット差分で実施（製品 exe は起動していない）:
+
+| コマンド / 対象 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/prelimiter-check.log` |
+| 同上 `--features portable` | exit 0 | `target/prelimiter-check-portable.log` |
+| `cargo test -p mimageviewer --lib effetune_pre_limiter` | 7 passed / exit 0。設定 UI→checkbox→OK→保存→再読込→local consumer / Remote admission、上限、OFF、遅延、reset | `target/prelimiter-unit.log` |
+| 同上 `video::audio::tests` | 52 passed / exit 0 | `target/prelimiter-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 33 passed、実ホスト profile 用 1 ignored / exit 0。前段 ON の AAC fallback 連続性も確認 | `target/prelimiter-clockless.log` |
+| 同上 `effetune::composition::tests` | 3 passed / exit 0 | `target/prelimiter-compose.log` |
+| 同上 `settings_db::tests` | 120 passed / exit 0 | `target/prelimiter-settings-db.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 60 passed / exit 0 | `target/prelimiter-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | `target/prelimiter-glyphs.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+
+追加した画像は `preferences_effetune_input_limit_dark.png` のみ。既存画像は変更せず、
+新規画像の日本語・行の収まりを目視確認した。AAC fixture は前段＋最終＋plugin 遅延を
+先頭 block 内に収めるため 512→1024 frames とし、既存の部分 trim 検証の意味を維持。
+独立完了レビューも ACCEPT（文書の encoding 指摘は修正して再確認済み）。
+
+`test-full.ps1` は vendor の `mimageviewer-vst3-host.exe` を起動する handler test を含むため、
+利用者の `mimageviewer*.exe` 起動禁止に従い未実施。全体 gate と実機の Level Meter / A/V sync / seek / OFF / Remote 確認は
+リリース担当の検証枠に残す。
+
+確認用 build は `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功（exit 0、
+normal feature set / dev-runtime、core 9m36s、Remote / EPUB worker も成功、VCRT PE check は runtime=4 / pe=3）。
+初回は turbojpeg-sys の並列 MSBuild が失敗したため、当該依存を単一ジョブでビルド後、
+今回の invocation のみ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を指定した。
+設定ファイル・build script は変更せず、コマンド終了時に env を元へ戻した。
+`target/dev-runtime/mimageviewer-core.exe` を利用者確認用に用意し、起動はしていない。
+この normal build は既定で実利用中の `%APPDATA%/mimageviewer` を使う。

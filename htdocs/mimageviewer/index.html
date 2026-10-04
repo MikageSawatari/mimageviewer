@@ -31,8 +31,8 @@
     "applicationCategory": "MultimediaApplication",
     "applicationSubCategory": "画像ビューア",
     "operatingSystem": "Windows 11 (64bit)",
-    "softwareVersion": "4.2.0",
-    "dateModified": "2026-09-29",
+    "softwareVersion": "4.3.0",
+    "dateModified": "2026-10-04",
     "inLanguage": "ja",
     "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。AI 処理はすべて利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
@@ -1100,6 +1100,7 @@
         <div class="icon">🔍</div>
         <h3>横断検索・絞り込み</h3>
         <p>Ctrl+F で表示中の一覧をその場で絞り込み、Ctrl+G でお気に入り全体の画像・PDF・動画を全文索引で横断検索。ファイル名・EXIF・AI プロンプト・サイドカーなどを対象に、10 万件規模でも高速に探せます。</p>
+        <p>常駐して使う場合は、終了中の変更を起動時に確認しない設定で起動を速くできます。検索結果に変更が反映されていないときは、お気に入り編集の「今すぐ確認」でまとめて確認できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">📱</div>
@@ -1155,6 +1156,7 @@
       <li><strong>EXIF 表示</strong> — カメラ・レンズ・露出・GPS 等の撮影情報をグループ別に表示</li>
       <li><strong>XMP ツイート情報表示</strong> — 埋め込まれたツイート ID・投稿者・本文・日時を表示</li>
       <li><strong>外部メタデータ (サイドカー)</strong> — 画像の隣の同名 JSON / テキストを読み取って表示</li>
+      <li><strong>動画・音声の長さ表示</strong> — サムネイルの右下で長さを確認</li>
       <li><strong>動画タイルモード</strong> — 動画全体を等間隔サムネで一覧し、クリック位置から再生</li>
       <li><strong>VST3 プラグイン対応</strong> — 動画・音楽の音声を VST3 チェーンに通して分析・加工（別プロセスで隔離）</li>
       <li><strong>ゲームパッド対応</strong> — Xbox 系パッドで一覧移動・ページ送り・フォルダ操作</li>
@@ -1188,7 +1190,8 @@
       <li><span class="label">OS</span><span>Windows 11（64bit）</span></li>
       <li><span class="label">GPU</span><span>DirectX 12 対応グラフィックカード（最新のグラフィックドライバを推奨）</span></li>
       <li><span class="label">メモリ</span><span>4GB 以上（8GB 以上推奨）</span></li>
-      <li><span class="label">ランタイム</span><span>不要（単体 exe、インストール不要）</span></li>
+      <li><span class="label">CPU</span><span>x86-64（Intel / AMD）。音響調整 (EffeTune) には AVX2 と FMA の両方への対応が必要です。</span></li>
+      <li><span class="label">ランタイム</span><span>EPUB の変換と音響調整 (EffeTune) の画面表示には Microsoft Edge WebView2 Runtime が必要です（Windows 11 に標準で含まれます）。</span></li>
     </ul>
     <p style="margin-top:0.9rem; font-size:0.82rem; color:#888; line-height:1.7;">
       ※ 動作確認は主に NVIDIA GeForce 環境で行っています。Intel / AMD など他の GPU でも動作しますが、不具合がありましたらご連絡ください。
@@ -1229,9 +1232,18 @@
       </div>
       <div class="trust-item">
         <h3>💾 設定や履歴はあなたの PC に保存</h3>
-        <p>設定・動画や音声の再生位置・選んだ音声トラック・サムネイルキャッシュ（動画の場面と音声波形の解析結果を含みます）・タグ・★評価・閲覧履歴・コレクションの名前と登録先・別バージョンを探すための索引は、PC に保存されます。リモート閲覧では端末から届いた動画の再生位置と音声トラックの選択も PC に記録されます。
+        <p>設定・動画や音声の再生位置・選んだ音声トラック・サムネイルキャッシュ（動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）・タグ・★評価・閲覧履歴・コレクションの名前と登録先・別バージョンを探すための索引は、PC に保存されます。リモート閲覧では端末から届いた動画の再生位置と音声トラックの選択も PC に記録されます。
           アンインストール時にまとめて削除できます。</p>
         <p style="margin-top:0.5rem;">EPUB を変換した PDF も通常は PC 内に保存されます。元の EPUB と同じ場所に PDF を書き出すのは、利用者が PDF ファイルへの保存・変換を選んだときだけです。</p>
+        <p style="margin-top:0.5rem;">音響調整 (EffeTune) のプリセット・設定は、mImageViewer のデータフォルダーとは別に
+          <code>%APPDATA%\effetune\</code> または <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。
+          取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に保存され、mImageViewer のデータフォルダーを変更しても保存先は変わりません。
+          EffeTune 自身の保存データは、mImageViewer のアンインストール時にも残ります。ポータブル版では音響調整を利用できません。
+          音響調整へ渡す前に大きな音のピークを抑える設定もあり、音の可視化だけでも使えます。
+          詳しくは<a href="manual/effetune.html">音響調整の説明</a>をご覧ください。</p>
+        <p style="margin-top:0.5rem;">リモート閲覧用サービスの動作記録等は、通常版では <code>%APPDATA%\mimageviewer-remote\</code> に保存され、
+          アンインストール後も残ります。ポータブル版は <code>data</code> と同じ場所の <code>data-remote</code> を使います。
+          不要になった場合は、アプリを終了してから手動で削除できます。</p>
         <p style="margin-top:0.5rem;">外部ツールへ渡すために書き出した画像は、Windows の一時フォルダー内の
           本アプリ専用の場所に置き、<strong>終了時に削除します</strong>。</p>
       </div>
@@ -1251,13 +1263,13 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v4.2.0</div>
-        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-09-29</div>
+        <div class="version">mImageViewer v4.3.0</div>
+        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-04</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
         <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラ版</a>
         <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe 版</a>
-        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v4.2.0.zip">ポータブル版（zip）</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v4.3.0.zip">ポータブル版（zip）</a>
       </div>
 
       <!-- Microsoft Store（副導線） -->
@@ -1422,6 +1434,15 @@
       <li>libjpeg-turbo（IJG / BSD-3-Clause / zlib）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には LIBJPEG-TURBO-LICENSE.txt も同梱しています。This software is based in part on the work of the Independent JPEG Group.</li>
     </ul>
 
+    <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（EffeTune / VST3 SDK）</h3>
+    <p style="font-size:0.9rem;">
+      単体exe版・インストーラ版の音響調整には EffeTune Mixwright（MIT License、
+      Copyright (c) 2025-2026 Yoshiyuki Kobayashi）を同梱しています。
+      VST3 対応には Steinberg VST3 SDK（MIT License、Steinberg Media Technologies GmbH）を使用しています。
+      EffeTune の同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate / setImmediate / pako (zlib)、CHOC、および通知に記載されたその他のライブラリ）には、それぞれのライセンスが適用されます。
+      通知全文は、アプリの「ソフトウェア情報」（バージョン情報）の EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。
+      ポータブル版は EffeTune と VST3 ホストを同梱しません。
+    </p>
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（FFmpeg / LGPL）</h3>
     <p style="font-size:0.9rem;">
       動画の再生機能は <a href="https://ffmpeg.org/">FFmpeg プロジェクト</a> のライブラリ

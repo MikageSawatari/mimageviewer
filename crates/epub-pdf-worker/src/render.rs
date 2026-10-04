@@ -81,12 +81,15 @@ pub fn print_html(items: &[&SpineItem], force_iframe: bool) -> String {
                 n
             })
             .clone();
-        let path = if force_iframe {
-            &item.path
+        let url = if force_iframe {
+            &item.url
         } else {
-            item.direct_image.as_ref().unwrap_or(&item.path)
+            item.direct_image
+                .as_ref()
+                .map(|image| &image.url)
+                .unwrap_or(&item.url)
         };
-        let src = escape(path);
+        let src = escape(url.as_str());
         let content = if force_iframe || item.direct_image.is_none() {
             format!("<iframe src=\"{src}\" scrolling=\"no\"></iframe>")
         } else {
@@ -136,15 +139,13 @@ pub fn write_fixed_html(
     Ok(name)
 }
 pub fn virtual_url(path: &str) -> String {
-    // Encode path segments for browser URLs while retaining directory separators.
-    let encoded = path
-        .split('/')
-        .map(|s| {
-            percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("https://{VIRTUAL_HOST}/{encoded}")
+    crate::package::member_url(path).to_string()
+}
+pub fn reflow_url(path: &str, item: &SpineItem) -> String {
+    let mut url = crate::package::member_url(path);
+    url.set_query(item.url.query());
+    url.set_fragment(item.url.fragment());
+    url.to_string()
 }
 fn info_text(value: &str) -> Object {
     let mut bytes = vec![0xfe, 0xff];
@@ -604,6 +605,41 @@ pub fn summarize(reports: &[crate::Report]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_sources_encode_real_names_before_html_escaping() {
+        let mut package = package_with_metadata("");
+        let item = &mut package.spine[0];
+        item.path = "OPS/a#% 日本語.xhtml".into();
+        item.url = crate::package::member_url(&item.path);
+        item.url.set_query(Some("v=1&b=2"));
+        item.url.set_fragment(Some("page"));
+        item.direct_image = Some(crate::package::MemberReference {
+            path: "images/a#% b.svg".into(),
+            url: {
+                let mut url = crate::package::member_url("images/a#% b.svg");
+                url.set_fragment(Some("view"));
+                url
+            },
+        });
+        assert!(print_html(&[item], true).contains(r#"src="https://epub.invalid/OPS/a%23%25%20%E6%97%A5%E6%9C%AC%E8%AA%9E%2Exhtml?v=1&amp;b=2#page""#));
+        assert!(
+            print_html(&[item], false)
+                .contains(r#"src="https://epub.invalid/images/a%23%25%20b%2Esvg#view""#)
+        );
+        assert_eq!(
+            virtual_url("OPS/a%20b.xhtml"),
+            "https://epub.invalid/OPS/a%2520b%2Exhtml"
+        );
+        assert_eq!(
+            reflow_url("OPS/#% _miv_reflow_0.xhtml", item),
+            "https://epub.invalid/OPS/%23%25%20%5Fmiv%5Freflow%5F0%2Exhtml?v=1&b=2#page"
+        );
+        // The report remains compatible: URLs are internal rendering metadata.
+        let report = serde_json::to_value(item).unwrap();
+        assert_eq!(report["path"], "OPS/a#% 日本語.xhtml");
+        assert_eq!(report["direct_image"], "images/a#% b.svg");
+        assert!(report.get("url").is_none());
+    }
     fn package_with_metadata(metadata: &str) -> Package {
         use std::io::{Cursor, Write};
         use zip::{ZipWriter, write::SimpleFileOptions};

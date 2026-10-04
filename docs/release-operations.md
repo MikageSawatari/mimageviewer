@@ -160,14 +160,23 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
 `build-dist.ps1` は installer と portable の生成後、DONE 表示前に
 `scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote / EPUB worker、
 installer wrapper、portable directory 配下、および埋め込み元 PDFium / DirectML ORT / FFmpeg /
-Susie / VST host を検査対象にする。各 input の SHA-256、machine、linker version、direct imports は
+Susie / VST host / EffeTune plugin PE (`.vst3` を含む) を検査対象にする。各 input の SHA-256、machine、linker version、direct imports は
 `target/vcrt-pe-reports/` の JSON に残る。
 
 Microsoft VC/Redist 由来の `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` /
 `vcruntime140_1.dll` は `vendor/vcrt/provenance.json` が正本で、全4本同一版、最低14.44、x64、
 manifest exact hash、Microsoft Authenticode Valid を必須とする。package 内コピーも canonical と
-exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。app-local CRT は Windows Update で
-更新されないため、toolchain / native dependency 更新時にこの正本と実体を一体で更新する。
+exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。
+EffeTune pluginの依存は `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` の
+processで解決する。同梱CRT4本は非検索subdir `vcrt/`。System32の全4本が存在・版数読取可能で
+各DLLのfile versionが同梱版以上なら全4本System32、他は全4本同梱を選ぶ。選択元と両版数をlogへ記録し、
+依存順に絶対pathからpreloadする。途中で混在させず、load不能なら理由を記録して停止する。
+旧host／CRTの上書きはせず、同一bytesは再抽出しない。
+直接起動テスト用にもCMakeが `vendor/vst3-host/vcrt/` へ公式CRT4本を配置する。
+`build-dist.ps1` のfull gateはrelease buildより前なので、事前にCMake buildまたは
+現ソース一致のhost＋CRTセットの復元を済ませる。exeだけを復元してfull gateへ進まない。
+両scriptのテスト前preflightはhostを起動せず、CRT4本と公式正本の完全一致を検査する。
+同梱CRTはWindows Updateで更新されないため、native dependency更新時に正本と実体を一体で更新する。
 
 `onnxruntime*.dll` も Microsoft Authenticode Valid を必須にする。既知4名以外の `msvcp*` /
 `vcruntime*` / `concrt*` import は依存 closure の再設計が必要なので fail とする。artifact の machine
@@ -207,9 +216,21 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   - 準備完了の判定はトレイ通知「SimplySign connected / Amount of cards available: 1」、
     または `certutil -scinfo` に Reader Name が出ること。
   - 毎回避けたければ `Set-Service SCardSvr -StartupType Automatic` (管理者)。
+- **R2 host identity gate (2026-10-02)**: CMakeのsourcehash markerを現CMakeLists／include／src／testsと照合する。
+  計算は `scripts/vst3-host-identity.ps1` をCMake／validatorで共有し、CRLFだけをLFへbyte正規化する。
+  他byteは保持する。core.autocrlfによるcheckout差を無視し、実ソースの変更は検知する。
+  `build-release`／`build-dist`の署名前・core埋込前・最終gateと非portable coreのbare cargo releaseでも必須。
+  `-SkipVst3Bridge`／SDK欠落時は一致するvendor hostのみ再利用できる。APPDATA等からのcopy fallbackはない。
+  一致しなければCMakeで再buildしSHA256／sizeを記録する。実host確認は承認済み手動検証へ分ける。
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
-  vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL) → core + remote + EPUB worker → launcher →
+  vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
+  EffeTune は `vendor/effetune-mixwright/` を target staging にコピーしてから全 PE を署名する
+  (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、
+  `build-release.ps1` の launcher build と dependency gate が同じ署名済み実体を使う。
+  署名前にtracked manifestの全425ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
+  PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
+  `third_party/effetune-mixwright/<version>/` と about の include_str! を一体で更新する。
 - **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
   `*.onnx` は PE でないので対象外。
 - `build-dist.ps1` は**署名を既定 ON** (`-NoSign` で回避)。実装は `scripts/sign-files.ps1`
@@ -284,7 +305,16 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   ただし VST3 ブリッジは**署名対応後も当面 portable へ非同梱**とする。再同梱は別タスクの
   ユーザー承認が必要な機能変更であり、`build-portable.ps1` / portable 文書の同時更新、署名検証、
   Chrome での実ダウンロード確認を通してから行う。単体exe / インストーラ版は埋め込みなので
-  VST3 は従来通り動く。
+  VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
+  [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
+  launcher が VERSION を記録した全 bundle (v0.12.0 は424ファイル、VERSION込み入力425ファイル) を
+  `runtime/<version>/effetune/<hash12>-<generation>/` へ全hash検証して公開し、
+  atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。
+  hash12はcontent SHA256先頭12桁でstampにはfull hashを使う。最深fileのUTF-16長260以上は理由付きで拒否する。
+  publisher busyは最大60秒待ってpointerを再確認する。coreには成功generationを渡して固定し、
+  修復失敗／timeoutは理由と拒否世代を渡して起動継続。音響調整ボタンで別公開世代を再確認できる。
+  正常時はstamp一覧・サイズ・更新時刻・作成時刻の一致を確認し、全量再hashとwrite lockを避ける。
+  メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
 - **検証**: ビルド後、**Chrome で実際に zip をダウンロード**してブロックされないことを確認する
   (VirusTotal のスコアはキャッシュラグがあるので最終確認は実 DL)。
 - **運用知見** (AV ベンダーへの誤検知申請が必要になった場合):

@@ -10209,7 +10209,10 @@ mod tests {
             .collect();
 
         let mut native_actions = directly_routed_video_actions(native_source, |name| {
-            vec![format!("matches_vk_action(KeyAction::{name},&key)")]
+            vec![
+                format!("matches_vk_action(KeyAction::{name},&key)"),
+                format!("resolved_action==Some(KeyAction::{name})"),
+            ]
         });
         let mut egui_actions = directly_routed_video_actions(egui_source, |name| {
             vec![
@@ -10218,9 +10221,12 @@ mod tests {
             ]
         });
 
-        let native_slot_route = "VIDEO_ADJUST_SLOT_ACTIONS.iter().position(|action|self.keymap.matches_vk_action(*action,&key))";
+        let native_slot_route =
+            "VIDEO_ADJUST_SLOT_ACTIONS.iter().position(|action|*action==resolved)";
         assert!(
-            native_compact.contains(native_slot_route),
+            native_compact.contains(native_slot_route)
+                && native_compact
+                    .contains("foractioninVIDEO_ADJUST_SLOT_ACTIONS{ifmatches(action)"),
             "native video adjustment-slot route changed; update this inventory test with it"
         );
         native_actions.extend(VIDEO_ADJUST_SLOT_ACTIONS);

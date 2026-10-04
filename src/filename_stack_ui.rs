@@ -124,7 +124,7 @@ pub(crate) struct StackExtractPending {
     cancel: Arc<AtomicBool>,
     source: StackGroupingSource,
     existing_keys: std::collections::HashSet<String>,
-    folder_signature: Option<u64>,
+    folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     context_id: crate::app::ViewerContextId,
     items_generation: u64,
     item_count: usize,
@@ -140,7 +140,7 @@ pub(crate) struct StackScriptPending {
     item_count: usize,
     sequence: u64,
     existing_keys: std::collections::HashSet<String>,
-    folder_signature: Option<u64>,
+    folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     retry_attempt: u8,
 }
 
@@ -223,7 +223,7 @@ enum StackRetrySource {
     GroupFresh(
         Arc<StackGroupingSource>,
         std::collections::HashSet<String>,
-        Option<u64>,
+        Option<crate::app::folder_scan::FolderScanSignature>,
     ),
     GroupReady(
         Arc<StackGroupingSource>,
@@ -232,7 +232,7 @@ enum StackRetrySource {
         Option<String>,
         Option<String>,
         std::collections::HashSet<String>,
-        Option<u64>,
+        Option<crate::app::folder_scan::FolderScanSignature>,
     ),
     SwitchReady(
         Arc<StackView>,
@@ -577,7 +577,7 @@ impl crate::app::App {
         separator: char,
         order: crate::rating_sort::ListingOrderRequest,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         script_enabled: bool,
         group_per_parent: bool,
     ) {
@@ -624,7 +624,7 @@ impl crate::app::App {
         &mut self,
         source: Arc<StackGroupingSource>,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         retry_attempt: u8,
     ) {
         self.cancel_stack_script_pending();
@@ -821,7 +821,7 @@ impl crate::app::App {
         rule: Option<String>,
         error: Option<String>,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         retry_attempt: u8,
     ) {
         self.cancel_stack_script_pending();
@@ -966,7 +966,7 @@ impl crate::app::App {
         &mut self,
         source: &StackGroupingSource,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     ) {
         // Separator, script and display-order changes re-group the same listing. Its captured
         // sort request remains valid until an explicit listing preparation replaces it.
@@ -1108,7 +1108,7 @@ impl crate::app::App {
         &mut self,
         folder: PathBuf,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         view: Arc<StackView>,
         prepared: StackPreparedItems,
         rule: Option<String>,
@@ -1605,9 +1605,9 @@ impl crate::app::App {
             self.toggle_subfolder_stack_mode();
             return;
         }
-        let Some(folder) = self.current_folder.clone() else {
+        if self.current_folder.is_none() {
             return;
-        };
+        }
         // トグル前のカーソル画像 (代表パス) を捕まえ、トグル後も同じ被写体に留まるようにする。
         let target = self.current_selected_representative_path();
         // 通常フォルダでの選択は名前ベースの select_after_load で復元する (ON 時の計算中の
@@ -1626,7 +1626,7 @@ impl crate::app::App {
         } else {
             None
         };
-        self.load_folder(folder);
+        self.reload_current_folder_preserving_override();
         // スクリプトをワーカーで計算中 (async) のときは、ここではトーストしない。完了時に
         // poll_stack_script が採用ルール / 失敗 / 非該当のトーストを出す。
         if self.stack_mode_requested && self.stack_script_pending.is_none() {

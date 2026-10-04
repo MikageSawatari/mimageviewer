@@ -13,7 +13,27 @@ use serde_json::Value;
 
 use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 
+mod bundle_location;
 pub mod composition;
+pub(crate) mod gui_gate;
+mod window;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GuiButtonAction {
+    Show,
+    Activate,
+    Hide,
+}
+
+pub(crate) fn gui_button_action(visible: bool, in_front: bool) -> GuiButtonAction {
+    if !visible {
+        GuiButtonAction::Show
+    } else if in_front {
+        GuiButtonAction::Hide
+    } else {
+        GuiButtonAction::Activate
+    }
+}
 
 const BUNDLE_NAME: &str = "EffeTune Mixwright.vst3";
 const INITIAL_CAPTURE_WAIT: Duration = Duration::from_secs(6);
@@ -22,6 +42,10 @@ const EXIT_FENCE: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnavailableReason {
     BundleMissing(String),
+    BundlePreparationFailed {
+        reason: String,
+        rejected_generation: Option<String>,
+    },
     CpuUnsupported,
     PlatformUnsupported,
 }
@@ -30,9 +54,28 @@ impl UnavailableReason {
     pub(crate) fn user_reason(&self) -> &'static str {
         match self {
             Self::BundleMissing(_) => "必要なファイルが見つかりません",
+            Self::BundlePreparationFailed { reason, .. }
+                if reason.contains(bundle_location::PATH_TOO_LONG_MARKER) =>
+            {
+                "保存先のパスが長すぎます (APPDATA のパスを短くしてください)"
+            }
+            Self::BundlePreparationFailed { .. } => {
+                "同梱ファイルを準備できません (詳しくはログを確認してください)"
+            }
             Self::CpuUnsupported => "この CPU では動作しません (AVX2/FMA が必要です)",
             Self::PlatformUnsupported => "この OS では利用できません",
         }
+    }
+
+    fn preparation_failed(reason: impl Into<String>) -> Self {
+        Self::BundlePreparationFailed {
+            reason: reason.into(),
+            rejected_generation: None,
+        }
+    }
+
+    pub(crate) fn preparation_retryable(&self) -> bool {
+        matches!(self, Self::BundlePreparationFailed { .. })
     }
 }
 
@@ -93,12 +136,23 @@ pub enum EffetuneRuntime {
     Idle,
     Loading {
         origin: LoadOrigin,
-        open_gui_when_ready: bool,
+        open_gui_when_ready: Option<ShowPermit>,
     },
     Running {
         generation: u64,
     },
     Failed(EffetuneFailure),
+}
+
+impl EffetuneRuntime {
+    fn can_start_load(&self) -> bool {
+        matches!(self, Self::Idle)
+            || matches!(self, Self::Unavailable(reason) if reason.preparation_retryable())
+    }
+
+    pub(crate) fn toolbar_available(&self) -> bool {
+        self.can_start_load() || matches!(self, Self::Running { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,7 +303,13 @@ pub struct ExitCaptureFence {
 }
 
 enum HostCommand {
+    RegisterBridge(std::sync::Weak<DspBridge>),
+    ReconcileVisibility,
     Disable(Arc<DspBridge>),
+    Show {
+        bridge: Arc<DspBridge>,
+        permit: ShowPermit,
+    },
     Gui {
         bridge: Arc<crate::video::dsp::bridge::Bridge>,
         value: Value,
@@ -571,12 +631,61 @@ pub fn resolve_bundle_from_exe(
     let parent = exe.parent().ok_or_else(|| {
         UnavailableReason::BundleMissing("executable has no parent directory".into())
     })?;
-    let bundle = parent.join("effetune").join(BUNDLE_NAME);
+    resolve_bundle_at(parent, None, None)
+}
+
+fn resolve_bundle_at(
+    parent: &Path,
+    generation: Option<&str>,
+    preparation_error: Option<&str>,
+) -> Result<PathBuf, UnavailableReason> {
+    #[cfg(not(feature = "portable"))]
+    if let Some(error) = preparation_error {
+        return Err(UnavailableReason::preparation_failed(error));
+    }
+    let container = parent.join("effetune");
+    #[cfg(not(feature = "portable"))]
+    let root = {
+        let result = if let Some(generation) = generation {
+            bundle_location::encode_pointer(generation)
+                .and_then(|_| bundle_location::checked_directory(&container))
+                .and_then(|_| {
+                    let root = container.join(generation);
+                    bundle_location::checked_directory(&root)?;
+                    Ok(root)
+                })
+        } else {
+            match std::fs::symlink_metadata(container.join(bundle_location::POINTER_FILE)) {
+                Ok(_) => bundle_location::read_generation(&container),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(container.clone()),
+                Err(error) => Err(error),
+            }
+        };
+        result.map_err(|error| UnavailableReason::preparation_failed(error.to_string()))?
+    };
+    #[cfg(feature = "portable")]
+    let root = {
+        let _ = (generation, preparation_error);
+        container
+    };
+    #[cfg(not(feature = "portable"))]
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => bundle_location::checked_directory(&root)
+            .map_err(|error| UnavailableReason::preparation_failed(error.to_string()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => {
+            return Err(UnavailableReason::preparation_failed(error.to_string()));
+        }
+    }
+    let bundle = root.join(BUNDLE_NAME);
     if !bundle.is_dir() {
         return Err(UnavailableReason::BundleMissing(
             bundle.display().to_string(),
         ));
     }
+    #[cfg(not(feature = "portable"))]
+    bundle_location::checked_directory(&bundle)
+        .map_err(|error| UnavailableReason::preparation_failed(error.to_string()))?;
     Ok(bundle)
 }
 
@@ -584,24 +693,133 @@ fn resolve_bundle() -> Result<PathBuf, UnavailableReason> {
     if !cfg!(windows) {
         return Err(UnavailableReason::PlatformUnsupported);
     }
-    let bundle = resolve_bundle_from_exe(std::env::current_exe())?;
+    let exe = std::env::current_exe()
+        .map_err(|error| UnavailableReason::BundleMissing(format!("current_exe: {error}")))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| UnavailableReason::BundleMissing("executable has no parent".into()))?;
+    let generation = std::env::var(bundle_location::GENERATION_ENV).ok();
+    let error = std::env::var(bundle_location::PREPARATION_ERROR_ENV).ok();
+    let bundle =
+        resolve_bundle_at(parent, generation.as_deref(), error.as_deref()).map_err(|mut why| {
+            if let UnavailableReason::BundlePreparationFailed {
+                rejected_generation,
+                ..
+            } = &mut why
+            {
+                *rejected_generation = std::env::var(bundle_location::REJECTED_GENERATION_ENV).ok();
+            }
+            why
+        })?;
+    check_bundle_cpu(bundle)
+}
+
+fn check_bundle_cpu(bundle: PathBuf) -> Result<PathBuf, UnavailableReason> {
     if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
         return Err(UnavailableReason::CpuUnsupported);
     }
     Ok(bundle)
 }
 
+fn resolve_bundle_for_retry(rejected: Option<&str>) -> Result<PathBuf, UnavailableReason> {
+    let exe = std::env::current_exe()
+        .map_err(|error| UnavailableReason::preparation_failed(format!("current_exe: {error}")))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| UnavailableReason::preparation_failed("executable has no parent"))?;
+    check_bundle_cpu(resolve_retry_at(parent, rejected)?)
+}
+
+fn resolve_retry_at(parent: &Path, rejected: Option<&str>) -> Result<PathBuf, UnavailableReason> {
+    // Retry must consume a new published generation, never the tree whose
+    // integrity the launcher rejected, and never the development fallback.
+    let generation = bundle_location::read_pointer(&parent.join("effetune"))
+        .map_err(|error| UnavailableReason::preparation_failed(error.to_string()))?;
+    if rejected == Some(generation.as_str()) {
+        return Err(UnavailableReason::preparation_failed(
+            "the rejected EffeTune generation has not been repaired yet",
+        ));
+    }
+    resolve_bundle_at(parent, Some(&generation), None)
+}
+fn remote_playback_snapshot(
+    source: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
+) -> (bool, Option<u64>) {
+    let handle = source.lock().unwrap().clone();
+    handle.map_or((false, None), |handle| {
+        let snapshot = handle.snapshot();
+        (
+            snapshot.phase.blocks_local_control(),
+            Some(snapshot.acquisition_sequence),
+        )
+    })
+}
+
+fn remote_playback_active(
+    source: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
+) -> bool {
+    remote_playback_snapshot(source).0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShowPermit {
+    minimize_sequence: u64,
+    remote_acquisition: Option<u64>,
+}
+
+impl ShowPermit {
+    fn allows(self, current: Self, remote: bool, minimized: bool) -> bool {
+        self == current && !remote && !minimized
+    }
+}
+
+fn show_permit(
+    window: &window::MainWindowObserver,
+    remote: &Mutex<Option<crate::remote_ipc::session::SessionHandle>>,
+) -> ShowPermit {
+    ShowPermit {
+        minimize_sequence: window.minimize_sequence(),
+        remote_acquisition: remote_playback_snapshot(remote).1,
+    }
+}
+
 struct LoadDone {
     bridge: Arc<DspBridge>,
 }
 
+enum LoadCompletion {
+    Loaded {
+        bundle: PathBuf,
+        result: Result<Option<LoadDone>, EffetuneFailure>,
+    },
+    Unavailable(UnavailableReason),
+    Failed(EffetuneFailure),
+}
+
+fn complete_load(
+    bundle: Result<PathBuf, UnavailableReason>,
+    load: impl FnOnce(&Path) -> Result<Option<LoadDone>, EffetuneFailure>,
+) -> LoadCompletion {
+    match bundle {
+        Ok(bundle) => {
+            let result = load(&bundle);
+            LoadCompletion::Loaded { bundle, result }
+        }
+        Err(reason) => LoadCompletion::Unavailable(reason),
+    }
+}
+
 pub struct EffetuneController {
+    main_window: Arc<window::MainWindowObserver>,
+    remote_session: Arc<Mutex<Option<crate::remote_ipc::session::SessionHandle>>>,
+    // Edge notification only. Worker presentation reads the canonical handle.
+    remote_session_notified: bool,
     pub runtime: EffetuneRuntime,
     pub slot: Arc<EffetuneAudioSlot>,
     bridge: Option<Arc<DspBridge>>,
     bundle_path: Option<PathBuf>,
     captures: Arc<CaptureQueue>,
-    pending_load: Option<mpsc::Receiver<Result<Option<LoadDone>, EffetuneFailure>>>,
+    pending_load: Option<mpsc::Receiver<LoadCompletion>>,
     next_audio_generation: u64,
     pending_capture: Option<mpsc::Receiver<Result<Vec<u8>, CaptureError>>>,
     failure_rx: mpsc::Receiver<EffetuneFailure>,
@@ -628,16 +846,55 @@ impl EffetuneController {
         let (gui_failure_tx, gui_failure_rx) = mpsc::channel();
         let (host_tx, host_rx) = mpsc::channel::<HostCommand>();
         let repaint_context = Arc::new(Mutex::new(None));
+        let remote_session = Arc::new(Mutex::new(None));
+        let main_window = Arc::new(window::MainWindowObserver::new(host_tx.clone()));
+        let host_main_window = Arc::downgrade(&main_window);
+        let host_remote_session = Arc::downgrade(&remote_session);
         let host_repaint = Arc::clone(&repaint_context);
         let host_failure_tx = failure_tx.clone();
         std::thread::Builder::new()
             .name("effetune-host-control".into())
             .spawn(move || {
+                let mut presentation_bridge = std::sync::Weak::<DspBridge>::new();
                 while let Ok(command) = host_rx.recv() {
                     match command {
-                        HostCommand::Disable(bridge) => bridge.disable(),
+                        HostCommand::RegisterBridge(bridge) => presentation_bridge = bridge,
+                        HostCommand::ReconcileVisibility => {
+                            if let Some(bridge) = presentation_bridge.upgrade() { bridge.sync_main_window_visibility(); }
+                        }
+                        HostCommand::Disable(bridge) => { presentation_bridge = std::sync::Weak::new(); bridge.disable(); },
+                        HostCommand::Show { bridge, permit } => {
+                            let Some(host_main_window) = host_main_window.upgrade() else { continue; };
+                            let Some(host_remote_session) = host_remote_session.upgrade() else { continue; };
+                            let result = (|| {
+                                if !permit.allows(show_permit(&host_main_window, &host_remote_session), remote_playback_active(&host_remote_session), bridge.main_window_is_minimized()) { return Ok(()); }
+                                bridge.attach_slot_gui_hidden(0)?;
+                                let remote = remote_playback_active(&host_remote_session);
+                                bridge.set_slot_gui_remote_session_checked(0, remote)?;
+                                // An editor attached while Remote acquired control remains hidden.
+                                // It was never visible, so release must not open it later.
+                                if permit.allows(show_permit(&host_main_window, &host_remote_session), remote, bridge.main_window_is_minimized()) {
+                                    bridge.show_slot_gui_checked(0, permit.minimize_sequence, gui_gate::GuiGate::remote_token(permit.remote_acquisition))?;
+                                }
+                                Ok::<_, String>(())
+                            })();
+                            if let Err(error) = result {
+                                let _ = host_failure_tx.send(EffetuneFailure::GuiFailed(error));
+                            }
+                            wake_ui(&host_repaint);
+                        }
                         HostCommand::Gui { bridge, value } => {
-                            if let Err(error) = bridge.send_value(&value) {
+                            let result = (|| {
+                                if matches!(value["cmd"].as_str(), Some("sync_gui_main_visibility" | "activate_gui")) {
+                                    bridge.send_value(&serde_json::json!({
+                                        "cmd": "set_gui_remote_session",
+                                        "slot_id": value["slot_id"],
+                                        "active": u32::from(host_remote_session.upgrade().is_some_and(|source| remote_playback_active(&source))),
+                                    }))?;
+                                }
+                                bridge.send_value(&value)
+                            })();
+                            if let Err(error) = result {
                                 let _ = host_failure_tx.send(EffetuneFailure::GuiFailed(format!(
                                     "GUI command failed: {error}"
                                 )));
@@ -657,6 +914,9 @@ impl EffetuneController {
             Err(reason) => EffetuneRuntime::Unavailable(reason.clone()),
         };
         Self {
+            main_window,
+            remote_session,
+            remote_session_notified: false,
             runtime,
             slot: Arc::new(EffetuneAudioSlot {
                 current: Mutex::new(None),
@@ -682,6 +942,61 @@ impl EffetuneController {
         }
     }
 
+    pub fn set_main_hwnd(&self, hwnd: u64) {
+        self.main_window.install(hwnd);
+    }
+
+    pub(crate) fn set_remote_session_source(
+        &self,
+        handle: Option<crate::remote_ipc::session::SessionHandle>,
+    ) {
+        let mut source = self.remote_session.lock().unwrap();
+        if let Some(previous) = source.take() {
+            previous.set_gui_gate(None);
+        }
+        if let Some(handle) = &handle {
+            if let Ok(gate) = self.main_window.gate() {
+                handle.set_gui_gate(Some(gate));
+            }
+        }
+        *source = handle;
+    }
+
+    pub fn set_remote_session(&mut self, active: bool) {
+        if std::mem::replace(&mut self.remote_session_notified, active) == active {
+            return;
+        }
+        if active
+            && let EffetuneRuntime::Loading {
+                open_gui_when_ready,
+                ..
+            } = &mut self.runtime
+        {
+            *open_gui_when_ready = None;
+        }
+        let _ = self.host_tx.send(HostCommand::ReconcileVisibility);
+    }
+
+    pub fn request_show_gui(&self) {
+        self.request_show_gui_with_permit(show_permit(&self.main_window, &self.remote_session));
+    }
+
+    pub fn request_show_gui_with_permit(&self, permit: ShowPermit) {
+        if remote_playback_active(&self.remote_session) {
+            return;
+        }
+        if let Some(bridge) = self.bridge.as_ref() {
+            let _ = self.host_tx.send(HostCommand::Show {
+                bridge: Arc::clone(bridge),
+                permit,
+            });
+        }
+    }
+
+    pub fn click_foreground(&self, pointer_click: bool) -> u64 {
+        self.main_window.click_foreground(pointer_click)
+    }
+
     pub fn set_repaint_context(&self, ctx: &egui::Context) {
         let mut context = self.repaint_context.lock().unwrap();
         if context.is_none() {
@@ -694,9 +1009,7 @@ impl EffetuneController {
     }
 
     pub fn click_idle(&mut self, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) {
-        if self.runtime == EffetuneRuntime::Idle {
-            self.start_load(LoadOrigin::UserButton, true, pos, size);
-        }
+        self.start_load(LoadOrigin::UserButton, true, pos, size);
     }
 
     fn start_load(
@@ -706,15 +1019,27 @@ impl EffetuneController {
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
     ) {
-        if !matches!(self.runtime, EffetuneRuntime::Idle) {
+        if !self.runtime.can_start_load() || self.pending_load.is_some() {
             return;
         }
-        let Some(bundle) = self.bundle_path.clone() else {
-            return;
+        let retry = match &self.runtime {
+            EffetuneRuntime::Idle => None,
+            EffetuneRuntime::Unavailable(reason) if reason.preparation_retryable() => {
+                Some(reason.clone())
+            }
+            _ => return,
         };
+        if let Err(error) = self.main_window.gate() {
+            self.fail(EffetuneFailure::GuiFailed(format!(
+                "presentation gate: {error}"
+            )));
+            return;
+        }
+        let bundle = self.bundle_path.clone();
         self.runtime = EffetuneRuntime::Loading {
             origin,
-            open_gui_when_ready,
+            open_gui_when_ready: open_gui_when_ready
+                .then(|| show_permit(&self.main_window, &self.remote_session)),
         };
         let captures = Arc::clone(&self.captures);
         let gui_failure_tx = self.gui_failure_tx.clone();
@@ -728,17 +1053,50 @@ impl EffetuneController {
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
-                let result = load_worker(
-                    &bundle,
-                    &path,
-                    &captures,
-                    origin,
-                    pos,
-                    size,
-                    gui_failure_tx,
-                    host_tx,
-                    repaint_context.clone(),
-                );
+                let bundle = if let Some(original) = retry {
+                    let UnavailableReason::BundlePreparationFailed {
+                        ref rejected_generation,
+                        ..
+                    } = original
+                    else {
+                        unreachable!()
+                    };
+                    match resolve_bundle_for_retry(rejected_generation.as_deref()) {
+                        Ok(path) => Ok(path),
+                        Err(error)
+                            if matches!(
+                                error,
+                                UnavailableReason::CpuUnsupported
+                                    | UnavailableReason::PlatformUnsupported
+                            ) =>
+                        {
+                            Err(error)
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "[EffeTune] preparation retry unavailable: {error:?}"
+                            ));
+                            Err(original)
+                        }
+                    }
+                } else {
+                    bundle.ok_or_else(|| {
+                        UnavailableReason::BundleMissing("resolved bundle path missing".into())
+                    })
+                };
+                let result = complete_load(bundle, |bundle| {
+                    load_worker(
+                        bundle,
+                        &path,
+                        &captures,
+                        origin,
+                        pos,
+                        size,
+                        gui_failure_tx,
+                        host_tx,
+                        repaint_context.clone(),
+                    )
+                });
                 let _ = tx.send(result);
                 wake_ui(&repaint_context);
             });
@@ -768,7 +1126,14 @@ impl EffetuneController {
     pub(crate) fn set_test_startup_completion(&mut self, result: Result<(), EffetuneFailure>) {
         let (tx, rx) = mpsc::channel();
         self.pending_load = Some(rx);
-        tx.send(result.map(|()| None)).unwrap();
+        tx.send(match result {
+            Ok(()) => LoadCompletion::Loaded {
+                bundle: self.bundle_path.clone().unwrap_or_default(),
+                result: Ok(None),
+            },
+            Err(error) => LoadCompletion::Failed(error),
+        })
+        .unwrap();
     }
 
     pub fn poll(&mut self) -> bool {
@@ -800,19 +1165,27 @@ impl EffetuneController {
         if let Some(rx) = self.pending_load.as_ref() {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
-                Err(mpsc::TryRecvError::Disconnected) => Some(Err(EffetuneFailure::LoadFailed(
-                    "load worker disconnected".into(),
-                ))),
+                Err(mpsc::TryRecvError::Disconnected) => Some(LoadCompletion::Failed(
+                    EffetuneFailure::LoadFailed("load worker disconnected".into()),
+                )),
                 Err(mpsc::TryRecvError::Empty) => None,
             };
             if let Some(result) = result {
                 self.pending_load = None;
                 match result {
-                    Ok(Some(done)) => {
-                        self.publish_running(done.bridge);
+                    LoadCompletion::Loaded { bundle, result } => {
+                        self.bundle_path = Some(bundle);
+                        match result {
+                            Ok(Some(done)) => self.publish_running(done.bridge),
+                            Ok(None) => self.runtime = EffetuneRuntime::Idle,
+                            Err(error) => self.fail(error),
+                        }
                     }
-                    Ok(None) => self.runtime = EffetuneRuntime::Idle,
-                    Err(error) => self.fail(error),
+                    LoadCompletion::Unavailable(reason) => {
+                        crate::logger::log(format!("[EffeTune] unavailable: {reason:?}"));
+                        self.runtime = EffetuneRuntime::Unavailable(reason);
+                    }
+                    LoadCompletion::Failed(error) => self.fail(error),
                 }
                 return true;
             }
@@ -877,6 +1250,12 @@ impl EffetuneController {
     }
 
     fn publish_running(&mut self, bridge: Arc<DspBridge>) {
+        if let Ok(gate) = self.main_window.gate() {
+            bridge.set_gui_gate(gate);
+        }
+        let _ = self
+            .host_tx
+            .send(HostCommand::RegisterBridge(Arc::downgrade(&bridge)));
         #[cfg(windows)]
         {
             let weak = Arc::downgrade(&bridge);
@@ -958,6 +1337,15 @@ impl EffetuneController {
     }
 }
 
+pub(crate) fn new_bridge() -> Arc<DspBridge> {
+    DspBridge::new_with_gui_chrome(
+        GuiOwnerPolicy::Unowned,
+        LatencyPolicy::ReportOnly,
+        true,
+        false,
+    )
+}
+
 fn load_worker(
     bundle: &Path,
     path: &Path,
@@ -982,12 +1370,7 @@ fn load_worker(
             "saved state is empty".into(),
         ));
     }
-    let bridge = DspBridge::new_with_gui_chrome(
-        GuiOwnerPolicy::FixedMain,
-        LatencyPolicy::ReportOnly,
-        true,
-        false,
-    );
+    let bridge = new_bridge();
     bridge.set_gui_failure_sink(gui_failure_tx.clone());
     let gui_repaint = Arc::clone(&repaint_context);
     bridge.set_gui_result_wake(Arc::new(move || wake_ui(&gui_repaint)));
@@ -1065,11 +1448,147 @@ fn startup_state_requires_load(saved: Option<&[u8]>) -> bool {
 mod tests {
     use super::*;
 
-    // Fixture shape: Frieve-A/effetune-mixwright v0.11.1,
-    // src/bridge/state_codec.cpp, StateCodec::encode. Confirmed against bytes
-    // returned by the bundled v0.11.1 plug-in through the real host handler.
+    #[test]
+    fn gui_button_decides_hidden_front_and_behind() {
+        assert_eq!(gui_button_action(false, false), GuiButtonAction::Show);
+        assert_eq!(gui_button_action(false, true), GuiButtonAction::Show);
+        assert_eq!(gui_button_action(true, true), GuiButtonAction::Hide);
+        assert_eq!(gui_button_action(true, false), GuiButtonAction::Activate);
+    }
+
+    #[test]
+    fn pending_show_is_revoked_by_current_or_completed_suppression() {
+        let permit = ShowPermit {
+            minimize_sequence: 1,
+            remote_acquisition: Some(2),
+        };
+        assert!(permit.allows(permit, false, false));
+        assert!(!permit.allows(permit, true, false));
+        assert!(!permit.allows(permit, false, true));
+        // A complete hide/restore interval during attach still revokes this open.
+        assert!(!permit.allows(
+            ShowPermit {
+                minimize_sequence: 2,
+                ..permit
+            },
+            false,
+            false
+        ));
+        assert!(!permit.allows(
+            ShowPermit {
+                remote_acquisition: Some(3),
+                ..permit
+            },
+            false,
+            false
+        ));
+        assert!(!permit.allows(
+            ShowPermit {
+                remote_acquisition: None,
+                ..permit
+            },
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn remote_acquisition_cancels_pending_open_and_blocks_show() {
+        let mut controller = EffetuneController::new();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        controller.set_remote_session_source(Some(handle.clone()));
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        let (tx, rx) = mpsc::channel();
+        controller.host_tx = tx;
+        controller.bridge = Some(DspBridge::new());
+        controller.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::UserButton,
+            open_gui_when_ready: Some(show_permit(
+                &controller.main_window,
+                &controller.remote_session,
+            )),
+        };
+        controller.set_remote_session(true);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::ReconcileVisibility)
+        ));
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Loading {
+                open_gui_when_ready: None,
+                ..
+            }
+        ));
+        controller.request_show_gui();
+        assert!(rx.try_recv().is_err());
+        let generation = handle.snapshot().generation;
+        assert!(handle.abort_acquire_barrier(generation));
+        controller.request_show_gui();
+        assert!(rx.try_recv().is_err()); // Drain still holds playback.
+        assert!(handle.complete_app_drain(generation));
+        controller.set_remote_session(false);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::ReconcileVisibility)
+        ));
+        // Release itself never requests a previously hidden editor to open.
+        assert!(rx.try_recv().is_err());
+        controller.request_show_gui();
+        assert!(matches!(rx.try_recv(), Ok(HostCommand::Show { .. })));
+    }
+
+    #[test]
+    fn worker_remote_reader_observes_acquisition_before_ui_notification() {
+        let mut controller = EffetuneController::new();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        controller.set_remote_session_source(Some(handle.clone()));
+        assert!(!remote_playback_active(&controller.remote_session));
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert!(!controller.remote_session_notified);
+        assert!(remote_playback_active(&controller.remote_session));
+        let gate = controller.main_window.gate().unwrap();
+        assert_eq!(gate.remote() & 1, 1);
+        let issued = gui_gate::GuiGate::remote_token(Some(0));
+        let generation = handle.snapshot().generation;
+        assert!(handle.abort_acquire_barrier(generation));
+        assert!(handle.complete_app_drain(generation));
+        // The GUI task sees the completed acquisition despite no UI notification.
+        assert_ne!(gate.remote(), issued);
+        assert_eq!(gate.remote() & 1, 0);
+        controller.set_remote_session_source(None);
+        assert_eq!(gate.remote(), 0);
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "old-detached-source".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert_eq!(gate.remote(), 0); // Old source cannot publish into a later binding.
+        assert!(!remote_playback_active(&controller.remote_session));
+        // A detached source cannot keep suppression latched on another session.
+        controller.set_remote_session(false);
+    }
+
+    // Fixture shape: Frieve-A/effetune-mixwright v0.12.0,
+    // src/bridge/state_codec.cpp, StateCodec::encode. The formatVersion=1
+    // shape was observed with v0.11.1; appVersion is informational to mIV.
+    // No v0.12.0 product/plugin launch is claimed by this fixture.
     fn fixture(a: &str, b: &str, current: &str, bypass: bool) -> Vec<u8> {
-        format!(r#"{{"appVersion":"0.11.1","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
+        format!(r#"{{"appVersion":"0.12.0","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
     }
 
     #[test]
@@ -1120,6 +1639,140 @@ mod tests {
     }
 
     #[test]
+    fn bundle_resolution_requires_bundle_beside_the_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("mimageviewer-core.exe");
+        assert!(matches!(
+            resolve_bundle_from_exe(Ok(exe.clone())),
+            Err(UnavailableReason::BundleMissing(_))
+        ));
+        let bundle = temp.path().join("effetune").join(BUNDLE_NAME);
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(resolve_bundle_from_exe(Ok(exe)).unwrap(), bundle);
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn bundle_resolution_pins_the_verified_generation_and_surfaces_preparation_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path();
+        let container = parent.join("effetune");
+        let first = format!("{}-Abc123", "a".repeat(bundle_location::FINGERPRINT_LENGTH));
+        let second = format!("{}-Def456", "b".repeat(bundle_location::FINGERPRINT_LENGTH));
+        for name in [&first, &second] {
+            std::fs::create_dir_all(container.join(name).join(BUNDLE_NAME)).unwrap();
+        }
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            bundle_location::encode_pointer(&first).unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_bundle_at(parent, Some(&first), None).unwrap();
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            bundle_location::encode_pointer(&second).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_bundle_at(parent, Some(&first), None).unwrap(),
+            resolved
+        );
+        assert_eq!(
+            resolve_bundle_at(parent, None, None).unwrap(),
+            container.join(&second).join(BUNDLE_NAME)
+        );
+        let failure =
+            resolve_bundle_at(parent, Some(&first), Some("publish: access denied")).unwrap_err();
+        assert!(
+            matches!(failure, UnavailableReason::BundlePreparationFailed { ref reason, .. } if reason.contains("access denied"))
+        );
+        assert!(failure.user_reason().contains("準備できません"));
+        // Corrupt pointers must not silently select the old legacy tree.
+        std::fs::create_dir_all(container.join(BUNDLE_NAME)).unwrap();
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            "effetune-v2\n../outside\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_bundle_at(parent, None, None),
+            Err(UnavailableReason::BundlePreparationFailed { .. })
+        ));
+        assert!(resolve_bundle_at(parent, Some("../outside"), None).is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn preparation_retry_rejects_old_generation_and_consumes_a_later_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path();
+        let container = parent.join("effetune");
+        std::fs::create_dir_all(container.join(BUNDLE_NAME)).unwrap();
+        assert!(resolve_retry_at(parent, None).is_err()); // No legacy fallback.
+        let first = format!("{}-Abc123", "a".repeat(bundle_location::FINGERPRINT_LENGTH));
+        let second = format!("{}-Def456", "b".repeat(bundle_location::FINGERPRINT_LENGTH));
+        for generation in [&first, &second] {
+            std::fs::create_dir_all(container.join(generation).join(BUNDLE_NAME)).unwrap();
+        }
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            bundle_location::encode_pointer(&first).unwrap(),
+        )
+        .unwrap();
+        assert!(resolve_retry_at(parent, Some(&first)).is_err());
+        let original = UnavailableReason::BundlePreparationFailed {
+            reason: "publisher timeout".into(),
+            rejected_generation: Some(first.clone()),
+        };
+        assert!(original.preparation_retryable());
+        assert!(EffetuneRuntime::Unavailable(original.clone()).can_start_load());
+        assert!(!EffetuneRuntime::Unavailable(UnavailableReason::CpuUnsupported).can_start_load());
+        let mut controller = EffetuneController::new();
+        let (tx, rx) = mpsc::channel();
+        controller.pending_load = Some(rx);
+        controller.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::UserButton,
+            open_gui_when_ready: None,
+        };
+        tx.send(complete_load(Err(original.clone()), |_| {
+            panic!("unavailable preparation must never invoke the host loader")
+        }))
+        .unwrap();
+        assert!(controller.poll());
+        assert_eq!(controller.runtime, EffetuneRuntime::Unavailable(original));
+        assert!(controller.bundle_path().is_none());
+        std::fs::write(
+            container.join(bundle_location::POINTER_FILE),
+            bundle_location::encode_pointer(&second).unwrap(),
+        )
+        .unwrap();
+        let published = container.join(&second).join(BUNDLE_NAME);
+        let (tx, rx) = mpsc::channel();
+        controller.pending_load = Some(rx);
+        controller.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        tx.send(complete_load(
+            resolve_retry_at(parent, Some(&first)),
+            |path| {
+                assert_eq!(path, published);
+                Ok(None) // An inert startup state, without constructing a VST host.
+            },
+        ))
+        .unwrap();
+        assert!(controller.poll());
+        assert_eq!(controller.runtime, EffetuneRuntime::Idle);
+        assert_eq!(controller.bundle_path(), Some(published.as_path()));
+        assert!(!controller.startup_pending());
+        let long = UnavailableReason::preparation_failed(format!(
+            "{}: fixture",
+            bundle_location::PATH_TOO_LONG_MARKER
+        ));
+        assert!(long.user_reason().contains("パスが長すぎます"));
+    }
+
+    #[test]
     fn startup_state_load_rule_and_controller_failure_transitions() {
         assert!(!startup_state_requires_load(None));
         assert!(!startup_state_requires_load(Some(&fixture(
@@ -1144,7 +1797,7 @@ mod tests {
             let mut controller = EffetuneController::new();
             controller.runtime = EffetuneRuntime::Loading {
                 origin: LoadOrigin::Startup,
-                open_gui_when_ready: false,
+                open_gui_when_ready: None,
             };
             controller.publish_running(DspBridge::new());
             assert!(controller.slot.snapshot().is_some());
@@ -1260,6 +1913,10 @@ mod tests {
             EffetuneRuntime::Failed(EffetuneFailure::GuiFailed("fixture attach error".into()))
         );
         assert!(controller.slot.snapshot().is_none());
+        assert!(matches!(
+            host_rx.try_recv(),
+            Ok(HostCommand::RegisterBridge(_))
+        ));
         assert!(matches!(host_rx.try_recv(), Ok(HostCommand::Disable(_))));
     }
 

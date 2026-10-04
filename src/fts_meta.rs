@@ -46,6 +46,235 @@ use crate::search_index_db::normalize_path;
 pub const INDEX_VERSION: i64 = 10;
 
 const TANTIVY_REBUILD_PENDING_KEY: &str = "tantivy_rebuild_pending";
+#[derive(Clone, Debug)]
+pub struct RangeFileStamp {
+    pub path: String,
+    pub favorite_id: String,
+    pub favorite_root: String,
+    pub mtime: i64,
+    pub file_size: i64,
+    pub status: i64,
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn range_query_never_fetches_excluded_rows_and_includes_other_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        for path in ["c:/a/x.jpg", "c:/a/inner/y.jpg", "c:/ab/z.jpg"] {
+            db.upsert_meta_ok(path, id, Path::new("c:/a"), IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let scope = crate::metadata_ownership::OwnedRange {
+            root: "c:/a".into(),
+            exclusions: vec!["c:/a/inner".into()],
+        };
+        let rows = db.list_range_files(&scope).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].favorite_id, id.to_string());
+        assert_eq!(
+            db.list_paths_outside_range(id, Some(&scope)).unwrap().len(),
+            2
+        );
+    }
+    #[test]
+    fn requested_rebuild_recreates_files_on_next_open_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db");
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        db.upsert_meta_ok(
+            "c:/x.jpg",
+            Uuid::new_v4(),
+            Path::new("c:/"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.request_item_index_rebuild().unwrap();
+        assert!(db.get("c:/x.jpg").unwrap().is_some());
+        drop(db);
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        assert!(db.rebuilt_on_open());
+        assert!(db.tantivy_rebuild_pending().unwrap());
+        assert!(db.get("c:/x.jpg").unwrap().is_none());
+    }
+    #[test]
+    fn cleanup_index_is_covering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT path FROM files WHERE favorite_id = ?1 AND NOT(path >= ?2 AND path < ?3)",params!["id","c:/a/","c:/a0"],|r| r.get(3)).unwrap();
+        assert!(plan.contains("COVERING INDEX idx_files_fav_path"), "{plan}");
+    }
+
+    #[test]
+    fn startup_owner_query_is_covered_without_reading_favorite_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        db.upsert_meta_ok("c:/a/x.jpg", id, Path::new("c:/a"), IndexKind::Image, 1, 1)
+            .unwrap();
+        assert_eq!(
+            db.list_path_owners().unwrap(),
+            vec![("c:/a/x.jpg".into(), id.to_string())]
+        );
+        let conn = db.conn.lock().unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT path, favorite_id FROM files",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("COVERING INDEX idx_files_fav_path"), "{plan}");
+    }
+
+    #[test]
+    fn path_range_cleanup_removes_root_and_descendants_without_prefix_neighbor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let id = Uuid::new_v4();
+        for path in [
+            "c:/a/books",
+            "c:/a/books/x.jpg",
+            "c:/a/bookshelf/y.jpg",
+            "c:/a/z.jpg",
+        ] {
+            db.upsert_meta_ok(path, id, Path::new("c:/a"), IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: "c:/a/books".into(),
+            exclusions: Vec::new(),
+        }
+        .sql_ranges();
+        assert_eq!(db.delete_path_ranges(&ranges).unwrap(), 2);
+        assert!(db.get("c:/a/bookshelf/y.jpg").unwrap().is_some());
+        assert!(db.get("c:/a/z.jpg").unwrap().is_some());
+    }
+
+    #[test]
+    fn configuration_delete_invalidates_old_and_repair_roots_atomically_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db");
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        let id = Uuid::new_v4();
+        for root in ["c:/old", "c:/current", "c:/other"] {
+            db.mark_scanned_once(root, "complete").unwrap();
+        }
+        db.upsert_meta_ok(
+            "c:/current/a.jpg",
+            id,
+            Path::new("C:/Old/"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let paths = vec!["c:/current/a.jpg".to_owned()];
+        let roots = vec!["c:/current".to_owned()];
+        assert!(
+            db.delete_paths_and_invalidate_scans(&paths, &roots)
+                .is_err()
+        );
+        assert!(db.get(&paths[0]).unwrap().is_some());
+        for root in ["c:/old", "c:/current", "c:/other"] {
+            assert!(db.scanned_once(root).unwrap().is_some(), "rollback: {root}");
+        }
+        conn.execute_batch("DROP TRIGGER fail_delete").unwrap();
+        assert_eq!(
+            db.delete_paths_and_invalidate_scans(&paths, &roots)
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.scanned_once("c:/old").unwrap(), None);
+        assert_eq!(db.scanned_once("c:/current").unwrap(), None);
+        assert!(db.scanned_once("c:/other").unwrap().is_some());
+
+        db.mark_scanned_once("c:/current", "complete").unwrap();
+        db.upsert_meta_ok(
+            &paths[0],
+            id,
+            Path::new("c:/current"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.delete_paths(&paths).unwrap();
+        db.delete_paths_and_invalidate_scans(&[], &roots).unwrap();
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: "c:/current".into(),
+            exclusions: vec![],
+        }
+        .sql_ranges();
+        assert_eq!(
+            db.delete_path_ranges_and_invalidate_scans(&ranges, &roots)
+                .unwrap(),
+            0
+        );
+        assert!(
+            db.scanned_once("c:/current").unwrap().is_some(),
+            "watcher and unchanged tidy preserve markers"
+        );
+    }
+
+    #[test]
+    fn favorite_purge_invalidates_known_root_even_without_sqlite_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        db.mark_scanned_once("c:/old", "complete").unwrap();
+        assert_eq!(
+            db.delete_all_for_favorite_and_invalidate_scans(Uuid::new_v4(), &["c:/old".into()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.scanned_once("c:/old").unwrap(), None);
+    }
+
+    #[test]
+    fn configuration_range_delete_preserves_unrelated_and_noop_scope_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let roots = vec!["c:/a".to_owned(), "c:/b".to_owned(), "c:/c".to_owned()];
+        for root in &roots {
+            db.mark_scanned_once(root, "complete").unwrap();
+        }
+        db.upsert_meta_ok(
+            "c:/b/new-exclusion/x.jpg",
+            Uuid::new_v4(),
+            Path::new("c:/b"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        let ranges = ["c:/b/new-exclusion", "c:/c/new-exclusion"]
+            .into_iter()
+            .flat_map(|root| {
+                crate::metadata_ownership::OwnedRange {
+                    root: root.into(),
+                    exclusions: vec![],
+                }
+                .sql_ranges()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            db.delete_path_ranges_and_invalidate_scans(&ranges, &roots)
+                .unwrap(),
+            1
+        );
+        assert!(db.scanned_once("c:/a").unwrap().is_some());
+        assert_eq!(db.scanned_once("c:/b").unwrap(), None);
+        assert!(db.scanned_once("c:/c").unwrap().is_some());
+    }
+}
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
@@ -152,7 +381,16 @@ impl FtsMetaDb {
         // v9→v10 は SQLite 列構造ではなく Tantivy 本文の意味変更なので、files が空でも
         // wipe が必要。既知の旧 version は行の MIN に依存せず semantic rebuild とする。
         let version_requires_rebuild = user_version > 0 && user_version < INDEX_VERSION;
-        let rebuild_needed = if user_version == INDEX_VERSION {
+        init_index_state_schema(&conn)?;
+        init_scanned_once_schema(&conn)?;
+        let requested_rebuild: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM index_state WHERE key = ?1 AND value != 0)",
+            params![TANTIVY_REBUILD_PENDING_KEY],
+            |r| r.get(0),
+        )?;
+        let rebuild_needed = if requested_rebuild {
+            true
+        } else if user_version == INDEX_VERSION {
             false
         } else {
             version_requires_rebuild || needs_rebuild(&conn)?
@@ -179,6 +417,7 @@ impl FtsMetaDb {
         init_schema(&tx)?;
         init_index_state_schema(&tx)?;
         if rebuild_needed || force_tantivy_rebuild {
+            tx.execute("DELETE FROM scanned_once", [])?;
             tx.execute(
                 "INSERT INTO index_state(key, value) VALUES (?1, 1)
                  ON CONFLICT(key) DO UPDATE SET value = 1",
@@ -225,6 +464,77 @@ impl FtsMetaDb {
             )
             .optional()?;
         Ok(value.is_some_and(|value| value != 0))
+    }
+
+    /// Next startup recreates both stores through the existing rebuild-pending path.
+    pub fn request_item_index_rebuild(&self) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM scanned_once", [])?;
+        tx.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
+        tx.commit()
+    }
+
+    /// root 単位の完全走査の印。root は metadata_ownership::root_key で正規化する。
+    pub(crate) fn scanned_once(&self, root: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM scanned_once WHERE root = ?1",
+                [root],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// 別指紋の Full は旧索引を書き換える前に完走印を失効させる。
+    /// 同一指紋の Full の取消・失敗は、以前の完走印を保持する。
+    pub(crate) fn prepare_full_scan(&self, root: &str, fingerprint: &str) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scanned_once WHERE root = ?1 AND fingerprint <> ?2",
+            params![root, fingerprint],
+        )?;
+        tx.commit()
+    }
+
+    pub(crate) fn mark_scanned_once(&self, root: &str, fingerprint: &str) -> rusqlite::Result<()> {
+        // rebuild pending と印の採用を同じ DB lock で判定し、再構築要求を追い越さない。
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO scanned_once(root, fingerprint) SELECT ?1, ?2
+             WHERE NOT EXISTS(SELECT 1 FROM index_state WHERE key = ?3 AND value != 0)
+             ON CONFLICT(root) DO UPDATE SET fingerprint = excluded.fingerprint",
+            params![root, fingerprint, TANTIVY_REBUILD_PENDING_KEY],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_scanned_once_for_root(&self, root: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM scanned_once WHERE root = ?1", [root])?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_scanned_once(&self) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM scanned_once", [])?;
+        Ok(())
+    }
+
+    /// Tantivy が再作成された起動では、古い stamp を stable と判定させない。
+    /// 新しい全文ストアと対応する inventory・完走印を同じ transaction で空にする。
+    pub(crate) fn reset_inventory_for_recreated_tantivy(&self) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM files", [])?;
+        tx.execute("DELETE FROM scanned_once", [])?;
+        tx.commit()
     }
 
     /// Cross-store owner (`open_stores_with_rebuild_sync`) だけが、旧 directory の wipe と
@@ -346,25 +656,227 @@ impl FtsMetaDb {
     /// お気に入り配下の全行を物理削除する (favorite の「メタ」チェックを OFF にした時)。
     /// 返り値は削除した行数。Tantivy 側の delete は呼び出し側の責務。
     pub fn delete_all_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn.execute(
+        self.delete_all_for_favorite_and_invalidate_scans(favorite_id, &[])
+    }
+
+    pub(crate) fn delete_all_for_favorite_and_invalidate_scans(
+        &self,
+        favorite_id: Uuid,
+        affected_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        invalidate_scan_roots_for_rows(
+            &tx,
+            "SELECT DISTINCT favorite_root FROM files WHERE favorite_id = ?1",
+            [favorite_id.to_string()],
+            affected_roots,
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM files WHERE favorite_id = ?1",
             params![favorite_id.to_string()],
         )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Read only the owned intervals; descendants excluded by SQL are never materialized.
+    pub fn list_range_files(
+        &self,
+        scope: &crate::metadata_ownership::OwnedRange,
+    ) -> rusqlite::Result<Vec<RangeFileStamp>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root, mtime, file_size, status FROM files WHERE path >= ?1 AND path < ?2")?;
+        let mut out = Vec::new();
+        for range in scope.sql_ranges() {
+            let rows = stmt.query_map(params![range.start, range.end], |r| {
+                Ok(RangeFileStamp {
+                    path: r.get(0)?,
+                    favorite_id: r.get(1)?,
+                    favorite_root: r.get(2)?,
+                    mtime: r.get(3)?,
+                    file_size: r.get(4)?,
+                    status: r.get(5)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_paths_outside_range(
+        &self,
+        id: Uuid,
+        scope: Option<&crate::metadata_ownership::OwnedRange>,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from("SELECT path FROM files WHERE favorite_id = ?1");
+        let mut values = vec![id.to_string()];
+        if let Some(scope) = scope {
+            for r in scope.sql_ranges() {
+                let pos = values.len() + 1;
+                sql.push_str(&format!(
+                    " AND NOT (path >= ?{pos} AND path < ?{})",
+                    pos + 1
+                ));
+                values.extend([r.start, r.end]);
+            }
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(values), |r| r.get(0))?
+            .collect()
+    }
+
+    /// Startup includes orphan/invalid UUIDs, not just IDs still present in settings.
+    /// The callback borrows SQLite's current row and runs under the connection mutex;
+    /// it must not re-enter this DB. Only callers that retain a row need to allocate strings.
+    pub(crate) fn for_each_path_owner(
+        &self,
+        mut visit: impl FnMut(&str, &str),
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        // EXPLAIN は idx_files_fav_path の COVERING INDEX scan (下の回帰テストで固定)。
+        let mut stmt = conn.prepare("SELECT path, favorite_id FROM files")?;
+        let mut rows = stmt.query([])?;
+        let mut visited = 0;
+        while let Some(row) = rows.next()? {
+            let path = row.get_ref(0)?.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let id = row.get_ref(1)?.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            visit(path, id);
+            visited += 1;
+        }
+        Ok(visited)
+    }
+
+    /// Test-only collection; startup retains only the paths that need deletion.
+    #[cfg(test)]
+    pub fn list_path_owners(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        self.for_each_path_owner(|path, id| out.push((path.to_owned(), id.to_owned())))?;
+        Ok(out)
+    }
+
+    /// Tantivy の範囲削除・commit・reload 成功後に、同じ半開区間の行を消す。
+    pub fn delete_path_ranges(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+    ) -> rusqlite::Result<usize> {
+        self.delete_path_ranges_inner(ranges, None)
+    }
+
+    pub(crate) fn delete_path_ranges_and_invalidate_scans(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+        affected_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        self.delete_path_ranges_inner(ranges, Some(affected_roots))
+    }
+
+    fn delete_path_ranges_inner(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+        affected_roots: Option<&[String]>,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted = 0;
+        for range in ranges {
+            if let Some(roots) = affected_roots {
+                let has_rows: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE path >= ?1 AND path < ?2)",
+                    params![range.start, range.end],
+                    |row| row.get(0),
+                )?;
+                if has_rows {
+                    let roots = roots
+                        .iter()
+                        .filter(|root| {
+                            crate::metadata_ownership::OwnedRange {
+                                root: (*root).clone(),
+                                exclusions: vec![],
+                            }
+                            .sql_ranges()
+                            .iter()
+                            .any(|scope| scope.start < range.end && range.start < scope.end)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    invalidate_scan_roots_for_rows(
+                        &tx,
+                        "SELECT DISTINCT favorite_root FROM files WHERE path >= ?1 AND path < ?2",
+                        params![range.start, range.end],
+                        &roots,
+                    )?;
+                }
+            }
+            deleted += tx.execute(
+                "DELETE FROM files WHERE path >= ?1 AND path < ?2",
+                params![range.start, range.end],
+            )?;
+        }
+        tx.commit()?;
         Ok(deleted)
     }
 
     /// 指定 path 群の行を物理削除する。Tantivy 側 delete 完了後の cleanup として呼ぶ。
     pub fn delete_paths(&self, paths: &[String]) -> rusqlite::Result<usize> {
+        self.delete_paths_inner(paths, None)
+    }
+
+    /// 構成変更・起動補修だけが使う。通常の watcher 削除は完走印を保持する。
+    pub(crate) fn delete_paths_and_invalidate_scans(
+        &self,
+        paths: &[String],
+        affected_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        self.delete_paths_inner(paths, Some(affected_roots))
+    }
+
+    fn delete_paths_inner(
+        &self,
+        paths: &[String],
+        affected_roots: Option<&[String]>,
+    ) -> rusqlite::Result<usize> {
         if paths.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().unwrap();
-        let placeholders = sql_in_placeholders(paths.len());
-        let sql = format!("DELETE FROM files WHERE path IN ({placeholders})");
-        let params_vec: Vec<&dyn rusqlite::ToSql> =
-            paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let deleted = conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted = 0;
+        for chunk in paths.chunks(500) {
+            if let Some(roots) = affected_roots {
+                let sql = format!(
+                    "SELECT DISTINCT favorite_root FROM files WHERE path IN ({})",
+                    sql_in_placeholders(chunk.len())
+                );
+                invalidate_scan_roots_for_rows(
+                    &tx,
+                    &sql,
+                    rusqlite::params_from_iter(chunk),
+                    roots,
+                )?;
+            }
+            let sql = format!(
+                "DELETE FROM files WHERE path IN ({})",
+                sql_in_placeholders(chunk.len())
+            );
+            deleted += tx.execute(&sql, rusqlite::params_from_iter(chunk))?;
+        }
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -421,10 +933,8 @@ impl FtsMetaDb {
         favorite_id: Uuid,
     ) -> rusqlite::Result<Vec<(String, FileStatus)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT path, status FROM files \
-             WHERE favorite_id = ?1 AND status != 0",
-        )?;
+        // 集合版と同じく、favorite 側の全行検索より Failed の部分索引を使う。
+        let mut stmt = conn.prepare(NOT_OK_PATHS_FOR_FAVORITE_SQL)?;
         let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -439,12 +949,12 @@ impl FtsMetaDb {
     /// 起動時 reconciliation 用の最適化版: 指定お気に入り集合内で status != Ok の
     /// (path, favorite_id, status) を 1 クエリで返す。
     ///
-    /// `list_not_ok_paths` をお気に入りごとにループすると `idx_files_fav_kind`
-    /// が選ばれて status フィルタが post-filter 化し、お気に入り配下の **全行**
-    /// (mIV では 65 万行で実測 1.1 秒) を読む羽目になる。これは部分インデックス
-    /// `idx_files_status` (status != 0 の行だけを保持) を使えば 17ms で済む。
-    /// `favorite_id IN (...)` で SQLite が自動的に部分インデックスを優先するため、
-    /// 1 クエリにまとめて呼ぶ形にする。
+    /// favorite 側の索引が選ばれると status フィルタが post-filter 化し、配下の全行を読む。
+    /// 以前の単一版では `idx_files_fav_kind` が選ばれ、65 万行で実測 1.1 秒だった。
+    /// 部分インデックス `idx_files_status` (status != 0 の行だけを保持) なら同測定で 17ms。
+    /// 1 クエリにまとめ、`+favorite_id IN (...)` の単項 + で favorite 側の索引候補を外す。
+    /// `idx_files_fav_path` 追加後も全 favorite 行の検索へ戻らず、Failed の部分索引を使う。
+    /// ID は TEXT の UUID として bind するので、単項 + による affinity 除去で比較は変わらない。
     ///
     /// `favorite_ids` が空なら空配列を返す (status != 0 行が他お気に入りに残って
     /// いても、auto_index_metadata=true でない限り触らない既存の reconciliation 規約に従う)。
@@ -456,11 +966,7 @@ impl FtsMetaDb {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders = sql_in_placeholders(favorite_ids.len());
-        let sql = format!(
-            "SELECT path, favorite_id, status FROM files \
-             WHERE status != 0 AND favorite_id IN ({placeholders})"
-        );
+        let sql = not_ok_paths_for_favorites_sql(favorite_ids.len());
         let mut stmt = conn.prepare(&sql)?;
         let params_vec: Vec<String> = favorite_ids.iter().map(|id| id.to_string()).collect();
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
@@ -592,6 +1098,17 @@ const FILEMETA_SELECT_SQL_BY_PATH: &str = concat!(
     " FROM files WHERE path = ?1"
 );
 
+const NOT_OK_PATHS_FOR_FAVORITE_SQL: &str =
+    "SELECT path, status FROM files WHERE +favorite_id = ?1 AND status != 0";
+
+fn not_ok_paths_for_favorites_sql(favorite_count: usize) -> String {
+    format!(
+        "SELECT path, favorite_id, status FROM files \
+         WHERE status != 0 AND +favorite_id IN ({})",
+        sql_in_placeholders(favorite_count),
+    )
+}
+
 fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let uuid_str: String = row.get(1)?;
     let favorite_id = Uuid::parse_str(&uuid_str).map_err(|e| {
@@ -687,6 +1204,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             status            INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_files_fav       ON files(favorite_id);
+         CREATE INDEX IF NOT EXISTS idx_files_fav_path ON files(favorite_id, path);
          CREATE INDEX IF NOT EXISTS idx_files_fav_mtime ON files(favorite_id, mtime);
          CREATE INDEX IF NOT EXISTS idx_files_fav_kind  ON files(favorite_id, kind);
          CREATE INDEX IF NOT EXISTS idx_files_status    ON files(status) WHERE status != 0;",
@@ -702,6 +1220,36 @@ fn init_index_state_schema(conn: &Connection) -> rusqlite::Result<()> {
          );",
     )?;
     Ok(())
+}
+
+/// 旧行の保存 root と現在の補修先を、行の変更と同じ transaction で失効させる。
+fn invalidate_scan_roots_for_rows(
+    conn: &Connection,
+    select: &str,
+    values: impl rusqlite::Params,
+    affected_roots: &[String],
+) -> rusqlite::Result<()> {
+    let roots = conn
+        .prepare(select)?
+        .query_map(values, |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for root in roots
+        .iter()
+        .map(|root| crate::metadata_ownership::root_key(Path::new(root)))
+        .chain(affected_roots.iter().cloned())
+    {
+        conn.execute("DELETE FROM scanned_once WHERE root = ?1", [root])?;
+    }
+    Ok(())
+}
+
+fn init_scanned_once_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scanned_once (
+        root TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL
+    );",
+    )
 }
 
 /// `IN (?1,?2,…?N)` 用の placeholder 文字列を生成する。
@@ -761,6 +1309,84 @@ mod tests {
         let id = Uuid::new_v4();
         assert!(db.list_favorite_files(id).unwrap().is_empty());
         assert!(db.list_not_ok().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scanned_once_legacy_open_preserves_released_rows_without_a_marker() {
+        let (tmp, db) = tmp_db();
+        let id = Uuid::new_v4();
+        db.upsert_meta_ok(
+            "c:/images/a.jpg",
+            id,
+            Path::new("c:/images"),
+            IndexKind::Image,
+            1,
+            2,
+        )
+        .unwrap();
+        drop(db);
+        let conn = Connection::open(tmp.path().join("fts_meta.db")).unwrap();
+        conn.execute_batch("DROP TABLE scanned_once").unwrap();
+        drop(conn);
+        let reopened = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+        assert!(!reopened.rebuilt_on_open());
+        assert!(reopened.get("c:/images/a.jpg").unwrap().is_some());
+        assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
+        reopened
+            .mark_scanned_once("c:/images", "fingerprint")
+            .unwrap();
+        assert_eq!(
+            reopened.scanned_once("c:/images").unwrap().as_deref(),
+            Some("fingerprint")
+        );
+    }
+
+    #[test]
+    fn scanned_once_rebuild_clears_immediately_and_blocks_late_complete() {
+        let (tmp, db) = tmp_db();
+        db.mark_scanned_once("c:/images", "fingerprint").unwrap();
+        db.request_item_index_rebuild().unwrap();
+        assert_eq!(db.scanned_once("c:/images").unwrap(), None);
+        db.mark_scanned_once("c:/images", "late complete").unwrap();
+        assert_eq!(db.scanned_once("c:/images").unwrap(), None);
+        drop(db);
+        let reopened = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+        assert!(reopened.rebuilt_on_open());
+        assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
+    }
+
+    #[test]
+    fn scanned_once_forced_store_recreation_clears_same_open() {
+        let (tmp, db) = tmp_db();
+        db.mark_scanned_once("c:/images", "fingerprint").unwrap();
+        drop(db);
+        let reopened = FtsMetaDb::open_at_with_tantivy_rebuild_requirement(
+            &tmp.path().join("fts_meta.db"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
+        assert!(reopened.tantivy_rebuild_pending().unwrap());
+    }
+
+    #[test]
+    fn full_scan_preparation_invalidates_only_other_fingerprints_in_this_root() {
+        let (_tmp, db) = tmp_db();
+        db.mark_scanned_once("c:/images", "original").unwrap();
+        db.mark_scanned_once("c:/other", "original").unwrap();
+        db.prepare_full_scan("c:/images", "original").unwrap();
+        assert_eq!(
+            db.scanned_once("c:/images").unwrap().as_deref(),
+            Some("original")
+        );
+        db.prepare_full_scan("c:/missing", "changed").unwrap();
+        assert_eq!(db.scanned_once("c:/missing").unwrap(), None);
+        db.prepare_full_scan("c:/images", "changed").unwrap();
+        assert_eq!(db.scanned_once("c:/images").unwrap(), None);
+        assert_eq!(
+            db.scanned_once("c:/other").unwrap().as_deref(),
+            Some("original")
+        );
     }
 
     /// 新規 DB 作成後に `PRAGMA user_version` が `INDEX_VERSION` と一致すること。
@@ -999,6 +1625,115 @@ mod tests {
 
         let paths: Vec<_> = rows.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(!paths.contains(&"c:/a/1.jpg"));
+    }
+
+    fn assert_not_ok_uses_status_index(favorite_count: usize, single: bool) {
+        // 新規 DB と既存 DB への追加では、競合する索引の作成順が異なる。
+        for appended in [false, true] {
+            for analyzed in [false, true] {
+                let (_tmp, db) = tmp_db();
+                let conn = db.conn.lock().unwrap();
+                conn.execute(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000)
+                     INSERT INTO files(path,favorite_id,favorite_root,kind,mtime,file_size,indexed_at,index_version,index_generation,status)
+                     SELECT 'c:/x/'||i||'.jpg',?1,'c:/x',0,1,1,1,?2,1,CASE WHEN i%100=0 THEN 2 ELSE 0 END FROM n",
+                    params![Uuid::from_u128(1).to_string(), INDEX_VERSION],
+                ).unwrap();
+                if appended {
+                    conn.execute_batch("DROP INDEX idx_files_fav_path; CREATE INDEX idx_files_fav_path ON files(favorite_id,path)").unwrap();
+                }
+                if analyzed {
+                    conn.execute_batch("ANALYZE").unwrap();
+                }
+                let sql = if single {
+                    NOT_OK_PATHS_FOR_FAVORITE_SQL.to_owned()
+                } else {
+                    not_ok_paths_for_favorites_sql(favorite_count)
+                };
+                let values: Vec<_> = (1..=favorite_count)
+                    .map(|i| Uuid::from_u128(i as u128).to_string())
+                    .collect();
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                let plan = stmt
+                    .query_map(rusqlite::params_from_iter(&values), |r| {
+                        r.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("; ");
+                assert!(
+                    plan.contains("USING INDEX idx_files_status"),
+                    "appended={appended}, analyzed={analyzed}: {plan}"
+                );
+                assert!(!plan.contains("idx_files_fav_path"), "{plan}");
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_files_fav_path'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_not_ok_paths_for_favorites_uses_partial_status_index_with_fav_path_index() {
+        for count in [1, 2, 12] {
+            assert_not_ok_uses_status_index(count, false);
+        }
+    }
+
+    #[test]
+    fn list_not_ok_paths_uses_partial_status_index_with_fav_path_index() {
+        assert_not_ok_uses_status_index(1, true);
+    }
+
+    #[test]
+    fn streaming_path_owners_reports_invalid_text_without_changing_rows() {
+        let (_tmp, db) = tmp_db();
+        let id = Uuid::new_v4();
+        db.upsert_meta_ok(
+            "c:/x/valid.jpg",
+            id,
+            Path::new("c:/x"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.upsert_meta_ok(
+            "c:/x/invalid.jpg",
+            id,
+            Path::new("c:/x"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE files SET favorite_id=x'ff' WHERE path='c:/x/invalid.jpg'",
+                [],
+            )
+            .unwrap();
+        let mut visited = 0;
+        assert!(db.for_each_path_owner(|_, _| visited += 1).is_err());
+        assert_eq!(visited, 1);
+        assert!(db.get("c:/x/valid.jpg").unwrap().is_some());
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

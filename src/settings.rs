@@ -1725,6 +1725,24 @@ pub enum ToolbarSectionId {
 }
 
 impl ToolbarSectionId {
+    /// 配布形態で提供されるセクション。実行時のファイル欠落では表示を隠さない。
+    pub fn available_in_build(self) -> bool {
+        match self {
+            Self::EffeTune => !cfg!(feature = "portable"),
+            Self::Unknown => false,
+            _ => true,
+        }
+    }
+
+    /// 保存順は保持したまま、現在の配布形態の描画対象だけを取り出す。
+    /// 非対応セクションの改行・セパレータ・ドラッグ領域も生成しない。
+    pub fn render_order(saved: &[Self]) -> Vec<Self> {
+        Self::ordered_with_fallback(saved)
+            .into_iter()
+            .filter(|id| id.available_in_build())
+            .collect()
+    }
+
     /// 既定の並び順 (= v1.x までのハードコード順)。これを崩すと既存ユーザーの
     /// 見た目が変わるので、`toolbar_section_order` 未設定時は必ずこの順を使う。
     pub fn default_order() -> &'static [Self] {
@@ -4415,6 +4433,9 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+    /// サムネイル右下に動画・音声の長さを表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_media_duration: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -5266,6 +5287,11 @@ pub struct Settings {
     #[serde(default)]
     pub minimize_to_tray_on_close: bool,
 
+    /// 完全走査済みの索引は起動時に終了中の変更を確認しない。起動時だけ採用する。
+    /// 終了中の変更は「今すぐ確認」で反映する。旧設定の欠落キーは false。
+    #[serde(default)]
+    pub skip_offline_change_scan: bool,
+
     /// タスクトレイに常駐している間 (= ウィンドウ非表示中) にバックグラウンドインデクサ
     /// (初回スキャン + notify-rs 経由の ingest) を一時停止する。ウィンドウを開き直すと
     /// 自動的に再開し、溜まっていた notify-rs イベントを順次処理する。
@@ -5578,6 +5604,9 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+    /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。再生開始時に取得する。
+    #[serde(default = "default_true")]
+    pub effetune_pre_limiter_enabled: bool,
     /// EffeTune GUI の最後の位置と外枠サイズ。
     #[serde(default)]
     pub effetune_gui_pos: Option<(i32, i32)>,
@@ -7209,6 +7238,7 @@ impl Default for Settings {
             gpu_memory_percent: default_gpu_memory_percent(),
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
+            thumb_show_media_duration: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -7419,6 +7449,7 @@ impl Default for Settings {
             susie_enabled: true,
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
+            skip_offline_change_scan: false,
             pause_indexer_while_minimized: false,
             write_rating_to_xmp: false,
             update_check_enabled: true,
@@ -7491,6 +7522,7 @@ impl Default for Settings {
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
+            effetune_pre_limiter_enabled: true,
             effetune_gui_pos: None,
             effetune_gui_size: None,
             vst3_video_compact: false,
@@ -10029,6 +10061,46 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_media_duration);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.thumb_show_media_duration);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_media_duration":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_media_duration);
+    }
+
+    #[test]
+    fn thumb_show_media_duration_missing_db_key_defaults_on_and_false_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_media_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert!(loaded.thumb_show_media_duration);
+        loaded.thumb_show_media_duration = false;
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let reopened = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            !reopened
+                .load_into_settings()
+                .unwrap()
+                .thumb_show_media_duration
+        );
+    }
+
     use super::*;
 
     fn released_image_ext_priority() -> Vec<String> {
@@ -11171,6 +11243,33 @@ mod tests {
     }
 
     // -- Toolbar section order (v2.0.0 Phase 1) --
+
+    #[test]
+    fn toolbar_section_render_order_matches_build_flavor_without_changing_saved_order() {
+        use ToolbarSectionId as TS;
+        // 通常版の設定持込み、重複、将来の既定順にも同じ表示制約を適用する。
+        let saved: Vec<TS> =
+            serde_json::from_str(r#"["Tags","EffeTune","Cols","EffeTune","Unknown"]"#).unwrap();
+        let original = saved.clone();
+        for order in [&saved[..], &[][..], TS::default_order()] {
+            let all = TS::ordered_with_fallback(order);
+            let rendered = TS::render_order(order);
+            assert_eq!(
+                rendered.contains(&TS::EffeTune),
+                !cfg!(feature = "portable")
+            );
+            let expected = all
+                .iter()
+                .copied()
+                .filter(|id| *id != TS::EffeTune || !cfg!(feature = "portable"))
+                .collect::<Vec<_>>();
+            assert_eq!(rendered, expected);
+            assert!(!rendered.contains(&TS::Unknown));
+            assert!(all.contains(&TS::EffeTune));
+        }
+        assert_eq!(saved, original);
+        assert_eq!(serde_json::to_value(TS::EffeTune).unwrap(), "EffeTune");
+    }
 
     #[test]
     fn toolbar_section_order_empty_is_default() {

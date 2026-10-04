@@ -836,7 +836,7 @@ pub(in crate::app) struct ViewerContextBundle {
     metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
-    current_folder_signature: Option<u64>,
+    current_folder_signature: Option<folder_scan::FolderScanSignature>,
     folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
     converted_archive_pin_root_states:
@@ -905,7 +905,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
-    raw_pages: RawPageStore,
+    raw_pages: Box<RawPageStore>,
     fs_pending: ItemsGenerationMap<FsPendingValue>,
     fullscreen_pdf_promotion: FullscreenPdfPromotionState,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
@@ -1860,7 +1860,7 @@ impl ViewerContextBundle {
             ),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
-            raw_pages: RawPageStore::new(),
+            raw_pages: Box::new(RawPageStore::new()),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
@@ -4184,6 +4184,16 @@ impl App {
             BuildOutcome::Commit
         })
         .expect("test window viewer context build must commit")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_window_context_for_test<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_viewer_context(id, f)
+            .expect("test window viewer context must mount")
     }
     pub(in crate::app) fn push_window_context_for_test(
         &mut self,

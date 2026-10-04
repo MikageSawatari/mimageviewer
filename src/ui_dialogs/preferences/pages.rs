@@ -1618,6 +1618,12 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
     );
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut settings.thumb_show_media_duration,
+        "動画・音声の長さをサムネイルに表示する",
+    );
+    ui.small("右下に分:秒、1 時間以上は時:分:秒で表示します。フィルタ一致数や他の表示と重なる場合は上へ移し、収まらない場合は表示しません。");
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -7350,13 +7356,28 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
-/// v0.8.0: 自動インデクサの速度プロファイル設定ページ。
+/// 検索インデックスの起動時確認と速度プロファイル設定ページ。
 ///
 /// `IndexerSpeedProfile` は `GlobalIoSemaphore` の permit 数を決める。
 /// 値の変更は **次回起動時に反映** される (ランタイム差し替えは `sync_with_favorites`
 /// でも反映されないので現状は再起動が必要)。
 pub(super) fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::IndexerSpeedProfile;
+    anchored(ui, state, "indexer/offline-change-scan", |ui, state| {
+        crate::ui_helpers::draw_offline_change_scan_setting(
+            ui,
+            &mut state.settings.skip_offline_change_scan,
+        );
+        ui.label(
+            egui::RichText::new("[今すぐ確認] は「お気に入り > 編集」にあります。")
+                .weak()
+                .size(11.0),
+        );
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
     anchored(ui, state, "indexer/speed", |ui, state| {
         let s = &mut state.settings;
 
@@ -7412,8 +7433,9 @@ pub(super) fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesStat
             "アプリを閉じる代わりに、タスクトレイに常駐する",
         )
         .on_hover_text(
-            "OFF (既定): [×] でプロセス終了。次回起動時にインデックスが再スキャンされます。\n\
-         ON: [×] でウィンドウを隠してタスクトレイに常駐。notify-rs でファイル変更を\n\
+            "OFF (既定): [×] でアプリ終了。終了中の変更を次回起動時に確認するかは\n\
+         「ライブラリ > 検索インデックス」で選べます。\n\
+         ON: [×] でウィンドウを隠してタスクトレイに常駐。ファイル変更を\n\
          追い続けるため、次回開いたときは最新のインデックスがそのまま使えます。\n\
          終了はタスクトレイアイコンを右クリックして「終了」を選んでください。",
         );
@@ -7866,6 +7888,14 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
     }
 
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-input-limit", |ui, state| {
+        draw_effetune_input_limit_settings(ui, &mut state.settings);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+    });
+
     anchored(ui, state, "video/normalize-cache", |ui, state| {
         draw_audio_normalize_cache_controls(ui, state);
     });
@@ -7987,6 +8017,24 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
             }
         }
     });
+}
+
+pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    {
+        ui.label(egui::RichText::new("音響調整 (EffeTune)").strong());
+        ui.checkbox(
+            &mut settings.effetune_pre_limiter_enabled,
+            "EffeTune に渡す前に 0dB を超える音を抑える",
+        )
+        .on_hover_text(
+            "音量を全体的に下げず、0dB を超えるピークを抑えます。音の可視化だけでも OVERLOAD が出るのを防ぎます。\n\
+             EffeTune 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
+             変更後は動画・音声の画面を閉じて開き直してください。リモート配信は終了してから始め直してください。",
+        );
+    }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
 }
 
 fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {

@@ -410,6 +410,14 @@ overlay / layout まで同期し、「バー非固定 + ストリップ固定」
 points を運ぶ。高さと5段階値の正本は overlay が持ち (`NativeBarLockState` で届く)、帯の矩形・
 セル寸法・波形ラスタの要求・左右パネルの hover band も同じ `VideoSeekGeometry` / `SeekStripLayout`
 から解決する ([video-seek-strip-plan.md](video-seek-strip-plan.md) の「全体表示と高さ」)。
+下部 HUD のストリップボタンのメニューは表示・高さに加えて、シーク位置プレビューの大きさを
+独立した 5 段階から選べる。高さとプレビューの各段階は保存済みの px 値を表示し、プレビュー選択は
+`SetSeekPreviewSize` を `SetSeekStripHeight` と同じ source 世代・strip session 照合経路で App へ返す。
+App は設定を保存し、`NativeBarLockState` で現在の presenter へ新しいプレビュー値を送る。
+§1.277 の実機確認追補では、静止画の popup も動画と同じ表示行 → 高さ / プレビューの 2 列・5 行に揃えた。
+両メニューの段階表記、見出し、行寸法は `src/seek_strip_menu.rs` が所有する。狭い画面では
+共通の短縮表記を使い、非常に低い画面だけスクロールする。静止画の egui ScrollArea は
+floating scrollbar の幅を予約し、右列の文字と操作面への重なりを防ぐ。native の描画・入力経路は維持する。
 要求高さが viewport に収まらない場合は下部 controls、固定上部、strip、残余の固定 gap の順に
 実効量を解き、hover で同時表示される上部 54pt と下部バーの間に strip を収める。正の領域では
 notice と範囲文字も実寸に合わせて連続的に縮小・省略し、strip 本体の clip 内へ収める。0 領域では
@@ -1181,7 +1189,7 @@ routing と applied を確定する。構築失敗・seek 失敗では旧 routin
 音声 lane 喪失として扱う。setup 構築時間は `audio/audio_setup_build` perf event に記録する。
 `AudioFrame.stream_index` は実際に decode した setup の stream index で、S3 の Norm gain 表に渡す。
 選択を次の seek まで保留するのは engine の published state が Eof、または切り替え先の既知の stream 範囲で音声を準備できない場合。`audio_track_available_at` は start 前と `position + AUDIO_TRACK_READY_MARGIN_SECS > end` を利用不可とし、UI の選択と demux の seek 取り出しで共用する。demux は音声を採用し始める位置 (通常 seek は target、frame-step seek は `FrameStep.base_secs` = audio trim 下限) で判定する。範囲外の選択は seek を出さず、demux で範囲外になった選択は旧 routing で通常 seek を続ける。`AudioTrackSelection.deferred_gen` は判定した generation と現在の desired が一致する場合だけ記録し、同じ generation の試行開始で解除する。表示は確定・失敗・保留・切り替え中の順に snapshot から導出する。`AudioTrackInfo` の範囲は stream の start_time/duration を優先し、MKV の stream `DURATION` タグは start_time が 0 または無い場合だけ end とする。
-demux が末尾を先読みして `clock.is_eof_reached()` を立てても、範囲内なら選択は即時 seek する。再生中・一時停止中とも、未表示の進行中 seek target (coalesce 中の pending を優先) があればそれを基準とし、無ければ表示済みフレームの PTS を使う。demux seek 失敗・frame-step 出力失敗・相対 seek の端判定・EOF 固着保険で中断した target は退役させる。音声出力が先に override を正常解除した target は映像表示まで保持する。frame-step pause は常に表示 PTS、映像が無ければ現在位置を使う。
+demux が末尾を先読みして `clock.is_demux_exhausted()` を立てても、範囲内なら選択は即時 seek する。再生中・一時停止中とも、未表示の進行中 seek target (coalesce 中の pending を優先) があればそれを基準とし、無ければ表示済みフレームの PTS を使う。demux seek 失敗・frame-step 出力失敗・相対 seek の端判定・EOF 固着保険で中断した target は退役させる。音声出力が先に override を正常解除した target は映像表示まで保持する。frame-step pause は常に表示 PTS、映像が無ければ現在位置を使う。
 異なる audio time base の検証には `multi-timebase.mp4` の 3 AAC stream を使い、実 pump と `fill_output` で出力消費時の PTS と A/V clock を測る。
 frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
 video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は
@@ -1215,27 +1223,27 @@ native HUD は `clock.is_seeking()` と `current_seek_serial()` を既存 state 
   Shift+← (1 秒) が全く動かなくなる、という二択になってしまう (どちらも 2026-05 報告)。
   絶対位置判定なら粒度に依存せず「先頭から 1 秒以内なら先頭扱い」で済む。
 
-加えて `seek_relative` は境界を検出したとき、**`is_eof_reached()` の場合に限り**
+加えて `seek_relative` は境界を検出したとき、**`is_demux_exhausted()` の場合に限り**
 pending な user seek と `seek_target_override` を
 `clear_seek_target_override(current_seek_serial())` で明示クリアする。直前の相対シークが
 末尾付近を target にして既に「シーク中...」固着状態になっているケースを、この境界判定の
 タイミングで回収するため (= 境界トーストと「シーク中...」が同時に出続ける症状の解消)。
 
-`is_eof_reached()` ガードが必須な理由 (Codex P1): 境界判定の `cur` は
+`is_demux_exhausted()` ガードが必須な理由 (Codex P1): 境界判定の `cur` は
 `user_seek_base_secs()` (= coalesce 中の pending target を優先) なので、←→ 押しっぱなし
 で pending target が clamp に到達すると、**実シークはまだ手前を向いている (= 正当な
 進行中 seek)** のに AtStart/AtEnd になり得る。ここで無条件にクリアすると、その正当な
 in-flight seek の override とまだ発行されていない pending seek を巻き込んで潰す。
-`is_eof_reached()` は demux が末尾まで読み切ったとき (= override がもう post-seek
+`is_demux_exhausted()` は demux が末尾まで読み切ったとき (= override がもう post-seek
 フレームを得られない固着状態) だけ true になるので、これでガードすれば固着時だけ掃除し、
 進行中 seek は通常経路 / tick 側保険に委ねられる。
 
 **stuck seek の tick 側保険解除**: `seek_relative` の境界回収は「次にもう一度 ←→ を
 押す」操作が前提なので、放置されたままだと「シーク中...」が残り続ける。これを潰す
-最終保険として `VideoPlayer::tick` 冒頭に、`is_seeking() && is_eof_reached()` が
+最終保険として `VideoPlayer::tick` 冒頭に、`is_seeking() && is_demux_exhausted()` が
 継続して true である時間を `seek_eof_stuck_since` で計測し、`SEEK_STUCK_EOF_TIMEOUT`
 (1200ms) を超えたら `seek_target_override` を強制クリアする処理を置く。
-`is_eof_reached()` は `request_seek` で一旦クリアされ demux が末尾まで読み切ったとき
+`is_demux_exhausted()` は `request_seek` で一旦クリアされ demux が末尾まで読み切ったとき
 だけ true になるので、進行中の通常 seek は誤検出しない。通常の near-end seek は
 post-seek フレーム到着で override が clear されて `is_seeking()` が false になり、
 timeout に達する前にラッチが解除される。override をクリアするだけで playing / 位置の
@@ -1271,11 +1279,36 @@ audio の timeout 待ちごとにこの video overflow を opportunistic に dra
 FirstFrameReady に必要な post-seek video packet が audio back-pressure の後ろに
 取り残されないようにする。
 
-**EOF**: demux thread が `input.packets()` 空を検出 → `clock.notify_eof_reached()`
+**入力終端 (demux exhausted)**: demux thread が `input.packets()` 空を検出 → `clock.notify_demux_exhausted()`
 + 両 channel に `Eof` を送る。動画は内部残フレームを失っても許容なので drain なし、
 音声は `avcodec_send_packet(NULL)` + receive_frame ループで残サンプルを drain
 (= 末尾の数十 ms の音声を出し切る)。demux thread はその後 `peek_seek_request_pending`
 の idle wait に入り、cancel か新 seek 要求まで待機。
+
+**再生終了 (engine Eof)**: 入力終端は先読み完了であり、packet queue、表示待ち frame、
+audio buffer はまだ残り得る。再生終了を所有するのは `EngineActor` の `EngineState::Eof`
+(published `state_code::EOF`) だけ。`VideoPlayer::tick` の既存 drain / quiet 条件が成立した後に
+`DecoderEvent::EofReached` で確定する。`VideoPlayer::is_at_eof()` はこの state を読む。
+入力終端後に一時停止した `Paused` は再生終了ではないため、play / Space はその位置から再開する。
+真の `Eof` でのみ 0 への replay を選ぶ (`toggle_play` と `set_playing(true)` の両方)。
+`!clock.is_playing() && clock.is_demux_exhausted()` は `Paused` / `Seeking` 等でも成立し、
+engine `Eof` と等価ではない (backlog §1.310)。
+
+| 入力終端の consumer | 必要な意味 / 判定 |
+| --- | --- |
+| `toggle_play` / `set_playing(true)` の replay | 再生終了。`is_at_eof()` を使う |
+| `seek_relative` の端での override 回収 / tick の stuck-seek 回収 | 入力終端。`is_demux_exhausted()` を維持 |
+| native tick の quiet gate / drain deadline | 入力終端から出力消費を待つ。`is_demux_exhausted()` を維持 |
+| 非 native tick (音声のみを含む) の quiet gate | 入力終端から frame / audio drain を待つ。`is_demux_exhausted()` を維持 |
+| audio pump の短い残量の `BufferReady` | 入力終端。閾値未満でも準備を進めるため `is_demux_exhausted()` を維持 |
+
+通常 fullscreen / detached / 動画→音声モードの入力は共通 player の transport を通る。
+native の先頭へ戻る command は明示 `seek(0.0)` のまま。loop / repeat は既存の drain gate と
+loop target を維持し、次 item 自動送りと resume 保存は engine EOF を使う。mIV Remote 配信の
+transcode generation の `metrics.ended` は配信生成の終端であり、ローカル player の入力終端ではない。
+seek 要求は入力終端をクリアし、同じ demux worker を起こすため EOF 後も decoder 再生成は不要。
+設計の簡素化として既存 engine state を唯一の再生終了 owner に再利用し、追加の終端 bool や
+時間待ち、操作制限は設けない。pause/resume をモーダル化すると通常操作を変えるため採用しない。
 
 **swresample 出力 frame の pre-allocation (⚠ 重要)**: `emit_audio_frame` は
 `setup.resampler.run(input, output)` を呼ぶ前に **output frame を正しいサイズで
@@ -1730,6 +1763,18 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 短い park 後の `Buffering` 中でも stale audio frame が `audio_tx` を塞ぎ続けない。
 
 #### `audio.rs`
+
+- EffeTune 適用時の DSP 順序は normalize → ユーザー VST3 → 任意の EffeTune 前段
+  SafetyLimiter → EffeTune → 既存の boost / 最終 SafetyLimiter → 出力音量。
+  前段は別 instance の ceiling 0 dBFS / lookahead 5 ms / release 100 ms で、
+  `effetune_pre_limiter_enabled`（既定 ON）を再生開始時に取得する。音楽も同じ pump、
+  Remote 動画・音楽は `ClocklessAudioProcessor` が同じ順序で処理する。
+  原音を保持した scratch だけを制限するため、EffeTune 失敗時はユーザー VST3 後へ戻り、
+  前段・EffeTune の遅延をともに除外する。成功時だけ前段の実サンプル数による遅延を PDC に加算。
+  2 秒 admission は従来どおり plugin のみ（両 limiter と stretch は上限外）。
+  seek / 非適用 / EffeTune 世代変更では前段 delay を reset。Remote 世代ごとの再作成も初期化する。
+  HUD ピーク表示は最終 limiter のみ。詳細と検証記録は `effetune-integration-plan.md` §13。
+
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
 - AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)
@@ -1836,7 +1881,8 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
     `EngineActor::handle_seek_request` は adaptive ロジックで「外部 bump 検知時は
     state 更新のみ」「内部 bump 必要時は av_clock.request_seek 経由で publish」を
     自動判別。詳細は [docs/video-engine-redesign.md] の「counter consolidation」節。
-  - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
+  - **再生制御の互換複製** (`playing` / `audio_active` / `seek_request` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
+  - **入力終端** (`demux_exhausted`): demux の先読み完了。engine の再生終了 state の複製ではない。drain / readiness / seek 終端処理で読み、seek 要求でクリアする。再生終了は engine の `Eof` が単独で所有する。
   - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.output_volume()` / `clock.pre_limiter_gain()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
 
 - **不変条件: `AvClock::playing` フラグは EngineActor 経由でしか書かない** (2026-05 root fix):
@@ -3211,6 +3257,18 @@ open / source swap、fullscreen 終了、または全体 OFF で解除する。
 この段階は確定値待ちのバックグラウンド scan として扱い、キー入力 / seek / deferred-play
 経路でモーダル blocker や `audio_preroll_suspended` を再度立てない。確定 gain への差分は
 audio-pump の 4 秒 ramp で追従する。
+仮 gain 適用前のモーダル段階でも、前後の動画・項目・フォルダへの移動は受け付ける。
+音声表示の前後ボタンは既存の移動経路へ合流する。native キーのモーダル gate は dispatch と
+同じ優先順位で一度解決した Action を使い、競合した非移動操作を通さない。ただし VST 表示中の
+Esc / 音声モード切替による波形ビューへの復帰は従来どおり許可し、scan は継続する。修飾なし Esc も
+固定入力として通し、キー割当と重なる場合の既存の dispatch 順を維持する。移動先の非同期解決中は
+元動画の scan と仮 gain を維持する。候補なし・失敗・破棄された移動要求では何も取り消さない。
+解決中に scan が完了した場合は通常どおり元動画の結果を保存する。移動先の採用時に、元動画を
+閉じる所有者 cleanup で scan を cancel して receiver を破棄し、以後に届く旧 worker の結果を
+保存・移動先へ適用しない。別窓が所有する scan は変更しない。移動先で測定値が必要なら通常の
+open 経路から新しい scan を始める。
+scan 中の全操作をモーダルに留める案は移動を待たせるため採らず、移動以外の再生・シーク・編集は
+従来のモーダル条件を維持する。専用の再開・巻き戻し状態は設けない。
 10 分未満の動画や、10 分時点で loudness がまだ有効でない動画は従来通り確定結果まで待つ。
 キャッシュ hit の動画を grid から再開する場合や、停止中の未測定動画をクリック / Enter で
 再生する場合も同じ deferred-play scan 経路を使う。

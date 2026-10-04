@@ -123,6 +123,54 @@ v1 は PDF の `source_*` へ page-box 単位を書いていた。どちらも W
 `pdf_layout_dims_version=2` への移行時に PDF catalog の全 page 行と通常 catalog の `pdfthumb:` 行を
 一度だけ削除・再生成し、無関係な画像 / ZIP 行は保持する。
 
+### 動画・音声メタデータ (`video_meta`)
+
+フォルダ単位の既存 catalog に次のテーブルを追加する。`pdf_meta` / `container_page_meta` と同じ
+追加方式であり、既存テーブル・行・schema version は変更せず、既存行の移行は不要。
+
+```sql
+CREATE TABLE video_meta (
+    filename TEXT NOT NULL PRIMARY KEY,
+    mtime INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    readable INTEGER NOT NULL,
+    duration_secs REAL,
+    width INTEGER,
+    height INTEGER,
+    codec TEXT
+);
+```
+
+長さ・解像度・コーデックを 1 回の probe からまとめて保存する。音声の幅・高さは NULL。
+`readable=0` は確定した読取失敗の negative cache で、値列は NULL。mtime / file_size の完全一致時
+だけ成功・失敗の両方を再利用する。source identity は `Option<(mtime, size)>` として保持し、
+未知と既知のサイズ 0 を区別する。空のファイルも確定失敗の保存対象で、未知は DB 再利用・書込の対象外。
+FFmpeg の内容不正・利用可能な stream 不在・非対応 codec / container だけを確定失敗とする。
+アクセス拒否・共有違反・ファイル不在・一般 I/O エラー、取消、10 秒 timeout は `Interrupted` で
+保存しない。メモリ内の `RetryLater` は試行時の `items_generation` だけで終端として扱い、
+同じ一覧で連続再試行しない。次回フォルダを開くと世代が変わり、DB miss として再取得できる。
+
+実ファイルの mtime / size は catalog の mutex・SQLite 書込ロックを取る前に再確認し、
+要求時と完全一致するときだけ保存へ進む。OS の属性取得自体は中断できないため、その前後で
+取消を確認し、取消後は保存しない。`BEGIN IMMEDIATE` の中は SQL 書込だけとし、ネットワーク
+共有の属性取得が停滞しても既存 UI 書込を妨げない。mtime の大小で新旧を推測しない。
+属性確認から commit までにファイルが変わり、新しい worker が先に保存した場合、遅い旧結果が
+その行を置き換える余地は残る。この行は現在の mtime / size と一致せず lookup が miss になるため、
+代償は次回の probe 1 回である。cache hit / probe の結果も worker が公開前に source identity を
+確認し、古い結果を `Interrupted` として捨てる。
+
+既存 details-meta worker が有界 catalog LRU と I/O semaphore を使って lookup → miss 時だけ probe →
+確定結果の書込を行う。UI は `DetailsLazyMeta` だけを読む。詳細列・ツールチップ・選択情報も
+同じ DB 値を使い、従来の値と整形は保つ。検索結果・コレクション・レーティング一覧・スマート
+フォルダでも、ページ数と同じ実ファイルの親 + basename で元 catalog を参照する。
+親 / キー / stamp を得られない項目や DB 障害では従来どおり probe し、表示を失敗させない。
+`--perf-log` の `details_meta/media_cache_hit` / `media_probe` で再利用と再取得を区別できる。
+
+状態の簡素化として、新 worker・要求フラグ・retry owner は追加せず、既存の staged session、
+取消、一覧世代、メモリキャッシュを再利用する。取得中の modal 化は通常のスクロールを妨げるため採用しない。
+サムネイルの範囲変更は既存 scroll idle gate 後に現在 viewer の範囲 snapshot を差し替え、旧 stage を
+取り消す。画面外の選択情報は別機構にせず同じ stage に加え、選択変更は待たずに反映する。
+
 ### 無効化ロジック（キャッシュ整合性）
 
 ```

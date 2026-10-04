@@ -11,7 +11,12 @@ mod path;
 mod prepare;
 mod read_lease;
 mod runtime;
+#[cfg(test)]
+mod test_clock;
 mod text;
+
+#[cfg(test)]
+pub(crate) use test_clock::TestReadClock;
 
 pub(crate) use export_all::{CollectionAllExportFailure, write_all_collections_export};
 pub use model::*;

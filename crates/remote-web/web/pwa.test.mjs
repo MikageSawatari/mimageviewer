@@ -117,37 +117,6 @@ test("legacy image URLs include the remote state generation", async () => {
   );
 });
 
-test("the startup path never touches a singleton declared after boot runs", async () => {
-  const app = await readFile(new URL("app.js", here), "utf8");
-  const bootBlock = app.indexOf("if (!RUNTIME_TEST_MODE) {");
-  assert.ok(bootBlock > 0, "startup block not found");
-  assert.match(app.slice(bootBlock), /\n  boot\(\);/);
-
-  // boot() はモジュール本体から同期的に呼ばれ、最初の await より前に
-  // renderLoading -> cleanupScreen まで到達する。そこで起動ブロックより後に
-  // 宣言された const を触ると TDZ でモジュール評価ごと落ち、画面が真っ黒になる。
-  // RUNTIME_TEST_MODE の node テストは起動ブロックを丸ごと飛ばすので気付けない。
-  const declaredAt = new Map();
-  for (const match of app.matchAll(/^const ([A-Za-z_$][\w$]*) = /gm)) {
-    if (!declaredAt.has(match[1])) declaredAt.set(match[1], match.index);
-  }
-  const late = [...declaredAt].filter(([, at]) => at > bootBlock).map(([name]) => name);
-  assert.ok(late.length, "no late declarations found; the pattern stopped matching");
-
-  for (const name of ["cleanupScreen", "renderLoading", "renderError", "renderPinLogin"]) {
-    const start = app.indexOf("function " + name + "(");
-    assert.ok(start > 0, name + " not found");
-    const body = app.slice(start, app.indexOf("\n}", start));
-    for (const identifier of late) {
-      assert.doesNotMatch(
-        body,
-        new RegExp("\\b" + identifier + "\\b"),
-        name + " references " + identifier + ", declared after the startup block (TDZ)"
-      );
-    }
-  }
-});
-
 test("the service worker only falls back for failed page navigations", async () => {
   const worker = await readFile(new URL("service-worker.js", here), "utf8");
   assert.match(worker, /request\.method !== "GET" \|\| request\.mode !== "navigate"/);
@@ -952,3 +921,29 @@ async function pngDimensions(relativePath) {
   );
   return [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
 }
+
+test("app.js runs its entry block after every top-level binding is initialized", async () => {
+  // boot() はモジュール本体から同期的に呼ばれ、最初の await より前に renderLoading ->
+  // cleanupScreen まで到達し、そこから先の関数がモジュール直下の const / let を読む。起動ブロックが
+  // その宣言より前にあると TDZ でモジュール評価ごと落ち、最初の通信も telemetry も出ないまま
+  // 画面が真っ黒になる (2026-09-30 iPad、cleanupScreen -> enqueueVideoProgress ->
+  // videoProgressWriters)。以前のテストは 4 関数の本文の直接参照だけを見ていて、呼び出しを
+  // 1 段挟んだこの経路を見逃した。起動ブロックを最後の文に置けば呼び出しの深さに関係なく起きない。
+  // RUNTIME_TEST_MODE の node テストは起動ブロックを丸ごと飛ばすので、原文の並びで検査する。
+  const source = await readFile(new URL("app.js", here), "utf8");
+  const lines = source.split("\n");
+  const entry = lines.indexOf("if (!RUNTIME_TEST_MODE) {");
+  assert.notEqual(entry, -1, "entry block not found");
+  assert.equal(lines.indexOf("if (!RUNTIME_TEST_MODE) {", entry + 1), -1, "second entry block");
+  // 本文は字下げされているので、閉じ括弧は起動ブロックより後で最初の 0 桁目の "}"。
+  const close = lines.findIndex((line, index) => index > entry && line === "}");
+  assert.ok(close > entry, "entry block is not closed at column 0");
+  assert.match(lines.slice(entry, close).join("\n"), /\n  boot\(\);$/, "boot() is not the last call");
+  // 後ろに続いてよいのは空行だけ。const / let / export const / class / トップレベルの呼び出しなど、
+  // どの文も boot() より後に評価される。
+  const trailing = lines
+    .slice(close + 1)
+    .map((line, offset) => ({ line, number: close + offset + 2 }))
+    .filter(({ line }) => line.trim() !== "");
+  assert.deepEqual(trailing, [], "top-level code after the entry block");
+});

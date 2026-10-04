@@ -159,6 +159,27 @@ CREATE TABLE restore_declined (
 > 積み、全件 snapshot へ merge してから Ready に戻す。段 0 は引き続きメモリだけを参照し、
 > SQLite を開かない。
 
+> **v4.3.0 初回 schema 競合修正 (§1.286)**: 起動時は recorder worker と検出 index
+> loader が別接続で同時に `open_at` を呼んでいた。空の DB では両方の `DEFERRED`
+> transaction が `user_version=0` / `edit_origin` 不在を読めるため、後から
+> `CREATE TABLE` へ昇格する片方が `SQLITE_BUSY` で即時失敗する。各接続の 5 秒
+> busy timeout は既に有効で、read→write の競合を解決できない。空の DB で
+> `journal_mode=WAL` を同時に設定する場合も timeout を待たずに `SQLITE_BUSY`
+> となる。共通の台帳 open 関数で、busy timeout 設定、WAL 設定、schema 確認を
+> プロセス共通の短い mutex 区間に置く。schema 関数はまず書き込み枠を取らずに
+> `user_version` と現行 schema を確認し、現行版ならそのまま返す。旧版または空 DB
+> の場合だけ `IMMEDIATE` transaction を開始し、その中で版を読み直してから
+> 作成・更新する。これにより、別接続の長い書き込み中でも現行版の open は
+> writer の完了を待たない。recorder、検出 index loader、検出、
+> backfill、restore、リネーム移行・コピー・purge、孤児メタデータ整理の台帳接続は
+> この open 関数を通る。区間を抜けた後の index 全件ロードや通常の読み書きは
+> 直列化しない。移行・コピー・purge 本体の read→write transaction も
+> `IMMEDIATE` にし、同型の昇格競合を除く。
+> recorder の完了を loader が待つ仕組みは使わないので、recorder が panic
+> しても loader は永久待ちにならない。DB 形式は変更しない。失敗時は
+> ディレクトリ作成、SQLite open、WAL 設定、schema 初期化、index 読込の
+> 段階をログへ残す。retry の追加や初回 schema 書込みの固定所有者は不要。
+
 ### 3.3 記録のタイミング
 
 - **編集の確定点** (`save_mask_with_sidecar` / `save_conceal_with_sidecar` / `set_page_params` 等)

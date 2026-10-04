@@ -3,6 +3,13 @@
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
 
+検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
+`metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。
+UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は各 manager worker が担う。
+起動確認の省略には既存の `fts_meta.db`・`search_index.db`・`similar.db` 内の追加テーブル
+`scanned_once` を使う。fts/name は root 単位、similar は有効 root 集合全体で1つの完走印を持ち、
+永続ストアの追加や保存先の変更はない。
+
 ---
 
 ## 1. レイヤー構造
@@ -150,7 +157,7 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | `filename_stack.rs` | ファイル名 prefix スタック (v2.0.0) の純ロジック。`StackMember`/`StackGroup`/`StackView` + `group_media` (末尾区切り文字の前でグループ化、動画は単独固定) / `materialize_aggregated` (集約グリッド) / `materialize_flat` (フラット読書フルスクリーン) / flat-index 写像 / `stack_jump_target` (Shift+↓↑)。I/O 無しで unit test 容易 |
 | `filename_stack_ui.rs` | 上記の App グルー (bin-only)。トグル / 集約⇔フラットのビュー切替 (`swap_stack_view_items`) / `stack_try_open_from_grid` (集約セル → フラットフルスクリーン) / `stack_reconcile_after_fullscreen_close` (閉じたら集約へ戻す)。集約構築は `load_folder_with_scan` hook 経由。詳細は [filename-stack-plan.md](filename-stack-plan.md) |
 | `thumb_loader.rs` | サムネイル並列ロード (WebP キャッシュ生成含む)。Folder 自動代表の再帰探索では子の非 Image pin を元ソースから生成せず、直上 catalog に完全一致の pin WebP がある場合だけ上位へ伝播する。再利用 WebP は完成済み cache origin として idle source upgrade を抑止する |
-| `catalog.rs` | フォルダ単位の SQLite catalog。サムネイル WebP、PDF メタデータ、ZIP / 画像のみフォルダのページ数を保持する。ページ数 cache は種別・mtime・file size・判定設定 fingerprint の完全一致時だけ再利用する。fingerprint はフォルダ走査が使うネイティブ対応拡張子集合も含み、保存済みの拡張子優先度が変わらなくても形式追加時に再取得する。再帰 pin の cache-only lookup 用に、DB が存在するときだけ schema 変更なしで read-only open する経路を持つ |
+| `catalog.rs` | フォルダ単位の SQLite catalog。サムネイル WebP、PDF メタデータ、ZIP / 画像のみフォルダのページ数、動画・音声の長さ / 解像度 / コーデック / 確定読取失敗 (`video_meta`) を保持する。ページ数 cache は種別・mtime・file size・判定設定 fingerprint の完全一致時だけ再利用する。fingerprint はフォルダ走査が使うネイティブ対応拡張子集合も含み、保存済みの拡張子優先度が変わらなくても形式追加時に再取得する。動画・音声は mtime / file size 一致で再利用し、取消 / timeout は保存しない。再帰 pin の cache-only lookup 用に、DB が存在するときだけ schema 変更なしで read-only open する経路を持つ |
 | `folder_thumb_pins.rs` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン DB (`%APPDATA%/mimageviewer/folder_thumb_pins.db`)。`apply_folder_thumb_pin` が cache key に `#pin:{source_id}` suffix を載せて pin の identity を表現し、子の Folder / ZIP / PDF / ZipDir が持つ代表 pin を最終 leaf まで連鎖解決する。cascade の source_id は経路 hash + leaf identity。固定 leaf が Image / ZipEntry / PdfPage なら canonical page key も親要求へ渡し、編集 preview を優先する。Video ピンは `seed_folder_video_pin_thumbs` で `video_pins` から WebP を catalog に seed する。RAR/7z/LZH 変換キャッシュ閲覧中は元アーカイブパスを root key にする |
 
 ### 仮想フォルダ (ZIP/PDF) / フォーマット
@@ -360,7 +367,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `collection.db` / `collection.db.bak1..bak10` | 名前付きコレクションの定義・登録元パス・手動順・シャッフル設定。既存 DB は起動時に整合を確認し、そのsessionの最初の実変更前に一度世代バックアップを試行する。未編集の空DBは最初の成功変更後から対象とする。v1/未版管理DBのschema移行前はバックアップ必須で、失敗時は移行を止める。通常のバックアップ失敗は記録して変更を続ける。設定リセット・メタ情報の移行には含めない | `collection_store/{runtime,db}.rs` |
 | `Pictures\mimageviewer\books\...` (既定、設定可) | 製本した本の実体。DB ではなく通常フォルダ + `0001_元名.ext` 画像ファイルのみ。`Settings.book_root` で変更でき、Ctrl+S/Ctrl+G の自動索引対象外 | `books.rs` + `ui_main.rs` + `ui_fullscreen.rs` |
 | `Settings.keymap` / `keymap.ini.default` | キーボード割り当て設定。GUI 編集の正本は `settings.db` 内の `Settings.keymap`。旧 `keymap.ini` が残っている環境では初回起動時に読み込み、同じ内容を `Settings.keymap` へ移してから `keymap.ini.imported*.bak` へリネームする。以後 `keymap.ini` は通常読み込み対象外。`keymap.ini.default` は現在バージョンの Action 名と既定キーを確認する参照ファイルとして更新される。競合は拒否せず warning として扱う | `keymap.rs` + `settings.rs` |
-| `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache。ページ数取得は詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元コンテナから再取得する | `catalog.rs` + `app/metadata_ops.rs` |
+| `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache + 動画・音声の `video_meta`。ページ数・メディア情報の取得は既存詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元ファイルから再取得する | `catalog.rs` + `app/metadata_ops.rs` |
 | `video_tile_thumbs.db` | 動画タイル / resume サムネイルの WebP と、粗い全尺波形の量子化 chunk。新しい波形 chunk は stream index を含む追加テーブルへ保存し、既定トラックだけ旧テーブルを互換読みする。path、stream index、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用し、窓解析と raster は保存しない。サムネイルキャッシュ管理のファイル単位・フォルダ単位・全件削除を共有する | `video/tile_thumb_cache.rs` + `video/seek_strip_wave.rs` |
 | `content_identity.db` | 物理ファイルの size / 先頭 64 KiB hash / 全体 hash と、復元元か検出 cache だけかを表す `has_restorable_content`、復元辞退組を保持する。schema は `PRAGMA user_version` の単一入口で作成 / upgrade し、unversioned A1 行へ列を足す migration の default は復元元を表す `1`。期待 schema を用意できない session は typed `Unusable` とし、空台帳として処理を続けない | `content_identity.rs` + `app/content_identity_detection.rs` |
 | `auto_aspect_cache.db` | Auto サムネイル比率のフォルダ別前回確定値と、UUID table に置く Collection root 別前回確定値。後続の実統計は既存ゲート (streak/cooldown 等) に従って補正する。Collection の DB I/O は単一 actor に限定し、prepare worker が最大 100 ms 待つ optional Get、UI はメモリ値だけを扱う。サムネイルキャッシュ管理の全件・期限整理は両 table を対象にする | `auto_aspect_cache.rs` + `app.rs` |

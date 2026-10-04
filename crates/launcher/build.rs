@@ -14,6 +14,8 @@ mod build_const_parser;
 
 use build_const_parser::extract_const;
 
+mod build_effetune;
+
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // crates/launcher/ → crates/ → workspace root
@@ -22,6 +24,8 @@ fn main() {
         .and_then(|p| p.parent())
         .expect("workspace root inferable from CARGO_MANIFEST_DIR")
         .to_path_buf();
+
+    build_effetune::generate(&workspace_root);
 
     // CARGO_TARGET_DIR を尊重 (環境変数が無ければ workspace_root/target)
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")

@@ -388,6 +388,10 @@ impl App {
         };
         self.content_identity_restore_pending = None;
 
+        self.advance_collection_thumbnail_source_epoch_for_pin_commit(
+            report.committed_thumbnail_pins,
+            "content_identity_restore",
+        );
         let restored = report.ledger_entries.len();
         let failures = report.errors.len();
         crate::logger::log(format!(
@@ -733,6 +737,36 @@ mod tests {
             entry.tags.as_deref(),
             Some(["#current".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn restore_pin_commit_report_advances_collection_epoch_without_touching_maps() {
+        let mut app = crate::app::setup_app_for_test();
+        let pin_key = "c:/books/unrelated.zip".to_string();
+        let pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "cover.jpg".to_string(),
+        };
+        app.folder_pin_map.insert(pin_key.clone(), pin.clone());
+        let ctx = egui::Context::default();
+        let epoch = app.collection_thumbnail_source_epoch;
+        for (changes, expected_epoch) in [(0, epoch), (2, epoch.wrapping_add(1))] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(crate::content_identity::ContentRestoreReport {
+                committed_thumbnail_pins: changes,
+                // Partial restore failures must still publish successful pin commits.
+                errors: (changes != 0)
+                    .then(|| "later store failed".to_string())
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+            app.content_identity_restore_pending = Some(ContentIdentityRestorePending { rx });
+            app.poll_content_identity_restore(&ctx);
+            assert_eq!(app.collection_thumbnail_source_epoch, expected_epoch);
+            assert_eq!(app.folder_pin_map.get(&pin_key), Some(&pin));
+        }
     }
 
     /// `edit_preview_close` の実ログで観測された退行: restore worker が DB へコピーした

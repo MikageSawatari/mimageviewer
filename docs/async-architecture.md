@@ -9,6 +9,7 @@
 
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
+| 合成ビューの pin 資産更新 (§1.313) | `std::thread` + 既存 `metadata_import_refresh::run` | viewer context ごとに最新要求 1 件 | `CurrentViewRefresh::Pins` が変更コンテナ／動画集合を所有。同一 items generation の先行範囲を統合し、FS metadata・cascade DB・catalog DELETE・video pin read／seed write を既存 metadata worker 内で完了し、live cache を変更せず private map を準備する。完了は egui を起こし、mounted context／generation と cache／catalog／policy identity が一致する結果だけを既存 metadata-pin 適用へ渡す。UI terminal は DB handle を持たず準備済みメモリだけを採用する。無関係な Loaded 資産を保持し、token 交換時は変更／未完了動画の producer を再開する。置換・世代切替・retired context・App drop で cancel。同世代の metadata import が pin materialization を置き換える場合も、準備済み対象要求を確定して旧 context owner を取消してから successor worker を開始する。取消する unpin の可視 container keys は既存の無効化対象集合へ引き継ぐ。pin 以外の import や対象外 context は退役させない。詳細は [pin-reload-audit.md](pin-reload-audit.md) |
 | Windows file clipboard cut 観測 | message-only window STA (`cut-clipboard-listener`) + OLE reader STA (`cut-clipboard-reader`) | process ごとに各 1 | production install は UI を待たず `Starting` を返し、同じ backend generation の reader / listener `Ready` が揃った時だけ `Running` にする。起動中の通知・読取結果は順序を保って後から適用し、失敗時は `Disabled` へ収束する。listener は `WM_CLIPBOARDUPDATE` を sequence と単調 request serialで latest slotへ発行するだけで、OLE/clipboard I/Oを行わない。readerが `IDataObject` を自thread内で読み、path正規化と不変集合構築を完了してApp-global reducerへ返す。sequence変更時は旧表示をPendingへ失効し、競合中だけ上限付きbackoffで再取得する。SetData完了もprivate tokenで同じreducerへ入りrepaintを要求する。終了時はlistenerを解除・joinし、起動中または外部COM内で停止不能なthreadは無条件joinしない。testの既定backendはinertで、実clipboard/HWNDを作らない |
 | 類似候補の長押し画像準備 | `std::thread` (`similar-preview`) + request専用mpsc/cancel | viewer ownerごとに実行中1件（取消drainを含む）＋最新待機1件 | `SimilarPanelState.preview` が要求・表示gesture・assetを所有し、既存viewer bundleと交換する。workerは毎pressのsource stamp確認と必要時の通常画像/ZIP/PDF decodeを行う。release/focus lossは表示だけを終了し、同じ要求の有効な遅延完了は隠れたcacheとして受ける。source/page/session変更やcloseは当該ownerを失効し、取消中に次workerを重ねない。ROOT updateがmounted/AtRest双方の終端をpollし、worker完了がROOTを一度起こす。UIはDB/ファイル待ちやdecodeを行わない。R4段階検証の現況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。起動時に設定された PDFium pool の並列度を活かすためここに置く) |
@@ -49,7 +50,7 @@
 | 横断ブックマーク一覧 | `std::thread` (`bookmark-browser-build` / `bookmark-browser-delete`) + mpsc | 一覧再読込または削除ごとに最大 1 | `video_bookmarks.db` と `book_bookmarks.db` を共通 read model にまとめ、登録日時順ソートと元コンテナ / ページの存在確認を行う。動画・音声の種別判定、保存済み WebP の decode、ZIP entry / PDF page の確認も worker 側。結果は通常の `App.items` グリッドと同順の sidecar row として install し、保存済み WebP も通常のフレーム当たり texture upload 上限を通す。削除 worker は DB 行だけを削除し、元メディアへ filesystem 操作を行わない。UI は在メモリの media / book subtype filter と通常 facet だけを評価する |
 | ブックマーク状態フィルタ | `std::thread` (`bookmark-presence-build`) + mpsc | 状態条件の初回使用または CRUD 後に最大 1 | 動画・音声 path、本 container / page identity の軽量集合だけを両 DB から読み、通常一覧へ渡す。行ごとのフィルタ判定は在メモリ。snapshot完了時はmain / active detached / paused detachedを順にmountし、各context所有の表示集合をDB I/Oなしで再計算する。スマートフォルダは既存 prepare worker 内で同じ snapshot を読み、UI スレッドから DB を開かない |
 | サイドカー復元確認 / parse 再利用 | `std::thread` (`sidecar-restore-recheck`) + mpsc + `Arc<AtomicBool>` | App-global restore request ごとに最大 1 | `Quiescing` 後の strict flush / writer idle、全 bytes SHA-256、edit/tag marker、source revalidation を worker が所有する。同一 raw folder path・data directory・family・disk token の clean parse だけを `SidecarProbeReuseCache`（4 folder、単体 192 MiB、合計 256 MiB）から再利用する。正規化 folder key は marker 用で、`App.sidecars` の writable owner identity は raw `PathBuf` 完全一致。worker は pending/failed writer を最優先し、その後の長さまたは mtime 不一致だけを hash 前の miss にする。一致時は全 bytes hash と strict fallback を省略しない。warm hit が遅着・取消で未採用なら既存 proof を LRU 昇格なしで維持し、cold 未採用候補は publish しない。dirty/warning/failed は proof を失効し、大きな候補・退役 Arc は既存 payload drop worker へ渡す |
-| 明示メタ情報転送 | `std::thread` (`metadata-export` / `metadata-import-preview` / `metadata-import` / `metadata-import-refresh`) + mpsc + `AtomicBool` | 完全モーダル中にimport本体と終端refreshを直列で最大 1 | `mimageviewer.meta.miv` の再帰列挙、JSON / media-kind / file-size検証・原子的exportと、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / ページ編集 / サムネピンDBのimportをUI thread外で行う。変換archiveはsource containerとcache ZIP pageのaliasをportable identityへ変換する。列挙は`read_dir`を逐次消費し、メタ情報DBは一時scope表とpath indexで列挙済み項目だけを読む。開始前にpending view-trimをメモリsnapshotとしてworkerへ渡す。main / active detached / paused detachedのXMP rating readerは取消し、既存metadata writer / rename migrationとともにdrainする。転送完了・開始失敗・待機cancel後はrating readerを全contextへ再生成する。dirtyな`mimageviewer.dat`群とAppのTagsDb connectionも所有権ごとimport workerへ移してflush / journal-mode handoff / 再openを行い、いずれかのflush失敗時はDB更新を開始しない。importは15ストアをattached connectionへまとめ、256項目 / 実record 64 MiB / 500 msの外側transactionと項目SAVEPOINTを使う。target照合はファイル本体を読まず相対path / kind / sizeを使う。family削除はindex range seek、sidecar syncはfolder / section単位、file種別外storeはskipする。異常終了では現在batch、項目エラーでは当該SAVEPOINTだけをrollbackし、明示cancelでは現在batchもcommitする。動画ピン変更はitem成功後もbatch内に留め、外側COMMIT成功分だけを`ImportSummary`の確定件数へ加える。UIが最初のImport結果を受理した時だけApp-globalなCollection thumbnail-source epochを進め、終端refreshの再試行では進めない。epochはprepare再利用keyに含め、全viewer contextのReady / Empty presentationと旧epochのPreparingだけを失効する。RequestNeeded / Snapshotのleaseとreceiver、Failed / Deleted、項目binding、物理child、player、navigation ownerは保持する。DB更新中は既存UI cacheを変更しない。終端時だけ影響viewer contextの現在キーとfolder-pin identityを3 ms / 2048項目ずつcompact snapshot化し、refresh workerがDBを一括再取得する。タグcacheは未タグキーも空Vecの読込済みsentinelとして含める。page-state importは永続edit-preview cacheのclear ACKを待ち、main / active detached / paused detachedへ失効を伝播し、旧/新編集状態の和に当たるmaterialized thumbnailを再要求する。UIは要求構築時に焼き込んだViewerContextIdのresidenceがMounted / AtRestで、かつitems generation一致後、各contextをmount中にcache swapとvisible/facet/details/selection再計算、およびXMP rating hydrationの再生成を行う。旧XMPタグ自動seedのworker・context owner・待機は2026-09-12に撤去した。mainも適用時のbindingではなく要求時のregistry.main()をidentityとして保持する。Retiredへの遅延結果はdebug記録だけで破棄し、Unknown / Building / Retiringは不変条件違反として診断して破棄する。外部snapshotによる表示再計算はApp-globalなfacet scope / suppressionを同期せず、不一致ならモーダル中に再取得する。video pin削除も全対象動画の再生成として表現する。終端refreshはimport本体と別cancel tokenを持ち、終了・破棄時はcontext/DB chunk境界で中断して巨大な途中結果をworker側でdropする。本体と終端refreshの段階時間は常時logと任意の構造化perf logへ記録する |
+| 明示メタ情報転送 | `std::thread` (`metadata-export` / `metadata-import-preview` / `metadata-import` / `metadata-import-refresh`) + mpsc + `AtomicBool` | 完全モーダル中にimport本体と終端refreshを直列で最大 1 | `mimageviewer.meta.miv` の再帰列挙、JSON / media-kind / file-size検証・原子的exportと、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / ページ編集 / サムネピンDBのimportをUI thread外で行う。変換archiveはsource containerとcache ZIP pageのaliasをportable identityへ変換する。列挙は`read_dir`を逐次消費し、メタ情報DBは一時scope表とpath indexで列挙済み項目だけを読む。開始前にpending view-trimをメモリsnapshotとしてworkerへ渡す。main / active detached / paused detachedのXMP rating readerは取消し、既存metadata writer / rename migrationとともにdrainする。転送完了・開始失敗・待機cancel後はrating readerを全contextへ再生成する。dirtyな`mimageviewer.dat`群とAppのTagsDb connectionも所有権ごとimport workerへ移してflush / journal-mode handoff / 再openを行い、いずれかのflush失敗時はDB更新を開始しない。importは15ストアをattached connectionへまとめ、256項目 / 実record 64 MiB / 500 msの外側transactionと項目SAVEPOINTを使う。target照合はファイル本体を読まず相対path / kind / sizeを使う。family削除はindex range seek、sidecar syncはfolder / section単位、file種別外storeはskipする。異常終了では現在batch、項目エラーでは当該SAVEPOINTだけをrollbackし、明示cancelでは現在batchもcommitする。動画ピン変更はitem成功後もbatch内に留め、外側COMMIT成功分だけを`ImportSummary`の確定件数へ加える。UIが最初のImport結果を受理した時だけApp-globalなCollection thumbnail-source epochを進め、終端refreshの再試行では進めない。epochはprepare再利用keyに含め、全viewer contextのReady / Empty presentationと旧epochのPreparingだけを失効する。RequestNeeded / Snapshotのleaseとreceiver、Failed / Deleted、項目binding、物理child、player、navigation ownerは保持する。DB更新中は既存UI cacheを変更しない。終端時だけ影響viewer contextの現在キーとfolder-pin identityを3 ms / 2048項目ずつcompact snapshot化し、refresh workerがDBを一括再取得し、folder pin の FS／cascade／catalog／動画 seed の準備も共通 pin materialization 境界で行う。UI は準備済み private cache と scalar owner identity のみ受け取り、live cache を worker に変更させない。タグcacheは未タグキーも空Vecの読込済みsentinelとして含める。page-state importは永続edit-preview cacheのclear ACKを待ち、main / active detached / paused detachedへ失効を伝播し、旧/新編集状態の和に当たるmaterialized thumbnailを再要求する。UIは要求構築時に焼き込んだViewerContextIdのresidenceがMounted / AtRestで、かつitems generation一致後、各contextをmount中にcache swapとvisible/facet/details/selection再計算、およびXMP rating hydrationの再生成を行う。旧XMPタグ自動seedのworker・context owner・待機は2026-09-12に撤去した。mainも適用時のbindingではなく要求時のregistry.main()をidentityとして保持する。Retiredへの遅延結果はdebug記録だけで破棄し、Unknown / Building / Retiringは不変条件違反として診断して破棄する。外部snapshotによる表示再計算はApp-globalなfacet scope / suppressionを同期せず、不一致ならモーダル中に再取得する。video pin削除も全対象動画の再生成として表現する。終端refreshはimport本体と別cancel tokenを持ち、終了・破棄時はcontext/DB chunk境界で中断して巨大な途中結果をworker側でdropする。本体と終端refreshの段階時間は常時logと任意の構造化perf logへ記録する |
 | テキスト注釈ベイク | `std::thread` (`comic-bake`) + mpsc | 閲覧時最大 2 | Ctrl+T 注釈を final composite 上へ焼き込む。閲覧時は stamp 画像の cache miss デコードも worker 側で行い、完了時に `comic_stamp_cache` へ merge する。編集中はライブ追従を優先し、プレビュー解像度で同期ベイクする |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
@@ -66,7 +67,7 @@
 | mIV Remote 時計なし benchmark | 呼出側 worker + production と同じ `clockless_transcode` | benchmark ごとに 1 本 | production と同じ demux/decode/encode/mux 駆動部を dev-tools から呼ぶ。完成 segment が ring 上限に達したら `Condvar` で park し、cancel は各重処理境界で確認する |
 | mIV Remote streaming IPC | `std::thread` (`remote-stream-ipc-0..3`) + bounded queue (32) | remote IPC server ごとに 4 本 | start/control/seek/playlist/segment/state/stop 専用 lane。start/state は共有 DSP 段の active slot と warning、選択音声トラックを返す。stream queue の飽和は Busy を即応答し、heavy / Home / write worker の枠を消費しない |
 | Normalize 測定値 lookup | `std::thread` (`normalize-lookup`) + mpsc | player の stream ごとに最大 1 つの実行中 request | App は `VideoInfo.opened_audio_stream_index` または選択先 stream が確定してから worker を起動する。worker は独立の読み取り専用 DB 接続を持つ。結果は開始元 `ViewerContextId` ごとに振り分け、所有 context の poll でのみ path と表の epoch・request 番号・stream・目標 LUFS が完全一致する `Pending` に適用する。一覧再配置で `fs_idx` が変わっても request identity から現在の index を求める。context が閉じた結果は破棄する。live-media fork で player が新 context に移った場合は旧 request を epoch で失効させ、移動先から再発行する。pump はその stream の raw frame を解決まで保持する |
-| Normalize 全尺 scan | `std::thread` (`normalize-scan`) + mpsc + `Arc<AtomicBool>` | App-global の active request 最大 1 本 | `NormalizeScanState` が viewer context ID / file path / fs_idx / stream index / cancel / atomic progress / receiver / worker handle を所有する。player の context fork では owner ID も移す。600 秒で `Provisional` を送り、同じ worker が全尺 `Done` まで継続する。完了は所有 context の poll でだけ受け取り、path と stream が一致するときだけ live 適用する。Done は stream 単位結果なので stale でもその stream と DB に保存する。新規 scan、cancel、対象 cache cleanup は cancel token を立て、古い結果を別動画や別トラックへ適用しない |
+| Normalize 全尺 scan | `std::thread` (`normalize-scan`) + mpsc + `Arc<AtomicBool>` | App-global の active request 最大 1 本 | `NormalizeScanState` が viewer context ID / file path / fs_idx / stream index / cancel / atomic progress / receiver / worker handle を所有する。player の context fork では owner ID も移す。600 秒で `Provisional` を送り、同じ worker が全尺 `Done` まで継続する。完了は所有 context の poll でだけ受け取り、path と stream が一致するときだけ live 適用する。通常の古い Done は stream 単位結果として DB に保存し得るが、ユーザーが動画・フォルダ移動を要求した scan は対象解決前に cancel token を立てて receiver を破棄し、既に送信済みの Done も保存しない。新規 scan、cancel、対象 cache cleanup は古い結果を別動画や別トラックへ適用しない |
 | 動画 native presenter | `std::thread` (`native-video-presenter`, Windows) | フルスクリーン動画 1 つにつき 1 本。ただし動画タイルモード中の動画→動画移動では `SwitchSource` で再利用 | 専用 HWND + D3D11 presenter + egui overlay を保持し、`video_rx` から受けた `VideoFrame` を表示する。`NativeVideoOutputCommand::SwitchSource` で source binding (`video_rx` / `AvClock` / engine event tx / duration / displayed_frame_seq) を差し替え、HWND と overlay を破棄せず次動画へ切り替える |
 | VST3 host bridge | **別プロセス** (`mimageviewer-vst3-host.exe`、C++) | ユーザー VST と音響調整で最大 2 本。配信開始で増えない | 1 process が 1 chain 全体を host する。App の `DspProcessingCoordinator` がローカル pump とリモート世代の process/reset/flush をブロック単位で排他する。bridge 内部は audio loop + GUI message pump + stdin pump。詳細は [docs/vst3-integration.md](vst3-integration.md) |
 | VST3 plugin GUI worker | bridge 内 per-slot STA thread (lazy) | editor を生成した slot ごと。表示した plugin 数まで増え得る | C++ bridge の plugin loader が slot ごとに STA message thread を lazy 生成し、bridge-owned editor surface と `IPlugView::attached()` を管理する。Rust 側に単一 `vst3-plugin-gui` thread はない |
@@ -92,7 +93,7 @@
 | メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
 | メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
-| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
+| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | 有効な正規化 root ごとに 1 本 (`auto_index_structure=true`) | manager が stop/join/clear/start を直列化し、完走印も同じ root の所有。印一致の起動は watcher 開始後の初回 Full だけ省く。手動 Full は owner mailbox で構成採用後・pause 再開後に実行 |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
 | タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Add / Remove / Clear / SetTags を serial に処理し、**`tags.db` だけ**を更新する。メディア本体 / XMP / Tantivy には書かない (`docs/tag-catalog-redesign-plan.md` D13)。サイドカー `mimageviewer.dat` へのミラーは結果を受けた UI スレッド側が行う |
 | 補正レイヤー書き込みワーカー | `std::thread` (常駐、最初の保存で遅延起動) | 1 | 補正レイヤー文書の直列化 (q8 量子化 → deflate → base64) + `local_adjust.db` 書き込み。24MP で 70.6ms、かつマスク系スライダーのドラッグ中は毎フレーム走っていた。**同じ page key は最新 generation だけ書く** (要求 1 件が原寸マスクを抱えるので、合体しないとキューにメモリが積み上がる)。サイドカー `mimageviewer.dat` へのミラーは、結果 (`EditStoreOutcome`) が `Committed` のときだけ UI スレッド側が行う (R-26、§5.7) |
@@ -135,6 +136,36 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
 
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、本ロック内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。別の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
+
+### サムネイルの動画・音声長さ取得
+
+`poll_details_meta_load` の既存 details-meta worker に統合する。Thumbnail モードの
+`thumb_show_media_duration` が ON なら、現在 viewer の `keep_set_sorted()` (可視 + 先読み) と
+選択情報の対象 1 件から bounded stage を作る。範囲変更は既存 scroll idle gate 後に snapshot を
+差し替え、`invalidate_details_meta_requirements` で旧 worker / revision を無効化する。
+Thumbnail / Details の切替も同じ取消・revision 更新を通す。Thumbnail の範囲限定ジョブの
+完了通知が、Details の全件取得を完了させることはない。
+専用選択情報バー・ツールチップの要求は一覧の列とは独立して同じ計画に合流し、モード切替後も
+選択項目を取得する。選択変更は画面外・画像等でも待たずに同じ stage へ反映する。
+全件計画中は既存 target の要求項目を合流し、worker 実行中は既存優先キューへ追加する。
+完了後の不足分は選択項目を含む bounded stage とし、全件走査の cursor を巻き戻さない。
+AI ファセットの全件取得は維持し、
+メディア取得だけ可視近傍に絞る。AI 全件取得後も新しい範囲を同じ staged reconciliation で取得する。
+既存 pending request の `DetailsMetaScanScope::{AllRequirements, VisibleStage}` が走査範囲を所有し、
+完了済み AI scan の後続は可視近傍だけを計画する。初回 AI 要求は進行中の長さ stage を取り消して
+全件要求へ戻す。長さだけの後続 stage は取得済み AI 候補を非準備状態へ戻さず、AI 集計 cache も
+AI 値または source identity が変わった patch だけで無効化する。
+
+worker は既存有界 catalog LRU / semaphore で `video_meta` を照会し、miss 時だけ FFmpeg probe を
+行う。`DetailsMediaProbeOutcome::{Read, Unreadable, Interrupted}` が読取結果の所有者で、
+`Read` / `Unreadable` だけ DB に保存する。FFmpeg のエラーを保持し、内容不正・利用可能な
+stream 不在・非対応 codec / container だけを `Unreadable` とする。アクセス拒否・共有違反・
+ファイル不在・一般 I/O エラー、取消、10 秒 timeout は `Interrupted` であり永続化しない。
+メモリ内は `DetailsMediaMeta::{NotFetched, Read, Unreadable, RetryLater}` が状態と値を所有する。
+`RetryLater` は試行時の既存 `items_generation` だけで取得済みと扱うため、同じ一覧で連続 probe
+せず、フォルダの再 open では世代が変わって再取得できる。取消は既存 worker 取消終端へ進む。
+UI は既存 `DetailsLazyMeta` を読むだけ。古い source identity の読取結果は公開前に破棄する。
+catalog の詳細・aggregate lookup・簡素化判断は [catalog-design.md](catalog-design.md) を参照。
 
 ## 2. スレッド間通信
 
@@ -662,6 +693,21 @@ ingest worker と tag_write_worker が共有する。独自に `fts.writer()` �
 共有 writer を使う。
 
 #### Indexer shutdown の有界化 (v2.3.0 第12弾)
+
+walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
+列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
+生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
+あり、Complete として返さない。この型は FS 観測だけの結果で、Full 全体の typed な
+完了結果とは分離する。S2 の停止は既存 cancel のまま。metadata manager worker が
+重複グループの cancel・join・cleanup・spawn を固定 snapshot で直列化し、後続要求は
+最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
+を唯一所有する。Shutdown は停止中の control にも到達し、spawn 採用と同じ短時間 lock
+で直列化する。4秒の期限には worker 自身と worker 所有の handle を含む。
+similar のお気に入り・PDF password 構成も、この worker が受理した固定 snapshot で反映する。
+App は後続要求を similar へ先行反映せず、OFF→ON の集約時に既存 watch を維持する。
+名前索引も正規化 root ごとの owner を manager worker に集約し、stop・clear・start の
+順序を起動と編集で共有する。`scanned_once` は完全な Full の後だけ立て、clear/rebuild と同じ
+transaction で消す。起動設定は最初の構成でだけ採用し、実行中の再構成は Full を維持する。
 
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、

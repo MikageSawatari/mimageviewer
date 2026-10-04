@@ -4404,6 +4404,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn skip_offline_change_scan_roundtrip_and_released_missing_key() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        assert!(!settings.skip_offline_change_scan);
+        settings.skip_offline_change_scan = true;
+        settings.grid_cols = 7;
+        db.save_full(&settings).unwrap();
+        assert!(db.load_into_settings().unwrap().skip_offline_change_scan);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'skip_offline_change_scan'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.skip_offline_change_scan);
+        assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
     fn effetune_editor_rect_round_trips_with_the_normal_full_save() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
@@ -4416,6 +4440,46 @@ mod tests {
         assert_eq!(loaded.grid_cols, 7);
         assert_eq!(loaded.effetune_gui_pos, Some((10, 20)));
         assert_eq!(loaded.effetune_gui_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn effetune_pre_limiter_default_missing_blob_and_db_roundtrip() {
+        assert!(Settings::default().effetune_pre_limiter_enabled);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_pre_limiter_enabled");
+        assert!(
+            serde_json::from_value::<Settings>(blob)
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let settings = Settings {
+            effetune_pre_limiter_enabled: false,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_pre_limiter_enabled'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
     }
 
     #[test]

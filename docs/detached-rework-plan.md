@@ -1459,9 +1459,35 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 `RawPageStore` を `ContextAsyncOwner` と `ViewerContextBundle` に登録した。`fs_pending` と同じ context-owned resource で、preview / source preparation / development の要求 ID、物理 source 指紋、現像 ticket、結果 channel と需要集合を所有する。park は未完了要求を取消し、Done / Blocked を保持する。generation 差し替えと drop はその context だけを破棄し、snapshot 再構築は表示 entry と owner を原子的に移す。明るさ変更は mounted / parked の各 owner に同じ RAW source transaction を適用する。detached の述語・viewport・window lifecycle は変更しない。
 
+2026-10-04 master v4.3.0 取り込み時の追補: 両ブランチの inline state を合わせると `App` が 110,104 bytes となり、既存の stack footprint 回帰の上限 110,000 bytes を超えた。`App` と `ViewerContextBundle` の `raw_pages` は唯一の owner のまま `Box<RawPageStore>` で保管し、`App` は 109,944 bytes となった。store 全体の move / swap、park、generation、cancel、drop は既存経路を保ち、新しい状態や detached 述語・viewport 分岐は加えない。実装担当と独立 Codex レビューは、状態の所有境界を変えず保管場所だけを heap へ移す構造修正であることに合意した。上限と既存テストは変更しない。
+
 **2026-09-27 RAW thumbnail ticket ownership (S2a)**
 
 `raw_thumb_develop` は `requested` と同じ viewer context が所有する idx / items generation / submission ID 付き map として `ViewerContextBundle` に加えた。旧世代の完了は同じ idx の新しい ticket を外さない。keep range 離脱、一覧世代変更、folder 移動、mounted context の pause/park（`fs_pending` を drain する境界）、drop でその context の ticket を cancel し、既存の canceled `ThumbMsg` で requested を解放する。別の detached flag や viewport 分岐は追加しない。
+
+**2026-09-30 §1.304 Collection root 可視採用時の main context 所有境界**
+
+Collection の明示 Open、物理子から root への復帰、offscreen 履歴準備後の root 採用を、可視一覧の置換前に共通 loader・ドライブ一覧も使う `change_main_context_for_visible_grid` へ通す。動画・音声の別窓は既存の promote で旧 items 世代・player・fs_cache と共に別 context へ移し、静止画・PDF は既存の park / close 方針を使う。passive / parked sibling と F12 linked の方針は変えない。移管不可なら履歴・surface・items の変更前に理由付きで終端する。移動元の履歴地点、検索中の履歴抑止、`return_to` は移管前に捕捉する。有効な同一 Collection root の fullscreen binding だけは旧 session の `cancel_pending` で installed snapshot を保持し、`begin` と空 items install をしない。明示 Open の即時読み込み・失敗表示と記録済み履歴、履歴復元の成功時確定は維持する。
+
+変更範囲は `src/app.rs` の Collection 親ナビ・履歴採用・既存 media promote 判定に加え、通常 loader・ドライブ一覧・親なし復帰の移管処理を同じ関数へ集約した部分、`src/app/collection_grid.rs` の root entry / binding 判定 / 回帰テストである。既存 3 経路の promote → park → close の順序と条件を保ち、detached の viewport、host、placement 判定は変更しない。誤った所有 context の items と cache を同時に更新する BA-7 の破綻を既存の移管境界で分ける修正で、guard・delay・retry・一括 reset ではない。ClaudeCode の設計改訂と独立 Codex 設計レビュー 2 回で構造的修正として合意した。モーダル化は Collection の非同期準備中に操作できる既存仕様を狭め、所有の誤りを解消しないため採用しなかった。別窓の閉鎖・再開は再生継続を失うため採用しなかった。
+
+監査実行で見つかった既存の監査漏れも `tools/viewer_context_audit/src/lib.rs` で修正した。A4 に既存の非 Windows 公開関数 2 件を登録し、A6 が `#[cfg(test)]` 付き local binding 内の呼出しをテスト専用として扱うようにした。registry / decoder の実装は変更していない。
+
+実装レビュー P2 の追補: `src/app/collection_grid.rs` の移管前 `return_to` 捕捉が Search / Snapshot の退場 fallback を落としていた。`src/global_search_ui.rs`、`src/app.rs`、`src/app/snapshot_ops.rs` の退場処理から戻り先計算を副作用のない関数へ切り出し、Collection 入口もそれを使う。`src/app/subfolder_expansion.rs` は合成 path の復帰状態を読む条件と take 条件を共有する。移管前に従来の退場順と canonical `return_to` の消費を再現して戻り先を確定し、退場処理は一度だけ走らせる。別窓 media の所有境界と detached viewport / host / placement は変更しない。通常 Open・別窓動画 Open × Search・Snapshot の回帰テストは d3f7e9c79 で失敗することを確認し、Snapshot とタグ表示が重なる場合の最後の fallback も検証した。
+
+再確認 P2 の追補: 戻り先の優先規則は共有したまま、通常の Search / Snapshot 退場では saved folder、canonical `return_to`、サブフォルダ展開の復帰状態を所有元から move する。Collection 移管前の読み取りだけが必要な fallback を複製し、transient から戻り先が決まれば現在 surface の復帰状態を余分に複製しない。これにより通常の検索終了時に動画サムネイル対応表や除外パス集合を同期コピーしない。移管・detached の所有境界は変えず、通常 Open・別窓動画 Open × Search・Snapshot の回帰テストを維持する。
+
+**2026-09-30 §1.301 動画ノーマライズ中の移動と native キー解決**
+
+native キーのモーダル gate は dispatch と同じ優先順位で解決した Action を使う。既存の `viewer_session_is_detached` を読んで、別窓の Enter / Escape が固定のセッション終了操作として先に処理される順序も保つ。移動要求時の scan 取消をやめ、移動先の採用・元動画の所有者終了にある共通 cleanup で取消す。別窓の scan は context ID で分離する。detached 述語自体、viewport、host、配置、focus、window lifecycle は変更しない。入力 gate と所有者の確定境界を揃える構造的修正であり、時間窓や新しい detached 状態による症状パッチではない。設計担当の方針と Codex の実装判断は一致している。
+
+**2026-10-01 §1.313 RatingPhysical 子のソート再表示 owner 転送**
+
+RatingPhysical 子の Immediate ソートが Navigation owner に落ち、WorkerScan の `CurrentViewOrderRefresh` も Collection owner しか運べず、評価一覧の親 chain と back／forward を失う不具合を修正する。F5 と同じ `current_folder_reload_owner` が選んだ単一の `OpenRequestOwner` を request に Box で保持し、各 consumer から共通採用境界までそのまま渡す。Box は App の既存 stack footprint 上限を守るためで、別の状態や owner を加えるものではない。共通の owner 有効性検証は選択 hint の変更前に行い、同じ path／order でも旧 generation の完了が現在の選択へ作用しないようにする。
+
+detached 固有コードで触れた箇所は `App::poll_detached_physical_folder_open` の `CurrentViewOrderRefresh` arm だけ。payload の `collection_owner` を `reload_owner` へ置換して既存 `apply_current_view_order_refresh` に転送する機械的変更で、Applied／Failed の扱いは既存のまま。detached の述語、viewport、geometry、配置、focus、window lifecycle は変更しない。guard／遅延／再試行による症状パッチではなく、生成時に確定した typed owner を採用まで保持する構造修正である。共通検証は既存 owner 契約の適用であり、detached 専用の条件分岐・flag は加えない。簡素化として F5 の owner 選択と既存 scan／採用経路を再利用し、新しい待機状態やモーダルは設けない。
+
+ClaudeCode（設計担当）は 2026-10-01、この機械的 owner 転送が症状パッチではなく構造修正であることに合意した。独立 Codex レビュー（gpt-6.1-sol / xhigh、session `01a0f38f-1566-75e0-bfa7-4f1fdf06d28b`）も 2026-10-01、同じ構造判断に合意し、§11 の変更範囲と理由が差分に一致することを確認した。実装担当の補助レビューをこの独立レビューとして扱わない。同レビューの全体判定は、合成ビュー pin 完了の UI thread I/O に対する P2 により changes needed だった。この P2 は共通 pin／metadata worker 境界で fix2 として修正し、detached 固有コードへの変更は追加しない。検証結果は [pin-reload-audit.md](pin-reload-audit.md) に記録する。
 
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 

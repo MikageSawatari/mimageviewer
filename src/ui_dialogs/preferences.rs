@@ -22,6 +22,11 @@ use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
 
 #[doc(hidden)]
+pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
+    pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
+}
+
+#[doc(hidden)]
 pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings {
         video_top_bar_locked: true,
@@ -1958,6 +1963,37 @@ fn merge_video_media_memory_for_preferences(
 }
 
 impl App {
+    pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
+        let old_raw_brightness = self.settings.raw_brightness;
+        let requested_raw_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
+        if requested_raw_parallelism != self.settings.raw_develop_parallelism {
+            if let Err(error) = self
+                .raw_develop_executor
+                .set_parallelism(requested_raw_parallelism as usize)
+            {
+                settings.raw_develop_parallelism = self.settings.raw_develop_parallelism;
+                self.show_feedback_toast(format!(
+                    "RAW の同時現像数を変更できませんでした: {error}"
+                ));
+            } else {
+                settings.raw_develop_parallelism = requested_raw_parallelism;
+            }
+        }
+        let media_duration_changed =
+            self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
+        let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
+        self.settings = settings;
+        if old_raw_brightness != self.settings.raw_brightness {
+            self.raw_brightness_changed();
+        }
+        if media_duration_changed {
+            self.invalidate_details_meta_requirements();
+        }
+        if books_root_changed {
+            self.sync_shared_favorite_indexers();
+        }
+    }
+
     pub(crate) fn open_preferences_page(&mut self, page: PreferencesPage) {
         self.open_preferences_request(PreferencesOpenRequest::page(page));
     }
@@ -2437,26 +2473,7 @@ impl App {
                 // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
                 // Settings に追加した場合はここにも追記が必要。
                 prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
-                let old_raw_brightness = self.settings.raw_brightness;
-                let requested_raw_parallelism = state.settings.raw_develop_parallelism.clamp(1, 10);
-                if requested_raw_parallelism != self.settings.raw_develop_parallelism {
-                    if let Err(error) = self
-                        .raw_develop_executor
-                        .set_parallelism(requested_raw_parallelism as usize)
-                    {
-                        state.settings.raw_develop_parallelism =
-                            self.settings.raw_develop_parallelism;
-                        self.show_feedback_toast(format!(
-                            "RAW の同時現像数を変更できませんでした: {error}"
-                        ));
-                    } else {
-                        state.settings.raw_develop_parallelism = requested_raw_parallelism;
-                    }
-                }
-                self.settings = state.settings;
-                if old_raw_brightness != self.settings.raw_brightness {
-                    self.raw_brightness_changed();
-                }
+                self.install_preferences_settings(state.settings);
                 if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
                     #[cfg(windows)]
                     self.invalidate_final_cover_spread_display_in_parked_contexts();
@@ -3674,6 +3691,66 @@ mod tests {
                 saved.raw_develop_parallelism
             );
         }
+    }
+
+    #[test]
+    fn preferences_books_root_change_submits_new_exclusion_to_name_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let favorite_root = app.tmp.path().join("preference-name-root");
+        std::fs::create_dir_all(&favorite_root).unwrap();
+        std::fs::write(favorite_root.join("indexed.zip"), b"").unwrap();
+        app.settings.book_root = Some(app.tmp.path().join("old-books-root"));
+        let mut favorite =
+            crate::settings::FavoriteEntry::new("name owner".into(), favorite_root.clone());
+        favorite.auto_index_structure = true;
+        let favorite_id = favorite.id;
+        app.settings.favorites = vec![favorite];
+        app.activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+        let db = app.search_index_db.as_ref().cloned().unwrap();
+        app.spawn_initial_name_index_supervisors();
+        let wait = |app: &App, expected_rows: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let complete = app
+                    .name_index_manager
+                    .as_ref()
+                    .unwrap()
+                    .all_initial_scans_done();
+                if complete && db.count_for_favorite(&favorite_root).unwrap() == expected_rows {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "name owner did not apply preferences exclusion"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait(&app, 1);
+        let mut edited = app.settings.clone();
+        edited.book_root = Some(favorite_root.clone());
+        app.install_preferences_settings(edited);
+        wait(&app, 0);
+        let stats = app.name_index_stats_by_id();
+        assert_eq!(
+            stats[&favorite_id].last_full_scan,
+            Some(crate::name_index_supervisor::NameFullScanOutcome::Complete)
+        );
+    }
+
+    #[test]
+    fn preferences_unchanged_effective_books_root_does_not_submit_index_configuration() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.book_root = None;
+        assert!(app.name_index_manager.is_none());
+        let mut edited = app.settings.clone();
+        // None と明示的 default の保存値が違っても、実効除外 root は同じ。
+        edited.book_root = Some(app.settings.books_root_path());
+        app.install_preferences_settings(edited);
+        assert!(
+            app.name_index_manager.is_none(),
+            "unchanged exclusion must not start/reconfigure the name owner"
+        );
     }
 
     fn disabled_trt_worker_snapshot() -> crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot {
@@ -5137,6 +5214,60 @@ mod tests {
                 .map(|item| item.name().into_owned())
                 .collect::<Vec<_>>(),
             ["two.jpg", "one.jpg", "unrated.jpg"],
+        );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-input-limit",
+        ));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // The search anchor intentionally animates a highlight; settle the scroll
+        // then stop that animation before querying controls in this headless test.
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        harness
+            .get_by_label("EffeTune に渡す前に 0dB を超える音を抑える")
+            .click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .effetune_pre_limiter_enabled
+        );
+        assert!(harness.state().settings.effetune_pre_limiter_enabled);
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert!(!harness.state().settings.effetune_pre_limiter_enabled);
+        let reloaded = Settings::load();
+        assert!(!reloaded.effetune_pre_limiter_enabled);
+        harness.state_mut().settings = reloaded;
+        let chain = harness.state().local_audio_dsp_chain();
+        assert!(!chain.effetune_pre_limiter_enabled);
+        // Exercise the actual limiter consumer with the saved local snapshot.
+        let input = [1.28, -1.27];
+        let mut limiter = crate::video::audio::EffetuneInputLimiter::new(1_000);
+        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune_pre_limiter_enabled);
+        assert_eq!(samples, input);
+        assert_eq!(latency, 0.0);
+        assert!(
+            !harness
+                .state()
+                .remote_clockless_audio_processing(1.0)
+                .effetune_pre_limiter_enabled()
         );
     }
 

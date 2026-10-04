@@ -77,12 +77,15 @@ enum WorkerMessage {
 }
 
 impl WorkerMessage {
-    fn committed_video_pin_changes(&self) -> usize {
+    fn committed_thumbnail_pin_changes(&self) -> usize {
         match self {
             Self::Import {
                 result: Ok(summary),
                 ..
-            } => summary.committed.video_pins,
+            } => summary
+                .committed
+                .video_pins
+                .saturating_add(summary.committed.folder_pins),
             Self::Progress(_)
             | Self::Preview(_)
             | Self::Export { .. }
@@ -408,7 +411,14 @@ impl App {
             self.advance_metadata_import_terminal_refresh(root, *recursive)
         });
         if refresh_ready {
-            let requests = self.take_metadata_import_refresh_requests();
+            let changed = self
+                .metadata_transfer
+                .as_ref()
+                .and_then(|state| state.pending_import_result.as_ref())
+                .and_then(|result| result.as_ref().ok())
+                .map(|summary| summary.changed)
+                .unwrap_or_default();
+            let requests = self.take_metadata_import_refresh_requests(changed);
             if let Some(state) = self.metadata_transfer.as_mut() {
                 start_metadata_import_refresh_worker(state, requests);
             }
@@ -510,7 +520,7 @@ impl App {
         let mut begin_terminal_refresh = false;
         let mut request_edit_preview_clear = false;
         let mut restart_terminal_refresh = false;
-        let mut committed_video_pin_changes = 0usize;
+        let mut committed_thumbnail_pin_changes = 0usize;
         let clear_status = self.metadata_transfer.as_ref().and_then(|state| {
             let Stage::WaitingForEditPreviewClear(completed) = &state.stage else {
                 return None;
@@ -533,8 +543,8 @@ impl App {
             begin_terminal_refresh = true;
         }
         for message in messages {
-            committed_video_pin_changes =
-                committed_video_pin_changes.saturating_add(message.committed_video_pin_changes());
+            committed_thumbnail_pin_changes = committed_thumbnail_pin_changes
+                .saturating_add(message.committed_thumbnail_pin_changes());
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
             };
@@ -605,8 +615,9 @@ impl App {
                 }
             }
         }
-        self.advance_collection_thumbnail_source_epoch_for_metadata_import(
-            committed_video_pin_changes,
+        self.advance_collection_thumbnail_source_epoch_for_pin_commit(
+            committed_thumbnail_pin_changes,
+            "metadata_import",
         );
         if disconnected
             && self.metadata_transfer.as_ref().is_some_and(|state| {
@@ -1496,6 +1507,7 @@ mod tests {
     fn committed_video_pin_epoch_signal_belongs_only_to_the_import_result() {
         let mut summary = ImportSummary::default();
         summary.committed.video_pins = 3;
+        summary.committed.folder_pins = 2;
         let import = WorkerMessage::Import {
             result: Ok(summary),
             resource_error: None,
@@ -1507,15 +1519,15 @@ mod tests {
             errors: vec!["retryable refresh detail".into()],
         });
 
-        assert_eq!(import.committed_video_pin_changes(), 3);
-        assert_eq!(refresh.committed_video_pin_changes(), 0);
+        assert_eq!(import.committed_thumbnail_pin_changes(), 5);
+        assert_eq!(refresh.committed_thumbnail_pin_changes(), 0);
         assert_eq!(
             WorkerMessage::Import {
                 result: Err("import failed".into()),
                 resource_error: None,
                 view_trim_saved: false,
             }
-            .committed_video_pin_changes(),
+            .committed_thumbnail_pin_changes(),
             0
         );
     }

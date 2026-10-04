@@ -5416,6 +5416,7 @@ impl App {
             | Ev::CommitSeekStrip { .. }
             | Ev::SetSeekStripView { .. }
             | Ev::SetSeekStripHeight { .. }
+            | Ev::SetSeekPreviewSize { .. }
             | Ev::StepSeekStripRange { .. }
             | Ev::ToggleTileMode
             | Ev::TogglePerfOverlay
@@ -6071,6 +6072,9 @@ impl App {
                     delta,
                 )) => self.navigate_native_video_fullscreen(ctx, fs_idx, delta),
                 Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(step)) => {
+                    if self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                        return;
+                    }
                     let new_volume = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
                         FsCacheEntry::Video { player, .. } => {
                             let volume = crate::settings::step_video_volume_by_fader_key_step(
@@ -6217,6 +6221,18 @@ impl App {
                 if self.set_video_seek_strip_height(fs_idx, height) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SetSeekPreviewSize {
+                size,
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
+                if self.set_video_seek_preview_size(fs_idx, size) {
+                    self.mark_native_video_hud_activity(ctx);
                 }
             }
             crate::video::NativeVideoOutputEvent::StepSeekStripRange { steps, stamp } => {
@@ -6904,6 +6920,13 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
+                if self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                    if !wheel.ctrl {
+                        let delta = if wheel.delta < 0 { 1 } else { -1 };
+                        self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
+                    }
+                    return;
+                }
                 if self.apply_native_video_panorama_wheel(ctx, fs_idx, i32::from(wheel.delta)) {
                     return;
                 }
@@ -7484,6 +7507,11 @@ impl App {
     /// take() で state を捨てて新規スキャン即開始可能にする。
     #[cfg(windows)]
     pub(crate) fn handle_cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        self.cancel_normalize_scan(ctx, fs_idx, "user_cancelled");
+    }
+
+    #[cfg(windows)]
+    fn cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize, reason: &'static str) {
         let should_drop = self
             .normalize_state
             .as_ref()
@@ -7498,7 +7526,7 @@ impl App {
                 state.fs_idx,
                 &state.file_path,
                 "normalize_scan_terminal",
-                "user_cancelled",
+                reason,
                 state.provisional_result.map(|result| result.gain_db),
             );
             self.normalize_auto_scan_suppressed.insert(
@@ -10354,6 +10382,24 @@ impl App {
         true
     }
 
+    #[cfg(windows)]
+    pub(crate) fn set_video_seek_preview_size(
+        &mut self,
+        fs_idx: usize,
+        size: crate::settings::VideoSeekPreviewSize,
+    ) -> bool {
+        if self.settings.video_seek_preview_size == size {
+            return false;
+        }
+        self.settings.video_seek_preview_size = size;
+        self.settings.save();
+        let bar_lock = self.native_bar_lock_state();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_bar_lock_state(bar_lock);
+        }
+        true
+    }
+
     /// 全体表示のあいだ、軸と中心を帯の実寸へ追随させる。
     #[cfg(windows)]
     fn sync_video_seek_strip_whole_span(&mut self) -> bool {
@@ -12164,6 +12210,127 @@ impl App {
         });
     }
 
+    /// Resolve the prefix of native dispatch through every file/folder navigation action.
+    /// Later media commands cannot take precedence over those actions. Fixed-key branches in
+    /// this prefix return None, so the modal scan never admits a conflicting non-navigation key.
+    #[cfg(windows)]
+    fn resolve_native_video_key_action(
+        &self,
+        fs_idx: usize,
+        key: &crate::video::native_window::NativeVideoKeyEvent,
+        rating_key_matches: bool,
+        video_audio_vst_active: bool,
+    ) -> Option<KeyAction> {
+        if video_audio_vst_active {
+            if key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt {
+                return None;
+            }
+            if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoToggleAudioMode, key)
+            {
+                return Some(KeyAction::VideoToggleAudioMode);
+            }
+        }
+        if self.viewer_session_is_detached()
+            && !key.repeat
+            && !key.shift
+            && !key.ctrl
+            && !key.alt
+            && matches!(key.virtual_key, 0x0D | 0x1B)
+        {
+            return None;
+        }
+        if rating_key_matches {
+            return None;
+        }
+        let matches = |action| self.keymap.matches_vk_action(action, key);
+        if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
+            for action in VIDEO_ADJUST_SLOT_ACTIONS {
+                if matches(action) {
+                    return Some(action);
+                }
+            }
+        }
+        let native_side_panel = crate::ui_helpers::fs_side_panel_key_owner(
+            matches!(self.items.get(fs_idx), Some(GridItem::Video(_))),
+            self.fs_music_view_active(fs_idx),
+        ) == crate::ui_helpers::FsSidePanelKeyOwner::NativeVideo;
+        if native_side_panel && !key.repeat && matches(KeyAction::FsToggleMetadata) {
+            return Some(KeyAction::FsToggleMetadata);
+        }
+        for action in [
+            KeyAction::VideoCloseFullscreen,
+            KeyAction::VideoExternalPlayer,
+            KeyAction::VideoPlayPause,
+        ] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        if key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt {
+            return None;
+        }
+        for action in [
+            KeyAction::FsBackToList,
+            KeyAction::VideoSeekStart,
+            KeyAction::ToggleAlwaysOnTop,
+            KeyAction::ToggleDetachedViewerMode,
+            KeyAction::FsToggleWindowMode,
+            KeyAction::FsPanoramaProjection,
+            KeyAction::FsPanorama,
+        ] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        if self.video_tile_mode_active && !key.alt && matches!(key.virtual_key, 0x25 | 0x27) {
+            return None;
+        }
+        for action in [
+            KeyAction::VideoFrameStepBack,
+            KeyAction::VideoFrameStepForward,
+            KeyAction::VideoSeekBackSmall,
+            KeyAction::VideoSeekForwardSmall,
+            KeyAction::VideoSeekBackMedium,
+            KeyAction::VideoSeekForwardMedium,
+            KeyAction::VideoSeekBackLarge,
+            KeyAction::VideoSeekForwardLarge,
+        ] {
+            if matches(action) {
+                return Some(action);
+            }
+        }
+        if matches!(key.virtual_key, 0x25 | 0x27) && !key.ctrl && !key.shift && !key.alt {
+            return None;
+        }
+        for action in [
+            KeyAction::FsCtrlNavPrev,
+            KeyAction::FsCtrlNavNext,
+            KeyAction::FsSiblingPrev,
+            KeyAction::FsSiblingNext,
+        ] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        if matches!(key.virtual_key, 0xA6 | 0xA7) {
+            return None;
+        }
+        for action in [KeyAction::VideoPrevFile, KeyAction::VideoNextFile] {
+            if matches(action) {
+                return Some(action);
+            }
+        }
+        for action in [KeyAction::FsJumpFirst, KeyAction::FsJumpLast] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        None
+    }
+
     #[cfg(windows)]
     fn dispatch_native_video_key_event(
         &mut self,
@@ -12187,24 +12354,52 @@ impl App {
             }
             return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::MusicVstShell);
         }
-        // 7e: 「動画→音声モード」の VST ホスト表示中は Escape / Z (音声モードトグル) で VST ホストを
-        // 畳んで波形ビュー (音声モード) へ戻る。他キーは通常動画として処理する (presenter 前面で
-        // native focus のため)。native presenter (プラグイン GUI 非フォーカス) にキーが来たときの
-        // ゲート (music_vst_shell の Escape 離脱と対を成す)。
-        if self.video_audio_vst_active_for(fs_idx) {
-            let esc = key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt;
-            let toggle = !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoToggleAudioMode, &key);
-            if esc {
+        // Resolve once in dispatch order. The modal gate and the branches below use this same
+        // Action, so an overlapping binding cannot admit a key that dispatches elsewhere.
+        let rating_key = self.keymap.native_video_rating_action(&key);
+        let video_audio_vst_active = self.video_audio_vst_active_for(fs_idx);
+        let resolved_action = self.resolve_native_video_key_action(
+            fs_idx,
+            &key,
+            rating_key.is_some(),
+            video_audio_vst_active,
+        );
+        let modal_escape_fixed =
+            key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt;
+        // The VST host's audio-mode toggle exited to the music view before the scan gate.
+        // Its priority is resolved above, so a conflicting navigation binding still exits VST.
+        let modal_vst_exit =
+            video_audio_vst_active && resolved_action == Some(KeyAction::VideoToggleAudioMode);
+        if self.normalize_scan_is_modal_for_current_player(fs_idx)
+            && !modal_escape_fixed
+            && !modal_vst_exit
+            && !matches!(
+                resolved_action,
+                Some(
+                    KeyAction::VideoPrevFile
+                        | KeyAction::VideoNextFile
+                        | KeyAction::FsJumpFirst
+                        | KeyAction::FsJumpLast
+                        | KeyAction::FsCtrlNavPrev
+                        | KeyAction::FsCtrlNavNext
+                        | KeyAction::FsSiblingPrev
+                        | KeyAction::FsSiblingNext
+                )
+            )
+        {
+            return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
+        }
+        // The VST host handles Escape and its audio-mode toggle before ordinary video keys.
+        // Both retain their pre-modal behavior through the gate above.
+        if video_audio_vst_active {
+            if modal_escape_fixed {
                 self.exit_video_audio_vst(ctx, fs_idx);
                 self.request_native_video_hud_repaint(ctx);
                 return NativeVideoKeyOutcome::FixedAction(
                     NativeVideoFixedKeyAction::ExitVideoAudioVst,
                 );
             }
-            if toggle {
+            if resolved_action == Some(KeyAction::VideoToggleAudioMode) {
                 let outcome =
                     self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
                 debug_assert_eq!(outcome, VideoAudioToggleOutcome::ExitedVst);
@@ -12213,14 +12408,6 @@ impl App {
                     NativeVideoFixedKeyAction::ExitVideoAudioVst,
                 );
             }
-        }
-        // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
-        // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
-        // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
-        if self.normalize_scan_is_modal_for_current_player(fs_idx)
-            && !(key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt)
-        {
-            return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
         }
         if self.viewer_session_is_detached()
             && !key.repeat
@@ -12235,7 +12422,7 @@ impl App {
             );
         }
         let mut hud_activity = true;
-        if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
+        if let Some(rating_key) = rating_key {
             if rating_key.container {
                 hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
             } else {
@@ -12261,10 +12448,11 @@ impl App {
             return NativeVideoKeyOutcome::FixedAction(action);
         }
         if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
-            if let Some(slot_idx) = VIDEO_ADJUST_SLOT_ACTIONS
-                .iter()
-                .position(|action| self.keymap.matches_vk_action(*action, &key))
-            {
+            if let Some(slot_idx) = resolved_action.and_then(|resolved| {
+                VIDEO_ADJUST_SLOT_ACTIONS
+                    .iter()
+                    .position(|action| *action == resolved)
+            }) {
                 self.dispatch_video_adjust_slot_key(
                     ctx,
                     slot_idx,
@@ -12280,9 +12468,7 @@ impl App {
             == crate::ui_helpers::FsSidePanelKeyOwner::NativeVideo;
         if side_panel_key_owned_by_native
             && !key.repeat
-            && self
-                .keymap
-                .matches_vk_action(KeyAction::FsToggleMetadata, &key)
+            && resolved_action == Some(KeyAction::FsToggleMetadata)
         {
             self.cycle_fs_side_panel_mode();
             let label = self.settings.fullscreen_side_panel_mode.label();
@@ -12292,22 +12478,14 @@ impl App {
             return NativeVideoKeyOutcome::Action(KeyAction::FsToggleMetadata);
         }
         let outcome = match key.virtual_key {
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoCloseFullscreen, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoCloseFullscreen) => {
                 self.handle_fullscreen_close_request_immediate();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoCloseFullscreen)
             }
             // Shift+Enter: open in external player, matching the legacy egui
             // fullscreen video path.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoExternalPlayer, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoExternalPlayer) => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     crate::ui_helpers::open_external_player(player.path());
                 }
@@ -12316,19 +12494,13 @@ impl App {
             // Enter in tile mode: start playback from the keyboard cursor.
             _ if !key.repeat
                 && self.video_tile_mode_active
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
+                && resolved_action == Some(KeyAction::VideoPlayPause) =>
             {
                 self.play_selected_video_tile(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Enter: play / pause.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoPlayPause) => {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
@@ -12359,17 +12531,13 @@ impl App {
                     NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::CloseFullscreen)
                 }
             }
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsBackToList, &key) => {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsBackToList) => {
                 self.close_fullscreen();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::FsBackToList)
             }
             // W: seek to start and play.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoSeekStart, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoSeekStart) => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
@@ -12378,22 +12546,14 @@ impl App {
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::ToggleAlwaysOnTop, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::ToggleAlwaysOnTop) => {
                 self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
             }
             // F12: detached viewer mode toggle. Keep this as a keymap action
             // so a future remap works when the native video HWND has focus.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::ToggleDetachedViewerMode, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::ToggleDetachedViewerMode) => {
                 // ここへ来る `repeat=false` は、**現 HWND・現 epoch が生成した
                 // first-key-down** である。stale 判定を App 側でやり直さないこと:
                 //
@@ -12416,20 +12576,12 @@ impl App {
             // toggle_video_window_mode は presenter rebuild を伴うので
             // toggle_still_window_mode (設定 flip だけ) では代用できない。
             // normalize scan 中は上の `normalize_state` ガードで既に弾かれている。
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsToggleWindowMode, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsToggleWindowMode) => {
                 self.toggle_video_window_mode_for_input(ctx);
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::FsToggleWindowMode)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsPanoramaProjection, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsPanoramaProjection) => {
                 if self.native_video_panorama_input_active(fs_idx)
                     && self.cycle_panorama_projection().is_some()
                 {
@@ -12437,7 +12589,7 @@ impl App {
                 }
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanoramaProjection)
             }
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsPanorama, &key) => {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsPanorama) => {
                 self.toggle_native_video_display_mode_for_input(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanorama)
             }
@@ -12453,74 +12605,50 @@ impl App {
                 NativeVideoKeyOutcome::FixedAction(action)
             }
             // Ctrl+Shift+Left / Right by default: frame step and pause.
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoFrameStepBack, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoFrameStepBack) => {
                 self.step_video_frame(ctx, fs_idx, -1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepBack)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoFrameStepForward, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoFrameStepForward) => {
                 self.step_video_frame(ctx, fs_idx, 1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepForward)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekBackSmall, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekBackSmall) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Small);
                 self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekForwardSmall, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekForwardSmall) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Small);
                 self.native_video_seek_relative_with_hint(fs_idx, seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardSmall)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekBackMedium, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekBackMedium) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
                 self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekForwardMedium, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekForwardMedium) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
                 self.native_video_seek_relative_with_hint(fs_idx, seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardMedium)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekBackLarge, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekBackLarge) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Large);
                 self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackLarge)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekForwardLarge, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekForwardLarge) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Large);
@@ -12543,22 +12671,14 @@ impl App {
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekForwardMedium)
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsCtrlNavPrev, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsCtrlNavPrev) => {
                 crate::logger::log(format!(
                     "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} keymap=FsCtrlNavPrev"
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavPrev)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsCtrlNavNext, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsCtrlNavNext) => {
                 crate::logger::log(format!(
                     "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} keymap=FsCtrlNavNext"
                 ));
@@ -12566,19 +12686,11 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavNext)
             }
             // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsSiblingPrev, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsSiblingPrev) => {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, false, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsSiblingPrev)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsSiblingNext, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsSiblingNext) => {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, true, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsSiblingNext)
             }
@@ -12603,24 +12715,18 @@ impl App {
                 );
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoPrevFile, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoPrevFile) => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPrevFile)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoNextFile, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoNextFile) => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoNextFile)
             }
             // Home / End (keymap: FsJumpFirst/FsJumpLast): jump to the first / last visible navigable item.
             // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
             // (Phase 1: 画像と挙動を揃える、Codex 第 1 ラウンド P2 反映)。
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpFirst, &key) => {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsJumpFirst) => {
                 let display_order = self.current_reader_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
@@ -12639,7 +12745,7 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsJumpFirst)
             }
             // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpLast, &key) => {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsJumpLast) => {
                 let display_order = self.current_reader_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);

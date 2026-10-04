@@ -19,8 +19,12 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 lopdf = "0.36"
 percent-encoding = "2"
+url = "2"
 walkdir = "2"
 base64 = "0.22"
 sha2 = "0.10"
 webview2-com = "0.39"
 windows = { version = "0.62", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"

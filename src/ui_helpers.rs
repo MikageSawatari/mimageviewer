@@ -13,6 +13,24 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// お気に入り編集と環境設定で共有する起動時の索引確認設定。
+pub const OFFLINE_CHANGE_SCAN_SETTING_LABEL: &str =
+    "起動時に、mIV を終了していた間の変更を確認しない";
+
+pub fn draw_offline_change_scan_setting(ui: &mut egui::Ui, skip: &mut bool) -> egui::Response {
+    let response = ui.checkbox(skip, OFFLINE_CHANGE_SCAN_SETTING_LABEL);
+    ui.label(egui::RichText::new(
+        "常駐して使っている場合に起動を速くします。終了中に追加・削除・移動したファイルは、検索結果に反映されないことがあります。その場合は [今すぐ確認] を押してください。"
+    ).weak().size(11.0));
+    response.on_hover_text("変更は次回起動から有効です。初めて索引を作る場合は確認を行います。")
+}
+
+/// 全索引の手動確認。呼出元が非同期の要求を提出する。
+pub fn draw_index_full_check_button(ui: &mut egui::Ui) -> egui::Response {
+    ui.button("今すぐ確認")
+        .on_hover_text("索引を有効にしたお気に入りを確認し、終了中の変更も検索結果に反映します。")
+}
+
 /// エラー表示の標準テキスト色。
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
@@ -1367,6 +1385,15 @@ pub fn draw_overlay_upscaled_video_badge(
         3.0,
         egui::Color32::from_rgba_unmultiplied(20, 120, 130, 215),
     );
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
+/// Media length stays legible over bright and dark thumbnail content in either theme.
+pub fn draw_overlay_media_duration_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(placement.rect, 3.0, egui::Color32::from_black_alpha(190));
     draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 

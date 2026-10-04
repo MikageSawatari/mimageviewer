@@ -873,6 +873,9 @@ impl crate::app::App {
             self.fs_transparent_bg_mode,
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
+        #[cfg(windows)]
+        self.effetune
+            .set_remote_session_source(Some(handle.clone()));
         self.remote_session_ui.handle = Some(handle);
     }
 
@@ -883,6 +886,8 @@ impl crate::app::App {
         let Some(handle) = self.remote_session_ui.handle.take() else {
             return;
         };
+        #[cfg(windows)]
+        self.effetune.set_remote_session_source(None);
         self.retire_current_remote_audio_stream();
         let generation = handle.retire_app_admission();
         if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
@@ -1002,6 +1007,8 @@ impl crate::app::App {
                 value.phase
             });
         let blocks_local_control = remote_phase.blocks_local_control();
+        #[cfg(windows)]
+        self.effetune.set_remote_session(blocks_local_control);
         let acquisition_changed = snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.acquisition_sequence != self.remote_session_ui.last_acquisition_sequence
         });
@@ -1281,7 +1288,7 @@ impl crate::app::App {
         })
     }
 
-    fn remote_clockless_audio_processing(
+    pub(crate) fn remote_clockless_audio_processing(
         &self,
         normalize_gain: f64,
     ) -> crate::video::clockless_transcode::ClocklessAudioProcessing {
@@ -1329,6 +1336,7 @@ impl crate::app::App {
                 user_warning,
                 effetune_warning,
             )
+            .with_effetune_preferences(&self.settings)
         }
     }
 

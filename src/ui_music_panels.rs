@@ -1999,7 +1999,7 @@ impl App {
 
         // 中央パネル
         let panel_w = 420.0_f32.min((rect.width() - 40.0).max(120.0));
-        let panel_h = 110.0_f32;
+        let panel_h = 150.0_f32;
         let panel_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(panel_w, panel_h));
         painter.rect_filled(
             panel_rect,
@@ -2079,6 +2079,31 @@ impl App {
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if cancel_resp.clicked() || esc {
             self.handle_cancel_normalize_scan(ctx, fs_idx);
+        }
+        let nav_size = egui::vec2(104.0, 28.0);
+        let nav_y = panel_rect.max.y - nav_size.y - 9.0;
+        for (direction, x, label) in [
+            (-1, panel_rect.center().x - nav_size.x - 6.0, "前の項目"),
+            (1, panel_rect.center().x + 6.0, "次の項目"),
+        ] {
+            let nav_rect = egui::Rect::from_min_size(egui::pos2(x, nav_y), nav_size);
+            let response = ui.interact(
+                nav_rect,
+                ui.id()
+                    .with(("music_normalize_file_nav", fs_idx, direction)),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, nav_rect, response.hovered(), false);
+            painter.text(
+                nav_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(13.0),
+                egui::Color32::WHITE,
+            );
+            if response.hover_tip_dark(label).clicked() {
+                self.music_navigate_file(ctx, fs_idx, direction);
+            }
         }
     }
 }

@@ -9,24 +9,17 @@
 //! - メタ索引の supervisor とは独立に動く (別 DB、別スレッド、キャンセル独立)。
 //! - Tantivy writer 制約は無いので複数 favorite を並列に走らせても問題ない。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress_excluding};
+use crate::folder_tree::is_apple_double;
 use crate::indexer_progress::ProgressReporter;
 use crate::search_index_db::{IndexEntry, IndexKind, SearchIndexDb};
 
-/// `walk_dirs_recursive_with_progress` の `on_error` と Pass 2 の `read_dir` 失敗ブランチ
-/// から共有する rate-limited logger。
-///
-/// 同一 path について 30 秒以内の再 log を抑制 (= 一過性のロック / 権限不足で毎フレーム
-/// 同じ行が走るケースで `mimageviewer.log` を膨張させない)。`HashMap` をローカルに 1 つ
-/// 持つことで、Pass 1 の再帰呼び出し越し / Pass 2 のループ越しで抑制が継続する
-/// (Codex P2 第 2 レビュー指摘: `folder_tree.rs` の汎用 DFS に直接 logging を入れずに、
-/// 呼び出し側 (本 module) でまとめて持つ設計)。
+/// フル走査の read_dir 失敗を path ごとに 30 秒間抑制する logger。
 struct ReadDirLogger {
     last_logged: HashMap<PathBuf, Instant>,
 }
@@ -61,8 +54,10 @@ impl ReadDirLogger {
 pub struct BulkSummary {
     pub folders_visited: usize,
     pub entries_written: usize,
+    /// 子集合が変化して実際に置換したフォルダ数 (空集合への置換も含む)。
+    pub folders_written: usize,
     pub cancelled: bool,
-    /// Pass 1 / Pass 2 で `read_dir` / `file_type` / `upsert_children` のいずれかが失敗
+    /// 走査中に `read_dir` / `file_type` / DB 更新のいずれかが失敗
     /// したか。`true` の場合は post-scan prune を skip する (不完全観測で正当な行を
     /// 消さないため — Codex P2 第 11 レビュー指摘)。
     pub had_error: bool,
@@ -87,6 +82,30 @@ pub fn run_bulk_name_index(
     cancel: &AtomicBool,
     progress: Option<&ProgressReporter>,
 ) -> BulkSummary {
+    run_bulk_name_index_with_reader(
+        fav_path,
+        db,
+        activity_gate,
+        excluded_roots,
+        cancel,
+        progress,
+        &mut |path| std::fs::read_dir(path),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bulk_name_index_with_reader<I>(
+    fav_path: &Path,
+    db: &SearchIndexDb,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    excluded_roots: &[PathBuf],
+    cancel: &AtomicBool,
+    progress: Option<&ProgressReporter>,
+    read_dir: &mut impl FnMut(&Path) -> std::io::Result<I>,
+) -> BulkSummary
+where
+    I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
     let mut summary = BulkSummary::default();
 
     if let Some(p) = progress {
@@ -99,85 +118,77 @@ pub fn run_bulk_name_index(
     // (旧実装は秒精度で、同秒に連続スキャンが入ると stale 行が残留するバグがあった)
     let scan_start_stamp = crate::search_index_db::next_write_stamp();
 
-    // Pass 1: サブフォルダ列挙。`on_visit` は各フォルダの `read_dir` 前に呼ばれるので、
-    // ここで ActivityGate を待てば再帰中でもユーザー操作中はフォルダ単位で列挙が停止する。
-    // (cancel 伝播は `walk_dirs_recursive_with_progress` 側の責務なので wait のみ)
-    // `on_error` は read_dir 失敗を rate-limit して log + had_error フラグを立てる
-    // (Codex P2 第 11 レビュー指摘: 不完全観測時は post-scan prune を skip)。
-    let mut found: Vec<PathBuf> = Vec::new();
+    let total_folders = match db.previous_folder_count(fav_path) {
+        Ok(count) => count,
+        Err(e) => {
+            crate::logger::log(format!("name_bulk_indexer: folder count failed: {e}"));
+            None
+        }
+    };
     let mut read_dir_logger = ReadDirLogger::new();
     let mut had_error = false;
-    walk_dirs_recursive_with_progress_excluding(
-        fav_path,
-        &mut found,
-        cancel,
-        &mut |cur| {
-            if let Some(gate) = activity_gate {
-                gate.wait_until_idle(cancel);
-            }
-            if let Some(p) = progress {
-                let display = cur.strip_prefix(fav_path).unwrap_or(cur).display();
-                p.set(format!("フォルダ列挙 {}", display));
-            }
-        },
-        &mut |p, e| {
-            had_error = true;
-            read_dir_logger.log(p, e);
-        },
-        // 1 フォルダ内の entries ループ (file_type per entry) でも 64 件ごとに
-        // ActivityGate を見る。huge folder の file_type 連続呼び出しで indexer が
-        // HDD seek を握り続けないようにする。
-        activity_gate,
-        excluded_roots,
-    );
-    if cancel.load(Ordering::Relaxed) {
-        summary.cancelled = true;
-        return summary;
-    }
-    summary.folders_visited = found.len();
-    let total_folders = found.len();
-
-    // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile を集めて upsert (動画は除外 §4.2)
-    for (i, folder) in found.iter().enumerate() {
-        // フォルダ 1 つ分を処理してから次でまた判定 (gate + cancel 両対応)。
+    // canonical key は循環検出専用。prune は DB と同じ列挙パスの key を使う。
+    let mut cycle_keys = HashSet::new();
+    let mut visited_parents = HashSet::new();
+    let mut pending = vec![(fav_path.to_path_buf(), 0u32)];
+    const MAX_WALK_DEPTH: u32 = 64;
+    while let Some((folder, depth)) = pending.pop() {
         if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
             summary.cancelled = true;
             break;
         }
-        if let Some(p) = progress {
-            // カウントを先頭に / フォルダは favorite 相対でフルパスが切れにくいようにする。
-            let display = folder.strip_prefix(fav_path).unwrap_or(folder).display();
-            p.set_msg_and_count(
-                format!("取込 ({}/{}) {}", i + 1, total_folders, display),
-                (i + 1) as u64,
-                total_folders as u64,
-            );
+        if depth > MAX_WALK_DEPTH {
+            // 深さ上限の先は未観測なので、prune と scanned_once の成功扱いを避ける。
+            had_error = true;
+            continue;
         }
-        let entries = match std::fs::read_dir(folder) {
-            Ok(e) => e,
+        if crate::books::path_is_under_any(&folder, excluded_roots)
+            || !crate::fs_entry::mark_directory_visited(&folder, &mut cycle_keys)
+        {
+            continue;
+        }
+        // 存在しない root は従来どおり完全な空走査。アクセス拒否は不在と決めない。
+        if depth == 0 {
+            match std::fs::metadata(&folder) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    had_error = true;
+                    read_dir_logger.log(&folder, &error);
+                    continue;
+                }
+            }
+        }
+        if let Some(p) = progress {
+            let display = folder.strip_prefix(fav_path).unwrap_or(&folder).display();
+            p.set(format!("フォルダ列挙 {}", display));
+        }
+        let entries = match read_dir(&folder) {
+            Ok(entries) => entries,
             Err(e) => {
                 had_error = true;
-                read_dir_logger.log(folder, &e);
+                read_dir_logger.log(&folder, &e);
                 continue;
             }
         };
-        // `collect_index_entries` が per-entry エラー (DirEntry::Err / file_type 失敗) を
-        // 検知して had_entry_error=true で返す (Codex P2 第 11 レビュー指摘)。
-        // yield_check で 64 entry ごとに ActivityGate を見る (動画オープン等で
-        // 中断したいケースの応答性向上)。
-        let (children, had_entry_error) = collect_index_entries(
+        // 1 回の read_dir から索引対象と子フォルダを両方得る。
+        let mut subfolders = Vec::new();
+        let (children, had_entry_error) = collect_index_entries_with_cancel(
             entries,
             "name_bulk_indexer",
             activity_gate.map(|g| (g, cancel)),
             excluded_roots,
+            Some(cancel),
+            Some(&mut subfolders),
         );
+        // 観測できた子の走査は続けるが、不完全な親を置換してはならない。
+        pending.extend(subfolders.into_iter().rev().map(|path| (path, depth + 1)));
+        if cancel.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            break;
+        }
         if had_entry_error {
-            // **upsert を skip する** (Codex P2 第 12 レビュー指摘):
-            // `upsert_children` は親直下を DELETE → INSERT で authoritative replace するので、
-            // 観測できなかった legit 子エントリがこの瞬間に消えてしまう。post-scan prune を
-            // skip しても、直接子の削除はもう発生している。
-            // 不完全観測のフォルダ全体を skip して既存行を保護する (次回 watcher event /
-            // 次回起動 walker の 3-way diff で補修される設計に揃える)。
             had_error = true;
             crate::logger::log(format!(
                 "name_bulk_indexer: skipping upsert_children for {} (per-entry error: incomplete observation)",
@@ -185,30 +196,47 @@ pub fn run_bulk_name_index(
             ));
             continue;
         }
-        // **Codex P2 #1 回帰修正 (2026-04)**: `children.is_empty()` でも continue せず、
-        // `upsert_children` を呼び出す。旧実装はここで skip していたため、アプリ停止中に
-        // 子フォルダ/ZIP/PDF/動画がすべて削除されて「空になった親フォルダ」では、
-        // upsert_children の DELETE が走らず古い行が残り続けるバグがあった。
-        // (tests/search_name_e2e.rs::full_scan_removes_stale_entries_from_became_empty_folder)
-        // upsert_children は DELETE → INSERT の順なので、children が空のときは
-        // DELETE だけが走って「この親配下の子エントリを全消去」する正しい挙動になる。
-        //
-        // **Codex P2 race 対策**: upsert_children 直前にも cancel を確認する。
-        // これで「UI が OFF に切り替えた → clear_for_favorite が走る → 直前の
-        // in-flight upsert が race で書き戻す」窓を最小化する。
+        let mut parent_key = crate::search_index_db::normalize_path(&folder);
+        // DB の子 key から得る親と揃える (drive root と filesystem root は '/' を保持)。
+        if parent_key != "/" && !parent_key.ends_with(":/") {
+            parent_key.truncate(parent_key.trim_end_matches('/').len());
+        }
+        visited_parents.insert(parent_key);
+        summary.folders_visited += 1;
+        if let Some(p) = progress {
+            let display = folder.strip_prefix(fav_path).unwrap_or(&folder).display();
+            let current = summary.folders_visited as u64;
+            if let Some(total) = total_folders {
+                p.set_msg_and_count(
+                    format!("取込 ({current}/{total}) {display}"),
+                    current,
+                    total,
+                );
+            } else {
+                p.set_msg_and_count(format!("取込 ({current}) {display}"), current, 0);
+            }
+        }
+        // 空になったフォルダも比較し、旧行があれば DELETE を実行する。
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
         }
-        summary.entries_written += children.len();
-        if let Err(e) = db.upsert_children(fav_path, folder, &children) {
-            had_error = true;
-            crate::logger::log(format!(
-                "name_bulk_indexer: upsert_children failed for {}: {e}",
-                folder.display()
-            ));
+        match db.upsert_children_if_changed(fav_path, &folder, &children) {
+            Ok(true) => {
+                summary.folders_written += 1;
+                summary.entries_written += children.len();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                had_error = true;
+                crate::logger::log(format!(
+                    "name_bulk_indexer: upsert_children failed for {}: {e}",
+                    folder.display()
+                ));
+            }
         }
     }
+    summary.cancelled |= cancel.load(Ordering::Relaxed);
 
     summary.had_error = had_error;
 
@@ -220,16 +248,19 @@ pub fn run_bulk_name_index(
     // stale 行を一掃 (cancel / per-entry エラー / read_dir 失敗 / upsert 失敗のいずれかで
     // 不完全観測の場合は skip — 観測できなかった正当な行を消さないため)。
     if !summary.cancelled && !summary.had_error {
-        match db.prune_stale_for_favorite(fav_path, scan_start_stamp) {
+        match db.prune_stale_for_favorite(fav_path, &visited_parents, scan_start_stamp) {
             Ok(0) => {}
             Ok(n) => crate::logger::log(format!(
                 "name_bulk_indexer: pruned {n} stale rows under {}",
                 fav_path.display()
             )),
-            Err(e) => crate::logger::log(format!(
-                "name_bulk_indexer: prune_stale_for_favorite failed for {}: {e}",
-                fav_path.display()
-            )),
+            Err(e) => {
+                summary.had_error = true;
+                crate::logger::log(format!(
+                    "name_bulk_indexer: prune_stale_for_favorite failed for {}: {e}",
+                    fav_path.display()
+                ));
+            }
         }
     } else if summary.had_error {
         crate::logger::log(format!(
@@ -256,13 +287,23 @@ pub fn run_bulk_name_index(
 ///
 /// なお `upsert_children` の DELETE は this 関数が返した `children` に含まれない
 /// 直下行を消す best-effort 動作なので、`had_entry_error == true` のときに上層で
-/// upsert を呼ぶか否かは呼び出し側の判断 (現状は best-effort で呼ぶが、post-scan
-/// prune は必ず skip する)。
+/// 不完全なフォルダでは upsert と post-scan prune の両方を skip する。
 pub fn collect_index_entries(
     entries: std::fs::ReadDir,
     log_prefix: &str,
     yield_check: Option<(&crate::activity_gate::ActivityGate, &AtomicBool)>,
     excluded_roots: &[PathBuf],
+) -> (Vec<IndexEntry>, bool) {
+    collect_index_entries_with_cancel(entries, log_prefix, yield_check, excluded_roots, None, None)
+}
+
+fn collect_index_entries_with_cancel(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    log_prefix: &str,
+    yield_check: Option<(&crate::activity_gate::ActivityGate, &AtomicBool)>,
+    excluded_roots: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    mut subfolders: Option<&mut Vec<PathBuf>>,
 ) -> (Vec<IndexEntry>, bool) {
     // 数千件規模のフォルダで `file_type()` を per-entry に呼ぶと HDD 上で
     // 数百 ms-1s 単位の I/O 連続が発生し、その間に動画オープン等の高優先 I/O が
@@ -273,6 +314,10 @@ pub fn collect_index_entries(
     let mut had_entry_error = false;
     let mut processed: usize = 0;
     for entry_result in entries {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            had_entry_error = true;
+            break;
+        }
         if processed > 0
             && processed % YIELD_EVERY_N == 0
             && let Some((gate, cancel)) = yield_check
@@ -298,7 +343,7 @@ pub fn collect_index_entries(
             continue;
         }
         let p = entry.path();
-        if is_apple_double(&p) {
+        if is_apple_double(&p) && subfolders.is_none() {
             continue;
         }
         if crate::books::path_is_under_any(&p, excluded_roots) {
@@ -315,9 +360,30 @@ pub fn collect_index_entries(
                 continue;
             }
         };
-        let Some(kind) = classify_name_index_kind(&p, &entry, &ft) else {
+        let kind = match crate::fs_entry::try_classify_dir_entry(&entry, &ft) {
+            Ok(kind) => kind,
+            Err(error) => {
+                had_entry_error = true;
+                crate::logger::log(format!(
+                    "{log_prefix}: entry classification failed for {}: {error}",
+                    p.display()
+                ));
+                continue;
+            }
+        };
+        let Some(kind) = name_index_kind_from_entry_kind(&p, kind) else {
             continue;
         };
+        // 旧 DFS は ._* ディレクトリにも入るが、そのディレクトリ自身は索引行にしない。
+        // 再帰先と索引対象を独立に集め、単一走査でも同じ範囲を保つ。
+        if kind == IndexKind::Folder
+            && let Some(subfolders) = subfolders.as_mut()
+        {
+            subfolders.push(p.clone());
+        }
+        if is_apple_double(&p) {
+            continue;
+        }
         let name = p
             .file_name()
             .and_then(|n| n.to_str())
@@ -342,6 +408,13 @@ pub fn classify_name_index_kind(
     file_type: &std::fs::FileType,
 ) -> Option<IndexKind> {
     let kind = crate::fs_entry::classify_dir_entry(entry, file_type);
+    name_index_kind_from_entry_kind(path, kind)
+}
+
+fn name_index_kind_from_entry_kind(
+    path: &Path,
+    kind: crate::fs_entry::DirEntryKind,
+) -> Option<IndexKind> {
     if kind.is_directory() {
         return Some(IndexKind::Folder);
     }
@@ -402,6 +475,37 @@ mod tests {
     }
     fn touch(p: &std::path::Path) {
         std::fs::write(p, b"").unwrap();
+    }
+
+    #[test]
+    fn prune_write_failure_is_a_failed_full_scan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        let db_path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&db_path).unwrap();
+        let deleted_parent = root.join("deleted");
+        db.upsert_children(
+            &root,
+            &deleted_parent,
+            &[crate::search_index_db::IndexEntry {
+                path: deleted_parent.join("stale.zip"),
+                display_name: "stale.zip".into(),
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_prune BEFORE DELETE ON entries BEGIN SELECT RAISE(FAIL, 'injected prune failure'); END;").unwrap();
+        drop(conn);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &AtomicBool::new(false), None);
+        assert!(!summary.cancelled);
+        assert!(
+            summary.had_error,
+            "prune failure cannot be a typed Complete"
+        );
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
     }
 
     #[test]
@@ -562,5 +666,215 @@ mod tests {
         let cancel = AtomicBool::new(true); // 最初から立てておく
         let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
         assert!(summary.cancelled);
+    }
+
+    #[test]
+    fn bulk_second_scan_skips_all_writes_and_reads_each_folder_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root.join("sub/empty"));
+        touch(&root.join("sub/book.zip"));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let first = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        assert_eq!(first.folders_written, 2);
+        let mut reads = HashMap::new();
+        let second =
+            run_bulk_name_index_with_reader(&root, &db, None, &[], &cancel, None, &mut |path| {
+                *reads.entry(path.to_path_buf()).or_insert(0) += 1;
+                std::fs::read_dir(path)
+            });
+        assert_eq!(second.folders_visited, 3);
+        assert_eq!(second.folders_written, 0);
+        assert_eq!(second.entries_written, 0);
+        assert!(!second.had_error);
+        assert_eq!(reads.len(), 3);
+        assert!(reads.values().all(|count| *count == 1));
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 3);
+    }
+
+    #[test]
+    fn bulk_preserves_traversal_into_apple_double_named_directories() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root.join("._folder"));
+        touch(&root.join("._folder/book.zip"));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        assert_eq!(summary.folders_visited, 2);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+        assert_eq!(
+            run_bulk_name_index(&root, &db, None, &[], &cancel, None).folders_written,
+            0
+        );
+    }
+
+    #[test]
+    fn bulk_excluded_root_and_missing_root_prune_old_rows() {
+        for excluded in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("fav");
+            mkdir(&root.join("sub"));
+            touch(&root.join("sub/book.pdf"));
+            let db = SearchIndexDb::open_in_memory().unwrap();
+            let cancel = AtomicBool::new(false);
+            run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+            let exclusions = if excluded {
+                vec![tmp.path().to_path_buf()]
+            } else {
+                std::fs::remove_dir_all(&root).unwrap();
+                vec![]
+            };
+            let summary = run_bulk_name_index(&root, &db, None, &exclusions, &cancel, None);
+            assert_eq!(summary.folders_visited, 0);
+            assert!(!summary.had_error);
+            assert_eq!(db.count_for_favorite(&root).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn bulk_empty_folder_and_deleted_deep_subtree_remove_stale_rows() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root.join("keep"));
+        mkdir(&root.join("gone/a/b"));
+        touch(&root.join("keep/book.zip"));
+        touch(&root.join("gone/a/b/book.pdf"));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        std::fs::remove_file(root.join("keep/book.zip")).unwrap();
+        std::fs::remove_dir_all(root.join("gone")).unwrap();
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        assert_eq!(summary.folders_written, 2);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+    }
+
+    #[test]
+    fn bulk_incomplete_listing_skips_folder_replace_and_prune() {
+        for per_entry_error in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("fav");
+            mkdir(&root.join("sub"));
+            touch(&root.join("sub/book.zip"));
+            let db = SearchIndexDb::open_in_memory().unwrap();
+            let cancel = AtomicBool::new(false);
+            run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+            let summary = run_bulk_name_index_with_reader(
+                &root,
+                &db,
+                None,
+                &[],
+                &cancel,
+                None,
+                &mut |path| {
+                    if path == root.join("sub") {
+                        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+                        if per_entry_error {
+                            Ok(vec![Err(error)])
+                        } else {
+                            Err(error)
+                        }
+                    } else {
+                        Ok(std::fs::read_dir(path)?.collect::<Vec<_>>())
+                    }
+                },
+            );
+            assert!(summary.had_error);
+            assert_eq!(summary.folders_written, 0);
+            assert_eq!(db.count_for_favorite(&root).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn bulk_cancel_during_listing_preserves_existing_children() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        touch(&root.join("book.zip"));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        let summary =
+            run_bulk_name_index_with_reader(&root, &db, None, &[], &cancel, None, &mut |path| {
+                cancel.store(true, Ordering::Relaxed);
+                std::fs::read_dir(path)
+            });
+        assert!(summary.cancelled);
+        assert_eq!(summary.folders_written, 0);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+    }
+
+    #[test]
+    fn bulk_prune_keeps_rows_written_after_scan_start() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let concurrent_parent = root.join("not_observed");
+        let summary =
+            run_bulk_name_index_with_reader(&root, &db, None, &[], &cancel, None, &mut |path| {
+                db.upsert_children(
+                    &root,
+                    &concurrent_parent,
+                    &[IndexEntry {
+                        path: concurrent_parent.join("new.zip"),
+                        display_name: "new.zip".into(),
+                        kind: IndexKind::ZipFile,
+                        mtime: 0,
+                    }],
+                )
+                .unwrap();
+                std::fs::read_dir(path)
+            });
+        assert!(!summary.had_error);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bulk_ancestor_case_change_updates_display_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("MixedCase");
+        mkdir(&root.join("sub"));
+        touch(&root.join("sub/book.zip"));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        let lower_root = tmp.path().join("mixedcase");
+        let second = run_bulk_name_index(&lower_root, &db, None, &[], &cancel, None);
+        assert_eq!(second.folders_written, 2);
+        let hits = db
+            .search("book", &[root], None, crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(hits[0].path, lower_root.join("sub/book.zip"));
+    }
+    #[test]
+    fn depth_limit_is_incomplete_and_does_not_prune_unobserved_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fav");
+        let mut deep = root.clone();
+        for _ in 0..65 {
+            deep.push("x");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        db.upsert_children(
+            &root,
+            &deep,
+            &[IndexEntry {
+                path: deep.join("stale.zip"),
+                display_name: "stale.zip".into(),
+                kind: IndexKind::ZipFile,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        let summary = run_bulk_name_index(&root, &db, None, &[], &AtomicBool::new(false), None);
+        assert!(summary.had_error);
+        assert!(!summary.cancelled);
+        assert!(db.count_for_favorite(&root).unwrap() >= 66);
     }
 }

@@ -4485,6 +4485,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 VideoThumbnailIndicator::PlayIcon,
                 true,
                 None,
+                None,
             );
             crate::app::draw_cell(
                 ui,
@@ -9382,7 +9383,8 @@ impl App {
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
-        let show_effetune = self.settings.show_toolbar_effetune;
+        let show_effetune = crate::settings::ToolbarSectionId::EffeTune.available_in_build()
+            && self.settings.show_toolbar_effetune;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
         let show_collections = self.settings.show_toolbar_collections;
         let (toolbar_collection_target_id, toolbar_collections, collections_status) =
@@ -9405,9 +9407,8 @@ impl App {
         let toolbar_smart_folder_definitions = self.settings.smart_folders.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
         let has_rating_selection = has_book_add_target;
-        let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
-            &self.settings.toolbar_section_order,
-        );
+        let toolbar_section_order =
+            crate::settings::ToolbarSectionId::render_order(&self.settings.toolbar_section_order);
         // 前フレームのツールバー content rect (空き領域 右クリック用背景 interact の矩形)。
         let toolbar_bg_rect = self.toolbar_content_rect;
         // ドラッグ並べ替えの許可状態 (既定 OFF)。OFF のときはカーソルも変えない。
@@ -9651,11 +9652,7 @@ impl App {
                             self.effetune.effective_state(),
                             Some(crate::effetune::EffectiveState::Effective)
                         );
-                        let available = matches!(
-                            self.effetune.runtime,
-                            crate::effetune::EffetuneRuntime::Idle
-                                | crate::effetune::EffetuneRuntime::Running { .. }
-                        );
+                        let available = self.effetune_toolbar_available();
                         let resp = ui
                             .add_enabled(
                                 available,
@@ -9667,9 +9664,10 @@ impl App {
                                     },
                                 ),
                             )
-                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
+                            .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
                         if resp.clicked() {
-                            self.effetune_toolbar_click();
+                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
                         }
                         self.finish_toolbar_section_lead(
                             ui,
@@ -10935,9 +10933,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         changed |= ui
             .checkbox(&mut s.show_toolbar_folder_tree_button, "ツリー")
             .changed();
-        changed |= ui
-            .checkbox(&mut s.show_toolbar_effetune, "音響調整")
-            .changed();
+        if crate::settings::ToolbarSectionId::EffeTune.available_in_build() {
+            changed |= ui
+                .checkbox(&mut s.show_toolbar_effetune, "音響調整")
+                .changed();
+        }
         changed |= ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚").changed();
         changed |= ui
             .checkbox(&mut s.show_toolbar_collections, "コレクション")
@@ -12247,7 +12247,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 prepare_ai_facet_menu_popup(ui);
                 self.request_ai_model_facet_load();
                 ui.ctx().request_repaint();
-                if !self.details_lazy_sort_ready() {
+                if !self.ai_model_facet_ready() {
                     self.draw_ai_facet_loading_menu(ui);
                     return;
                 }
@@ -12296,7 +12296,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 prepare_ai_facet_menu_popup(ui);
                 self.request_ai_model_facet_load();
                 ui.ctx().request_repaint();
-                if !self.details_lazy_sort_ready() {
+                if !self.ai_model_facet_ready() {
                     self.draw_ai_facet_loading_menu(ui);
                     return;
                 }
@@ -18277,6 +18277,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         row.badge_label()
                                     }
                                 });
+                                let media_duration = self.thumbnail_media_duration_text(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -18306,6 +18307,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.settings.video_thumbnail_indicator,
                                     is_checked,
                                     filter_match_count,
+                                    media_duration.as_deref(),
                                 );
 
                                 primary_click_hit_cell |=
@@ -18349,6 +18351,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.settings.video_thumbnail_indicator,
                                         self.checked.contains(&idx),
                                         filter_match_count,
+                                        media_duration.as_deref(),
                                     );
                                 }
 
@@ -19665,9 +19668,11 @@ mod selection_info_tests {
             DetailsLazyMeta {
                 source_mtime: 1_700_000_000,
                 source_size: 4096,
-                video_duration_secs: Some(125.0),
-                video_dims: Some((1920, 1080)),
-                video_codec: Some("h264".to_string()),
+                media: crate::app::DetailsMediaMeta::Read(crate::app::DetailsVideoProbe {
+                    duration_secs: Some(125.0),
+                    dims: Some((1920, 1080)),
+                    codec: Some("h264".to_string()),
+                }),
                 ..Default::default()
             },
         );
@@ -21755,7 +21760,11 @@ mod compute_cell_size_tests {
             crate::app::DetailsLazyMeta {
                 source_mtime: 1_700_000_000,
                 source_size: 4096,
-                video_codec: Some(codec.clone()),
+                media: crate::app::DetailsMediaMeta::Read(crate::app::DetailsVideoProbe {
+                    duration_secs: None,
+                    dims: None,
+                    codec: Some(codec.clone()),
+                }),
                 ..Default::default()
             },
         );
@@ -23502,6 +23511,194 @@ mod compute_cell_size_tests {
 
         assert_eq!(claimed, Some(GridScrollIntent::Top));
         assert_eq!(pending, Some(GridScrollIntent::Bottom));
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod effetune_toolbar_flavor_tests {
+    use super::*;
+    use crate::settings::ToolbarSectionId as TS;
+
+    fn collect_text(shape: &egui::epaint::Shape, text: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(shape) => text.push_str(&shape.galley.job.text),
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(2400.0, 400.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn only_effetune(settings: &mut crate::settings::Settings) {
+        for &section in TS::default_order() {
+            set_toolbar_section_visible(settings, section, section == TS::EffeTune);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn effetune_button_enables_preparation_retry_but_keeps_other_failures_disabled() {
+        use crate::effetune::{EffetuneFailure, EffetuneRuntime, LoadOrigin, UnavailableReason};
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+        let cases = [
+            (EffetuneRuntime::Idle, true),
+            (EffetuneRuntime::Running { generation: 1 }, true),
+            (
+                EffetuneRuntime::Unavailable(UnavailableReason::BundlePreparationFailed {
+                    reason: "publisher timeout".into(),
+                    rejected_generation: None,
+                }),
+                true,
+            ),
+            (
+                EffetuneRuntime::Unavailable(UnavailableReason::BundleMissing("fixture".into())),
+                false,
+            ),
+            (
+                EffetuneRuntime::Unavailable(UnavailableReason::CpuUnsupported),
+                false,
+            ),
+            (
+                EffetuneRuntime::Loading {
+                    origin: LoadOrigin::UserButton,
+                    open_gui_when_ready: None,
+                },
+                false,
+            ),
+            (
+                EffetuneRuntime::Failed(EffetuneFailure::LoadFailed("fixture".into())),
+                false,
+            ),
+        ];
+        for (runtime, expected) in cases {
+            let mut app = crate::app::setup_app_for_test();
+            only_effetune(&mut app.settings);
+            app.settings.toolbar_section_order = vec![TS::EffeTune];
+            app.effetune.runtime = runtime;
+            assert_eq!(app.effetune_toolbar_available(), expected);
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1200.0, 300.0))
+                .build(move |ctx| {
+                    if fonts_ready {
+                        app.render_toolbar(ctx);
+                    } else {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                    }
+                });
+            harness.run();
+            assert_eq!(
+                harness
+                    .get_by_label("音響調整")
+                    .accesskit_node()
+                    .is_disabled(),
+                !expected
+            );
+            // Inspect only: never click/load a real VST host.
+        }
+    }
+
+    #[test]
+    fn saved_effetune_section_and_row_break_follow_build_flavor() {
+        let mut app = crate::app::setup_app_for_test();
+        only_effetune(&mut app.settings);
+        app.settings.show_toolbar_folder_tree_button = true;
+        app.settings.show_toolbar_cols = true;
+        let saved = vec![TS::FolderTree, TS::EffeTune, TS::Cols];
+        app.settings.toolbar_section_order = saved.clone();
+        app.settings.toolbar_section_new_row = vec![TS::EffeTune];
+        // A missing bundle must remain visible in the normal build. Never click or start it.
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Unavailable(
+            crate::effetune::UnavailableReason::BundleMissing("fixture".into()),
+        );
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        // Panels settle their height and newly installed fonts over the initial frames.
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                app.render_toolbar(ctx);
+            });
+        }
+        let output = ctx.run(input(), |ctx| {
+            app.render_toolbar(ctx);
+        });
+        let mut text = String::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut text);
+        }
+        assert_eq!(text.contains("音響調整"), !cfg!(feature = "portable"));
+        assert_eq!(
+            app.toolbar_section_anchors
+                .iter()
+                .any(|(id, _)| *id == TS::EffeTune),
+            !cfg!(feature = "portable")
+        );
+        assert_eq!(app.settings.toolbar_section_order, saved);
+        assert_eq!(app.settings.toolbar_section_new_row, [TS::EffeTune]);
+        assert!(
+            app.effetune_toolbar_tooltip()
+                .contains("必要なファイルが見つかりません")
+        );
+
+        if cfg!(feature = "portable") {
+            let with_hidden_row = app.toolbar_section_anchors.clone();
+            let with_hidden_row_rect = app.toolbar_content_rect;
+            app.settings.toolbar_section_new_row.clear();
+            let _ = ctx.run(input(), |ctx| {
+                app.render_toolbar(ctx);
+            });
+            assert_eq!(app.toolbar_section_anchors, with_hidden_row);
+            assert_eq!(app.toolbar_content_rect, with_hidden_row_rect);
+        }
+    }
+
+    #[test]
+    fn effetune_customization_candidate_follows_build_flavor() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let output = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.draw_toolbar_visibility_menu(ui, false, false);
+            });
+        });
+        let mut text = String::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut text);
+        }
+        assert_eq!(text.contains("音響調整"), !cfg!(feature = "portable"));
+        assert!(text.contains("ツリー"));
+        assert!(app.settings.show_toolbar_effetune);
+    }
+
+    #[test]
+    #[cfg(feature = "portable")]
+    fn hidden_effetune_alone_does_not_create_an_empty_toolbar() {
+        let mut app = crate::app::setup_app_for_test();
+        only_effetune(&mut app.settings);
+        app.settings.toolbar_section_order = vec![TS::EffeTune];
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input(), |ctx| {
+            app.render_toolbar(ctx);
+        });
+        assert!(app.toolbar_section_anchors.is_empty());
+        assert!(app.toolbar_content_rect.is_none());
     }
 }
 

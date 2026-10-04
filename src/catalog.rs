@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -10,6 +11,22 @@ const CATALOG_VERSION: &str = "2";
 const PDF_LAYOUT_DIMS_META_KEY: &str = "pdf_layout_dims_version";
 const PDF_LAYOUT_DIMS_VERSION: &str = "2";
 pub const THUMB_LONG_SIDE: u32 = 512;
+
+/// A known media identity includes empty files and epoch-zero timestamps.
+/// Failure to obtain either stamp component is an unknown identity.
+pub(crate) fn media_source_identity_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> Option<(i64, i64)> {
+    metadata.modified().ok()?;
+    Some((
+        crate::ui_helpers::mtime_secs(metadata),
+        i64::try_from(metadata.len()).ok()?,
+    ))
+}
+
+pub(crate) fn media_source_identity(path: &Path) -> Option<(i64, i64)> {
+    media_source_identity_from_metadata(&std::fs::metadata(path).ok()?)
+}
 
 // -----------------------------------------------------------------------
 // DB path helpers
@@ -178,6 +195,17 @@ pub enum ContainerPageKind {
 pub struct ContainerPageMeta {
     /// `None` は走査に成功したが、本として扱う対象ではなかったことを表す。
     pub page_count: Option<u32>,
+}
+
+/// A definitive media probe result. Interrupted probes are never persisted.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VideoMeta {
+    Read {
+        duration_secs: Option<f64>,
+        dims: Option<(u32, u32)>,
+        codec: Option<String>,
+    },
+    Unreadable,
 }
 
 /// 保存済みサムネのバイト列からヘッダのみで `(w, h)` を取り出す。
@@ -888,6 +916,49 @@ impl CatalogDb {
         Ok(())
     }
 
+    /// Worker-owned pin refresh publication. Check cancellation inside the catalog write
+    /// boundary so a superseded waiter cannot overwrite a newer refresh's video seed.
+    pub(crate) fn commit_pin_materializations(
+        &self,
+        deletes: &[String],
+        seeds: &[(String, CacheEntry)],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> rusqlite::Result<bool> {
+        use std::sync::atomic::Ordering;
+        let conn = self.conn.lock().unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let tx = conn.unchecked_transaction()?;
+        for key in deletes {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            tx.execute("DELETE FROM thumbnails WHERE filename = ?1", params![key])?;
+        }
+        for (key, entry) in seeds {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let Some((width, height)) = decode_thumb_dims(&entry.jpeg_data) else {
+                continue;
+            };
+            tx.execute(
+                "INSERT OR REPLACE INTO thumbnails \
+                 (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
+                  layout_width, layout_height, folder_provenance, selection_proof) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
+                params![key, entry.mtime, entry.file_size, width, height, entry.jpeg_data,
+                    serde_json::to_string(&FolderThumbProvenance::Seeded).unwrap()],
+            )?;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
     pub fn delete_missing(&self, existing: &HashSet<String>) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1074,6 +1145,107 @@ impl CatalogDb {
         .optional()
     }
 
+    pub fn get_video_meta(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+    ) -> rusqlite::Result<Option<VideoMeta>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT readable, duration_secs, width, height, codec FROM video_meta \
+             WHERE filename = ?1 AND mtime = ?2 AND file_size = ?3",
+            params![filename, mtime, file_size],
+            |row| {
+                let readable: bool = row.get(0)?;
+                if !readable {
+                    return Ok(VideoMeta::Unreadable);
+                }
+                Ok(VideoMeta::Read {
+                    duration_secs: row.get(1)?,
+                    dims: valid_dims(row.get(2)?, row.get(3)?),
+                    codec: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Recheck the source without holding a catalog mutex or SQLite write lock.
+    /// Cancellation is checked around the OS stat, which cannot be interrupted.
+    pub fn set_video_meta(
+        &self,
+        source_path: &Path,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        meta: &VideoMeta,
+        cancel: &AtomicBool,
+    ) -> rusqlite::Result<bool> {
+        self.set_video_meta_with_source_check(filename, mtime, file_size, meta, cancel, || {
+            media_source_identity(source_path)
+        })
+    }
+
+    fn set_video_meta_with_source_check(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        meta: &VideoMeta,
+        cancel: &AtomicBool,
+        source_check: impl FnOnce() -> Option<(i64, i64)>,
+    ) -> rusqlite::Result<bool> {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let identity = source_check();
+        if cancel.load(Ordering::Relaxed) || identity != Some((mtime, file_size)) {
+            return Ok(false);
+        }
+        let (readable, duration_secs, dims, codec) = match meta {
+            VideoMeta::Read {
+                duration_secs,
+                dims,
+                codec,
+            } => (true, *duration_secs, *dims, codec.as_deref()),
+            VideoMeta::Unreadable => (false, None, None, None),
+        };
+        let mut conn = self.conn.lock().unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        // The IMMEDIATE transaction contains only SQL writes. A source change
+        // after the stat may let this result replace a newer worker's row, but
+        // lookups require exact mtime/size equality: that stale row is a miss,
+        // costing one later probe rather than publishing incorrect metadata.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO video_meta \
+             (filename, mtime, file_size, readable, duration_secs, width, height, codec) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(filename) DO UPDATE SET \
+               mtime = excluded.mtime, file_size = excluded.file_size, \
+               readable = excluded.readable, duration_secs = excluded.duration_secs, \
+               width = excluded.width, height = excluded.height, codec = excluded.codec",
+            params![
+                filename,
+                mtime,
+                file_size,
+                readable,
+                duration_secs,
+                dims.map(|(w, _)| w),
+                dims.map(|(_, h)| h),
+                codec
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn set_container_page_meta(
         &self,
         filename: &str,
@@ -1139,6 +1311,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              fingerprint    INTEGER NOT NULL,
              page_count     INTEGER,
              PRIMARY KEY(filename, kind)
+         );
+         CREATE TABLE IF NOT EXISTS video_meta (
+             filename       TEXT    NOT NULL PRIMARY KEY,
+             mtime          INTEGER NOT NULL,
+             file_size      INTEGER NOT NULL,
+             readable       INTEGER NOT NULL,
+             duration_secs  REAL,
+             width          INTEGER,
+             height         INTEGER,
+             codec          TEXT
          );",
     )?;
     // Trigger ownership is at the catalog layer. Install before any migration or
@@ -1549,6 +1731,62 @@ mod tests {
             has_layout_dims_columns: true,
             has_folder_proof_columns: true,
         }
+    }
+
+    #[test]
+    fn pin_materialization_batch_rolls_back_delete_when_seed_fails() {
+        let db = open_in_memory();
+        db.save("old", 1, 1, 1, 1, None, b"old").unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_seed BEFORE INSERT ON thumbnails WHEN NEW.filename = 'seed' BEGIN SELECT RAISE(ABORT, 'rejected seed'); END;").unwrap();
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 0, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        let seed = CacheEntry {
+            mtime: 2,
+            file_size: 2,
+            jpeg_data: bytes,
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(FolderThumbProvenance::Seeded),
+            selection_proof: None,
+        };
+        assert!(
+            db.commit_pin_materializations(
+                &["old".into()],
+                &[("seed".into(), seed)],
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(db.load_one("old").unwrap().unwrap().jpeg_data, b"old");
+        assert!(db.load_one("seed").unwrap().is_none());
+    }
+
+    #[test]
+    fn pin_materialization_cancelled_owner_cannot_delete_newer_seed() {
+        let db = std::sync::Arc::new(open_in_memory());
+        db.save("newer", 2, 2, 1, 1, None, b"newer").unwrap();
+        let guard = db.conn.lock().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_db = db.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            worker_db
+                .commit_pin_materializations(&["newer".into()], &[], &worker_cancel)
+                .unwrap()
+        });
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(guard);
+        assert!(!worker.join().unwrap());
+        assert_eq!(db.load_one("newer").unwrap().unwrap().jpeg_data, b"newer");
     }
 
     fn revision(db: &CatalogDb) -> CatalogRevision {
@@ -2356,6 +2594,409 @@ mod tests {
             .query_row("SELECT count(*) FROM thumbnails", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    fn write_video_meta_source(path: &Path, mtime: i64, size: i64) {
+        std::fs::write(path, vec![0; size as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64),
+                ),
+            )
+            .unwrap();
+        assert_eq!(media_source_identity(path), Some((mtime, size)));
+    }
+
+    #[test]
+    fn video_meta_stalled_source_stat_does_not_block_catalog_or_ui_pin_writes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("movie.mp4");
+        let cache = temp.path().join("cache");
+        let writer = CatalogDb::open(&cache, temp.path()).unwrap();
+        let ui = CatalogDb::open(&cache, temp.path()).unwrap();
+        let pin_key = "folderthumb:auto-v3:numeric:d3:child#pin:video";
+        ui.save(pin_key, 1, 2, 1, 1, None, b"pin").unwrap();
+        ui.conn
+            .lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        write_video_meta_source(&source, 100, 2048);
+        let cancel = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (mutex_available, pin_write, saved) = std::thread::scope(|scope| {
+            let writer_ref = &writer;
+            let source_ref = &source;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                writer_ref.set_video_meta_with_source_check(
+                    "movie.mp4",
+                    100,
+                    2048,
+                    &VideoMeta::Unreadable,
+                    cancel_ref,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        media_source_identity(source_ref)
+                    },
+                )
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let mutex_available = writer.conn.try_lock().is_ok();
+            // This is the same write used by UI metadata pin refresh. A zero
+            // busy timeout makes holding an IMMEDIATE lock fail deterministically.
+            let pin_write = ui.delete_one(pin_key);
+            resume_tx.send(()).unwrap();
+            (mutex_available, pin_write, worker.join().unwrap())
+        });
+        assert!(mutex_available, "source stat held the catalog mutex");
+        pin_write.expect("source stat held a SQLite write lock against the UI");
+        assert!(saved.unwrap());
+        assert_eq!(
+            ui.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn video_meta_cancel_before_or_during_source_stat_prevents_writes() {
+        let db = open_in_memory();
+        let cancel = AtomicBool::new(true);
+        let mut stat_called = false;
+        assert!(
+            !db.set_video_meta_with_source_check(
+                "movie.mp4",
+                100,
+                2048,
+                &VideoMeta::Unreadable,
+                &cancel,
+                || {
+                    stat_called = true;
+                    Some((100, 2048))
+                },
+            )
+            .unwrap()
+        );
+        assert!(!stat_called, "already canceled work must not start a stat");
+
+        cancel.store(false, Ordering::Relaxed);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let saved = std::thread::scope(|scope| {
+            let db_ref = &db;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                db_ref.set_video_meta_with_source_check(
+                    "movie.mp4",
+                    100,
+                    2048,
+                    &VideoMeta::Unreadable,
+                    cancel_ref,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        Some((100, 2048))
+                    },
+                )
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap()
+        });
+        assert!(!saved.unwrap());
+        assert_eq!(db.get_video_meta("movie.mp4", 100, 2048).unwrap(), None);
+    }
+
+    #[test]
+    fn video_meta_source_change_after_stat_makes_delayed_row_a_current_identity_miss() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("movie.mp4");
+        let cache = temp.path().join("cache");
+        let old_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+        let new_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+        write_video_meta_source(&source, 100, 2048);
+        let cancel = AtomicBool::new(false);
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let current = VideoMeta::Read {
+            duration_secs: Some(42.0),
+            dims: Some((1280, 720)),
+            codec: Some("h264".into()),
+        };
+        let (new_saved, old_saved) = std::thread::scope(|scope| {
+            let old_ref = &old_worker;
+            let source_ref = &source;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                old_ref.set_video_meta_with_source_check(
+                    "movie.mp4",
+                    100,
+                    2048,
+                    &VideoMeta::Unreadable,
+                    cancel_ref,
+                    || {
+                        let identity = media_source_identity(source_ref);
+                        checked_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        identity
+                    },
+                )
+            });
+            checked_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            write_video_meta_source(&source, 50, 4096);
+            let new_saved =
+                new_worker.set_video_meta(&source, "movie.mp4", 50, 4096, &current, &cancel);
+            resume_tx.send(()).unwrap();
+            (new_saved, worker.join().unwrap())
+        });
+        assert!(new_saved.unwrap());
+        assert!(old_saved.unwrap());
+        assert_eq!(media_source_identity(&source), Some((50, 4096)));
+        assert_eq!(
+            new_worker.get_video_meta("movie.mp4", 50, 4096).unwrap(),
+            None
+        );
+        assert_eq!(
+            old_worker.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn video_meta_changed_source_is_rejected_in_both_completion_orders() {
+        // A file identity is not ordered by mtime: replacements can be backdated
+        // or keep the same timestamp while changing size.
+        for new_identity in [(200, 4096), (50, 4096), (100, 4096)] {
+            for old_finishes_first in [false, true] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let source = temp.path().join("movie.mp4");
+                let cache = temp.path().join("cache");
+                let old_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+                let new_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+                write_video_meta_source(&source, 100, 2048);
+                // Both workers captured their identities before completing;
+                // either completion order must reject the obsolete result.
+                write_video_meta_source(&source, new_identity.0, new_identity.1);
+                if old_finishes_first {
+                    assert!(
+                        !old_worker
+                            .set_video_meta(
+                                &source,
+                                "movie.mp4",
+                                100,
+                                2048,
+                                &VideoMeta::Unreadable,
+                                &AtomicBool::new(false)
+                            )
+                            .unwrap()
+                    );
+                }
+                let current = VideoMeta::Read {
+                    duration_secs: Some(42.0),
+                    dims: Some((1280, 720)),
+                    codec: Some("h264".into()),
+                };
+                assert!(
+                    new_worker
+                        .set_video_meta(
+                            &source,
+                            "movie.mp4",
+                            new_identity.0,
+                            new_identity.1,
+                            &current,
+                            &AtomicBool::new(false),
+                        )
+                        .unwrap()
+                );
+                if !old_finishes_first {
+                    assert!(
+                        !old_worker
+                            .set_video_meta(
+                                &source,
+                                "movie.mp4",
+                                100,
+                                2048,
+                                &VideoMeta::Unreadable,
+                                &AtomicBool::new(false)
+                            )
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    old_worker
+                        .get_video_meta("movie.mp4", new_identity.0, new_identity.1)
+                        .unwrap(),
+                    Some(current)
+                );
+                assert_eq!(
+                    new_worker.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn video_meta_publication_rejects_missing_source_and_accepts_known_zero_size() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("empty.mp4");
+        let db = open_in_memory();
+        assert!(
+            !db.set_video_meta(
+                &source,
+                "empty.mp4",
+                0,
+                0,
+                &VideoMeta::Unreadable,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        write_video_meta_source(&source, 0, 0);
+        assert!(
+            db.set_video_meta(
+                &source,
+                "empty.mp4",
+                0,
+                0,
+                &VideoMeta::Unreadable,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_video_meta("empty.mp4", 0, 0).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn video_meta_roundtrip_identity_and_negative_cache() {
+        let db = open_in_memory();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("movie.mp4");
+        write_video_meta_source(&source, 100, 2048);
+        let value = VideoMeta::Read {
+            duration_secs: Some(123.456789),
+            dims: Some((1920, 1080)),
+            codec: Some("h264".into()),
+        };
+        assert!(
+            db.set_video_meta(
+                &source,
+                "movie.mp4",
+                100,
+                2048,
+                &value,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+            Some(value)
+        );
+        assert_eq!(db.get_video_meta("movie.mp4", 101, 2048).unwrap(), None);
+        assert_eq!(db.get_video_meta("movie.mp4", 100, 4096).unwrap(), None);
+        write_video_meta_source(&source, 101, 4096);
+        assert!(
+            db.set_video_meta(
+                &source,
+                "movie.mp4",
+                101,
+                4096,
+                &VideoMeta::Unreadable,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 101, 4096).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+        assert_eq!(db.get_video_meta("movie.mp4", 102, 4096).unwrap(), None);
+        assert_eq!(db.get_video_meta("movie.mp4", 101, 4097).unwrap(), None);
+        let conn = db.conn.lock().unwrap();
+        let values: (Option<f64>, Option<u32>, Option<u32>, Option<String>) = conn.query_row(
+            "SELECT duration_secs, width, height, codec FROM video_meta WHERE filename='movie.mp4'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(values, (None, None, None, None));
+    }
+
+    #[test]
+    fn video_meta_audio_preserves_null_dimensions_and_unknown_duration() {
+        let db = open_in_memory();
+        let temp = tempfile::TempDir::new().unwrap();
+        for (name, duration_secs) in [("music.flac", Some(65.25)), ("stream.mp3", None)] {
+            let value = VideoMeta::Read {
+                duration_secs,
+                dims: None,
+                codec: Some("flac".into()),
+            };
+            let source = temp.path().join(name);
+            write_video_meta_source(&source, 100, 1024);
+            assert!(
+                db.set_video_meta(&source, name, 100, 1024, &value, &AtomicBool::new(false))
+                    .unwrap()
+            );
+            assert_eq!(db.get_video_meta(name, 100, 1024).unwrap(), Some(value));
+            let dims: (Option<u32>, Option<u32>) = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT width, height FROM video_meta WHERE filename=?1",
+                    [name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(dims, (None, None));
+        }
+    }
+
+    #[test]
+    fn video_meta_schema_addition_preserves_existing_metadata() {
+        let db = open_in_memory();
+        db.set_pdf_meta("book.pdf", 100, 1024, 42, true).unwrap();
+        db.set_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2048, 0, Some(30))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DROP TABLE video_meta", []).unwrap();
+            init_schema(&conn).unwrap();
+        }
+        assert_eq!(
+            db.get_pdf_meta("book.pdf", 100, 1024).unwrap(),
+            Some((42, true))
+        );
+        assert_eq!(
+            db.get_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2048, 0)
+                .unwrap(),
+            Some(ContainerPageMeta {
+                page_count: Some(30)
+            })
+        );
+        assert_eq!(db.get_video_meta("new.mp4", 100, 1024).unwrap(), None);
     }
 
     #[test]

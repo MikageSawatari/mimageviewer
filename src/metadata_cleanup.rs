@@ -560,7 +560,12 @@ fn open_for_scan(
     descriptor: &StoreDescriptor,
     state: &mut ScanState,
 ) -> Option<rusqlite::Connection> {
-    match open_readonly(path) {
+    let connection = if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(path)
+    } else {
+        open_readonly(path).map_err(|error| error.to_string())
+    };
+    match connection {
         Ok(connection) => Some(connection),
         Err(error) => {
             state
@@ -842,7 +847,12 @@ fn delete_descriptor<F>(
     F: FnMut(),
 {
     let path = data_dir.join(descriptor.file);
-    let mut connection = match open_for_write(&path) {
+    let connection = if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(&path)
+    } else {
+        open_for_write(&path).map_err(|error| error.to_string())
+    };
+    let mut connection = match connection {
         Ok(connection) => connection,
         Err(error) => {
             report.errors.push(format!("{}: {error}", descriptor.file));
@@ -1350,9 +1360,10 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::create_dir_all(&files).unwrap();
         let removed_file = files.join("gone.png");
-        let db = rusqlite::Connection::open(data_dir.join("content_identity.db")).unwrap();
-        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
-            .unwrap();
+        let db = crate::content_identity::open_ledger_connection_at(
+            &data_dir.join("content_identity.db"),
+        )
+        .unwrap();
         drop(db);
         assert!(journal_failed_delete_purge(
             &data_dir,

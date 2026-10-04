@@ -5,6 +5,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::seek_strip_menu::{
+    SEEK_STRIP_MENU_ROW_HEIGHT, SEEK_STRIP_MENU_SEPARATOR_HEIGHT, SEEK_STRIP_MENU_TEXT_LEFT,
+    SEEK_STRIP_MENU_VERTICAL_PADDING, SeekStripMenuLabels,
+    seek_strip_menu_row_rect as native_seek_strip_menu_row_rect,
+};
+
 use serde_json::Value;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, RECT, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::{
@@ -1614,6 +1620,11 @@ fn draw_native_seek_strip_menu_button(
     });
     if enabled && response.clicked() {
         *menu_open = !*menu_open;
+        if *menu_open {
+            ui.ctx().data_mut(|data| {
+                data.remove_temp::<f32>(egui::Id::new("native_video_seek_strip_menu_scroll"))
+            });
+        }
     }
     if !enabled {
         *menu_open = false;
@@ -1631,6 +1642,9 @@ fn draw_native_seek_strip_menu(
     button_rect: egui::Rect,
     view: crate::video::seek_strip_layout::SeekStripView,
     height: crate::video::seek_strip_layout::SeekStripHeight,
+    height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
+    preview_size: crate::settings::VideoSeekPreviewSize,
+    preview_size_values: crate::settings::VideoSeekPreviewSizeValues,
     expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
     menu_open: &mut bool,
     menu_rect_out: &mut Option<egui::Rect>,
@@ -1645,7 +1659,10 @@ fn draw_native_seek_strip_menu(
         return;
     }
 
-    let rows: Vec<(String, bool, NativeOverlayCommand)> = std::iter::once((
+    let labels = SeekStripMenuLabels::for_viewport(full_rect);
+    let compact = labels.compact;
+    let tiny = labels.tiny;
+    let view_rows: Vec<(String, bool, NativeOverlayCommand)> = std::iter::once((
         "非表示".to_owned(),
         !view.is_visible(),
         NativeOverlayCommand::SetSeekStripView {
@@ -1655,7 +1672,11 @@ fn draw_native_seek_strip_menu(
     ))
     .chain(SEEK_STRIP_SHOWING_ORDER.iter().map(|showing| {
         (
-            showing.label().to_owned(),
+            if tiny {
+                showing.label().replace(" (", "").replace(')', "")
+            } else {
+                showing.label().to_owned()
+            },
             view == SeekStripView::Showing(*showing),
             NativeOverlayCommand::SetSeekStripView {
                 view: SeekStripView::Showing(*showing),
@@ -1663,38 +1684,110 @@ fn draw_native_seek_strip_menu(
             },
         )
     }))
-    .chain(SeekStripHeight::ALL.iter().map(|preset| {
-        (
-            format!("高さ: {}", preset.label()),
-            height == *preset,
-            NativeOverlayCommand::SetSeekStripHeight {
-                height: *preset,
-                expected,
-            },
-        )
-    }))
     .collect();
-    // 高さの段の手前に区切りを入れる。表示の選択と高さの選択は別の問い。
-    let separator_before = 1 + SEEK_STRIP_SHOWING_ORDER.len();
-
-    let label_font = egui::FontId::proportional(13.0);
-    let content_width = ctx.fonts_mut(|fonts| {
-        rows.iter().fold(0.0_f32, |widest, (label, _, _)| {
-            widest.max(
-                fonts
-                    .layout_no_wrap(label.clone(), label_font.clone(), egui::Color32::WHITE)
-                    .rect
-                    .width(),
+    // A detached viewer can be 320 x 240. Pack the display modes and shorten
+    // labels there so every choice still fits inside its viewport.
+    let height_rows: Vec<_> = SeekStripHeight::ALL
+        .iter()
+        .map(|preset| {
+            (
+                labels.preset(preset.label(), height_values.points(*preset)),
+                height == *preset,
+                NativeOverlayCommand::SetSeekStripHeight {
+                    height: *preset,
+                    expected,
+                },
             )
         })
+        .collect();
+    let preview_rows: Vec<_> = crate::settings::VideoSeekPreviewSize::ALL
+        .iter()
+        .map(|preset| {
+            (
+                labels.preset(preset.label(), preview_size_values.points(*preset)),
+                preview_size == *preset,
+                NativeOverlayCommand::SetSeekPreviewSize {
+                    size: *preset,
+                    expected,
+                },
+            )
+        })
+        .collect();
+    // The five height and preview presets share rows, so the popup remains usable in a
+    // window where stacking both five-row groups would push the existing choices off screen.
+    let separator_before = if compact {
+        view_rows.len().div_ceil(2)
+    } else {
+        view_rows.len()
+    };
+    let preset_start = separator_before + 1; // a non-interactive heading row
+    let total_rows = preset_start + height_rows.len();
+    let row_height = if compact {
+        SEEK_STRIP_MENU_ROW_HEIGHT.min(
+            ((full_rect.height()
+                - 16.0
+                - SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
+                - SEEK_STRIP_MENU_SEPARATOR_HEIGHT)
+                / total_rows as f32)
+                .max(18.0),
+        )
+    } else {
+        SEEK_STRIP_MENU_ROW_HEIGHT
+    };
+
+    let label_font = labels.font();
+    let (view_width, height_width, preview_width) = ctx.fonts_mut(|fonts| {
+        let mut width = |label: &str| {
+            fonts
+                .layout_no_wrap(label.to_owned(), label_font.clone(), egui::Color32::WHITE)
+                .rect
+                .width()
+        };
+        let mut view_width = 0.0_f32;
+        for row in &view_rows {
+            view_width = view_width.max(width(&row.0));
+        }
+        let mut height_width = width(labels.headings()[0]);
+        for row in &height_rows {
+            height_width = height_width.max(width(&row.0));
+        }
+        let mut preview_width = width(labels.headings()[1]);
+        for row in &preview_rows {
+            preview_width = preview_width.max(width(&row.0));
+        }
+        (view_width, height_width, preview_width)
     });
+    let left_column_width = height_width + SEEK_STRIP_MENU_TEXT_LEFT + 10.0;
     let size = egui::vec2(
-        (content_width + SEEK_STRIP_MENU_TEXT_LEFT + 16.0).max(150.0),
-        rows.len() as f32 * SEEK_STRIP_MENU_ROW_HEIGHT
+        (left_column_width + preview_width + SEEK_STRIP_MENU_TEXT_LEFT + 12.0)
+            .max(view_width + SEEK_STRIP_MENU_TEXT_LEFT + 16.0)
+            .min((full_rect.width() - 16.0).max(80.0)),
+        (total_rows as f32 * row_height
             + SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
-            + SEEK_STRIP_MENU_SEPARATOR_HEIGHT,
+            + SEEK_STRIP_MENU_SEPARATOR_HEIGHT)
+            .min((full_rect.height() - 16.0).max(40.0)),
     );
     let anchor = native_seek_strip_menu_rect(full_rect, button_rect, size);
+    let content_height = total_rows as f32 * row_height
+        + SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
+        + SEEK_STRIP_MENU_SEPARATOR_HEIGHT;
+    let max_scroll = (content_height - size.y).max(0.0);
+    let scroll_id = egui::Id::new("native_video_seek_strip_menu_scroll");
+    let mut scroll = ctx
+        .data_mut(|data| data.get_temp::<f32>(scroll_id))
+        .unwrap_or(0.0)
+        .min(max_scroll);
+    if max_scroll > 0.0
+        && anchor.contains(ctx.input(|input| input.pointer.hover_pos().unwrap_or_default()))
+    {
+        let delta = ctx.input(|input| input.raw_scroll_delta.y);
+        if delta < -0.1 {
+            scroll = (scroll + row_height).min(max_scroll);
+        } else if delta > 0.1 {
+            scroll = (scroll - row_height).max(0.0);
+        }
+    }
+    ctx.data_mut(|data| data.insert_temp(scroll_id, scroll));
 
     let mut selected = None;
     let mut drawn_rect = anchor;
@@ -1705,7 +1798,11 @@ fn draw_native_seek_strip_menu(
             crate::os_theme::apply_dark_ui(ui);
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             drawn_rect = rect;
+            let column_split = left_column_width.min((rect.width() - 8.0) * 0.55);
             let painter = ui.painter().clone();
+            let content_painter = painter.with_clip_rect(rect.shrink(2.0));
+            let content_rect = rect.translate(egui::vec2(0.0, -scroll));
+            let text_left = if tiny { 6.0 } else { SEEK_STRIP_MENU_TEXT_LEFT };
             painter.rect_filled(
                 rect,
                 6.0,
@@ -1720,47 +1817,155 @@ fn draw_native_seek_strip_menu(
                 ),
                 egui::StrokeKind::Outside,
             );
-            for (row_index, (label, is_current, command)) in rows.iter().enumerate() {
-                let item_rect = native_seek_strip_menu_row_rect(rect, row_index, separator_before);
-                let item_resp = ui.interact(
-                    item_rect,
-                    egui::Id::new(("native_video_seek_strip_menu_item", row_index)),
-                    egui::Sense::click(),
-                );
-                if item_resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                let background = if *is_current {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
+            let mut draw_choice =
+                |ui: &mut egui::Ui,
+                 item_rect: egui::Rect,
+                 id: egui::Id,
+                 label: &str,
+                 is_current: bool,
+                 command: &NativeOverlayCommand| {
+                    let visible_rect = item_rect.intersect(rect.shrink(2.0));
+                    if !visible_rect.is_positive() {
+                        return;
+                    }
+                    let item_resp = ui.interact(visible_rect, id, egui::Sense::click());
+                    if item_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let background = if is_current {
+                        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                    } else if item_resp.hovered() {
+                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    content_painter.rect_filled(item_rect, 4.0, background);
+                    content_painter
+                        .with_clip_rect(item_rect.shrink2(egui::vec2(2.0, 0.0)))
+                        .text(
+                            egui::pos2(item_rect.min.x + text_left, item_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            label_font.clone(),
+                            egui::Color32::from_gray(226),
+                        );
+                    if item_resp.clicked() {
+                        selected = Some(command.clone());
+                    }
                 };
-                painter.rect_filled(item_rect, 4.0, background);
-                painter.text(
-                    egui::pos2(
-                        item_rect.min.x + SEEK_STRIP_MENU_TEXT_LEFT,
-                        item_rect.center().y,
-                    ),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    label_font.clone(),
-                    egui::Color32::from_gray(226),
+            for (index, (label, is_current, command)) in view_rows.iter().enumerate() {
+                let row_index = if compact { index / 2 } else { index };
+                let row_rect = native_seek_strip_menu_row_rect(
+                    content_rect,
+                    row_index,
+                    separator_before,
+                    row_height,
                 );
-                if row_index + 1 == separator_before {
-                    let y = item_rect.max.y + SEEK_STRIP_MENU_SEPARATOR_HEIGHT * 0.5;
-                    painter.line_segment(
-                        [
-                            egui::pos2(rect.min.x + 8.0, y),
-                            egui::pos2(rect.max.x - 8.0, y),
-                        ],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                let item_rect = if compact {
+                    let middle = row_rect.center().x;
+                    if index % 2 == 0 {
+                        egui::Rect::from_min_max(row_rect.min, egui::pos2(middle, row_rect.max.y))
+                    } else {
+                        egui::Rect::from_min_max(egui::pos2(middle, row_rect.min.y), row_rect.max)
+                    }
+                } else {
+                    row_rect
+                };
+                draw_choice(
+                    ui,
+                    item_rect,
+                    egui::Id::new(("native_video_seek_strip_menu_view", index)),
+                    label,
+                    *is_current,
+                    command,
+                );
+            }
+            let heading_rect = native_seek_strip_menu_row_rect(
+                content_rect,
+                separator_before,
+                separator_before,
+                row_height,
+            );
+            let separator_y = heading_rect.min.y - SEEK_STRIP_MENU_SEPARATOR_HEIGHT * 0.5;
+            content_painter.line_segment(
+                [
+                    egui::pos2(rect.min.x + 8.0, separator_y),
+                    egui::pos2(rect.max.x - 8.0, separator_y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+            );
+            for (heading_column, label) in labels.headings().into_iter().enumerate() {
+                let column_rect = if heading_column == 0 {
+                    egui::Rect::from_min_max(
+                        heading_rect.min,
+                        egui::pos2(heading_rect.min.x + column_split, heading_rect.max.y),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        egui::pos2(heading_rect.min.x + column_split, heading_rect.min.y),
+                        heading_rect.max,
+                    )
+                };
+                content_painter
+                    .with_clip_rect(column_rect.shrink2(egui::vec2(2.0, 0.0)))
+                    .text(
+                        egui::pos2(column_rect.min.x + text_left, heading_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        label_font.clone(),
+                        egui::Color32::from_gray(180),
                     );
-                }
-                if item_resp.clicked() {
-                    selected = Some(command.clone());
-                }
+            }
+            for (index, (height_row, preview_row)) in
+                height_rows.iter().zip(&preview_rows).enumerate()
+            {
+                let row_rect = native_seek_strip_menu_row_rect(
+                    content_rect,
+                    preset_start + index,
+                    separator_before,
+                    row_height,
+                );
+                let left_rect = egui::Rect::from_min_max(
+                    row_rect.min,
+                    egui::pos2(row_rect.min.x + column_split, row_rect.max.y),
+                );
+                let right_rect = egui::Rect::from_min_max(
+                    egui::pos2(left_rect.max.x, row_rect.min.y),
+                    row_rect.max,
+                );
+                draw_choice(
+                    ui,
+                    left_rect,
+                    egui::Id::new(("native_video_seek_strip_menu_height", index)),
+                    &height_row.0,
+                    height_row.1,
+                    &height_row.2,
+                );
+                draw_choice(
+                    ui,
+                    right_rect,
+                    egui::Id::new(("native_video_seek_strip_menu_preview", index)),
+                    &preview_row.0,
+                    preview_row.1,
+                    &preview_row.2,
+                );
+            }
+            if max_scroll > 0.0 {
+                let track = egui::Rect::from_min_max(
+                    egui::pos2(rect.max.x - 4.0, rect.min.y + 5.0),
+                    egui::pos2(rect.max.x - 2.0, rect.max.y - 5.0),
+                );
+                painter.rect_filled(track, 1.0, egui::Color32::from_gray(75));
+                let thumb_height = (track.height() * size.y / content_height).max(8.0);
+                let thumb_y = track.min.y + (track.height() - thumb_height) * scroll / max_scroll;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(track.min.x, thumb_y),
+                        egui::vec2(track.width(), thumb_height),
+                    ),
+                    1.0,
+                    egui::Color32::from_gray(180),
+                );
             }
         });
 
@@ -1957,11 +2162,6 @@ fn audio_track_menu_size(full_rect: egui::Rect, widest: f32, rows: usize) -> (eg
     (size, visible_rows)
 }
 
-const SEEK_STRIP_MENU_ROW_HEIGHT: f32 = 26.0;
-const SEEK_STRIP_MENU_TEXT_LEFT: f32 = 14.0;
-const SEEK_STRIP_MENU_VERTICAL_PADDING: f32 = 6.0;
-const SEEK_STRIP_MENU_SEPARATOR_HEIGHT: f32 = 7.0;
-
 /// メニューはボタンの**上**へ吊るす。下 HUD の中にあるので、下へ開くと画面外に出る。
 fn native_seek_strip_menu_rect(
     full_rect: egui::Rect,
@@ -1975,28 +2175,6 @@ fn native_seek_strip_menu_rect(
     let min_y = full_rect.min.y + margin;
     let y = (button_rect.min.y - 6.0 - size.y).max(min_y);
     egui::Rect::from_min_size(egui::pos2(x, y), size)
-}
-
-fn native_seek_strip_menu_row_rect(
-    menu_rect: egui::Rect,
-    row_index: usize,
-    separator_before: usize,
-) -> egui::Rect {
-    let separator = if row_index >= separator_before {
-        SEEK_STRIP_MENU_SEPARATOR_HEIGHT
-    } else {
-        0.0
-    };
-    egui::Rect::from_min_size(
-        egui::pos2(
-            menu_rect.min.x + 4.0,
-            menu_rect.min.y
-                + SEEK_STRIP_MENU_VERTICAL_PADDING
-                + separator
-                + row_index as f32 * SEEK_STRIP_MENU_ROW_HEIGHT,
-        ),
-        egui::vec2(menu_rect.width() - 8.0, SEEK_STRIP_MENU_ROW_HEIGHT - 2.0),
-    )
 }
 
 /// メニューが開いているあいだ、その矩形も HUD の当たり判定に含める。
@@ -4409,6 +4587,10 @@ pub enum NativeOverlayCommand {
     },
     SetSeekStripHeight {
         height: crate::video::seek_strip_layout::SeekStripHeight,
+        expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
+    },
+    SetSeekPreviewSize {
+        size: crate::settings::VideoSeekPreviewSize,
         expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
     },
     StepSeekStripRange {
@@ -9428,6 +9610,29 @@ impl NativeEguiOverlay {
         let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt);
         self.pointer_pos = Some(pos);
         self.modifiers = modifiers;
+        if matches!(
+            self.normalize_state.ui_state,
+            crate::video::normalize_types::NormalizeUiState::Scanning
+        ) {
+            // Keep the scan modal for zoom, tile columns and panel scrolling. A file-navigation
+            // wheel request uses the same command as it does outside the progress overlay.
+            let command = immediate_native_wheel_command(
+                wheel.delta,
+                wheel.shift,
+                wheel.ctrl,
+                wheel.alt,
+                false,
+                false,
+            );
+            let disposition = if let Some(command) = command {
+                self.pending_overlay_commands.push(command);
+                NativeOverlayInputDisposition::Command
+            } else {
+                NativeOverlayInputDisposition::OverlayRegion
+            };
+            self.dirty = true;
+            return disposition;
+        }
         // The ownership decision uses the same current pointer and panel
         // latches as the logical pass that will consume this event.
         self.update_side_panel_hover_latches();
@@ -9452,6 +9657,10 @@ impl NativeEguiOverlay {
             modal_dialog_visible,
             self.audio_track_menu_open,
             self.last_drawn_audio_track_menu_rect,
+            pos,
+        ) || audio_track_menu_owns_wheel(
+            self.seek_strip_menu_open,
+            self.last_drawn_seek_strip_menu_rect,
             pos,
         );
         let plan = plan_native_wheel(
@@ -12170,7 +12379,9 @@ impl NativeEguiOverlay {
         let mut audio_track_menu_open = self.audio_track_menu_open;
         let mut audio_track_button_rect = None;
         let mut audio_track_menu_rect = None;
+        let mut normalize_file_nav_rects: Option<[egui::Rect; 2]> = None;
         let seek_strip_height = self.seek_strip_height;
+        let seek_strip_height_values = self.seek_strip_height_values;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
         let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
@@ -12692,7 +12903,8 @@ impl NativeEguiOverlay {
                         visibility_hover_pos,
                         !bookmark_title_edit_visible
                             && !bulk_bookmark_dialog_visible
-                            && !shortcut_help_open,
+                            && !shortcut_help_open
+                            && !seek_strip_menu_open,
                         strip,
                         bottom_lock.strip_locked(),
                         &seek_strip_texture_ids,
@@ -13061,7 +13273,11 @@ impl NativeEguiOverlay {
                             let prev_file_resp = ui.interact(
                                 prev_file_rect,
                                 egui::Id::new("native_video_prev_file"),
-                                egui::Sense::click(),
+                                if normalize_scanning {
+                                    egui::Sense::hover()
+                                } else {
+                                    egui::Sense::click()
+                                },
                             );
                             draw_overlay_button_bg(
                                 painter,
@@ -13087,10 +13303,15 @@ impl NativeEguiOverlay {
                                 egui::pos2(x, center_y - btn_size * 0.5),
                                 egui::vec2(btn_size, btn_size),
                             );
+                            normalize_file_nav_rects = Some([prev_file_rect, next_file_rect]);
                             let next_file_resp = ui.interact(
                                 next_file_rect,
                                 egui::Id::new("native_video_next_file"),
-                                egui::Sense::click(),
+                                if normalize_scanning {
+                                    egui::Sense::hover()
+                                } else {
+                                    egui::Sense::click()
+                                },
                             );
                             draw_overlay_button_bg(
                                 painter,
@@ -14038,6 +14259,9 @@ impl NativeEguiOverlay {
                         button_rect,
                         seek_strip_view,
                         seek_strip_height,
+                        seek_strip_height_values,
+                        seek_preview_size,
+                        seek_preview_size_values,
                         seek_strip.as_ref().map(|strip| strip.stamp),
                         &mut seek_strip_menu_open,
                         &mut seek_strip_menu_rect,
@@ -14081,6 +14305,7 @@ impl NativeEguiOverlay {
                         overlay_width_points,
                         overlay_height_points,
                         progress,
+                        normalize_file_nav_rects,
                         &mut commands,
                     );
                 }
@@ -17140,107 +17365,263 @@ mod tests {
 
     /// 巡回から外したモードにもメニューからは届く。ここが到達可能性の保証。
     #[test]
-    fn every_view_and_height_is_reachable_from_the_strip_menu() {
-        use crate::video::seek_strip_layout::{
-            SEEK_STRIP_SHOWING_ORDER, SeekStripHeight, SeekStripView,
-        };
-
-        let overlay_size = egui::vec2(1280.0, 720.0);
-        let button = egui::Rect::from_min_size(egui::pos2(1180.0, 676.0), egui::vec2(28.0, 28.0));
-        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size);
-        let wanted: Vec<super::NativeOverlayCommand> =
-            std::iter::once(super::NativeOverlayCommand::SetSeekStripView {
-                view: SeekStripView::Hidden,
-                expected: None,
-            })
-            .chain(SEEK_STRIP_SHOWING_ORDER.iter().map(|showing| {
-                super::NativeOverlayCommand::SetSeekStripView {
-                    view: SeekStripView::Showing(*showing),
-                    expected: None,
-                }
-            }))
-            .chain(SeekStripHeight::ALL.iter().map(|height| {
-                super::NativeOverlayCommand::SetSeekStripHeight {
-                    height: *height,
-                    expected: None,
-                }
-            }))
-            .collect();
-
-        for (row_index, expected) in wanted.iter().enumerate() {
-            let ctx = egui::Context::default();
-            crate::ui_fonts::configure_fonts(&ctx);
-            let mut menu_open = true;
-            let mut menu_rect = None;
-            let mut commands = Vec::new();
-            // 1 パス目で行の位置を測り、2 パス目でその行を押す。
-            let mut row_center = egui::Pos2::ZERO;
-            for pass in 0..5 {
-                let events = match pass {
-                    1 => Vec::new(),
-                    2 => vec![egui::Event::PointerMoved(row_center)],
-                    3 => vec![egui::Event::PointerButton {
-                        pos: row_center,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    }],
-                    4 => vec![egui::Event::PointerButton {
-                        pos: row_center,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    }],
-                    _ => Vec::new(),
-                };
-                let _ = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(full),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        super::draw_native_seek_strip_menu(
-                            ctx,
-                            full,
-                            button,
-                            SeekStripView::Hidden,
-                            SeekStripHeight::Large,
-                            None,
-                            &mut menu_open,
-                            &mut menu_rect,
-                            &mut commands,
-                        );
-                    },
-                );
-                // Area は 1 フレーム目にまだ `fixed_pos` へ落ち着いていない。押す位置は
-                // 落ち着いた後 (pass 1) の実 rect から取る。
-                if pass <= 1 {
-                    let rect = menu_rect.expect("メニューは開いている");
-                    row_center = super::native_seek_strip_menu_row_rect(
-                        rect,
-                        row_index,
-                        1 + SEEK_STRIP_SHOWING_ORDER.len(),
-                    )
-                    .center();
-                }
-            }
-            assert!(
-                commands.iter().any(|command| match (command, expected) {
-                    (
-                        super::NativeOverlayCommand::SetSeekStripView { view, .. },
-                        super::NativeOverlayCommand::SetSeekStripView { view: wanted, .. },
-                    ) => view == wanted,
-                    (
-                        super::NativeOverlayCommand::SetSeekStripHeight { height, .. },
-                        super::NativeOverlayCommand::SetSeekStripHeight { height: wanted, .. },
-                    ) => height == wanted,
-                    _ => false,
-                }),
-                "{row_index} 行目からこの選択に届かない: {expected:?}"
-            );
-            assert!(!menu_open, "選んだらメニューは閉じる");
+    fn every_view_height_and_preview_size_is_reachable_from_the_strip_menu() {
+        for overlay_size in [
+            egui::vec2(1280.0, 720.0),
+            egui::vec2(320.0, 240.0),
+            egui::vec2(260.0, 200.0),
+            egui::vec2(160.0, 120.0),
+        ] {
+            assert_choices_reachable(overlay_size);
         }
+
+        fn assert_choices_reachable(overlay_size: egui::Vec2) {
+            use crate::settings::VideoSeekPreviewSize;
+            use crate::video::seek_strip_layout::{
+                SEEK_STRIP_SHOWING_ORDER, SeekStripHeight, SeekStripView,
+            };
+
+            let compact = overlay_size.x < 400.0 || overlay_size.y < 340.0;
+            let button = egui::Rect::from_min_size(
+                egui::pos2(overlay_size.x - 60.0, overlay_size.y - 44.0),
+                egui::vec2(28.0, 28.0),
+            );
+            let full = egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size);
+            let mut wanted: Vec<(usize, usize, super::NativeOverlayCommand)> = vec![(
+                0,
+                0,
+                super::NativeOverlayCommand::SetSeekStripView {
+                    view: SeekStripView::Hidden,
+                    expected: None,
+                },
+            )];
+            wanted.extend(
+                SEEK_STRIP_SHOWING_ORDER
+                    .iter()
+                    .enumerate()
+                    .map(|(index, showing)| {
+                        (
+                            if compact { (index + 1) / 2 } else { index + 1 },
+                            if compact { (index + 1) % 2 } else { 0 },
+                            super::NativeOverlayCommand::SetSeekStripView {
+                                view: SeekStripView::Showing(*showing),
+                                expected: None,
+                            },
+                        )
+                    }),
+            );
+            let separator_before = if compact {
+                3
+            } else {
+                1 + SEEK_STRIP_SHOWING_ORDER.len()
+            };
+            let preset_start = separator_before + 1;
+            wanted.extend(
+                SeekStripHeight::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, height)| {
+                        (
+                            preset_start + index,
+                            0,
+                            super::NativeOverlayCommand::SetSeekStripHeight {
+                                height: *height,
+                                expected: None,
+                            },
+                        )
+                    }),
+            );
+            wanted.extend(
+                VideoSeekPreviewSize::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, size)| {
+                        (
+                            preset_start + index,
+                            1,
+                            super::NativeOverlayCommand::SetSeekPreviewSize {
+                                size: *size,
+                                expected: None,
+                            },
+                        )
+                    }),
+            );
+
+            for (row_index, column, expected) in wanted.iter() {
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                let mut menu_open = true;
+                let mut menu_rect = None;
+                let mut commands = Vec::new();
+                // 1 パス目で行の位置を測り、2 パス目でその行を押す。
+                let mut row_center = egui::Pos2::ZERO;
+                for pass in 0..5 {
+                    let events = match pass {
+                        1 => Vec::new(),
+                        2 => vec![egui::Event::PointerMoved(row_center)],
+                        3 => vec![egui::Event::PointerButton {
+                            pos: row_center,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        4 => vec![egui::Event::PointerButton {
+                            pos: row_center,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        _ => Vec::new(),
+                    };
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(full),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            if pass == 1 && overlay_size.y < 140.0 && *row_index >= 5 {
+                                ctx.data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new("native_video_seek_strip_menu_scroll"),
+                                        77.0_f32,
+                                    )
+                                });
+                            }
+                            super::draw_native_seek_strip_menu(
+                                ctx,
+                                full,
+                                button,
+                                SeekStripView::Hidden,
+                                SeekStripHeight::Large,
+                                crate::video::seek_strip_layout::SeekStripHeightValues::default(),
+                                VideoSeekPreviewSize::Large,
+                                crate::settings::VideoSeekPreviewSizeValues::default(),
+                                None,
+                                &mut menu_open,
+                                &mut menu_rect,
+                                &mut commands,
+                            );
+                        },
+                    );
+                    // Area は 1 フレーム目にまだ `fixed_pos` へ落ち着いていない。押す位置は
+                    // 落ち着いた後 (pass 1) の実 rect から取る。
+                    if pass <= 1 {
+                        let rect = menu_rect.expect("メニューは開いている");
+                        assert!(
+                            full.contains_rect(rect),
+                            "{overlay_size:?} で画面外へ出る: {rect:?}"
+                        );
+                        let row_height = (rect.height()
+                            - super::SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
+                            - super::SEEK_STRIP_MENU_SEPARATOR_HEIGHT)
+                            / (preset_start + SeekStripHeight::ALL.len()) as f32;
+                        let row_height = row_height.max(18.0);
+                        let scroll = ctx
+                            .data(|data| {
+                                data.get_temp::<f32>(egui::Id::new(
+                                    "native_video_seek_strip_menu_scroll",
+                                ))
+                            })
+                            .unwrap_or(0.0);
+                        let row_rect = super::native_seek_strip_menu_row_rect(
+                            rect.translate(egui::vec2(0.0, -scroll)),
+                            *row_index,
+                            separator_before,
+                            row_height,
+                        );
+                        row_center = egui::pos2(
+                            row_rect.min.x
+                                + row_rect.width() * if *column == 0 { 0.25 } else { 0.75 },
+                            row_rect.center().y,
+                        );
+                        if pass == 1 {
+                            assert!(
+                                rect.contains(row_center),
+                                "{overlay_size:?}: {row_index} 行が見えない: {row_center:?} / {rect:?} / scroll={scroll}"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    commands.iter().any(|command| match (command, expected) {
+                        (
+                            super::NativeOverlayCommand::SetSeekStripView { view, .. },
+                            super::NativeOverlayCommand::SetSeekStripView { view: wanted, .. },
+                        ) => view == wanted,
+                        (
+                            super::NativeOverlayCommand::SetSeekStripHeight { height, .. },
+                            super::NativeOverlayCommand::SetSeekStripHeight {
+                                height: wanted, ..
+                            },
+                        ) => height == wanted,
+                        (
+                            super::NativeOverlayCommand::SetSeekPreviewSize { size, .. },
+                            super::NativeOverlayCommand::SetSeekPreviewSize {
+                                size: wanted, ..
+                            },
+                        ) => size == wanted,
+                        _ => false,
+                    }),
+                    "{row_index} 行目からこの選択に届かない: {expected:?}"
+                );
+                assert!(!menu_open, "選んだらメニューは閉じる");
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_seek_strip_menu_wheel_scrolls_to_lower_choices() {
+        use crate::settings::VideoSeekPreviewSize;
+        use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripView};
+
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(160.0, 120.0));
+        let button = egui::Rect::from_min_size(egui::pos2(100.0, 76.0), egui::vec2(28.0, 28.0));
+        let mut open = true;
+        let mut menu_rect: Option<egui::Rect> = None;
+        let mut commands = Vec::new();
+        for pass in 0..4 {
+            let events = match pass {
+                1 | 2 => vec![egui::Event::PointerMoved(
+                    menu_rect.expect("menu rect").center(),
+                )],
+                3 => vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                _ => Vec::new(),
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(full),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    super::draw_native_seek_strip_menu(
+                        ctx,
+                        full,
+                        button,
+                        SeekStripView::Hidden,
+                        SeekStripHeight::Large,
+                        crate::video::seek_strip_layout::SeekStripHeightValues::default(),
+                        VideoSeekPreviewSize::Large,
+                        crate::settings::VideoSeekPreviewSizeValues::default(),
+                        None,
+                        &mut open,
+                        &mut menu_rect,
+                        &mut commands,
+                    );
+                },
+            );
+        }
+        let scroll = ctx
+            .data(|data| data.get_temp::<f32>(egui::Id::new("native_video_seek_strip_menu_scroll")))
+            .unwrap_or(0.0);
+        assert!(scroll > 0.0, "ホイールでメニューがスクロールする: {scroll}");
     }
 
     #[test]

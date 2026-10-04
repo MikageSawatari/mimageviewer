@@ -1157,7 +1157,37 @@ fn file_stem_ci(path: &std::path::Path) -> Option<String> {
         .map(str::to_lowercase)
 }
 
-/// `ScannedDir` の内容シグネチャ (path + mtime + size + 種別) を u64 ハッシュ化する。
+/// 一覧の適用済み stamp。通常比較は従来どおり全項目の mtime を含める。
+/// `same_listing` だけが実 Folder の mtime を除き、表示中の一覧を維持できるか判定する。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FolderScanSignature {
+    full: u64,
+    listing: u64,
+}
+
+impl PartialEq for FolderScanSignature {
+    fn eq(&self, other: &Self) -> bool {
+        self.full == other.full
+    }
+}
+
+impl Eq for FolderScanSignature {}
+
+impl FolderScanSignature {
+    pub(crate) fn same_listing(self, other: Self) -> bool {
+        self.listing == other.listing
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u64) -> Self {
+        Self {
+            full: value,
+            listing: value,
+        }
+    }
+}
+
+/// `ScannedDir` の内容シグネチャ (path + mtime + size + 種別) をハッシュ化する。
 /// フォーカス復帰時の差分判定用。`read_dir` の返却順は NTFS で保証されないので
 /// 並び順非依存にするため path で明示的にソートしてからハッシュする。
 /// プロセス内比較専用 (DefaultHasher は Rust バージョン間で安定でないため永続化しない)。
@@ -1166,7 +1196,7 @@ fn file_stem_ci(path: &std::path::Path) -> Option<String> {
 /// 上書きされた場合は差分検知できず再ロードがスキップされる。画像ファイルが
 /// 偶然同サイズで <1 秒以内に書き換わる現実的なシナリオは稀なため許容している。
 /// 必要なら `metadata.modified()` の SystemTime を秒+nanos で取り直す拡張が可能。
-pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
+pub(crate) fn signature_from_scan(scan: &ScannedDir) -> FolderScanSignature {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut entries: Vec<(&std::ffi::OsStr, i64, i64, &'static str)> =
@@ -1192,7 +1222,9 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     }
     entries.sort();
     let mut hasher = DefaultHasher::new();
+    let mut listing_hasher = DefaultHasher::new();
     entries.len().hash(&mut hasher);
+    entries.len().hash(&mut listing_hasher);
     // `omitted` は意図的に含めない。この signature は「一覧を差し替える必要があるか」を
     // 判定するもので、`hidden` / `unsupported` には Explorer が書く Thumbs.db / desktop.ini
     // (どちらも hidden 属性) が入る。これを含めるとサムネイルキャッシュが書かれるたびに
@@ -1201,8 +1233,179 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     // 常に整合しており、実際に一覧が変わったときの再ロードで更新される。
     for e in &entries {
         e.hash(&mut hasher);
+        let &(path, mtime, size, kind) = e;
+        (path, if kind == "folder" { 0 } else { mtime }, size, kind).hash(&mut listing_hasher);
     }
-    hasher.finish()
+    FolderScanSignature {
+        full: hasher.finish(),
+        listing: listing_hasher.finish(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod signature_tests {
+    use super::*;
+
+    pub(crate) fn fixture(root: &std::path::Path) -> ScannedDir {
+        let folders = [
+            GridItem::Folder(root.join("child")),
+            GridItem::ZipFile(root.join("book.zip")),
+            GridItem::PdfFile(root.join("book.pdf")),
+            GridItem::PdfFile(root.join("book.epub")),
+            GridItem::ConvertibleArchive {
+                path: root.join("book.rar"),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+        ]
+        .into_iter()
+        .map(|item| ScannedFolderEntry {
+            display_meta: Some((
+                10,
+                if matches!(item, GridItem::Folder(_)) {
+                    0
+                } else {
+                    20
+                },
+            )),
+            sort_meta: crate::settings::ListingSortMetadata::new(10, None),
+            item,
+        })
+        .collect();
+        let all_media = [
+            ScanMediaKind::Image,
+            ScanMediaKind::Video,
+            ScanMediaKind::Audio,
+        ]
+        .into_iter()
+        .zip(["image.png", "video.mp4", "audio.mp3"])
+        .map(|(kind, name)| ScannedMediaEntry {
+            path: root.join(name),
+            kind,
+            mtime: 10,
+            file_size: 20,
+            sort_meta: crate::settings::ListingSortMetadata::new(10, Some(20)),
+        })
+        .collect();
+        ScannedDir {
+            folders,
+            all_media,
+            omitted: Default::default(),
+        }
+    }
+
+    pub(crate) fn real_changes(root: &std::path::Path) -> Vec<(&'static str, ScannedDir)> {
+        let mut cases = Vec::new();
+        for (label, modify) in [
+            ("file added", 0),
+            ("file removed", 1),
+            ("file renamed", 2),
+            ("folder added", 3),
+            ("folder removed", 4),
+            ("folder renamed", 5),
+            ("folder kind", 6),
+            ("folder size", 7),
+            ("media kind", 8),
+        ] {
+            let mut scan = fixture(root);
+            match modify {
+                0 => {
+                    let mut entry = scan.all_media[0].clone();
+                    entry.path = root.join("new.png");
+                    scan.all_media.push(entry);
+                }
+                1 => {
+                    scan.all_media.remove(0);
+                }
+                2 => scan.all_media[0].path = root.join("renamed.png"),
+                3 => {
+                    let mut entry = scan.folders[0].clone();
+                    entry.item = GridItem::Folder(root.join("new_child"));
+                    scan.folders.push(entry);
+                }
+                4 => {
+                    scan.folders.remove(0);
+                }
+                5 => scan.folders[0].item = GridItem::Folder(root.join("renamed_child")),
+                6 => scan.folders[0].item = GridItem::ZipFile(root.join("child")),
+                7 => scan.folders[0].display_meta = Some((10, 1)),
+                8 => scan.all_media[0].kind = ScanMediaKind::Video,
+                _ => unreachable!(),
+            }
+            cases.push((label, scan));
+        }
+        for index in 1..5 {
+            for size_change in [false, true] {
+                let mut scan = fixture(root);
+                scan.folders[index].display_meta =
+                    Some(if size_change { (10, 21) } else { (11, 20) });
+                cases.push(("archive/PDF/EPUB stamp", scan));
+            }
+        }
+        for index in 0..3 {
+            for size_change in [false, true] {
+                let mut scan = fixture(root);
+                if size_change {
+                    scan.all_media[index].file_size += 1;
+                } else {
+                    scan.all_media[index].mtime += 1;
+                }
+                cases.push(("media stamp", scan));
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn signature_from_scan_splits_only_real_folder_mtimes() {
+        let root = std::path::Path::new("signature_fixture");
+        let scan = fixture(root);
+        let initial = signature_from_scan(&scan);
+        let mut changed = fixture(root);
+        changed.folders[0].display_meta = Some((11, 0));
+        let updated = signature_from_scan(&changed);
+        assert_ne!(
+            initial, updated,
+            "normal signature equality must include folder mtime"
+        );
+        assert!(initial.same_listing(updated));
+        for (label, scan) in real_changes(root) {
+            let changed = signature_from_scan(&scan);
+            assert_ne!(initial, changed, "{label}");
+            assert!(!initial.same_listing(changed), "{label}");
+        }
+    }
+
+    #[test]
+    fn signature_from_scan_preserves_original_hash_and_order_independence() {
+        use std::hash::{Hash, Hasher};
+        let root = std::path::Path::new("signature_fixture");
+        let mut scan = fixture(root);
+        let signature = signature_from_scan(&scan);
+        // Original signature's exact tuple stream, independent of the new implementation.
+        let mut entries = vec![
+            (root.join("child"), 10i64, 0i64, "folder"),
+            (root.join("book.zip"), 10, 20, "zip"),
+            (root.join("book.pdf"), 10, 20, "pdf"),
+            (root.join("book.epub"), 10, 20, "pdf"),
+            (root.join("book.rar"), 10, 20, "archive"),
+            (root.join("image.png"), 10, 20, "image"),
+            (root.join("video.mp4"), 10, 20, "video"),
+            (root.join("audio.mp3"), 10, 20, "audio"),
+        ];
+        entries.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entries.len().hash(&mut hasher);
+        for (path, mtime, size, kind) in entries {
+            (path.as_os_str(), mtime, size, kind).hash(&mut hasher);
+        }
+        assert_eq!(signature.full, hasher.finish());
+        scan.folders.reverse();
+        scan.all_media.reverse();
+        scan.omitted.unsupported = 99;
+        let reordered = signature_from_scan(&scan);
+        assert_eq!(signature, reordered);
+        assert!(signature.same_listing(reordered));
+    }
 }
 
 #[cfg(test)]

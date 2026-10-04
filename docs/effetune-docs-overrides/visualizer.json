@@ -1,0 +1,62 @@
+[
+  {
+    "operation": "replace_paragraph",
+    "anchor": "PCではヘッダーの **Effect Pipeline**、**Music Library** の隣にある **Visualizer** を選びます。モバイルでは右上のメニューボタンの左にある **Visualizer** アイコンを選びます。デスクトップアプリでは **表示 > Visualizer** からも開けます。[ブラウザ拡張版](browser-extension.md)では、Pipeline Editor のヘッダーにある **Visualizer** を選びます。**設定 > 環境設定...** で起動時の表示にも指定できます。",
+    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンを選びます。mImageViewer には、デスクトップ版 EffeTune の「表示」メニューやミニプレーヤーはありません。",
+    "reason": "Bundled effetune.html visualizerButton; standalone menu absent."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "表示領域にポインターを重ねるかタップすると **⛶** が現れます。押すと、指定した縦横比を保ったままアプリの表示領域いっぱいに拡大します。端が切り取られることがあります。再度 **⛶** を押すか、**Esc** またはモバイルの戻る操作で元に戻ります。デスクトップアプリでVisualizerの表示中にミニプレーヤーへ切り替えると、再生操作の上に表示が付きます。",
+    "replacement": "表示領域にポインターを重ねると **⛶** が現れます。押すと、指定した縦横比を保ったまま EffeTune の表示領域いっぱいに拡大します。端が切り取られることがあります。再度 **⛶** を押すか、**Esc** で元に戻ります。",
+    "reason": "Remove mobile back/mini player instructions; this expands inside EffeTune, not mIV fullscreen."
+  },
+  {
+    "operation": "insert_note",
+    "heading_id": "visualizer",
+    "note": "mImageViewer で再生している曲のジャケット画像・曲名・アルバム名・アーティスト名は、この表示には渡されません。Artwork、Title、Album、Artist は通常表示では空になります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像は使用できます。",
+    "reason": "ui-manager.js:103,2080 has no audioPlayer; visualizer-view.js:199-202 uses its metadata, renderer skips absent metadata."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "ツールバーの **共有** を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは **バックアップ / 復元** を使ってください。Web版では、リンクを開くとVisualizerが開いてレイアウトが適用されます。デスクトップ版やブラウザ拡張版で共有したリンクもWeb版で開きます。デスクトップ版やブラウザ拡張版の場合、またはリンクからEffeTuneが開かない場合は、リンクをコピーしてツールバーの **リンクを読み込む** を選ぶか、Visualizerの表示中にCtrl+V（Macでは⌘V）を押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、**Edit** を開いて **元に戻す** を選んでください。",
+    "replacement": "ツールバーの **共有** を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは **バックアップ / 復元** を使ってください。共有したリンクは EffeTune Web アプリで開きます。mImageViewer の EffeTune へ取り込むには、リンクをコピーしてツールバーの **リンクを読み込む** を選ぶか、Visualizerの表示中にCtrl+Vを押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、**Edit** を開いて **元に戻す** を選んでください。",
+    "reason": "Keep bundled Visualizer sharing/import and undo; remove desktop/extension and Mac instructions."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<p>デスクトップアプリでディスプレイが2台以上あるときは、<strong>表示 &gt; Visualizer クリーンフィード</strong> で選んだディスプレイにVisualizerを全画面表示できます。ウインドウ枠や操作ボタンは表示されません。レイアウトの縦横比は保たれ、余白は黒で埋まります。ほかのアプリを操作している間（同じメニューの <strong>非アクティブ時も表示</strong> がオンのときを除く）、メインウインドウやミニプレーヤーでVisualizerを表示している間、メインウインドウがそのディスプレイに重なっている間、ブラインドテスト中は非表示になります。やめるときは <strong>オフ</strong> を選ぶか、フィード画面をクリックして Esc キーを押します。ディスプレイが1台だけのときは選べません。</p>",
+    "replacement": "",
+    "reason": "Clean Feed uses the standalone application menu; no VST entry exists."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**設定** で **表示を音声に同期** を有効にすると、表示を聞こえる音に合わせるため、音声が遅延することがあります。グラフが表示できない場合は、**オーディオ設定** で **WebAssembly 音声処理を使用する** が有効か、EffeTuneを通して音声が再生されているかを確認してください。",
+    "replacement": "mImageViewer の EffeTune 画面には、デスクトップ版のオーディオ設定はありません。音声グラフは EffeTune に渡された音を表示します。リモート配信中は EffeTune の窓が非表示になり、配信を終えると元の表示状態に戻ります。",
+    "reason": "Native telemetry replaces standalone WASM/audio-device settings; Remote suppression is the current mIV contract."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<p>デスクトップ版では、<strong>ハードウェア アクセラレーションを使用</strong> が初期状態でオンです。画面がちらつく、または更新されなくなる場合は、<strong>設定 &gt; 環境設定...</strong> でオフにしてEffeTuneを再起動してください。表示の問題が繰り返されると、自動的にオフにして再起動します。再度試すときは、同じ設定をオンにして再起動してください。</p>",
+    "replacement": "",
+    "reason": "Standalone Electron hardware-acceleration preference is absent in bundled WebView."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "Ctrl+D（MacではCmd+D）",
+    "replacement": "Ctrl+D",
+    "reason": "mIV is Windows-only."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "（Ctrl+Z・Ctrl+Y、MacではCmd）",
+    "replacement": "（Ctrl+Z・Ctrl+Y）",
+    "reason": "mIV is Windows-only."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "複数のアイテムを選ぶには、キャンバスかアイテム一覧でShift+クリックします。選択中のアイテムをShift+クリックすると選択が外れます。アイテム一覧ではCtrl+クリック（MacではCmd+クリック）でも同じように選べます。キャンバスの空いている所からドラッグすると枠内に完全に収まるアイテムを選べ、Shiftを押しながらドラッグすると選択に追加できます。アイテムが重なっている所では、キャンバス上でCtrl+クリック（MacではCmd+クリック）すると背面のアイテムを選べます。Ctrl+クリックするたびに1つずつ奥のアイテムへ移り、最背面の次は最前面に戻ります。選んだアイテムはそのままドラッグできます。Ctrl+A（MacではCmd+A）ですべて選択し、Escで選択を解除します。移動・削除・複製・切り取り・コピー・貼り付けは選択中のすべてのアイテムにまとめて働きます。大きさの変更は1つずつ行います。同じ種類のアイテムだけを選んでいるときは、右側に先頭のアイテムの設定が表示され、変更は選択中のすべてのアイテムに反映されます。右側には並べ替えのボタンのほか、左端・左右中央・右端・上端・上下中央・下端に揃えるボタンも表示されます。",
+    "replacement": "複数のアイテムを選ぶには、キャンバスかアイテム一覧でShift+クリックします。選択中のアイテムをShift+クリックすると選択が外れます。アイテム一覧ではCtrl+クリックでも同じように選べます。キャンバスの空いている所からドラッグすると枠内に完全に収まるアイテムを選べ、Shiftを押しながらドラッグすると選択に追加できます。アイテムが重なっている所では、キャンバス上でCtrl+クリックすると背面のアイテムを選べます。Ctrl+クリックするたびに1つずつ奥のアイテムへ移り、最背面の次は最前面に戻ります。選んだアイテムはそのままドラッグできます。Ctrl+Aですべて選択し、Escで選択を解除します。移動・削除・複製・切り取り・コピー・貼り付けは選択中のすべてのアイテムにまとめて働きます。大きさの変更は1つずつ行います。同じ種類のアイテムだけを選んでいるときは、右側に先頭のアイテムの設定が表示され、変更は選択中のすべてのアイテムに反映されます。右側には並べ替えのボタンのほか、左端・左右中央・右端・上端・上下中央・下端に揃えるボタンも表示されます。",
+    "reason": "mIV is Windows-only; preserve multi-selection and cycling through overlapping items."
+  }
+]

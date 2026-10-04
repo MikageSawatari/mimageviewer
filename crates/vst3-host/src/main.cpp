@@ -52,6 +52,10 @@
 #include "host_app.h"
 #include "plugin_loader.h"
 #include "protocol.h"
+#include "ipc_strings.h"
+#include "utf8_paths.h"
+#include "vcrt_preload.h"
+#include "build_identity.h"
 
 namespace miv {
 
@@ -183,16 +187,10 @@ void send_event_gui_bypass_toggle(uint64_t slot_id) {
 }
 
 static std::string wide_to_utf8(const wchar_t* text) {
-    if (!text || !*text) {
-        return {};
-    }
-    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-    if (needed <= 1) {
-        return {};
-    }
-    std::string out(static_cast<size_t>(needed - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
-    return out;
+    // Window titles originate in third-party plugins; a malformed surrogate
+    // should not terminate the host just while producing a diagnostic.
+    try { return text ? miv::utf16_to_utf8(text) : std::string{}; }
+    catch (const std::exception&) { return "(invalid UTF-16)"; }
 }
 
 static BOOL CALLBACK enum_current_thread_window_proc(HWND hwnd, LPARAM param) {
@@ -654,16 +652,7 @@ private:
     // 単純な JSON 解析: { "cmd": "<value>", ... } から cmd を取り出す。
     // POC 用なので本格的な JSON パーサは入れない (将来 nlohmann/json 採用検討)。
     static std::string extract_string_field(const std::string& json, const std::string& key) {
-        std::string needle = "\"" + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return {};
-        pos = json.find(':', pos);
-        if (pos == std::string::npos) return {};
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) return {};
-        auto end = json.find('"', pos + 1);
-        if (end == std::string::npos) return {};
-        return json.substr(pos + 1, end - pos - 1);
+        return extract_json_string_field(json, key);
     }
 
     static uint64_t extract_number_field(const std::string& json, const std::string& key) {
@@ -905,7 +894,16 @@ private:
             GuiWindowOptions options;
             options.slot_id = slot_id;
             options.owner_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "owner_hwnd"));
-            if (!options.owner_hwnd) {
+            options.unowned = extract_number_field(msg, "unowned") != 0;
+            options.gui_gate_name = extract_string_field(msg, "gui_gate_name");
+            options.main_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "main_hwnd"));
+            if (options.unowned) {
+                if (options.owner_hwnd || !options.main_hwnd ||
+                    !IsWindow(reinterpret_cast<HWND>(options.main_hwnd))) {
+                    send_event_error("show_gui: unowned editor requires a valid main reference and no owner");
+                    return true;
+                }
+            } else if (!options.owner_hwnd) {
                 send_event_error("show_gui: owner_hwnd missing");
                 return true;
             }
@@ -947,6 +945,32 @@ private:
         if (cmd == "hide_gui") {
             if (PluginLoader* loader = loader_for_message(msg)) loader->hide_gui();
             write_message("{\"event\":\"gui_detached\"}");
+            return true;
+        }
+        if (cmd == "set_gui_remote_session") {
+            if (PluginLoader* loader = loader_for_message(msg))
+                loader->set_gui_remote_session(extract_number_field(msg, "active") != 0);
+            return true;
+        }
+        if (cmd == "sync_gui_main_visibility") {
+            if (PluginLoader* loader = loader_for_message(msg)) loader->sync_gui_main_visibility();
+            return true;
+        }
+        if (cmd == "activate_gui") {
+            if (PluginLoader* loader = loader_for_message(msg)) loader->activate_gui();
+            return true;
+        }
+        if (cmd == "set_gui_visibility_checked") {
+            const uint64_t id = extract_number_field(msg, "request_id");
+            const uint64_t slot = extract_number_field(msg, "slot_id");
+            const bool visible = extract_number_field(msg, "visible") != 0;
+            const GuiGateSnapshot permit {extract_number_field(msg, "minimized_sequence"), extract_number_field(msg, "remote_token")};
+            auto reply = [id, slot](const char* outcome) {
+                write_message("{\"event\":\"gui_visibility_result\",\"request_id\":" + std::to_string(id) +
+                              ",\"slot_id\":" + std::to_string(slot) + ",\"outcome\":\"" + outcome + "\"}");
+            };
+            if (PluginLoader* loader = loader_for_message(msg)) loader->set_gui_visibility_checked(visible, permit, std::move(reply));
+            else reply("error");
             return true;
         }
         if (cmd == "set_gui_visible") {
@@ -1939,12 +1963,14 @@ static void start_parent_watchdog(DWORD parent_pid) {
 }
 
 int main(int argc, char** argv) {
+    std::fprintf(stderr, "%s\n", MIV_VST3_HOST_SOURCE_MARKER);
     // bridge プロセスを Per-Monitor v2 DPI Aware に設定する。
     // これがないと GetDpiForSystem / GetDpiForWindow がプライマリ DPI ではなく
     // 96 を返してしまい、setContentScaleFactor で正しい scale を伝えられない。
     // VST3 GUI を任意のスレッドで attached する前に必ずプロセス全体に設定する必要がある。
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     start_parent_watchdog(parse_parent_pid_arg(argc, argv));
+    if (!miv::preload_vcrt()) return 1;
     miv::Bridge bridge;
     return bridge.run();
 }

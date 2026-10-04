@@ -2,7 +2,8 @@
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
 //! process load time and starts `mimageviewer-remote.exe` and `mimageviewer-epub-pdf.exe`
-//! from its own directory. The launcher therefore extracts all three executables, FFmpeg DLLs, and the app-local VC runtime into
+//! from its own directory. The launcher extracts these executables, FFmpeg DLLs,
+//! app-local VC runtime and the complete EffeTune bundle into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
 
 #![windows_subsystem = "windows"]
@@ -14,8 +15,17 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+#[path = "../../../src/effetune/bundle_location.rs"]
+mod bundle_location;
+mod bundle_paths;
+mod effetune_bundle;
+include!(concat!(env!("OUT_DIR"), "/effetune_files.rs"));
+
 #[cfg(test)]
 mod build_const_parser;
+#[cfg(test)]
+#[path = "../build_effetune_source.rs"]
+mod build_effetune_source;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -125,12 +135,16 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
 
     extract_assets(&runtime_dir)?;
+    // EffeTune preparation is optional to application startup. Never run a
+    // damaged/old bundle silently when this launcher's preparation failed.
+    let effetune = prepare_effetune(&runtime_dir);
 
     let core_path = runtime_dir.join("mimageviewer-core.exe");
     let launcher_path = std::env::current_exe().ok();
 
     let mut cmd = Command::new(&core_path);
     cmd.args(&user_args);
+    configure_effetune_command(&mut cmd, effetune);
     if let Some(path) = launcher_path {
         cmd.env("MIV_LAUNCHER_EXE_PATH", path);
     }
@@ -145,6 +159,44 @@ fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
         extract_asset(runtime_dir, asset)?;
     }
     Ok(())
+}
+
+fn configure_effetune_command(
+    cmd: &mut Command,
+    result: Result<PathBuf, effetune_bundle::PreparationError>,
+) {
+    cmd.env_remove(bundle_location::PREPARATION_ERROR_ENV);
+    cmd.env_remove(bundle_location::GENERATION_ENV);
+    cmd.env_remove(bundle_location::REJECTED_GENERATION_ENV);
+    match result {
+        Ok(root) => {
+            cmd.env(bundle_location::GENERATION_ENV, root.file_name().unwrap());
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            cmd.env(bundle_location::PREPARATION_ERROR_ENV, error.to_string());
+            if let Some(generation) = error.rejected_generation {
+                cmd.env(bundle_location::REJECTED_GENERATION_ENV, generation);
+            }
+        }
+    }
+}
+
+fn prepare_effetune(
+    runtime_dir: &Path,
+) -> Result<std::path::PathBuf, effetune_bundle::PreparationError> {
+    effetune_bundle::ensure_bundle(runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST).map_err(
+        |mut e| {
+            e.reason = std::io::Error::new(
+                e.reason.kind(),
+                format!(
+                    "extract EffeTune {EFFETUNE_VERSION} failed: {e}\n(runtime dir: {})",
+                    runtime_dir.display()
+                ),
+            );
+            e
+        },
+    )
 }
 
 fn extract_asset(runtime_dir: &Path, asset: &(&str, &[u8], &str)) -> Result<(), String> {
@@ -575,6 +627,106 @@ fn show_error(msg: &str) {
 #[cfg(all(test, windows))]
 mod tests {
     use std::ffi::OsString;
+
+    #[test]
+    fn preparation_failure_and_success_are_forwarded_without_starting_core() {
+        let mut cmd = std::process::Command::new("dummy-core-never-run.exe");
+        let name = format!(
+            "{}-Abc123",
+            "a".repeat(super::bundle_location::FINGERPRINT_LENGTH)
+        );
+        super::configure_effetune_command(
+            &mut cmd,
+            Err(super::effetune_bundle::PreparationError {
+                reason: std::io::Error::other("EffeTune publish: access denied"),
+                rejected_generation: Some(name.clone()),
+            }),
+        );
+        let vars: Vec<_> = cmd.get_envs().collect();
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::PREPARATION_ERROR_ENV
+            && value.is_some()));
+        assert!(
+            vars.iter().any(
+                |(key, value)| *key == super::bundle_location::GENERATION_ENV && value.is_none()
+            )
+        );
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::REJECTED_GENERATION_ENV
+            && *value == Some(std::ffi::OsStr::new(&name))));
+        super::configure_effetune_command(&mut cmd, Ok(std::path::PathBuf::from(&name)));
+        let vars: Vec<_> = cmd.get_envs().collect();
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::PREPARATION_ERROR_ENV
+            && value.is_none()));
+        assert!(vars.iter().any(
+            |(key, value)| *key == super::bundle_location::GENERATION_ENV
+                && *value == Some(std::ffi::OsStr::new(&name))
+        ));
+        assert!(vars.iter().any(|(key, value)| *key
+            == super::bundle_location::REJECTED_GENERATION_ENV
+            && value.is_none()));
+    }
+
+    #[test]
+    fn embedded_effetune_fits_long_user_profile_generation_path() {
+        // Exercise every real bundle path and the longest permitted generation
+        // basename without creating directories or loading the plugin.
+        let profile = format!(r"C:\Users\{}", "a".repeat(40));
+        let generation = format!("{}-{}", "a".repeat(12), "b".repeat(32));
+        let root = std::path::PathBuf::from(profile)
+            .join(r"AppData\Roaming\mimageviewer\runtime\4.3.0\effetune")
+            .join(generation);
+        let deepest = super::EFFETUNE_FILES
+            .iter()
+            .map(|file| {
+                root.join(file.name)
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(deepest, 252);
+        assert!(deepest < 260);
+    }
+
+    #[test]
+    fn embedded_effetune_extracts_complete_bundle_beside_core() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::effetune_bundle::ensure_bundle(
+            temp.path(),
+            super::EFFETUNE_FILES,
+            super::EFFETUNE_MANIFEST,
+        )
+        .unwrap();
+        let bundle = root.join("EffeTune Mixwright.vst3");
+        assert!(
+            bundle
+                .join("Contents/x86_64-win/EffeTune Mixwright.vst3")
+                .is_file()
+        );
+        assert!(
+            bundle
+                .join("Contents/Resources/webview/plugins/dsp/NOTICE.txt")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("VERSION"))
+                .unwrap()
+                .trim(),
+            super::EFFETUNE_VERSION
+        );
+        for file in super::EFFETUNE_FILES {
+            assert_eq!(
+                super::sha256_file_hex(&root.join(file.name)).unwrap(),
+                file.hash,
+                "{}",
+                file.name
+            );
+        }
+        assert!(super::EFFETUNE_FILES.len() > 400);
+    }
 
     #[test]
     fn data_dir_option_defers_single_instance_routing_to_core() {

@@ -157,6 +157,7 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
+mod pin_materialization;
 pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 
 #[cfg(test)]
@@ -338,6 +339,7 @@ pub(crate) struct RatingPhysicalLoadOwner {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RatingPhysicalLoadIntent {
+    Refresh,
     Explicit,
     Restore,
 }
@@ -706,6 +708,14 @@ pub(crate) enum FolderOpenOutcome {
     ConversionDialogOpened,
     Ignored,
     Refused(FolderOpenRefusal),
+}
+
+/// Outcome of the main-grid ownership boundary; Collection callers use Blocked before adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectionMainContextChange {
+    NotNeeded,
+    Transferred,
+    Blocked(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3416,6 +3426,7 @@ pub(crate) struct RatingSessionWrite {
 
 #[derive(Default)]
 struct MetadataImportRefreshIndex {
+    pin_materialization: pin_materialization::Request,
     items_generation: u64,
     next_item: usize,
     complete: bool,
@@ -3938,6 +3949,8 @@ impl Drop for StartupOpenPathResolvePending {
 pub(crate) struct StartupInitPending {
     rx: mpsc::Receiver<crate::indexer_manager::StartupInitOutcome>,
     started_at: std::time::Instant,
+    /// 名前索引は即時に要求済み。残る metadata / similar の要求だけを集約する。
+    full_check_requested: bool,
 }
 
 impl StartupInitPending {
@@ -5254,31 +5267,6 @@ fn run_vst3_startup_load(
     }
 }
 
-/// 名前索引 OFF 遷移時の「supervisor join 完了 → search_index_db クリア」を実行する
-/// 共通ヘルパー (T53 + Codex P3 / 2026-05-16)。
-///
-/// 自由関数として extract する理由: `apply_favorite_name_index_change` の旧コードでは
-/// `std::thread::Builder::spawn(closure)` の closure 内に clear ロジックを直書きしていた
-/// が、`spawn` は失敗時に closure を実行せずに drop するだけなので、spawn 失敗パスでは
-/// clear が永久に走らない不具合があった。channel handoff (= spawn 成功時) と sync 呼び出し
-/// (= spawn 失敗時) の両方から本関数を呼ぶ構造に変えることで、どちらの経路でも join → clear
-/// の順序を保ったまま、必ず両方が実行される。
-fn run_name_index_off_completion(
-    handle: crate::name_index_supervisor::NameIndexSupervisorHandle,
-    clear_target: Option<(Arc<crate::search_index_db::SearchIndexDb>, PathBuf)>,
-) {
-    // Drop 内で cancel 再送 + thread.join() が走る (= bulk scan が止まるまで待つ)。
-    drop(handle);
-    if let Some((db, path)) = clear_target {
-        if let Err(e) = db.clear_for_favorite(&path) {
-            crate::logger::log(format!(
-                "favorites: clear name index for {} failed (post-join): {e}",
-                path.display()
-            ));
-        }
-    }
-}
-
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
@@ -5376,10 +5364,10 @@ pub(crate) enum FolderOpenScanPurpose {
         navigation_purpose: FsNavigationPurpose,
     },
     /// 現在の物理フォルダを、変更済みの表示順設定で再構築するための事前走査。
-    /// path と並び設定の snapshot が一致する owning context だけが完了を適用する。
+    /// path・並び設定の snapshot・typed reload owner が一致する context だけが完了を適用する。
     CurrentViewOrderRefresh {
         order: CurrentViewOrderSnapshot,
-        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        reload_owner: Box<OpenRequestOwner>,
     },
 }
 
@@ -6031,10 +6019,43 @@ pub(crate) struct DetailsLazyMeta {
     pub(crate) page_count_pdf_password_revision: Option<u64>,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) image_dims_failed: bool,
-    pub(crate) video_duration_secs: Option<f64>,
-    pub(crate) video_dims: Option<(u32, u32)>,
-    pub(crate) video_codec: Option<String>,
-    pub(crate) video_meta_failed: bool,
+    pub(crate) media: DetailsMediaMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum DetailsMediaMeta {
+    #[default]
+    NotFetched,
+    Read(DetailsVideoProbe),
+    Unreadable,
+    /// Retry on a new item installation, without repeatedly probing this list.
+    RetryLater {
+        generation: u64,
+    },
+}
+
+impl DetailsMediaMeta {
+    fn read(&self) -> Option<&DetailsVideoProbe> {
+        match self {
+            Self::Read(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    fn satisfies(&self, generation: u64) -> bool {
+        match self {
+            Self::NotFetched => false,
+            Self::RetryLater {
+                generation: attempted,
+            } => *attempted == generation,
+            Self::Read(_) | Self::Unreadable => true,
+        }
+    }
+
+    fn failed_for_generation(&self, generation: u64) -> bool {
+        matches!(self, Self::Unreadable)
+            || matches!(self, Self::RetryLater { generation: attempted } if *attempted == generation)
+    }
 }
 
 impl DetailsLazyMeta {
@@ -6070,10 +6091,7 @@ impl DetailsLazyMeta {
             self.image_dims_failed = patch.image_dims_failed;
         }
         if loaded.video_meta {
-            self.video_duration_secs = patch.video_duration_secs;
-            self.video_dims = patch.video_dims;
-            self.video_codec = patch.video_codec;
-            self.video_meta_failed = patch.video_meta_failed;
+            self.media = patch.media;
         }
         source_changed
     }
@@ -6143,7 +6161,14 @@ impl DetailsCellContentRevisions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsMetaScanScope {
+    AllRequirements,
+    VisibleStage,
+}
+
 struct DetailsMetaPending {
+    scan_scope: DetailsMetaScanScope,
     visible_revision: u64,
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
@@ -6262,8 +6287,7 @@ struct DetailsMetaTarget {
     key: String,
     item: GridItem,
     relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
-    source_mtime: i64,
-    source_size: i64,
+    source_identity: Option<(i64, i64)>,
     catalog_folder: Option<PathBuf>,
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
@@ -6278,6 +6302,14 @@ struct DetailsMetaTarget {
 }
 
 impl DetailsMetaTarget {
+    fn source_mtime(&self) -> i64 {
+        self.source_identity.map_or(0, |identity| identity.0)
+    }
+
+    fn source_size(&self) -> i64 {
+        self.source_identity.map_or(0, |identity| identity.1)
+    }
+
     fn requested_fields(&self) -> DetailsLazyFieldFlags {
         DetailsLazyFieldFlags {
             page_count: self.load_page_count,
@@ -6295,6 +6327,14 @@ impl DetailsMetaTarget {
         self.load_image_dims &= !processed.image_dims;
         self.load_video_meta &= !processed.video_meta;
     }
+
+    fn include_requested_fields(&mut self, requested: DetailsLazyFieldFlags) {
+        self.load_page_count |= requested.page_count;
+        self.load_created_at |= requested.created_at;
+        self.load_ai_metadata |= requested.ai_metadata;
+        self.load_image_dims |= requested.image_dims;
+        self.load_video_meta |= requested.video_meta;
+    }
 }
 
 #[derive(Clone)]
@@ -6304,10 +6344,11 @@ struct DetailsPageCountConfig {
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
 }
 
-struct DetailsVideoProbe {
-    duration_secs: Option<f64>,
-    dims: Option<(u32, u32)>,
-    codec: Option<String>,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DetailsVideoProbe {
+    pub(crate) duration_secs: Option<f64>,
+    pub(crate) dims: Option<(u32, u32)>,
+    pub(crate) codec: Option<String>,
 }
 
 /// 非同期お気に入り検索 (Ctrl+S) の状態。
@@ -10995,7 +11036,8 @@ pub(crate) struct ExternalRescanPending {
     /// 走査の条件。隠しファイル表示などを変えて読み直したら、古い条件の結果は捨てる。
     pub(crate) scan_options: ExternalRescanOptions,
     pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) rx: mpsc::Receiver<Option<folder_scan::ScannedDir>>,
+    pub(crate) rx:
+        mpsc::Receiver<Option<(folder_scan::ScannedDir, folder_scan::FolderScanSignature)>>,
     /// 走査中に届いた次の変更。**通知を捨てず、完了後にもう一度走らせる。**
     ///
     /// 「いま走っているから要らない」と扱うと、走査が stamp を読んだ後の上書きを
@@ -13405,6 +13447,47 @@ pub(crate) struct FavoriteViewContextState {
     pub(crate) location_favorite_id: Option<uuid::Uuid>,
 }
 
+#[derive(Clone)]
+enum CurrentViewRefresh {
+    Full,
+    Pins {
+        folders: std::collections::HashSet<PathBuf>,
+        videos: std::collections::HashSet<PathBuf>,
+    },
+}
+
+impl CurrentViewRefresh {
+    fn merge(&mut self, previous: &Self) {
+        match (self, previous) {
+            (current, Self::Full) => *current = Self::Full,
+            (
+                Self::Pins { folders, videos },
+                Self::Pins {
+                    folders: old_folders,
+                    videos: old_videos,
+                },
+            ) => {
+                folders.extend(old_folders.iter().cloned());
+                videos.extend(old_videos.iter().cloned());
+            }
+            (Self::Full, _) => {}
+        }
+    }
+}
+
+struct CurrentViewPinRefresh {
+    items_generation: u64,
+    refresh: CurrentViewRefresh,
+    rx: mpsc::Receiver<Option<metadata_import_refresh::RefreshResult>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for CurrentViewPinRefresh {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
@@ -13866,7 +13949,8 @@ pub struct App {
     /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
     /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
-    pub(crate) raw_pages: RawPageStore,
+    /// Keep the unique context owner off-stack within App's footprint bound.
+    pub(crate) raw_pages: Box<RawPageStore>,
     pub(crate) fs_pending: ItemsGenerationMap<FsPendingValue>,
 
     /// 現在表示単位の PDF pool 昇格 dedup / not_found retry。items / fullscreen_idx と
@@ -14075,19 +14159,8 @@ pub struct App {
     // Paused capability を表し、保存済み auto_index_similar の値やデータは変更しない。
     pub(crate) similar_index: Option<crate::similar_index::SimilarIndexManager>,
 
-    /// 名前索引 Supervisor のアクティブ handle (favorite_id → handle)。
-    ///
-    /// `auto_index_structure = true` のお気に入りごとに 1 つ。長期スレッド +
-    /// FsWatcher を持ち、初期バルクが終わった後も notify-rs イベントで差分追従する。
-    ///
-    /// 2026-04 ユーザー指摘: 旧 `name_bulk_handles` はワンショット bulk thread の
-    /// JoinHandle だけを保持していたため、初期スキャン後に追加された
-    /// フォルダ/ZIP/PDF は Ctrl+S 検索にヒットしなかった。メタ索引側の
-    /// `indexer_supervisor` と対称な構造に揃えるため `NameIndexSupervisor` に差し替え。
-    pub(crate) name_index_supervisors: std::collections::HashMap<
-        uuid::Uuid,
-        crate::name_index_supervisor::NameIndexSupervisorHandle,
-    >,
+    /// 名前索引の root owner。handle/join/DB I/O は専用 worker が所有する。
+    pub(crate) name_index_manager: Option<crate::name_index_manager::NameIndexManager>,
 
     /// 操作中はバックグラウンドインデクサを一時停止するためのゲート (2026-04 F)。
     /// `App::update` の入力検知で `bump()` され、indexer 側が `wait_until_idle()` で待機。
@@ -14804,7 +14877,8 @@ pub struct App {
     pub(crate) converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
     /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty_paths` と同じ作法)。
-    pub(crate) folder_thumb_pin_dirty: bool,
+    pub(crate) folder_thumb_pin_dirty: std::collections::HashSet<PathBuf>,
+    current_view_pin_refreshes: std::collections::HashMap<ViewerContextId, CurrentViewPinRefresh>,
 
     // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
     /// S キーでトグルされる動画タイルモード状態。再生中に間隔別にサムネを並べて
@@ -16929,10 +17003,10 @@ pub struct App {
     /// トレイ復帰 / フォーカス復帰時に `std::fs::metadata` で新しい mtime を取り、値が
     /// 変わっていたら再ロードする。ZIP / PDF / 検索合成パスには使わないので None のまま。
     pub(crate) current_folder_last_mtime: Option<std::time::SystemTime>,
-    /// 直近ロードしたフォルダ内容のシグネチャ (path + mtime + size のハッシュ)。
-    /// mtime 変化を検知して再走査した結果が同一なら、items 差し替えをスキップして
+    /// 適用済みフォルダ内容のシグネチャ (path + mtime + size + 種別のハッシュ)。
+    /// 再走査が同一、または実 Folder の mtime だけの差分なら items 差し替えをスキップして
     /// 画面ちらつきを防ぐ。`current_folder_last_mtime` と同じくディレクトリ実体のみ。
-    pub(crate) current_folder_signature: Option<u64>,
+    pub(crate) current_folder_signature: Option<folder_scan::FolderScanSignature>,
     /// 前フレームの main viewport focus 状態。false → true 遷移で外部更新チェックを走らせる。
     /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
     pub(crate) last_main_focused: bool,
@@ -17577,7 +17651,8 @@ impl App {
             crate::data_dir::get(),
             notify_book_query_change,
         );
-        if let Some(index) = &similar_index {
+        if let Some(index) = similar_index.as_ref() {
+            index.set_skip_offline_change_scan(settings.skip_offline_change_scan);
             index.set_raw_executor(Arc::clone(&raw_develop_executor));
         }
 
@@ -17742,7 +17817,7 @@ impl App {
             fs_page_load_scheduler,
             raw_develop_executor: Arc::clone(&raw_develop_executor),
             input_generation: std::collections::HashMap::new(),
-            raw_pages: RawPageStore::new(),
+            raw_pages: Box::new(RawPageStore::new()),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
@@ -17816,7 +17891,7 @@ impl App {
             fav_add_auto_index_similar: false,
             indexer_manager,
             similar_index,
-            name_index_supervisors: std::collections::HashMap::new(),
+            name_index_manager: None,
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
             global_search_subfolder_restore: None,
@@ -18087,7 +18162,8 @@ impl App {
             converted_archive_cache_paths: std::collections::HashMap::new(),
             converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
-            folder_thumb_pin_dirty: false,
+            folder_thumb_pin_dirty: std::collections::HashSet::new(),
+            current_view_pin_refreshes: std::collections::HashMap::new(),
             #[cfg(windows)]
             video_tile_mode_active: false,
             #[cfg(windows)]
@@ -20915,17 +20991,7 @@ impl App {
             return Some(nav);
         }
         // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
-        #[cfg(windows)]
-        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
-        #[cfg(not(windows))]
-        let detached_video_preserved = false;
-        #[cfg(windows)]
-        if !detached_video_preserved {
-            self.preserve_active_detached_image_window_for_main_context_change();
-        }
-        if !detached_video_preserved {
-            self.close_fullscreen();
-        }
+        self.change_main_context_for_visible_grid(false);
         None
     }
 
@@ -20934,13 +21000,21 @@ impl App {
         restore: top_level_grid_view::CollectionGridRestore,
         fullscreen_close_origin: bool,
     ) {
-        if fullscreen_close_origin {
+        let collection_id = restore.identity.collection_id;
+        let source_location = self.collection_nav_history_source();
+        let return_to = self.collection_open_return_to(collection_id, true);
+        let change = self.prepare_collection_main_context_change(collection_id);
+        if let CollectionMainContextChange::Blocked(reason) = change {
+            crate::logger::log(format!("collection parent navigation blocked: {reason}"));
+            return;
+        }
+        if fullscreen_close_origin && matches!(change, CollectionMainContextChange::NotNeeded) {
             self.close_fullscreen();
         }
         // AddressBarNav::Collection is a parent-navigation request. The root loading shell is
         // visible adoption, so commit its child -> parent edge before replacing the child.
-        self.record_collection_nav_transition(restore.clone());
-        self.open_collection_grid(restore.identity.collection_id, Some(restore));
+        self.record_collection_nav_transition(restore.clone(), source_location);
+        self.open_collection_grid_after_context_change(collection_id, Some(restore), return_to);
     }
 
     /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
@@ -21489,13 +21563,28 @@ impl App {
         Some(target)
     }
 
+    /// Search is a transparent history overlay. Capture that decision while the source bundle
+    /// is still mounted: promoting detached media swaps `global_search` out of the new main.
+    pub(crate) fn collection_nav_history_source(&self) -> Option<FolderNavHistoryTarget> {
+        if !self.main_folder_history_available()
+            || self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || self.suppress_nav_record_for_search_restore
+        {
+            None
+        } else {
+            self.folder_nav_current_target()
+        }
+    }
+
     pub(crate) fn record_collection_nav_transition(
         &mut self,
         restore: top_level_grid_view::CollectionGridRestore,
+        source_location: Option<FolderNavHistoryTarget>,
     ) {
         let target = FolderNavHistoryTarget::Collection(restore);
-        let current = self.folder_nav_current_target();
-        self.record_folder_nav_transition_from_current(target, current);
+        self.record_folder_nav_transition_from_current(target, source_location);
     }
 
     /// The collection session is still at `from` when its physical load reaches the visible
@@ -21611,6 +21700,25 @@ impl App {
             rating_view_stars,
             self.top_level_grid_view.smart_folder().cloned(),
         )
+    }
+
+    /// Resolve a transient view's canonical return before consulting its legacy fallback.
+    /// Borrowed inputs are used by Collection's pre-transfer read; dismissal supplies moved
+    /// ownership, so normal close never clones a subfolder expansion restore payload.
+    pub(crate) fn view_return_context_from_canonical_or_fallback<'a>(
+        &self,
+        canonical: Option<std::borrow::Cow<'a, top_level_grid_view::TopLevelGridRestore>>,
+        fallback: impl FnOnce() -> (
+            Option<PathBuf>,
+            Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+        ),
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        if let Some(return_to) = canonical {
+            return return_to.into_owned();
+        }
+        let (path, subfolder_restore) = fallback();
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars)
     }
 
     pub(crate) fn current_top_level_restore_snapshot(
@@ -22388,7 +22496,7 @@ impl App {
     ///   (Windows Search / ウイルススキャン等が触っただけ → ちらつき抑止)
     ///
     /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
-    /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
+    /// UI は親の `metadata()` と適用可否の比較だけを行い、走査と signature 計算は worker で行う。
     pub(crate) fn check_external_folder_changes(
         &mut self,
         ctx: &egui::Context,
@@ -22490,7 +22598,11 @@ impl App {
                     include_epub,
                     show_hidden_files,
                 )
-                .ok();
+                .ok()
+                .map(|scan| {
+                    let signature = signature_from_scan(&scan);
+                    (scan, signature)
+                });
                 // 送ってから起こす。起きたフレームの poll が必ず受け取れる順序。
                 let _ = tx.send(scan);
                 repaint.request_repaint();
@@ -22577,8 +22689,8 @@ impl App {
             return;
         }
         let _ = scan_options;
-        let scan = scan.expect("checked above");
-        self.apply_external_rescan(folder.clone(), mtime, scan);
+        let (scan, signature) = scan.expect("checked above");
+        self.apply_external_rescan(folder.clone(), mtime, scan, signature);
         restart(self, ctx);
     }
 
@@ -22588,6 +22700,7 @@ impl App {
         folder: PathBuf,
         new_mtime: std::time::SystemTime,
         scan: folder_scan::ScannedDir,
+        new_sig: folder_scan::FolderScanSignature,
     ) {
         // 走査中に別のフォルダーへ移っていたら捨てる。
         if !self
@@ -22597,11 +22710,14 @@ impl App {
         {
             return;
         }
-        // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
-        // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
-        // ウイルススキャン等が触っただけで mtime が更新されるケースを救済する。
-        let new_sig = signature_from_scan(&scan);
-        if self.current_folder_signature == Some(new_sig) {
+        // 実 Folder の mtime だけの差分も一覧を維持する (§1.314)。表示 metadata と
+        // 代表サムネ要求 stamp は一覧を開いた時点のまま、比較用 stamp だけを進める。
+        // それ以外の差分や未適用の一覧は従来の reload / defer へ流す。
+        if self
+            .current_folder_signature
+            .is_some_and(|old| old.same_listing(new_sig))
+        {
+            self.current_folder_signature = Some(new_sig);
             self.current_folder_last_mtime = Some(new_mtime);
             return;
         }
@@ -22680,7 +22796,8 @@ impl App {
             self.context_menu_idx = None;
         }
         // 既に走らせた scan を pre_scan として渡し、UI スレッドで再 read_dir しない。
-        self.load_folder_with_scan(folder, Some(scan));
+        let owner = self.current_folder_reload_owner(&folder);
+        self.load_folder_with_scan_owned(folder, Some(scan), owner);
         // 再ロード後に選択パスを探し、見つかればそこにカーソルを戻してスクロール依頼。
         // 見つからない (消えた) / そもそも未選択ならスクロール位置は触らない。
         if let Some(path) = selected_path {
@@ -22715,7 +22832,58 @@ impl App {
             .map(|item| item.name().into_owned());
     }
 
+    /// The adopted location owns a refresh, including the parent provenance of physical children.
+    fn current_folder_reload_owner(&self, folder: &Path) -> OpenRequestOwner {
+        if let Some(mut owner) = self.collection_grid_physical_reload_owner(folder) {
+            owner.intent = top_level_grid_view::CollectionGridPhysicalLoadIntent::Refresh;
+            return OpenRequestOwner::CollectionGridPhysical(owner);
+        }
+        if let Some(mut owner) = self.rating_view_physical_load_owner(folder)
+            && matches!(
+                owner.source_location,
+                FolderNavHistoryTarget::RatingPhysical(_)
+            )
+        {
+            owner.intent = RatingPhysicalLoadIntent::Refresh;
+            return OpenRequestOwner::RatingPhysical(owner);
+        }
+        OpenRequestOwner::Navigation
+    }
+
     pub(crate) fn reload_current_folder_preserving_override(&mut self) {
+        self.reload_current_view_in_place(CurrentViewRefresh::Full);
+    }
+
+    fn reload_current_view_in_place(&mut self, refresh: CurrentViewRefresh) {
+        if self.zip_nav.is_some() && matches!(refresh, CurrentViewRefresh::Pins { .. }) {
+            self.refresh_current_zip_level_preserving_position();
+            return;
+        }
+        if self.items_are_global_search_view
+            || self.favsearch.on_results_grid()
+            || self.items_are_tag_view
+            || self.items_are_rating_view
+            || self.items_are_reading_history_view
+            || self.items_are_bookmark_view
+            || matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Snapshot
+            )
+        {
+            if matches!(refresh, CurrentViewRefresh::Full)
+                && !matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                )
+                && let Some(ctx) = self.edit_preview_repaint_ctx.clone()
+            {
+                self.reload_top_level_grid(&ctx);
+                return;
+            }
+            // These rows have a synthetic owner; their backing folder is not a navigation target.
+            self.refresh_current_view_pin_thumbnails(refresh);
+            return;
+        }
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
@@ -22728,10 +22896,7 @@ impl App {
         let previous_hint = self.select_after_load.clone();
         self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
-        let owner = self
-            .collection_grid_physical_reload_owner(&folder)
-            .map(OpenRequestOwner::CollectionGridPhysical)
-            .unwrap_or(OpenRequestOwner::Navigation);
+        let owner = self.current_folder_reload_owner(&folder);
         let outcome =
             self.load_folder_or_convert_archive_with_auto_fullscreen_owned(folder, false, owner);
         if matches!(
@@ -22745,6 +22910,180 @@ impl App {
         if let Some(src) = saved_override {
             self.address = src.to_string_lossy().to_string();
             self.archive_source_override = Some(src);
+        }
+    }
+
+    /// Refresh synthetic assets with the existing context/generation-owned metadata worker.
+    fn refresh_current_view_pin_thumbnails(&mut self, mut refresh: CurrentViewRefresh) {
+        if let Some(previous) = self
+            .current_view_pin_refreshes
+            .get(&self.projected_viewer_context_id())
+            && previous.items_generation == self.items_generation
+        {
+            refresh.merge(&previous.refresh);
+        }
+        // Retire the old persistence owner before its successor can start writing.
+        self.current_view_pin_refreshes
+            .remove(&self.projected_viewer_context_id());
+        let pending_refresh = refresh.clone();
+        let context_id = self.projected_viewer_context_id();
+        let mut paths = self.folder_pin_context_lookup_paths();
+        let mut aliases = Vec::new();
+        let mut materialization = self.pin_materialization_request(refresh);
+        let items = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let container_path = self.folder_pin_lookup_target_for_item(item).map(|target| {
+                    materialization.rows.push(self.pin_materialization_row(index, item, target.path.clone()));
+                    paths.push(target.path.clone());
+                    if let Some(alias) = target.alias {
+                        aliases.push(alias);
+                    }
+                    target.path
+                });
+                let video_path = match item {
+                    GridItem::Video(path)
+                        if matches!(materialization.scope, CurrentViewRefresh::Full)
+                            || matches!(&materialization.scope, CurrentViewRefresh::Pins { videos, .. }
+                                if videos.iter().any(|dirty| crate::path_key::eq_keep_drive(dirty, path)))
+                            || !matches!(self.thumbnails.get(index), Some(ThumbnailState::Loaded { .. })) =>
+                    {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                metadata_import_refresh::ItemKey {
+                    index,
+                    key: String::new(),
+                    rating: false,
+                    tags: false,
+                    page: false,
+                    had_page_state: false,
+                    alternate_page_key: None,
+                    container_path,
+                    video_path,
+                    video_size: self
+                        .image_metas
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .map_or(0, |(_, size)| size.max(0) as u64),
+                }
+            })
+            .collect();
+        let request = metadata_import_refresh::ContextRequest {
+            pin_materialization: materialization,
+            context_id,
+            items_generation: self.items_generation,
+            items,
+            current_rating_key: None,
+            spread_container_path: None,
+            spread_container_fallback: None,
+            // The producer has already removed an unpinned key from the mounted map. Include
+            // the visible container keys so removal also invalidates its previous materialization.
+            old_folder_pin_keys: paths
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .chain(self.folder_pin_map.keys().cloned())
+                .collect(),
+            folder_pin_paths: paths,
+            folder_pin_aliases: aliases,
+        };
+        let data_dir = crate::data_dir::get();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let repaint_ctx = self.edit_preview_repaint_ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = metadata_import_refresh::run(
+                data_dir,
+                vec![request],
+                crate::metadata_transfer::ImportChangedSections {
+                    thumbnail_pins: true,
+                    ..Default::default()
+                },
+                &worker_cancel,
+            );
+            if let Some(result) = &result {
+                for error in &result.errors {
+                    crate::logger::log(error);
+                }
+            }
+            if tx.send(result).is_ok()
+                && let Some(ctx) = repaint_ctx
+            {
+                ctx.request_repaint();
+            }
+        });
+        self.current_view_pin_refreshes.insert(
+            context_id,
+            CurrentViewPinRefresh {
+                rx,
+                cancel,
+                items_generation: self.items_generation,
+                refresh: pending_refresh,
+            },
+        );
+    }
+
+    fn prune_current_view_pin_refreshes(&mut self) {
+        if self.current_view_pin_refreshes.is_empty() {
+            return;
+        }
+        let live_contexts = self.viewer_context_ids();
+        self.current_view_pin_refreshes
+            .retain(|id, _| live_contexts.contains(id));
+    }
+
+    fn poll_current_view_pin_refresh(&mut self) {
+        self.prune_current_view_pin_refreshes();
+        let context_id = self.projected_viewer_context_id();
+        let Some(pending) = self.current_view_pin_refreshes.get(&context_id) else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.current_view_pin_refreshes.remove(&context_id);
+        if let Some(result) = result {
+            for context in result.contexts {
+                if context.context_id != context_id {
+                    continue;
+                }
+                self.apply_current_metadata_import_terminal_result(
+                    context,
+                    crate::metadata_transfer::ImportChangedSections {
+                        thumbnail_pins: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
+    /// Pin changes assets at the current ZIP level; explicit F5 still re-enumerates it.
+    fn refresh_current_zip_level_preserving_position(&mut self) {
+        let selected = self.selected;
+        let scroll = self.scroll_offset_y;
+        let checked = self.checked.clone();
+        let show_search_bar = self.show_search_bar;
+        let query = self.search_query.clone();
+        let filter = self.search_filter.clone();
+        let search_was_pending = self.search_pending.is_some();
+        self.zip_nav_show_current_level();
+        self.selected = selected.filter(|index| *index < self.items.len());
+        self.scroll_offset_y = scroll;
+        self.checked = checked;
+        self.show_search_bar = show_search_bar;
+        self.search_query = query;
+        self.search_filter = filter;
+        self.rebuild_visible_indices();
+        if search_was_pending && let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
+            self.execute_search(&ctx);
         }
     }
 
@@ -22837,10 +23176,7 @@ impl App {
             let previous_history = self.folder_history.remove(&path);
             match physical_mode {
                 PhysicalFolderSortReload::Immediate => {
-                    let owner = self
-                        .collection_grid_physical_reload_owner(&path)
-                        .map(OpenRequestOwner::CollectionGridPhysical)
-                        .unwrap_or(OpenRequestOwner::Navigation);
+                    let owner = self.current_folder_reload_owner(&path);
                     let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                         path.clone(),
                         false,
@@ -22865,12 +23201,12 @@ impl App {
                         return;
                     }
                     let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
-                    let collection_owner = self.collection_grid_physical_reload_owner(&path);
+                    let reload_owner = Box::new(self.current_folder_reload_owner(&path));
                     self.start_folder_open_scan(
                         path,
                         FolderOpenScanPurpose::CurrentViewOrderRefresh {
                             order,
-                            collection_owner,
+                            reload_owner,
                         },
                     );
                 }
@@ -23249,17 +23585,7 @@ impl App {
             }
         }
 
-        #[cfg(windows)]
-        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
-        #[cfg(not(windows))]
-        let detached_video_preserved = false;
-        #[cfg(windows)]
-        if !detached_video_preserved {
-            self.preserve_active_detached_image_window_for_main_context_change();
-        }
-        if !detached_video_preserved {
-            self.close_fullscreen();
-        }
+        self.change_main_context_for_visible_grid(false);
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -24685,9 +25011,10 @@ impl App {
             return false;
         }
         let mut nav_chain = rating.nav_chain.clone();
-        if !nav_chain
-            .last()
-            .is_some_and(|last| crate::folder_tree::path_eq(last, path))
+        if rating.intent != RatingPhysicalLoadIntent::Refresh
+            && !nav_chain
+                .last()
+                .is_some_and(|last| crate::folder_tree::path_eq(last, path))
         {
             nav_chain.push(path.to_path_buf());
             if nav_chain.len() > MAX_FOLDER_NAV_STACK {
@@ -24840,10 +25167,16 @@ impl App {
                 if !self.smart_folder_session_owns_load(path) {
                     let logical_path = match owner {
                         OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
-                        _ => path,
+                        // A reload of the current cache is still the same logical archive.
+                        _ => zip_pin_root_path(
+                            path,
+                            self.archive_source_override.as_deref(),
+                            self.current_folder.as_deref(),
+                        ),
                     };
+                    let logical_path = logical_path.to_path_buf();
                     self.record_folder_nav_transition_from_current(
-                        FolderNavHistoryTarget::Path(logical_path.to_path_buf()),
+                        FolderNavHistoryTarget::Path(logical_path),
                         history_origin.cloned(),
                     );
                 }
@@ -25630,139 +25963,93 @@ impl App {
         true
     }
 
-    /// 名前索引フラグ (`auto_index_structure`) の OFF→ON / ON→OFF 遷移を即時反映する。
-    /// 呼び出し側はすでに `settings.favorites[*].auto_index_structure` を更新した後に呼ぶ。
-    ///
-    /// - false → true: 既存 supervisor があれば先に drop、新規 supervisor を spawn。
-    ///   supervisor が初期バルクを走らせ、その後 notify-rs で差分追従する。
-    /// - true → false: supervisor を drop し、`search_index_db` をクリア。
-    ///   **順序重要**: supervisor の drop (cancel + join) を先に完了させないと、
-    ///   in-flight upsert が clear_for_favorite 後に走って索引を復活させる race が
-    ///   発生する。
+    /// settings 更新後の起動/編集を同じ root owner 経路へ提出する。
     pub(crate) fn apply_favorite_name_index_change(
         &mut self,
-        fav_id: uuid::Uuid,
-        fav_path: &std::path::Path,
-        new_on: bool,
+        _fav_id: uuid::Uuid,
+        _fav_path: &std::path::Path,
+        _new_on: bool,
     ) {
-        // 既存 supervisor があれば drop (OFF 遷移だけでなく ON→ON でも念のため:
-        // path 変更等で spawn し直すシナリオ)。
-        // `drop(handle)` は `thread.join()` を待つため、bulk scan 進行中は UI が
-        // 数百 ms ブロックする。signal_stop で cancel は立ててから、実際の join は
-        // バックグラウンドスレッドに逃がす。spawn 失敗時は closure が現スレッドで drop
-        // されるので同期 join にフォールバックする (UI ブロックするが整合性は保たれる)。
-        //
-        // T53 (Codex R-SEARCH-002 / 2026-05-16): OFF 遷移の `clear_for_favorite` は
-        // **必ず supervisor の join 完了後**に走らせる。旧コードは joiner スレッドを
-        // spawn した直後に UI スレッドで clear を呼んでいたため、supervisor の最後の
-        // upsert が DB mutex 待ち中に clear が走り、その後 upsert が完了して OFF 後の
-        // 索引にゴーストレコードを残す race があった。new_on=false 経路では clear を
-        // joiner closure 内に移し、join 完了後 (= in-flight upsert 全消化後) に走らせる。
-        let existing_handle = self.name_index_supervisors.remove(&fav_id);
-        let clear_target = if !new_on {
-            self.search_index_db
-                .as_ref()
-                .map(|db| (Arc::clone(db), fav_path.to_path_buf()))
-        } else {
-            None
-        };
-        if let Some(handle) = existing_handle {
-            handle.signal_stop();
-            // T53 + Codex post-merge P3 (2026-05-16): spawn 失敗時に closure 内のロジック
-            // が走らない問題を回避する。`std::thread::Builder::spawn` は失敗時 closure を
-            // **実行せずに drop** するだけなので、closure 内に `clear_for_favorite` を入れて
-            // しまうと spawn 失敗時に索引クリアが永久に行われない (= 低頻度だが OFF 後にも
-            // 行が残る)。
-            //
-            // mpsc 経由でハンドル + clear_target を background worker に手渡しする構造に
-            // すれば、spawn 成功時は worker が同じ処理を行い、spawn 失敗時は handle と
-            // clear_target が外側に残るので main thread で同期実行できる。**どちらの経路
-            // でも join → clear の順序は保たれる**。
-            let (tx, rx) = mpsc::channel::<(
-                crate::name_index_supervisor::NameIndexSupervisorHandle,
-                Option<(
-                    Arc<crate::search_index_db::SearchIndexDb>,
-                    std::path::PathBuf,
-                )>,
-            )>();
-            let spawn_result = std::thread::Builder::new()
-                .name(format!("name-index-joiner-{}", fav_id.as_simple()))
-                .spawn(move || {
-                    if let Ok((handle, target)) = rx.recv() {
-                        run_name_index_off_completion(handle, target);
-                    }
-                });
-            match spawn_result {
-                Ok(_) => {
-                    // worker が rx.recv で待機中。ここで handle + clear_target を譲渡。
-                    let _ = tx.send((handle, clear_target));
+        self.sync_name_index_supervisors();
+    }
+
+    pub(crate) fn sync_name_index_supervisors(&mut self) {
+        if self.name_index_manager.is_none() {
+            let Some(db) = self.search_index_db.as_ref().cloned() else {
+                return;
+            };
+            match crate::name_index_manager::NameIndexManager::new_with_startup_policy(
+                db,
+                Some(Arc::clone(&self.activity_gate)),
+                self.settings.skip_offline_change_scan,
+            ) {
+                Ok(manager) => self.name_index_manager = Some(manager),
+                Err(error) => {
+                    crate::logger::log(format!("name-index-manager: start failed: {error}"));
+                    return;
                 }
-                Err(e) => {
-                    crate::logger::log(format!(
-                        "name-index-joiner spawn failed, sync join instead: {e}"
-                    ));
-                    drop(tx); // rx もすでに drop 済 (closure dropped by failed spawn)
-                    run_name_index_off_completion(handle, clear_target);
-                }
-            }
-        } else if let Some((db, path)) = clear_target {
-            // 既存 supervisor が居なかった場合 (= 既に OFF だが clear を念のため呼ぶ
-            // / 起動直後の冪等処理) はそのまま同期 clear。
-            if let Err(e) = db.clear_for_favorite(&path) {
-                crate::logger::log(format!(
-                    "favorites: clear name index for {} failed: {e}",
-                    path.display()
-                ));
             }
         }
-
-        let Some(db) = self.search_index_db.as_ref() else {
-            return;
-        };
-        if new_on {
-            crate::logger::log(format!(
-                "favorites: spawning name index supervisor for {}",
-                fav_path.display()
-            ));
-            let handle = crate::name_index_supervisor::spawn(
-                fav_id,
-                fav_path.to_path_buf(),
-                Arc::clone(db),
+        if let Some(manager) = &self.name_index_manager {
+            manager.sync_with_favorites(
+                &self.settings.favorites,
                 vec![self.settings.books_root_path()],
-                Some(Arc::clone(&self.activity_gate)),
             );
-            self.name_index_supervisors.insert(fav_id, handle);
         }
     }
 
-    /// 別バージョン索引フラグの変更を、対象 snapshot と共有 watcher の両方へ即時反映する。
+    pub(crate) fn name_index_stats_by_id(
+        &self,
+    ) -> std::collections::HashMap<uuid::Uuid, crate::name_index_supervisor::NameIndexStats> {
+        self.name_index_manager
+            .as_ref()
+            .map(|manager| manager.stats_by_id(&self.settings.favorites))
+            .unwrap_or_default()
+    }
+
+    /// 全索引の確認を非同期に要求する。初期化中は metadata / similar だけを予約する。
+    pub(crate) fn request_index_full_check(&mut self) {
+        if self.name_index_manager.is_none() {
+            self.sync_name_index_supervisors();
+        }
+        if let Some(manager) = self.name_index_manager.as_ref() {
+            manager.request_full_rescan();
+        }
+        self.request_index_full_check_shared();
+    }
+
+    fn request_index_full_check_shared(&mut self) {
+        if let Some(manager) = self.indexer_manager.as_ref() {
+            manager.request_shared_full_check();
+        } else if let Some(pending) = self.startup_init.as_mut() {
+            pending.full_check_requested = true;
+        } else {
+            let name_status = if self.name_index_manager.is_some() {
+                "コンテナ索引の確認は受け付けました。"
+            } else {
+                "コンテナ索引も初期化できなかったため、確認を行えません。"
+            };
+            self.show_feedback_toast(format!(
+                "アイテム索引を初期化できなかったため、アイテム索引と別バージョン索引の確認は行えません。{name_status}"
+            ));
+        }
+    }
+
+    /// 別バージョン索引フラグの変更を、共有 watcher と同じ構成 snapshot に提出する。
     /// OFF 時の削除も同じ worker へ渡し、後続の全走査の完走には依存させない。
     pub(crate) fn apply_favorite_similar_index_change(
         &mut self,
         _favorite_path: &std::path::Path,
         _new_on: bool,
     ) {
-        if let Some(similar_index) = self.similar_index.as_ref() {
-            similar_index.configure(
-                &self.settings.favorites,
-                self.pdf_passwords.clone(),
-                Some(Arc::clone(&self.activity_gate)),
-                vec![self.settings.books_root_path()],
-            );
-        }
         self.sync_shared_favorite_indexers();
     }
 
     /// Reflect favorite changes into the ordinary metadata watcher even when the optional
     /// alternate-version service is paused.
     pub(crate) fn sync_shared_favorite_indexers(&mut self) {
-        if let Some(manager) = self.indexer_manager.as_mut() {
-            manager.sync_with_favorites(&self.settings.favorites);
-        } else if self.startup_done {
-            if let Some(similar_index) = self.similar_index.as_ref() {
-                similar_index.notifier().finish_watch_bootstrap();
-            }
-        }
+        self.sync_name_index_supervisors();
+        self.refresh_similar_index_password_config();
     }
 
     pub(crate) fn similar_index_progress(&self) -> crate::similar_index::IndexProgress {
@@ -25783,14 +26070,26 @@ impl App {
         }
     }
 
-    fn refresh_similar_index_password_config(&self) {
-        if let Some(similar_index) = self.similar_index.as_ref() {
-            similar_index.configure(
+    fn refresh_similar_index_password_config(&mut self) {
+        let excluded = vec![self.settings.books_root_path()];
+        if let Some(manager) = self.indexer_manager.as_mut() {
+            manager.sync_with_configuration_and_passwords(
                 &self.settings.favorites,
+                excluded,
                 self.pdf_passwords.clone(),
-                Some(Arc::clone(&self.activity_gate)),
-                vec![self.settings.books_root_path()],
             );
+        } else if self.startup_done {
+            // With no shared watcher manager, close the bootstrap barrier explicitly.
+            if let Some(similar_index) = self.similar_index.as_ref() {
+                let notifier = similar_index.notifier();
+                notifier.configure(
+                    &self.settings.favorites,
+                    self.pdf_passwords.clone(),
+                    Some(Arc::clone(&self.activity_gate)),
+                    excluded,
+                );
+                notifier.finish_watch_bootstrap();
+            }
         }
     }
 
@@ -25876,19 +26175,13 @@ impl App {
         }
         let favorites = self.settings.favorites.clone();
         let excluded_roots = vec![self.settings.books_root_path()];
-        if let Some(similar_index) = self.similar_index.as_ref() {
-            similar_index.configure(
-                &favorites,
-                self.pdf_passwords.clone(),
-                Some(Arc::clone(&self.activity_gate)),
-                excluded_roots.clone(),
-            );
-        }
+        let similar_passwords = self.pdf_passwords.clone();
         let similar_notifier = self
             .similar_index
             .as_ref()
             .map(crate::similar_index::SimilarIndexManager::notifier);
         let speed = self.settings.indexer_speed_profile;
+        let skip_offline_change_scan = self.settings.skip_offline_change_scan;
         let activity_gate = Arc::clone(&self.activity_gate);
         let progress = Arc::clone(&self.startup_progress);
         let (tx, rx) = mpsc::channel();
@@ -25903,16 +26196,24 @@ impl App {
                     let outcome = crate::indexer_manager::IndexerManager::new(
                         &favorites,
                         speed,
-                        activity_gate,
-                        excluded_roots,
+                        Arc::clone(&activity_gate),
+                        excluded_roots.clone(),
                         similar_notifier.clone(),
+                        Some(similar_passwords.clone()),
                         Some(hook),
+                        skip_offline_change_scan,
                     );
                     if !matches!(
                         &outcome,
                         crate::indexer_manager::StartupInitOutcome::Ready(_)
                     ) {
                         if let Some(similar_notifier) = similar_notifier.as_ref() {
+                            similar_notifier.configure(
+                                &favorites,
+                                similar_passwords,
+                                Some(activity_gate),
+                                excluded_roots,
+                            );
                             similar_notifier.finish_watch_bootstrap();
                         }
                     }
@@ -25934,7 +26235,9 @@ impl App {
                 self.similar_index
                     .as_ref()
                     .map(crate::similar_index::SimilarIndexManager::notifier),
+                Some(self.pdf_passwords.clone()),
                 Some(hook),
+                self.settings.skip_offline_change_scan,
             );
             self.indexer_manager = match outcome {
                 crate::indexer_manager::StartupInitOutcome::Ready(manager) => Some(manager),
@@ -25951,9 +26254,14 @@ impl App {
             }
             self.startup_done = true;
             self.housekeeping_armed = true;
+            self.sync_shared_favorite_indexers();
             return;
         }
-        self.startup_init = Some(StartupInitPending { rx, started_at });
+        self.startup_init = Some(StartupInitPending {
+            rx,
+            started_at,
+            full_check_requested: false,
+        });
     }
 
     /// 起動直後の VST3 bridge enable + チェーン自動ロードを UI とは独立に開始する。
@@ -26145,8 +26453,35 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn effetune_toolbar_click(&mut self) {
+    pub(crate) fn local_audio_dsp_chain(&self) -> crate::video::audio::AudioDspChain {
+        crate::video::audio::AudioDspChain {
+            user: Some(self.dsp_bridge.clone()),
+            effetune: Arc::clone(&self.effetune.slot),
+            effetune_pre_limiter_enabled: self.settings.effetune_pre_limiter_enabled,
+            coordinator: Arc::clone(&self.dsp_processing),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_available(&self) -> bool {
+        !self.remote_session_blocks_local_control() && self.effetune.runtime.toolbar_available()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_click(&mut self, pointer_click: bool) {
+        let foreground = self.effetune.click_foreground(pointer_click);
+        if !self.effetune_toolbar_available() {
+            return;
+        }
         match self.effetune.runtime.clone() {
+            crate::effetune::EffetuneRuntime::Unavailable(ref reason)
+                if reason.preparation_retryable() =>
+            {
+                self.effetune.click_idle(
+                    self.settings.effetune_gui_pos,
+                    self.settings.effetune_gui_size,
+                )
+            }
             crate::effetune::EffetuneRuntime::Idle => self.effetune.click_idle(
                 self.settings.effetune_gui_pos,
                 self.settings.effetune_gui_size,
@@ -26155,14 +26490,20 @@ impl App {
                 let Some(bridge) = self.effetune.bridge().cloned() else {
                     return;
                 };
-                if bridge.slot(0).is_some_and(|slot| slot.gui_visible) {
-                    self.save_effetune_gui_rect();
-                    self.effetune.request_hide_gui();
-                } else {
-                    if let Some(hwnd) = self.main_hwnd {
-                        bridge.set_main_hwnd(hwnd as u64);
+                use crate::effetune::{GuiButtonAction, gui_button_action};
+                let visible = bridge.slot(0).is_some_and(|slot| slot.gui_visible);
+                match gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground)) {
+                    GuiButtonAction::Hide => {
+                        self.save_effetune_gui_rect();
+                        self.effetune.request_hide_gui();
                     }
-                    bridge.show_slot_gui_async(0);
+                    GuiButtonAction::Activate => self.effetune.request_show_gui(),
+                    GuiButtonAction::Show => {
+                        if let Some(hwnd) = self.main_hwnd {
+                            bridge.set_main_hwnd(hwnd as u64);
+                        }
+                        self.effetune.request_show_gui();
+                    }
                 }
             }
             _ => {}
@@ -26171,8 +26512,14 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn effetune_toolbar_tooltip(&self) -> String {
+        if self.remote_session_blocks_local_control() {
+            return "リモート接続中は音響調整の窓を表示できません。接続が終了すると、表示していた窓が戻ります".into();
+        }
         use crate::effetune::{EffectiveState, EffetuneRuntime};
         match &self.effetune.runtime {
+            EffetuneRuntime::Unavailable(reason) if reason.preparation_retryable() => {
+                format!("音響調整を利用できません: {}\nクリックして準備を再確認します", reason.user_reason())
+            }
             EffetuneRuntime::Unavailable(reason) => {
                 format!("音響調整を利用できません: {}", reason.user_reason())
             }
@@ -26198,20 +26545,20 @@ impl App {
     pub(crate) fn poll_effetune(&mut self, ctx: &egui::Context) {
         self.effetune.set_repaint_context(ctx);
         let startup_pending = self.effetune.startup_pending();
-        let open_gui_when_ready = matches!(
-            self.effetune.runtime,
+        let open_gui_when_ready = match self.effetune.runtime {
             crate::effetune::EffetuneRuntime::Loading {
-                open_gui_when_ready: true,
+                open_gui_when_ready,
                 ..
-            }
-        );
+            } => open_gui_when_ready,
+            _ => None,
+        };
         if !self.sidecar_restore_active() && self.effetune.poll() {
             if let Some(bridge) = self.effetune.bridge() {
                 if let Some(hwnd) = self.main_hwnd {
                     bridge.set_main_hwnd(hwnd as u64);
                 }
-                if open_gui_when_ready {
-                    std::sync::Arc::clone(bridge).show_slot_gui_async(0);
+                if let Some(permit) = open_gui_when_ready {
+                    self.effetune.request_show_gui_with_permit(permit);
                 }
             }
             if startup_pending
@@ -26507,9 +26854,9 @@ impl App {
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::all_supervisors_idle);
         let name_all_done = self
-            .name_index_supervisors
-            .values()
-            .all(|handle| handle.snapshot_stats().initial_scan_done);
+            .name_index_manager
+            .as_ref()
+            .is_none_or(crate::name_index_manager::NameIndexManager::all_initial_scans_done);
 
         if Self::take_initial_scan_settled_event(
             &mut self.initial_scan_settled_pending,
@@ -26533,6 +26880,7 @@ impl App {
         };
         match pending.try_recv() {
             Ok(outcome) => {
+                let full_check_requested = pending.full_check_requested;
                 crate::logger::log(format!(
                     "startup: IndexerManager init completed in {:.0} ms",
                     pending.elapsed_ms()
@@ -26548,23 +26896,32 @@ impl App {
                 self.startup_init = None;
                 self.startup_done = true;
                 self.housekeeping_armed = true;
+                self.sync_shared_favorite_indexers();
+                if full_check_requested {
+                    self.request_index_full_check_shared();
+                }
                 if let Ok(mut p) = self.startup_progress.lock() {
                     *p = "起動完了".to_string();
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
+                let full_check_requested = pending.full_check_requested;
                 // bg スレッドが panic 等で落ちた: 検索機能なしで継続させる。
                 crate::logger::log("startup: init thread disconnected unexpectedly");
                 self.indexer_manager = None;
                 self.startup_init = None;
                 self.startup_done = true;
+                self.refresh_similar_index_password_config();
                 if let Some(similar_index) = self.similar_index.as_ref() {
                     // The worker normally closes the watch-registration barrier when
                     // `IndexerManager::new` returns `None`. A panic can disconnect the channel
                     // before that owner runs, so close the same barrier here instead of leaving
                     // the optional Similar service permanently AwaitingWatch.
                     similar_index.notifier().finish_watch_bootstrap();
+                }
+                if full_check_requested {
+                    self.request_index_full_check_shared();
                 }
             }
         }
@@ -26758,48 +27115,27 @@ impl App {
         });
     }
 
-    /// 起動時に `auto_index_structure = true` のお気に入りごとに name index supervisor を
-    /// spawn する。`indexer_manager.sync_with_favorites` のメタ側の挙動に対応する。
-    /// 呼び出しは `App` 構築後 (settings が load 済みで search_index_db が開いている状態) に
-    /// 1 回だけ。
+    /// 起動時も編集時と同じ root 単位の直列化経路を使う。
     pub(crate) fn spawn_initial_name_index_supervisors(&mut self) {
-        let Some(db) = self.search_index_db.as_ref().cloned() else {
-            return;
-        };
-        for fav in &self.settings.favorites {
-            if !fav.auto_index_structure {
-                continue;
-            }
-            if self.name_index_supervisors.contains_key(&fav.id) {
-                continue;
-            }
-            crate::logger::log(format!(
-                "startup: spawning name index supervisor for {}",
-                fav.path.display()
-            ));
-            let handle = crate::name_index_supervisor::spawn(
-                fav.id,
-                fav.path.clone(),
-                Arc::clone(&db),
-                vec![self.settings.books_root_path()],
-                Some(Arc::clone(&self.activity_gate)),
-            );
-            self.name_index_supervisors.insert(fav.id, handle);
-        }
+        self.sync_name_index_supervisors();
     }
 
     /// タイトルバーの「(インデックス更新中)」表示用。
     /// 名前索引 / メタ索引 / 別バージョン索引のいずれかが走査中なら true。
     /// notify-rs の watcher で待機中 (監視中) は false。
     pub(crate) fn any_indexer_in_full_scan(&self) -> bool {
-        // 名前索引
-        for h in self.name_index_supervisors.values() {
-            if h.snapshot_stats().in_full_scan {
-                return true;
-            }
+        if self
+            .name_index_manager
+            .as_ref()
+            .is_some_and(crate::name_index_manager::NameIndexManager::any_in_full_scan)
+        {
+            return true;
         }
         // メタ索引
         if let Some(mgr) = self.indexer_manager.as_ref() {
+            if mgr.is_reconciling() {
+                return true;
+            }
             for v in mgr.all_stats() {
                 if v.stats.in_full_scan {
                     return true;
@@ -26818,25 +27154,20 @@ impl App {
         false
     }
 
-    // name_index_supervisors は HashMap の Drop で各 handle が個別に cancel + join
-    // される。名前索引は SQLite ベースで Tantivy writer のような共有リソースが
-    // 無いため、1 体ずつ drop してもデッドロックしない (メタ側の writer 共有とは違う)。
+    /// purge/stop/restart は manager の worker が現在構成から順序を決める。
+    pub(crate) fn apply_favorite_meta_index_change(&mut self, _fav_id: uuid::Uuid, _new_on: bool) {
+        self.sync_shared_favorite_indexers();
+    }
 
-    /// メタデータ索引フラグ (`auto_index_metadata`) の OFF→ON / ON→OFF 遷移を即時反映する。
-    /// 呼び出し側はすでに `settings.favorites[*].auto_index_metadata` を更新した後に呼ぶ。
-    ///
-    /// - false → true: 呼び出し側で `sync_with_favorites` を呼べば supervisor が spawn される
-    /// - true → false: 当 favorite の fts_meta 行を tombstone 化 → `sync_with_favorites` で
-    ///   supervisor を停止
-    pub(crate) fn apply_favorite_meta_index_change(&mut self, fav_id: uuid::Uuid, new_on: bool) {
-        if !new_on {
-            if let Some(mgr) = self.indexer_manager.as_ref() {
-                mgr.purge_favorite_metadata(fav_id);
-            }
-        }
-        // spawn/stop は sync_with_favorites 側
-        if let Some(mgr) = self.indexer_manager.as_mut() {
-            mgr.sync_with_favorites(&self.settings.favorites);
+    /// worker で確定した再起動案内を既存の全画面トーストへ届ける。
+    fn poll_indexer_notifications(&mut self) {
+        let notifications = self
+            .indexer_manager
+            .as_ref()
+            .map(|manager| manager.take_notifications())
+            .unwrap_or_default();
+        if !notifications.is_empty() {
+            self.show_feedback_toast_with_duration(notifications.join("\n"), 5.0);
         }
     }
 
@@ -27013,6 +27344,21 @@ impl App {
 
     /// Ctrl+S の状態だけを終了し、元ビューの再構築は行わず戻り先の所有権を返す。
     /// 別の最上位ビューへ直行するとき、復元 worker を起動直後にキャンセルする競合を防ぐ。
+    pub(crate) fn favsearch_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                (
+                    self.favsearch.saved_folder.clone(),
+                    self.favsearch_subfolder_restore.clone(),
+                )
+            },
+        )
+    }
+
     pub(crate) fn dismiss_favsearch_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
@@ -27027,13 +27373,12 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         let path = self.favsearch.saved_folder.take();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let subfolder_restore = self.favsearch_subfolder_restore.take();
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     pub(crate) fn restore_view_return_context(
@@ -27131,6 +27476,21 @@ impl App {
         self.restore_view_return_context(return_context);
     }
 
+    pub(crate) fn tag_view_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                (
+                    self.tag_view.saved_folder.clone(),
+                    self.tag_view_subfolder_restore.clone(),
+                )
+            },
+        )
+    }
+
     pub(crate) fn dismiss_tag_view_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
@@ -27150,13 +27510,12 @@ impl App {
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
         let path = self.tag_view.saved_folder.take();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let subfolder_restore = self.tag_view_subfolder_restore.take();
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     pub(crate) fn record_tag_view_nav_open(&mut self, path: &Path) {
@@ -28562,11 +28921,13 @@ impl App {
                         }
                         match request.target.clone() {
                             FolderNavHistoryTarget::Collection(restore) => {
-                                self.adopt_collection_history_root(
+                                if !self.adopt_collection_history_root(
                                     restore,
                                     prepared,
                                     request.return_to.take(),
-                                );
+                                ) {
+                                    return;
+                                }
                                 if let CollectionHistoryIntent::Replay { direction, target } =
                                     &request.intent
                                 {
@@ -33872,7 +34233,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     ) {
         self.start_loading_items_inner(
             source_path,
@@ -33897,7 +34258,7 @@ impl App {
         source_path: PathBuf,
         prepared: crate::filename_stack_ui::StackPreparedItems,
         existing_keys: std::collections::HashSet<String>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     ) {
         let crate::filename_stack_ui::StackPreparedItems {
@@ -33988,7 +34349,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
-        folder_signature: Option<u64>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
         prepared_page_edits: Option<(
             page_edit_snapshot::PageEditSnapshot,
@@ -34266,17 +34627,7 @@ impl App {
                     .insert(cur, (self.scroll_offset_y, self.selected));
             }
         }
-        #[cfg(windows)]
-        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
-        #[cfg(not(windows))]
-        let detached_video_preserved = false;
-        #[cfg(windows)]
-        if !detached_video_preserved {
-            self.preserve_active_detached_image_window_for_main_context_change();
-        }
-        if !detached_video_preserved {
-            self.close_fullscreen();
-        }
+        self.change_main_context_for_visible_grid(false);
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
         // 計測する (nav cancel / items 割当 / キャッシュ clear)。UI が止まる潜在箇所を
@@ -34976,7 +35327,7 @@ impl App {
         // 取り直す経路を踏まない)。`catalog_existing_keys` には既に pinned 形式が
         // 含まれているので、直後の delete_missing がこの seed 行を消すことはない。
         if !aggregate_catalog_was_prepared {
-            self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref());
+            self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref(), None);
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -35202,6 +35553,10 @@ impl App {
                 .lock()
                 .unwrap()
                 .set_items_generation(items_generation);
+            // Pin materializations persist on their worker, so retire the old items owner
+            // before the successor view can load/seed the same catalog keys.
+            self.current_view_pin_refreshes
+                .remove(&self.projected_viewer_context_id());
             // Exact seek indices belong to the items identity, not the current page.
             self.clear_still_seek_thumbnail_requests();
             // The page layout describes the last frame painted from this exact items identity.
@@ -36009,6 +36364,7 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
         catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+        indices: Option<&[usize]>,
     ) {
         if self.folder_pin_map.is_empty() {
             return;
@@ -36031,7 +36387,11 @@ impl App {
         let use_full_path_keys = self.use_full_path_cache_keys();
         let mut seeded = 0u32;
         let mut purged = 0u32;
-        for item in &self.items {
+        let candidates: Box<dyn Iterator<Item = &GridItem> + '_> = match indices {
+            Some(indices) => Box::new(indices.iter().filter_map(|index| self.items.get(*index))),
+            None => Box::new(self.items.iter()),
+        };
+        for item in candidates {
             let GridItem::Folder(container_path) = item else {
                 continue;
             };
@@ -36578,7 +36938,7 @@ impl App {
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.insert(key, source);
                 self.invalidate_smart_folder_resort_metadata();
-                self.folder_thumb_pin_dirty = true;
+                self.folder_thumb_pin_dirty.insert(container.to_path_buf());
                 crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
                 if self.zip_nav.is_some() {
                     self.record_current_container_content_identity(
@@ -36610,7 +36970,7 @@ impl App {
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.remove(&key);
                 self.invalidate_smart_folder_resort_metadata();
-                self.folder_thumb_pin_dirty = true;
+                self.folder_thumb_pin_dirty.insert(container.to_path_buf());
                 crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
                 if self.zip_nav.is_some() {
                     self.record_current_container_content_identity(
@@ -36833,7 +37193,7 @@ impl App {
             // 再 materialize (= scroll/selected リセット) は不要。dirty を消して
             // 読書位置を保つ。親へ戻ると zip_nav_back の refresh_folder_pin_map が
             // ピンを拾ってセルに反映する。
-            self.folder_thumb_pin_dirty = false;
+            self.folder_thumb_pin_dirty.remove(&book_key);
             return;
         }
         let Some(container) = self.current_folder.clone() else {
@@ -36969,16 +37329,13 @@ impl App {
         if self.sidecar_restore_active() {
             return;
         }
-        if std::mem::take(&mut self.folder_thumb_pin_dirty) {
-            // ネスト ZIP ツリー閲覧中は現在の階層を保ったまま再 materialize する。
-            // load_folder(zip_path) で開き直すと ZIP のルートに飛んでしまう
-            // (ユーザー報告: 内側ファイルを P でピンするとトップ階層にジャンプ)。
-            if self.zip_nav.is_some() {
-                self.zip_nav_show_current_level();
-            } else if let Some(cur) = self.current_folder.clone() {
-                self.folder_history.remove(&cur);
-                self.load_folder(cur);
-            }
+        self.poll_current_view_pin_refresh();
+        let dirty = std::mem::take(&mut self.folder_thumb_pin_dirty);
+        if !dirty.is_empty() {
+            self.reload_current_view_in_place(CurrentViewRefresh::Pins {
+                folders: dirty,
+                videos: Default::default(),
+            });
         }
     }
 
@@ -37024,35 +37381,15 @@ impl App {
             return;
         }
         self.video_thumb_reload_last_at = Some(std::time::Instant::now());
-        if self.items_are_subfolder_expansion_view {
-            // 同じ snapshot を再適用して動画ピンの WebP を再取得する。
-            if !self.reinstall_subfolder_expansion_snapshot()
-                && let Some(root) = self.subfolder_expansion_root.clone()
-            {
-                let roots = if self.subfolder_expansion_roots.is_empty() {
-                    vec![root.clone()]
-                } else {
-                    self.subfolder_expansion_roots.clone()
-                };
-                self.start_subfolder_expansion_scan_roots(root, roots);
-            }
-        } else if self.items_are_smart_folder_view {
+        if self.items_are_smart_folder_view {
             // A resident smart-folder result is frozen for the session. The explicit toolbar /
             // menu / gamepad reopen is the refresh gesture for path-keyed metadata and pins.
-        } else if let Some(cur) = self.current_folder.clone()
-            && !is_synthetic_view_path(&cur)
-        {
-            // 現フォルダ + 履歴を温存したまま再ロード。folder pin 側にある zip_nav
-            // 分岐 (ルートへ飛ぶ罠の回避) は不要 — ZIP ビューには実ファイル Video
-            // セルも動画へ解決される Folder タイルも出ないため、可視性チェックで
-            // 必ず手前で return する。
-            self.folder_history.remove(&cur);
-            self.load_folder(cur);
+        } else {
+            self.reload_current_view_in_place(CurrentViewRefresh::Pins {
+                folders: Default::default(),
+                videos: dirty,
+            });
         }
-        // 既知の制限 (bool フラグ時代から同じ): 検索 / タグ等の合成ビューに dirty 動画の
-        // Video セルが見えている場合、可視性は true になるがどの再ロード分岐にも入らず
-        // サムネは古いまま (従来も close_fullscreen で consume して何もしなかった)。
-        // ビューを閉じてフォルダへ戻る load_folder で反映される。
     }
 
     /// `consume_video_thumb_overrides_dirty` の可視性判定 (App 状態込み)。
@@ -37153,8 +37490,7 @@ impl App {
                 "folder-refresh: reloading current folder after deferred change ({})",
                 cur.display()
             ));
-            self.folder_history.remove(&cur);
-            self.load_folder(cur);
+            self.reload_current_folder_preserving_override();
         }
     }
 
@@ -37171,7 +37507,7 @@ impl App {
         // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
         // リセット) は不要。dirty を消して読書位置を保つ。
         if in_zip {
-            self.folder_thumb_pin_dirty = false;
+            self.folder_thumb_pin_dirty.remove(&container);
         }
     }
 
@@ -39020,6 +39356,7 @@ impl App {
                 .then(|| self.folder_pin_context_lookup_paths())
                 .unwrap_or_default();
             self.metadata_import_refresh_index = Some(MetadataImportRefreshIndex {
+                pin_materialization: self.pin_materialization_request(CurrentViewRefresh::Full),
                 items_generation: self.items_generation,
                 current_rating_key,
                 affected,
@@ -39061,6 +39398,12 @@ impl App {
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
+            if let Some(container) = &container_path {
+                index
+                    .pin_materialization
+                    .rows
+                    .push(self.pin_materialization_row(item_index, item, container.clone()));
+            }
             if let Some(target) = folder_pin_target {
                 if let Some(alias) = target.alias {
                     index.folder_pin_aliases.push(alias);
@@ -39126,6 +39469,7 @@ impl App {
 
     pub(crate) fn take_metadata_import_refresh_requests(
         &mut self,
+        changed: crate::metadata_transfer::ImportChangedSections,
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
@@ -39140,6 +39484,7 @@ impl App {
             (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
                 context_id,
                 items_generation: index.items_generation,
+                pin_materialization: index.pin_materialization,
                 items: index.items,
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
@@ -39187,6 +39532,29 @@ impl App {
                 old_folder_pin_keys,
             ) {
                 requests.push(request);
+            }
+        }
+        if changed.thumbnail_pins {
+            // The import's full pin snapshot now owns these contexts' materializations.
+            // Retire prior writers before spawning it, including same-generation requests.
+            // Unaffected contexts and transfers without pin changes retain their requests.
+            for request in &mut requests {
+                if self
+                    .current_view_pin_refreshes
+                    .remove(&request.context_id)
+                    .is_some()
+                {
+                    // An unpin may already be absent from the mounted map; the retiring
+                    // synthetic request included visible rows to invalidate that removal.
+                    // Carry that coverage into its full-snapshot successor as well.
+                    request
+                        .old_folder_pin_keys
+                        .extend(request.items.iter().filter_map(|item| {
+                            item.container_path
+                                .as_deref()
+                                .map(crate::path_key::normalize_keep_drive)
+                        }));
+                }
             }
         }
         requests
@@ -39444,78 +39812,70 @@ impl App {
         (result.errors, stale_context)
     }
 
-    fn refresh_folder_pin_thumbnail_materializations(&mut self, indices: &[usize]) {
-        let use_full_path_keys = self.use_full_path_cache_keys();
-        let mut pin_prefixes = std::collections::HashSet::new();
-        let mut retained_pin_keys = std::collections::HashSet::new();
-        for &index in indices {
-            let Some(item) = self.items.get(index) else {
-                continue;
-            };
-            let item_meta = self.image_metas.get(index).copied().flatten();
-            let keys = folder_thumb_existing_keys_for(
-                item,
-                item_meta,
-                &self.folder_pin_map,
-                self.folder_thumb_pin_db.as_deref(),
-                Some(self.settings.folder_thumb_sort),
-                self.settings.folder_thumb_depth,
-                use_full_path_keys,
-            );
-            if let Some(base_key) = keys.first() {
-                pin_prefixes.insert(
-                    [base_key.as_str(), crate::thumb_loader::CACHE_KEY_PIN_SUFFIX].concat(),
-                );
-            }
-            retained_pin_keys.extend(keys.into_iter().skip(1));
+    fn pin_materialization_identity(&self) -> pin_materialization::Identity {
+        pin_materialization::Identity {
+            cache: self
+                .current_color_cache_map
+                .as_ref()
+                .map(|map| Arc::as_ptr(map) as usize),
+            catalog: self
+                .current_color_catalog
+                .as_ref()
+                .map(|catalog| Arc::as_ptr(catalog) as usize),
+            sort: self.settings.folder_thumb_sort,
+            depth: self.settings.folder_thumb_depth,
+            full_path: self.use_full_path_cache_keys(),
         }
+    }
 
-        for &index in indices {
-            self.evict_thumbnail_for_reload(index);
+    fn pin_materialization_row(
+        &self,
+        index: usize,
+        item: &GridItem,
+        container: PathBuf,
+    ) -> pin_materialization::Row {
+        let dependency_root = match item {
+            GridItem::ZipDir { zip_path, .. } => zip_pin_root_path(
+                zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            )
+            .to_path_buf(),
+            _ => container.clone(),
+        };
+        pin_materialization::Row {
+            index,
+            item: item.clone(),
+            metadata: self.image_metas.get(index).copied().flatten(),
+            container,
+            dependency_root,
         }
+    }
 
-        let Some(cache_map) = self.current_color_cache_map.clone() else {
-            return;
-        };
-        let Some(catalog) = self.current_color_catalog.clone() else {
-            return;
-        };
-        let stale_pin_keys = cache_map
-            .read()
-            .ok()
-            .map(|map| {
-                map.keys()
-                    .filter(|key| {
-                        pin_prefixes.iter().any(|prefix| key.starts_with(prefix))
-                            && !retained_pin_keys.contains(*key)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for key in stale_pin_keys {
-            match catalog.delete_one(&key) {
-                Ok(()) => {
-                    if let Ok(mut map) = cache_map.write() {
-                        map.remove(&key);
-                    }
-                }
-                Err(error) => crate::logger::log(format!(
-                    "metadata pin refresh: stale catalog delete failed: {error} ({key})"
-                )),
-            }
+    fn pin_materialization_request(
+        &self,
+        scope: CurrentViewRefresh,
+    ) -> pin_materialization::Request {
+        pin_materialization::Request {
+            rows: Vec::new(),
+            identity: self.pin_materialization_identity(),
+            scope,
+            cache: self
+                .current_color_cache_map
+                .clone()
+                .zip(self.current_color_catalog.clone()),
         }
-        self.seed_folder_video_pin_thumbs(&cache_map, Some(&catalog));
     }
 
     fn restart_thumbnail_workers_after_metadata_pin_refresh(&mut self) {
-        if self.reload_queue.is_none() && self.heavy_io_queue.is_none() {
-            return;
-        }
-        let Some(cache_map) = self.current_color_cache_map.clone() else {
-            return;
-        };
+        let had_workers = self.reload_queue.is_some() || self.heavy_io_queue.is_some();
+        let cache_map = self.current_color_cache_map.clone();
 
+        if self.projected_viewer_context_id() == self.viewer_context_main()
+            && let Some(cancel) = self.search_video_thread_cancel.take()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
 
@@ -39527,8 +39887,8 @@ impl App {
         self.tx = tx.clone();
         self.rx = rx;
         self.cancel_token = Arc::clone(&cancel);
-        self.reload_queue = Some(Arc::clone(&reload_queue));
-        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.reload_queue = had_workers.then(|| Arc::clone(&reload_queue));
+        self.heavy_io_queue = had_workers.then(|| Arc::clone(&heavy_io_queue));
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.requested.clear();
         self.pending_finalize.clear();
@@ -39536,6 +39896,11 @@ impl App {
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
 
+        // Lightweight search requests also own their result channel. Replace it even without
+        // persistent workers, so cancelled old video/image results cannot overwrite fresh pins.
+        let Some(cache_map) = cache_map.filter(|_| had_workers) else {
+            return;
+        };
         self.spawn_thumbnail_workers(
             &tx,
             cancel,
@@ -39552,7 +39917,12 @@ impl App {
         mut result: metadata_import_refresh::ContextResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> bool {
-        if result.items_generation != self.items_generation {
+        if result.items_generation != self.items_generation
+            || result
+                .folder_pin_materializations
+                .as_ref()
+                .is_some_and(|prepared| !prepared.matches(self.pin_materialization_identity()))
+        {
             return false;
         }
         let rating_cache_replaced = result.rating_cache.is_some();
@@ -39650,13 +40020,23 @@ impl App {
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
-        let folder_pin_reset_indices = result.folder_pin_reset_indices.take().unwrap_or_default();
+        let folder_pin_reset_indices =
+            if let Some(prepared) = result.folder_pin_materializations.take() {
+                if let Some(map) = prepared.replacement {
+                    self.current_color_cache_map = Some(map);
+                }
+                prepared.reset_indices
+            } else {
+                Vec::new()
+            };
         if let Some(folder_pins) = result.folder_pin_map.take() {
             self.invalidate_converted_archive_pin_root_states();
             self.folder_pin_map = folder_pins;
         }
         if !folder_pin_reset_indices.is_empty() {
-            self.refresh_folder_pin_thumbnail_materializations(&folder_pin_reset_indices);
+            for &index in &folder_pin_reset_indices {
+                self.evict_thumbnail_for_reload(index);
+            }
         }
         let video_refresh = match (result.video_items.take(), result.video_pin_blobs.take()) {
             (Some(video_items), Some(pin_blobs)) if !video_items.is_empty() => {
@@ -39671,13 +40051,41 @@ impl App {
             self.restart_thumbnail_workers_after_metadata_pin_refresh();
         }
         if let Some((video_items, pin_blobs)) = video_refresh {
-            self.spawn_video_thread(
-                self.tx.clone(),
-                Arc::clone(&self.cancel_token),
-                video_items,
-                self.video_thumb_overrides.clone(),
-                Arc::new(pin_blobs),
-            );
+            if self.items_are_global_search_view {
+                // Keep Ctrl+G's streaming policy and exclude the previous folder's sidecars.
+                let pin_paths = pin_blobs.keys().cloned().collect();
+                let candidates = Self::compute_search_video_candidates(
+                    &self.items,
+                    &self.thumbnails,
+                    &pin_paths,
+                    !self.global_search.done,
+                );
+                if !candidates.is_empty() {
+                    let cancel = if self.projected_viewer_context_id() == self.viewer_context_main()
+                    {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        self.search_video_thread_cancel = Some(Arc::clone(&cancel));
+                        cancel
+                    } else {
+                        Arc::clone(&self.cancel_token)
+                    };
+                    self.spawn_video_thread(
+                        self.tx.clone(),
+                        cancel,
+                        candidates,
+                        std::collections::HashMap::new(),
+                        Arc::new(pin_blobs),
+                    );
+                }
+            } else {
+                self.spawn_video_thread(
+                    self.tx.clone(),
+                    Arc::clone(&self.cancel_token),
+                    video_items,
+                    self.video_thumb_overrides.clone(),
+                    Arc::new(pin_blobs),
+                );
+            }
         }
         if changed.book_bookmarks {
             self.current_book_bookmarks.clear();
@@ -44443,11 +44851,6 @@ impl App {
         let raw_executor = Arc::clone(&self.raw_develop_executor);
         let raw_tickets = Arc::clone(&self.raw_thumb_develop);
 
-        crate::logger::log(format!(
-            "  spawning {} regular + {} I/O workers",
-            regular_threads, io_threads,
-        ));
-
         // ── 共通のワーカーループ本体 ──
         // queue を受け取り、priority 順に取り出して process_load_request を呼ぶ。
         let spawn_worker = |worker_idx: usize, prefix: &str, queue: Arc<NotifyQueue>| {
@@ -44482,6 +44885,12 @@ impl App {
                 // 固定代表が指すページの個別色調補正は UI thread で同期 DB 参照せず、
                 // worker ごとの接続から解決する。
                 let adjustment_db_w = crate::adjustment_db::AdjustmentDb::open().ok();
+                if tag == "w0" {
+                    crate::logger::log(format!(
+                        "  spawning {} regular + {} I/O workers",
+                        regular_threads, io_threads
+                    ));
+                }
                 crate::logger::log(format!("  {tag} started"));
                 loop {
                     // priority (可視範囲) を最優先、次に scroll_hint に近い順。
@@ -49231,9 +49640,9 @@ impl App {
             }
             FolderOpenScanPurpose::CurrentViewOrderRefresh {
                 order,
-                collection_owner,
+                reload_owner,
             } => {
-                self.apply_current_view_order_refresh(ready.path, scan, order, collection_owner);
+                self.apply_current_view_order_refresh(ready.path, scan, order, *reload_owner);
                 None
             }
         }
@@ -49244,20 +49653,18 @@ impl App {
         path: PathBuf,
         scan: ScannedDir,
         order: CurrentViewOrderSnapshot,
-        collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        owner: OpenRequestOwner,
     ) -> bool {
         if !self
             .current_folder
             .as_deref()
             .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
             || !order.matches(&self.settings)
+            || !self.open_request_owner_is_current(&path, &owner)
         {
             return false;
         }
         self.preserve_cursor_hint_for_reload();
-        let owner = collection_owner
-            .map(OpenRequestOwner::CollectionGridPhysical)
-            .unwrap_or(OpenRequestOwner::Navigation);
         if self.epub_batch_convert.is_some() {
             // The batch modal owns this same-location listing refresh. It is a completion of
             // accepted work, not a new open, so it must bypass the new-open admission gate.
@@ -49398,10 +49805,9 @@ impl App {
             }
             FolderOpenScanPurpose::CurrentViewOrderRefresh {
                 order,
-                collection_owner,
+                reload_owner,
             } => {
-                if self.apply_current_view_order_refresh(ready.path, scan, order, collection_owner)
-                {
+                if self.apply_current_view_order_refresh(ready.path, scan, order, *reload_owner) {
                     DetachedPhysicalFolderOpenPoll::Applied
                 } else {
                     DetachedPhysicalFolderOpenPoll::Failed
@@ -57017,7 +57423,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn should_promote_active_detached_video_for_main_context_change(&self) -> bool {
+    fn active_detached_media_requires_main_context_transfer(&self) -> bool {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -57033,11 +57439,58 @@ impl App {
             // replacing `items`, otherwise `start_loading_items` falls through to
             // `close_fullscreen` and drops the session that tray hide deliberately retained.
             && self.viewer_session_is_detached_or_switching()
-            && !self.fs_nav_is_locked()
             // 音声もメディア窓を使う (stage-audio / §1.7)。Video 限定だと main の
             // フォルダ移動で detached 音声が promote されず close_fullscreen で
             // 再生ごと止まる (Codex audit P2、複数ウィンドウモードにも存在した既存ギャップ)。
             && self.viewer_item_is_media(idx)
+    }
+
+    #[cfg(windows)]
+    fn should_promote_active_detached_video_for_main_context_change(&self) -> bool {
+        !self.fs_nav_is_locked() && self.active_detached_media_requires_main_context_transfer()
+    }
+
+    /// Every visible main-grid replacement uses this promote / park / close boundary. Collection
+    /// adoption requires an unlocked detached media owner; existing folder-nav reopen callers
+    /// retain their established locked-session close behavior.
+    fn change_main_context_for_visible_grid(
+        &mut self,
+        block_locked_media: bool,
+    ) -> CollectionMainContextChange {
+        #[cfg(windows)]
+        {
+            if block_locked_media
+                && self.fs_nav_is_locked()
+                && self.active_detached_media_requires_main_context_transfer()
+            {
+                return CollectionMainContextChange::Blocked("detached media navigation is active");
+            }
+            let preserved_media = self.promote_active_detached_video_for_main_context_change();
+            if !preserved_media {
+                self.preserve_active_detached_image_window_for_main_context_change();
+                self.close_fullscreen();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = block_locked_media;
+            self.close_fullscreen();
+        }
+        CollectionMainContextChange::Transferred
+    }
+
+    /// Decide before Collection history or transient-state mutation. A locked detached media
+    /// navigation cannot give its context to a new Collection until its own transition ends.
+    pub(crate) fn prepare_collection_main_context_change(
+        &mut self,
+        collection_id: crate::collection_store::CollectionId,
+    ) -> CollectionMainContextChange {
+        if self.collection_root_installed_binding_matches(collection_id)
+            || self.fullscreen_idx.is_none()
+        {
+            return CollectionMainContextChange::NotNeeded;
+        }
+        self.change_main_context_for_visible_grid(true)
     }
 
     #[cfg(windows)]
@@ -59246,6 +59699,17 @@ impl App {
         if self.fullscreen_idx.is_none() {
             self.fs_pdf_display_target = None;
         }
+        // The admitted open commits this viewer to a different item. Retire the old media
+        // owner's scan here; resolver requests, failed candidates, and superseded targets leave
+        // its scan and provisional gain untouched. The same owner cleanup is used when the old
+        // player is evicted or the fullscreen session closes.
+        #[cfg(windows)]
+        if let Some(previous_idx) = self
+            .fullscreen_idx
+            .filter(|&previous_idx| previous_idx != idx)
+        {
+            self.cleanup_normalize_state_for_fs_idx(previous_idx);
+        }
         self.fullscreen_idx = Some(idx);
         if load_contract == FsPageLoadContract::LatestSeek {
             self.apply_fs_page_load_contract(idx, load_contract);
@@ -59765,6 +60229,10 @@ impl App {
                 entry.get_mut().apply_patch(meta, loaded)
             }
         };
+        if loaded.ai_metadata || replaced_existing_source {
+            self.facet_ai_model_counts_cache = None;
+            self.facet_ai_tool_counts_cache = None;
+        }
         if replaced_existing_source {
             self.details_cell_content_revisions.bump_all_lazy_fields();
         } else {
@@ -59772,13 +60240,41 @@ impl App {
         }
     }
 
-    fn details_page_count_uses_visible_stages(&self) -> bool {
-        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && self.settings.details_show_page_count
-            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+    fn thumbnail_media_duration_enabled(&self) -> bool {
+        self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
+            && self.settings.thumb_show_media_duration
     }
 
-    fn details_visible_page_count_needs_load(&self) -> bool {
+    fn details_lazy_uses_visible_stages(&self) -> bool {
+        self.thumbnail_media_duration_enabled()
+            || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                && self.settings.details_show_page_count
+                && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+    }
+
+    fn details_meta_visible_order(&self) -> Vec<usize> {
+        let mut order = self.details_tag_prewarm_indices.to_vec();
+        order.sort_unstable();
+        order.dedup();
+        if let Some(selected) = self.selection_info_lazy_target_idx() {
+            order.retain(|&idx| idx != selected);
+            order.insert(0, selected);
+        }
+        order
+    }
+
+    fn details_visible_stage_needs_load(&self) -> bool {
+        if self.selection_info_needs_lazy_meta_request() {
+            return true;
+        }
+        if self.thumbnail_media_duration_enabled() {
+            return self.details_tag_prewarm_indices.iter().copied().any(|idx| {
+                self.details_item_requires_lazy_meta(idx)
+                    && self
+                        .details_lazy_meta_for_idx(idx)
+                        .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
+            });
+        }
         self.details_tag_prewarm_indices.iter().copied().any(|idx| {
             self.lazy_load_page_count_for_idx(idx)
                 && self
@@ -59814,27 +60310,69 @@ impl App {
     /// 完了できるか判定する。未取得ページ数があれば同じセッションの次ジョブを開始し、
     /// 無ければここだけが staged page-count セッションを Ready にする。
     pub(crate) fn reconcile_details_lazy_session_after_grid(&mut self, ctx: &egui::Context) {
-        if !self.details_page_count_uses_visible_stages() {
+        if !self.details_lazy_uses_visible_stages() {
             return;
         }
 
         let failed = match self.details_image_dims_state {
             LazyColumnState::Reconciling { failed, .. } => Some(failed),
-            LazyColumnState::Ready { .. } if self.details_visible_page_count_needs_load() => None,
+            LazyColumnState::Ready { .. } if self.details_visible_stage_needs_load() => None,
             _ => return,
         };
 
-        if self.details_visible_page_count_needs_load() {
+        if self.details_visible_stage_needs_load() {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.details_image_dims_state = LazyColumnState::NotRequested;
-            self.start_details_meta_load(ctx);
+            self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         } else if let Some(failed) = failed {
             self.finish_details_lazy_session(failed);
             ctx.request_repaint();
         }
     }
 
+    // Reuse the current viewer's range snapshot and cancellation owner. Scrolling adopts a
+    // new thumbnail stage only after the existing idle gate; selection changes stay prompt.
+    fn refresh_thumbnail_details_stage(&mut self, ctx: &egui::Context) {
+        if self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail {
+            return;
+        }
+        if !self.thumbnail_media_duration_enabled() && self.ai_model_facet_should_load() {
+            return;
+        }
+        let selected = self.selection_info_lazy_target_idx();
+        let selection_key = self.selection_info_lazy_target_key();
+        let selection_changed = self.details_meta_pending.as_ref().map_or_else(
+            || self.selection_info_needs_lazy_meta_request(),
+            |pending| pending.selection_target_key != selection_key,
+        );
+        let mut near = if self.thumbnail_media_duration_enabled() {
+            self.keep_set_sorted()
+        } else {
+            Vec::new()
+        };
+        near.extend(selected);
+        near.sort_unstable();
+        near.dedup();
+        if near == self.details_tag_prewarm_indices && !selection_changed {
+            return;
+        }
+        if !selection_changed && let Some(last_scroll) = self.last_prefetch_scroll_at {
+            let remaining = PREFETCH_IDLE_THRESHOLD.saturating_sub(last_scroll.elapsed());
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+                return;
+            }
+        }
+        self.details_tag_prewarm_indices = near;
+        // AI facets retain their all-grid scan. The existing priority queue handles new visible
+        // media in that scan; badge-only stages can discard their old bounded range outright.
+        if !self.ai_model_facet_should_load() {
+            self.invalidate_details_meta_requirements();
+        }
+    }
+
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
+        self.refresh_thumbnail_details_stage(ctx);
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
                 pending.cancel.store(true, Ordering::Relaxed);
@@ -59864,23 +60402,21 @@ impl App {
 
         // ページ数ソート以外は画面外の全コンテナを開かず、可視範囲 + 先読み範囲だけを
         // 段階取得する。前の範囲が Ready でもスクロール先に未取得行があれば次ジョブを開始。
-        if self.details_page_count_uses_visible_stages()
-            && matches!(self.details_image_dims_state, LazyColumnState::Ready { .. })
-            && self.details_visible_page_count_needs_load()
+        if matches!(self.details_image_dims_state, LazyColumnState::Ready { .. })
+            && ((self.details_lazy_uses_visible_stages()
+                && self.details_visible_stage_needs_load())
+                || self.selection_info_needs_lazy_meta_request())
         {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
-            self.details_image_dims_state = LazyColumnState::NotRequested;
+            self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         }
 
         // 大きく scroll して可視近傍が移ったら、全件 plan / worker を作り直さず、現在の
         // 可視 target だけを priority queue へ差し込む。idle gate は従来どおり共有する。
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && self.details_meta_pending.is_some()
-        {
+        if self.details_meta_pending.is_some() {
             let current_visible_order: Vec<usize> = self
-                .details_tag_prewarm_indices
-                .iter()
-                .copied()
+                .details_meta_visible_order()
+                .into_iter()
                 .filter(|&idx| {
                     self.details_item_requires_lazy_meta(idx)
                         && self
@@ -59895,6 +60431,12 @@ impl App {
                 .copied()
                 .filter_map(|idx| self.details_lazy_cache_key(idx))
                 .collect();
+            let selection_key = self.selection_info_lazy_target_key();
+            let selection_changed = !self.selection_info_only_lazy_load()
+                && self
+                    .details_meta_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.selection_target_key != selection_key);
             let reprioritize_candidate =
                 self.details_meta_pending.as_ref().is_some_and(|pending| {
                     details_meta_reprioritize_candidate(
@@ -59903,14 +60445,15 @@ impl App {
                     )
                 });
             let now = std::time::Instant::now();
-            let reprioritize = self.details_meta_pending.as_ref().is_some_and(|pending| {
-                details_meta_reprioritize_allowed(
-                    now,
-                    self.last_prefetch_scroll_at,
-                    &current_visible,
-                    &pending.normal_target_keys,
-                )
-            });
+            let reprioritize = selection_changed
+                || self.details_meta_pending.as_ref().is_some_and(|pending| {
+                    details_meta_reprioritize_allowed(
+                        now,
+                        self.last_prefetch_scroll_at,
+                        &current_visible,
+                        &pending.normal_target_keys,
+                    )
+                });
             if reprioritize_candidate
                 && !reprioritize
                 && let Some(last_scroll_at) = self.last_prefetch_scroll_at
@@ -59931,6 +60474,9 @@ impl App {
                 let priority_count = priority_targets.len();
                 if let Some(pending) = self.details_meta_pending.as_mut() {
                     pending.normal_target_keys = current_visible;
+                    if selection_changed {
+                        pending.selection_target_key = selection_key;
+                    }
                     match &mut pending.phase {
                         DetailsMetaPendingPhase::Planning(plan) => {
                             plan.visible_near = current_visible_indices;
@@ -60027,8 +60573,6 @@ impl App {
                     loaded,
                 } if generation == self.items_generation => {
                     self.apply_details_lazy_meta_patch(key, meta, loaded);
-                    self.facet_ai_model_counts_cache = None;
-                    self.facet_ai_tool_counts_cache = None;
                     ctx.request_repaint();
                 }
                 DetailsMetaEvent::Finished { generation, failed }
@@ -60040,7 +60584,7 @@ impl App {
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
                     self.details_meta_pending = None;
                     if revision_matches {
-                        if self.details_page_count_uses_visible_stages() {
+                        if self.details_lazy_uses_visible_stages() {
                             let total = match self.details_image_dims_state {
                                 LazyColumnState::Loading { total, .. } => total,
                                 _ => 0,
@@ -60120,7 +60664,9 @@ impl App {
                     || self.selection_info_lazy_target_idx().is_some()
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.ai_model_facet_should_load() || self.selection_info_lazy_target_idx().is_some()
+                self.settings.thumb_show_media_duration
+                    || self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx().is_some()
             }
         }
     }
@@ -60166,173 +60712,142 @@ impl App {
     fn selection_info_only_lazy_load(&self) -> bool {
         !self.ai_model_facet_should_load()
             && match self.settings.grid_view_mode {
-                crate::settings::GridViewMode::Thumbnail => true,
+                crate::settings::GridViewMode::Thumbnail => {
+                    !self.settings.thumb_show_media_duration
+                }
                 crate::settings::GridViewMode::Details => !self.details_any_lazy_columns_enabled(),
             }
     }
 
-    fn selection_info_item_requires_lazy_meta(&self, idx: usize) -> bool {
-        use crate::ui_main::{DetailsColumn, selection_info_bottom_bar_shows_column};
-
-        ((self.settings.thumb_tooltip_show_created
-            || selection_info_bottom_bar_shows_column(
+    fn selection_info_lazy_column_requested(&self, column: crate::ui_main::DetailsColumn) -> bool {
+        use crate::ui_main::DetailsColumn;
+        let tooltip = self.settings.selection_info_display_mode.shows_tooltip()
+            && match column {
+                DetailsColumn::Created => self.settings.thumb_tooltip_show_created,
+                DetailsColumn::PageCount => self.settings.thumb_tooltip_show_page_count,
+                DetailsColumn::ImageDimensions => self.settings.thumb_tooltip_show_image_dimensions,
+                DetailsColumn::VideoDuration => self.settings.thumb_tooltip_show_video_duration,
+                DetailsColumn::VideoDimensions => self.settings.thumb_tooltip_show_video_dimensions,
+                DetailsColumn::VideoCodec => self.settings.thumb_tooltip_show_video_codec,
+                _ => false,
+            };
+        tooltip
+            || crate::ui_main::selection_info_bottom_bar_shows_column(
                 &self.settings,
-                DetailsColumn::Created,
+                column,
                 self.items_are_rating_view,
-            ))
+            )
+    }
+
+    fn selection_info_item_requires_lazy_meta(&self, idx: usize) -> bool {
+        use crate::ui_main::DetailsColumn;
+        (self.selection_info_lazy_column_requested(DetailsColumn::Created)
             && self.details_item_supports_created_at(idx))
-            || ((self.settings.thumb_tooltip_show_page_count
-                || selection_info_bottom_bar_shows_column(
-                    &self.settings,
-                    DetailsColumn::PageCount,
-                    self.items_are_rating_view,
-                ))
+            || (self.selection_info_lazy_column_requested(DetailsColumn::PageCount)
                 && self.details_item_supports_page_count(idx))
-            || ((self.settings.thumb_tooltip_show_image_dimensions
-                || selection_info_bottom_bar_shows_column(
-                    &self.settings,
-                    DetailsColumn::ImageDimensions,
-                    self.items_are_rating_view,
-                ))
+            || (self.selection_info_lazy_column_requested(DetailsColumn::ImageDimensions)
                 && self.details_item_supports_image_dims(idx))
             || match self.items.get(idx) {
                 Some(GridItem::Video(_)) => {
-                    self.settings.thumb_tooltip_show_video_duration
-                        || selection_info_bottom_bar_shows_column(
-                            &self.settings,
-                            DetailsColumn::VideoDuration,
-                            self.items_are_rating_view,
-                        )
-                        || self.settings.thumb_tooltip_show_video_dimensions
-                        || selection_info_bottom_bar_shows_column(
-                            &self.settings,
-                            DetailsColumn::VideoDimensions,
-                            self.items_are_rating_view,
-                        )
-                        || self.settings.thumb_tooltip_show_video_codec
-                        || selection_info_bottom_bar_shows_column(
-                            &self.settings,
-                            DetailsColumn::VideoCodec,
-                            self.items_are_rating_view,
-                        )
+                    self.selection_info_lazy_column_requested(DetailsColumn::VideoDuration)
+                        || self.selection_info_lazy_column_requested(DetailsColumn::VideoDimensions)
+                        || self.selection_info_lazy_column_requested(DetailsColumn::VideoCodec)
                 }
                 Some(GridItem::Audio(_)) => {
-                    self.settings.thumb_tooltip_show_video_duration
-                        || selection_info_bottom_bar_shows_column(
-                            &self.settings,
-                            DetailsColumn::VideoDuration,
-                            self.items_are_rating_view,
-                        )
-                        || self.settings.thumb_tooltip_show_video_codec
-                        || selection_info_bottom_bar_shows_column(
-                            &self.settings,
-                            DetailsColumn::VideoCodec,
-                            self.items_are_rating_view,
-                        )
+                    self.selection_info_lazy_column_requested(DetailsColumn::VideoDuration)
+                        || self.selection_info_lazy_column_requested(DetailsColumn::VideoCodec)
                 }
                 _ => false,
             }
     }
 
     fn lazy_load_created_for_idx(&self, idx: usize) -> bool {
+        let selection = self.selection_info_lazy_target_idx() == Some(idx)
+            && self.selection_info_lazy_column_requested(crate::ui_main::DetailsColumn::Created);
         let requested = match self.settings.grid_view_mode {
             crate::settings::GridViewMode::Details => {
-                self.settings.details_show_created
-                    || (self.selection_info_only_lazy_load()
-                        && self.selection_info_lazy_target_idx() == Some(idx)
-                        && self.settings.thumb_tooltip_show_created)
+                self.settings.details_show_created || selection
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_created
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::Created,
-                        self.items_are_rating_view,
-                    )
+                selection
+                    || (self.ai_model_facet_should_load()
+                        && self.selection_info_lazy_column_requested(
+                            crate::ui_main::DetailsColumn::Created,
+                        ))
             }
         };
         requested && self.details_item_supports_created_at(idx)
     }
 
     fn lazy_load_page_count_for_idx(&self, idx: usize) -> bool {
+        let selection = self.selection_info_lazy_target_idx() == Some(idx)
+            && self.selection_info_lazy_column_requested(crate::ui_main::DetailsColumn::PageCount);
         let requested = match self.settings.grid_view_mode {
             crate::settings::GridViewMode::Details => {
-                self.settings.details_show_page_count
-                    || (self.selection_info_only_lazy_load()
-                        && self.selection_info_lazy_target_idx() == Some(idx)
-                        && self.settings.thumb_tooltip_show_page_count)
+                self.settings.details_show_page_count || selection
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_page_count
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::PageCount,
-                        self.items_are_rating_view,
-                    )
+                selection
+                    || (self.ai_model_facet_should_load()
+                        && self.selection_info_lazy_column_requested(
+                            crate::ui_main::DetailsColumn::PageCount,
+                        ))
             }
         };
         requested && self.details_item_supports_page_count(idx)
     }
 
     fn lazy_load_image_dims_for_idx(&self, idx: usize) -> bool {
+        let selection = self.selection_info_lazy_target_idx() == Some(idx)
+            && self.selection_info_lazy_column_requested(
+                crate::ui_main::DetailsColumn::ImageDimensions,
+            );
         let requested = match self.settings.grid_view_mode {
             crate::settings::GridViewMode::Details => {
-                self.settings.details_show_image_dimensions
-                    || (self.selection_info_only_lazy_load()
-                        && self.selection_info_lazy_target_idx() == Some(idx)
-                        && self.settings.thumb_tooltip_show_image_dimensions)
+                self.settings.details_show_image_dimensions || selection
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_image_dimensions
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::ImageDimensions,
-                        self.items_are_rating_view,
-                    )
+                selection
+                    || (self.ai_model_facet_should_load()
+                        && self.selection_info_lazy_column_requested(
+                            crate::ui_main::DetailsColumn::ImageDimensions,
+                        ))
             }
         };
         requested && self.details_item_supports_image_dims(idx)
     }
 
     fn lazy_load_video_meta_for_idx(&self, idx: usize) -> bool {
+        use crate::ui_main::DetailsColumn;
+        let selection = self.selection_info_lazy_target_idx() == Some(idx);
+        let selection_or_ai = selection
+            || (self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
+                && self.ai_model_facet_should_load());
         let (want_duration, want_dims, want_codec) = match self.settings.grid_view_mode {
-            crate::settings::GridViewMode::Details => {
-                let selection_target = self.selection_info_only_lazy_load()
-                    && self.selection_info_lazy_target_idx() == Some(idx);
-                (
-                    self.settings.details_show_video_duration
-                        || (selection_target && self.settings.thumb_tooltip_show_video_duration),
-                    self.settings.details_show_video_dimensions
-                        || (selection_target && self.settings.thumb_tooltip_show_video_dimensions),
-                    self.settings.details_show_video_codec
-                        || (selection_target && self.settings.thumb_tooltip_show_video_codec),
-                )
-            }
+            crate::settings::GridViewMode::Details => (
+                self.settings.details_show_video_duration
+                    || (selection
+                        && self.selection_info_lazy_column_requested(DetailsColumn::VideoDuration)),
+                self.settings.details_show_video_dimensions
+                    || (selection
+                        && self
+                            .selection_info_lazy_column_requested(DetailsColumn::VideoDimensions)),
+                self.settings.details_show_video_codec
+                    || (selection
+                        && self.selection_info_lazy_column_requested(DetailsColumn::VideoCodec)),
+            ),
             crate::settings::GridViewMode::Thumbnail => (
-                self.settings.thumb_tooltip_show_video_duration
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::VideoDuration,
-                        self.items_are_rating_view,
-                    ),
-                self.settings.thumb_tooltip_show_video_dimensions
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::VideoDimensions,
-                        self.items_are_rating_view,
-                    ),
-                self.settings.thumb_tooltip_show_video_codec
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::VideoCodec,
-                        self.items_are_rating_view,
-                    ),
+                self.settings.thumb_show_media_duration
+                    || (selection_or_ai
+                        && self.selection_info_lazy_column_requested(DetailsColumn::VideoDuration)),
+                selection_or_ai
+                    && self.selection_info_lazy_column_requested(DetailsColumn::VideoDimensions),
+                selection_or_ai
+                    && self.selection_info_lazy_column_requested(DetailsColumn::VideoCodec),
             ),
         };
         match self.items.get(idx) {
             Some(GridItem::Video(_)) => want_duration || want_dims || want_codec,
-            // 音声は解像度を持たないので、長さ / コーデックのどちらかが要求されたときだけ
-            // probe する (解像度トグルだけ ON では音声に表示できる値が無く probe が無駄)。
             Some(GridItem::Audio(_)) => want_duration || want_codec,
             _ => false,
         }
@@ -60345,9 +60860,8 @@ impl App {
     pub(crate) fn request_ai_model_facet_load(&mut self) {
         if !self.ai_model_facet_requested {
             self.ai_model_facet_requested = true;
-            if self.details_meta_pending.is_none() && !self.details_image_dims_state.is_loading() {
-                self.details_image_dims_state = LazyColumnState::NotRequested;
-            }
+            // A media-only stage cannot stand in for the initial all-item AI scan.
+            self.invalidate_details_meta_requirements();
         }
     }
 
@@ -60366,6 +60880,18 @@ impl App {
 
     pub(crate) fn details_lazy_sort_ready(&self) -> bool {
         self.details_image_dims_state.is_ready()
+    }
+
+    pub(crate) fn ai_model_facet_ready(&self) -> bool {
+        self.details_image_dims_state.is_ready()
+            || matches!(
+                self.details_image_dims_state,
+                LazyColumnState::Reconciling { .. }
+            )
+            || self
+                .details_meta_pending
+                .as_ref()
+                .is_some_and(|pending| pending.scan_scope == DetailsMetaScanScope::VisibleStage)
     }
 
     pub(crate) fn details_created_text(&self, idx: usize) -> String {
@@ -60466,6 +60992,20 @@ impl App {
             .map(|(w, h)| (w as u64) * (h as u64))
     }
 
+    pub(crate) fn thumbnail_media_duration_text(&self, idx: usize) -> Option<String> {
+        if !self.settings.thumb_show_media_duration
+            || !matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            )
+        {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.media.read()?.duration_secs)
+            .and_then(crate::thumb_overlay_layout::format_media_duration)
+    }
+
     pub(crate) fn details_video_duration_text(&self, idx: usize) -> String {
         // 長さは動画・音声の両方が持つ (音声も詳細ビューで長さを表示する)。
         if !matches!(
@@ -60475,10 +61015,10 @@ impl App {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-            if let Some(secs) = meta.video_duration_secs {
+            if let Some(secs) = meta.media.read().and_then(|values| values.duration_secs) {
                 return format_details_duration(secs);
             }
-            if meta.video_meta_failed {
+            if meta.media.failed_for_generation(self.items_generation) {
                 return "-".to_string();
             }
         }
@@ -60497,10 +61037,10 @@ impl App {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-            if let Some((w, h)) = meta.video_dims {
+            if let Some((w, h)) = meta.media.read().and_then(|values| values.dims) {
                 return format!("{w}x{h}");
             }
-            if meta.video_meta_failed {
+            if meta.media.failed_for_generation(self.items_generation) {
                 return "-".to_string();
             }
         }
@@ -60523,10 +61063,10 @@ impl App {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-            if let Some(codec) = meta.video_codec.as_ref() {
+            if let Some(codec) = meta.media.read().and_then(|values| values.codec.as_ref()) {
                 return codec.clone();
             }
-            if meta.video_meta_failed {
+            if meta.media.failed_for_generation(self.items_generation) {
                 return "-".to_string();
             }
         }
@@ -60545,7 +61085,7 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_duration_secs)
+            .and_then(|meta| meta.media.read()?.duration_secs)
             .filter(|secs| secs.is_finite() && *secs > 0.0)
             .map(|secs| (secs * 1000.0).round() as u64)
     }
@@ -60555,7 +61095,7 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_dims)
+            .and_then(|meta| meta.media.read()?.dims)
             .map(|(w, h)| (w as u64) * (h as u64))
     }
 
@@ -60564,10 +61104,18 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_codec.clone())
+            .and_then(|meta| meta.media.read()?.codec.clone())
     }
 
     fn start_details_meta_load(&mut self, ctx: &egui::Context) {
+        self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::AllRequirements);
+    }
+
+    fn start_details_meta_load_for_scope(
+        &mut self,
+        ctx: &egui::Context,
+        scan_scope: DetailsMetaScanScope,
+    ) {
         if self.details_meta_pending.is_some() {
             return;
         }
@@ -60608,9 +61156,12 @@ impl App {
                 },
                 visible_near,
             )
-        } else if visible_page_count_stage_only {
-            let mut order = self.details_tag_prewarm_indices.to_vec();
-            order.sort_unstable();
+        } else if visible_page_count_stage_only
+            || scan_scope == DetailsMetaScanScope::VisibleStage
+            || (self.thumbnail_media_duration_enabled()
+                && (!ai_facet_load || scan_scope == DetailsMetaScanScope::VisibleStage))
+        {
+            let order = self.details_meta_visible_order();
             let visible_near: HashSet<usize> = order.iter().copied().collect();
             (
                 DetailsMetaScanOrder::Explicit {
@@ -60626,15 +61177,14 @@ impl App {
                     len: self.current_grid_order().len(),
                     order_revision: self.details_order_revision,
                 },
-                self.details_tag_prewarm_indices.iter().copied().collect(),
+                self.details_meta_visible_order().into_iter().collect(),
             )
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.details_meta_pending = Some(DetailsMetaPending {
+            scan_scope,
             visible_revision: self.details_lazy_visible_revision,
-            selection_target_key: selection_info_only
-                .then(|| self.selection_info_lazy_target_key())
-                .flatten(),
+            selection_target_key: self.selection_info_lazy_target_key(),
             normal_target_keys: visible_near
                 .iter()
                 .filter_map(|&idx| self.details_lazy_cache_key(idx))
@@ -60670,6 +61220,7 @@ impl App {
             return;
         }
         let DetailsMetaPending {
+            scan_scope,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -60694,6 +61245,38 @@ impl App {
             ctx.request_repaint();
             return;
         }
+
+        // Selection uses the same plan even outside the grid order or after its
+        // cursor has passed. Merge fields without restarting a whole-grid/AI scan.
+        if let Some(selected) = self.selection_info_lazy_target_idx() {
+            plan.visible_near.insert(selected);
+            if let Some(target) =
+                self.details_meta_target_for_idx(selected, &plan.visible_near, true)
+            {
+                if let Some(existing) = plan
+                    .visible_targets
+                    .iter_mut()
+                    .find(|existing| existing.idx == selected)
+                {
+                    existing.include_requested_fields(target.requested_fields());
+                    existing.warm_page_count = existing.warm_page_count.or(target.warm_page_count);
+                    existing.pdf_password_revision = target
+                        .pdf_password_revision
+                        .or(existing.pdf_password_revision);
+                } else {
+                    // Do not search the growing background queue on the UI thread.
+                    // Its existing copy keeps its fields; worker per-field dedup
+                    // merges this priority request without probing a field twice.
+                    plan.total += 1;
+                    plan.visible_targets.push(target);
+                }
+            }
+        }
+        let mut queued_visible: HashSet<usize> = plan
+            .visible_targets
+            .iter()
+            .map(|target| target.idx)
+            .collect();
 
         let scan_budget = if plan.order.is_incremental() {
             DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME
@@ -60723,7 +61306,7 @@ impl App {
                 }
             };
 
-            if !self.details_item_requires_lazy_meta(idx) {
+            if queued_visible.contains(&idx) || !self.details_item_requires_lazy_meta(idx) {
                 continue;
             }
             if let Some(meta) = self.details_lazy_meta_for_idx(idx)
@@ -60734,7 +61317,7 @@ impl App {
                 plan.cached_failed += usize::from(
                     meta.page_count_failed
                         || meta.image_dims_failed
-                        || meta.video_meta_failed
+                        || meta.media.failed_for_generation(self.items_generation)
                         || meta.created_at_failed,
                 );
                 continue;
@@ -60746,6 +61329,7 @@ impl App {
             ) {
                 plan.total += 1;
                 if target.priority >= crate::io_semaphore::IoPriority::Normal {
+                    queued_visible.insert(idx);
                     plan.visible_targets.push(target);
                 } else {
                     plan.background_targets.push(target);
@@ -60781,6 +61365,7 @@ impl App {
                 total: plan.total,
             };
             self.details_meta_pending = Some(DetailsMetaPending {
+                scan_scope,
                 visible_revision,
                 selection_target_key,
                 normal_target_keys,
@@ -60791,12 +61376,20 @@ impl App {
             return;
         }
 
-        self.launch_details_meta_worker(ctx, visible_revision, selection_target_key, cancel, plan);
+        self.launch_details_meta_worker(
+            ctx,
+            scan_scope,
+            visible_revision,
+            selection_target_key,
+            cancel,
+            plan,
+        );
     }
 
     fn launch_details_meta_worker(
         &mut self,
         ctx: &egui::Context,
+        scan_scope: DetailsMetaScanScope,
         visible_revision: u64,
         selection_target_key: Option<String>,
         cancel: Arc<AtomicBool>,
@@ -60811,9 +61404,8 @@ impl App {
         // target plan 中に scroll した場合も、起動時点の可視範囲を worker の先頭へ差し込む。
         // 元の background target は idx bitmap で重複排除され、全件走査 cursor は巻き戻さない。
         let current_visible_order: Vec<usize> = self
-            .details_tag_prewarm_indices
-            .iter()
-            .copied()
+            .details_meta_visible_order()
+            .into_iter()
             .filter(|&idx| {
                 self.details_item_requires_lazy_meta(idx)
                     && self
@@ -60956,6 +61548,7 @@ impl App {
             .ok();
 
         self.details_meta_pending = Some(DetailsMetaPending {
+            scan_scope,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -61024,12 +61617,7 @@ impl App {
         {
             return false;
         }
-        if self.lazy_load_video_meta_for_idx(idx)
-            && meta.video_duration_secs.is_none()
-            && meta.video_dims.is_none()
-            && meta.video_codec.is_none()
-            && !meta.video_meta_failed
-        {
+        if self.lazy_load_video_meta_for_idx(idx) && !meta.media.satisfies(self.items_generation) {
             return false;
         }
         true
@@ -61103,12 +61691,7 @@ impl App {
     ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
         let key = self.details_lazy_cache_key(idx)?;
-        let (source_mtime, source_size) = self
-            .image_metas
-            .get(idx)
-            .copied()
-            .flatten()
-            .unwrap_or((0, 0));
+        let source_identity = self.image_metas.get(idx).copied().flatten();
         let (catalog_folder, catalog_key) = self.details_catalog_lookup_for_item(&item);
         let priority = if visible_near.contains(&idx) {
             crate::io_semaphore::IoPriority::Normal
@@ -61120,12 +61703,10 @@ impl App {
             && existing_meta
                 .is_none_or(|meta| meta.image_dims.is_none() && !meta.image_dims_failed);
         let load_video_meta = self.lazy_load_video_meta_for_idx(idx)
-            && existing_meta.is_none_or(|meta| {
-                meta.video_duration_secs.is_none()
-                    && meta.video_dims.is_none()
-                    && meta.video_codec.is_none()
-                    && !meta.video_meta_failed
-            });
+            && (self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
+                || visible_near.contains(&idx)
+                || self.selection_info_lazy_target_idx() == Some(idx))
+            && existing_meta.is_none_or(|meta| !meta.media.satisfies(self.items_generation));
         let load_page_count = allow_page_count
             && self.lazy_load_page_count_for_idx(idx)
             && existing_meta
@@ -61172,8 +61753,7 @@ impl App {
             key,
             item,
             relative_page_provenance: self.relative_page_provenance_for_idx(idx),
-            source_mtime,
-            source_size,
+            source_identity,
             catalog_folder,
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
@@ -61219,6 +61799,8 @@ impl App {
                 Some(crate::grid_item::pdf_page_cache_key(*page_num)),
             ),
             GridItem::Folder(path)
+            | GridItem::Video(path)
+            | GridItem::Audio(path)
             | GridItem::ZipFile(path)
             | GridItem::PdfFile(path)
             | GridItem::ConvertibleArchive { path, .. } => (
@@ -62199,7 +62781,7 @@ impl App {
 
         let ai_filter_active = !self.settings.facet_filter.ai_models.is_empty()
             || !self.settings.facet_filter.ai_tools.is_empty();
-        if ai_filter_active && !self.details_lazy_sort_ready() {
+        if ai_filter_active && !self.ai_model_facet_ready() {
             return true;
         }
         if ignore != Some(FacetField::AiModel)
@@ -62456,16 +63038,14 @@ impl App {
 
     fn apply_grid_view_mode_runtime(&mut self, mode: crate::settings::GridViewMode) {
         self.details_thumb_suppression_applied = false;
+        // A bounded thumbnail request cannot complete the full details request.
+        self.invalidate_details_meta_requirements();
         match mode {
             crate::settings::GridViewMode::Details => {
                 self.rebuild_details_order();
-                if self.details_any_lazy_columns_enabled() {
-                    self.details_image_dims_state = LazyColumnState::NotRequested;
-                }
             }
             crate::settings::GridViewMode::Thumbnail => {
                 self.clear_details_hover_keep();
-                self.cancel_details_meta_loading();
                 self.details_order.clear();
                 self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();
@@ -65772,11 +66352,7 @@ impl App {
                 // attaching them to this player's unused audio pump would create another claimant.
                 None
             } else {
-                Some(crate::video::audio::AudioDspChain {
-                    user: Some(self.dsp_bridge.clone()),
-                    effetune: Arc::clone(&self.effetune.slot),
-                    coordinator: Arc::clone(&self.dsp_processing),
-                })
+                Some(self.local_audio_dsp_chain())
             },
             output_consumer,
             #[cfg(windows)]
@@ -66215,11 +66791,7 @@ impl App {
             #[cfg(windows)]
             None, // gpu_video_device (headless)
             #[cfg(windows)]
-            Some(crate::video::audio::AudioDspChain {
-                user: Some(self.dsp_bridge.clone()),
-                effetune: Arc::clone(&self.effetune.slot),
-                coordinator: Arc::clone(&self.dsp_processing),
-            }),
+            Some(self.local_audio_dsp_chain()),
             crate::video::VideoOutputConsumer::Presentation,
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)
@@ -83820,6 +84392,7 @@ impl App {
                     // main.rs の `install_mouse_nav_hook` のコメント参照。
                     crate::install_mouse_nav_hook();
                     crate::key_input::install_main_window_subclass(hwnd_raw as u64);
+                    self.effetune.set_main_hwnd(hwnd_raw as u64);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
                     #[cfg(windows)]
@@ -84121,6 +84694,7 @@ impl App {
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
+        self.poll_indexer_notifications();
         self.poll_housekeeping_arm();
         // VST3 起動時の bridge enable + 自動ロードは専用 worker で走らせる。
         // 画像閲覧だけの起動では通常 UI を先に出し、動画を開いた時点でまだロード中なら
@@ -85887,16 +86461,11 @@ impl App {
                         (
                             FolderOpenScanPurpose::CurrentViewOrderRefresh {
                                 order,
-                                collection_owner,
+                                reload_owner,
                             },
                             Ok(scan),
                         ) => {
-                            self.apply_current_view_order_refresh(
-                                path,
-                                scan,
-                                order,
-                                collection_owner,
-                            );
+                            self.apply_current_view_order_refresh(path, scan, order, *reload_owner);
                             None
                         }
                         (
@@ -86523,6 +87092,8 @@ impl eframe::App for App {
         // Process-global clipboard events must be visible before fullscreen/native early
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
+        // Retired asset requests must cancel even when presentation returns early.
+        self.prune_current_view_pin_refreshes();
         // Collection startup/revision/worker responses must likewise progress even when
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
@@ -88664,6 +89235,186 @@ pub(crate) use tests::phase_c_support::{
 };
 
 #[cfg(test)]
+mod index_full_check_tests {
+    use super::*;
+
+    #[test]
+    fn index_full_check_initializing_reserves_shared_once_and_runs_name_immediately() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        app.sync_name_index_supervisors();
+        let (tx, rx) = mpsc::channel();
+        app.startup_init = Some(StartupInitPending {
+            rx,
+            started_at: std::time::Instant::now(),
+            full_check_requested: false,
+        });
+        app.startup_done = false;
+        app.request_index_full_check();
+        app.request_index_full_check();
+        assert!(app.startup_init.as_ref().unwrap().full_check_requested);
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            2
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            0
+        );
+        let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
+            &env.tmp.path().join("full-check"),
+            Arc::clone(&app.activity_gate),
+            app.similar_index.as_ref().unwrap().notifier(),
+            app.pdf_passwords.clone(),
+        );
+        assert!(
+            tx.send(crate::indexer_manager::StartupInitOutcome::Ready(manager))
+                .is_ok()
+        );
+        app.poll_startup_init();
+        assert!(app.startup_init.is_none());
+        assert!(
+            app.indexer_manager
+                .as_ref()
+                .unwrap()
+                .full_check_requested_for_test()
+        );
+        app.indexer_manager
+            .as_ref()
+            .unwrap()
+            .wait_full_check_dispatched_for_test();
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            1
+        );
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            2
+        );
+    }
+
+    #[test]
+    fn index_full_check_unavailable_keeps_name_and_explains_shared_failure() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        app.startup_done = true;
+        app.request_index_full_check();
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            1
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            0
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("初期化できなかった")
+        );
+        let (tx, rx) = mpsc::channel();
+        app.startup_init = Some(StartupInitPending {
+            rx,
+            started_at: std::time::Instant::now(),
+            full_check_requested: false,
+        });
+        app.startup_done = false;
+        app.request_index_full_check();
+        assert!(
+            tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
+                .is_ok()
+        );
+        app.poll_startup_init();
+        assert!(app.startup_init.is_none());
+        assert!(app.indexer_manager.is_none());
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            2
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            0
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("コンテナ索引")
+        );
+    }
+
+    #[test]
+    fn index_full_check_ready_fans_out_once_per_subsystem_while_paused() {
+        let mut env = setup_app_for_test();
+        let data = env.tmp.path().join("full-check");
+        let app = &mut env.app;
+        app.activity_gate.set_paused(true);
+        app.indexer_manager = Some(
+            crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
+                &data,
+                Arc::clone(&app.activity_gate),
+                app.similar_index.as_ref().unwrap().notifier(),
+                app.pdf_passwords.clone(),
+            ),
+        );
+        app.startup_done = true;
+        app.request_index_full_check();
+        assert!(
+            app.indexer_manager
+                .as_ref()
+                .unwrap()
+                .full_check_requested_for_test()
+        );
+        app.indexer_manager
+            .as_ref()
+            .unwrap()
+            .wait_full_check_dispatched_for_test();
+        assert_eq!(
+            app.name_index_manager
+                .as_ref()
+                .unwrap()
+                .request_full_check_count_for_test(),
+            1
+        );
+        assert_eq!(
+            app.similar_index
+                .as_ref()
+                .unwrap()
+                .full_check_request_count_for_test(),
+            1
+        );
+        app.activity_gate.set_paused(false);
+    }
+}
+
+#[cfg(test)]
 impl App {
     pub(crate) fn test_paint_provenance_for_idx(
         &self,
@@ -88743,13 +89494,13 @@ mod favorite_view_state_tests {
                     match ready.purpose {
                         FolderOpenScanPurpose::CurrentViewOrderRefresh {
                             order,
-                            collection_owner,
+                            reload_owner,
                         } => {
                             assert!(app.apply_current_view_order_refresh(
                                 ready.path,
                                 scan,
                                 order,
-                                collection_owner,
+                                *reload_owner,
                             ));
                         }
                         _ => panic!("unexpected folder scan purpose"),

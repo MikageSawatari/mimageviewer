@@ -98,6 +98,7 @@ pub enum BottomContainerKind {
 pub enum BadgeKind {
     StackCount,
     FilterMatchCount,
+    MediaDuration,
     BookmarkTime,
     UpscaledVideo,
     Edit(EditBadgeKind),
@@ -121,6 +122,7 @@ pub enum BadgePriority {
     Filename,
     Rating,
     FilterMatchCount,
+    MediaDuration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +187,7 @@ pub struct ThumbnailOverlayLayout {
     pub top_left: TopLeftOverlayLayout,
     pub bottom_left: BottomLeftOverlayLayout,
     pub filter_match_count: Option<BadgePlacement>,
+    pub media_duration: Option<BadgePlacement>,
 }
 
 impl ThumbnailOverlayLayout {
@@ -194,6 +197,7 @@ impl ThumbnailOverlayLayout {
             .chain(self.top_left.placements())
             .chain(self.bottom_left.placements())
             .chain(self.filter_match_count.iter())
+            .chain(self.media_duration.iter())
     }
 }
 
@@ -237,6 +241,7 @@ pub struct ThumbnailOverlayLayoutInput<'a> {
     pub checked: bool,
     pub stack_count: Option<usize>,
     pub filter_match_count: Option<u32>,
+    pub media_duration: Option<&'a str>,
     pub bookmark_time: Option<&'a str>,
     pub upscaled_video: bool,
     pub edit_badges: EditBadgeFlags,
@@ -360,6 +365,31 @@ pub fn stack_count_style(inner: egui::Rect) -> BadgeTextStyle {
 }
 
 pub fn filter_match_count_style() -> BadgeTextStyle {
+    BadgeTextStyle {
+        font_size: 11.0,
+        family: BadgeFontFamily::Proportional,
+        padding: BadgePadding::symmetric(5.0, 2.0),
+    }
+}
+
+/// Whole-second media length for thumbnail badges. The details column uses the same rounding.
+/// Unknown, negative, non-finite, or unrepresentably large lengths do not produce a badge.
+pub fn format_media_duration(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() || seconds < 0.0 || seconds.round() >= u64::MAX as f64 {
+        return None;
+    }
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    Some(if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    })
+}
+
+pub fn media_duration_style() -> BadgeTextStyle {
     BadgeTextStyle {
         font_size: 11.0,
         family: BadgeFontFamily::Proportional,
@@ -656,7 +686,7 @@ pub fn layout_thumbnail_overlays(
         }
     }
 
-    let occupied: Vec<egui::Rect> = check
+    let mut occupied: Vec<egui::Rect> = check
         .iter()
         .copied()
         .chain(stack_count.iter().map(|badge| badge.rect))
@@ -679,21 +709,8 @@ pub fn layout_thumbnail_overlays(
                 .find(|text| measure(text, style).x <= available)
                 .and_then(|text| {
                     let size = measured_badge_size(&text, style, &mut measure);
-                    let x = input.cell.max.x - size.x - 3.0;
-                    let mut y = input.cell.max.y - size.y - 3.0;
-                    let mut rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
-                    // Keep the count in the right column and lift it above occupied bottom badges.
-                    // At the 32pt floor there may be no free row; then the count yields to the
-                    // check, rating, and existing left-lane content.
-                    for _ in 0..occupied.len() {
-                        let blocker = occupied.iter().find(|other| other.intersects(rect));
-                        let Some(blocker) = blocker else { break };
-                        y = blocker.min.y - BOTTOM_ITEM_GAP - size.y;
-                        rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
-                    }
-                    (input.cell.contains_rect(rect)
-                        && !occupied.iter().any(|other| other.intersects(rect)))
-                    .then_some(BadgePlacement {
+                    let rect = place_bottom_right(input.cell, size, &occupied)?;
+                    Some(BadgePlacement {
                         kind: BadgeKind::FilterMatchCount,
                         priority: BadgePriority::FilterMatchCount,
                         rect,
@@ -703,13 +720,53 @@ pub fn layout_thumbnail_overlays(
                 })
         });
 
+    // Existing badges reserve first; the filter count also owns the right corner ahead of length.
+    occupied.extend(filter_match_count.iter().map(|badge| badge.rect));
+    let media_duration = input
+        .media_duration
+        .filter(|text| !text.is_empty())
+        .and_then(|text| {
+            let style = media_duration_style();
+            let size = measured_badge_size(text, style, &mut measure);
+            let rect = place_bottom_right(input.cell, size, &occupied)?;
+            Some(BadgePlacement {
+                kind: BadgeKind::MediaDuration,
+                priority: BadgePriority::MediaDuration,
+                rect,
+                text: text.to_owned(),
+                style,
+            })
+        });
+
     ThumbnailOverlayLayout {
         check,
         stack_count,
         top_left,
         bottom_left,
         filter_match_count,
+        media_duration,
     }
+}
+
+/// Keep a badge in the right column, lifting it above occupied rows. When the cell has no
+/// free row, the badge yields without moving or hiding any already-reserved content.
+fn place_bottom_right(
+    cell: egui::Rect,
+    size: egui::Vec2,
+    occupied: &[egui::Rect],
+) -> Option<egui::Rect> {
+    let x = cell.max.x - size.x - 3.0;
+    let mut y = cell.max.y - size.y - 3.0;
+    let mut rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+    for _ in 0..occupied.len() {
+        let Some(blocker) = occupied.iter().find(|other| other.intersects(rect)) else {
+            break;
+        };
+        y = blocker.min.y - BOTTOM_ITEM_GAP - size.y;
+        rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+    }
+    (cell.contains_rect(rect) && !occupied.iter().any(|other| other.intersects(rect)))
+        .then_some(rect)
 }
 
 fn natural_placement(
@@ -794,6 +851,101 @@ mod tests {
         (cell, cell.shrink(4.0))
     }
 
+    fn duration_input(cell: egui::Rect, inner: egui::Rect) -> ThumbnailOverlayLayoutInput<'static> {
+        ThumbnailOverlayLayoutInput {
+            cell,
+            inner,
+            checked: false,
+            stack_count: None,
+            filter_match_count: None,
+            media_duration: Some("1:02:03"),
+            bookmark_time: None,
+            upscaled_video: false,
+            edit_badges: EditBadgeFlags::default(),
+            tags: &[],
+            bottom_container: None,
+            rating_text: None,
+            filename: None,
+        }
+    }
+
+    #[test]
+    fn media_duration_formats_whole_seconds_and_rejects_invalid_lengths() {
+        for (seconds, expected) in [
+            (0.0, "0:00"),
+            (7.4, "0:07"),
+            (7.5, "0:08"),
+            (62.0, "1:02"),
+            (3599.4, "59:59"),
+            (3599.5, "1:00:00"),
+            (3723.0, "1:02:03"),
+            (360000.0, "100:00:00"),
+        ] {
+            assert_eq!(format_media_duration(seconds).as_deref(), Some(expected));
+        }
+        for seconds in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            assert_eq!(format_media_duration(seconds), None);
+        }
+    }
+
+    #[test]
+    fn media_duration_uses_bottom_right_and_preserves_hour_text_width() {
+        let (cell, inner) = cell(240.0);
+        let layout = layout_thumbnail_overlays(duration_input(cell, inner), measure);
+        let duration = layout.media_duration.as_ref().unwrap();
+        assert_eq!(duration.kind, BadgeKind::MediaDuration);
+        assert_eq!(duration.text, "1:02:03");
+        assert_eq!(duration.rect.max, cell.max - egui::vec2(3.0, 3.0));
+        let measured = measured_badge_size("1:02:03", media_duration_style(), &mut measure);
+        assert!((duration.rect.size() - measured).length() < 0.001);
+        assert_placements_inside_cell(&layout, cell);
+    }
+
+    #[test]
+    fn filter_count_keeps_the_corner_while_media_duration_lifts() {
+        let (cell, inner) = square_cell(100.0);
+        let mut input = duration_input(cell, inner);
+        input.filter_match_count = Some(42);
+        let layout = layout_thumbnail_overlays(input, measure);
+        let count = layout.filter_match_count.as_ref().unwrap();
+        let duration = layout.media_duration.as_ref().unwrap();
+        assert_eq!(count.rect.max, cell.max - egui::vec2(3.0, 3.0));
+        assert!(count.priority < duration.priority);
+        assert!(duration.rect.max.y <= count.rect.min.y - BOTTOM_ITEM_GAP);
+        assert_pairwise_non_intersecting(layout.badge_placements());
+        assert_placements_inside_cell(&layout, cell);
+    }
+
+    #[test]
+    fn duration_yields_in_small_cells_without_changing_existing_badges() {
+        for width in [32.0, 100.0, 240.0] {
+            let (cell, inner) = square_cell(width);
+            let mut input = duration_input(cell, inner);
+            input.checked = true;
+            input.filter_match_count = Some(123);
+            input.upscaled_video = true;
+            input.edit_badges = EditBadgeFlags {
+                page_override: true,
+                crop: true,
+                pin: true,
+                ..Default::default()
+            };
+            input.rating_text = Some("★★★★★");
+            input.filename = Some("long-video-name.mp4");
+            let mut without_duration = input.clone();
+            without_duration.media_duration = None;
+            let baseline = layout_thumbnail_overlays(without_duration, measure);
+            let mut with_duration = layout_thumbnail_overlays(input, measure);
+            assert_placements_inside_cell(&with_duration, cell);
+            assert_pairwise_non_intersecting(with_duration.badge_placements());
+            if width == 32.0 {
+                assert!(with_duration.media_duration.is_none());
+            }
+            with_duration.media_duration = None;
+            assert_eq!(with_duration, baseline);
+        }
+    }
+
     fn assert_pairwise_non_intersecting<'a>(
         placements: impl IntoIterator<Item = &'a BadgePlacement>,
     ) {
@@ -835,6 +987,7 @@ mod tests {
                     checked: true,
                     stack_count: None,
                     filter_match_count: Some(123),
+                    media_duration: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
@@ -893,6 +1046,7 @@ mod tests {
                     checked: false,
                     stack_count: Some(120),
                     filter_match_count: None,
+                    media_duration: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
@@ -926,6 +1080,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: Some(42),
+                media_duration: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -953,6 +1108,7 @@ mod tests {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    media_duration: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
@@ -992,6 +1148,7 @@ mod tests {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    media_duration: None,
                     bookmark_time: Some("12:34"),
                     upscaled_video: true,
                     edit_badges: EditBadgeFlags {
@@ -1050,6 +1207,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: Some("12:34"),
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -1083,6 +1241,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: Some("0:07"),
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -1126,6 +1285,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: Some("12:34"),
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -1157,6 +1317,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: None,
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -1192,6 +1353,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -1224,6 +1386,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -1256,6 +1419,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -1288,6 +1452,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                media_duration: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags {
