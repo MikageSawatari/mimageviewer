@@ -28,8 +28,8 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     pre-grid            App::update のグリッド直前区間を要素別に集計
     collection          コレクション読取 lease を session + request_id で相関し、
                         旧イベントは段別時間・outcome・未相関件数だけを集計
-    hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
-                        表示 (デフォルト 33ms = 30fps 閾値)
+    hitches [--ms N]    遅い update / フレーム間隔と logger・UI・thumb 区間、
+                        全カテゴリのイベント空白を表示 (デフォルト 33ms)
     idle-health         静止区間の update 頻度、repaint 理由の継続、同一 work の
                         反復を検査し、閾値超過時に終了コード 1 を返す
     startup             起動時間のフェーズ別 breakdown (data_dir / models /
@@ -2248,66 +2248,171 @@ def cmd_idle_health(
 
 
 # -----------------------------------------------------------------------
-# hitches — フレーム間隔の分布と nav 区間との重なり
+# hitches — update / フレーム間隔と待ち先の区間相関
 # -----------------------------------------------------------------------
 
-def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
-    """frame.begin の間隔が threshold_ms を超えたヒッチを検出し、
-    その直前 500ms に発生した nav.* 区間を表示する。"""
-    frame_ts: list[float] = []
-    for e in events:
-        if e.get("cat") == "frame" and e.get("kind") == "begin":
-            frame_ts.append(e.get("t", 0.0))
+def _hitch_number(event: dict, field: str) -> float | None:
+    value = event.get(field)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if math.isfinite(value) else None
+    return None
 
-    if len(frame_ts) < 2:
-        print("(frame.begin が 2 件未満)")
-        return
 
-    gaps: list[tuple[float, float]] = []  # (t_end, gap_ms)
-    for i in range(1, len(frame_ts)):
-        gap = (frame_ts[i] - frame_ts[i - 1]) * 1000.0
-        if gap >= threshold_ms:
-            gaps.append((frame_ts[i], gap))
+def _hitch_interval(event: dict) -> tuple[float, float] | None:
+    """Explicit times survive deferred emission; legacy spans end at event t."""
+    end = _hitch_number(event, "end_t")
+    if end is None:
+        end = _hitch_number(event, "t")
+    start = _hitch_number(event, "start_t")
+    if start is None:
+        ms = _hitch_number(event, "total_ms")
+        if ms is None or ms < 0 or end is None:
+            return None
+        start = end - ms / 1000.0
+    if end is None or end < start:
+        return None
+    return start, end
 
-    print(f"フレーム数: {len(frame_ts)}  間隔 >= {threshold_ms}ms のヒッチ: {len(gaps)} 件")
-    if not gaps:
-        return
 
-    gaps_sorted = sorted(g for _, g in gaps)
-    n = len(gaps_sorted)
-    p50 = gaps_sorted[n // 2]
-    p95 = gaps_sorted[min(n - 1, int(n * 0.95))]
-    print(
-        f"ヒッチ間隔: min={min(gaps_sorted):.1f} p50={p50:.1f} "
-        f"p95={p95:.1f} max={max(gaps_sorted):.1f} ms"
-    )
+def _hitch_overlaps(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return max(a[0], b[0]) < min(a[1], b[1])
 
-    # nav 区間 (end イベント) を直前 500ms 以内に含むものを列挙
-    nav_ends = [
-        e for e in events
-        if e.get("cat") == "nav" and e.get("kind", "").endswith("_end")
-    ]
 
-    print("\n最も大きいヒッチ 10 件:")
-    for t_end, gap in sorted(gaps, key=lambda x: -x[1])[:10]:
-        t_start = t_end - gap / 1000.0
-        # 直前 500ms ウィンドウ
-        window_start = t_start - 0.5
-        nearby = [
-            e for e in nav_ends
-            if window_start <= e.get("t", 0.0) <= t_end
-        ]
-        # ms 上位 3 件だけ出す
-        nearby.sort(key=lambda e: -float(e.get("ms", 0.0)))
-        tags = [
-            f"{e.get('kind')}={float(e.get('ms', 0.0)):.1f}ms"
-            for e in nearby[:3]
-        ]
-        tags_str = ", ".join(tags) if tags else "(nav イベントなし)"
+def _hitch_measurements(event: dict, fields: list[str]) -> str:
+    parts = []
+    for field in fields:
+        ms = _hitch_number(event, field + "_ms")
+        if ms is None:
+            continue
+        cycles = _hitch_number(event, field + "_cycles")
+        cycle_text = "cycles=n/a" if cycles is None else f"cycles={cycles:.0f}"
+        if cycles is not None and ms > 0:
+            cycle_text += f" ({cycles / ms:.0f}/ms)"
+        parts.append(f"{field}={ms:.1f}ms {cycle_text}")
+    return ", ".join(parts) or "(段階別フィールドなし)"
+
+
+def _print_hitch_context(events: list[dict], interval: tuple[float, float]) -> None:
+    logger_rows = []
+    thumb_rows = []
+    for event in events:
+        cat_kind = (event.get("cat"), event.get("kind"))
+        if cat_kind not in {("log", "slow_io"), ("thumb", "load_phases")}:
+            continue
+        span = _hitch_interval(event)
+        if span is not None and _hitch_overlaps(span, interval):
+            (logger_rows if cat_kind[0] == "log" else thumb_rows).append((event, span))
+    print(f"    logger 重複区間: {len(logger_rows)} 件")
+    for event, span in sorted(logger_rows, key=lambda row: row[1][0])[:10]:
         print(
-            f"  t={t_end:>8.3f}s  gap={gap:>6.1f}ms  "
-            f"直前 nav: {tags_str}"
+            f"      [{span[0]:.3f}, {span[1]:.3f}]s "
+            f"logger={event.get('logger', '?')} tid={event.get('tid', '?')} "
+            f"operation={event.get('operation', '?')} acquired_t={event.get('acquired_t', '?')} "
+            f"site={event.get('call_site', '?')} "
+            f"holder(snapshot)={event.get('holder_tid')}/{event.get('holder_site')} "
+            + _hitch_measurements(event, ["wait", "hold", "write", "flush", "auxiliary", "rotation", "diagnostics"])
         )
+    if logger_rows:
+        print("      write/flush/auxiliary は hold の内訳。holder は待ち開始時の best-effort snapshot。")
+    print(f"    thumb.load_phases 重複区間: {len(thumb_rows)} 件")
+    for event, span in sorted(thumb_rows, key=lambda row: -(row[1][1] - row[1][0]))[:10]:
+        print(
+            f"      [{span[0]:.3f}, {span[1]:.3f}]s tid={event.get('tid', '?')} "
+            f"idx={event.get('idx', '?')} key={fmt_key(event.get('key'))} "
+            + _hitch_measurements(event, [
+                "total", "decode", "display", "send_display", "cache_encode",
+                "cache_save", "cache_map", "offer_raster", "stats", "normal_log", "perf_log",
+                "prefill_db", "unaccounted",
+            ])
+        )
+    if thumb_rows:
+        print("      prefill_db は offer_raster の内訳 (重複加算しない)。区間重複だけでは待ち先は確定しない。")
+
+
+def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
+    """Correlate wall time / cycles by frame n and intervals, not JSONL order."""
+    dropped = sum(
+        _hitch_number(e, "count") or 0 for e in events
+        if e.get("cat") == "log" and e.get("kind") == "diagnostic_dropped"
+    )
+    if dropped:
+        print(f"logger 診断欠落: {dropped:.0f} 件 (queue 飽和、待ち先の証拠は不完全)")
+    frames = sorted(
+        [e for e in events if e.get("cat") == "frame" and e.get("kind") == "begin"
+         and _hitch_number(e, "t") is not None],
+        key=lambda e: e["t"],
+    )
+    gaps = [(previous["t"], current["t"]) for previous, current in zip(frames, frames[1:])
+            if (current["t"] - previous["t"]) * 1000.0 >= threshold_ms]
+    print(f"フレーム数: {len(frames)}  間隔 >= {threshold_ms}ms のヒッチ: {len(gaps)} 件")
+    if len(frames) < 2:
+        print("(frame.begin が 2 件未満)")
+    if gaps:
+        gap_ms = sorted((end - start) * 1000.0 for start, end in gaps)
+        n = len(gap_ms)
+        print(
+            f"ヒッチ間隔: min={min(gap_ms):.1f} p50={gap_ms[n // 2]:.1f} "
+            f"p95={gap_ms[min(n - 1, int(n * 0.95))]:.1f} max={max(gap_ms):.1f} ms"
+        )
+    nav_ends = [e for e in events if e.get("cat") == "nav" and e.get("kind", "").endswith("_end")]
+    print("\n最も大きいヒッチ 10 件:")
+    for start, end in sorted(gaps, key=lambda row: -(row[1] - row[0]))[:10]:
+        nearby = [e for e in nav_ends if start - 0.5 <= e.get("t", 0.0) <= end]
+        nearby.sort(key=lambda e: -float(e.get("ms", 0.0)))
+        tags = [f"{e.get('kind')}={float(e.get('ms', 0.0)):.1f}ms" for e in nearby[:3]]
+        tags_str = ", ".join(tags) if tags else "(nav イベントなし)"
+        print(f"  [{start:.3f}, {end:.3f}]s gap={(end - start) * 1000.0:.1f}ms 直前 nav: {tags_str}")
+        _print_hitch_context(events, (start, end))
+
+    updates = [e for e in events if e.get("cat") == "ui" and e.get("kind") == "update_breakdown"]
+    known_numbers = {e.get("n") for e in updates if e.get("n") is not None}
+    # The current begin reports the previous update. Keep the previous n.
+    for previous, current in zip(frames, frames[1:]):
+        ms = _hitch_number(current, "prev_update_ms")
+        if previous.get("n") not in known_numbers and ms is not None:
+            updates.append({
+                "n": previous.get("n"), "start_t": previous["t"],
+                "end_t": previous["t"] + ms / 1000.0, "total_ms": ms,
+                "total_cycles": current.get("prev_update_cycles"),
+                "outside_ms": current.get("prev_outside_ms"),
+            })
+    slow_updates = [e for e in updates if (_hitch_number(e, "total_ms") or 0) >= threshold_ms]
+    print(f"\nupdate >= {threshold_ms}ms: {len(slow_updates)} 件 (上位 10 件)")
+    if not updates:
+        print("  (update 計測なし: フレーム間隔は idle/present 等も含む)")
+    subevents = [e for e in events if e.get("cat") == "ui"
+                 and e.get("kind") == "other_worker_polls_breakdown"]
+    for event in sorted(slow_updates, key=lambda e: -e["total_ms"])[:10]:
+        span = _hitch_interval(event)
+        span_text = f"[{span[0]:.3f}, {span[1]:.3f}]s" if span else "[区間不明]"
+        print(f"  n={event.get('n', '?')} {span_text} " + _hitch_measurements(event, ["total"]))
+        stages = [field[:-3] for field in event if field.endswith("_ms") and field != "total_ms"]
+        stages.sort(key=lambda field: -(_hitch_number(event, field + "_ms") or 0))
+        print("    update 段 (上位 3): " + _hitch_measurements(event, stages[:3]))
+        matching = [e for e in subevents if event.get("n") is not None and e.get("n") == event["n"]]
+        if not matching:
+            print("    (other_worker_polls 内訳なし: 旧ログまたは未計測)")
+        for detail in matching:
+            detail_span = _hitch_interval(detail)
+            detail_text = f"[{detail_span[0]:.3f}, {detail_span[1]:.3f}]s " if detail_span else ""
+            print("    other_worker_polls " + detail_text + _hitch_measurements(detail, [
+                "total", "details_meta", "global_search_events", "search_debounce",
+                "prepared_adoption", "tag_prewarm", "video_pin_fetch", "other",
+            ]))
+            print("      UI 段は排他的計測 (tag_prewarm/video_pin_fetch も独立、重複なし)。")
+        if span:
+            _print_hitch_context(events, span)
+
+    timestamps = sorted({e["t"] for e in events if _hitch_number(e, "t") is not None})
+    log_gaps = [(start, end) for start, end in zip(timestamps, timestamps[1:])
+                if (end - start) * 1000.0 >= threshold_ms]
+    print(f"\n全カテゴリイベント時刻の空白 >= {threshold_ms}ms: {len(log_gaps)} 件 (上位 10 件)")
+    for start, end in sorted(log_gaps, key=lambda row: -(row[1] - row[0]))[:10]:
+        print(f"  [{start:.3f}, {end:.3f}]s gap={(end - start) * 1000.0:.1f}ms")
+    print(
+        "注: 空白/同時停止だけでは OS paging・プロセス停止・logger 待ちを断定できない。"
+        "未計装/idle/遅延記録もあり、待機スタック・ディスク I/O・hard fault は OS trace で確認する。"
+    )
 
 
 # -----------------------------------------------------------------------

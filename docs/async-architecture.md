@@ -1324,6 +1324,11 @@ installer shutdown はこの遮断を迂回して通常終了する。
 - `ui`     — UI フレーム: `tail_repaint` / `slow_frame_breakdown` / `pre_grid_breakdown`。
   `pre_grid_breakdown` は `n` / `total_ms` と、検索・お気に入り・タグ・ファセット・遅延状態・
   下部情報・フォルダペイン・選択 overlay・scroll routing・stack reconcile の各 `*_ms` を持つ
+- `log` — 共用 logger の `slow_io`（wait / hold が50 ms以上のときのみ）と `diagnostic_dropped`。
+  通常 / perf logger の待ち・保持・write/flush と holder snapshot を有界メモリキューに記録し、
+  後続perf書込で再帰なしに排出する。`ui.other_worker_polls_breakdown` と
+  `thumb.load_phases` の追加区間も含む詳細・入れ子・時刻の読み方は
+  [UI応答性の計装一覧](ui-responsiveness.md#恒久的に使える計装) を参照。
 - `folder_pane` — 左フォルダツリーペイン: `scan_subfolders` (子ディレクトリ列挙の ms / 件数 / cancel)
 
 ### 7.4 解析

@@ -7058,7 +7058,7 @@ pub(crate) fn offer_thumbnail_raster(
     file_size: i64,
     image: &image::DynamicImage,
     source_dims: (u32, u32),
-) {
+) -> crate::perf::stall::Timing {
     offer_thumbnail_raster_with_capability(
         PRODUCT_SIMILAR_FEATURE_CAPABILITY,
         path,
@@ -7068,7 +7068,7 @@ pub(crate) fn offer_thumbnail_raster(
         file_size,
         image,
         source_dims,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7081,7 +7081,7 @@ fn offer_thumbnail_raster_with_capability(
     file_size: i64,
     image: &image::DynamicImage,
     source_dims: (u32, u32),
-) {
+) -> crate::perf::stall::Timing {
     offer_thumbnail_raster_with_target_resolver(
         capability,
         path,
@@ -7092,7 +7092,7 @@ fn offer_thumbnail_raster_with_capability(
         image,
         source_dims,
         prefill_target,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7106,15 +7106,15 @@ fn offer_thumbnail_raster_with_target_resolver(
     image: &image::DynamicImage,
     source_dims: (u32, u32),
     resolve_target: impl FnOnce() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)>,
-) {
+) -> crate::perf::stall::Timing {
     // This direct capability gate is intentional.  A stale process-global test registration (or
     // a future accidental manager construction) must not turn ordinary thumbnail decoding into
     // similar-index signature work or DB writes while the feature is paused.
     if !capability.is_enabled() {
-        return;
+        return crate::perf::stall::Timing::default();
     }
     let Some((db, enabled_roots)) = resolve_target() else {
-        return;
+        return crate::perf::stall::Timing::default();
     };
     let prepared = match prepare_thumbnail_prefill(
         &enabled_roots,
@@ -7127,21 +7127,25 @@ fn offer_thumbnail_raster_with_target_resolver(
         source_dims,
     ) {
         Ok(Some(prepared)) => prepared,
-        Ok(None) => return,
+        Ok(None) => return crate::perf::stall::Timing::default(),
         Err(error) => {
             crate::logger::log(format!(
                 "similar prefill {} failed for {}: {}",
                 error.stage, error.item_key, error.message
             ));
-            return;
+            return crate::perf::stall::Timing::default();
         }
     };
-    if let Err(error) = store_offered_thumbnail_prefill(&db, &enabled_roots, &prepared) {
+    let db_started = crate::perf::stall::Span::start();
+    let result = store_offered_thumbnail_prefill(&db, &enabled_roots, &prepared);
+    let db_timing = db_started.map(|at| at.finish()).unwrap_or_default();
+    if let Err(error) = result {
         crate::logger::log(format!(
             "similar prefill write failed for {}: {error}",
             prepared.item.item_key
         ));
     }
+    db_timing
 }
 
 fn raster_is_large_enough_for_canonical_proxy(

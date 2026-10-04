@@ -84306,6 +84306,7 @@ impl App {
         }
         self.poll_metadata_load();
         mark_update_perf(&mut update_perf, UpdatePerfStage::SearchAndMetadataPolls);
+        let other_worker_scope = crate::perf::stall::OtherWorkerScope::start(self.frame_counter);
         // スタックスクリプトは items generation を差し替える。復旧中は receiver を保持し、
         // terminal 後に既存 poll へ一度だけ戻す。
         if !self.sidecar_restore_active() {
@@ -84313,13 +84314,21 @@ impl App {
         }
         self.poll_subfolder_expansion(ctx);
         self.poll_smart_folder(ctx);
-        self.poll_details_meta_load(ctx);
+        {
+            let _section =
+                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::DetailsMeta);
+            self.poll_details_meta_load(ctx);
+        }
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
         // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み
         // 2. settle 静止検出 + render spawn + 結果ポーリング
         self.poll_pano_high_res(ctx);
         self.update_pano_refinement(ctx);
-        self.poll_tag_prewarm_results();
+        {
+            let _section =
+                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::TagPrewarm);
+            self.poll_tag_prewarm_results();
+        }
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_epub_batch_convert();
@@ -84362,8 +84371,17 @@ impl App {
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
-        self.poll_global_search_debounce(ctx);
-        self.poll_global_search_events(ctx);
+        {
+            let _section = crate::perf::stall::PollSection::start(
+                crate::perf::stall::PollPart::SearchDebounce,
+            );
+            self.poll_global_search_debounce(ctx);
+        }
+        {
+            let _section =
+                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::SearchEvents);
+            self.poll_global_search_events(ctx);
+        }
         if self.global_search.is_searching() {
             // Ctrl+G の検索そのものもインタラクティブ操作として扱う。
             // 入力イベントの bump だけだと DEFAULT_QUIET_MS 経過後にインデクサが
@@ -84411,6 +84429,7 @@ impl App {
         }
         let t_background_polls = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::OtherWorkerPolls);
+        drop(other_worker_scope);
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {

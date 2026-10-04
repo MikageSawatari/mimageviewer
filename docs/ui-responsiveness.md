@@ -110,6 +110,32 @@ perf ログ有効時のみ動作し、無効時は時計を読まない:
 - `frame.begin` の `prev_update_ms` / `prev_update_cycles_per_ms` — フレーム全体の実行率
 - `frame.begin` の `prev_outside_ms` — eframe の描画と present (= 自分のコードの外)
 - `ui.update_breakdown` (23 段) / `ui.fs_render_breakdown` (56 段) — 各段の `_ms` と `_cycles`
+- `ui.other_worker_polls_breakdown` — OtherWorkerPolls が **50 ms 以上**のときだけ、
+  `n` / `start_t` / `end_t` / total と details_meta、search_debounce、global_search_events、
+  prepared_adoption、tag_prewarm（結果 poll と検索結果への prewarm）、video_pin_fetch、other の
+  `_ms` / `_cycles` を記録する。子区間へ入る間は親の計測を止めるため、各段は排他的で加算可能。
+- `log.slow_io` — 通常 / perf logger の mutex 待ちまたは保持が **50 ms 以上**のときだけ、
+  `logger` / `operation` / 呼出元 `call_site` / 実行 `tid`、`start_t` / `acquired_t` / `end_t`、
+  `wait_ms` / `hold_ms` / `write_ms` / `flush_ms` / `auxiliary_ms` を記録する。
+  auxiliary は通常 logger では rotation、perf logger では診断キュー出力の時間。
+  write / flush / auxiliary は hold の内訳であり、hold へ再加算しない。
+  `holder_tid` / `holder_site` は待ち開始時の best-effort atomic snapshot（不在・更新中なら null）。
+  長い待ちの途中で保持者が交代し得るため、同じ区間の保持側イベントとも照合する。
+  mutex 解放後に128件の有界メモリキューへ非ブロッキングで登録し、後続の perf event / flush が
+  再帰しない raw write 経路で出力する。`t` は出力時刻でなく計測終了時刻なので JSONL の行順は
+  時刻順とは限らない。満杯の欠落は `log.diagnostic_dropped.count` に出る。
+  終了・永久停止など後続の書込がない場合は未出力記録が残り得る。
+- `thumb.load_phases` — 従来イベントに `offer_raster` / `stats` / `normal_log` / `perf_log` の
+  `_ms` / `_cycles` と計測区間の `start_t` / `end_t` を追加し、排他的合計から `unaccounted_ms` を求める。
+  `prefill_db_ms` / `_cycles` は offer_raster 内の類似索引 DB mutex + SQL の内訳で、二重に引かない。
+  catalog mutex + SQL は既存 `cache_save_ms` 内。decode 内の render / orientation も引き続き内訳扱い。
+
+`python scripts/analyze_perf.py <path> hitches --ms 500` は遅い update の `n` で UI 内訳を対応させ、
+明示区間または `t-total_ms` の重なりから logger / thumbnail を表示し、全カテゴリの時刻空白も出す。
+通常ログの長い hold/write/flush と複数 tid の wait が一致すれば共用 logger 待ちの根拠になる。
+UI の tag/pin だけ長ければ同期 DB 経路を調べる。低 cycles と全体の空白だけでは paging と断定せず、
+未計測時間が残る場合は OS trace の待機スタック・disk I/O・hard fault を併用する。
+process memory の毎フレーム sample は追加していない（page-fault 種別の確定には OS trace が必要）。
 
 **待ちを疑うときは `_ms` と `_cycles` を必ず対で読む。**
 
