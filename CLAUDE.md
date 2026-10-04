@@ -1036,8 +1036,10 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
 古い core / remote / EPUB worker が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
-(Codex レビュー助言)。古いバージョンの runtime ディレクトリはユーザーが手動で
-削除可能 (将来的にランチャー側で「最新 N 世代だけ残す」掃除処理を追加するかも)。
+(Codex レビュー助言)。core の起動完了・初回描画後、短命の背景 worker が現在実行中の
+`CARGO_PKG_VERSION` だけを残し、他の版を best-effort 削除する。未知の名前と再解析ポイントは
+残し、削除失敗はログだけで次回起動へ回す。ダウングレード時には新しい版も削除対象となり、
+その版を再び起動すると launcher が再展開する。portable は清掃しない。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
 `scripts/build-release.{sh,ps1}` が 4 段階に分けて呼ぶ:
@@ -1706,10 +1708,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
   launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
-  検証済み世代を一度だけ公開する。既存・使用中treeの移動、置換、削除はしない。**atomicなのは
+  検証済み世代を一度だけ公開する。公開処理は既存・使用中treeの移動、置換、削除をしない。**atomicなのは
   完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
   正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
-  不一致は別世代を全hash検証して公開する。公開済み旧世代のcleanupは起動経路外に保留する。
+  不一致は別世代を全hash検証して公開する。core の起動後の runtime 清掃 worker が、current と
+  当該 core の固定世代以外を best-effort 削除する。公開用 OS lock が busy、current が不明、
+  core の固定世代が未確定・未知の配置なら世代清掃を見送り、初期化は待たせない。
   hash12はcontent SHA256先頭12桁（stampはfull hashを比較）。公開前に最深fileのUTF-16長を確認し、
   260以上なら明示理由で拒否する。publisher busyはworkerのOS lockを最大60秒待ってpointerを再確認する。
   repair不能／timeoutでもcoreは起動し、理由と実際に拒否した世代をenvで渡してUnavailableにする。

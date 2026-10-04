@@ -554,8 +554,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
 - 起動時は `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/`
   へ新しい世代を構築する。全ファイルのhashと一覧を検証してから、小さな `effetune/current`
-  pointerだけをatomicに更新する。公開済みtreeは使用中の読手から見えるため一切移動・削除しない。
-  旧世代のcleanupは起動経路では行わない。修復は別世代の公開でありin-placeの置換ではない。
+  pointerだけをatomicに更新する。公開処理は公開済みtreeを移動・削除しない。
+  旧世代のcleanupは起動後のcore背景workerで行う（下記2026-10-05追補）。修復は別世代の公開でありin-placeの置換ではない。
   正常stampの一覧・サイズ・更新時刻・作成時刻が一致するときは全量再hashもwrite lockも不要。
   metadataを保持したままの内容改変は通常起動での検出対象外。書込不能／publisher busyなどで
   repairできなくてもcoreは起動する。失敗理由と拒否世代を専用envからUnavailable UI／ログへ伝え、古いtreeを
@@ -585,7 +585,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   UTF-16長が260以上なら公開せず、UIにパスが長すぎる理由を示す。SDK directory checkのNotFound以外のerrorも
   単体DLL pathへfallbackせず報告し、Win32にはnative backslash wide pathを渡す。
   hostはCMakeで現trackedソースhash markerを埋め、署名前／core埋込前／bare cargo releaseのgateで照合する。
-  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは[バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)へ延期する。
+  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは下記追補および
+  [バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)を参照。
 - 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
@@ -596,6 +597,28 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
 - EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
   アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
+
+#### 起動後の旧世代清掃（§1.331 / §1.316、2026-10-05）
+
+- 利用者決定は「今の版だけ残して削除」。core の起動完了・初回描画後、`runtime-cleanup` worker
+  が `<data_dir>/runtime` 直下の SemVer として読める他版を削除する。ダウングレードでも新しい版を
+  削除し、再度その版を起動すれば launcher が再展開する。portable は完全な no-op。
+- 現在版の `effetune` は current pointer と当該 core が固定した世代を残す。pointerの綴りではなく
+  canonical化した世代名を比較し、Windowsでnonceの大文字・小文字が違っても同じ世代を保持する。既存の
+  `.effetune.lock` を exclusive に一度だけ試し、busy/error は今回見送る。取得中に pointer と
+  既存世代の候補一覧だけをsnapshotし、重いtree検査・削除の前にlockを解放する。
+  publisherは正常currentをそのまま使い、修復は必ずfreshな一意世代を公開する（旧世代を再公開しない）ため、
+  解放後の未公開stage／次のcurrentは候補に入らない。この不変条件を変える際は清掃設計も見直す。
+- 単純化としてcontrollerの既存 `bundle_path` snapshotを使う。Someになった後は再解決しない。
+  None（初回解決失敗／retry完了未受理）の場合は全世代を今回は残すため、pending retry の
+  世代とpointer更新の競合を扱う新しい状態・reader lock・待機は不要。未知の配置やcurrent異常も見送る。
+- 各targetはcanonical化してruntime内の直下child関係を確認する。root／祖先／全subtreeの
+  symlink・junction・reparse pointは明示的に拒否し、そのtreeを残す。削除失敗はlogのみ。
+  部分削除は許容し、次回起動で再度試す。timer、retry loop、UI通知、終了時joinは持たない。
+- 清掃が保護する固定世代は当該coreのもの。別 `--data-dir` のcoreもlauncherのAPPDATA runtimeを
+  共有し得るため、そのcoreの旧固定世代まで保持する跨プロセスleaseは今回追加していない。
+  使用中の旧runtime／旧世代の削除失敗は次回へ回す（部分削除は許容）。
+- 同梱bundleだけが対象。EffeTune設定／プリセット／IR／測定データ、WebView保存領域は削除しない。
 
 ### 10.3 同梱版更新 (2026-10-04、v4.3.0 公開前)
 

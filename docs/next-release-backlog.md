@@ -141,16 +141,29 @@
 ### 1.331 単体exe版・インストーラ版で、旧バージョンの runtime フォルダーが消えずに溜まる — 開発機の実測 (2026-10-05)
 
 - 観測 (開発機の `%APPDATA%\mimageviewer\runtime\`、2026-10-05 に ClaudeCode が一覧と `du` で計測): 2.13.0〜4.3.0 の 20 版分が残り、各 400〜540 MiB、合計約 8.5 GiB。利用者の他の PC は未確認。
-- 仕組み (コード / CLAUDE.md「FFmpeg LGPL DLL 管理」): launcher は版ごとに `runtime\<version>\` へ core・DLL・EffeTune を展開する (旧版の core が動作中でも上書きで失敗しないため)。旧版を消す処理は無く、CLAUDE.md にも「ユーザーが手動で削除可能 (将来的に掃除処理を追加するかも)」とだけある。更新のたびに約 0.5 GiB ずつ増える。
+- 原因 (コード / CLAUDE.md「FFmpeg LGPL DLL 管理」): launcher は版ごとに `runtime\<version>\` へ core・DLL・EffeTune を展開するが、従来は旧版を消す所有者が無かった。更新のたびに約 0.5 GiB ずつ増える。
 - §1.316 (EffeTune の旧世代) は同じ runtime 配下の、より小さい同種の問題 (修復 1 回あたり約 37 MiB)。掃除の仕組みは 1 つにまとめて考える。
-- 検討する点 (未決定、利用者に相談): 消す時機 (launcher が新版の core を起動した後 / core 起動後のバックグラウンド)、残す数 (現在版だけ / 直前版も)、使用中の旧版 core・host の扱い (消せなければ次回に回すだけで起動を止めない)、portable 版は対象外 (runtime を使わない)。
+- 利用者決定 (2026-10-05): 「今の版だけ残して削除」。ダウングレード時は新しい版も削除する（そのlauncherを次に起動すると再展開）。portable は対象外。
+- 実装: core の起動完了・初回描画後に `runtime-cleanup` を一度spawn。resolved data-dirのruntime直下のSemVer名だけを対象に、現在版以外をbest-effort削除する。canonical confinementと全treeのreparse検査を行い、未知名・リンクは残す。失敗はlogのみ、部分削除可、次回起動で再試行。UI I/O、timer、待機、初期化とのjoinは無い。
+- owner選択: launcherはcoreをspawnして即終了し、ログ／描画完了を持たない。coreのstartup完了境界を利用し、EffeTune／AI初期化の経路には清掃を挿入しない。
+- 棚卸し（今回の清掃対象外、別ownerで検討）:
+  - `vst3/hosts/<host+CRT SHA256>` は旧hashが残る。host抽出／実行中bridgeのownerでcurrentと読手を確定する必要があり、runtime配下の清掃には含めない。
+  - `addons/editing/packs/<pack-version>` と `downloads/<zip>.partial` は利用者が取得する追加パック。active pointer／font・model読手／download再開を持つため、別途保持方針を決める。
+  - `tensorrt-engines/<model-kind>` 内のTensorRT/ORT生成cacheはモデル・GPU・precision等のhashに依存する。複数の有効なvariantが共存するため「currentだけ」を適用しない。pack本体は固定の`tensorrt/`でありmIV版別世代ではないが、manifest asset名のzip／`.partial`が変更・再開用に残り得るためinstaller ownerで別途検討する。
+  - `archive_cache/<hash前2文字>/<path-hash>/<basename>.zip`、`epub_cache/<hash前2文字>/<path-hash>/<stem>.g<id>.pdf` は閲覧元ごとのcacheで、既存のcache管理を使う。「current版だけ」のruntimeルールには含めない。
+  - Susie32 exe、PDFium、ORT DLLはdata-dir直下の固定名、埋込みmodelは`models/<filename>`で置換するためmIV版別世代ではない。廃止model名は残り得るが、外部/追加modelと区別するmanifestが必要。
+  - 別`--data-dir`のcoreがAPPDATA runtimeを共有する場合、そのcoreの固定EffeTune世代まで保護する跨プロセスleaseは今回の範囲外（当該core＋currentを保持）。
+- 検証: 一時data-dirで現在版保持、旧版／新しい版／inactive世代削除、未知名、junction、publisher busy、locked file、portable no-opを検査。コマンドと結果は実装引継ぎに記録。実アプリは未起動。
 - 規模 / 優先度: Small〜Medium / P2 (利用者のディスクを黙って使い続ける)。
 
 ### 1.316 EffeTune 公開済み旧世代の best-effort cleanup — 2026-10-02
 
 - R2配布修正は使用中のtreeを移動／削除せず、不変世代を追加してcurrent pointerだけを更新する。
   修復のたびに約37 MiBが残るため、繰り返すとruntime cacheが増える。
-- 起動経路外で旧世代をbest-effort削除する設計を検討する。currentと実行中core／hostの世代を保持し、
+- §1.331と同じ起動後workerで実装。currentと当該core／hostが固定した世代を保持し、
+  それ以外の認識済み世代名だけをbest-effort削除する。publisher lockは一度だけ非blocking取得し、
+  busy、current不明、core世代未確定／未知layoutなら今回は全世代を保持する。
+  lock中に候補一覧をsnapshotし削除前に解放する（publisherは旧世代を再公開せずfresh世代だけを作る）。
   使用中・権限不足などの削除失敗はlogだけで起動／EffeTuneを阻害しない。lock不在だけでは未使用と判断しない。
 - 正本: [EffeTune配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01)。
 

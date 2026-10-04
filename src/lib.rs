@@ -224,6 +224,8 @@ pub mod rename_key_migration;
 pub mod ring_shortcut;
 mod rotation_cache;
 pub mod rotation_db;
+#[cfg(any(not(feature = "portable"), test))]
+mod runtime_cleanup;
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;

@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 
-mod bundle_location;
+pub(crate) mod bundle_location;
 pub mod composition;
 pub(crate) mod gui_gate;
 mod window;
