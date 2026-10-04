@@ -1455,6 +1455,22 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-05 §1.319 AudioTracks が Opening host を選ぶ readiness 契約の修正**
+
+`20261004T154102775Z-79036-AudioTracks-b6d55588` は root fullscreen の F12 が新規 window 3 の
+native presentation transition を開始した後、hidden HWND 登録だけを完了と誤認して action を
+要求した。window 3 は Opening／Mounted、active session は None。通常 passive activation の
+Mounted 拒否を変えると進行中の移行に別の activation を重ねるため、その検査を維持する。
+scenario の `detached_video` が既存 `active_immediate` 診断を待ち、registered host と active
+session viewport の描画完了を区別する。共通 helper を初回 open／開き直し／F12 に使う。
+`src/app/test_script_support.rs` の既存 read-only 投影には lifecycle の回帰テストだけを追加する。
+product の detached 述語、manager intent／mount／host／viewport／placement／native reducer と
+activation consumer は変更しない。新 state／delay／retry／repaint／pause は不要。
+
+利用者の test-script／scenario 層という指示に沿い、既存 lifecycle の所有境界を待機条件へ反映する。
+§2 の frozen product paths を修正する症状パッチではない。実装担当の判断と検証を記録し、
+ClaudeCode の検収と次の明示了承後の live 確認へ引き継ぐ。この round の独立レビューは未実施。
+
 **2026-10-05 §1.319 ee0eedb23 の期限競合 P2 対応**
 
 独立レビューで承認された root routing は維持し、診断 request の配送所有境界を修正する。

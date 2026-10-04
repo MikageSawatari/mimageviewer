@@ -7030,6 +7030,65 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn audio_tracks_scenario_waits_for_an_active_detached_video() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        // Execute the real scenario helper without running its UI actions.
+        let ast = engine
+            .compile(include_str!("../scripts/ui-smoke/audio-tracks.rhai"))
+            .unwrap()
+            .clone_functions_only();
+        let owner = window_identity_with_backend_token(3, 0, 3, 5);
+        let mut window = window_snapshot(owner.clone(), 1, 0, "multi.mkv");
+        window.residence = "mounted".into();
+        window.media_kind = "video".into();
+        let resolve = |window: TestScriptWindowSnapshot| {
+            let snapshot = TestScriptSnapshot {
+                windows: vec![window],
+                ..Default::default()
+            };
+            engine
+                .call_fn::<Dynamic>(
+                    &mut rhai::Scope::new(),
+                    &ast,
+                    "detached_video",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+
+        // A registered, Mounted Opening destination is not an action-ready session.
+        // Other also represents Resuming/Closing; parked windows are not active either.
+        for presentation in [
+            TestScriptWindowPresentation::Other,
+            TestScriptWindowPresentation::ParkedLiveImmediate,
+            TestScriptWindowPresentation::PassiveDeferredFrozen,
+        ] {
+            window.presentation = presentation;
+            assert!(window.to_rhai_map()["host_ready"].clone_cast::<bool>());
+            assert!(resolve(window.clone()).is_unit(), "{presentation:?}");
+        }
+
+        // The same Mounted owner becomes eligible after the active viewport renders.
+        window.presentation = TestScriptWindowPresentation::ActiveImmediate;
+        let selected = resolve(window.clone()).cast::<Map>();
+        assert_eq!(selected["window_id"].clone_cast::<rhai::INT>(), 3);
+        assert_eq!(selected["context_serial"].clone_cast::<rhai::INT>(), 0);
+        assert_eq!(selected["backend_token"].clone_cast::<rhai::INT>(), 5);
+        assert_eq!(window.identity, Some(owner.clone()));
+
+        window.identity = None;
+        assert!(resolve(window.clone()).is_unit());
+        window.identity = Some(owner);
+        window.media_kind = "image".into();
+        assert!(resolve(window.clone()).is_unit());
+        window.media_kind = "video".into();
+        window.role = "root".into();
+        assert!(resolve(window).is_unit());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_seek_strip_fixture_exceeds_the_nine_cell_fallback_at_a_bounded_width() {
         let cell_height = crate::video::seek_strip_layout::SeekStripHeightValues::default()
             .points(crate::video::seek_strip_layout::SeekStripHeight::Smallest)

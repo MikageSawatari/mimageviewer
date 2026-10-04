@@ -1071,6 +1071,10 @@ UI より先に入れる (UI から切り替えられるようになった時点
   ee0eedb23 の独立レビュー P2 で、worker だけの期限と Interrupt 公開前に遅い消費が可能な点を修正。
   UI／worker が同じ request の deadline と配送 outcome を所有し、期限前の到達記録で遅い ACK を判定する。
   acquisition も exact request を操作直前に検査し、詳細と追加回帰は同 smoke 設計の P2 追補に記録する。
+  次の利用者了承済み run `20261004T154102775Z-79036-AudioTracks-b6d55588` は root F12 を通過したが、
+  HWND 登録済みの Opening window 3 を scenario が選び、Mounted の passive activation 拒否で停止した。
+  host_ready は登録完了だけなので、共通 detached_video helper で既存 active_immediate presentation を
+  待つ。製品の F12／activation／安全検査と操作列は維持し、root cause・回帰・検証は同 smoke 設計へ記録する。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
   Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。

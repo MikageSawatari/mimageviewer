@@ -755,6 +755,35 @@ mod tests {
     }
 
     #[test]
+    fn registered_opening_detached_presentation_is_not_active() {
+        for state in [
+            DetachedWindowState::Opening,
+            DetachedWindowState::Resuming,
+            DetachedWindowState::Closing,
+        ] {
+            assert_eq!(
+                test_script_window_presentation(
+                    Some(3),
+                    Some(state),
+                    ContextResidence::Mounted,
+                    false,
+                ),
+                TestScriptWindowPresentation::Other,
+                "{state:?}",
+            );
+        }
+        assert_eq!(
+            test_script_window_presentation(
+                Some(3),
+                Some(DetachedWindowState::Active),
+                ContextResidence::Mounted,
+                false,
+            ),
+            TestScriptWindowPresentation::ActiveImmediate,
+        );
+    }
+
+    #[test]
     fn frozen_capture_presentation_requires_parked_at_rest_passive_view() {
         let classify = |state, residence, has_frozen_view| {
             test_script_window_presentation(Some(1), state, residence, has_frozen_view)

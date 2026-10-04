@@ -261,6 +261,64 @@ snapshot writer 競合を検査する。新しい live は未実施で、全体 
 通常 profile の確認 binary は診断限定差分の対象外。実装担当は製品／runner を起動していない。
 ClaudeCode の P2 検収と新たな明示了承後の live 全体 PASS は引き継ぐ。
 
+#### F12 の Opening host と active presentation の区別 (2026-10-05 第5 round)
+
+利用者了承後の `20261004T154102775Z-79036-AudioTracks-b6d55588` は root F12 の旧停止点を
+通過し、約4秒で ScriptFailure（exit 1、runner timeout ではない）になった。
+保存した manifest の `source_head` と調査 worktree の HEAD は `e1ffd0c25`。
+`logs/mimageviewer.log` と `screenshots/01-failure-root.png` を source と照合した。
+2.053秒の `[fs-key] source=root ... semantic:ToggleDetachedViewerMode`、2.054秒の
+`bundle_fullscreen_idx=Some(0) video_cache_entries=1` と presentation transition 2 の開始は、
+root が開いている動画の F12 切り替えを処理した証拠である。画面の grid／ON toast は移行中の
+root 表示で、動画なしの grid で既定設定だけを切り替えたことを意味しない。
+共通 `toggle_detached_viewer_mode` はこの動画を新しい DetachedWindow presentation へ移す。
+
+window 3 は正当な新しい移行先である。2.068秒には HWND／backend が登録されるが、窓は
+非表示、lifecycle は `Opening`、active session は None のまま。`host_ready` は exact host
+identity が存在するという診断であり、presentation の完了を表さない。
+旧 `detached_video(s)` は role／host_ready／media_kind だけを見たため、30秒 wait は既に true と
+なり、2.083秒に移行中の owner を選択した。2.085秒の `VideoSeekStart` は active session の
+経路に入れず、通常の passive activation が `Mounted` context を拒否している。
+これは正しい ownership 検査で、Mounted 全般を許可したり activation を重ねてはならない。
+native presenter の準備はその後も進み、2.163秒に initial composition ready、2.215秒に
+シナリオ失敗に伴う終了で transition が取消される。製品の移行失敗を示すログではない。
+
+シナリオの `detached_video` に既存 `presentation == "active_immediate"` を要求する。
+native reducer の exact `NativeCommitted` → `ApplyPresentation` が active session を開始し、
+その session の実 viewport render だけが Opening／Resuming → Active を昇格させる。
+HWND 登録と active presentation を区別する既存 lifecycle の契約を使い、固定 delay／retry、
+新しい状態、activation の変更は追加しない。初回 open・開き直し・F12 のすべてが同じ helper
+で readiness を確認する。音声／周波数の確認と全操作列、exact owner／backend／focus／handler／
+deadline、native control の入力前検査は維持する。製品コードは変更しない。
+
+回帰は実 `.rhai` から helper 関数だけを実行し、registered Mounted Opening と parked／終了中、
+未登録／別 role／別 media の除外、および同じ Mounted owner の Active 後の選択を検査する。
+App の読み取り専用 presentation 投影も Opening／Resuming／Closing と Active を区別する。
+非対話検証結果は以下に記録する。製品／runner は実装担当が起動せず、全体 live PASS は未確認。
+通常 profile の確認 binary はシナリオとテストだけの差分のため対象外。
+
+非対話検証 (2026-10-05、`next-audiotracks-smoke`、base `e1ffd0c25` 上の未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features test-script audio_tracks_scenario`: 2 passed
+  (`target/atsmoke-opening-scenario-tests.log`)。新テストの最初の compile は型別名 `INT` の未修飾で
+  exit 1。`rhai::INT` に修正後に再実行した。製品・テスト期待値の変更による回避はない。
+- `cargo test -p mimageviewer --lib --features test-script test_script`: 120 passed
+  (`target/atsmoke-opening-script-tests.log`)。新規2件と既存 deadline／owner／scope／handler 回帰を検査。
+- 同 feature 付き command の `native_ui_smoke`: 47 passed、`root_f12`: 4 passed、
+  `native_video_f12`: 3 passed、`always_new_media_f12`: 2 passed
+  (`target/atsmoke-opening-native-smoke-tests.log` / `target/atsmoke-opening-root-f12-tests.log` /
+  `target/atsmoke-opening-native-f12-tests.log` / `target/atsmoke-opening-media-f12-tests.log`)。
+- `cargo test -p mimageviewer --lib test_script`: 92 passed
+  (`target/atsmoke-opening-normal-script-tests.log`)。新規2件は feature 限定で、通常 suite は不変。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`、
+  `--features portable,test-script`: すべて exit 0 (`target/atsmoke-opening-check-normal.log` /
+  `target/atsmoke-opening-check-portable.log` / `target/atsmoke-opening-check-diagnostic.log`)。
+- `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-opening-fmt.log` /
+  `target/atsmoke-opening-diff-check.log`)。
+
+通常 product の code／依存／build 設定／fixture と backend witness は不変で、既存の有効な広い gate と
+witness 検証は再利用する。今回の独立レビューと ClaudeCode 検収、明示了承後の全体 live PASS は未了。
+
 準備だけなら起動・入力は行わない:
 
 ```powershell

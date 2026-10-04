@@ -107,7 +107,7 @@
 - 次の一手: 通常ロガーの mutex 取得待ち・保持時間・`write_all` 時間を保持者 tid 付きでメモリに記録し、OtherWorkerPolls (details_meta / 検索 events / 結果取り込み / タグ prewarm / 動画 pin) とサムネイルの未計測区間を wall time と cycles の対で分ける。再測定時は OS トレース (待機スタック・ディスク I/O・hard fault) を添える。
 - v4.3.0 は記録のうえで出荷 (1 回だけの観測で再現せず、退行の根拠なし)。
 
-### 1.319 ui-smoke AudioTracks の native control／Targeted focus 取得 — smoke 実行記録 (2026-10-02、10-04 追補)
+### 1.319 ui-smoke AudioTracks の native control／Targeted focus 取得 — smoke 実行記録 (2026-10-02、10-05 追補)
 
 - 観測: v4.3.0 の配布前 smoke (使い捨て portable、source_head 0f3399113) で 2 回続けて同じ失敗。runner の分類は `environment_failure`。証跡 `target/ui-smoke-runs/20261002T005040656Z-250924-AudioTracks-430e3e66` と `...005111110Z-75016-AudioTracks-e1d38f63`。このシナリオは §1.251 S8 で作ってから一度も実行していなかった。
 - 失敗の手前までは進む: multi.mkv の再生と既定トラック (880 Hz、stream 2、Applied) の確認は通っている。止まるのは HUD の音声メニュー 1 行目を OS 入力でクリックする直前の再確認 ([native_ui_smoke.rs の click_native_audio_control](../src/video/native_ui_smoke.rs)) で、snapshot と入力直前とで target の token か位置が一致しない。
@@ -120,6 +120,8 @@
 - 第3 round (2026-10-04): focus 修正 0072aced5 は独立レビュー承認後にコミット。利用者了承後の `20261004T135833517Z-11688-AudioTracks-352e9a51` は再生中／停止中切り替え、保存行3からの開き直し、detached → root F12 を通過した。次の root → detached は focus ready 後の consumer ACK 待ちで 240秒 timeout。後続30秒 wait_until は未実行。既存 root fullscreen router の event-only probe が semantic PendingAction を見落とし、backdrop 早期 return で他 handler にも届かない診断入力の欠落だった。native F12 は keymap から共通切り替えへ届き、root → 新 detached の期待は製品仕様通り。
 - 今回は root probe に exact Targeted owner／backend／AwaitingPass／Press scope の読み取り専用照会を接続し、既存 guarded handler で消費する。run_action は既定30秒（指定も可）で environment_failure と状態診断を返し、Interrupt で期限後の遅い consume／peek／probe／activation を拒否する。wait_until にも owner／snapshot 診断を加え、正の予算経過後の true を失敗にするが zero の即時判定は維持する。製品の F12・native input・scenario 列は変更しない。検証・再実行手順は同 smoke 設計、構造判断は detached plan §11。全体 PASS は未確認。
 - P2 追補 (2026-10-05): ee0eedb23 の routing／cfg／probe／構造記録は独立レビュー承認。期限が worker 内だけにあり、Interrupt 公開前の遅い消費と無条件の遅い ACK 成功が可能だった点を指摘。共有 ActionRequest の同じ deadline と typed outcome で期限前配送／拒否の一方を確定し、UI の全 consume／peek／probe／acquisition と worker が照合する。期限切れは診断取得前に確定し、snapshot 競合では待たない。取得 handle は exact request を保持し、同 owner の別 request に再結合しない。製品の入力・切り替え・scenario は不変。公開前 gap の回帰と検証は smoke 設計へ追記し、live は次回の明示了承待ち。
+
+- 第5 round (2026-10-05): 利用者了承後の `20261004T154102775Z-79036-AudioTracks-b6d55588` は root F12 を処理し、新しい window 3 の HWND を登録した。しかし lifecycle は Opening、active session は None、native presentation transition 2 は進行中だった。scenario の `detached_video` が HWND 登録だけを表す host_ready を移行完了と誤認し、Mounted context に通常 passive activation を要求して約4秒で ScriptFailure。Mounted の拒否は正しく、製品不具合を示す evidence ではない。既存の active_immediate presentation を helper の readiness 条件に加え、初回 open／開き直し／F12 のすべてで実 session render を待つ。製品 state・activation・操作列・安全検査は変更しない。回帰・非対話検証は smoke 設計、境界の記録は detached plan §11。全体 live PASS は次の明示了承後の run 待ち。
 
 ### 1.317 環境設定のエクスポート・インポート — 5ch >>498 からの検討 (2026-10-02)
 
