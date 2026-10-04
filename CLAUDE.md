@@ -1027,7 +1027,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
        EffeTune は同ディレクトリ下の不変世代へ全hash検証して公開し、atomic更新するのはcurrent pointerだけ。
        一覧・サイズ・更新時刻・作成時刻とstampが一致すれば再hash／write lockなし。修復失敗もcore起動を継続。
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
-    3. ランチャー即終了 (GUI なので exit code を待たない)
+    3. core が使用中lockを引き継いだ通知後にランチャー終了 (coreの通常終了は待たない)
 ```
 
 ランチャーは **FFmpeg API を一切呼ばない** ので Windows ローダの DLL 解決問題に
@@ -1037,7 +1037,11 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
 古い core / remote / EPUB worker が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
 (Codex レビュー助言)。core の起動完了・初回描画後、短命の背景 worker が現在実行中の
-`CARGO_PKG_VERSION` だけを残し、他の版を best-effort 削除する。未知の名前と再解析ポイントは
+`CARGO_PKG_VERSION` と使用中lockで保護された版を残し、他の版を best-effort 削除する。
+coreはexeの版directoryと固定EffeTune世代のshared leaseを寿命中保持し、launcherもcoreへの
+引き渡しまで保持する。清掃はcandidateのexclusive leaseと抽出／公開lockを非blocking取得し、
+削除完了まで保持する。workerが実行中process画像を一度だけ列挙し、候補内の画像があれば旧版も
+保持する。同版の別coreが存在する間は全旧EffeTune世代を保守的に保持する。未知の名前と再解析ポイントは
 残し、削除失敗はログだけで次回起動へ回す。ダウングレード時には新しい版も削除対象となり、
 その版を再び起動すると launcher が再展開する。portable は清掃しない。
 
@@ -1712,7 +1716,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
   正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
   不一致は別世代を全hash検証して公開する。core の起動後の runtime 清掃 worker が、current と
-  当該 core の固定世代以外を best-effort 削除する。公開用 OS lock が busy、current が不明、
+  使用中の固定世代以外を best-effort 削除する。各coreが世代shared leaseを保持し、
+  清掃はcandidateのexclusive leaseと版の公開lockを削除完了まで保持する。
+  ロック未対応旧coreもprocess画像で確認し、同版の別coreが動く間は全旧世代を保持する。
+  公開用 OS lock が busy、current が不明、
   core の固定世代が未確定・未知の配置なら世代清掃を見送り、初期化は待たせない。
   hash12はcontent SHA256先頭12桁（stampはfull hashを比較）。公開前に最深fileのUTF-16長を確認し、
   260以上なら明示理由で拒否する。publisher busyはworkerのOS lockを最大60秒待ってpointerを再確認する。

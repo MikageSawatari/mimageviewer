@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 mod bundle_location;
 mod bundle_paths;
 mod effetune_bundle;
+#[path = "../../../src/runtime_locks.rs"]
+mod runtime_locks;
 include!(concat!(env!("OUT_DIR"), "/effetune_files.rs"));
 
 #[cfg(test)]
@@ -134,22 +136,60 @@ fn run() -> Result<(), String> {
     std::fs::create_dir_all(&runtime_dir)
         .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
 
+    // Lease the real resource while preserving existing redirected APPDATA use.
+    // Cleanup's reparse refusal must not turn a runnable install into an error.
+    let lock_dir =
+        std::fs::canonicalize(&runtime_dir).map_err(|e| format!("runtime identity failed: {e}"))?;
+    let _runtime_lease =
+        runtime_locks::shared(&lock_dir).map_err(|e| format!("runtime lease failed: {e}"))?;
+    // Main assets had no extraction lock before this change. Serialize writers,
+    // and share this lock with the collector of other versions.
+    let extraction = effetune_bundle::wait_for_publish_lock(
+        runtime_locks::open(&lock_dir, runtime_locks::EXTRACTION)
+            .map_err(|e| format!("extraction lock failed: {e}"))?,
+        std::time::Duration::from_secs(60),
+    )
+    .map_err(|e| format!("extraction lock failed: {e}"))?;
+
     extract_assets(&runtime_dir)?;
     // EffeTune preparation is optional to application startup. Never run a
     // damaged/old bundle silently when this launcher's preparation failed.
-    let effetune = prepare_effetune(&runtime_dir);
+    let (effetune_lease, effetune) = match effetune_bundle::ensure_pinned_bundle(
+        &runtime_dir,
+        EFFETUNE_FILES,
+        EFFETUNE_MANIFEST,
+    ) {
+        Ok(pin) => {
+            let path = pin.path.clone();
+            (Some(pin), Ok(path))
+        }
+        Err(error) => (None, Err(error)),
+    };
 
     let core_path = runtime_dir.join("mimageviewer-core.exe");
     let launcher_path = std::env::current_exe().ok();
 
     let mut cmd = Command::new(&core_path);
+    #[cfg(windows)]
+    let handoff = runtime_locks::Handoff::new().map_err(|e| format!("runtime handoff: {e}"))?;
+    #[cfg(windows)]
+    handoff.configure(&mut cmd);
     cmd.args(&user_args);
     configure_effetune_command(&mut cmd, effetune);
     if let Some(path) = launcher_path {
         cmd.env("MIV_LAUNCHER_EXE_PATH", path);
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
+    drop(extraction);
+    #[cfg(windows)]
+    handoff
+        .wait(&mut child)
+        .map_err(|e| format!("runtime handoff: {e}"))?;
+    #[cfg(not(windows))]
+    child.wait().map_err(|e| format!("wait core: {e}"))?;
+    drop(effetune_lease);
 
     Ok(())
 }

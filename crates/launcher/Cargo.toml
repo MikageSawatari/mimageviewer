@@ -14,7 +14,7 @@ rust-version.workspace = true
 #   - core / remote / EPUB worker、FFmpeg DLL、VC runtime と EffeTune bundle 全体を
 #     `include_bytes!` で内包する (本クレートの src/main.rs 参照)
 #   - 初回起動時に `%APPDATA%\mimageviewer\runtime\<version>\` へ展開
-#   - core を `std::process::Command::spawn` で起動 → ランチャー即終了
+#   - core を spawn → 使用中lease引き渡しの通知後にランチャー終了
 #
 # FFmpeg API は呼ばないので Windows ローダの DLL 解決問題を完全に回避する。
 # 本体クレート (`mimageviewer-core.exe`) は ffmpeg-the-third を import library

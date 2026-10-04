@@ -226,6 +226,8 @@ mod rotation_cache;
 pub mod rotation_db;
 #[cfg(any(not(feature = "portable"), test))]
 mod runtime_cleanup;
+#[cfg(any(not(feature = "portable"), test))]
+mod runtime_locks;
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;
@@ -932,6 +934,10 @@ fn write_to_parent_console(msg: &str) {
 }
 
 pub fn run() -> eframe::Result {
+    // Executable ownership is independent of --data-dir and includes workers.
+    #[cfg(all(windows, not(feature = "portable")))]
+    let _runtime_lease = runtime_cleanup::pin_running_version()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
     #[cfg(windows)]
     let _startup_windows_diagnostics = startup_windows_diag::start();
     // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
@@ -1081,6 +1087,15 @@ pub fn run() -> eframe::Result {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     logger::init();
+
+    #[cfg(all(windows, not(feature = "portable")))]
+    {
+        // Resolve/pin before egui construction, never in update or App::new.
+        effetune::prepare_startup_bundle();
+        if let Err(error) = runtime_locks::signal_ready() {
+            logger::log(format!("runtime lease handoff: {error}"));
+        }
+    }
 
     // Keep the shared liveness lock alive until run() returns. A disabled gate is
     // retained as a typed outcome for the EPUB integration in the next stage.

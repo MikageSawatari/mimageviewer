@@ -1,13 +1,49 @@
 //! Post-startup, best-effort collection of launcher-owned immutable runtimes.
 //! No UI I/O, joins, timers or in-process retries. Unknown layouts are retained.
+//! Parent-directory TOCTOU swaps by another process running as the same user are
+//! accepted (2026-10-05): that process can delete the user's files directly.
+//! Canonical confinement/reparse pre-checks remain; they are not a handle-pinned
+//! guarantee against a malicious concurrent replacement of a parent directory.
+//! Legacy owners do not take leases: a single process-image snapshot on this
+//! worker retains their trees (and all generations if another same-version core
+//! runs). Starting an unchanged old launcher after the snapshot remains an
+//! accepted race: it requires concurrent user launches, and re-extracts next time.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(all(test, not(feature = "portable")))]
 use fs4::fs_std::FileExt;
 
 use crate::effetune::bundle_location;
+use crate::runtime_locks;
+
+#[cfg(all(windows, not(feature = "portable")))]
+pub(crate) fn pin_running_version() -> io::Result<Option<fs::File>> {
+    let exe = std::env::current_exe()?;
+    pin_version_at(&exe, env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(windows)]
+fn pin_version_at(exe: &Path, running_version: &str) -> io::Result<Option<fs::File>> {
+    let Some(version) = exe.parent().filter(|version| {
+        version
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(running_version))
+            && version
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("runtime"))
+    }) else {
+        return Ok(None);
+    };
+    // Lease identity follows the executable's real directory. Redirected APPDATA
+    // remains runnable; cleanup's stricter ancestor refusal only skips deletion.
+    runtime_locks::shared(&fs::canonicalize(version)?).map(Some)
+}
 
 #[cfg(all(windows, not(feature = "portable"), not(test)))]
 pub(crate) fn spawn(data_dir: PathBuf, pinned_bundle: Option<PathBuf>) {
@@ -26,6 +62,15 @@ pub(crate) fn spawn(data_dir: PathBuf, pinned_bundle: Option<PathBuf>) {
 }
 
 fn cleanup(data_dir: &Path, version: &str, pinned_bundle: Option<&Path>) {
+    cleanup_with_processes(data_dir, version, pinned_bundle, process_images);
+}
+
+fn cleanup_with_processes(
+    data_dir: &Path,
+    version: &str,
+    pinned_bundle: Option<&Path>,
+    processes: impl FnOnce() -> io::Result<Vec<(u32, PathBuf)>>,
+) {
     // Portable uses loose dependencies, even when --data-dir points at a normal profile.
     if cfg!(feature = "portable") {
         return;
@@ -36,6 +81,13 @@ fn cleanup(data_dir: &Path, version: &str, pinned_bundle: Option<&Path>) {
         checked_ancestors(data_dir)?;
         let data_dir = fs::canonicalize(data_dir)?;
         let runtime = checked_child(&data_dir, &data_dir.join("runtime"))?;
+        // One snapshot per startup, never per candidate. Failure/truncation keeps
+        // everything this time; ordinary protected/exited processes are skipped
+        // by the native provider. Canonicalize image identities once, off the UI.
+        let processes: Vec<_> = processes()?
+            .into_iter()
+            .map(|(pid, image)| (pid, fs::canonicalize(&image).unwrap_or(image)))
+            .collect();
         for entry in fs::read_dir(&runtime)? {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -50,11 +102,11 @@ fn cleanup(data_dir: &Path, version: &str, pinned_bundle: Option<&Path>) {
                 continue;
             };
             if candidate != current {
-                remove_candidate(&runtime, &runtime, &entry.path());
+                remove_candidate(&runtime, &runtime, &entry.path(), &processes);
             }
         }
         if let Some(bundle) = pinned_bundle {
-            if let Err(error) = cleanup_effetune(&runtime, version, bundle) {
+            if let Err(error) = cleanup_effetune(&runtime, version, bundle, &processes) {
                 log_failure(&runtime.join(version).join("effetune"), &error);
             }
         }
@@ -69,8 +121,27 @@ fn cleanup(data_dir: &Path, version: &str, pinned_bundle: Option<&Path>) {
     }
 }
 
-fn cleanup_effetune(runtime: &Path, version: &str, bundle: &Path) -> io::Result<()> {
+fn cleanup_effetune(
+    runtime: &Path,
+    version: &str,
+    bundle: &Path,
+    processes: &[(u32, PathBuf)],
+) -> io::Result<()> {
     let current = checked_child(runtime, &runtime.join(version))?;
+    // A legacy core's executable is in the version, not its pinned generation.
+    // Its plugin may not be loaded yet, so image/module checks of the generation
+    // alone cannot prove it idle. Conservatively retain every generation while
+    // another core uses this version; helper children do not trigger this gate.
+    if processes.iter().any(|(pid, image)| {
+        *pid != std::process::id()
+            && image_under(image, &current)
+            && image.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case("mimageviewer-core.exe")
+            })
+    }) {
+        return Err(io::Error::other("another core uses this runtime version"));
+    }
     let container = checked_child(&current, &current.join("effetune"))?;
     // Only the controller's recognized, pinned generation belongs to this sweep.
     // A development loose bundle (or a different data-dir's bundle) is not evidence.
@@ -91,40 +162,17 @@ fn cleanup_effetune(runtime: &Path, version: &str, bundle: &Path) -> io::Result<
         ));
     }
 
-    let candidates = generation_candidates(&current, &container, active_name.unwrap())?;
+    let publisher = runtime_locks::exclusive(&current, runtime_locks::PUBLISHER)?;
+    let candidates = generation_candidates(&container, active_name.unwrap())?;
     for candidate in candidates {
-        remove_candidate(runtime, &container, &candidate);
+        remove_candidate(runtime, &container, &candidate, processes);
     }
+    drop(publisher);
     Ok(())
 }
 
-fn generation_candidates(
-    current: &Path,
-    container: &Path,
-    active_name: &str,
-) -> io::Result<Vec<PathBuf>> {
-    // Share the publisher's OS lock, but never wait. Capture the complete list
-    // while no unpublished stage can be under construction. Drop the lock before
-    // recursive validation/deletion, so repair never waits behind that work.
-    let lock_path = current.join(".effetune.lock");
-    let metadata = checked_metadata(&lock_path)?;
-    if !metadata.is_file() {
-        return Err(io::Error::other("invalid EffeTune publisher lock"));
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
-    }
-    let lock = options.open(lock_path)?;
-    if !lock.try_lock_exclusive()? {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "EffeTune publisher busy",
-        ));
-    }
+fn generation_candidates(container: &Path, active_name: &str) -> io::Result<Vec<PathBuf>> {
+    // Caller holds the version's publisher lock through candidate removal.
     let pointer = bundle_location::read_pointer(container)?;
     // A malformed/dangling/reparse current is insufficient evidence for deletion.
     let pointer_generation = checked_child(container, &container.join(&pointer))?;
@@ -143,11 +191,6 @@ fn generation_candidates(
             candidates.push(entry.path());
         }
     }
-    // Publisher invariant: valid current is reused unchanged; repair ALWAYS
-    // publishes a fresh unique directory, never an existing inactive generation.
-    // Future stages/current are absent from this snapshot, and these candidates
-    // cannot become current after unlocking. Republish/rollback would require a
-    // new cleanup ownership design. File drop releases the publisher lock here.
     Ok(candidates)
 }
 
@@ -202,25 +245,112 @@ fn checked_tree(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_candidate(runtime: &Path, parent: &Path, path: &Path) {
+fn remove_candidate(runtime: &Path, parent: &Path, path: &Path, processes: &[(u32, PathBuf)]) {
     let result = (|| -> io::Result<()> {
         let target = checked_child(parent, path)?;
         if !target.starts_with(runtime) || target == runtime {
             return Err(io::Error::other("deletion target outside runtime"));
+        }
+        if processes
+            .iter()
+            .any(|(_, image)| image_under(image, &target))
+        {
+            return Err(io::Error::other("a running process image uses this tree"));
         }
         // Skip the whole candidate if ANY nested entry is a reparse point. On
         // Windows std::fs::remove_dir_all also opens entries with
         // FILE_FLAG_OPEN_REPARSE_POINT and deletes relative to directory handles,
         // providing protection against link replacement during recursive removal.
         checked_tree(&target)?;
+        // Acquire every owner before touching any asset. All acquisitions are
+        // nonblocking, and handles stay alive through remove_dir_all.
+        let lease = runtime_locks::exclusive(&target, runtime_locks::IN_USE)?;
+        let version_locks = if parent == runtime {
+            Some((
+                runtime_locks::exclusive(&target, runtime_locks::EXTRACTION)?,
+                runtime_locks::exclusive(&target, runtime_locks::PUBLISHER)?,
+            ))
+        } else {
+            None
+        };
         checked_child(parent, &target)?;
         fs::remove_dir_all(&target)?;
+        drop(version_locks);
+        drop(lease);
         crate::logger::log(format!("runtime cleanup: removed {}", target.display()));
         Ok(())
     })();
     if let Err(error) = result {
         log_failure(path, &error);
     }
+}
+
+fn image_under(image: &Path, tree: &Path) -> bool {
+    // Canonical paths normally already have matching spelling. The fallback
+    // handles disappeared images and Windows case/extended-prefix aliases.
+    #[cfg(windows)]
+    {
+        fn normalized(path: &Path) -> PathBuf {
+            let text = path.to_string_lossy().to_uppercase();
+            PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+        }
+        normalized(image).starts_with(normalized(tree))
+    }
+    #[cfg(not(windows))]
+    image.starts_with(tree)
+}
+
+#[cfg(all(windows, not(feature = "portable")))]
+fn native_process_images() -> io::Result<Vec<(u32, PathBuf)>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::K32EnumProcesses;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    // Bounded storage, one enumeration, one limited-rights image query per PID.
+    // No module enumeration, VM reads, subprocesses, waits or retry loops.
+    let mut pids = vec![0u32; 16384];
+    let capacity = (pids.len() * std::mem::size_of::<u32>()) as u32;
+    let mut bytes = 0;
+    if unsafe { K32EnumProcesses(pids.as_mut_ptr(), capacity, &mut bytes) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if bytes >= capacity {
+        return Err(io::Error::other(
+            "process snapshot truncated; keeping runtimes",
+        ));
+    }
+    let mut buffer = vec![0u16; 32768];
+    let mut images = Vec::new();
+    for pid in pids
+        .into_iter()
+        .take(bytes as usize / std::mem::size_of::<u32>())
+    {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            continue; // Protected system process, or already exited.
+        }
+        let mut size = buffer.len() as u32;
+        let found =
+            unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+        unsafe { CloseHandle(handle) };
+        if found != 0 {
+            images.push((
+                pid,
+                std::ffi::OsString::from_wide(&buffer[..size as usize]).into(),
+            ));
+        }
+    }
+    Ok(images)
+}
+
+fn process_images() -> io::Result<Vec<(u32, PathBuf)>> {
+    #[cfg(all(windows, not(feature = "portable"), not(test)))]
+    return native_process_images();
+    #[cfg(any(not(windows), feature = "portable", test))]
+    Ok(Vec::new()) // Unit fixtures inject snapshots; portable never calls this.
 }
 
 fn log_failure(path: &Path, error: &io::Error) {
@@ -370,35 +500,208 @@ mod tests {
         }
 
         #[test]
-        fn future_publication_is_outside_snapshot_and_lock_is_released_before_deletion() {
+        fn publisher_stays_locked_through_generation_deletion() {
             let (temp, runtime, bundle) = fixture();
             let current = fs::canonicalize(runtime.join(VERSION)).unwrap();
             let container = current.join("effetune");
-            let candidates = generation_candidates(&current, &container, ACTIVE).unwrap();
-            let publisher = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(current.join(".effetune.lock"))
-                .unwrap();
-            assert!(publisher.try_lock_exclusive().unwrap());
-            let fresh = "dddddddddddd-Jkl012";
-            tree(&container.join(fresh).join("EffeTune Mixwright.vst3"));
-            fs::write(
-                container.join("current"),
-                bundle_location::encode_pointer(fresh).unwrap(),
-            )
-            .unwrap();
-            drop(publisher);
+            let publisher = runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).unwrap();
+            let candidates = generation_candidates(&container, ACTIVE).unwrap();
             let runtime = fs::canonicalize(runtime).unwrap();
             for candidate in candidates {
-                remove_candidate(&runtime, &container, &candidate);
+                assert!(runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).is_err());
+                remove_candidate(&runtime, &container, &candidate, &[]);
+                assert!(runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).is_err());
             }
+            drop(publisher);
+            assert!(runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).is_ok());
             assert!(!container.join(OLD).exists());
             assert!(container.join(POINTER).exists());
-            assert!(container.join(fresh).exists());
             assert!(bundle.exists());
             // All I/O remained inside the fixture; no process-global data-dir.
             assert!(temp.path().exists());
+        }
+
+        #[test]
+        fn shared_version_and_generation_leases_keep_whole_trees() {
+            let (temp, runtime, bundle) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            let generation = runtime.join(VERSION).join("effetune").join(OLD);
+            let version_reader = runtime_locks::shared(&old).unwrap();
+            let generation_reader = runtime_locks::shared(&generation).unwrap();
+            cleanup(temp.path(), VERSION, Some(&bundle));
+            assert_eq!(fs::read(old.join("nested/asset")).unwrap(), b"asset");
+            assert_eq!(
+                fs::read(generation.join("EffeTune Mixwright.vst3/nested/asset")).unwrap(),
+                b"asset"
+            );
+            drop((version_reader, generation_reader));
+            cleanup(temp.path(), VERSION, Some(&bundle));
+            assert!(!old.exists());
+            assert!(!generation.exists());
+        }
+
+        #[test]
+        fn other_version_publisher_and_extraction_locks_prevent_any_deletion() {
+            let (temp, runtime, _) = fixture();
+            let publisher_version = runtime.join("3.0.0");
+            let extraction_version = runtime.join("2.0.0");
+            tree(&publisher_version);
+            tree(&extraction_version);
+            let publisher =
+                runtime_locks::exclusive(&publisher_version, runtime_locks::PUBLISHER).unwrap();
+            let extraction =
+                runtime_locks::exclusive(&extraction_version, runtime_locks::EXTRACTION).unwrap();
+            cleanup(temp.path(), VERSION, None);
+            for version in [&publisher_version, &extraction_version] {
+                assert_eq!(fs::read(version.join("nested/asset")).unwrap(), b"asset");
+            }
+            drop((publisher, extraction));
+            cleanup(temp.path(), VERSION, None);
+            assert!(!publisher_version.exists());
+            assert!(!extraction_version.exists());
+        }
+
+        #[test]
+        fn old_versions_without_lock_files_are_collected() {
+            let (temp, runtime, _) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            assert!(!old.join(runtime_locks::IN_USE).exists());
+            cleanup(temp.path(), VERSION, None);
+            assert!(!old.exists());
+        }
+
+        #[test]
+        fn legacy_process_snapshot_keeps_in_use_version_and_generation() {
+            let (temp, runtime, bundle) = fixture();
+            let old = runtime.join("3.0.0");
+            let idle = runtime.join("2.0.0");
+            tree(&old);
+            tree(&idle);
+            let generation = runtime.join(VERSION).join("effetune").join(OLD);
+            let images = vec![
+                (101, old.join("mimageviewer-core.exe")),
+                (102, generation.join("host.exe")),
+            ];
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(images));
+            assert!(old.join("nested/asset").exists());
+            assert!(
+                generation
+                    .join("EffeTune Mixwright.vst3/nested/asset")
+                    .exists()
+            );
+            assert!(!old.join(runtime_locks::IN_USE).exists());
+            assert!(!generation.join(runtime_locks::IN_USE).exists());
+            assert!(!idle.exists());
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(vec![]));
+            assert!(!old.exists());
+            assert!(!generation.exists());
+        }
+
+        #[test]
+        fn another_core_keeps_legacy_generations_even_before_plugin_load() {
+            let (temp, runtime, bundle) = fixture();
+            let current = runtime.join(VERSION);
+            let generation = current.join("effetune").join(OLD);
+            let other_pid = std::process::id().wrapping_add(1);
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || {
+                Ok(vec![(other_pid, current.join("mimageviewer-core.exe"))])
+            });
+            assert!(
+                generation
+                    .join("EffeTune Mixwright.vst3/nested/asset")
+                    .exists()
+            );
+            assert!(!generation.join(runtime_locks::IN_USE).exists());
+            // Own core and ordinary helper children do not suppress collection.
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || {
+                Ok(vec![
+                    (std::process::id(), current.join("mimageviewer-core.exe")),
+                    (other_pid, current.join("mimageviewer-remote.exe")),
+                ])
+            });
+            assert!(!generation.exists());
+        }
+
+        #[test]
+        fn process_snapshot_failure_keeps_all_candidates_and_portion_names_do_not_match() {
+            let (temp, runtime, bundle) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || {
+                Err(io::Error::other("injected snapshot failure"))
+            });
+            assert!(old.join("nested/asset").exists());
+            assert!(runtime.join(VERSION).join("effetune").join(OLD).exists());
+            // Prefix text is insufficient: matching is by path components.
+            cleanup_with_processes(temp.path(), VERSION, None, || {
+                Ok(vec![(101, runtime.join("3.0.0-other/host.exe"))])
+            });
+            assert!(!old.exists());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn native_process_snapshot_finds_self_and_measures_worker_cost() {
+            let started = std::time::Instant::now();
+            let images = native_process_images().unwrap();
+            let own_image = images.iter().find(|(pid, _)| *pid == std::process::id());
+            assert!(own_image.is_some());
+            let canonical: Vec<_> = images
+                .iter()
+                .map(|(_, image)| fs::canonicalize(image).unwrap_or_else(|_| image.clone()))
+                .collect();
+            eprintln!(
+                "process snapshot: {} readable images, enumeration + canonicalization {:?}",
+                canonical.len(),
+                started.elapsed()
+            );
+            let alias = PathBuf::from(r"C:\DATA\Runtime\3.0.0\CORE.EXE");
+            assert!(image_under(&alias, Path::new(r"\\?\C:\data\runtime\3.0.0")));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn version_lease_uses_executable_directory_with_windows_case_alias() {
+            let (temp, runtime, _) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            let exe = temp
+                .path()
+                .join("RUNTIME")
+                .join("3.0.0")
+                .join("mimageviewer-core.exe");
+            let reader = pin_version_at(&exe, "3.0.0").unwrap().unwrap();
+            cleanup(temp.path(), VERSION, None);
+            assert!(old.join("nested/asset").exists());
+            drop(reader);
+            cleanup(temp.path(), VERSION, None);
+            assert!(!old.exists());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn redirected_runtime_is_runnable_while_cleanup_stays_disabled() {
+            let temp = tempfile::tempdir().unwrap();
+            let outside = temp.path().join("outside");
+            tree(&outside.join(VERSION));
+            tree(&outside.join("3.0.0"));
+            let data = temp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            junction(&data.join("runtime"), &outside);
+            let exe = data
+                .join("runtime")
+                .join(VERSION)
+                .join("mimageviewer-core.exe");
+            let reader = pin_version_at(&exe, VERSION).unwrap().unwrap();
+            assert!(
+                runtime_locks::exclusive(&outside.join(VERSION), runtime_locks::IN_USE).is_err()
+            );
+            cleanup(&data, VERSION, None);
+            assert!(outside.join("3.0.0/nested/asset").exists());
+            drop(reader);
+            fs::remove_dir(data.join("runtime")).unwrap();
         }
 
         #[test]
@@ -414,7 +717,7 @@ mod tests {
             let outside = temp.path().join("3.0.0");
             tree(&outside);
             let canonical_runtime = fs::canonicalize(runtime).unwrap();
-            remove_candidate(&canonical_runtime, &canonical_runtime, &outside);
+            remove_candidate(&canonical_runtime, &canonical_runtime, &outside, &[]);
             assert_eq!(fs::read(outside.join("nested/asset")).unwrap(), b"asset");
         }
 

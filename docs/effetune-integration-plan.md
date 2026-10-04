@@ -603,22 +603,50 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 利用者決定は「今の版だけ残して削除」。core の起動完了・初回描画後、`runtime-cleanup` worker
   が `<data_dir>/runtime` 直下の SemVer として読める他版を削除する。ダウングレードでも新しい版を
   削除し、再度その版を起動すれば launcher が再展開する。portable は完全な no-op。
-- 現在版の `effetune` は current pointer と当該 core が固定した世代を残す。pointerの綴りではなく
-  canonical化した世代名を比較し、Windowsでnonceの大文字・小文字が違っても同じ世代を保持する。既存の
-  `.effetune.lock` を exclusive に一度だけ試し、busy/error は今回見送る。取得中に pointer と
-  既存世代の候補一覧だけをsnapshotし、重いtree検査・削除の前にlockを解放する。
-  publisherは正常currentをそのまま使い、修復は必ずfreshな一意世代を公開する（旧世代を再公開しない）ため、
-  解放後の未公開stage／次のcurrentは候補に入らない。この不変条件を変える際は清掃設計も見直す。
-- 単純化としてcontrollerの既存 `bundle_path` snapshotを使う。Someになった後は再解決しない。
-  None（初回解決失敗／retry完了未受理）の場合は全世代を今回は残すため、pending retry の
-  世代とpointer更新の競合を扱う新しい状態・reader lock・待機は不要。未知の配置やcurrent異常も見送る。
+- **P1/P2対応の利用者決定（2026-10-05）**: 各coreはexeの属する `runtime/<version>` と、
+  固定したEffeTune世代の `.in-use.lock` をsharedでプロセス寿命中保持する。`--data-dir` が異なる
+  coreも同じ実体のlockを使う。成功した世代解決はpathとleaseを持つ単一ownerとして固定し、
+  初回はegui構築前、準備失敗後の再解決は既存load worker内で取得する。UI updateにI/Oを追加しない。
+  版の使用権はWindowsのcase aliasも認識してcanonical実体で取得する。APPDATAのredirect自体は
+  起動を妨げず、清掃の祖先reparse拒否だけを適用する。
+- launcherも展開開始前から版のshared leaseを持つ。exe/DLL抽出には従来lockが無かったため
+  `.extract.lock` のexclusive lockを追加し、既存 `.effetune.lock` は世代公開のexclusive ownerを
+  継続する。正常世代を使う経路でも世代shared leaseを取得してから検査する。新規世代はlease fileを
+  公開前に作成し、bundle内容のstamp対象からこの管理fileだけを除く（regular fileかは検査する）。
+- spawn直後にlauncherがleaseを放す隙間を作らない。coreが自身の版leaseと初回の世代pin／Unavailableを
+  確定してnamed eventで通知するまで、launcherはshared leaseを保持してOS waitする。
+  coreはこの通知に対して待機しない。coreが先に終了した場合もlauncherは終了できる。
+  生存中coreのpinをtimeoutで放すことはしない。通常はこの引き渡し直後にlauncherが終了する。
+- 現在版の `effetune` はcurrentと当該coreの固定世代を残す。canonical化した世代名を比較し、
+  nonceの大文字・小文字違いも同じ実体として扱う。清掃は各候補の `.in-use.lock` をexclusiveで
+  非blocking取得し、版全体ならその版の `.extract.lock` と `.effetune.lock` も取得する。
+  現在版の世代清掃も版の `.effetune.lock` をexclusiveで取得し、**tree削除完了まで保持**する。
+  busy/errorなら資産の削除を始めず今回は見送る。初回世代未確定、未知配置、current異常も見送る。
 - 各targetはcanonical化してruntime内の直下child関係を確認する。root／祖先／全subtreeの
   symlink・junction・reparse pointは明示的に拒否し、そのtreeを残す。削除失敗はlogのみ。
   部分削除は許容し、次回起動で再度試す。timer、retry loop、UI通知、終了時joinは持たない。
-- 清掃が保護する固定世代は当該coreのもの。別 `--data-dir` のcoreもlauncherのAPPDATA runtimeを
-  共有し得るため、そのcoreの旧固定世代まで保持する跨プロセスleaseは今回追加していない。
-  使用中の旧runtime／旧世代の削除失敗は次回へ回す（部分削除は許容）。
+- **P1 #2は受容（利用者決定2026-10-05）**: 事前検査後に親directoryをjunctionへ差し替える
+  TOCTOUは対処しない。成立には利用者と同じ権限で動く別processが必要で、そのprocessは同じfileを
+  直接削除できるため、新たな権限を与えない。既存のcanonical／reparse事前検査は維持するが、
+  親directoryをhandleで固定した競合耐性を保証するものとは説明しない。
 - 同梱bundleだけが対象。EffeTune設定／プリセット／IR／測定データ、WebView保存領域は削除しない。
+- **旧版互換（利用者／ClaudeCode決定2026-10-05、方針1）**: workerが起動ごとに一度だけ
+  `K32EnumProcesses` と `QueryFullProcessImageNameW`（query limited rights）でprocess画像を列挙し、
+  候補tree内で実行中の画像があれば削除しない。世代内にexeが無い旧coreもあるため、現在版内の
+  別 `mimageviewer-core.exe` が動く間は全旧世代を保守的に残す（自coreとremote等のhelperは除外）。
+  この事前検査はlock対応版にも適用し、既存のshared／exclusive lock保護も維持する。
+  missing leaseは事前検査後に清掃側で新規作成してexclusive取得するので、未使用の既存旧版も
+  清掃できる。作成不能／権限不足は通常の削除失敗と同じくlogして次回起動へ回す。
+  process画像はcanonical化して比較し、列挙失敗／固定bufferの不足は全清掃を見送る。
+  終了済み／query拒否のprocessは画像を取得できないため検査対象外。全画像の一度の列挙だけで、
+  module列挙・VM read・待機・再試行は行わず、UI／起動／初期化の経路には置かない。
+  API仕様: [EnumProcesses](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-enumprocesses)、
+  [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)。
+  開発機のheadless test実測は525画像の列挙＋canonical化で約123ms（性能保証ではない）。
+- **旧launcher同時開始raceも受容（同決定）**: snapshot後に新規起動する未対応旧launcherは
+  lockを取得しないため、清掃との競合を完全には防げない。新旧版を利用者が同時に起動する必要が
+  あり、旧launcherは次回起動で再展開する。上記親junction TOCTOUと併記する受容範囲であり、
+  lock対応版同士は版lease／抽出／公開lockで保護する。
 
 ### 10.3 同梱版更新 (2026-10-04、v4.3.0 公開前)
 

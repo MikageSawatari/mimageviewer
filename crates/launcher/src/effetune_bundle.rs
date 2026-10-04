@@ -2,6 +2,7 @@
 //! Published bundle trees are never moved or deleted during launcher startup.
 use crate::bundle_location;
 use crate::bundle_paths::{checked_metadata, exists_checked, inventory_metadata, relative_name};
+use crate::runtime_locks::{self, PinnedGeneration};
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +36,25 @@ pub fn ensure_bundle(
     ensure_bundle_with_wait(runtime, files, manifest, Duration::from_secs(60))
 }
 
+pub fn ensure_pinned_bundle(
+    runtime: &Path,
+    files: &[BundleFile],
+    manifest: &str,
+) -> Result<PinnedGeneration, PreparationError> {
+    let mut rejected_generation = None;
+    ensure_bundle_inner(
+        runtime,
+        files,
+        manifest,
+        Duration::from_secs(60),
+        &mut rejected_generation,
+    )
+    .map_err(|reason| PreparationError {
+        reason,
+        rejected_generation,
+    })
+}
+
 fn ensure_bundle_with_wait(
     runtime: &Path,
     files: &[BundleFile],
@@ -42,12 +62,12 @@ fn ensure_bundle_with_wait(
     wait: Duration,
 ) -> Result<PathBuf, PreparationError> {
     let mut rejected_generation = None;
-    ensure_bundle_inner(runtime, files, manifest, wait, &mut rejected_generation).map_err(
-        |reason| PreparationError {
+    ensure_bundle_inner(runtime, files, manifest, wait, &mut rejected_generation)
+        .map(|pin| pin.path.clone())
+        .map_err(|reason| PreparationError {
             reason,
             rejected_generation,
-        },
-    )
+        })
 }
 
 fn ensure_bundle_inner(
@@ -56,7 +76,7 @@ fn ensure_bundle_inner(
     manifest: &str,
     wait: Duration,
     rejected_generation: &mut Option<String>,
-) -> io::Result<PathBuf> {
+) -> io::Result<PinnedGeneration> {
     if !checked_metadata(runtime)?.is_dir() {
         return Err(io::Error::other("runtime directory required"));
     }
@@ -64,7 +84,8 @@ fn ensure_bundle_inner(
     if exists_checked(&container)? && !checked_metadata(&container)?.is_dir() {
         return Err(io::Error::other("EffeTune container must be a directory"));
     }
-    // A valid installation has no write/lock requirement, including read-only APPDATA.
+    // A valid cooperating installation needs only a shared read-only lease,
+    // without a publisher write lock or another asset hash pass.
     if let Ok(root) = ready_generation(&container, files, manifest, rejected_generation) {
         return Ok(root);
     }
@@ -94,7 +115,10 @@ fn ensure_bundle_inner(
     publish_generation(&container, files, manifest)
 }
 
-fn wait_for_publish_lock(lock: std::fs::File, wait: Duration) -> io::Result<std::fs::File> {
+pub(crate) fn wait_for_publish_lock(
+    lock: std::fs::File,
+    wait: Duration,
+) -> io::Result<std::fs::File> {
     if lock.try_lock_exclusive()? {
         return Ok(lock);
     }
@@ -118,7 +142,7 @@ fn ready_generation(
     files: &[BundleFile],
     manifest: &str,
     rejected_generation: &mut Option<String>,
-) -> io::Result<PathBuf> {
+) -> io::Result<PinnedGeneration> {
     if !checked_metadata(container)?.is_dir() {
         return Err(io::Error::other("EffeTune directory required"));
     }
@@ -127,6 +151,7 @@ fn ready_generation(
     *rejected_generation = Some(generation.clone());
     let root = container.join(generation);
     bundle_location::checked_directory(&root)?;
+    let pin = PinnedGeneration::new(root.clone())?;
     let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
     if !root
         .file_name()
@@ -144,7 +169,7 @@ fn ready_generation(
     if !checked_metadata(&stamp)?.is_file() || std::fs::read_to_string(stamp)? != expected {
         return Err(io::Error::other("EffeTune extraction stamp mismatch"));
     }
-    Ok(root)
+    Ok(pin)
 }
 
 fn snapshot(root: &Path, files: &[BundleFile], manifest: &str) -> io::Result<String> {
@@ -163,11 +188,19 @@ fn snapshot(root: &Path, files: &[BundleFile], manifest: &str) -> io::Result<Str
     }
     let actual: BTreeSet<_> = entries
         .iter()
-        .filter(|(name, _, _)| name != ".manifest")
+        .filter(|(name, _, _)| name != ".manifest" && name != runtime_locks::IN_USE)
         .map(|(name, meta, _)| (name.clone(), meta.is_dir()))
         .collect();
     if actual != expected {
         return Err(io::Error::other("bundle inventory mismatch"));
+    }
+    if let Some((_, metadata, _)) = entries
+        .iter()
+        .find(|(name, _, _)| name == runtime_locks::IN_USE)
+    {
+        if !metadata.is_file() {
+            return Err(io::Error::other("generation lease must be a regular file"));
+        }
     }
     let metadata: BTreeMap<_, _> = entries
         .into_iter()
@@ -202,7 +235,7 @@ fn publish_generation(
     container: &Path,
     files: &[BundleFile],
     manifest: &str,
-) -> io::Result<PathBuf> {
+) -> io::Result<PinnedGeneration> {
     let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
     let stage = tempfile::Builder::new()
         .prefix(&format!(
@@ -211,6 +244,7 @@ fn publish_generation(
         ))
         .tempdir_in(container)?;
     check_publish_path_length(stage.path(), files)?;
+    let pin = PinnedGeneration::new(stage.path().to_path_buf())?;
     for file in files {
         relative_name(Path::new(file.name))?;
         let path = stage.path().join(file.name);
@@ -243,7 +277,8 @@ fn publish_generation(
         .persist(container.join(bundle_location::POINTER_FILE))
         .map_err(|e| e.error)?;
     // Cleanup is outside startup: absence of a lock cannot prove assets are unused.
-    Ok(stage.keep())
+    let _ = stage.keep();
+    Ok(pin)
 }
 
 fn check_publish_path_length(root: &Path, files: &[BundleFile]) -> io::Result<()> {
