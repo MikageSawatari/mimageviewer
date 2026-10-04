@@ -18562,6 +18562,8 @@ impl App {
                 .set_hud_raise_hook(std::sync::Arc::new(move || {
                     hud_raise_pending.store(true, std::sync::atomic::Ordering::Release);
                 }));
+            app.effetune
+                .set_keep_visible_when_minimized(app.settings.effetune_keep_visible_when_minimized);
         }
 
         if app

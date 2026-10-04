@@ -5614,6 +5614,9 @@ pub struct Settings {
     /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。再生開始時に取得する。
     #[serde(default = "default_true")]
     pub effetune_pre_limiter_enabled: bool,
+    /// メイン最小化中も、表示していた音響調整の窓を残す。
+    #[serde(default)]
+    pub effetune_keep_visible_when_minimized: bool,
     /// EffeTune GUI の最後の位置と外枠サイズ。
     #[serde(default)]
     pub effetune_gui_pos: Option<(i32, i32)>,
@@ -7511,6 +7514,7 @@ impl Default for Settings {
             vst3_plugin_state: None,
             vst3_gui_visible: true,
             effetune_pre_limiter_enabled: true,
+            effetune_keep_visible_when_minimized: false,
             effetune_gui_pos: None,
             effetune_gui_size: None,
             vst3_video_compact: false,

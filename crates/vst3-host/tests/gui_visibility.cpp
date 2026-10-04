@@ -76,3 +76,59 @@ static_assert(suppression_after_dispatch_cancels_first_show(true, false, true));
 static_assert(suppression_after_dispatch_cancels_first_show(false, true, false));
 static_assert(suppression_after_dispatch_cancels_first_show(false, true, true));
 static_assert(cancelled_raise_keeps_prior_visible_request());
+
+constexpr bool minimized_policy_and_remote(bool keep_visible, bool release_remote_first) {
+    miv::GuiVisibility state;
+    state.request(true);
+    state.reconcile_main(true, true, keep_visible);
+    if (state.should_show(true, false) != keep_visible) return false;
+    state.suppress(miv::GuiSuppression::RemoteSession, true);
+    if (state.should_show(true, true) || !state.requested()) return false;
+    if (release_remote_first) {
+        state.suppress(miv::GuiSuppression::RemoteSession, false);
+        if (state.should_show(true, false) != keep_visible) return false;
+        state.reconcile_main(true, false, keep_visible);
+    } else {
+        state.reconcile_main(true, false, keep_visible);
+        if (state.should_show(true, true)) return false;
+        state.suppress(miv::GuiSuppression::RemoteSession, false);
+    }
+    return state.should_show(true, false);
+}
+constexpr bool policy_changes_while_minimized() {
+    miv::GuiVisibility state;
+    state.request(true);
+    state.reconcile_main(true, true, false);
+    if (state.should_show(true, true)) return false;
+    state.reconcile_main(true, true, true);
+    if (!state.should_show(true, false)) return false;
+    state.suppress(miv::GuiSuppression::RemoteSession, true);
+    state.reconcile_main(true, true, false);
+    state.reconcile_main(true, true, true);
+    if (state.should_show(true, true)) return false;
+    state.suppress(miv::GuiSuppression::RemoteSession, false);
+    if (!state.should_show(true, false)) return false;
+    state.reconcile_main(true, true, false);
+    if (state.should_show(true, true)) return false;
+    state.reconcile_main(true, false, false);
+    return state.should_show(true, false);
+}
+constexpr bool policy_never_opens_user_hidden_or_missing_main(bool user_closed) {
+    miv::GuiVisibility state;
+    state.request(user_closed);
+    state.reconcile_main(true, true, false);
+    state.request(false);
+    state.reconcile_main(true, true, true);
+    state.reconcile_main(true, false, true);
+    if (state.should_show(true, true)) return false;
+    state.request(true);
+    state.reconcile_main(false, false, true);
+    return !state.should_show(true, true);
+}
+static_assert(minimized_policy_and_remote(false, false));
+static_assert(minimized_policy_and_remote(false, true));
+static_assert(minimized_policy_and_remote(true, false));
+static_assert(minimized_policy_and_remote(true, true));
+static_assert(policy_changes_while_minimized());
+static_assert(policy_never_opens_user_hidden_or_missing_main(false));
+static_assert(policy_never_opens_user_hidden_or_missing_main(true));

@@ -195,6 +195,10 @@ enum EffetuneFailure {
 - **mIV による一時非表示は host の `GuiVisibility` が単独で所有**する。表示希望と非表示理由の集合
   (`Minimized` / `RemoteSession`) を持ち、理由がすべて解除され、表示希望が残るときだけ非アクティブで戻す。
   最小化や Remote による hide で `user_hidden`、設定保存、state capture、音声の実行状態を変えない。
+  §1.312: `effetune_keep_visible_when_minimized`（既定 false）で `Minimized` だけを解除できる。
+  起動保存値と Preferences OK を既存 gate に公開し、変更時だけ worker の既存 reconcile を通知する。
+  最小化中も即時反映し、表示希望のない窓は開かない。`RemoteSession` は常に優先する。
+  tray-only `SW_HIDE` は OS の最小化ではなく、両設定とも既存どおり窓を残す。主窓が iconic なら設定に従う。
   最小化はメインの `WM_SIZE` で共有 atomic の連番を更新し、worker に通知する。
   WndProc は bridge を参照せず、`DspBridge.inner` のロック・列挙・IPC は worker 側だけで行う。
   実際の表示直前にも現在の `IsIconic(main)` を確認する。
@@ -213,8 +217,8 @@ enum EffetuneFailure {
   attach 中に最小化／Remote の開始と終了が両方済んだ場合も取消し、
   まだ表示していなかった窓を「復帰」として開かない。時間窓や独自 Remote revision は使わない。
   **配送後の取消しも host の GUI thread で確定する** (2026-10-01 review fix1)。
-  32 byte の専用共有 mapping は native 最小化連番と Remote の取得連番・phase の read-only projection
-  だけを運ぶ。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
+  専用共有 mapping は native 最小化連番と Remote の取得連番・phase、および最小化中の表示設定の read-only projection
+  を運ぶ（§1.312 で version 2 / 40 byte、設定 atomic は offset 32）。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
   worker に復帰判定を通知する。worker は source を weak に参照し、通知 sender の循環で残留しない。
   `set_gui_visibility_checked` は request ID と発行時の連番を運び、GUI thread が共有値と最小化を
   表示・アクティブ化の直前に照合する。取消しは未表示の窓の表示希望を作らず、既に表示希望のある
@@ -499,7 +503,7 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 
 ## 10. 決定済みの配布方針と残る対象外事項
 
-- 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
+- 最小化中もビジュアライザーを残す設定は当初の配布作業では対象外。公開後の §1.312 で実装、既定は一緒に隠す。§14 を参照。
 - **Windows Sandbox では音響調整 (と EPUB 変換) が動かない — 対処しない (2026-10-04 利用者判断)。** Sandbox では
   `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\EBWebView` が
   存在しない旧版フォルダ (152.0.4191.66) を指し、実フォルダはホストと共有の 153 / 154。EdgeUpdate が無効なのでずれが直らない。
@@ -1195,3 +1199,69 @@ v4.3.0 にも存在する別の pipeline 設計事項であり、この loop / s
 dev-runtime core（PID 112920）と Remote（PID 117288）が使用中のため exit 1 で更新を拒否した。
 実行中アプリを停止せず、旧確認用 exe は保持。利用者の通常終了後に同じ script を再実行する。
 この invocation だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を設定し、終了時に復元した。
+
+## 14. 最小化中の窓表示設定 (§1.312、2026-10-04)
+
+- 利用者が実装を承認。`Settings.effetune_keep_visible_when_minimized` を追加し、既定 false。
+  released settings を維持する加算的変更で、旧 JSON field / `settings_kv` key の欠落は serde default false。
+  `settings_db` は既存の全 field serialization / deserialization 経路で保存し、schema version は変更しない。
+- 環境設定「動画・音声 → 動画」の音響調整グループで入力ピーク保護の次にチェックボックスを配置。
+  portable build flavor は描画・検索索引とも cfg で除外する。保存済み設定自体は保持する。
+- 表示設定は起動時と Preferences OK 時に既存 `GuiGate` へ atomic で公開する。
+  mapping の version 2 / 40 byte は C++ と Rust で検査し、末尾 offset 32 がこの bool の u64 projection。
+  値が変わったときだけ既存 host-control worker の `ReconcileVisibility` を通知する。
+  GUI thread が現在値を読み `GuiVisibility::reconcile_main` で `Minimized` 理由だけを設定する。
+  `RemoteSession` と requested-visible の所有者は変更しない。main HWND 消失時は ON でも抑止する。
+- 単純化: 次回最小化までの保留値や追加の表示状態を作る案より、既存 reason-set の即時再評価を採用。
+  最小化中の OK も即時反映し、accepted な表示希望だけを非アクティブ復帰する。
+  未表示の初回 open / attach は従来どおり最小化イベントで取消し、ON にしただけで新しく開かない。
+  エディター再生成・モーダル化は、窓を残す目的と通常操作を妨げるため不要。
+- owner HWND 0 / tool window / 非 TOPMOST、既存の復帰 `SW_SHOWNA` を維持。owner・z-order・fullscreen・
+  detached・DSP・state capture・`user_hidden` の経路は変更しない。
+  tray-only `SW_HIDE` は `IsIconic` ではなく、現行コードも EffeTune を抑止しないため両設定でこの挙動を維持。
+  新しい tray reason や tray visibility の共有状態を追加しない。格納前から iconic なら最小化設定に従う。
+- 独立設計レビュー: GPT-6.1 Sol / xhigh が §4 と現行コードを確認し、上記所有境界・単純化に同意。
+  実装担当が自動検証を所有し、同じ Cargo target への重複実行を避ける。
+
+### 検証記録
+
+対象: `next-effetune-minimized` / base `d3cd4152a` の未コミット差分。実アプリは起動せず、利用者確認待ち。
+独立 completion source review は GPT-6.1 Sol / xhigh が ACCEPT（重大な指摘なし）。
+
+- `cmake --build crates/vst3-host/build --config Release`: exit 0。既存と追加の GUI 純状態 compile-time 回帰を含む。
+  `scripts/vst3-host-identity.ps1 -ValidateRepo .` も exit 0、source identity
+  `b981fb61b8ad8ba64a80eb8e16ad75f98754d2baa3465aef97f3120c9167207e`。
+  新 host は 835,584 bytes、SHA256 `582f47aa1f061080a61dc7c3bbfaaac65489ba44c9f49fa2ee2a9105deac1f49`。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。
+- 同 check `--features portable`: exit 0（`target/minvis/check-portable.log`）。
+- `cargo test -p mimageviewer --lib effetune`: exit 0、57 passed（`target/minvis/effetune-tests.log`）。
+  gate の policy 配送・連番維持、旧 blob / DB key 欠落、DB round trip、起動保存値、Preferences edit → OK → gate、既存 host handler を含む。
+- `cargo test -p mimageviewer --lib effetune_minimized --features portable`: exit 0、2 passed
+  （`target/minvis/portable-tests.log`）。保存設定の互換性と検索候補の除外を確認。
+- `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test ui_snapshot preferences_effetune_input_limit_dark`:
+  exit 0、1 passed（`target/minvis/snapshot-update.log`）。更新 PNG を目視確認し、初期値 OFF・入力保護の次の配置・日本語ラベルの欠けなしを確認。
+- `python scripts/check_ui_glyphs.py`: exit 0、危険な glyph 0。`cargo fmt --all --check` と `git diff --check` も clean。
+- `scripts/test-full.ps1 -SuppressCrashDialogs`: exit 101、launcher build の前提となる
+  `target/release/mimageviewer-{core,remote,epub-pdf}.exe` がこの worktree にないため、テスト実行前に停止。
+  product test failure ではなく不足前提。ログ `target/minvis/test-full.log`。full gate は未完了。
+- `scripts/build-dev.ps1 -PreserveRuntime`: exit 1、同じ worktree の dev-runtime core（PID 10696）が使用中のため更新を拒否。
+  実行中 core / Remote を停止せず、既存の確認 exe は更新されていない（`target/minvis/build-dev.log`）。
+  利用者の通常終了後に同じ script を再実行する。今回の指示に従い build-dev を選択し、C++ bridge 自体は先に再 build 済み。
+
+- `cargo test -p mimageviewer --lib`: exit 101、10,247 passed / 1 failed / 51 ignored、644.76 秒
+  （`target/minvis/core-lib-tests.log`）。唯一の失敗は未変更の
+  `fs_page_load_scheduler::tests::slow_read_and_decode_stay_within_process_budget` の最終 `peak == 3`（実際 2）。
+  scheduler が Running を公開してから worker が active/peak を更新する前に gate を解放できるテスト同期の隙間を、
+  実装者・独立 reviewer が確認した。permit 上限違反ではなく、機能差分の ACCEPT は維持。full-lib 全体は green と扱わない。
+  同じテストを `-- --exact` で孤立再実行すると exit 0 / 1 passed（`target/minvis/scheduler-isolated.log`）。
+  別の test-only follow-up は gate 解放前に `stats == 3 && active == 3` を待つ。期待値は緩和せず、今回の差分には入れない。
+- `cargo test -p mimageviewer --test ui_snapshot`: 並列実行は 17 件成功後に `0xc0000005 / STATUS_ACCESS_VIOLATION` で異常終了
+  （`target/minvis/snapshot-compare.log`）。原因は未特定で、snapshot 比較失敗とは区別して記録する。
+  同じ比較を `-- --test-threads=1` で直列実行し、exit 0 / 60 passed（25.62 秒、`target/minvis/snapshot-compare-serial.log`）。
+  更新した EffeTune snapshot も更新モードなしで一致を確認した。
+
+実アプリ起動・commit は行っていない。引き継ぎは `target/minvis-msg.txt`（英語 subject、UTF-8 BOM なし）。
+確認用 core を更新するには利用者がこの worktree の dev-runtime core / Remote を通常終了してから
+`scripts/build-dev.ps1 -PreserveRuntime` を再実行する。旧 exe は今回の機能確認には使わない。
+利用者確認は、OFF の最小化・復帰、ON の最小化中の窓操作・復帰、
+Remote と最小化の両解除順、ユーザーが閉じた窓の非復帰、tray-only 格納、再起動後の設定保持。
