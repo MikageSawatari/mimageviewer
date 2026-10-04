@@ -369,10 +369,13 @@ impl AudioOutput {
                                     && bridge.active_slot_count() > 0
                             })
                             .and_then(|bridge| {
-                                bridge
-                                    .try_reset_plugins_sync()
-                                    .err()
-                                    .map(|error| (bridge, error))
+                                trace_handoff_reset(
+                                    bridge,
+                                    worker_control.pump_instance,
+                                    "user_vst",
+                                )
+                                .err()
+                                .map(|error| (bridge, error))
                             });
                         let still_desired = || {
                             !cancel.load(Ordering::Acquire)
@@ -384,10 +387,13 @@ impl AudioOutput {
                             let effetune_failure =
                                 worker_control.chain.effetune.snapshot().and_then(
                                     |(generation, bridge)| {
-                                        bridge
-                                            .try_reset_plugins_sync()
-                                            .err()
-                                            .map(|error| (generation, error))
+                                        trace_handoff_reset(
+                                            &bridge,
+                                            worker_control.pump_instance,
+                                            "effetune",
+                                        )
+                                        .err()
+                                        .map(|error| (generation, error))
                                     },
                                 );
                             if !still_desired() {
@@ -496,6 +502,33 @@ impl AudioOutput {
             samples.iter().any(|sample| sample.abs() > 1e-4),
             (after != before).then(|| f64::from_bits(after)),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_samples_without_device_for_test(
+        &self,
+        samples: &mut [f32],
+        clock: &Arc<AvClock>,
+        engine_state: &Arc<AtomicU8>,
+    ) -> (usize, Option<f64>) {
+        let before = self.diagnostics.output_frames_total.load(Ordering::Acquire);
+        fill_output(
+            samples,
+            &self.buffer,
+            clock,
+            engine_state,
+            &self.diagnostics,
+            None,
+        );
+        let consumed = self.diagnostics.output_frames_total.load(Ordering::Acquire) - before;
+        let pts = (consumed > 0).then(|| {
+            f64::from_bits(
+                self.diagnostics
+                    .audio_audible_pts_bits
+                    .load(Ordering::Acquire),
+            )
+        });
+        (consumed as usize, pts)
     }
 
     pub fn pause_stream(&self) {
@@ -1187,6 +1220,87 @@ impl EffetuneInputLimiter {
     }
 }
 
+#[cfg(windows)]
+fn trace_handoff_reset(
+    bridge: &super::dsp::DspBridge,
+    pump_instance: u64,
+    stage: &str,
+) -> Result<(), String> {
+    let result = bridge.try_reset_plugins_sync();
+    let fields = [
+        ("pump_instance", serde_json::Value::from(pump_instance)),
+        ("stage", serde_json::Value::from(stage)),
+        (
+            "latency_frames",
+            serde_json::Value::from(bridge.total_latency_samples()),
+        ),
+        ("acknowledged", serde_json::Value::from(result.is_ok())),
+    ];
+    crate::logger::log(format!(
+        "[audio-dsp] handoff_reset: pump_instance={pump_instance} stage={stage} latency_frames={} acknowledged={}",
+        bridge.total_latency_samples(),
+        result.is_ok()
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event("audio_dsp", "handoff_reset", None, 0, &fields);
+    }
+    result
+}
+
+/// Worker-owned diagnostics; never changes transport or DSP state.
+#[derive(Default)]
+struct AudioEpochTrace {
+    serial: u64,
+    first_non_silent: [bool; 4],
+    drained_frames: usize,
+}
+
+impl AudioEpochTrace {
+    fn first(&mut self, stage: usize, samples: &[f32], pts: f64, source_rate: f64, rate: u32) {
+        if self.first_non_silent[stage] {
+            return;
+        }
+        if let Some(index) = samples.iter().position(|sample| sample.abs() > 1e-6) {
+            self.first_non_silent[stage] = true;
+            audio_epoch_event(
+                "first_non_silent",
+                self.serial,
+                &[
+                    (
+                        "stage",
+                        serde_json::Value::from(
+                            ["decoded", "user_vst", "effetune", "prepared_output"][stage],
+                        ),
+                    ),
+                    (
+                        "pts",
+                        serde_json::Value::from(
+                            pts + (index / 2) as f64 / rate as f64 * source_rate,
+                        ),
+                    ),
+                    ("sample_rate", serde_json::Value::from(rate)),
+                ],
+            );
+        }
+    }
+}
+
+fn audio_epoch_event(name: &str, serial: u64, fields: &[(&str, serde_json::Value)]) {
+    crate::logger::log(format!(
+        "[audio-epoch] {name}: serial={serial} {}",
+        fields
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    if crate::perf::is_enabled() {
+        let mut fields = fields.to_vec();
+        fields.push(("seek_serial", serde_json::Value::from(serial)));
+        crate::perf::event("audio_epoch", name, None, 0, &fields);
+    }
+}
+
 /// Only normal EOS drains these delays. Seek/stop discard the owner along with
 /// the limiter state. Metadata is captured before trimming/reconciliation so a
 /// short last block can still release its held audio with the original PDC.
@@ -1761,11 +1875,14 @@ pub(super) fn complete_audio_tail_and_wake(
     clock: &AvClock,
     serial: u64,
     events: &crate::video::EngineEventSender,
-) {
+) -> bool {
     if clock.complete_audio_tail(serial) {
         // Commit precedes completion; wake ROOT even when tick has no remaining
         // time deadline while the tail is in flight.
         events.wake_ui();
+        true
+    } else {
+        false
     }
 }
 
@@ -1882,6 +1999,8 @@ fn run_pump(
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
     let mut effetune_input_limiter = EffetuneInputLimiter::new(sample_rate);
     let mut dsp_tail = AudioDspTail::default();
+    let mut epoch_trace = AudioEpochTrace::default();
+    let mut logged_first_output_serial = u64::MAX;
     let mut time_stretcher = TimeStretcher::new(sample_rate);
     let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
     let mut last_processed_normalize_stream: Option<usize> = None;
@@ -2030,6 +2149,10 @@ fn run_pump(
             let should_reset_plugins = frame_seek_serial >= cur_clock_serial
                 && (!seen_valid_audio_frame || frame_seek_serial > last_seen_seek_serial);
             if should_reset_plugins {
+                epoch_trace = AudioEpochTrace {
+                    serial: frame_seek_serial,
+                    ..Default::default()
+                };
                 #[cfg(windows)]
                 let _reset_permit = dsp_control
                     .as_ref()
@@ -2054,7 +2177,24 @@ fn run_pump(
                         && b.is_enabled()
                         && b.active_slot_count() > 0
                     {
-                        b.reset_plugins_sync();
+                        let result = b.try_reset_plugins_sync();
+                        audio_epoch_event(
+                            "plugin_reset",
+                            frame_seek_serial,
+                            &[
+                                ("stage", serde_json::Value::from("user_vst")),
+                                (
+                                    "latency_frames",
+                                    serde_json::Value::from(b.total_latency_samples()),
+                                ),
+                                ("acknowledged", serde_json::Value::from(result.is_ok())),
+                            ],
+                        );
+                        if let Err(error) = result {
+                            crate::logger::log(format!(
+                                "[VST3] CRITICAL: reset_plugins_sync failed: {error}; pre-seek audio may leak briefly"
+                            ));
+                        }
                     }
                 }
                 #[cfg(windows)]
@@ -2063,20 +2203,48 @@ fn run_pump(
                     && !cancel.load(Ordering::Acquire)
                     && let Some(slot) = effetune_slot.as_ref()
                     && let Some((generation, bridge)) = slot.snapshot()
-                    && let Err(error) = bridge.try_reset_plugins_sync()
                 {
-                    effetune_reset_failed_serial = Some(frame_seek_serial);
-                    slot.report_failure_once(
-                        generation,
-                        crate::effetune::EffetuneFailure::ProcessFailed(format!(
-                            "seek reset: {error}"
-                        )),
+                    let result = bridge.try_reset_plugins_sync();
+                    audio_epoch_event(
+                        "plugin_reset",
+                        frame_seek_serial,
+                        &[
+                            ("stage", serde_json::Value::from("effetune")),
+                            ("generation", serde_json::Value::from(generation)),
+                            (
+                                "latency_frames",
+                                serde_json::Value::from(bridge.total_latency_samples()),
+                            ),
+                            ("acknowledged", serde_json::Value::from(result.is_ok())),
+                        ],
                     );
+                    if let Err(error) = result {
+                        effetune_reset_failed_serial = Some(frame_seek_serial);
+                        slot.report_failure_once(
+                            generation,
+                            crate::effetune::EffetuneFailure::ProcessFailed(format!(
+                                "seek reset: {error}"
+                            )),
+                        );
+                    }
                 }
                 last_seen_seek_serial = frame_seek_serial;
                 seen_valid_audio_frame = true;
                 // 新 seek 世代: target / activate を reset
                 safety_limiter.reset();
+                audio_epoch_event(
+                    "reset",
+                    frame_seek_serial,
+                    &[
+                        ("input_pts", serde_json::Value::from(frame.pts_secs)),
+                        ("sample_rate", serde_json::Value::from(sample_rate)),
+                        (
+                            "final_limiter_frames",
+                            serde_json::Value::from(safety_limiter.lookahead_frames),
+                        ),
+                        ("pre_limiter_reset", serde_json::Value::from(true)),
+                    ],
+                );
                 dsp_tail = AudioDspTail::Empty;
                 #[cfg(windows)]
                 effetune_input_limiter.reset();
@@ -2376,6 +2544,7 @@ fn run_pump(
                 pending_normalize_stream = None;
 
                 // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
+                epoch_trace.first(0, &raw.samples, raw.pts_secs, 1.0, sample_rate);
                 let playback_speed = clock.playback_speed();
                 let mut stretched =
                     time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
@@ -2477,6 +2646,16 @@ fn run_pump(
                     f64,
                 ) = (stretched.samples.clone(), 0.0);
 
+                epoch_trace.first(
+                    1,
+                    &output_samples,
+                    raw.pts_secs
+                        - (current_pdc_latency_secs + stretched.stretcher_latency_output_secs)
+                            * stretched.source_secs_per_output_sec,
+                    stretched.source_secs_per_output_sec,
+                    sample_rate,
+                );
+
                 #[cfg(windows)]
                 let mut effetune_applied = false;
                 #[cfg(windows)]
@@ -2567,6 +2746,16 @@ fn run_pump(
                     current_pdc_latency_secs = composition.plugin_latency_secs;
                 }
 
+                epoch_trace.first(
+                    2,
+                    &output_samples,
+                    raw.pts_secs
+                        - (current_pdc_latency_secs + stretched.stretcher_latency_output_secs)
+                            * stretched.source_secs_per_output_sec,
+                    stretched.source_secs_per_output_sec,
+                    sample_rate,
+                );
+
                 let pre_limiter_gain = clock.pre_limiter_gain();
                 if pre_limiter_gain > 1.0 {
                     for sample in &mut output_samples {
@@ -2648,6 +2837,11 @@ fn run_pump(
                 {
                     if clock.begin_audio_tail(eos_serial) {
                         dsp_tail.start(eos_serial);
+                        audio_epoch_event(
+                            "drain_begin",
+                            eos_serial,
+                            &[("sample_rate", serde_json::Value::from(sample_rate))],
+                        );
                     }
                 }
                 let next = dsp_tail.next(
@@ -2703,10 +2897,23 @@ fn run_pump(
                 );
                 let Some(chunk) = next else {
                     if dsp_tail.complete() {
-                        complete_audio_tail_and_wake(&clock, eos_serial, &engine_event_tx);
+                        if complete_audio_tail_and_wake(&clock, eos_serial, &engine_event_tx) {
+                            audio_epoch_event(
+                                "drain_complete",
+                                eos_serial,
+                                &[
+                                    (
+                                        "drained_frames",
+                                        serde_json::Value::from(epoch_trace.drained_frames),
+                                    ),
+                                    ("sample_rate", serde_json::Value::from(sample_rate)),
+                                ],
+                            );
+                        }
                     }
                     break;
                 };
+                epoch_trace.drained_frames += chunk.samples.len() / 2;
                 chunk
             };
             let current_latency_source_secs = untrimmed.pdc_latency_secs_at_process;
@@ -2765,6 +2972,13 @@ fn run_pump(
                 pdc_latency_secs_at_process: current_latency_source_secs,
                 effetune_generation: untrimmed.effetune_generation,
             };
+            epoch_trace.first(
+                3,
+                &chunk.samples,
+                chunk.audible_pts_secs,
+                chunk.source_secs_per_output_sec,
+                sample_rate,
+            );
             #[cfg(feature = "test-script")]
             let processed_frequency_hz =
                 estimate_processed_frequency_hz(&chunk.samples, sample_rate);
@@ -2944,6 +3158,36 @@ fn run_pump(
         // ── A/V drift instrumentation: 1Hz snapshot + edge JSONL emit (Codex P1 ① 反映) ──
         // RT callback は atomic を書くだけ。実際の `perf::event` (= JSON 構築 + writer
         // mutex) は pump スレッドのここでまとめる。callback への影響ゼロ。
+        // The callback publishes this pair under the same existing buffer lock. Copy only;
+        // formatting/logging after unlocking keeps the serial and PTS coherent and RT-safe.
+        let first_output = {
+            let _buf = buffer.lock().unwrap();
+            let serial = diagnostics.first_output_serial.load(Ordering::Acquire);
+            (serial != u64::MAX && serial != logged_first_output_serial).then(|| {
+                (
+                    serial,
+                    f64::from_bits(diagnostics.first_output_pts_bits.load(Ordering::Relaxed)),
+                )
+            })
+        };
+        if let Some((serial, pts)) = first_output {
+            logged_first_output_serial = serial;
+            audio_epoch_event(
+                "first_device_output",
+                serial,
+                &[
+                    ("pts", serde_json::Value::from(pts)),
+                    (
+                        "stream_id",
+                        serde_json::Value::from(
+                            diagnostics.audio_stream_id.load(Ordering::Acquire),
+                        ),
+                    ),
+                    ("sample_rate", serde_json::Value::from(sample_rate)),
+                ],
+            );
+        }
+
         if crate::perf::is_enabled() {
             let log_now = std::time::Instant::now();
             let stream_id = diagnostics.audio_stream_id.load(Ordering::Acquire);
@@ -3626,6 +3870,22 @@ fn fill_output(
         for i in 0..take {
             out[written + i] = first.samples[buf.drain_offset_in_first + i] * vol;
         }
+        let output_serial = first.seek_serial;
+        if diagnostics.first_output_serial.load(Ordering::Relaxed) != output_serial
+            && let Some(index) = out[written..written + take]
+                .iter()
+                .position(|sample| sample.abs() > 1e-6)
+        {
+            let pts = chunk_audible_pts
+                + ((buf.drain_offset_in_first + index) / 2) as f64 / (samples_per_sec / 2.0)
+                    * chunk_source_rate;
+            diagnostics
+                .first_output_pts_bits
+                .store(pts.to_bits(), Ordering::Relaxed);
+            diagnostics
+                .first_output_serial
+                .store(output_serial, Ordering::Release);
+        }
         written += take;
         real_consumed += take;
         buf.drain_offset_in_first += take;
@@ -3654,6 +3914,10 @@ fn fill_output(
     // **buf.next_pts_secs を audible PTS で更新** (= chunk metadata baked-in)。
     // 以後 publish_buffer_secs / underrun resync は audible PTS ベースで動く。
     if let Some(audible) = next_audible_pts {
+        diagnostics
+            .output_frames_total
+            .fetch_add((real_consumed / 2) as u64, Ordering::Release);
+
         buf.next_pts_secs = audible;
     }
     let pts_for_video = next_audible_pts.unwrap_or(buf.next_pts_secs);
@@ -4214,6 +4478,52 @@ mod tests {
             pdc_latency_secs_at_process: 0.0,
             effetune_generation: None,
         }
+    }
+
+    #[test]
+    fn callback_trace_records_first_non_silent_pts_and_actual_consumption_per_seek() {
+        let clock = make_clock();
+        clock.set_volume(1.0);
+        let buffer = make_buffer(1_000);
+        let diagnostics = make_diag();
+        let state = playing_state();
+        buffer.lock().unwrap().processed.push_back(make_chunk(
+            vec![0.0, 0.0, 0.0, 0.0, 0.25, -0.25],
+            0.0,
+            2_000.0,
+        ));
+        let mut out = [0.0; 10];
+        fill_output(&mut out, &buffer, &clock, &state, &diagnostics, None);
+        assert_eq!(diagnostics.output_frames_total.load(Ordering::Acquire), 3);
+        assert_eq!(diagnostics.first_output_serial.load(Ordering::Acquire), 0);
+        assert_eq!(
+            f64::from_bits(diagnostics.first_output_pts_bits.load(Ordering::Acquire)),
+            0.002
+        );
+        assert_eq!(&out[6..], &[0.0; 4]); // underrun padding is not counted as real PCM
+
+        clock.request_seek(0.0);
+        clock.notify_seek_completed(0.0);
+        clock.clear_seek_target_override(clock.current_seek_serial());
+        clock.set_playing(true);
+        let serial = clock.current_seek_serial();
+        let mut chunk = make_chunk(vec![0.0, 0.0, 0.3, -0.3], 0.0, 2_000.0);
+        chunk.seek_serial = serial;
+        {
+            let mut buf = buffer.lock().unwrap();
+            buf.pump_seek_serial = serial;
+            buf.processed.push_back(chunk);
+        }
+        fill_output(&mut out, &buffer, &clock, &state, &diagnostics, None);
+        assert_eq!(diagnostics.output_frames_total.load(Ordering::Acquire), 5);
+        assert_eq!(
+            diagnostics.first_output_serial.load(Ordering::Acquire),
+            serial
+        );
+        assert_eq!(
+            f64::from_bits(diagnostics.first_output_pts_bits.load(Ordering::Acquire)),
+            0.001
+        );
     }
 
     #[test]

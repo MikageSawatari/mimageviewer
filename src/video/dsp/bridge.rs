@@ -767,6 +767,12 @@ impl Bridge {
             .next_reset_id
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
+        let started = std::time::Instant::now();
+        crate::logger::log(format!(
+            "[VST3] reset_begin: pid={} id={id} latency_frames={}",
+            self.process_id(),
+            self.cached_latency_samples_value()
+        ));
         if let Err(e) = self.send(&Cmd::Reset { reset_id: id }) {
             crate::logger::log(format!("[VST3] reset_sync: send failed for id={id}: {e}"));
             return Err(format!("reset send failed: {e}"));
@@ -778,7 +784,14 @@ impl Bridge {
                 return Err("reset ack timeout".to_string());
             }
             match self.reset_ack_rx.recv_timeout(deadline - now) {
-                Ok(got_id) if got_id == id => return Ok(()),
+                Ok(got_id) if got_id == id => {
+                    crate::logger::log(format!(
+                        "[VST3] reset_ack: pid={} id={id} elapsed_ms={:.3}",
+                        self.process_id(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ));
+                    return Ok(());
+                }
                 Ok(got_id) => {
                     crate::logger::log(format!(
                         "[VST3] reset_sync: ignored stale ResetDone ack id={got_id}, expected={id}"

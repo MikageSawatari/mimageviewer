@@ -1120,3 +1120,78 @@ build / staging の information stream は `target/p3-build-dev.log` に記録�
 `target/dev-runtime/mimageviewer-core.exe` を更新したが起動していない。通常 APPDATA を使うため、
 利用者の確認前に installed / tray-resident mIV を閉じる。実機確認の残事項は前 round と同じ。
 コミットせず、`target/prelimiter-msg.txt` はこの P3 follow-up のみの内容で UTF-8 / BOM なしに上書き済み。
+
+
+### 実機フィードバック: 周回先頭への resampler 末尾混入（2026-10-04）
+
+5a569fb6f の dev-runtime を利用者が確認。2秒 / 48kHz stereo の可逆素材で、
+末尾4ms・10msのバーストは loop ON のとき2クリック、OFFなら1クリック。
+中央4msの対照素材は1回。通常 profile の Pro-L 2 + EffeTune では末尾4ms素材に
+open 直後のノイズもあった。これらは利用者の聴感結果であり、PCM測定ではない。
+この調査・修正も公開済み v4.3.0 には未収録。codec だけの Flush と SWR の EOS 未排出は
+v4.3.0 のソースにも存在する。利用者は installed v4.3.0 と聴感比較していないため、
+クリック全体を今回の EOS 変更による退行と断定しない。
+
+- 従来の P3 回帰は AudioFrame を注入し、Complete 後にまとめて callback で消費した。
+  decoder / swresample の履歴や、callback 間の underrun 無音を検査していなかった。
+  新しい回帰は実 WAV / MKV decoder → pump → callback → UI の EOF Full-loop tick →
+  demux seek / Flush を通し、全 callback 出力と実消費 PCM を別々に保持する。
+  48kHz 出力では各素材3周の単一バーストを確認。44.1kHz 出力では末尾4ms WAV の
+  次周先頭に peak 約0.69995 を再現し、単体 decoder と実 EOF-loop の両方が修正前に失敗した。
+- 原因は audio worker の Flush が codec だけを初期化し、SWR の delay / filter 履歴を
+  次 serial へ持ち越したこと。単なる seek reset では保持音声を捨てるため、通常 EOS では
+  codec → SWR → 共通 PCM sender → decoded EOS → 既存 DSP tail の順に排出する。
+  seek / stop / cancel では履歴を捨て、codec・SWR・sample timeline を同じ所有境界で初期化する。
+- SWR の出力は入力 frame の PTS へ毎回貼り直さず、一つの timeline owner が入力端と
+  実出力 sample 数による出力端を管理する。stream time-base の丸めは連続扱いにし、
+  実際の forward discontinuity は旧 SWR を排出・初期化してから新 PTS へ移る。
+  missing / backwards timestamp の既存の単調補完を保つ。新しい待ち時間・transport flag は設けない。
+- 排出中の pause は保持音声を捨てない。共通 sender が現在の PCM を stack 上に保持し、
+  bounded channel の空きを待つ。pause 中に enqueue できても callback の Playing gate は
+  音を出さず、次 packet の取得前に decoder が park する。seek / cancel は既存 serial /
+  cancel fence で pending PCM を破棄し、queue accounting を戻す。専用 EOS mode や queue は追加しない。
+- 成功した SWR 変換が0出力でも入力端を進め、後続入力と EOS で回復するケースを検査する。
+  ただし48kHz→44.1kHzで全体1入力 frameだけの極短媒体は、標準SWR NULL flush自体が
+  0出力となることを別テストで確認した。これは今回の2秒素材の欠落／混入とは別の上流制約で、
+  padding / crop による新しい回復処理は今回の範囲に含めない。
+- user VST / EffeTune の reset 呼出しは open の DSP handoff と、新 serial の最初の有効 frame に
+  既に存在し、v4.3.0 と条件は同じ。user VST は今回の EOS drain に入力されない。
+  従って通常 profile の open ノイズを「reset 呼び忘れ」や今回の drain だけで説明する根拠はない。
+  setProcessing の切替と報告 latency 分の無音処理は plugin 内部状態の完全消去を保証しない。
+  強い再初期化は visualizer 履歴、GUI thread、latency 再確認、owner handoff に影響するため、
+  reset ACK と段ごとの最初の非ゼロ出力を実機で照合してから判断する。
+- 診断は worker の通常ログと `audio_epoch` perf events に reset、drain frames、sample rate、
+  decoded / user VST 後 / EffeTune 後 / 出力準備の最初の非ゼロ PTS を記録する。
+  callback の `first_device_output` は全出力 PCM（underrun 無音を含む）のうち最初の非ゼロ PTS。
+  RT callback は既存 buffer lock 内で atomics だけを更新し、ログ出力は pump が行う。
+  VST reset は request ID / ACK / latency frames を記録する。マイク測定や OS / device 内の
+  buffering を測るものではない。新 profile と通常 profile の open・loop の比較に使う。
+
+forward discontinuity の保証は decoder / SWR の区間境界まで。既存の下流 DSP は同一 serial の
+PTS gap を区間別に管理せず、保持した旧 PCM を次 chunk の時刻へ割り当てる制約がある。
+v4.3.0 にも存在する別の pipeline 設計事項であり、この loop / seek-to-zero 修正では変更しない。
+
+独立 follow-up レビュー（GPT-6.1 Sol / xhigh）は ACCEPT。実機ノイズ全体の解決という判定ではなく、
+再現した decoder / SWR の混入、pause 所有境界と診断の差分に対する判定。
+
+| 実機フィードバック round の検証 | 結果 | ログ |
+| --- | --- | --- |
+| 修正前の実 decoder seek / UI EOF Full-loop 回帰 | 44.1kHz の次周先頭に旧末尾バーストを検出し失敗（意図した再現） | `target/audio-tail-seek-before.log` / `target/audio-tail-loop-before.log` |
+| `cargo test -p mimageviewer --lib audio_tail_seek_fixture_tests` | 6 passed。実素材、timeline、forward gap、cancel、pause / resume / seek、0出力後の回復 | `target/audio-tail-test-0.log` |
+| 同上 `video::audio::` / `video::decoder::` / `video::clockless_transcode::` | 60 / 86 / 38 passed、decoder / clockless 各1 ignored | `target/audio-tail-test-1.log`〜`-3.log` |
+| 同上 `effetune::composition::` / `video::clock::` | 3 / 14 passed | `target/audio-tail-test-4.log` / `-5.log` |
+| 同上 `real_decoder_eof_full_loop` | 1 passed。WAV / MKV × 44.1 / 48kHz × tail4ms / tail10ms / mid4ms × 3周、計36周。全 callback 出力と実消費 PCM を検査 | `target/audio-tail-test-6.log` |
+| 同上 `video::tests::native_tick_` / `eos_tick` / `eos_empty_audio_seek` / `reaches_eof_with_real_pump` | 4 / 1 / 1 / 2 passed | `target/audio-tail-test-7.log`〜`-10.log` |
+| 関連テスト計（重複する狭い6件を除く） | 210 passed / 2 ignored | 上記 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/audio-tail-check.log` / `target/audio-tail-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` / glyph check | 成功。UI文字列変更なし、dangerous glyph 0 | `target/audio-tail-fmt.log` / `target/audio-tail-glyphs.log` |
+
+製品 exe は起動せず、元の実機素材は読み取りだけで、通常 profile の設定・データを操作していない。
+検査用の実コピーを `testdata/audio-tail/` に収録した。実機確認手順と perf log の比較方法は
+`target/audio-tail-hardware-verification.md` に記録。通常 profile の open ノイズと利用者の出力 rate、
+修正後の末尾／先頭の聴感は利用者の確認待ち。
+
+確認用 build は `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` を実行したが、
+dev-runtime core（PID 112920）と Remote（PID 117288）が使用中のため exit 1 で更新を拒否した。
+実行中アプリを停止せず、旧確認用 exe は保持。利用者の通常終了後に同じ script を再実行する。
+この invocation だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を設定し、終了時に復元した。

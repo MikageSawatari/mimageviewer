@@ -5979,9 +5979,10 @@ fn run_audio_decode(
     let mut current_seek_target_secs: Option<f64> = None;
     // Some codecs, notably WMA Pro in ASF/WMV, emit one correctly timestamped
     // frame followed by several decoded frames with pts/best_effort_timestamp
-    // reset to 0. Keep a monotonic synthetic cursor per seek generation so the
-    // audio clock and video pacing do not get pinned to zero.
-    let mut next_audio_pts_secs: Option<f64> = None;
+    // reset to 0. Track accepted input separately from emitted samples so swr
+    // delay cannot leak into a new seek or create gaps between output frames.
+    let mut resample_timeline = AudioResampleTimeline::default();
+    log_audio_resample_boundary("open", &setup, current_seek_serial, &resample_timeline, 0);
     let mut pause_park_last_log: Option<std::time::Instant> = None;
 
     'outer: loop {
@@ -6078,6 +6079,13 @@ fn run_audio_decode(
                 trim_before_secs,
                 replace_setup,
             }) => {
+                log_audio_resample_boundary(
+                    "seek_flush_before",
+                    &setup,
+                    current_seek_serial,
+                    &resample_timeline,
+                    0,
+                );
                 if let Some(new_setup) = replace_setup {
                     let old_setup = std::mem::replace(&mut setup, *new_setup);
                     drop(old_setup);
@@ -6086,7 +6094,20 @@ fn run_audio_decode(
                 current_seek_serial = serial;
                 drop_before_secs = trim_before_secs;
                 current_seek_target_secs = seek_target_secs;
-                next_audio_pts_secs = None;
+                if let Err(error) = reset_audio_resampler(&mut setup) {
+                    crate::logger::log(format!(
+                        "[audio-decode] resampler seek reset failed: serial={serial} error={error}"
+                    ));
+                    break 'outer;
+                }
+                resample_timeline = AudioResampleTimeline::default();
+                log_audio_resample_boundary(
+                    "seek_reset_codec_swr",
+                    &setup,
+                    serial,
+                    &resample_timeline,
+                    0,
+                );
             }
             AudioDecodeInput::Packet(AudioPacketMsg::Eof { serial }) => {
                 if !packet_matches_seek(serial, current_seek_serial, &clock) {
@@ -6096,14 +6117,6 @@ fn run_audio_decode(
                 // 残サンプルを最後まで取り出して送る。これにより末尾の数十 ms が
                 // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
                 //
-                // ⚠️ resampler 側 (`setup.resampler.flush()`) はここでは呼ばない。
-                // emit_audio_frame の pre-alloc 修正により swr 内部 delay は
-                // SAFETY=32 sample (= 0.7ms @ 44.1kHz) 以下で安定するため、
-                // EOF 残留 sample も同オーダーで体感不可能。flush するには
-                // emit_audio_frame の送信処理 (preroll trim / serial check /
-                // AudioFrame 送出ループ) を helper に分離する大規模 refactor が
-                // 必要なので費用対効果が悪い。将来 emit パスを整理する機会が
-                // あれば併せて入れる。
                 use ffmpeg_the_third::ffi::avcodec_send_packet;
                 unsafe {
                     let _ = avcodec_send_packet(setup.decoder.as_mut_ptr(), std::ptr::null());
@@ -6120,15 +6133,30 @@ fn run_audio_decode(
                         current_seek_serial,
                         current_seek_target_secs,
                         None,
-                        &mut next_audio_pts_secs,
+                        &mut resample_timeline,
                         &clock,
                         &audio_tx,
                         &engine_state,
+                        &cancel,
                     ) {
                         break 'outer;
                     }
                 }
-                // Publish only after the last decoded frame has reached the pump channel.
+                if !drain_audio_resampler(
+                    &mut setup,
+                    &mut resample_timeline,
+                    &mut drop_before_secs,
+                    current_seek_serial,
+                    current_seek_target_secs,
+                    &clock,
+                    &audio_tx,
+                    &engine_state,
+                    &cancel,
+                    "eos",
+                ) {
+                    break 'outer;
+                }
+                // Decoded EOS includes codec and resampler output committed to the pump channel.
                 clock.note_audio_decoded_eos(serial);
                 // EOF 後 decoder を flush して次回の Packet/Flush に備える。
                 setup.decoder.flush();
@@ -6226,10 +6254,11 @@ fn run_audio_decode(
                         current_seek_serial,
                         current_seek_target_secs,
                         Some(packet_decode_t0.elapsed().as_secs_f64() * 1000.0),
-                        &mut next_audio_pts_secs,
+                        &mut resample_timeline,
                         &clock,
                         &audio_tx,
                         &engine_state,
+                        &cancel,
                     ) {
                         break 'outer;
                     }
@@ -6268,6 +6297,240 @@ fn resample_output_buffer_samples(
     (rate_converted + delay_out_samples + safety) as usize
 }
 
+/// One worker-owned sample timeline. Input timestamps describe decoded input,
+/// while output timestamps describe samples already released by swr.
+#[derive(Default)]
+struct AudioResampleTimeline(Option<AudioResamplePosition>);
+
+struct AudioResamplePosition {
+    expected_input_end: f64,
+    next_output: f64,
+}
+
+#[derive(Clone, Copy)]
+struct AudioInputTiming {
+    pts_secs: f64,
+    synthesized: bool,
+    discontinuity: bool,
+}
+
+impl AudioResampleTimeline {
+    fn input_timing(&self, raw: Option<f64>, timestamp_quantum_secs: f64) -> AudioInputTiming {
+        let Some(position) = self.0.as_ref() else {
+            return AudioInputTiming {
+                pts_secs: raw.unwrap_or(0.0),
+                synthesized: raw.is_none(),
+                discontinuity: false,
+            };
+        };
+        // Container timestamps may round each frame to a declared time-base tick.
+        // This tolerance comes from that precision, not an arbitrary wall-time guard.
+        let quantum = timestamp_quantum_secs.abs();
+        let tolerance = quantum + f64::EPSILON * position.expected_input_end.abs().max(1.0) * 4.0;
+        match raw {
+            Some(pts) if pts > position.expected_input_end + tolerance => AudioInputTiming {
+                pts_secs: pts,
+                synthesized: false,
+                discontinuity: true,
+            },
+            Some(pts) if pts >= position.expected_input_end - tolerance => AudioInputTiming {
+                pts_secs: position.expected_input_end,
+                synthesized: false,
+                discontinuity: false,
+            },
+            // WMA Pro can repeat zero timestamps after its first valid frame.
+            _ => AudioInputTiming {
+                pts_secs: position.expected_input_end,
+                synthesized: true,
+                discontinuity: false,
+            },
+        }
+    }
+
+    fn accept_input(&mut self, timing: AudioInputTiming, frames: usize, input_rate: u32) {
+        let position = self.0.get_or_insert(AudioResamplePosition {
+            expected_input_end: timing.pts_secs,
+            next_output: timing.pts_secs,
+        });
+        position.expected_input_end = timing.pts_secs + frames as f64 / input_rate as f64;
+    }
+
+    fn output_pts(&self) -> Option<f64> {
+        self.0.as_ref().map(|position| position.next_output)
+    }
+
+    fn advance_output(&mut self, frames: usize, output_rate: u32) {
+        let position = self
+            .0
+            .as_mut()
+            .expect("output follows accepted audio input");
+        position.next_output += frames as f64 / output_rate as f64;
+    }
+}
+
+fn reset_audio_resampler(setup: &mut AudioSetup) -> Result<(), ffmpeg_the_third::Error> {
+    // The audio worker exclusively owns this initialized context. FFmpeg permits
+    // close/init with the same configured layouts/rates, discarding sample history.
+    let result = unsafe {
+        let context = setup.resampler.as_mut_ptr();
+        ffmpeg_the_third::ffi::swr_close(context);
+        ffmpeg_the_third::ffi::swr_init(context)
+    };
+    if result < 0 {
+        Err(ffmpeg_the_third::Error::from(result))
+    } else {
+        Ok(())
+    }
+}
+
+fn audio_resampler_delay_frames(setup: &AudioSetup, rate: u32) -> i64 {
+    // Context::delay() queries with base=1 and rounds a subsecond delay to zero.
+    // Read in sample units for allocation and diagnostics instead.
+    unsafe {
+        ffmpeg_the_third::ffi::swr_get_delay(setup.resampler.as_ptr() as *mut _, i64::from(rate))
+    }
+}
+
+fn log_audio_resample_boundary(
+    event: &'static str,
+    setup: &AudioSetup,
+    serial: u64,
+    timeline: &AudioResampleTimeline,
+    flushed_frames: usize,
+) {
+    let input_end = timeline
+        .0
+        .as_ref()
+        .map(|position| position.expected_input_end);
+    let output_end = timeline.output_pts();
+    let input_delay = audio_resampler_delay_frames(setup, setup.input_rate);
+    let output_delay = audio_resampler_delay_frames(setup, setup.out_rate);
+    crate::logger::log(format!(
+        "[audio-decode] resampler {event}: serial={serial} stream={} input_rate={} output_rate={} flushed_frames={flushed_frames} input_end={input_end:?} output_end={output_end:?} filter_delay_input_frames={input_delay} filter_delay_output_frames={output_delay}",
+        setup.stream_idx, setup.input_rate, setup.out_rate,
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "audio",
+            event,
+            None,
+            serial,
+            &[
+                ("serial", serde_json::Value::from(serial)),
+                ("stream_index", serde_json::Value::from(setup.stream_idx)),
+                ("input_rate", serde_json::Value::from(setup.input_rate)),
+                ("output_rate", serde_json::Value::from(setup.out_rate)),
+                ("flushed_frames", serde_json::Value::from(flushed_frames)),
+                (
+                    "input_end",
+                    input_end
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                (
+                    "output_end",
+                    output_end
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                (
+                    "filter_delay_input_frames",
+                    serde_json::Value::from(input_delay),
+                ),
+                (
+                    "filter_delay_output_frames",
+                    serde_json::Value::from(output_delay),
+                ),
+            ],
+        );
+    }
+}
+
+fn drain_audio_resampler(
+    setup: &mut AudioSetup,
+    timeline: &mut AudioResampleTimeline,
+    drop_before_secs: &mut Option<f64>,
+    serial: u64,
+    seek_target_secs: Option<f64>,
+    clock: &AvClock,
+    audio_tx: &Sender<AudioFrame>,
+    engine_state: &std::sync::atomic::AtomicU8,
+    cancel: &AtomicBool,
+    boundary: &'static str,
+) -> bool {
+    use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+    use ffmpeg_the_third::util::frame::audio::Audio;
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut flushed_frames = 0;
+    // The same-rate multichannel fast path never sends input to swr.
+    if setup.fast_downmix.is_none() && timeline.output_pts().is_some() {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return false;
+            }
+            if clock.current_seek_serial() != serial {
+                return true;
+            }
+            let emit_t0 = std::time::Instant::now();
+            let capacity = audio_resampler_delay_frames(setup, setup.out_rate).max(0) as usize + 32;
+            let mut output = Audio::empty();
+            unsafe {
+                output.alloc(
+                    Sample::F32(SampleType::Packed),
+                    capacity,
+                    ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                );
+                output.set_rate(setup.out_rate);
+            }
+            if let Err(error) = setup.resampler.flush(&mut output) {
+                crate::logger::log(format!(
+                    "[audio-decode] resampler {boundary} drain failed: serial={serial} error={error}"
+                ));
+                return false;
+            }
+            let frames = output.samples();
+            if frames == 0 {
+                break;
+            }
+            // Packed stereo f32 contains exactly frames*2 elements; omit alignment padding.
+            let samples = unsafe {
+                let data = (*output.as_ptr()).data[0] as *const f32;
+                std::slice::from_raw_parts(data, frames * 2).to_vec()
+            };
+            let pts_secs = timeline.output_pts().expect("resampler has accepted input");
+            timeline.advance_output(frames, setup.out_rate);
+            flushed_frames += frames;
+            let convert_ms = emit_t0.elapsed().as_secs_f64() * 1000.0;
+            if !emit_audio_samples(
+                setup,
+                ConvertedAudio {
+                    samples,
+                    pts_secs,
+                    raw_pts_secs: None,
+                    pts_synthesized: true,
+                    audio_path: "swr_flush",
+                    decode_wait_ms: None,
+                    convert_ms,
+                    emit_t0,
+                },
+                drop_before_secs,
+                serial,
+                seek_target_secs,
+                clock,
+                audio_tx,
+                engine_state,
+                cancel,
+            ) {
+                return false;
+            }
+        }
+    }
+    log_audio_resample_boundary(boundary, setup, serial, timeline, flushed_frames);
+    true
+}
+
 fn emit_audio_frame(
     setup: &mut AudioSetup,
     frame: &mut ffmpeg_the_third::util::frame::audio::Audio,
@@ -6275,147 +6538,221 @@ fn emit_audio_frame(
     current_seek_serial: u64,
     current_seek_target_secs: Option<f64>,
     decode_wait_ms: Option<f64>,
-    next_audio_pts_secs: &mut Option<f64>,
+    resample_timeline: &mut AudioResampleTimeline,
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
     engine_state: &std::sync::atomic::AtomicU8,
+    cancel: &AtomicBool,
 ) -> bool {
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::util::frame::audio::Audio;
     use ffmpeg_the_third as ffmpeg;
 
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
     let emit_t0 = std::time::Instant::now();
     let raw_pts_secs = audio_frame_timestamp(frame)
         .map(|pts| (pts as f64) * setup.time_base_num / setup.time_base_den);
-    let mut pts_synthesized = false;
-    let mut pts_secs = match (*next_audio_pts_secs, raw_pts_secs) {
-        (Some(next), Some(raw)) if raw + 0.001 >= next => raw,
-        (Some(next), _) => {
-            pts_synthesized = true;
-            next
+    let input_timing =
+        resample_timeline.input_timing(raw_pts_secs, setup.time_base_num / setup.time_base_den);
+    if input_timing.discontinuity {
+        // Old filter history belongs before the source gap. Emit it there, then
+        // start the new input segment with a clean converter and timeline.
+        if !drain_audio_resampler(
+            setup,
+            resample_timeline,
+            drop_before_secs,
+            current_seek_serial,
+            current_seek_target_secs,
+            clock,
+            audio_tx,
+            engine_state,
+            cancel,
+            "source_gap",
+        ) {
+            return false;
         }
-        (None, Some(raw)) => raw,
-        (None, None) => {
-            pts_synthesized = true;
-            0.0
+        if let Err(error) = reset_audio_resampler(setup) {
+            crate::logger::log(format!(
+                "[audio-decode] resampler source-gap reset failed: serial={current_seek_serial} error={error}"
+            ));
+            return false;
         }
-    };
+        *resample_timeline = AudioResampleTimeline::default();
+    }
     const CHANNELS: usize = 2;
     let convert_t0 = std::time::Instant::now();
-    let (mut samples, audio_path): (Vec<f32>, &'static str) =
-        if let Some(downmix) = &setup.fast_downmix {
-            match downmix.run(frame) {
-                Some(samples) => (samples, "fast_downmix"),
-                None => return true,
-            }
-        } else {
-            // resampler は `setup` 構築時に正規化済みレイアウトで作られている。
-            // 各 frame の `ch_layout` も未指定なら同じ正規化を適用し、resampler が
-            // 期待する入力レイアウトと一致させる (mono を stereo 扱いするとチャンネル
-            // 解釈ミス / swr_convert_frame エラーになる)。
-            let (frame_layout, frame_layout_substituted) =
-                normalize_audio_input_layout(frame.ch_layout());
-            if frame_layout_substituted {
-                frame.set_ch_layout(frame_layout);
-            }
-            // ⚠️ output frame を **正しいサイズ**で pre-allocate する。
-            //
-            // ffmpeg-the-third 3.0.2 の `Context::run()` は `output.is_empty()` の
-            // ときに `output.alloc(format, input.samples(), layout)` で確保するが、
-            // これは入力サンプル数を出力サンプル数として使っており、サンプル
-            // レート変換 (例: 32kHz AAC → 44.1kHz) で不足する。32k→44.1k の
-            // 場合、本来 1024 * 44100 / 32000 ≈ 1411 samples 必要だが 1024 しか
-            // 確保されず、約 27% (= 1 - in_rate/out_rate) のサンプルが swr
-            // 内部 delay に取り残される。これが累積し audio buffer が想定より
-            // 早く尽きて、動画末尾が無音になる。
-            //
-            // ここで標準 FFmpeg パターン (av_rescale_rnd 相当) で
-            //   out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + safety
-            // を計算し、`av_frame_get_buffer` 済みの output を渡すことで
-            // `Context::run()` の誤った alloc 経路をスキップする。
-            //
-            // ⚠️ `Delay::output` は **既に出力サンプル単位** なので、レート換算
-            // (`* out_rate / in_rate`) を**かけずに**そのまま加算する。
-            // 過去の実装で `(in_samples + delay_output) * out_rate / in_rate` と
-            // していたが、これは delay を out_rate/in_rate 倍してしまう誤りで、
-            // upsample (32k→44.1k) では過大確保で偶然安全側、downsample
-            // (96k→44.1k) では過小見積もりとなり swr 内部 delay にサンプルが
-            // 残る危険があった (Codex 指摘)。
-            let in_samples = frame.samples();
-            if in_samples == 0 {
-                // 入力 0 サンプル frame は av_frame_get_buffer が失敗する。
-                // PTS 維持だけ next に伝えて即 return。
-                *next_audio_pts_secs = Some(pts_secs);
-                return true;
-            }
-            let delay_out_samples = setup
-                .resampler
-                .delay()
-                .map(|d| d.output.max(0) as u64)
-                .unwrap_or(0);
-            // SAFETY margin: swr 位相補間の丸め誤差吸収用。32 sample / 44.1kHz
-            // = 0.7ms 相当で十分なバッファ。
-            const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
-            let out_samples = resample_output_buffer_samples(
-                in_samples as u64,
-                setup.input_rate,
-                setup.out_rate,
-                delay_out_samples,
-                SWR_OUTPUT_SAFETY_SAMPLES,
+    let (samples, audio_path): (Vec<f32>, &'static str) = if let Some(downmix) = &setup.fast_downmix
+    {
+        match downmix.run(frame) {
+            Some(samples) => (samples, "fast_downmix"),
+            None => return true,
+        }
+    } else {
+        // resampler は `setup` 構築時に正規化済みレイアウトで作られている。
+        // 各 frame の `ch_layout` も未指定なら同じ正規化を適用し、resampler が
+        // 期待する入力レイアウトと一致させる (mono を stereo 扱いするとチャンネル
+        // 解釈ミス / swr_convert_frame エラーになる)。
+        let (frame_layout, frame_layout_substituted) =
+            normalize_audio_input_layout(frame.ch_layout());
+        if frame_layout_substituted {
+            frame.set_ch_layout(frame_layout);
+        }
+        // ⚠️ output frame を **正しいサイズ**で pre-allocate する。
+        //
+        // ffmpeg-the-third 3.0.2 の `Context::run()` は `output.is_empty()` の
+        // ときに `output.alloc(format, input.samples(), layout)` で確保するが、
+        // これは入力サンプル数を出力サンプル数として使っており、サンプル
+        // レート変換 (例: 32kHz AAC → 44.1kHz) で不足する。32k→44.1k の
+        // 場合、本来 1024 * 44100 / 32000 ≈ 1411 samples 必要だが 1024 しか
+        // 確保されず、約 27% (= 1 - in_rate/out_rate) のサンプルが swr
+        // 内部 delay に取り残される。これが累積し audio buffer が想定より
+        // 早く尽きて、動画末尾が無音になる。
+        //
+        // ここで標準 FFmpeg パターン (av_rescale_rnd 相当) で
+        //   out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + safety
+        // を計算し、`av_frame_get_buffer` 済みの output を渡すことで
+        // `Context::run()` の誤った alloc 経路をスキップする。
+        //
+        // ⚠️ `Delay::output` は **既に出力サンプル単位** なので、レート換算
+        // (`* out_rate / in_rate`) を**かけずに**そのまま加算する。
+        // 過去の実装で `(in_samples + delay_output) * out_rate / in_rate` と
+        // していたが、これは delay を out_rate/in_rate 倍してしまう誤りで、
+        // upsample (32k→44.1k) では過大確保で偶然安全側、downsample
+        // (96k→44.1k) では過小見積もりとなり swr 内部 delay にサンプルが
+        // 残る危険があった (Codex 指摘)。
+        let in_samples = frame.samples();
+        if in_samples == 0 {
+            // No input is accepted by swr for an empty frame.
+            return true;
+        }
+        let delay_out_samples = audio_resampler_delay_frames(setup, setup.out_rate).max(0) as u64;
+        // SAFETY margin: swr 位相補間の丸め誤差吸収用。32 sample / 44.1kHz
+        // = 0.7ms 相当で十分なバッファ。
+        const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
+        let out_samples = resample_output_buffer_samples(
+            in_samples as u64,
+            setup.input_rate,
+            setup.out_rate,
+            delay_out_samples,
+            SWR_OUTPUT_SAFETY_SAMPLES,
+        );
+        let mut resampled = Audio::empty();
+        unsafe {
+            resampled.alloc(
+                Sample::F32(SampleType::Packed),
+                out_samples,
+                ffmpeg::ChannelLayoutMask::STEREO,
             );
-            let mut resampled = Audio::empty();
-            unsafe {
-                resampled.alloc(
-                    Sample::F32(SampleType::Packed),
-                    out_samples,
-                    ffmpeg::ChannelLayoutMask::STEREO,
-                );
-                resampled.set_rate(setup.out_rate);
-            }
-            if let Err(e) = setup.resampler.run(frame, &mut resampled) {
-                crate::logger::log(format!("swr resample: {e}"));
-                return true; // 1 frame 失敗は致命的でない
-            }
-            // 1 plane (packed) の f32 を取り出す。
-            //
-            // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
-            // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
-            // のため **実サンプル数より大きいバイト列を返す**。
-            // `chunks_exact(4)` で f32 化すると末尾のパディング
-            // (未初期化メモリ or 0) も f32 として再生してしまい、
-            // 強い "ブチブチ" ノイズの原因になる。
-            //
-            // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
-            // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
-            // を指定して `from_raw_parts` でスライス化する。これにより
-            // FFmpeg の linesize パディングを完全にスキップできる。
-            //
-            // SAFETY:
-            //   - resampled は packed format (Sample::F32(Type::Packed))
-            //   - data[0] は frame の生存中有効
-            //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
-            //   - resampler.run() の出力なので i32 オーバーフローは起きない
-            let nb_samples = resampled.samples();
-            if nb_samples == 0 {
-                // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
-                // raw pointer dereference を避けて早期 return。
-                return true;
-            }
-            // ランタイム不変条件チェック (Codex P3): resampler の出力が
-            // 期待通り f32 packed であること。デバッグ時に format/layout
-            // を取り違えていれば即座に panic で気付ける。
-            debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
-            debug_assert!(resampled.is_packed());
-            let element_count = nb_samples * CHANNELS;
-            let samples = unsafe {
-                let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
-                debug_assert!(!raw_ptr.is_null());
-                std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
-            };
-            (samples, "swr")
+            resampled.set_rate(setup.out_rate);
+        }
+        if let Err(e) = setup.resampler.run(frame, &mut resampled) {
+            crate::logger::log(format!("swr resample: {e}"));
+            return true; // 1 frame 失敗は致命的でない
+        }
+        // 1 plane (packed) の f32 を取り出す。
+        //
+        // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
+        // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
+        // のため **実サンプル数より大きいバイト列を返す**。
+        // `chunks_exact(4)` で f32 化すると末尾のパディング
+        // (未初期化メモリ or 0) も f32 として再生してしまい、
+        // 強い "ブチブチ" ノイズの原因になる。
+        //
+        // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
+        // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
+        // を指定して `from_raw_parts` でスライス化する。これにより
+        // FFmpeg の linesize パディングを完全にスキップできる。
+        //
+        // SAFETY:
+        //   - resampled は packed format (Sample::F32(Type::Packed))
+        //   - data[0] は frame の生存中有効
+        //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
+        //   - resampler.run() の出力なので i32 オーバーフローは起きない
+        let nb_samples = resampled.samples();
+        if nb_samples == 0 {
+            resample_timeline.accept_input(input_timing, frame.samples(), setup.input_rate);
+            return true;
+        }
+        // ランタイム不変条件チェック (Codex P3): resampler の出力が
+        // 期待通り f32 packed であること。デバッグ時に format/layout
+        // を取り違えていれば即座に panic で気付ける。
+        debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
+        debug_assert!(resampled.is_packed());
+        let element_count = nb_samples * CHANNELS;
+        let samples = unsafe {
+            let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
+            debug_assert!(!raw_ptr.is_null());
+            std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
         };
+        (samples, "swr")
+    };
     let convert_ms = convert_t0.elapsed().as_secs_f64() * 1000.0;
+    resample_timeline.accept_input(input_timing, frame.samples(), setup.input_rate);
+    let pts_secs = resample_timeline
+        .output_pts()
+        .expect("accepted audio input");
+    resample_timeline.advance_output(samples.len() / CHANNELS, setup.out_rate);
+    emit_audio_samples(
+        setup,
+        ConvertedAudio {
+            samples,
+            pts_secs,
+            raw_pts_secs,
+            pts_synthesized: input_timing.synthesized,
+            audio_path,
+            decode_wait_ms,
+            convert_ms,
+            emit_t0,
+        },
+        drop_before_secs,
+        current_seek_serial,
+        current_seek_target_secs,
+        clock,
+        audio_tx,
+        engine_state,
+        cancel,
+    )
+}
 
+struct ConvertedAudio {
+    samples: Vec<f32>,
+    pts_secs: f64,
+    raw_pts_secs: Option<f64>,
+    pts_synthesized: bool,
+    audio_path: &'static str,
+    decode_wait_ms: Option<f64>,
+    convert_ms: f64,
+    emit_t0: std::time::Instant,
+}
+
+/// Both ordinary conversion and EOS use the same trim, generation and channel accounting.
+fn emit_audio_samples(
+    setup: &AudioSetup,
+    converted: ConvertedAudio,
+    drop_before_secs: &mut Option<f64>,
+    current_seek_serial: u64,
+    current_seek_target_secs: Option<f64>,
+    clock: &AvClock,
+    audio_tx: &Sender<AudioFrame>,
+    engine_state: &std::sync::atomic::AtomicU8,
+    cancel: &AtomicBool,
+) -> bool {
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
+    let ConvertedAudio {
+        mut samples,
+        mut pts_secs,
+        raw_pts_secs,
+        pts_synthesized,
+        audio_path,
+        decode_wait_ms,
+        convert_ms,
+        emit_t0,
+    } = converted;
+    const CHANNELS: usize = 2;
     // post-seek preroll の trim:
     // avformat_seek は keyframe に戻るので、target_secs 未満の
     // 音声フレームが届く。完全に target 前ならフレーム破棄、
@@ -6424,7 +6761,6 @@ fn emit_audio_frame(
         let frame_secs = (samples.len() / CHANNELS) as f64 / setup.out_rate as f64;
         if pts_secs + frame_secs <= min {
             // 完全に target 前 → 捨てる
-            *next_audio_pts_secs = Some(pts_secs + frame_secs);
             return true;
         }
         if pts_secs < min {
@@ -6444,7 +6780,9 @@ fn emit_audio_frame(
     // 1 stereo pair = 2 float (samples_per_sec stereo = setup.out_rate * 2)
     let frame_sample_pairs = samples.len() / CHANNELS;
     let duration_secs = frame_sample_pairs as f64 / setup.out_rate as f64;
-    *next_audio_pts_secs = Some(pts_secs + duration_secs);
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
     if clock.current_seek_serial() != current_seek_serial {
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -6491,6 +6829,10 @@ fn emit_audio_frame(
     let mut last_send_wait_log = send_t0;
     let mut pending_frame = Some(frame_out);
     loop {
+        if cancel.load(Ordering::Acquire) {
+            clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
+            return false;
+        }
         if clock.current_seek_serial() != current_seek_serial {
             clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
             if crate::perf::is_enabled() {
@@ -6519,44 +6861,18 @@ fn emit_audio_frame(
             return true;
         }
         let engine_st = engine_state.load(Ordering::Acquire);
-        if engine_state_parks_decode(engine_st) {
-            clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
-            crate::logger::log(format!(
-                "[audio-decode] audio_tx send aborted for park: serial={current_seek_serial} pts={pts_secs:.3} audio_tx_len={} engine_state={} clock_playing={} clock_seeking={}",
-                audio_tx.len(),
-                engine_state_code_name(engine_st),
-                clock.is_playing(),
-                clock.is_seeking()
-            ));
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "audio",
-                    "frame_send_aborted_for_park",
-                    None,
-                    0,
-                    &[
-                        ("pts", serde_json::Value::from(pts_secs)),
-                        (
-                            "serial",
-                            serde_json::Value::from(current_seek_serial as i64),
-                        ),
-                        (
-                            "audio_tx_len",
-                            serde_json::Value::from(audio_tx.len() as i64),
-                        ),
-                        (
-                            "engine_state",
-                            serde_json::Value::from(engine_state_code_name(engine_st)),
-                        ),
-                    ],
-                );
-            }
-            return true;
-        }
+        // Pause/EOF parks future decode work, but this already converted frame
+        // still owns real PCM. Retain its single bounded pending send until the
+        // consumer resumes; only cancellation or a new seek discards it.
+        let send_wait = if engine_state_parks_decode(engine_st) {
+            std::time::Duration::from_millis(50)
+        } else {
+            std::time::Duration::from_millis(2)
+        };
         let frame = pending_frame
             .take()
             .expect("pending audio frame should exist before send_timeout");
-        match audio_tx.send_timeout(frame, std::time::Duration::from_millis(2)) {
+        match audio_tx.send_timeout(frame, send_wait) {
             Ok(()) => break,
             Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => {
                 pending_frame = Some(frame);
@@ -8617,6 +8933,681 @@ fn try_gpu_blit_path(
         pts_secs,
         seek_serial: current_seek_serial,
     })
+}
+
+#[cfg(test)]
+mod audio_tail_seek_fixture_tests {
+    use super::{AudioResampleTimeline, DecodeHandles, VideoDynamicState, spawn};
+    use crate::video::clock::AvClock;
+    use crate::video::engine::actor::state_code;
+    use crate::video::{EngineEventSender, VideoUiWake};
+    use crossbeam_channel::{Receiver, bounded};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct DecoderSession {
+        handles: DecodeHandles,
+        clock: Arc<AvClock>,
+        cancel: Arc<AtomicBool>,
+        events: Receiver<crate::video::engine::EngineEvent>,
+        output_rate: u32,
+    }
+
+    impl Drop for DecoderSession {
+        fn drop(&mut self) {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    impl DecoderSession {
+        fn open(name: &str, output_rate: u32) -> Self {
+            let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+            clock.set_playing(true);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (events_tx, events) = bounded(64);
+            let handles = spawn(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("testdata/audio-tail")
+                    .join(name),
+                clock.clone(),
+                cancel.clone(),
+                output_rate,
+                false,
+                crate::settings::VideoDeinterlaceMode::Off,
+                #[cfg(windows)]
+                None,
+                Arc::new(AtomicU8::new(state_code::PLAYING)),
+                EngineEventSender::new(events_tx, Arc::new(VideoUiWake::default())),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(VideoDynamicState::default()),
+            );
+            let info = handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("fixture metadata")
+                .expect("fixture open");
+            assert!(info.has_audio);
+            Self {
+                handles,
+                clock,
+                cancel,
+                events,
+                output_rate,
+            }
+        }
+
+        fn drain_generation(&self, serial: u64) -> Vec<f32> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut samples = Vec::new();
+            let mut expected_pts = 0.0;
+            loop {
+                for frame in self.handles.video_rx.try_iter() {
+                    self.clock.clear_seek_target_override(frame.seek_serial);
+                }
+                for _ in self.events.try_iter() {}
+                for frame in self.handles.audio_rx.try_iter() {
+                    self.clock.add_audio_tx_queued_secs_for_epoch(
+                        -frame.queued_wall_secs,
+                        frame.audio_tx_accounting_epoch,
+                    );
+                    assert_eq!(frame.seek_serial, serial, "stale decoded AudioFrame");
+                    assert!(
+                        (frame.pts_secs - expected_pts).abs() < 1e-9,
+                        "resampled output gap/overlap: serial={serial} pts={} expected={expected_pts}",
+                        frame.pts_secs,
+                    );
+                    expected_pts = frame.pts_secs + frame.duration_secs;
+                    self.clock.clear_seek_target_override(serial);
+                    // This test isolates decoder output. Its consumer acknowledges source
+                    // progress directly instead of opening an audio device or presenter.
+                    self.clock
+                        .set_audio_pts_jump(frame.pts_secs + frame.duration_secs);
+                    samples.extend(frame.samples);
+                }
+                if self.clock.audio_decoded_eos(serial) && self.handles.audio_rx.is_empty() {
+                    assert!(!samples.is_empty());
+                    assert_eq!(
+                        samples.len() / 2,
+                        self.output_rate as usize * 2,
+                        "complete two-second PCM"
+                    );
+                    assert!(
+                        (expected_pts - 2.0).abs() < 1e-9,
+                        "resampled end PTS={expected_pts}"
+                    );
+                    return samples;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "decoder EOS missing: serial={serial}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn audio_resample_timeline_uses_declared_timestamp_precision_and_output_counts() {
+        let mut timeline = AudioResampleTimeline::default();
+        // AAC-sized frames in a container with millisecond timestamps. The
+        // converter initially holds 16 output frames; input rounding must not
+        // create gaps in the output sample timeline.
+        for index in 0..8 {
+            let raw = (index as f64 * 1024.0 / 48_000.0 * 1000.0).round() / 1000.0;
+            let timing = timeline.input_timing(Some(raw), 0.001);
+            assert!(!timing.discontinuity);
+            assert!(!timing.synthesized);
+            timeline.accept_input(timing, 1024, 48_000);
+            let frames = if index == 0 { 925 } else { 941 };
+            let expected = if index == 0 {
+                0
+            } else {
+                925 + (index - 1) * 941
+            };
+            assert!((timeline.output_pts().unwrap() - expected as f64 / 44_100.0).abs() < 1e-12);
+            timeline.advance_output(frames, 44_100);
+        }
+        let gap = timeline.input_timing(Some(1.0), 0.001);
+        assert!(gap.discontinuity);
+        assert_eq!(gap.pts_secs, 1.0);
+        for raw in [None, Some(0.0)] {
+            let missing = timeline.input_timing(raw, 0.001);
+            assert!(!missing.discontinuity);
+            assert!(missing.synthesized);
+            assert!((missing.pts_secs - 8192.0 / 48_000.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn audio_resample_forward_gap_drains_old_tail_before_reanchoring() {
+        fn convert(chunks: &[(i64, Vec<i16>)]) -> Vec<super::AudioFrame> {
+            use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+            use ffmpeg_the_third::util::frame::audio::Audio;
+            ffmpeg_the_third::init().unwrap();
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+            let input = ffmpeg_the_third::format::input(&path).unwrap();
+            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+            clock.set_playing(true);
+            let state = AtomicU8::new(state_code::PLAYING);
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = bounded(32);
+            let mut timeline = AudioResampleTimeline::default();
+            let mut trim = None;
+            for (pts, samples) in chunks {
+                let mut frame = Audio::empty();
+                unsafe {
+                    frame.alloc(
+                        Sample::I16(SampleType::Packed),
+                        samples.len() / 2,
+                        ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                    );
+                    frame.set_rate(48_000);
+                    (*frame.as_mut_ptr()).pts = *pts;
+                    let data = (*frame.as_mut_ptr()).data[0] as *mut i16;
+                    std::slice::from_raw_parts_mut(data, samples.len()).copy_from_slice(samples);
+                }
+                assert!(super::emit_audio_frame(
+                    &mut setup,
+                    &mut frame,
+                    &mut trim,
+                    0,
+                    None,
+                    None,
+                    &mut timeline,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel
+                ));
+            }
+            assert!(super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut trim,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "test_eos"
+            ));
+            rx.try_iter().collect()
+        }
+        let burst: Vec<i16> = (0..192)
+            .flat_map(|index| {
+                let sample =
+                    ((index as f64 * std::f64::consts::TAU / 48.0).sin() * 20_000.0) as i16;
+                [sample, sample]
+            })
+            .collect();
+        let fresh = convert(&[(0, burst.clone())]);
+        let gapped = convert(&[(0, burst), (48_000, vec![0; 4800 * 2])]);
+        let reference: Vec<f32> = fresh
+            .iter()
+            .flat_map(|frame| frame.samples.iter().copied())
+            .collect();
+        let old_segment: Vec<f32> = gapped
+            .iter()
+            .filter(|frame| frame.pts_secs < 1.0)
+            .flat_map(|frame| frame.samples.iter().copied())
+            .collect();
+        assert_eq!(
+            old_segment, reference,
+            "old filter tail must remain at its original source position"
+        );
+        let mut old_end = 0.0;
+        let mut new_end = 1.0;
+        let mut new_frames = 0;
+        for frame in gapped {
+            let end = if frame.pts_secs < 1.0 {
+                &mut old_end
+            } else {
+                &mut new_end
+            };
+            assert!((frame.pts_secs - *end).abs() < 1e-12);
+            *end += frame.duration_secs;
+            if frame.pts_secs >= 1.0 {
+                assert!(
+                    frame.samples.iter().all(|sample| *sample == 0.0),
+                    "old filter history entered new segment"
+                );
+                new_frames += frame.samples.len() / 2;
+            }
+        }
+        assert_eq!(new_frames, 4410);
+        assert!((new_end - 1.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn audio_resample_cancel_discards_drain_and_releases_sender_backpressure() {
+        ffmpeg_the_third::init().unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+        let input = ffmpeg_the_third::format::input(&path).unwrap();
+        let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock.set_playing(true);
+        let state = Arc::new(AtomicU8::new(state_code::PLAYING));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = bounded(1);
+        let converted = |pts_secs| super::ConvertedAudio {
+            samples: vec![0.25; 882],
+            pts_secs,
+            raw_pts_secs: Some(pts_secs),
+            pts_synthesized: false,
+            audio_path: "test",
+            decode_wait_ms: None,
+            convert_ms: 0.0,
+            emit_t0: Instant::now(),
+        };
+        assert!(super::emit_audio_samples(
+            &setup,
+            converted(0.0),
+            &mut None,
+            0,
+            None,
+            &clock,
+            &tx,
+            &state,
+            &cancel
+        ));
+        let worker = {
+            let clock = clock.clone();
+            let state = state.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let sent = super::emit_audio_samples(
+                    &setup,
+                    converted(0.01),
+                    &mut None,
+                    0,
+                    None,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel,
+                );
+                let mut timeline = AudioResampleTimeline::default();
+                assert!(!super::drain_audio_resampler(
+                    &mut setup,
+                    &mut timeline,
+                    &mut None,
+                    0,
+                    None,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel,
+                    "cancelled_eos"
+                ));
+                sent
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while clock.audio_tx_queued_secs() < 0.019 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered_send_wait = clock.audio_tx_queued_secs() > 0.019;
+        cancel.store(true, Ordering::Release);
+        assert!(!worker.join().unwrap());
+        assert!(entered_send_wait, "second frame did not enter send wait");
+        assert_eq!(rx.len(), 1);
+        assert!(
+            (clock.audio_tx_queued_secs() - 0.01).abs() < 1e-12,
+            "cancelled sender accounting must roll back"
+        );
+    }
+
+    #[test]
+    fn audio_resample_pause_preserves_tail_until_resume_seek_or_cancel() {
+        use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+        use ffmpeg_the_third::util::frame::audio::Audio;
+        ffmpeg_the_third::init().unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+        let input = ffmpeg_the_third::format::input(&path).unwrap();
+        let make_frame = || {
+            let mut frame = Audio::empty();
+            unsafe {
+                frame.alloc(
+                    Sample::I16(SampleType::Packed),
+                    192,
+                    ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                );
+                frame.set_rate(48_000);
+                (*frame.as_mut_ptr()).pts = 0;
+                let data = (*frame.as_mut_ptr()).data[0] as *mut i16;
+                let samples = std::slice::from_raw_parts_mut(data, 384);
+                for (index, pair) in samples.chunks_exact_mut(2).enumerate() {
+                    let sample =
+                        ((index as f64 * std::f64::consts::TAU / 48.0).sin() * 20_000.0) as i16;
+                    pair.fill(sample);
+                }
+            }
+            frame
+        };
+        let reference = {
+            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+            clock.set_playing(true);
+            let state = AtomicU8::new(state_code::PLAYING);
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = bounded(8);
+            let mut timeline = AudioResampleTimeline::default();
+            assert!(super::emit_audio_frame(
+                &mut setup,
+                &mut make_frame(),
+                &mut None,
+                0,
+                None,
+                None,
+                &mut timeline,
+                &clock,
+                &tx,
+                &state,
+                &cancel
+            ));
+            assert!(super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut None,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "pause_reference_eos"
+            ));
+            rx.try_iter()
+                .flat_map(|frame| frame.samples)
+                .collect::<Vec<_>>()
+        };
+        for action in ["resume", "seek", "cancel"] {
+            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+            clock.set_playing(true);
+            let state = Arc::new(AtomicU8::new(state_code::PLAYING));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = bounded(1);
+            let mut timeline = AudioResampleTimeline::default();
+            assert!(super::emit_audio_frame(
+                &mut setup,
+                &mut make_frame(),
+                &mut None,
+                0,
+                None,
+                None,
+                &mut timeline,
+                &clock,
+                &tx,
+                &state,
+                &cancel
+            ));
+            let initial_queued = clock.audio_tx_queued_secs();
+            assert_eq!(rx.len(), 1, "initial PCM fills the decoder-to-pump channel");
+            state.store(state_code::PAUSED, Ordering::Release);
+            clock.set_playing(false);
+            let (started_tx, started_rx) = bounded(1);
+            let (done_tx, done_rx) = bounded(1);
+            let worker = {
+                let clock = clock.clone();
+                let state = state.clone();
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let result = super::drain_audio_resampler(
+                        &mut setup,
+                        &mut timeline,
+                        &mut None,
+                        0,
+                        None,
+                        &clock,
+                        &tx,
+                        &state,
+                        &cancel,
+                        "paused_eos",
+                    );
+                    done_tx.send(result).unwrap();
+                })
+            };
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if let Ok(result) = done_rx.recv_timeout(Duration::from_millis(100)) {
+                cancel.store(true, Ordering::Release);
+                worker.join().unwrap();
+                panic!(
+                    "paused resampler drain discarded pending PCM before {action}: result={result}"
+                );
+            }
+            assert!(
+                clock.audio_tx_queued_secs() > initial_queued,
+                "paused pending tail retains its channel accounting"
+            );
+            match action {
+                "resume" => {
+                    state.store(state_code::PLAYING, Ordering::Release);
+                    clock.set_playing(true);
+                    let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    clock.add_audio_tx_queued_secs_for_epoch(
+                        -first.queued_wall_secs,
+                        first.audio_tx_accounting_epoch,
+                    );
+                    let tail = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    clock.add_audio_tx_queued_secs_for_epoch(
+                        -tail.queued_wall_secs,
+                        tail.audio_tx_accounting_epoch,
+                    );
+                    assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                    let output: Vec<_> = first.samples.into_iter().chain(tail.samples).collect();
+                    assert_eq!(
+                        output, reference,
+                        "pause/resume lost or repeated the real swr tail"
+                    );
+                    assert!(clock.audio_tx_queued_secs().abs() < 1e-12);
+                }
+                "seek" => {
+                    clock.request_seek(0.0);
+                    assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                    assert_eq!(rx.len(), 1, "old pending tail must not commit after seek");
+                    assert!((clock.audio_tx_queued_secs() - initial_queued).abs() < 1e-12);
+                    clock.note_audio_decoded_eos(0);
+                    assert!(
+                        !clock.audio_decoded_eos(1),
+                        "retired EOS cannot finish the new generation"
+                    );
+                }
+                "cancel" => {
+                    cancel.store(true, Ordering::Release);
+                    assert!(!done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                    assert_eq!(rx.len(), 1);
+                    assert!((clock.audio_tx_queued_secs() - initial_queued).abs() < 1e-12);
+                    assert!(!clock.audio_decoded_eos(0));
+                }
+                _ => unreachable!(),
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn audio_resample_successful_zero_output_retains_tiny_input_until_eos() {
+        fn convert(rate: u32, chunks: &[usize]) -> Vec<super::AudioFrame> {
+            use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+            use ffmpeg_the_third::util::frame::audio::Audio;
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+            let input = ffmpeg_the_third::format::input(&path).unwrap();
+            let mut setup = super::build_audio_setup(&input, 0, rate).unwrap();
+            let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+            clock.set_playing(true);
+            let state = AtomicU8::new(state_code::PLAYING);
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = bounded(8);
+            let mut timeline = AudioResampleTimeline::default();
+            let mut offset = 0;
+            for frames in chunks {
+                let mut frame = Audio::empty();
+                unsafe {
+                    frame.alloc(
+                        Sample::I16(SampleType::Packed),
+                        *frames,
+                        ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                    );
+                    frame.set_rate(48_000);
+                    (*frame.as_mut_ptr()).pts = offset as i64;
+                    let data = (*frame.as_mut_ptr()).data[0] as *mut i16;
+                    std::slice::from_raw_parts_mut(data, frames * 2).fill(8192);
+                }
+                assert!(super::emit_audio_frame(
+                    &mut setup,
+                    &mut frame,
+                    &mut None,
+                    0,
+                    None,
+                    None,
+                    &mut timeline,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel
+                ));
+                if rate == 44_100 && offset == 0 && *frames <= 3 {
+                    assert!(
+                        rx.is_empty(),
+                        "test must exercise accepted input with zero emitted output"
+                    );
+                }
+                offset += frames;
+                assert!(
+                    (timeline.0.as_ref().unwrap().expected_input_end - offset as f64 / 48_000.0)
+                        .abs()
+                        < 1e-12
+                );
+            }
+            assert!(super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut None,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "tiny_then_normal_eos"
+            ));
+            let output: Vec<_> = rx.try_iter().collect();
+            let output_frames: usize = output.iter().map(|frame| frame.samples.len() / 2).sum();
+            let expected = (offset * rate as usize).div_ceil(48_000);
+            assert_eq!(
+                output_frames, expected,
+                "accepted tiny input lost: input={offset} rate={rate}"
+            );
+            assert!((timeline.output_pts().unwrap() - expected as f64 / rate as f64).abs() < 1e-12);
+            cancel.store(true, Ordering::Release);
+            assert!(!super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut None,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "cancelled_tiny_eos"
+            ));
+            assert!(rx.is_empty());
+            assert!(!clock.audio_decoded_eos(0));
+            output
+        }
+        ffmpeg_the_third::init().unwrap();
+        for rate in [44_100, 48_000] {
+            for first in [1, 3] {
+                // Whole media shorter than swr's initial filter needs additional
+                // upstream support. Here tiny packets precede ordinary input.
+                let split = convert(rate, &[first, 256]);
+                let fresh = convert(rate, &[first + 256]);
+                let split_pcm: Vec<f32> = split
+                    .iter()
+                    .flat_map(|frame| frame.samples.iter().copied())
+                    .collect();
+                let fresh_pcm: Vec<f32> = fresh
+                    .iter()
+                    .flat_map(|frame| frame.samples.iter().copied())
+                    .collect();
+                assert_eq!(
+                    split_pcm, fresh_pcm,
+                    "tiny/normal packet split changed PCM: first={first} rate={rate}"
+                );
+                for output in [split, fresh] {
+                    let mut end = 0.0;
+                    for frame in output {
+                        assert!((frame.pts_secs - end).abs() < 1e-12);
+                        end += frame.duration_secs;
+                    }
+                    assert!(
+                        (end - ((first + 256) * rate as usize).div_ceil(48_000) as f64
+                            / rate as f64)
+                            .abs()
+                            < 1e-12
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_audio_tail_seek_matches_fresh_decode_without_loop_head_replay() {
+        for output_rate in [48_000, 44_100] {
+            for name in [
+                "tail4ms.wav",
+                "tail4ms.mkv",
+                "tail10ms.wav",
+                "tail10ms.mkv",
+                "mid4ms.wav",
+                "mid4ms.mkv",
+            ] {
+                let session = DecoderSession::open(name, output_rate);
+                let fresh = session.drain_generation(0);
+                assert!(fresh.iter().any(|sample| sample.abs() > 0.1));
+                let head_samples = output_rate as usize / 20 * 2;
+                assert!(
+                    fresh[..head_samples]
+                        .iter()
+                        .all(|sample| sample.abs() < 1e-6)
+                );
+                for pass in 1..=2 {
+                    session.clock.request_seek(0.0);
+                    let serial = session.clock.current_seek_serial();
+                    let replay = session.drain_generation(serial);
+                    let peak_at_head = replay[..head_samples]
+                        .iter()
+                        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                    assert!(
+                        peak_at_head < 1e-6,
+                        "previous tail replayed at loop head: {name} rate={output_rate} pass={pass} peak={peak_at_head}"
+                    );
+                    assert_eq!(
+                        replay.len(),
+                        fresh.len(),
+                        "resampler history changed decoded length: {name} rate={output_rate} pass={pass}"
+                    );
+                    let first_difference = replay
+                        .iter()
+                        .zip(&fresh)
+                        .position(|(actual, expected)| actual != expected);
+                    assert!(
+                        first_difference.is_none(),
+                        "fresh/seek PCM mismatch: {name} rate={output_rate} pass={pass} first_difference={first_difference:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1314,6 +1314,19 @@ seek 要求は入力終端をクリアし、同じ demux worker を起こすた�
 設計の簡素化として既存 engine state を唯一の再生終了 owner に再利用し、追加の終端 bool や
 時間待ち、操作制限は設けない。pause/resume をモーダル化すると通常操作を変えるため採用しない。
 
+**通常 EOS と seek の SWR 所有境界（2026-10-04 follow-up、公開済み v4.3.0 には未収録）**:
+48kHz → 44.1kHz の末尾バーストで、codec だけの Flush が SWR の履歴を残し、
+実 EOF Full-loop の次世代先頭へ旧音声を出すことを回帰で確認した。audio worker は
+codec / SWR / `AudioResampleTimeline` を同じ Flush で初期化する。通常 EOS は codec
+を drain した後に SWR の実出力が0になるまで drain し、既存の trim / serial fence /
+queue accounting を持つ共通 PCM sender へ流してから decoded EOS を公開する。
+seek / cancel / stop は排出せず破棄する。pause は共通 PCM sender の pending frame を
+捨てず、bounded send の空きまたは resume を待つ（pause 中の空きへ enqueue しても
+callback は非 Playing gate で保持）。seek / cancel は待機中も fence と accounting rollback を行う。
+timeline は入力端と実 sample 数で進む出力端を
+一つの owner に保持する。timestamp の stream time-base 丸めを吸収し、forward gap は
+旧 SWR の排出・初期化後に新 source PTS へ anchor する。PDC と最終 limiter の遅延は変更しない。
+
 **swresample 出力 frame の pre-allocation (⚠ 重要)**: `emit_audio_frame` は
 `setup.resampler.run(input, output)` を呼ぶ前に **output frame を正しいサイズで
 明示確保** する。`ffmpeg-the-third 3.0.2` の `Context::run()` 実装は `output.is_empty()`
@@ -1798,6 +1811,13 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   delay-line silence を sample 単位で除き、EOS 排出と合わせて dry chain の入出力 frames を
   一致させる。初回・loop-to-zero・seek-to-zero で同じ pump の trim を使う
   （2026-10-04 P3 follow-up、公開済み v4.3.0 には未収録）。
+
+- open / seek / loop の診断は `audio_epoch` の reset / drain_begin / drain_complete /
+  first_non_silent / first_device_output を使う。serial、rate、limiter reset、排出 frames、
+  段ごとの先頭非ゼロ PTS と callback が実際に渡した先頭非ゼロ PTS を記録する。
+  VST IPC reset は reset ID と ACK を通常ログへ記録する。callback は atomics のみ、
+  formatting / perf writer は pump スレッド。fixture 回帰は実 decoder と EOF-loop tick を通し、
+  実消費 PCM に加えて underrun padding を含む全 callback 出力も検査する。
 
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
