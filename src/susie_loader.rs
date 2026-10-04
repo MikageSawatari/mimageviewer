@@ -1586,13 +1586,32 @@ mod tests {
             // the other two even though their injected waits have no timeout.
             shared.1.notify_one();
         }
+        let finish_deadline = Instant::now() + Duration::from_secs(5);
         let results: Vec<_> = (0..3)
-            .map(|_| finished_rx.recv_timeout(Duration::from_secs(5)))
+            .map(|_| {
+                finished_rx.recv_timeout(finish_deadline.saturating_duration_since(Instant::now()))
+            })
             .collect();
-        // Ensure a failing assertion cannot leave test workers parked forever.
-        complete_init(&mut shared.0.lock().unwrap(), &shared.1);
-        for worker in workers {
-            worker.join().unwrap();
+        // Cleanup must not depend on the notification helper under test.
+        {
+            *shared.0.lock().unwrap() = true;
+            shared.1.notify_all();
+        }
+        // Reap on a separate thread so even a broken waiter cannot hang the test.
+        let (joined_tx, joined_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for worker in workers {
+                if joined_tx.send(worker.join()).is_err() {
+                    return;
+                }
+            }
+        });
+        let join_deadline = Instant::now() + Duration::from_secs(5);
+        for _ in 0..3 {
+            joined_rx
+                .recv_timeout(join_deadline.saturating_duration_since(Instant::now()))
+                .expect("waiter cleanup did not finish within five seconds")
+                .unwrap();
         }
         assert_eq!(results, vec![Ok(5); 3]);
         assert_eq!(fallbacks.load(Ordering::SeqCst), 1);

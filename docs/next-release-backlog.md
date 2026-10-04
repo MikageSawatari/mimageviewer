@@ -84,7 +84,8 @@
 - 影響の見込み (推測): Susie の初期化が遅い・終わらない環境で、起動時の索引走査など `get_pool` を待つ処理の開始が 5 秒より遅れる。UI スレッドは待たない。
 - 方針: 絶対期限で待つ、fallback 時に notify_all する。回帰テスト: 初期化しない状態で複数の待機者が 5 秒前後でそろって進むこと。
 - 実装済み (2026-10-05、独立レビュー待ち): `get_pool` の待機開始からの絶対期限を維持し、init / reload / fallback の完了公開を `notify_all` 付き共通 helper に統一。process-global pool を変更しない回帰テストで仮想 2 秒の早期 wake 後の残り 3 秒と、仮想 5 秒で 1 waiter だけを起こした fallback による全 3 waiter の解放を検証する。sleep による同期は使わない。
-- 自動検証: `cargo test -p mimageviewer --lib susie_loader::tests`、回帰を含む 14 件成功。実時間の 5 秒待ちや製品起動は実行していない。
+- 自動検証: `cargo test -p mimageviewer --lib susie_loader::tests`、回帰を含む 14 件成功。本番の 5 秒初期化待ちや製品起動は実行していない。
+- Codex P3 対応 (2026-10-05、7dada7053 の独立レビュー指摘): 回帰テストの cleanup を検証対象 helper から独立した `done = true` / `notify_all` に変更。結果の受信と worker join の待機はそれぞれ全体 5 秒の絶対期限に限定。`complete_init` の通知を一時的に除去した対照では `[Ok(5), Err(Timeout), Err(Timeout)]` でテスト実行 5.00 秒で期待どおり失敗し、ハングしなかった。通知を復元後、Susie 14 テスト成功。製品コードの変更は残していない。
 - 規模 / 優先度: Small / P3。
 
 ### 1.324 「EffeTune に渡す前に 0dB を超える音を抑える」を再生中に反映するか — 残り 1 件 (2026-10-04)
