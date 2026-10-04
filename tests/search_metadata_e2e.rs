@@ -21,7 +21,8 @@
 //!
 //! notify-rs の発火は Windows の `ReadDirectoryChangesW` 挙動に依存するため、
 //! タイムアウトを長めに取っている (`common::FS_EVENT_TIMEOUT = 8s`)。
-//! ローカルで不安定なら `POLL_INTERVAL` を短くする。
+//! 初回走査の前提となる Susie 初期化は common の fixture が明示的に行う。
+//! 初回待ちの失敗ログには manager / supervisor の状態と reader の件数を含める。
 
 mod common;
 

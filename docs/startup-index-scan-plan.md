@@ -1342,3 +1342,80 @@ UI snapshot は見た目変更がないため §11.8 の59件成功を再利用�
 runtime=4 / pe=3 で成功。core の build は2分59秒、companion は増分 build。
 `build-dev.log` に記録した。全workspace suite・アプリ起動・通常 profile の操作・コミットは
 行っていない。利用者の実データでの修正後の所要時間は、この build での確認に残る。
+
+### 11.11 search E2E の初期化漏れと負荷検証 (2026-10-04)
+
+対象は `next-search-e2e-flaky`、base `9dcb031ba` の未コミット差分。
+製品コード・走査スケジューリング・待機上限は変更していない。
+
+`wait_scan_done` は supervisor の `initial_scan_done` を待っていた。起動時 cleanup /
+reconciliation が supervisor 作成に先行し、supervisor は watch 登録 → 指紋作成 → walk →
+ingest の順に進む。ingest の成功した flush は Tantivy commit / reader reload の後に SQLite
+行を公開するので、初回 Full 成功後の reader 遅延待ちは不要。
+`initial_scan_done` 自体は失敗にも立つため、helper は typed な Complete も確認するようにした。
+
+指紋に Susie の拡張子を含めたことで、native PNG の初回走査も `get_pool()` を通る。
+アプリは `susie-init` で初期化するが、E2E はこの処理を呼んでいなかった。
+統合テストのライブラリは `cfg(test)` ではないため、未初期化時は100 msではなく本番の
+5秒 fallback を待つ。新規プロセスの probe は0.010秒で before-walk / pool 未作成を観測し、
+5.004秒で pool が現れ、5.036秒で Complete に到達した（実 walk / ingest は33 ms）。
+明示的な無効初期化を入れた対照では0.062秒で Complete（実走査51 ms）。
+単独 E2E の全体時間も修正前5.97秒から修正後約0.95秒になった。
+
+診断付きの初期化なし対照では、9件同時の10秒失敗を再現した。
+ログの fallback 成立は5.411秒、8件の timeout snapshot は before-walk、1件は ingest 中。
+残りの walker 開始ログは10.411〜10.412秒で、timeout後のcancelを受けて終了した。
+`get_pool()` は Condvar の相対5秒 wait を反復し、fallback で done を立てた際に notify しない。
+追加の待ちを許すコードと時間は確認したが、個々の wakeup の種類・順序は未計測。
+元の配布 build #5 の停止段階はログ不足で未確定だが、同じ9件同時の症状と初期化依存は再現した。
+
+writer dispatcher / I/O semaphore / activity gate / 再構成 worker は各 manager が作成・所有し、
+テスト間の共用 scan queue や HDD gate はない。watcher debounce は初回走査の待機条件ではない。
+`tests/common/mod.rs` を使うのは metadata / name の2バイナリで、name の直接 bulk / spawn
+入口も `FixtureRoot` を通る。fixture と両起動 helper で無効の Susie pool を Once 初期化する。
+実設定のロード、worker の起動・展開は行わない。process内で不変の pool を用意することで
+初期化と走査の組合せを除き、テスト直列化・timeout拡大・製品のfallback変更は採用しなかった。
+新規プロセスで16スレッドが fixture を作成し、走査前に同じ空 pool を取得する回帰を追加した。
+timeout の回帰は状態文字列の出力と、成功時に診断処理を呼ばないことを確認する。
+
+検証は Windows、`test` profile、`pack-build-tools` feature。
+Cargoで構築したテスト実行体を新規プロセスで反復し、各実行を `--test-threads=32` にした。
+負荷試験は `target/e2eflaky-load.ps1` で複数実行体を同時起動した。初期化なし/ありの強負荷
+試験は同時に走らせ、最大16プロセスが重なる条件を含む（通常のCargo gateより強い負荷）。
+全試行の非ゼロ結果を保持し、成功した再実行で置き換えていない。
+
+| 条件 | 実行数 / テスト数 | 初回10秒 timeout | その他の失敗 |
+| --- | --- | --- | --- |
+| 修正前実行体、8プロセス × 3周 | 24 / 336 | 19 | watcher 1（4実行が非ゼロ） |
+| 修正後実行体、単独 × 10周 | 10 / 160 | 0 | 0 |
+| 修正後実行体、4プロセス × 20周、lib compileとも重複 | 80 / 1,280 | 0 | 0 |
+| 修正後実行体、8プロセス × 10周 | 80 / 1,280 | 0 | Full Failed 2、watcher待ち5（7実行が非ゼロ） |
+| 診断コピー、初期化なし、8プロセス × 3周 | 24 / 336 | 19 | 0（2実行が非ゼロ、うち1つが9件同時失敗） |
+| 診断コピー、初期化あり、8プロセス × 10周 | 80 / 1,120 | 0 | Tantivy書き込みの os error 5 が3（3実行が非ゼロ） |
+
+診断コピーは元の14シナリオを使い、commonの2回帰は除外。使い捨ての process-local
+data dir / logger だけを追加した一時的なテストtargetで、製品のlibは同じ。
+生成用scriptとsourceはtargetに保存し、一時的な `tests/search_e2eflaky_probe.rs` は撤去した。
+ログ付きの2件の Full Failed は `ingest apply failed: Access denied (os error 5)`、残り1件も
+直接 `writer.batch` が同じpermission errorを返した。OS側の干渉やI/O対象の特定は未完。
+ログなし強負荷の watcher 5件も未解決。これらは成功条件を緩めず §1.321 に残した。
+索引は再生成できるデータなので、稀なI/O失敗に新たなretry/復旧stateを足さず、次の担当は
+エラーの対象を特定し、必要なら再走査・再起動での再生成という割り切りを設計担当へ相談する。
+通常の多お気に入りで製品が starvation する根拠は見つからなかった。
+
+関連libは `cargo test -p mimageviewer --lib --features pack-build-tools <filter>` で全153件成功:
+`indexer_` 45、`metadata_reconfiguration::` 19、`metadata_ownership::` 3、
+`search_walker::` 31、`ingest_worker::` 14、`fts_writer_dispatcher::` 10、
+`io_semaphore::` 10、`activity_gate::` 8、`susie_loader::` 13。
+焦点Cargo実行は metadata 16 / name 17件成功。`cargo fmt --all --check` と
+`git diff --check` は成功。full workspace gateは内包に必要な3本のrelease exeがこのworktreeに
+ないため実行していない。製品バイナリは起動せず、テストのみの変更のためbuild-devも不要。
+
+証跡: `target/e2eflaky-{cold,initialized}-probe.log`、
+`target/e2eflaky-{baseline-checked,fixed-alone,fixed-four,fixed-load}.log`、
+`target/e2eflaky-{baseline,fixed}-diagnostic.log`、`target/e2eflaky-lib-summary.log`、
+`target/e2eflaky-focused.log`、`target/e2eflaky-logs/`。
+9件同時失敗は `baseline-diagnostic-2-1.out.log` と
+`baseline-runtime/86220/logs/mimageviewer.log`。permission error の2つのworkerログは
+`fixed-runtime/112968/logs/mimageviewer.log` と `fixed-runtime/116324/logs/mimageviewer.log`。
+初回fallback依存を修正したことと、強負荷で全シナリオが必ず通ることは区別する。

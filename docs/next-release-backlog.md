@@ -44,10 +44,37 @@
 - 推測: 初回の展開 (AI モデル・ONNX Runtime・EffeTune など) と起動処理が重なって、確保済みメモリがしきい値を超えた。発生条件の違いは未確認。
 - 次の一手: 初回起動直後のメモリ使用量 (private bytes / working set) を perf ログに記録し、どの段階で増えるかを見る。必要なら展開や初期化を遅らせる。
 
-### 1.321 search_metadata_e2e が全体テストの負荷下で「初回スキャンを 10 秒待っても終わらない」と 9 件そろって落ちる — build-dist 記録 (2026-10-03)
+### 1.321 search_metadata_e2e の負荷時失敗 — 初期化漏れ修正済み、強負荷での別失敗は未解決 (2026-10-04)
 
 - 観測: v4.3.0 の 3 回目の配布ビルド (master a924081e5/ebb86ebb7) の全体テストで、`tests/search_metadata_e2e.rs` の 9 件が `tests/common/mod.rs:294` の `wait_until timed out after 10s: initial scan for favorite ...` で同時に失敗。同じファイルを単独で回すと 14 件すべて 6 秒で通った。1 時間前の配布ビルド (6b2bc99c9) でも通っていた。差分は告知と文書だけで、索引の処理は変えていない。
-- 推測: 全体を並列で回しているときの負荷で、固定 10 秒の待ちが足りない。待ちを伸ばすだけで済ませず、どの段階で待っているか (スキャン開始・走査・commit) を記録して原因を確かめる。
+- 確定した原因: 共通 fixture がアプリ起動時の Susie 初期化を行っていなかった。
+  起動スキャン変更で追加された `fts_scan_extensions()` が走査指紋作成時に process-global
+  `get_pool()` を呼び、統合テストではライブラリに `cfg(test)` が付かないため、本番用の
+  5 秒 fallback を待つ。新規プロセスの計測で `initial_scan_done=false`、
+  `in_full_scan=false`、pool 未作成が 5.004 秒続き、その後の walk / ingest / commit / reload
+  は 33 ms で完了した。明示的に無効として初期化した対照では 62 ms で terminal に到達。
+- 修正: fixture と両 indexer 起動 helper で無効の Susie pool を process ごとに一度だけ
+  準備し、初期化と走査の組合せを除いた。実設定の読み取り、worker の起動・展開はない。
+  初回待ちの上限は 10 秒のまま。完了フラグだけでなく typed な Full 成功を確認し、
+  timeout に manager / supervisor の状態、進捗、pool の有無、reader 可視件数を付ける。
+- 確定と推測の境界: 修正前の強負荷試験では同じ初回 10 秒失敗を再現、修正後は消えた。
+  診断付き対照では9件同時失敗を再現し、8件は before-walk、1件は遅れて ingest に入った。
+  fallback 成立の5.411秒後ではなく約10.411秒まで一部の待機者が進まなかった。
+  `get_pool` の相対 timeout 反復と fallback 時の notify 不在が追加待ちを許すが、
+  その実行の各 Condvar wakeup は記録していない。テストをこの fallback に依存させない。
+  元の build #5 には状態ログがないため、その9件が停止した厳密な段階は未確定。
+  writer / I/O semaphore / activity gate / 再構成 worker は各 manager の所有であり、
+  別テストの索引と共有する scan gate / HDD 直列化 / debounce はこの初回経路にない。
+- 残件: 8プロセス並行 × 32 test threads の修正後80実行では、初回10秒 timeout は0、
+  別の非ゼロ失敗は7実行（初回 Full の Failed terminal 2件、watcher の8秒待ち5件）。
+  後者は上限を延ばしたり成功条件を緩めたりせず残した。Failed の具体的な I/O エラーと
+  watcher の受信 / 反映経路を切り分ける。追加のログ付き80実行では初回10秒 timeout は0、
+  Tantivy 書き込み時の `Access denied (os error 5)` が3件（Full Failed 2件、直接batch 1件）。
+  permission error の発生元と watcher の残件は未確定。稀な I/O 失敗への自動再試行は足さず、
+  次の担当はログをもとに OS 側の干渉 / 書き込み経路を調べ、必要なら再走査・再起動で
+  再生成する割り切りを設計担当・利用者へ相談する。
+  全失敗の解消や製品の starvation が証明されたとは扱わない。
+  詳細・実行数・ログは [起動スキャン計画 §11.11](startup-index-scan-plan.md#1111-search-e2e-の初期化漏れと負荷検証-2026-10-04)。
 - v4.3.0 では、この 9 件以外の全テストが通っていたこと、単独で通ることを確認したうえで、`-SkipRustTests` で配布物を作り直した (例外扱い)。
 
 ### 1.320 検索結果の取り込み中に UI とサムネイル処理がそろって約 0.8 秒止まる — perf smoke (2026-10-03)

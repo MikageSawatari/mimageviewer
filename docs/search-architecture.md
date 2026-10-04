@@ -919,6 +919,15 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
   (初期バルク + watcher による新規フォルダ / ZIP 追加 + 並列動作)
 - [tests/common/mod.rs](../tests/common/mod.rs) — `FixtureRoot` / `start_indexer_at` /
   `wait_for_search_hits` 等のハーネス
+  - native format の E2E は fixture 作成時に Susie を無効として一度だけ初期化する。
+    アプリの `susie-init` を実行しない統合テストでも、走査指紋 / 未知拡張子の判定が
+    本番用 `get_pool()` の 5 秒 fallback に依存しないようにする。各テストの DB、writer、
+    I/O semaphore、activity gate は引き続き独立で、テストを直列化しない。
+  - 初回待ちは `initial_scan_done` の terminal に加え typed な Full 成功を確認する。
+    ingest flush は commit + reader reload を同期完了するので、成功した初回走査の後に
+    reader の遅延 reload を待つ必要はない。watcher 更新は従来どおり非同期の反映を待つ。
+    timeout には supervisor の有無、before-walk / walk-or-ingest、進捗・結果・診断、
+    manager の再構成状態、Susie pool の有無、reader の可視件数を出す。
 - `src/app.rs::phase_c_key_tests` — 検索バーの相互排他 (Ctrl+F/S/G が常に ≤1 active)
 - `src/app/tests.rs::smart_folder_transition_tests` — 検索→検索、検索由来Snapshot→検索、
   pending smart→検索 / 別smartの`TopLevelGridRestore`移譲、Ctrl+F query再適用、ドライブ一覧・
