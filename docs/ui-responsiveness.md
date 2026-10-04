@@ -620,14 +620,17 @@ core の private bytes に含まれない。WER の P1 が core だった利用�
 # 利用者が初回環境で単体 exe を起動する
 .\mimageviewer.exe --perf-log
 # launcher の展開完了後、core が起動してから別の PowerShell で記録する
-$Core = Get-Process -Name mimageviewer-core | Select-Object -First 1
+# PDF ワーカーも同じ core exe なので、プロセス名では選ばない。perf ログの session start の PID で確定する
+$Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
+$Session = Get-Content $Perf -Encoding utf8 | ForEach-Object { $_ | ConvertFrom-Json } |
+    Where-Object { $_.cat -eq 'session' -and $_.kind -eq 'start' } | Select-Object -Last 1
+$Core = Get-Process -Id $Session.pid
 $CoreStart = $Core.StartTime
 $Core | Select-Object Id, @{Name='StartTimeUtc'; Expression={$_.StartTime.ToUniversalTime().ToString('o')}}
 # core の StartTime から少なくとも60秒待ち、アプリを正常終了してログを回収する
 # launcher 起動から60秒では、展開にかかった時間だけ core の採取区間が短くなる
 Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Windows Error Reporting'; Id=1001; StartTime=$CoreStart} |
     Select-Object @{Name='TimeCreatedUtc'; Expression={$_.TimeCreated.ToUniversalTime().ToString('o')}}, Id, Message
-$Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
 python scripts\analyze_perf.py $Perf memory  # UTC / 相対秒 / PID / MiB / stage を時刻順に表示
 python scripts\analyze_perf.py $Perf startup
 ```
@@ -654,7 +657,6 @@ launcher 起動からの利用者観測の秒数を、そのまま JSONL の `t`
 # 5. アプリを終了
 
 # 6. 分析
-$Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
 python scripts\analyze_perf.py $Perf startup   # 起動時間ブレークダウン
 python scripts\analyze_perf.py $Perf nav       # Ctrl+↑↓ 区間別統計
 python scripts\analyze_perf.py $Perf pre-grid  # グリッド直前のバー/ペイン/scroll 内訳
