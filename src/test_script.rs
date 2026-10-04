@@ -4183,6 +4183,66 @@ fn start_inner(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(
     Ok(())
 }
 
+fn request_action_target_focus_with(
+    owner: &TestScriptWindowIdentity,
+    current_owner: Option<&TestScriptWindowIdentity>,
+    backend_is_current: impl FnOnce(&TestScriptWindowIdentity) -> bool,
+    foreground_hwnd: u64,
+    claim_foreground: impl FnOnce(u64),
+    request_viewport_focus: impl FnOnce(egui::ViewportId),
+) -> bool {
+    if current_owner != Some(owner) || !backend_is_current(owner) {
+        return false;
+    }
+    // winit skips focus_window when this top-level HWND is already foreground.
+    // Its native presenter child can still own keyboard focus in that case.
+    if foreground_hwnd == owner.hwnd() {
+        claim_foreground(owner.hwnd());
+    }
+    request_viewport_focus(owner.viewport_id());
+    true
+}
+
+/// Acquire focus for a semantic action, after resolving its exact current owner.
+/// This request does not make the action eligible: actual viewport focus,
+/// foreground/backend identity, and the normal handler guards remain mandatory.
+pub(crate) fn request_action_target_focus(
+    ctx: &egui::Context,
+    owner: &TestScriptWindowIdentity,
+    current_owner: Option<&TestScriptWindowIdentity>,
+) -> bool {
+    #[cfg(windows)]
+    let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+    #[cfg(not(windows))]
+    let foreground_hwnd = 0;
+    request_action_target_focus_with(
+        owner,
+        current_owner,
+        |owner| {
+            eframe::miv_test_script_window_witness::is_current(
+                owner.viewport_id(),
+                owner.hwnd(),
+                owner.backend_token(),
+            )
+            .unwrap_or(false)
+        },
+        foreground_hwnd,
+        |hwnd| {
+            #[cfg(windows)]
+            {
+                let report = crate::video::native_window::claim_foreground(hwnd);
+                crate::logger::log(format!(
+                    "[test-script] action target keyboard focus claim owner={} report={report:?}",
+                    owner.describe()
+                ));
+            }
+            #[cfg(not(windows))]
+            let _ = hwnd;
+        },
+        |viewport_id| ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus),
+    )
+}
+
 pub(crate) fn action_target_is_focused(
     ctx: &egui::Context,
     owner: &TestScriptWindowIdentity,
@@ -4551,6 +4611,10 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 if runtime.finish.is_some() {
                     let _ = applied.send(Err("script is already finishing".to_string()));
                 } else {
+                    let focus_owner = match &selection {
+                        TestScriptActionSelection::Targeted(owner) => Some(owner.clone()),
+                        TestScriptActionSelection::LegacyImplicit => None,
+                    };
                     let target_focused = match &selection {
                         TestScriptActionSelection::Targeted(owner) => {
                             action_target_is_focused(ctx, owner)
@@ -4560,7 +4624,14 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     if let Some(viewport_id) =
                         runtime.queue_action(action, selection, applied, target_focused)
                     {
-                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                        if let Some(owner) = focus_owner.as_ref() {
+                            let current_owner = runtime
+                                .authoritative_windows
+                                .iter()
+                                .filter_map(|window| window.identity.as_ref())
+                                .find(|current| *current == owner);
+                            request_action_target_focus(ctx, owner, current_owner);
+                        }
                         ctx.request_repaint_of(viewport_id);
                     }
                 }
@@ -6702,6 +6773,133 @@ mod tests {
                 .unwrap_err()
                 .contains("already finishing")
         );
+    }
+
+    #[test]
+    fn targeted_focus_claims_keyboard_focus_on_the_already_foreground_parent() {
+        for owner in [root_identity(11, 0x503), window_identity(7, 11, 14)] {
+            let requests = RefCell::new(Vec::new());
+            assert!(request_action_target_focus_with(
+                &owner,
+                Some(&owner),
+                |candidate| candidate == &owner,
+                owner.hwnd(),
+                |hwnd| requests.borrow_mut().push(("keyboard", hwnd)),
+                |viewport| {
+                    assert_eq!(viewport, owner.viewport_id());
+                    requests.borrow_mut().push(("viewport", 0));
+                },
+            ));
+            assert_eq!(
+                requests.into_inner(),
+                vec![("keyboard", owner.hwnd()), ("viewport", 0)]
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_focus_keeps_normal_activation_when_another_window_is_foreground() {
+        let owner = window_identity(7, 11, 14);
+        let requested = std::cell::Cell::new(false);
+        assert!(request_action_target_focus_with(
+            &owner,
+            Some(&owner),
+            |_| true,
+            owner.hwnd() + 1,
+            |_| panic!("do not force foreground across windows"),
+            |viewport| {
+                assert_eq!(viewport, owner.viewport_id());
+                requested.set(true);
+            },
+        ));
+        assert!(requested.get());
+    }
+
+    #[test]
+    fn targeted_focus_rejects_stale_owner_or_backend_before_any_input() {
+        let owner = window_identity_with_backend_token(7, 11, 14, 101);
+        let replacements = [
+            window_identity_with_backend_token(8, 11, 14, 101),
+            window_identity_with_backend_token(7, 12, 14, 101),
+            window_identity_with_backend_token(7, 11, 15, 101),
+            window_identity_with_backend_token(7, 11, 14, 102),
+            root_identity(11, owner.hwnd()),
+        ];
+        for current in std::iter::once(None).chain(replacements.iter().map(Some)) {
+            assert!(!request_action_target_focus_with(
+                &owner,
+                current,
+                |_| panic!("stale logical owner must stop before backend/input"),
+                owner.hwnd(),
+                |_| panic!("stale owner must not claim keyboard focus"),
+                |_| panic!("stale owner must not request viewport focus"),
+            ));
+        }
+        assert!(!request_action_target_focus_with(
+            &owner,
+            Some(&owner),
+            |_| false,
+            owner.hwnd(),
+            |_| panic!("replaced backend must not claim keyboard focus"),
+            |_| panic!("replaced backend must not request viewport focus"),
+        ));
+    }
+
+    #[test]
+    fn targeted_focus_request_still_waits_for_observed_focus_and_exact_handler() {
+        for owner in [root_identity(11, 0x503), window_identity(7, 11, 14)] {
+            let action = KeyAction::VideoSeekStart;
+            let mut runtime = local_runtime();
+            runtime
+                .publish_windows(vec![window_snapshot(owner.clone(), 17, 2, "video::owner")])
+                .unwrap();
+            let (applied, acknowledgement) = mpsc::sync_channel(1);
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                applied,
+                false,
+            );
+            if matches!(owner, TestScriptWindowIdentity::Detached { .. }) {
+                runtime.finish_targeted_detached_owner(&owner, Ok(()));
+            }
+            assert!(request_action_target_focus_with(
+                &owner,
+                Some(&owner),
+                |_| true,
+                owner.hwnd(),
+                |_| {}, // A successful request is not proof that focus changed.
+                |_| {},
+            ));
+            runtime.promote_focused_action_targets(|_| false);
+            assert!(!consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&owner),
+                action
+            ));
+            assert!(matches!(
+                acknowledgement.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            runtime.promote_focused_action_targets(|candidate| candidate == &owner);
+            let sibling = window_identity(8, 12, 15);
+            assert!(!consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&sibling),
+                action
+            ));
+            assert!(consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&owner),
+                action
+            ));
+            assert_eq!(acknowledgement.try_recv().unwrap(), Ok(()));
+            assert!(!consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&owner),
+                action
+            ));
+        }
     }
 
     #[test]

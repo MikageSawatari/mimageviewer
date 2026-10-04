@@ -1455,6 +1455,25 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-04 §1.319 test-script Targeted action の keyboard focus 取得**
+
+c998db1cb の AudioTracks 実行は native HUD の OS クリックを通過した後、semantic
+`VideoSeekStart` の egui focus 待ちで停止した。native 子は設計上 keyboard owner だが、
+winit の `ViewportCommand::Focus` は top-level target が既に foreground なら取得を省く。
+`src/test_script.rs` の診断 helper で full current identity と backend witness を再検証し、
+同じ HWND が foreground の場合だけ既存 `claim_foreground` を使って keyboard focus を取得する。
+root 受付と `src/app/test_script_support.rs` の active detached／通常 activation 完了を同じ取得へ通す。
+実 focus／foreground／backend の観測と実 handler の eligibility／ack は維持する。
+製品の native focus、manager の intent、mount、viewport identity、host／placement と lifecycle は
+変更しない。`src/app/native_video.rs` の追加は native key handler の headless テストだけ。
+
+geometry 捕捉、delay／再試行、新規 detached state で競合を隠す修正ではなく、明示 semantic
+要求の対象取得境界を OS の focus 所有に合わせる構造修正である。modal 化・pause・窓の閉鎖／再開は
+入力取得の誤った前提を解消せず、AudioTracks が検証する再生中切り替えを狭めるため採用しない。
+実装担当と bounded 独立 Codex レビュー（gpt-6.1-sol / xhigh）はこの設計と実装に合意した。
+ClaudeCode によるこの round の検収・構造判断と利用者了承後の live PASS は引き継ぎ事項であり、
+確認済みとしては記録しない。
+
 **2026-09-30 §1.304 Collection root 可視採用時の main context 所有境界**
 
 Collection の明示 Open、物理子から root への復帰、offscreen 履歴準備後の root 採用を、可視一覧の置換前に共通 loader・ドライブ一覧も使う `change_main_context_for_visible_grid` へ通す。動画・音声の別窓は既存の promote で旧 items 世代・player・fs_cache と共に別 context へ移し、静止画・PDF は既存の park / close 方針を使う。passive / parked sibling と F12 linked の方針は変えない。移管不可なら履歴・surface・items の変更前に理由付きで終端する。移動元の履歴地点、検索中の履歴抑止、`return_to` は移管前に捕捉する。有効な同一 Collection root の fullscreen binding だけは旧 session の `cancel_pending` で installed snapshot を保持し、`begin` と空 items install をしない。明示 Open の即時読み込み・失敗表示と記録済み履歴、履歴復元の成功時確定は維持する。

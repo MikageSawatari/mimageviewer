@@ -15895,6 +15895,50 @@ mod configurable_video_seek_dispatch_tests {
     use super::*;
 
     #[test]
+    fn native_seek_start_window_event_works_without_egui_viewport_focus() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            focused: false,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(false);
+        let _ = ctx.run(input, |_| {});
+        assert_eq!(ctx.input(|input| input.viewport().focused), Some(false));
+
+        for (bindings, virtual_key) in [
+            ("[FsVideo]\n", 0x57), // Default W, as in AudioTracks.
+            ("[FsVideo]\nVideoSeekStart = F15\n", 0x7E),
+        ] {
+            let (mut app, idx) = setup_seek_app();
+            app.keymap = crate::keymap::Keymap::from_ini_str(bindings);
+            let key = native_key(virtual_key, false, false);
+            app.handle_native_video_window_event(
+                &ctx,
+                idx,
+                crate::video::native_window::NativeVideoWindowEvent::KeyDown(key),
+            );
+            assert_eq!(player_seek_base(&app, idx), 0.0);
+            assert_eq!(ctx.input(|input| input.viewport().focused), Some(false));
+
+            reset_seek_player(&mut app, idx);
+            let repeat = crate::video::native_window::NativeVideoKeyEvent {
+                repeat: true,
+                ..key
+            };
+            app.handle_native_video_window_event(
+                &ctx,
+                idx,
+                crate::video::native_window::NativeVideoWindowEvent::KeyDown(repeat),
+            );
+            assert_eq!(player_seek_base(&app, idx), 100.0);
+        }
+    }
+
+    #[test]
     fn rebound_always_on_top_native_key_toggles_once_per_press() {
         let (mut app, idx) = setup_seek_app();
         let ctx = egui::Context::default();

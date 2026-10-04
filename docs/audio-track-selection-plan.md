@@ -1058,7 +1058,11 @@ UI より先に入れる (UI から切り替えられるようになった時点
   音声行・ボタンの観測に実 `Response.enabled()` を使う。入力直前の token/area と source/host の
   同一性検査は維持する。再生中の切り替えを pause/delay で回避しない。原因・非対話検証・
   利用者了承後の disposable portable コマンドは [smoke 設計](ui-smoke-automation-plan.md#audiotracks-の入力対象契約-1319)。
-  旧 2 run は失敗ログを保持し、修正後の実アプリ PASS は未確認。
+  旧 2 run は失敗ログを保持する。c998db1cb の利用者了承後の 2 run は再生中 440 Hz の OS クリック
+  切り替えを通過し、その後の Targeted `VideoSeekStart` の egui focus 待ちで timeout。
+  native 子が focus owner の前面親への winit Focus が省略されるため、診断の取得側で exact
+  owner／backend を検査して既存 focus claim を使う。実 focus／通常 handler の検査と製品の native
+  キー経路は維持する。全体 PASS は再実行待ちで、証跡と修正・検証の記録は同 smoke 設計に追補。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
   Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。

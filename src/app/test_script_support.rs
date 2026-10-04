@@ -505,7 +505,12 @@ impl App {
             if test_script_active_detached_target_matches(self, window_id, viewport_id, &owner) {
                 crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
                 if !crate::test_script::action_target_is_focused(ctx, &owner) {
-                    ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                    crate::test_script::request_action_target_focus(
+                        ctx,
+                        &owner,
+                        self.test_script_window_identity(window_id, viewport_id)
+                            .as_ref(),
+                    );
                 }
                 ctx.request_repaint_of(viewport_id);
             } else {
@@ -561,7 +566,7 @@ impl App {
         if committed && actual_owner.as_ref() == Some(&owner) {
             crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
             if !crate::test_script::action_target_is_focused(ctx, &owner) {
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                crate::test_script::request_action_target_focus(ctx, &owner, actual_owner.as_ref());
             }
             ctx.request_repaint_of(viewport_id);
         } else {

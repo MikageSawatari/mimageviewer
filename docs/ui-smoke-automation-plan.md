@@ -39,7 +39,8 @@ source/generation、host request/epoch/windows、overlay owner、canvas geometry
 2026-10-02 の MAIN repo の 2 run は既定 880 Hz の確認後、Row(0) の入力前検査で停止した。
 保存ログには old/fresh の token・rect の対は無く、その実行時の差分値は復元できない。
 2026-10-04 の source 調査と実描画関数の headless テストで、初回 sizing pass の誤った
-enabled 投影と次回の位置変化を調べた。修正後の実アプリ PASS は利用者了承後の確認待ち。
+enabled 投影と次回の位置変化を調べた。修正 c998db1cb は独立レビュー済みで、
+利用者了承後の 2 run で再生中 440 Hz への OS クリック切り替えが成功した（次項）。
 証跡の source `0f3399113` と今回の base `a0aea7fe2` の間で、調査対象の
 `native_ui_smoke.rs` / `native_presenter/render_core.rs` / `native_presenter/overlay_draw.rs` は同一。
 
@@ -75,7 +76,65 @@ enabled 投影と次回の位置変化を調べた。修正後の実アプリ PA
   PASS に書き換えず、script 全体の再実行成功とは区別する。
 
 変更は `test-script` 診断とその headless テスト・文書に限定するため、通常 profile の確認用
-`build-dev.ps1` は今回の検証対象ではない。製品/runner の起動は実施していない。
+`build-dev.ps1` は確認 binary の対象ではない。上記の初回修正・非対話検証では実装担当による
+製品/runner の起動は実施していない。
+
+#### native HUD クリック後の Targeted action の focus (2026-10-04 追補)
+
+ClaudeCode が利用者の明示了承後に c998db1cb で実行した証跡は
+`target/ui-smoke-runs/20261004T100833327Z-53356-AudioTracks-ce2c6702` と
+`.../20261004T101801866Z-44908-AudioTracks-966f668f`。2 回とも再生中の
+440 Hz 切り替えが通り、後者は 2.088 s に確認した。その直後の `VideoSeekStart` は
+`AwaitingDetachedOwner` → `action target ready` まで進み、viewport `5361` の
+`Focus` 前後が `has_focus=false` のまま 240 秒で timeout。後者の app log は
+`target/portable-smoke/data/logs/mimageviewer.log` とも照合した。
+
+native presenter は通常の keyboard/IME owner で、egui viewport の focus=false は単独では
+異常ではない。`WM_KEYDOWN` → Window event → native handler で `VideoSeekStart` も処理する。
+この証跡は実キーの紛失を記録したものではない。一方 `run_action` は S1b の semantic action で、
+egui handler の focus/owner guard を通す契約である。Windows winit 0.30.13 の
+`focus_window` は target HWND が既に `GetForegroundWindow()` なら処理を省くため、
+前面の親と keyboard focus を持つ native 子を区別できず、取得要求が満たされない。
+クリック直前の native 検査は presenter の `GA_ROOT` と foreground が owner に一致することを要求し、
+ログにも presenter の focus 取得がある。ただし選択後の `GetFocus()` 値自体は旧ログにない。
+
+診断の Targeted focus 取得を共通 helper に揃える。full current identity と backend witness を
+再確認し、target HWND が既に foreground の場合だけ既存 `claim_foreground` で親の
+keyboard focus を取得する。他 HWND が foreground なら従来の `ViewportCommand::Focus` を使う。
+root の受付と detached の active／通常 activation 完了の 3 経路で同じ処理を使う。
+claim の成功を配送許可とせず、従来通り実 egui focus・foreground・backend identity と通常
+handler の eligible pass／consumer ack を待つ。音声切り替え後の製品 focus 方針、native
+キー配送、シナリオ操作列は変更しない。native へ直接 action を投げる案は S1b の検査経路を
+別実装にするため採用せず、pause／delay／再試行も加えない。
+
+回帰は headless／fake focus request で、root／detached の前面親への claim 順序、別の前面窓への
+強制 claim 禁止、logical identity／backend 置換時の入力禁止、focus 未観測時の待機、兄弟 handler
+拒否・exact owner の一回だけの ack を検査する。native Window event の handler テストは
+egui focus=false で既定 W と remap F15 の seek、および repeat 抑止を検査する。
+実 HWND の focus 回復と AudioTracks 全体の PASS は次回、利用者の明示了承を得た run で確認する。
+
+この round の非対話検証 (2026-10-04、c998db1cb 上の未コミット差分、すべて exit 0):
+
+- `cargo test -p mimageviewer --lib --features portable,test-script targeted_focus`: 新規 4 passed
+  (`target/atsmoke-focus-tests.log`)。以下の 107 件にも含まれる。
+- 同 command の filter `test_script`: 107 passed (`target/atsmoke-focus-script-tests.log`)。
+  `configurable_video_seek_dispatch_tests`: 15 passed (`target/atsmoke-focus-native-key-tests.log`)。
+  `native_ui_smoke`: 47 passed (`target/atsmoke-focus-native-controls.log`)。
+- `cargo test -p mimageviewer --lib native_seek_start_window_event_works_without_egui_viewport_focus`:
+  1 passed、通常 feature でも新規 native handler 回帰を検査 (`target/atsmoke-focus-native-key-normal.log`)。
+- `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features
+  --features wgpu,miv-test-script-window-witness --lib`: 20 passed (`target/atsmoke-focus-witness-tests.log`)。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と `--features portable`:
+  exit 0 (`target/atsmoke-focus-check-normal.log` / `target/atsmoke-focus-check-portable.log`)。
+  `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-focus-fmt.log`)。
+
+通常製品の変更はなく、新しい native handler テストだけは通常 feature でも再実行した。
+build/test 方針の再利用条件に従い、前 round の本体・snapshot・Susie・vendor の有効な証拠を
+再利用し、今回は `test-full.ps1` を再実行していない。前 round の初回 script exit 1 と
+素材補完後の個別 gate 成功という区別は上記の記録通り維持する。
+独立 Codex（gpt-6.1-sol / xhigh）の設計・実装レビューは承認済み。ClaudeCode の検収と
+live 全体 PASS は未了。通常 profile の `build-dev.ps1` は診断専用変更の確認 binary としては
+対象外で、修正入りの診断 portable は次の準備 command で再ビルドする。実装担当は起動していない。
 
 準備だけなら起動・入力は行わない:
 
@@ -252,6 +311,9 @@ Targetedがstale・未登録・不適合の場合にLegacyへfallbackしては�
   区別しない。inventoryではなく実mounted contextとidentityの一致を観測する。
 - Targeted Rootは既存`ViewportCommand::Focus`を要求し、既存gridのfocus/permit/text/modal等の
   guardを通った実handlerのeligible passを待つ。専用のguard迂回は加えない。
+  root／detached とも native 子が keyboard focus を持つ前面親には、exact identity／backend を
+  再確認して既存 `claim_foreground` を先に使う。winit が前面親の Focus を省くケースを取得側で
+  扱い、実 viewport focus の観測と通常 handler の許可は省略しない（§1.319 追補）。
 - passive detachedのactivationは、既存`queue_deferred_detached_window_activation`と
   `commit_pending_deferred_detached_window_activation`を使う。既存intentはwindow IDだけを
   保持し、commitは全pendingの最小IDを選ぶため、直前queueだけでは対象commitを保証しない。
