@@ -50430,6 +50430,16 @@ impl App {
             return;
         };
         let (ppp, reported_maximized) = ctx.input(|i| (i.pixels_per_point, i.viewport().maximized));
+        #[cfg(windows)]
+        crate::startup_windows_diag::mark(
+            "app.deferred_initial_size.considered",
+            self.main_hwnd.unwrap_or(0) as usize,
+            || {
+                serde_json::json!({"requested_size": [w, h], "ppp": ppp,
+                "created_maximized": self.created_maximized, "reported_maximized": reported_maximized,
+                "ready": deferred_initial_size_ready(self.created_maximized, reported_maximized)})
+            },
+        );
         if !deferred_initial_size_ready(self.created_maximized, reported_maximized) {
             return;
         }
@@ -50443,6 +50453,12 @@ impl App {
             self.created_maximized
         ));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
+        #[cfg(windows)]
+        crate::startup_windows_diag::mark(
+            "app.deferred_initial_size.command",
+            self.main_hwnd.unwrap_or(0) as usize,
+            || serde_json::json!({"viewport_size": [viewport_size.x, viewport_size.y], "command": "InnerSize"}),
+        );
     }
 
     /// ウィンドウの矩形を記録する。**2 つの値を別々に持つ。**
@@ -83732,6 +83748,11 @@ impl App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    crate::startup_windows_diag::mark(
+                        "app.tray_main_hwnd.capture",
+                        hwnd_raw as usize,
+                        || serde_json::json!({}),
+                    );
                     crate::presentation_observer::register(
                         crate::presentation_observer::WindowRole::Main,
                         hwnd_raw as u64,

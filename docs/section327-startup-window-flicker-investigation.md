@@ -4,6 +4,10 @@
 実装担当によるソース調査と、別 context の GPT-6.1 Sol / xhigh による独立設計レビュー。
 **修正未実装・製品未起動。白フレームと HWND の対応は未確定。**
 
+利用者の「診断先行・修正は後」の判断を受け、opt-inのnative診断を実装した。
+2026-10-04、調査文書commit `d82f94d76` の後続。表示／配置の挙動修正は含まない。
+採取方法・観測限界は §6。利用者実行のログ・録画はまだない。
+
 ## 1. 利用者の録画から読めること
 
 利用者は新規の隔離 `--data-dir`、保存 placement なし、VST3 / EffeTune なしでも
@@ -92,7 +96,8 @@ early return より後にあり、overlay 初回 paint → eframe show → 初�
 ## 4. 独立設計レビューと実装境界
 
 実装担当と独立 reviewer は、hidden 初期化と native ShowWindow の所有境界に問題が
-あることには一致した。**backend 修正案への設計合意は未成立**。コードは変更していない。
+あることには一致した。**backend 修正案への設計合意は未成立**。
+表示／配置の挙動修正は実装していない。後続の診断のみ §6 のとおり追加した。
 
 退行を作る近道は採用しない:
 
@@ -129,9 +134,9 @@ detached の述語や placement owner を別に増やさない。main tray は w
 
 ## 5. 次の観測と受入条件
 
-次の bounded brief は、起動直前の STARTUPINFO と、最初の HWND 生成からの native
-create / show / hide / maximize / restore / position、requested visibility、実visibility、
-foreground、矩形と DPI を記録する診断。creator で main HWND を得てからの記録だけでは遅い。
+次の bounded brief の診断を §6 の方法で実装した。起動直前の STARTUPINFO と、
+最初の HWND 生成からの native通知、requested visibility、実visibility、foreground、
+矩形と DPI を記録する。creator で main HWND を得てからの記録だけでは遅い。
 利用者が隔離起動と録画を行い、2イベントと各 HWND / 操作を対応付ける。
 その結果を根拠に hidden preparation と明示 visibility commit の backend 設計を確定する。
 
@@ -165,5 +170,103 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\flicker\fresh-user-check-01'
 ```
 
-現時点の dev build は調査対象の挙動を持つ**未修正版**。上の「白い窓がない」という
+現時点の dev build は診断機能を持つ**ちらつき未修正版**。上の「白い窓がない」という
 受入判定は修正後に行う。ビルド／テスト結果は `target/flicker-msg.txt` に記録する。
+
+## 6. native診断の採取と読み方 (2026-10-04)
+
+`--diag-startup-windows` を渡したcoreプロセスだけで有効。env varや設定DBは使用しない。
+通常のdev-runtime build、portable、明示の `--data-dir` で使える。
+無効時はフック・QPC/native照会・worker・ファイルI/Oを始めず、CLI scanとmilestoneの
+未登録チェックだけ。診断は表示／配置APIの引数・呼出順・WndProc/CBTの戻り値を変更しない。
+
+### 採取
+
+worktreeのPowerShellで実行する。新規隔離profileの例:
+
+```powershell
+$startupDiagDir = Join-Path (Get-Location) ('target\flicker\fresh-diag-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList @('--diag-startup-windows', '--data-dir', ('"{0}"' -f $startupDiagDir))
+```
+
+本体が現れてから2秒程度は終了せず、同時に起動直前からの画面録画を残す。
+ログは `$startupDiagDir\logs\startup-windows.log`。
+明示の別data dirは別single-instance namespaceなので、通常profileの既存プロセスへ転送されない。
+
+通常profileは、インストール版・tray常駐版を先に終了してから:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--diag-startup-windows'
+```
+
+この通常版coreは `%APPDATA%\mimageviewer` の実設定／データを更新し得る。
+同じdata dirのsingle-instance mutexを共有する。ログは
+`%APPDATA%\mimageviewer\logs\startup-windows.log`。
+診断起動ごとにそのログを上書きするので、次の起動前にログ・録画をコピーしておく。
+無効時は既存診断ログを変更しない。古いログとの混同はheaderのpid／process creation FILETIMEで確認する。
+
+収集期間はcore診断入口から最大10秒、またはeframeの最初の `set_visible(true)` が戻って
+から1秒まで。診断workerがメモリの記録をUTF-8 BOMなしJSON Linesへ保存して終了する。
+mainが表示されない場合も10秒上限で保存する。data dir決定前の即時終了やprocess強制終了は
+保存を保証しない。フラグ付きの `--help`／worker内部モードは診断対象外。
+
+### ログの実装境界
+
+- core `run()` の入口でSTARTUPINFO.dwFlags/wShowWindow、creation FILETIMEとQPCを取得する。
+  eframe/winit event loop、起動worker、ネイティブ窓を作る前に診断workerの
+  WinEvent登録完了を待ち、UI threadへCBT／CALLWNDPROCフックを登録する。
+  このhandshakeはGUI開始前だけ。App::updateはworker待機・join・ファイル保存をしない。
+- workerの `SetWinEventHook` はOUTOFCONTEXT、process id限定、全thread対象。
+  OBJECT CREATE/SHOW/HIDE/DESTROY/LOCATIONCHANGEとSYSTEM FOREGROUNDを選ぶ。
+  OBJID_WINDOW/idChild=0のwindow通知を選ぶ。同期UIフックはmessage-only／childを除く。
+  WinEventは配送前に破棄・再利用された短命窓のCREATE/SHOWまで失わないようbare通知を残す。
+  top-levelを確定できないものはscope unknown、historical identityも未確定と表示する。
+- UI threadのCBTはCREATEWND (WM_NCCREATE前)、MINMAX、ACTIVATE、MOVESIZE、DESTROYWND。
+  CREATESTRUCTから生成要求のtitle/style/parent/xywhをコピーする。
+  CALLWNDPROCはWM_NCCREATE/CREATE/SHOWWINDOW/WINDOWPOSCHANGING/CHANGED/SIZE/DESTROYの
+  WndProc実行前を記録する。生成要求のrectは最終rectとは区別する。
+- native snapshotはclass/rect/style/exstyle/visible/DPI/owner pid・thread/foreground HWND。
+  UIではtitleの同期messageやDWM照会を行わない。workerが別のdelivery_snapshotに
+  title (WM_GETTEXT timeout 20ms)／DWMWA_CLOAKEDを補足し、それぞれsample_qpcを保存する。
+  title取得失敗・破棄済み窓などはnull。以前のtitleはcached_identityに分ける。
+- milestoneはNativeOptions決定 (size/position/maximized/UI scale)、App creator開始、
+  tray用途のmain HWND捕捉、初回paint呼出からpost_renderingへ戻った境界、
+  set_visible(true)前／後、deferred初期sizeの判断とInnerSize command発行。
+  `eframe.first_paint.call_returned` はsurface取得skipでも通るので、描画成功の証明ではない。
+- 同期UIのHCBT_CREATEWNDだけがnative_generationを進める。遅配WinEvent CREATE/DESTROYは
+  その世代を変更せず、WinEvent自身のevent世代はunknown。別世代のdelivery titleを
+  以前のUI snapshotへ混ぜない。
+- 非blockingの有界record queueと16,384件のbuffer。header/output pathとhook handleは
+  lossy queueに載せない。終了時は受付を閉じ、進行中callbackとaccepted recordをworkerで
+  回収してunhook／保存する。pump/drainにはbudgetとdeadlineを置く。欠落数はfooterのdropped。
+  フック登録失敗はhooks.*.readyのerrorコードに記録する。
+
+診断を単一owner・単一期限に閉じ、アプリ操作とのrollbackやresumeを設計しない形で
+組み合わせを減らした。modal化・別窓の閉鎖／再openは挙動を変えるので診断には採用しない。
+独立Sol/xhighレビューで観測限定の設計を確認し、生成世代・終了回収・paint名称の指摘を修正した。
+
+### 読む
+
+```powershell
+python .\scripts\analyze_startup_windows.py "$startupDiagDir\logs\startup-windows.log"
+python .\scripts\analyze_startup_windows.py "$env:APPDATA\mimageviewer\logs\startup-windows.log"
+```
+
+最初にhook error=0、footerのdropped=0、main_visible_commit=Trueを確認する。
+`entry_ms`はQPCによるcore診断入口からの時刻。raw qpc/entry_usが順序の正本。
+process生成からのt_usはcreation FILETIMEとQPCの一度の較正による推定。
+WinEventのOS_event_process_msはdwmsEventTimeからのms精度の推定で、配送遅延も併記する。
+UI行は同期callback前の状態、WinEvent行は非同期配送時点の状態。
+title_at_delivery／cloaked_at_delivery／cached_title_last_observedを過去イベントの状態と混同しない。
+
+録画の白矩形と同じrect/titleを持つHWNDを探し、main capture milestoneのHWNDと比較する。
+同じUI native_generationで生成→位置変更→show/hideが続くなら同一窓の経路、異なるHWND／
+世代なら別窓として読む。最初のeframe明示showより前のSHOW／SWP_SHOWWINDOW／activationも探す。
+
+**API観測の限界:** WinEventはWM_NCCREATE途中のhistorical状態を保存しない。
+CBT/CALLWNDPROCはその前後を補うが、すべてのShowWindow呼出をinterceptしない。
+MINMAXのeffective_cmd_showはOS通知のlow-word SW_で、callerのrequested nCmdShowそのものとは限らない。
+WM_SHOWWINDOWのwParamはboolで、[一部show操作では通知されない](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-showwindow)。
+正確な最初のShowWindow引数がログから決められなければ未確定とし、その呼出サイト計装を
+次の限定scopeとして検討する。process限定FOREGROUNDは別processへのforeground移動を通知しない。
+この診断だけでDWMがどのsurfaceをどの録画frameに表示したかを断定しない。

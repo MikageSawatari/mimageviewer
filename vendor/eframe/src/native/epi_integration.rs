@@ -305,8 +305,29 @@ impl EpiIntegration {
     pub fn post_rendering(&mut self, window: &winit::window::Window) {
         profiling::function_scope!();
         if std::mem::take(&mut self.is_first_frame) {
+            #[cfg(target_os = "windows")]
+            let diagnostic_hwnd = if crate::startup_window_observer::enabled() {
+                window.window_handle().ok().and_then(|handle| {
+                    if let raw_window_handle::RawWindowHandle::Win32(handle) = handle.as_raw() {
+                        Some(handle.hwnd.get() as usize)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = diagnostic_hwnd {
+                crate::startup_window_observer::emit("eframe.first_paint.call_returned", hwnd);
+                crate::startup_window_observer::emit("eframe.set_visible.begin", hwnd);
+            }
             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
             window.set_visible(true);
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = diagnostic_hwnd {
+                crate::startup_window_observer::emit("eframe.set_visible.complete", hwnd);
+            }
         }
     }
 

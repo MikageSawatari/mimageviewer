@@ -82,6 +82,8 @@ mod gpu_lanczos;
 pub mod metadata_transfer;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+#[cfg(windows)]
+mod startup_windows_diag;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
 /// (HWND 引数の関数群の呼び出し元はすべて cfg(windows) 済み)。
@@ -864,6 +866,7 @@ fn maybe_handle_version_or_help() -> bool {
              Options:\n  \
              -V, --version  Print version and exit\n  \
              -h, --help     Print this help and exit\n  \
+             --diag-startup-windows  Record startup HWND diagnostics (Windows)\n  \
              \n\
              PATH  Open the given image file or folder on startup.\n",
             ver = env!("CARGO_PKG_VERSION"),
@@ -915,6 +918,8 @@ fn write_to_parent_console(msg: &str) {
 }
 
 pub fn run() -> eframe::Result {
+    #[cfg(windows)]
+    let _startup_windows_diagnostics = startup_windows_diag::start();
     // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
     // worker モード等の前に処理する (これらは内部フラグで --version と衝突しない)。
     if maybe_handle_version_or_help() {
@@ -1003,6 +1008,10 @@ pub fn run() -> eframe::Result {
     let t0 = Instant::now();
     data_dir::init();
     let data_dir_elapsed = t0.elapsed();
+    #[cfg(windows)]
+    if startup_windows_diag::enabled() {
+        startup_windows_diag::set_log_dir(data_dir::get().join("logs"));
+    }
 
     // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
     // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
@@ -1309,6 +1318,15 @@ pub fn run() -> eframe::Result {
         wgpu_options,
         ..Default::default()
     };
+    #[cfg(windows)]
+    startup_windows_diag::mark("app.native_options.decided", 0, || {
+        serde_json::json!({
+            "inner_size": [size[0], size[1]], "position": options.viewport.position.map(|p| [p.x, p.y]),
+            "maximized": start_maximized, "min_inner_size": MIN_INNER_SIZE,
+            "requested_visible": options.viewport.visible,
+            "effective_eframe_create_visible": false, "ui_scale_factor": saved.ui_scale_factor,
+        })
+    });
 
     // Collection DBはproduction起動だけで開始する。actorのjoin権限はrun_native外のprocess
     // ownerに残し、Appへはclientとevent streamだけを渡す。
@@ -1389,6 +1407,8 @@ pub fn run() -> eframe::Result {
             // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
             emit_startup("creator_enter", None);
+            #[cfg(windows)]
+            startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
             #[cfg(windows)]
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             modifier_probe::install(&cc.egui_ctx);

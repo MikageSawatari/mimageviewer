@@ -9,7 +9,7 @@
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
-| [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓の録画・native window inventory、eframeとwinitの表示境界、未確定のHWND対応と構造設計の残件。修正未実装 |
+| [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native window inventory、opt-in STARTUPINFO/WinEvent/CBT診断とtimelineの採取手順・観測限界。ちらつき修正未実装 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |

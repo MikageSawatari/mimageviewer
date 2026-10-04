@@ -34,7 +34,7 @@
 - 観測 (利用者、v4.3.0 前後の開発ビルド): 起動時にウィンドウのようなものが一瞬表示されてちらつく。いつからかは不明。
 - 追加観測 (利用者、2026-10-04): 新規隔離 `--data-dir`、保存placementなし、VST3 / EffeTuneなしでも発生。録画24枚には大きい白窓、左上と中央の白窓の重なり、その後のfade-outが写る。各矩形のHWNDは未記録。
 - 調査 (Codex実装担当 + 独立Sol/xhighレビュー): eframe ROOTは既にhidden生成・初回paint後show。winit 0.30.13はhidden初期化でも配置前のSW_HIDE、hidden最大化／復元でもSW_MAXIMIZE／SW_RESTORE→SW_HIDEを発行する。STARTUPINFOによる初回show上書きも成立条件を持つ。mainが第一候補だが今回の2イベントとの因果は未確定。overlayはROOT内描画、空起動でfullscreen/detached/presenterを生成する根拠はない。
-- 現状 / 次の一手: **修正未実装、backend設計合意未成立**。初回からのnative HWND・表示操作とSTARTUPINFOを利用者実行で記録し、通常／最大化の復元矩形・混在DPI・trayを維持するnative表示境界の設計を確定する。冗長hideだけの撤去、最大化の表示後延期、delay等の症状パッチは採用しない。正本: [§1.327起動時ウィンドウ調査](section327-startup-window-flicker-investigation.md)。製品はエージェント未起動。
+- 現状 / 次の一手: 利用者判断は**診断先行・修正は後**。`--diag-startup-windows` の早期STARTUPINFO・WinEvent・UI CBT/message hook・アプリmilestoneとtimeline printerを実装。ちらつき修正は未実装。利用者が1回の隔離起動と録画からHWND／表示通知を対応付け、通常／最大化の復元矩形・混在DPI・trayを維持するbackend設計を確定する。全ShowWindow呼出・requested引数の捕捉は保証しない。冗長hide撤去だけ、最大化の表示後延期、delay等の症状パッチは採用しない。採取方法と観測限界の正本: [§1.327起動時ウィンドウ調査 §6](section327-startup-window-flicker-investigation.md#6-native診断の採取と読み方-2026-10-04)。製品はエージェント未起動、利用者ログは未採取。
 - 規模 / 優先度: 共有Win32 backendの構造設計が必要、未見積もり / P2 (毎回の起動で目に入るため)。
 
 ### 1.326 A/B クイックフォルダで B を選んだまま終了すると、次回は A で B のフォルダが開く — 利用者報告 (2026-10-04)
