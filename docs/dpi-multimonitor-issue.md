@@ -112,11 +112,13 @@ winit はこのメッセージを受け取り、推奨矩形に従ってウィ�
   論理/物理ピクセルの取り違えで異常サイズ（縦に極端に長い等）のウィンドウが
   生成される既知バグがある（[egui#4918](https://github.com/emilk/egui/issues/4918) /
   [winit#923](https://github.com/rust-windowing/winit/issues/923)）。
-- 対策: `App::pending_initial_size` に意図したサイズを保持し、
+- 対策: 意図した通常サイズを `StartupWindowGeometry` ([src/startup_window_geometry.rs](../src/startup_window_geometry.rs)) が保持し、
   初回 `update()` 呼び出し（= DPI 確定後）で
   `ctx.send_viewport_cmd(ViewportCommand::InnerSize(..))` により再適用する。
-- 実装: `src/lib.rs` の creator closure で `pending_initial_size` を設定し、
-  `src/app.rs` の初回 `update()` で `ViewportCommand::InnerSize` を送る。
+- 実装: `src/lib.rs` の creator closure で `StartupWindowGeometry` を作り、`src/app.rs` の初回 `update()` で
+  通常サイズの `ViewportCommand::InnerSize` を送る。最大化で保存されていた場合も root は通常サイズの非表示で作り、
+  eframe の初回表示が完了してから最大化を 1 回だけ要求する (§1.327 の起動時ちらつき対策、
+  詳細は [section327 調査 §8](section327-startup-window-flicker-investigation.md))。
 - 通常経路でも無害な no-op になるため、副作用なし。
 - Win+Shift+Arrow による位置ずれ（移動時のバグ）は別問題で、この対策では解消しない。
 
@@ -180,6 +182,6 @@ Remove-Item Env:MIV_DETAILS_LAYOUT_DEBUG
 
 | ファイル | 内容 |
 |----------|------|
-| `src/lib.rs` | ウィンドウ初期サイズ・位置の設定、モニター境界チェック、`pending_initial_size` の設定 |
+| `src/lib.rs` | ウィンドウ初期サイズ・位置の設定、モニター境界チェック、`StartupWindowGeometry` の作成 |
 | `src/monitor.rs` | `MonitorFromPoint` / `GetMonitorInfoW` / `GetDpiForMonitor` を使ったモニター情報取得 |
 | `src/app.rs` | `last_outer_rect` / `last_inner_size` / `last_pixels_per_point` の追跡、初回 size 再適用、viewport command、`on_exit` でのウィンドウ状態保存 |
