@@ -1068,6 +1068,9 @@ UI より先に入れる (UI から切り替えられるようになった時点
   診断限定の read-only exact owner／backend／phase／scope probe を既存 guarded handler へ接続し、
   run_action に30秒の有限 ACK 待ちと期限後の遅い消費禁止、wait_until に owner／snapshot 診断を加える。
   native F12 と操作列は維持し、全体 PASS は次回の明示了承後の run で確認する。
+  ee0eedb23 の独立レビュー P2 で、worker だけの期限と Interrupt 公開前に遅い消費が可能な点を修正。
+  UI／worker が同じ request の deadline と配送 outcome を所有し、期限前の到達記録で遅い ACK を判定する。
+  acquisition も exact request を操作直前に検査し、詳細と追加回帰は同 smoke 設計の P2 追補に記録する。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
   Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。

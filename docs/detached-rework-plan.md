@@ -1455,6 +1455,22 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-05 §1.319 ee0eedb23 の期限競合 P2 対応**
+
+独立レビューで承認された root routing は維持し、診断 request の配送所有境界を修正する。
+同じ immutable deadline と typed delivery outcome を worker／UI が共有し、短い request lock 内で
+期限前 Delivered か期限切れ Rejected を確定する。worker の診断取得や Interrupt 公開を UI の
+拒否条件に代用しない。遅い ACK は記録済みの到達時刻で判定する。
+`src/app/test_script_support.rs` の診断 acquisition は exact request handle を保持し、activation／focus
+開始直前と phase 完了で期限を検査する。同じ owner の別 request に完了を付け替えない。
+開始済み acquisition の rollback は行わず、後続の配送期限も延長しない。
+App の manager intent／mount／host／viewport／placement／切り替え reducer と実キー経路は不変。
+
+診断 lifecycle の単一 request owner に時間と配送の確定を集約する構造修正で、grace／delay／retry、
+新しい detached state、OS 操作中の request lock 保持は追加しない。modal 化・pause では所有のずれを
+解消できない。実装担当と bounded 独立 Codex（gpt-6.1-sol / xhigh）は設計・最終実装に合意した。
+ClaudeCode の P2 指示に沿う follow-up として実装し、検証・検収は smoke 設計の追補へ記録する。
+
 **2026-10-04 §1.319 root fullscreen の semantic action 入口と有限 ACK 待ち**
 
 0072aced5 の live smoke は focus を回復し、detached → root の F12 まで通過した。

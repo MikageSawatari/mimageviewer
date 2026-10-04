@@ -119,6 +119,7 @@
 - v4.3.0 は他の 7 本 (MultiWindowPdf / Stills / RarNav / RatingSort / RatingSortCollection / FolderHistory / AlwaysOnTop) が PASS で、このシナリオは外して出荷する。
 - 第3 round (2026-10-04): focus 修正 0072aced5 は独立レビュー承認後にコミット。利用者了承後の `20261004T135833517Z-11688-AudioTracks-352e9a51` は再生中／停止中切り替え、保存行3からの開き直し、detached → root F12 を通過した。次の root → detached は focus ready 後の consumer ACK 待ちで 240秒 timeout。後続30秒 wait_until は未実行。既存 root fullscreen router の event-only probe が semantic PendingAction を見落とし、backdrop 早期 return で他 handler にも届かない診断入力の欠落だった。native F12 は keymap から共通切り替えへ届き、root → 新 detached の期待は製品仕様通り。
 - 今回は root probe に exact Targeted owner／backend／AwaitingPass／Press scope の読み取り専用照会を接続し、既存 guarded handler で消費する。run_action は既定30秒（指定も可）で environment_failure と状態診断を返し、Interrupt で期限後の遅い consume／peek／probe／activation を拒否する。wait_until にも owner／snapshot 診断を加え、正の予算経過後の true を失敗にするが zero の即時判定は維持する。製品の F12・native input・scenario 列は変更しない。検証・再実行手順は同 smoke 設計、構造判断は detached plan §11。全体 PASS は未確認。
+- P2 追補 (2026-10-05): ee0eedb23 の routing／cfg／probe／構造記録は独立レビュー承認。期限が worker 内だけにあり、Interrupt 公開前の遅い消費と無条件の遅い ACK 成功が可能だった点を指摘。共有 ActionRequest の同じ deadline と typed outcome で期限前配送／拒否の一方を確定し、UI の全 consume／peek／probe／acquisition と worker が照合する。期限切れは診断取得前に確定し、snapshot 競合では待たない。取得 handle は exact request を保持し、同 owner の別 request に再結合しない。製品の入力・切り替え・scenario は不変。公開前 gap の回帰と検証は smoke 設計へ追記し、live は次回の明示了承待ち。
 
 ### 1.317 環境設定のエクスポート・インポート — 5ch >>498 からの検討 (2026-10-02)
 

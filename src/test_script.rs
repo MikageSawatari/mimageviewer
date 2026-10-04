@@ -1393,7 +1393,7 @@ enum UiCommand {
     RunAction {
         action: KeyAction,
         selection: TestScriptActionSelection,
-        applied: mpsc::SyncSender<Result<(), String>>,
+        request: Arc<ActionRequest>,
     },
     SmokeAction(UiSmokeAction),
     ClickWidget {
@@ -1852,7 +1852,8 @@ impl RunnerBridge {
             TestScriptActionSelection::LegacyImplicit => "legacy_implicit".to_string(),
             TestScriptActionSelection::Targeted(owner) => owner.describe(),
         };
-        match self.latest_snapshot() {
+        // A timeout diagnostic must not wait on a UI snapshot writer.
+        match self.snapshot.try_read() {
             Ok(s) => format!(
                 "owner={owner} snapshot_frame={} fullscreen={} fs_idx={} target_registered={} focused={} modal={} ime={} text={} popup={} acquisition=[{}]",
                 s.snapshot_frame,
@@ -1866,7 +1867,7 @@ impl RunnerBridge {
                 s.popup_open,
                 s.action_wait_diagnostic,
             ),
-            Err(error) => format!("owner={owner} snapshot_error={error}"),
+            Err(error) => format!("owner={owner} snapshot_unavailable={error}"),
         }
     }
 
@@ -1879,34 +1880,55 @@ impl RunnerBridge {
             .ok_or("run_action timeout is too large")?;
         let selection = self.action_selection()?;
         let (applied, acknowledgement) = mpsc::sync_channel(1);
+        let request = ActionRequest::new(deadline, applied);
         self.send(UiCommand::RunAction {
             action,
             selection: selection.clone(),
-            applied,
+            request: Arc::clone(&request),
         })?;
+        self.await_action(&request, &acknowledgement, timeout, || {
+            format!(
+                "action={} {}",
+                action.ini_name(),
+                self.wait_diagnostic(&selection)
+            )
+        })
+    }
+
+    fn await_action(
+        &self,
+        request: &ActionRequest,
+        acknowledgement: &mpsc::Receiver<Result<(), String>>,
+        timeout: Duration,
+        diagnostic: impl FnOnce() -> String,
+    ) -> Result<(), String> {
         loop {
             self.interrupt.check()?;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                // Observe an acknowledgement already queued at the boundary before failing.
-                if let Ok(result) = acknowledgement.try_recv() {
-                    return result;
+            // The request owns the decision. Expiry is committed before any
+            // diagnostic collection; an ACK is only a wake, never delivery proof.
+            match request.outcome() {
+                Some(Ok(at)) if at < request.deadline => return Ok(()),
+                Some(Ok(_)) => return Err("run_action has an invalid delivery timestamp".into()),
+                Some(Err(ActionRejection::Handler(message))) => return Err(message),
+                Some(Err(ActionRejection::Deadline)) => {
+                    let message = format!(
+                        "run_action timed out after {} ms awaiting consumer acknowledgement: {}",
+                        timeout.as_millis(),
+                        diagnostic(),
+                    );
+                    self.interrupt.fail(message.clone());
+                    return Err(message);
                 }
-                let message = format!(
-                    "run_action timed out after {} ms awaiting consumer acknowledgement: action={} {}",
-                    timeout.as_millis(),
-                    action.ini_name(),
-                    self.wait_diagnostic(&selection),
-                );
-                // Stop child consumption even before ROOT can drain the queued Cancel.
-                self.interrupt.fail(message.clone());
-                return Err(message);
+                None => {}
             }
+            let remaining = request.deadline.saturating_duration_since(Instant::now());
             match acknowledgement.recv_timeout(remaining.min(WAIT_POLL_INTERVAL)) {
-                Ok(result) => return result,
+                Ok(_) => {} // Re-check the shared outcome, including after a late ACK.
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("run_action apply acknowledgement disconnected".into());
+                    if request.outcome().is_none() {
+                        return Err("run_action apply acknowledgement disconnected".into());
+                    }
                 }
             }
         }
@@ -3375,13 +3397,146 @@ fn spawn_script_source(source: String, bridge: RunnerBridge) -> Result<(), Strin
         .map_err(|error| format!("failed to spawn test-script runner: {error}"))
 }
 
+#[derive(Clone, Debug)]
+enum ActionRejection {
+    Deadline,
+    Handler(String),
+}
+
+#[derive(Debug)]
+enum ActionRequestState {
+    Undelivered(mpsc::SyncSender<Result<(), String>>),
+    Delivered { at: Instant },
+    Rejected(ActionRejection),
+}
+
+enum ActionRequestAttempt {
+    Observe,
+    Deliver,
+    Reject(String),
+}
+
+#[derive(Debug)]
+struct ActionRequest {
+    deadline: Instant,
+    state: Mutex<ActionRequestState>,
+}
+
+impl ActionRequest {
+    fn new(deadline: Instant, applied: mpsc::SyncSender<Result<(), String>>) -> Arc<Self> {
+        Arc::new(Self {
+            deadline,
+            state: Mutex::new(ActionRequestState::Undelivered(applied)),
+        })
+    }
+
+    /// The clock read inside this request's lock is the delivery/rejection
+    /// linearization point. Only Undelivered may transition. No diagnostics,
+    /// channel sends, OS calls or application work run while holding this lock.
+    fn resolve(&self, attempt: ActionRequestAttempt) -> Option<Result<Instant, ActionRejection>> {
+        self.resolve_with_clock(attempt, Instant::now)
+    }
+
+    fn resolve_with_clock(
+        &self,
+        attempt: ActionRequestAttempt,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<Result<Instant, ActionRejection>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Some(Err(ActionRejection::Handler(
+                "run_action request is poisoned".into(),
+            )));
+        };
+        let at = now();
+        let outcome = match &*state {
+            ActionRequestState::Undelivered(_) if at >= self.deadline => {
+                Some(Err(ActionRejection::Deadline))
+            }
+            ActionRequestState::Undelivered(_) => match attempt {
+                ActionRequestAttempt::Observe => None,
+                ActionRequestAttempt::Deliver => Some(Ok(at)),
+                ActionRequestAttempt::Reject(message) => {
+                    Some(Err(ActionRejection::Handler(message)))
+                }
+            },
+            ActionRequestState::Delivered { at } => Some(Ok(*at)),
+            ActionRequestState::Rejected(reason) => Some(Err(reason.clone())),
+        };
+        let notify = if let Some(outcome) = &outcome
+            && matches!(*state, ActionRequestState::Undelivered(_))
+        {
+            let terminal = match outcome {
+                Ok(at) => ActionRequestState::Delivered { at: *at },
+                Err(reason) => ActionRequestState::Rejected(reason.clone()),
+            };
+            let ActionRequestState::Undelivered(applied) = std::mem::replace(&mut *state, terminal)
+            else {
+                unreachable!("transition was checked")
+            };
+            Some(applied)
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(applied) = notify {
+            let result =
+                outcome
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .map(|_| ())
+                    .map_err(|reason| match reason {
+                        ActionRejection::Deadline => {
+                            "run_action deadline expired before delivery".into()
+                        }
+                        ActionRejection::Handler(message) => message,
+                    });
+            let _ = applied.send(result);
+        }
+        outcome
+    }
+
+    fn outcome(&self) -> Option<Result<Instant, ActionRejection>> {
+        self.resolve(ActionRequestAttempt::Observe)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.outcome().is_none()
+    }
+
+    fn is_delivered(&self) -> bool {
+        matches!(self.outcome(), Some(Ok(_)))
+    }
+
+    fn try_deliver(&self) -> bool {
+        matches!(self.resolve(ActionRequestAttempt::Deliver), Some(Ok(_)))
+    }
+
+    fn reject(&self, message: impl Into<String>) {
+        let _ = self.resolve(ActionRequestAttempt::Reject(message.into()));
+    }
+}
+
+pub(crate) struct TargetedActionAcquisition {
+    pub(crate) owner: TestScriptWindowIdentity,
+    request: Arc<ActionRequest>,
+    interrupt: Arc<InterruptState>,
+}
+
+impl TargetedActionAcquisition {
+    /// Admit acquisition immediately before a focus/activation starts. An
+    /// admitted operation may finish later; it is not consumer delivery.
+    pub(crate) fn is_live(&self) -> bool {
+        self.interrupt.check().is_ok() && self.request.is_pending()
+    }
+}
+
 struct PendingAction {
     action: KeyAction,
     dispatch: PendingActionDispatch,
-    // `None` means a non-consuming pressed_action peek already acknowledged
-    // the command. Keep the entry until the frame ends so later peeks observe
-    // the same press, just like an egui input event.
-    applied: Option<mpsc::SyncSender<Result<(), String>>>,
+    // A delivered pressed_action peek stays until the frame ends so later
+    // peeks observe the same press, just like an egui input event.
+    request: Arc<ActionRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3526,7 +3681,7 @@ impl UiRuntime {
                 .fail("test-script pointer region catalog is poisoned");
         }
         let mut retained_actions = VecDeque::with_capacity(self.pending_actions.len());
-        while let Some(mut pending) = self.pending_actions.pop_front() {
+        while let Some(pending) = self.pending_actions.pop_front() {
             let stale_owner = match &pending.dispatch {
                 PendingActionDispatch::LegacyImplicit => None,
                 PendingActionDispatch::Targeted { owner, .. } => (!self
@@ -3540,9 +3695,7 @@ impl UiRuntime {
                     "run_action target is no longer current: {}",
                     owner.describe()
                 );
-                if let Some(applied) = pending.applied.take() {
-                    let _ = applied.send(Err(message.clone()));
-                }
+                pending.request.reject(message.clone());
                 crate::logger::log(format!(
                     "[test-script] action rejected target_mode=targeted owner={} reason=stale",
                     owner.describe()
@@ -3756,7 +3909,7 @@ impl UiRuntime {
                     "action={} dispatch={:?} awaiting_ack={}",
                     pending.action.ini_name(),
                     pending.dispatch,
-                    pending.applied.is_some()
+                    pending.request.is_pending()
                 )
             })
             .collect::<Vec<_>>()
@@ -3907,10 +4060,8 @@ impl UiRuntime {
     }
 
     fn release_pending_actions(&mut self, message: &str) {
-        for mut pending in self.pending_actions.drain(..) {
-            if let Some(applied) = pending.applied.take() {
-                let _ = applied.send(Err(message.to_string()));
-            }
+        for pending in self.pending_actions.drain(..) {
+            pending.request.reject(message);
         }
     }
 
@@ -3918,15 +4069,19 @@ impl UiRuntime {
         &mut self,
         action: KeyAction,
         selection: TestScriptActionSelection,
-        applied: mpsc::SyncSender<Result<(), String>>,
+        request: Arc<ActionRequest>,
         target_focused: bool,
     ) -> Option<egui::ViewportId> {
+        if !self.actions_are_live() || !request.is_pending() {
+            request.reject("run_action is no longer live");
+            return None;
+        }
         match selection {
             TestScriptActionSelection::LegacyImplicit => {
                 self.pending_actions.push_back(PendingAction {
                     action,
                     dispatch: PendingActionDispatch::LegacyImplicit,
-                    applied: Some(applied),
+                    request,
                 });
                 crate::logger::log(format!(
                     "[test-script] run_action action={} target_mode=legacy_implicit",
@@ -3944,7 +4099,7 @@ impl UiRuntime {
                         "run_action target is no longer current: {}",
                         owner.describe()
                     );
-                    let _ = applied.send(Err(message));
+                    request.reject(message);
                     return None;
                 };
                 let phase = match (&owner, window.residence.as_str()) {
@@ -3964,7 +4119,7 @@ impl UiRuntime {
                             owner.describe(),
                             window.residence
                         );
-                        let _ = applied.send(Err(message));
+                        request.reject(message);
                         return None;
                     }
                 };
@@ -3978,7 +4133,7 @@ impl UiRuntime {
                 self.pending_actions.push_back(PendingAction {
                     action,
                     dispatch: PendingActionDispatch::Targeted { owner, phase },
-                    applied: Some(applied),
+                    request,
                 });
                 focus
             }
@@ -4003,7 +4158,7 @@ impl UiRuntime {
             return None;
         }
         self.pending_actions.iter().find_map(|pending| {
-            (pending.applied.is_some()
+            (pending.request.is_pending()
                 && matches!(&pending.dispatch, PendingActionDispatch::Targeted { .. })
                 && action_matches_owner(&pending.dispatch, Some(owner))
                 && command_catalog().any(|spec| {
@@ -4029,7 +4184,7 @@ impl UiRuntime {
             && peek_pending_action_from(&mut self.pending_actions, owner, action)
     }
 
-    fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+    fn pending_targeted_detached_action(&self) -> Option<TargetedActionAcquisition> {
         if !self.actions_are_live() {
             return None;
         }
@@ -4039,28 +4194,42 @@ impl UiRuntime {
                 PendingActionDispatch::Targeted {
                     owner,
                     phase: TargetedActionPhase::AwaitingDetachedOwner,
-                } => Some(owner.clone()),
-                PendingActionDispatch::LegacyImplicit
-                | PendingActionDispatch::Targeted {
-                    phase: TargetedActionPhase::AwaitingFocus | TargetedActionPhase::AwaitingPass,
-                    ..
-                } => None,
+                } if pending.request.is_pending() => Some(TargetedActionAcquisition {
+                    owner: owner.clone(),
+                    request: Arc::clone(&pending.request),
+                    interrupt: Arc::clone(&self.interrupt),
+                }),
+                PendingActionDispatch::LegacyImplicit | PendingActionDispatch::Targeted { .. } => {
+                    None
+                }
             })
     }
 
-    fn finish_targeted_detached_owner(
+    #[cfg(test)]
+    fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+        self.pending_targeted_detached_action()
+            .map(|target| target.owner)
+    }
+
+    fn finish_targeted_detached_action(
         &mut self,
-        owner: &TestScriptWindowIdentity,
+        target: &TargetedActionAcquisition,
         result: Result<(), String>,
     ) {
+        let owner = &target.owner;
+        if !self.actions_are_live() {
+            return;
+        }
         let Some(index) = self.pending_actions.iter().position(|pending| {
-            matches!(
-                &pending.dispatch,
-                PendingActionDispatch::Targeted {
-                    owner: pending_owner,
-                    phase: TargetedActionPhase::AwaitingDetachedOwner,
-                } if pending_owner == owner
-            )
+            Arc::ptr_eq(&pending.request, &target.request)
+                && pending.request.is_pending()
+                && matches!(
+                    &pending.dispatch,
+                    PendingActionDispatch::Targeted {
+                        owner: pending_owner,
+                        phase: TargetedActionPhase::AwaitingDetachedOwner,
+                    } if pending_owner == owner
+                )
         }) else {
             return;
         };
@@ -4077,10 +4246,8 @@ impl UiRuntime {
                 ));
             }
             Err(message) => {
-                let mut pending = self.pending_actions.remove(index).expect("index exists");
-                if let Some(applied) = pending.applied.take() {
-                    let _ = applied.send(Err(message.clone()));
-                }
+                let pending = self.pending_actions.remove(index).expect("index exists");
+                pending.request.reject(message.clone());
                 crate::logger::log(format!(
                     "[test-script] action target resolution failed owner={} error={message}",
                     owner.describe()
@@ -4094,16 +4261,21 @@ impl UiRuntime {
         is_focused: impl Fn(&TestScriptWindowIdentity) -> bool,
     ) -> Vec<egui::ViewportId> {
         let mut ready = Vec::new();
+        if !self.actions_are_live() {
+            return ready;
+        }
         for pending in &mut self.pending_actions {
             let PendingActionDispatch::Targeted { owner, phase } = &mut pending.dispatch else {
                 continue;
             };
             if *phase == TargetedActionPhase::AwaitingFocus
+                && pending.request.is_pending()
                 && self
                     .authoritative_windows
                     .iter()
                     .any(|window| window.identity.as_ref() == Some(owner))
                 && is_focused(owner)
+                && pending.request.is_pending()
             {
                 *phase = TargetedActionPhase::AwaitingPass;
                 crate::logger::log(format!(
@@ -4125,7 +4297,7 @@ impl UiRuntime {
         while let Some(pending) = self.pending_actions.pop_front() {
             match pending.dispatch {
                 PendingActionDispatch::LegacyImplicit => {
-                    if pending.applied.is_some() {
+                    if pending.request.is_pending() {
                         unconsumed.push(pending);
                     }
                 }
@@ -4142,10 +4314,8 @@ impl UiRuntime {
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!("run_action was not consumed in its UI frame: {names}");
-        for mut pending in unconsumed {
-            if let Some(applied) = pending.applied.take() {
-                let _ = applied.send(Err(message.clone()));
-            }
+        for pending in unconsumed {
+            pending.request.reject(message.clone());
         }
         self.fail_environment(message, frame);
     }
@@ -4161,8 +4331,8 @@ impl UiRuntime {
                     phase: TargetedActionPhase::AwaitingPass,
                 } if pending_owner == owner
             );
-            if belongs_to_pass && (eligible || pending.applied.is_none()) {
-                if eligible && pending.applied.is_some() {
+            if belongs_to_pass && (eligible || pending.request.is_delivered()) {
+                if eligible && pending.request.is_pending() {
                     unconsumed.push(pending);
                 }
             } else {
@@ -4182,10 +4352,8 @@ impl UiRuntime {
             "run_action was not consumed in its target UI pass: owner={} actions={names}",
             owner.describe()
         );
-        for mut pending in unconsumed {
-            if let Some(applied) = pending.applied.take() {
-                let _ = applied.send(Err(message.clone()));
-            }
+        for pending in unconsumed {
+            pending.request.reject(message.clone());
         }
         self.fail_environment(message, frame);
     }
@@ -4429,10 +4597,10 @@ fn consume_pending_action_from(
     }) else {
         return false;
     };
-    let mut pending = pending_actions.remove(index).expect("index exists");
-    if let Some(applied) = pending.applied.take() {
-        let _ = applied.send(Ok(()));
+    if !pending_actions[index].request.try_deliver() {
+        return false;
     }
+    pending_actions.remove(index);
     true
 }
 
@@ -4447,10 +4615,7 @@ fn peek_pending_action_from(
     else {
         return false;
     };
-    if let Some(applied) = pending.applied.take() {
-        let _ = applied.send(Ok(()));
-    }
-    true
+    pending.request.try_deliver()
 }
 
 fn action_pass_observation_id(viewport_id: egui::ViewportId) -> egui::Id {
@@ -4533,7 +4698,8 @@ pub(crate) fn finish_action_pass(ctx: &egui::Context) {
 }
 
 /// Read-only entry probe. A semantic action has no egui Key event to wake the
-/// root fullscreen router; only the ordinary handler may consume or acknowledge it.
+/// root fullscreen router; only the ordinary handler may confirm successful
+/// delivery. Observing expiry may reject the request and notify its worker.
 pub(crate) fn probe_targeted_action(
     ctx: &egui::Context,
     active_scopes: &[CommandScope],
@@ -4567,15 +4733,15 @@ pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> boo
     runtime.peek_action(owner.as_ref(), action)
 }
 
-pub(crate) fn pending_targeted_detached_owner() -> Option<TestScriptWindowIdentity> {
+pub(crate) fn pending_targeted_detached_action() -> Option<TargetedActionAcquisition> {
     runtime()
         .lock()
         .ok()
-        .and_then(|guard| guard.as_ref()?.pending_targeted_detached_owner())
+        .and_then(|guard| guard.as_ref()?.pending_targeted_detached_action())
 }
 
-pub(crate) fn finish_targeted_detached_owner(
-    owner: &TestScriptWindowIdentity,
+pub(crate) fn finish_targeted_detached_action(
+    target: &TargetedActionAcquisition,
     result: Result<(), String>,
 ) {
     let Ok(mut guard) = runtime().lock() else {
@@ -4584,7 +4750,7 @@ pub(crate) fn finish_targeted_detached_owner(
     let Some(runtime) = guard.as_mut() else {
         return;
     };
-    runtime.finish_targeted_detached_owner(owner, result);
+    runtime.finish_targeted_detached_action(target, result);
 }
 
 fn flush_exit_logs() {
@@ -4760,10 +4926,10 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
             UiCommand::RunAction {
                 action,
                 selection,
-                applied,
+                request,
             } => {
                 if runtime.finish.is_some() {
-                    let _ = applied.send(Err("script is already finishing".to_string()));
+                    request.reject("script is already finishing");
                 } else {
                     let focus_owner = match &selection {
                         TestScriptActionSelection::Targeted(owner) => Some(owner.clone()),
@@ -4775,16 +4941,24 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
                         }
                         TestScriptActionSelection::LegacyImplicit => true,
                     };
-                    if let Some(viewport_id) =
-                        runtime.queue_action(action, selection, applied, target_focused)
-                    {
-                        if let Some(owner) = focus_owner.as_ref() {
+                    if let Some(viewport_id) = runtime.queue_action(
+                        action,
+                        selection,
+                        Arc::clone(&request),
+                        target_focused,
+                    ) {
+                        if let Some(owner) = focus_owner.as_ref()
+                            && runtime.actions_are_live()
+                            && request.is_pending()
+                        {
                             let current_owner = runtime
                                 .authoritative_windows
                                 .iter()
                                 .filter_map(|window| window.identity.as_ref())
                                 .find(|current| *current == owner);
-                            request_action_target_focus(ctx, owner, current_owner);
+                            if request.is_pending() {
+                                request_action_target_focus(ctx, owner, current_owner);
+                            }
                         }
                         ctx.request_repaint_of(viewport_id);
                     }
@@ -5484,9 +5658,9 @@ mod tests {
                     kind: SyntheticKeyCommandKind::Down { .. },
                     ..
                 }) => key_downs += 1,
-                UiCommand::RunAction { applied, .. } => {
+                UiCommand::RunAction { request, .. } => {
                     action_count += 1;
-                    applied.send(Ok(())).unwrap();
+                    assert!(request.try_deliver());
                 }
                 UiCommand::SmokeAction(_) => smoke_count += 1,
                 UiCommand::Capture { reply, .. } => {
@@ -6113,6 +6287,277 @@ mod tests {
     }
 
     #[test]
+    fn action_deadline_rejects_every_boundary_while_worker_diagnostics_are_pending() {
+        for (owner, phase) in [
+            (root_identity(0, 0x101), TargetedActionPhase::AwaitingPass),
+            (root_identity(0, 0x101), TargetedActionPhase::AwaitingFocus),
+            (
+                window_identity(7, 0, 1),
+                TargetedActionPhase::AwaitingDetachedOwner,
+            ),
+        ] {
+            let (bridge, _, _) = runner_bridge(ready_snapshot());
+            let (applied, acknowledgement) = mpsc::sync_channel(4);
+            let late_ack = applied.clone();
+            let request = ActionRequest::new(Instant::now(), applied);
+            let mut active = local_runtime();
+            active.interrupt = Arc::clone(&bridge.interrupt);
+            active
+                .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+                .unwrap();
+            active.pending_actions.push_back(PendingAction {
+                action: KeyAction::ToggleDetachedViewerMode,
+                dispatch: PendingActionDispatch::Targeted {
+                    owner: owner.clone(),
+                    phase,
+                },
+                request: Arc::clone(&request),
+            });
+            let target = TargetedActionAcquisition {
+                owner: owner.clone(),
+                request: Arc::clone(&request),
+                interrupt: Arc::clone(&bridge.interrupt),
+            };
+            let (entered, at_diagnostic) = mpsc::sync_channel(1);
+            let (release, collect_diagnostic) = mpsc::sync_channel(1);
+            let worker = {
+                let request = Arc::clone(&request);
+                std::thread::spawn(move || {
+                    bridge.await_action(
+                        &request,
+                        &acknowledgement,
+                        Duration::from_millis(10),
+                        || {
+                            entered.send(()).unwrap();
+                            collect_diagnostic
+                                .recv_timeout(Duration::from_secs(2))
+                                .unwrap();
+                            "diagnostic gap".into()
+                        },
+                    )
+                })
+            };
+            at_diagnostic.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                active.interrupt.check().is_ok(),
+                "Interrupt is intentionally not published yet"
+            );
+            assert!(!active.consume_action(Some(&owner), KeyAction::ToggleDetachedViewerMode));
+            assert!(!active.peek_action(Some(&owner), KeyAction::ToggleDetachedViewerMode));
+            assert!(
+                active
+                    .probe_targeted_action(&owner, &[CommandScope::Global])
+                    .is_none()
+            );
+            assert!(active.pending_targeted_detached_action().is_none());
+            assert!(!target.is_live());
+            assert!(active.promote_focused_action_targets(|_| true).is_empty());
+            active.finish_targeted_detached_action(&target, Ok(()));
+            assert!(matches!(&active.pending_actions[0].dispatch,
+                PendingActionDispatch::Targeted { phase: actual, .. } if *actual == phase));
+            late_ack.send(Ok(())).unwrap(); // An unproven late ACK cannot change rejection.
+            release.send(()).unwrap();
+            assert!(
+                worker
+                    .join()
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("diagnostic gap")
+            );
+            assert!(matches!(
+                request.outcome(),
+                Some(Err(ActionRejection::Deadline))
+            ));
+        }
+    }
+
+    #[test]
+    fn action_deadline_is_checked_by_ui_even_when_worker_has_not_run() {
+        let owner = root_identity(0, 0x101);
+        for boundary in ["consume", "peek", "probe", "queue"] {
+            let (applied, acknowledgement) = mpsc::sync_channel(1);
+            let request = ActionRequest::new(Instant::now(), applied);
+            let mut active = local_runtime();
+            active
+                .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+                .unwrap();
+            if boundary == "queue" {
+                assert!(
+                    active
+                        .queue_action(
+                            KeyAction::VideoSeekStart,
+                            TestScriptActionSelection::Targeted(owner.clone()),
+                            Arc::clone(&request),
+                            false
+                        )
+                        .is_none()
+                );
+                assert!(active.pending_actions.is_empty());
+            } else {
+                active.pending_actions.push_back(PendingAction {
+                    action: KeyAction::VideoSeekStart,
+                    dispatch: PendingActionDispatch::Targeted {
+                        owner: owner.clone(),
+                        phase: TargetedActionPhase::AwaitingPass,
+                    },
+                    request: Arc::clone(&request),
+                });
+                match boundary {
+                    "consume" => {
+                        assert!(!active.consume_action(Some(&owner), KeyAction::VideoSeekStart))
+                    }
+                    "peek" => assert!(!active.peek_action(Some(&owner), KeyAction::VideoSeekStart)),
+                    "probe" => assert!(
+                        active
+                            .probe_targeted_action(&owner, &[CommandScope::FsVideo])
+                            .is_none()
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(active.interrupt.check().is_ok());
+            assert!(acknowledgement.try_recv().unwrap().is_err());
+            assert!(matches!(
+                request.outcome(),
+                Some(Err(ActionRejection::Deadline))
+            ));
+        }
+    }
+
+    #[test]
+    fn action_delivery_reads_time_after_acquiring_its_request_lock() {
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        let request = ActionRequest::new(Instant::now() + Duration::from_millis(5), applied);
+        let locked = request.state.lock().unwrap();
+        let (started, waiting) = mpsc::sync_channel(1);
+        let consumer = {
+            let request = Arc::clone(&request);
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                request.try_deliver()
+            })
+        };
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(Instant::now() >= request.deadline);
+        drop(locked);
+        assert!(!consumer.join().unwrap());
+        assert!(acknowledgement.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn action_delivery_before_deadline_survives_late_ack_observation_and_same_pass_peeks() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        let deadline = Instant::now();
+        let request = ActionRequest::new(deadline, applied);
+        // Model the earlier consumer clock at the same locked decision boundary.
+        // The real worker clock is already past this immutable deadline below.
+        assert!(
+            matches!(request.resolve_with_clock(ActionRequestAttempt::Deliver,
+            || deadline.checked_sub(Duration::from_millis(1)).unwrap()), Some(Ok(at)) if at < deadline)
+        );
+        let mut pending = VecDeque::from([PendingAction {
+            action: KeyAction::FsClose,
+            dispatch: PendingActionDispatch::LegacyImplicit,
+            request: Arc::clone(&request),
+        }]);
+        assert!(peek_pending_action_from(
+            &mut pending,
+            None,
+            KeyAction::FsClose
+        ));
+        // Deterministically observe a time past the same immutable deadline.
+        assert!(
+            matches!(request.resolve_with_clock(ActionRequestAttempt::Observe,
+            || request.deadline), Some(Ok(at)) if at < request.deadline)
+        );
+        assert!(peek_pending_action_from(
+            &mut pending,
+            None,
+            KeyAction::FsClose
+        ));
+        bridge
+            .await_action(&request, &acknowledgement, RUN_ACTION_TIMEOUT, || {
+                panic!("an in-time delivery must not collect a timeout diagnostic")
+            })
+            .unwrap();
+        assert_eq!(acknowledgement.try_recv(), Ok(Ok(())));
+        assert!(matches!(
+            acknowledgement.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(consume_pending_action_from(
+            &mut pending,
+            None,
+            KeyAction::FsClose
+        ));
+        assert!(pending.is_empty());
+        assert!(bridge.interrupt.check().is_ok());
+
+        // Conversely, a bare success notification after expiry is no delivery proof.
+        let (applied, acknowledgement) = mpsc::sync_channel(4);
+        let late_ack = applied.clone();
+        let request = ActionRequest::new(Instant::now(), applied);
+        late_ack.send(Ok(())).unwrap();
+        assert!(
+            bridge
+                .await_action(&request, &acknowledgement, Duration::from_millis(1), || {
+                    "late ACK".into()
+                })
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(!request.try_deliver());
+    }
+
+    #[test]
+    fn targeted_activation_completion_cannot_attach_to_a_replacement_request_for_the_same_owner() {
+        let owner = window_identity(7, 0, 1);
+        let mut active = local_runtime();
+        active
+            .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+            .unwrap();
+        let (applied, _) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::VideoSeekStart,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            action_request_for_test(applied),
+            false,
+        );
+        let old = active.pending_targeted_detached_action().unwrap();
+        active.release_pending_actions("old request cancelled");
+        let (applied, _) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::VideoSeekStart,
+            TestScriptActionSelection::Targeted(owner),
+            action_request_for_test(applied),
+            false,
+        );
+        let current = active.pending_targeted_detached_action().unwrap();
+        assert!(!old.is_live());
+        assert!(current.is_live());
+        active.finish_targeted_detached_action(&old, Ok(()));
+        assert!(active.pending_targeted_detached_action().is_some());
+        active.finish_targeted_detached_action(&current, Ok(()));
+        assert!(active.pending_targeted_detached_action().is_none());
+    }
+
+    #[test]
+    fn action_timeout_diagnostic_does_not_wait_for_the_snapshot_writer() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        let snapshot = Arc::clone(&bridge.snapshot);
+        let _writer = snapshot.write().unwrap();
+        spawn_script_source("run_action(\"VideoSeekStart\", 20);".into(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(
+            matches!(commands.last(), Some(UiCommand::Finished(ScriptOutcome {
+            kind: ScriptOutcomeKind::EnvironmentFailure, message,
+        })) if message.contains("snapshot_unavailable") && message.contains("VideoSeekStart"))
+        );
+    }
+
+    #[test]
     fn run_action_deadline_reports_each_acquisition_phase_and_blocks_late_consumers() {
         for (owner, focused, phase) in [
             (root_identity(0, 0x101), false, "AwaitingFocus"),
@@ -6139,12 +6584,12 @@ mod tests {
             let UiCommand::RunAction {
                 action,
                 selection,
-                applied,
+                request,
             } = rx.recv_timeout(Duration::from_secs(2)).unwrap()
             else {
                 panic!("expected action")
             };
-            active.queue_action(action, selection, applied, focused);
+            active.queue_action(action, selection, request, focused);
             active.publish_snapshot(snapshot).unwrap();
             let commands = receive_through_finished(&rx);
             assert!(
@@ -6211,11 +6656,11 @@ mod tests {
             UiCommand::RunAction {
                 action: actual,
                 selection,
-                applied,
+                request,
             } => {
                 assert_eq!(actual, action);
                 assert_eq!(selection, TestScriptActionSelection::LegacyImplicit);
-                applied.send(Ok(())).unwrap();
+                assert!(request.try_deliver());
             }
             command => panic!("unexpected command before action acknowledgement: {command:?}"),
         }
@@ -6268,11 +6713,11 @@ mod tests {
                 UiCommand::RunAction {
                     action,
                     selection,
-                    applied,
+                    request,
                 } => {
                     assert_eq!(action, KeyAction::GridMoveFirst);
                     assert_eq!(selection, TestScriptActionSelection::Targeted(owner));
-                    applied.send(Ok(())).unwrap();
+                    assert!(request.try_deliver());
                     break;
                 }
                 UiCommand::Log(message) => assert!(message.contains("mode=targeted")),
@@ -6315,7 +6760,7 @@ mod tests {
         let mut pending = VecDeque::from([PendingAction {
             action,
             dispatch: PendingActionDispatch::LegacyImplicit,
-            applied: Some(applied),
+            request: action_request_for_test(applied),
         }]);
 
         assert!(peek_pending_action_from(&mut pending, None, action));
@@ -6749,6 +7194,12 @@ mod tests {
         )
     }
 
+    fn action_request_for_test(
+        applied: mpsc::SyncSender<Result<(), String>>,
+    ) -> Arc<ActionRequest> {
+        ActionRequest::new(Instant::now() + RUN_ACTION_TIMEOUT, applied)
+    }
+
     #[test]
     fn capture_targets_preserve_frozen_presentation_and_native_registration() {
         let root = root_identity(0, 0x100);
@@ -7030,7 +7481,7 @@ mod tests {
         active.queue_action(
             KeyAction::ToggleDetachedViewerMode,
             TestScriptActionSelection::Targeted(owner.clone()),
-            applied,
+            action_request_for_test(applied),
             false,
         );
         assert!(
@@ -7070,7 +7521,7 @@ mod tests {
         active.queue_action(
             KeyAction::GridMoveFirst,
             TestScriptActionSelection::Targeted(owner.clone()),
-            applied,
+            action_request_for_test(applied),
             true,
         );
         assert!(
@@ -7082,7 +7533,7 @@ mod tests {
         active.queue_action(
             KeyAction::VideoSeekStart,
             TestScriptActionSelection::LegacyImplicit,
-            applied,
+            action_request_for_test(applied),
             true,
         );
         assert!(
@@ -7191,7 +7642,7 @@ mod tests {
                 active.queue_action(
                     action,
                     TestScriptActionSelection::Targeted(owner.clone()),
-                    applied,
+                    action_request_for_test(applied),
                     true,
                 );
                 assert!(runtime().lock().unwrap().replace(active).is_none());
@@ -7310,11 +7761,12 @@ mod tests {
             runtime.queue_action(
                 action,
                 TestScriptActionSelection::Targeted(owner.clone()),
-                applied,
+                action_request_for_test(applied),
                 false,
             );
             if matches!(owner, TestScriptWindowIdentity::Detached { .. }) {
-                runtime.finish_targeted_detached_owner(&owner, Ok(()));
+                let target = runtime.pending_targeted_detached_action().unwrap();
+                runtime.finish_targeted_detached_action(&target, Ok(()));
             }
             assert!(request_action_target_focus_with(
                 &owner,
@@ -7373,7 +7825,7 @@ mod tests {
             runtime.queue_action(
                 action,
                 TestScriptActionSelection::Targeted(owner.clone()),
-                applied,
+                action_request_for_test(applied),
                 false,
             ),
             None,
@@ -7388,7 +7840,8 @@ mod tests {
             Some(&owner),
             action
         ));
-        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        let target = runtime.pending_targeted_detached_action().unwrap();
+        runtime.finish_targeted_detached_action(&target, Ok(()));
         assert!(!peek_pending_action_from(
             &mut runtime.pending_actions,
             Some(&owner),
@@ -7458,7 +7911,7 @@ mod tests {
             runtime.queue_action(
                 action,
                 TestScriptActionSelection::Targeted(owner.clone()),
-                applied,
+                action_request_for_test(applied),
                 true,
             ),
             None
@@ -7476,7 +7929,7 @@ mod tests {
             runtime.queue_action(
                 action,
                 TestScriptActionSelection::Targeted(owner.clone()),
-                applied,
+                action_request_for_test(applied),
                 false,
             ),
             Some(egui::ViewportId::ROOT)
@@ -7513,7 +7966,7 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::Targeted(owner.clone()),
-            applied,
+            action_request_for_test(applied),
             false,
         );
 
@@ -7523,7 +7976,8 @@ mod tests {
             acknowledgement.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
-        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        let target = runtime.pending_targeted_detached_action().unwrap();
+        runtime.finish_targeted_detached_action(&target, Ok(()));
         runtime.promote_focused_action_targets(|candidate| candidate == &owner);
         runtime.finish_target_pass(&owner, true, 2);
         let error = acknowledgement
@@ -7546,7 +8000,7 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::Targeted(owner.clone()),
-            applied,
+            action_request_for_test(applied),
             false,
         );
 
@@ -7588,7 +8042,7 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::Targeted(old_owner),
-            applied,
+            action_request_for_test(applied),
             false,
         );
 
@@ -7618,7 +8072,7 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::LegacyImplicit,
-            applied,
+            action_request_for_test(applied),
             true,
         );
 
@@ -7731,7 +8185,7 @@ mod tests {
                 owner: old_owner,
                 phase: TargetedActionPhase::AwaitingPass,
             },
-            applied: Some(applied),
+            request: action_request_for_test(applied),
         }]);
 
         assert_eq!(observed_owner, None);

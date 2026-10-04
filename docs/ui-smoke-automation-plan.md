@@ -155,7 +155,7 @@ seek／音声モードなども同じ入口を使う。製品の native F12 は 
 
 修正は既存 root probe に test-script 限定の読み取り専用照会を接続する。exact current owner／
 active backend witness、`AwaitingPass`、未 ACK の Press action と active command scope を照合する。
-probe は consume／peek／ACK を発行せず、既存の focus／modal／IME／edit guard を通った
+probe は consume／peek／成功 ACK を発行せず、既存の focus／modal／IME／edit guard を通った
 本来の handler だけが消費する。実キーイベントがない新入口では既存 KeyboardOwner の
 `blocks_legacy_keymap_shortcuts` も照合し、Focused TextInput／FocusedUi を拒否する。
 S3 の互換仕様通り PendingFocus だけではブロックしない。既存の実キーイベントがある入口や
@@ -164,11 +164,16 @@ Keymap の先行 semantic consume が text 判定を迂回する既存挙動は�
 Legacy、native VK、製品の F12 routing と scenario 列は変更しない。
 専用 F12 consumer／handler 直呼び／新しい detached state は加えない。
 
-`run_action(name)` は受付から consumer ACK まで monotonic 30秒の予算を持つ。
+`run_action(name)` は受付から consumer 到達まで monotonic 30秒の予算を持つ。
 `run_action(name, timeout_ms)` でも指定でき、0／負数は拒否する。phase ごとに期限を延長しない。
-UI が処理しなくても worker が期限を検出し、既存 Interrupt を失敗へ移して `environment_failure`
-にする。consume／peek／probe／detached activation 照会は直ちに拒否し、ROOT の Cancel 到着前の
-遅い child pass でも未配送要求を消費しない。既に consumer に届いた処理を rollback はしない。
+同じ deadline を共有 ActionRequest で UI に渡す。短い request lock 内の時計読取を確定点として、
+Undelivered から Delivered（到達時刻 < deadline）か Rejected（期限切れ／handler 拒否）の一方へ移す。
+worker と UI の consume／最初の pressed-action peek／probe／activation 取得が同じ outcome を照合し、
+worker が遅れたり Interrupt がまだ未公開でも、期限後の未配送要求を消費しない。
+UI が処理しなくても worker は診断取得前に期限切れを確定してから、既存 Interrupt を失敗へ移し
+`environment_failure` にする。ACK channel は通知だけで、成功通知単独を配送の証明としない。
+期限前の Delivered は ACK の観測が遅れても成功で、同 pass の後続 peek も維持する。
+consumer に届いた処理を rollback はしない。
 UI 更新で既存終了処理が pending を解放する。診断は action・exact selected owner、取得 phase、
 publishing pass owner／eligible、snapshot frame、fullscreen／fs_idx、focus／登録、modal／IME／text／popup。
 snapshot は frame 冒頭の観測であり、直後の handler 結果とは扱わない。consumer ACK と操作結果は別のまま。
@@ -208,6 +213,53 @@ Rhai の既存 operation limit／Interrupt も維持する。実 HWND の新 det
 本体・snapshot・Susie・vendor gate を再利用し、変更した診断 suite は今回再実行した。
 通常 profile の `build-dev.ps1` は診断専用差分の確認 binary 対象外。製品／runner は起動していない。
 ClaudeCode の検収と新しい実 HWND の生成・全体 live PASS は未了。
+
+#### ee0eedb23 の期限競合 P2 追補 (2026-10-05)
+
+独立レビューは routing／cfg 隔離／probe の owner・phase・scope 照合と detached 記録を承認したが、
+worker 内だけの期限と Interrupt 公開に依存した拒否へ P2 を指摘した。worker が遅れた場合や、
+期限を検出して snapshot 診断を集めている間には UI が未配送要求を消費でき、期限後の ACK を
+無条件に成功へ読み替える分岐もあった。上の期限契約はこの追補の共有 request 修正後のもの。
+
+request は immutable deadline と typed outcome を一つだけ所有し、PendingAction の ACK Option を
+置き換える。最初の terminal transition の勝者だけが lock 解放後に通知を送る。
+lock 内には診断・channel send・App／OS 操作・待機を入れない。worker は通常受信・期限到達・
+channel 切断のすべてで outcome を正本とし、期限切れ確定後に診断を取得する。
+timeout 診断の snapshot は一回の try_read とし、競合なら unavailable を記録して待たない。
+
+detached acquisition は exact request Arc を含む handle を返す。初期 root focus、active detached の
+focus、passive activation の queue 直前、完了後の focus、phase promotion／完了で期限を照合する。
+同じ owner の別 request へ完了を再結合しない。取得の開始 admission は配送 ACK と別であり、
+期限前に開始した focus／queue+commit が後から完了することは許すが、後続 consumer の到達期限は
+延長しない。timeout 後の rollback／新しい manager intent／in-flight state は加えない。
+modal 化や pause は worker と UI の期限所有のずれを解消しないため採用しない。
+
+旧 112 件の検証は Interrupt 公開後の拒否を確認していたが、公開前の競合を覆っていなかった。
+今回の追加回帰は診断取得を一時停止した gap、worker 未実行、request lock 取得後の時計読取、
+期限前到達の遅い ACK と同 pass の peek、期限後の未証明成功 ACK、同 owner の request 置換、
+snapshot writer 競合を検査する。新しい live は未実施で、全体 PASS は未確認。
+
+非対話検証 (2026-10-05、`next-audiotracks-smoke`、base `ee0eedb23` 上の P2 未コミット差分):
+
+- `cargo test -p mimageviewer --lib --features test-script test_script`: 118 passed
+  (`target/atsmoke-p2-script-tests.log`)。上記6新規回帰と既存 owner／scope／handler guard を検査。
+- `cargo test -p mimageviewer --lib test_script`: 92 passed (`target/atsmoke-p2-normal-tests.log`)。
+  新規6件は通常 feature の単体回帰でも実行した。
+- 同 feature 付き command の `native_ui_smoke`: 47 passed、`root_f12`: 4 passed、
+  `native_video_f12`: 3 passed、`always_new_media_f12`: 2 passed
+  (`target/atsmoke-p2-native-smoke-tests.log` / `target/atsmoke-p2-root-f12-tests.log` /
+  `target/atsmoke-p2-native-f12-tests.log` / `target/atsmoke-p2-media-f12-tests.log`)。
+- `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features
+  --features wgpu,miv-test-script-window-witness --lib`: 20 passed (`target/atsmoke-p2-witness-tests.log`)。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と同 command の `--features portable`、
+  `--features portable,test-script`: exit 0 (`target/atsmoke-p2-check-normal.log` /
+  `target/atsmoke-p2-check-portable.log` / `target/atsmoke-p2-check-diagnostic.log`)。
+- `cargo fmt --all --check` と `git diff --check`: exit 0 (`target/atsmoke-p2-fmt.log`)。
+
+すべて正常終了。独立 Codex（gpt-6.1-sol / xhigh）は設計と最終実装を承認した。
+通常 product の入力・state／依存／fixture は不変で、既存の広い gate の有効な証拠は再利用する。
+通常 profile の確認 binary は診断限定差分の対象外。実装担当は製品／runner を起動していない。
+ClaudeCode の P2 検収と新たな明示了承後の live 全体 PASS は引き継ぐ。
 
 準備だけなら起動・入力は行わない:
 
