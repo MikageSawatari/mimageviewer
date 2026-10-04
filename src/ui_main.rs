@@ -18393,10 +18393,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.settings.video_thumbnail_indicator,
                                     is_cut,
                                 );
-                                let meter_rtl = self.settings.fullscreen_seek_direction.is_rtl(
-                                    if book_resume_meter.is_some_and(|value| value.rtl) { crate::settings::ReadingDirection::Rtl }
-                                    else { crate::settings::ReadingDirection::Ltr });
-                                crate::app::paint_book_resume_meter(ui, cell_rect, &overlay_layout, book_resume_meter, meter_rtl, is_cut);
+                                crate::app::paint_book_resume_meter(ui, cell_rect, &overlay_layout, book_resume_meter, is_cut);
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {

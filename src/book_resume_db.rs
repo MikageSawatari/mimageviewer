@@ -33,16 +33,12 @@ use crate::path_key;
 pub struct ReadingMeterValue {
     pub ordinal: usize,
     pub total: usize,
-    pub rtl: bool,
 }
 
 impl ReadingMeterValue {
-    pub fn new(ordinal: usize, total: usize, rtl: bool) -> Option<Self> {
-        (ordinal > 0 && ordinal <= total && i64::try_from(total).is_ok()).then_some(Self {
-            ordinal,
-            total,
-            rtl,
-        })
+    pub fn new(ordinal: usize, total: usize) -> Option<Self> {
+        (ordinal > 0 && ordinal <= total && i64::try_from(total).is_ok())
+            .then_some(Self { ordinal, total })
     }
 
     pub fn fraction(self) -> f32 {
@@ -143,7 +139,7 @@ impl BookResumeDb {
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
         let tx = self.conn.transaction()?;
-        for column in ["page_ordinal", "page_total", "reading_rtl"] {
+        for column in ["page_ordinal", "page_total"] {
             if !columns.iter().any(|existing| existing == column) {
                 tx.execute_batch(&format!(
                     "ALTER TABLE book_resume ADD COLUMN {column} INTEGER"
@@ -159,18 +155,17 @@ impl BookResumeDb {
         page: usize,
         value: Option<ReadingMeterValue>,
     ) -> Result<(), rusqlite::Error> {
-        let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total, v.rtl));
+        let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
         self.conn.execute(
-            "INSERT INTO book_resume (path,page,page_ordinal,page_total,reading_rtl)
-             VALUES (?1,?2,?3,?4,?5) ON CONFLICT(path) DO UPDATE SET
+            "INSERT INTO book_resume (path,page,page_ordinal,page_total)
+             VALUES (?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET
              page=excluded.page,page_ordinal=excluded.page_ordinal,
-             page_total=excluded.page_total,reading_rtl=excluded.reading_rtl",
+             page_total=excluded.page_total",
             rusqlite::params![
                 normalize_path(path),
                 page as i64,
                 value.map(|v| v.ordinal as i64),
-                value.map(|v| v.total as i64),
-                value.map(|v| i64::from(v.rtl))
+                value.map(|v| v.total as i64)
             ],
         )?;
         Ok(())
@@ -179,7 +174,7 @@ impl BookResumeDb {
     fn read_meters(&self) -> Result<MeterSnapshot, rusqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path,page_ordinal,page_total,reading_rtl FROM book_resume")?;
+            .prepare("SELECT path,page_ordinal,page_total FROM book_resume")?;
         let mut rows = stmt.query([])?;
         let mut snapshot = MeterSnapshot {
             values: HashMap::new(),
@@ -187,14 +182,10 @@ impl BookResumeDb {
         while let Some(row) = rows.next()? {
             let key = row.get(0)?;
             let mut value = None;
-            let tuple = (
-                row.get::<_, Option<i64>>(1),
-                row.get::<_, Option<i64>>(2),
-                row.get::<_, Option<i64>>(3),
-            );
-            if let (Ok(Some(ordinal)), Ok(Some(total)), Ok(Some(rtl @ (0 | 1)))) = tuple
+            let tuple = (row.get::<_, Option<i64>>(1), row.get::<_, Option<i64>>(2));
+            if let (Ok(Some(ordinal)), Ok(Some(total))) = tuple
                 && let (Ok(ordinal), Ok(total)) = (usize::try_from(ordinal), usize::try_from(total))
-                && let Some(valid) = ReadingMeterValue::new(ordinal, total, rtl == 1)
+                && let Some(valid) = ReadingMeterValue::new(ordinal, total)
             {
                 value = Some(valid);
             }
@@ -375,12 +366,21 @@ mod tests {
         db.set(book, 7).unwrap();
         db.migrate_meter_columns().unwrap();
         db.migrate_meter_columns().unwrap();
+        let columns = db
+            .conn
+            .prepare("PRAGMA table_info(book_resume)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, ["path", "page", "page_ordinal", "page_total"]);
         assert_eq!(db.get(book), Some(7));
         assert_eq!(
             db.read_meters().unwrap().values[&normalize_path(book)],
             None
         );
-        let meter = ReadingMeterValue::new(2, 4, true).unwrap();
+        let meter = ReadingMeterValue::new(2, 4).unwrap();
         db.set_meter(book, 8, Some(meter)).unwrap();
         // 出荷済み2列版のupsert/SELECTをそのまま実行できる。新列が残るのは合意済み。
         db.set(book, 9).unwrap();
@@ -401,32 +401,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = BookResumeDb::open_at(&tmp.path().join("resume.db")).unwrap();
         db.migrate_meter_columns().unwrap();
-        for (idx, (ordinal, total, rtl)) in [(0, 5, 0), (1, 0, 0), (6, 5, 0), (-1, 5, 0), (1, 5, 2)]
-            .into_iter()
-            .enumerate()
-        {
+        for (idx, (ordinal, total)) in [(0, 5), (1, 0), (6, 5), (-1, 5)].into_iter().enumerate() {
             db.conn
                 .execute(
-                    "INSERT INTO book_resume VALUES (?1,0,?2,?3,?4)",
-                    rusqlite::params![format!("bad{idx}"), ordinal, total, rtl],
+                    "INSERT INTO book_resume VALUES (?1,0,?2,?3)",
+                    rusqlite::params![format!("bad{idx}"), ordinal, total],
                 )
                 .unwrap();
         }
         let snapshot = db.read_meters().unwrap();
-        assert_eq!(snapshot.values.len(), 5);
+        assert_eq!(snapshot.values.len(), 4);
         assert!(snapshot.values.values().all(Option::is_none));
-        assert!(ReadingMeterValue::new(0, 1, false).is_none());
-        assert!(ReadingMeterValue::new(1, 0, false).is_none());
-        assert!(ReadingMeterValue::new(2, 1, false).is_none());
-        assert_eq!(ReadingMeterValue::new(1, 1, false).unwrap().fraction(), 1.0);
+        assert!(ReadingMeterValue::new(0, 1).is_none());
+        assert!(ReadingMeterValue::new(1, 0).is_none());
+        assert!(ReadingMeterValue::new(2, 1).is_none());
+        assert_eq!(ReadingMeterValue::new(1, 1).unwrap().fraction(), 1.0);
     }
 
     #[test]
     fn book_resume_meter_failed_alter_rolls_back_and_raw_record_survives() {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = BookResumeDb::open_at(&tmp.path().join("resume.db")).unwrap();
-        // SQLite既定列上限直前: 2列追加成功後に3列目が失敗する決定的なrollback検証。
-        let columns = (0..1996)
+        // SQLite既定列上限直前: 1列追加成功後に2列目が失敗する決定的なrollback検証。
+        let columns = (0..1997)
             .map(|idx| format!(",legacy_{idx} INTEGER"))
             .collect::<String>();
         db.conn.execute_batch(&format!("DROP TABLE book_resume; CREATE TABLE book_resume(path TEXT PRIMARY KEY,page INTEGER NOT NULL DEFAULT 0{columns})")).unwrap();
@@ -451,7 +448,7 @@ mod tests {
         let writer = BookResumeWriter::spawn_at(tmp.path().join("resume.db")).unwrap();
         let release = writer.pause_for_test();
         let book = Path::new("C:/books/a.zip");
-        let value = ReadingMeterValue::new(3, 10, true).unwrap();
+        let value = ReadingMeterValue::new(3, 10).unwrap();
         assert!(writer.record(book, 9, Some(value)));
         assert!(writer.is_busy());
         let read = writer.read_all();

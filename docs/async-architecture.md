@@ -888,7 +888,7 @@ delete では処理中 descriptor の transaction を rollback する。完了�
 ### 5.3 UI スレッドで重処理
 
 読書位置メーターは既存 `BookResumeWriter` のFIFOでRecord / ReadAll / Clearを扱う。
-起動時workerがnullable列を移行し、全行を1回読んでApp共通mapへ返す。UIはSQLiteを読まず、
+起動時workerがordinal/totalのnullable2列を移行し、全行を1回読んでApp共通mapへ返す。UIはSQLiteを読まず、
 受理したローカル/Remote記録とscope除去/Clearをmapと読込中差分へ適用する。
 ReadAllのreceiverを差し替えることで古い結果を捨て、最新結果へ待機中差分を重ねる。
 rename・purge retry・明示整理等の既存writer待機predicateにはBookResumeWriterの未処理数も含める。

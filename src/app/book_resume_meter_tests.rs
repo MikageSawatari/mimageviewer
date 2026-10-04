@@ -10,8 +10,8 @@ use crate::settings::{ReadingDirection, SpreadMode};
 
 const WORKER_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn meter(ordinal: usize, total: usize, rtl: bool) -> Option<ReadingMeterValue> {
-    ReadingMeterValue::new(ordinal, total, rtl)
+fn meter(ordinal: usize, total: usize) -> Option<ReadingMeterValue> {
+    ReadingMeterValue::new(ordinal, total)
 }
 
 /// ReadのACKは、それより前のRecord/Clearがcommit済みであることを証明する。
@@ -46,17 +46,14 @@ fn set_pages(app: &mut AppTestEnv, items: Vec<GridItem>) {
     app.rebuild_visible_indices();
 }
 
-fn stored_row(
-    data_dir: &Path,
-    path: &Path,
-) -> Option<(i64, Option<i64>, Option<i64>, Option<i64>)> {
+fn stored_row(data_dir: &Path, path: &Path) -> Option<(i64, Option<i64>, Option<i64>)> {
     use rusqlite::OptionalExtension;
     rusqlite::Connection::open(data_dir.join("book_resume.db"))
         .unwrap()
         .query_row(
-            "SELECT page,page_ordinal,page_total,reading_rtl FROM book_resume WHERE path=?1",
+            "SELECT page,page_ordinal,page_total FROM book_resume WHERE path=?1",
             [crate::path_key::normalize(path)],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .unwrap()
@@ -96,25 +93,22 @@ fn book_resume_meter_records_hud_ordinal_in_mixed_items() {
         app.record_book_resume(idx);
         assert_eq!(
             app.last_book_resume,
-            Some((book.clone(), idx, meter(ordinal, 3, false)))
+            Some((book.clone(), idx, meter(ordinal, 3)))
         );
-        assert_eq!(app.book_resume_meters.get(&book), meter(ordinal, 3, false));
+        assert_eq!(app.book_resume_meters.get(&book), meter(ordinal, 3));
     }
     app.record_book_resume(1);
     app.record_book_resume(2);
-    assert_eq!(
-        app.last_book_resume,
-        Some((book.clone(), 4, meter(3, 3, false)))
-    );
+    assert_eq!(app.last_book_resume, Some((book.clone(), 4, meter(3, 3))));
     settle(&mut app);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
-        Some((4, Some(3), Some(3), Some(0)))
+        Some((4, Some(3), Some(3)))
     );
 }
 
 #[test]
-fn book_resume_meter_keeps_rtl_single_direction_and_spread_anchor() {
+fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
     let mut app = setup_app();
     settle(&mut app);
     let book = app.tmp.path().join("rtl-book");
@@ -133,10 +127,7 @@ fn book_resume_meter_keeps_rtl_single_direction_and_spread_anchor() {
         Some("2 / 4")
     );
     app.record_book_resume(1);
-    assert_eq!(
-        app.last_book_resume,
-        Some((book.clone(), 1, meter(2, 4, true)))
-    );
+    assert_eq!(app.last_book_resume, Some((book.clone(), 1, meter(2, 4))));
 
     app.spread_mode = SpreadMode::Rtl;
     assert_eq!(
@@ -144,15 +135,12 @@ fn book_resume_meter_keeps_rtl_single_direction_and_spread_anchor() {
         Some("2, 1 / 4")
     );
     app.record_book_resume(1);
-    assert_eq!(
-        app.last_book_resume,
-        Some((book.clone(), 1, meter(2, 4, true)))
-    );
-    assert_eq!(app.book_resume_meters.get(&book), meter(2, 4, true));
+    assert_eq!(app.last_book_resume, Some((book.clone(), 1, meter(2, 4))));
+    assert_eq!(app.book_resume_meters.get(&book), meter(2, 4));
 }
 
 #[test]
-fn book_resume_meter_same_raw_index_updates_denominator_direction_and_null() {
+fn book_resume_meter_same_raw_index_updates_denominator_and_null() {
     let mut app = setup_app();
     settle(&mut app);
     let book = app.tmp.path().join("changing-book");
@@ -163,7 +151,7 @@ fn book_resume_meter_same_raw_index_updates_denominator_direction_and_null() {
     settle(&mut app);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
-        Some((0, Some(1), Some(1), Some(0)))
+        Some((0, Some(1), Some(1)))
     );
 
     set_pages(
@@ -177,25 +165,29 @@ fn book_resume_meter_same_raw_index_updates_denominator_direction_and_null() {
     settle(&mut app);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
-        Some((0, Some(1), Some(2), Some(0)))
+        Some((0, Some(1), Some(2)))
     );
 
     app.reading_direction = ReadingDirection::Rtl;
-    app.record_book_resume(0);
-    settle(&mut app);
-    assert_eq!(
-        stored_row(app.tmp.path(), &book),
-        Some((0, Some(1), Some(2), Some(1)))
-    );
+    for seek_direction in [
+        crate::settings::FullscreenSeekDirection::FollowReading,
+        crate::settings::FullscreenSeekDirection::LeftToRight,
+    ] {
+        app.settings.fullscreen_seek_direction = seek_direction;
+        app.record_book_resume(0);
+        settle(&mut app);
+        assert_eq!(
+            stored_row(app.tmp.path(), &book),
+            Some((0, Some(1), Some(2)))
+        );
+        assert_eq!(app.book_resume_meters.get(&book), meter(1, 2));
+    }
 
     // 共通入口のNULL記録 (Remoteもこの入口) は同idxでも旧meterを消す。
     app.persist_book_resume(book.clone(), 0, None);
     assert_eq!(app.book_resume_meters.get(&book), None);
     settle(&mut app);
-    assert_eq!(
-        stored_row(app.tmp.path(), &book),
-        Some((0, None, None, None))
-    );
+    assert_eq!(stored_row(app.tmp.path(), &book), Some((0, None, None)));
     assert_eq!(app.book_resume_entry_count(), 1, "NULL行も登録件数には含む");
 }
 
@@ -205,18 +197,18 @@ fn book_resume_meter_pending_snapshot_replays_record_remove_and_clear() {
     settle(&mut app);
     let keep = app.tmp.path().join("keep.zip");
     let remove = app.tmp.path().join("remove.zip");
-    app.persist_book_resume(keep.clone(), 0, meter(1, 3, false));
-    app.persist_book_resume(remove.clone(), 0, meter(1, 4, false));
+    app.persist_book_resume(keep.clone(), 0, meter(1, 3));
+    app.persist_book_resume(remove.clone(), 0, meter(1, 4));
     settle(&mut app);
 
     // 古いSELECT結果を受信済みだが未適用のまま、ローカルの更新を先に適用する。
     app.reload_book_resume_meters();
     writer_ack(app.book_resume_writer.as_ref().unwrap());
-    app.persist_book_resume(keep.clone(), 2, meter(3, 3, true));
+    app.persist_book_resume(keep.clone(), 2, meter(3, 3));
     app.book_resume_meters
         .remove_scopes(std::slice::from_ref(&remove));
     app.poll_book_resume_meters(&egui::Context::default());
-    assert_eq!(app.book_resume_meters.get(&keep), meter(3, 3, true));
+    assert_eq!(app.book_resume_meters.get(&keep), meter(3, 3));
     assert_eq!(app.book_resume_meters.get(&remove), None);
     assert_eq!(app.book_resume_entry_count(), 1);
 
@@ -224,16 +216,16 @@ fn book_resume_meter_pending_snapshot_replays_record_remove_and_clear() {
     writer_ack(app.book_resume_writer.as_ref().unwrap());
     app.clear_book_resume_async();
     assert_eq!(app.last_book_resume, None);
-    app.persist_book_resume(keep.clone(), 1, meter(2, 3, false));
+    app.persist_book_resume(keep.clone(), 1, meter(2, 3));
     app.poll_book_resume_meters(&egui::Context::default());
-    assert_eq!(app.book_resume_meters.get(&keep), meter(2, 3, false));
+    assert_eq!(app.book_resume_meters.get(&keep), meter(2, 3));
     assert_eq!(app.book_resume_meters.get(&remove), None);
     assert_eq!(app.book_resume_entry_count(), 1);
     settle(&mut app);
     assert_eq!(stored_row(app.tmp.path(), &remove), None);
     assert_eq!(
         stored_row(app.tmp.path(), &keep),
-        Some((1, Some(2), Some(3), Some(0)))
+        Some((1, Some(2), Some(3)))
     );
 }
 
@@ -242,15 +234,15 @@ fn book_resume_meter_new_reload_replaces_old_receiver() {
     let dir = tempfile::tempdir().unwrap();
     let writer = BookResumeWriter::spawn_at(dir.path().join("book_resume.db")).unwrap();
     let book = PathBuf::from("C:/books/reload.zip");
-    assert!(writer.record(&book, 0, meter(1, 3, false)));
+    assert!(writer.record(&book, 0, meter(1, 3)));
     let mut cache = BookResumeMeters::default();
     cache.reload(&writer);
     writer_ack(&writer);
-    assert!(writer.record(&book, 2, meter(3, 3, true)));
+    assert!(writer.record(&book, 2, meter(3, 3)));
     cache.reload(&writer);
     writer_ack(&writer);
     assert!(cache.poll().unwrap().is_ok());
-    assert_eq!(cache.get(&book), meter(3, 3, true));
+    assert_eq!(cache.get(&book), meter(3, 3));
     assert_eq!(cache.count(), 1);
 }
 
@@ -260,7 +252,7 @@ fn book_resume_meter_reload_preserves_latest_pending_resume_source() {
     settle(&mut app);
     let book = app.tmp.path().join("pending-book.zip");
     let resume = app.book_resume_writer.as_ref().unwrap().pause_for_test();
-    let value = meter(8, 10, true);
+    let value = meter(8, 10);
     app.persist_book_resume(book.clone(), 7, value);
     let latest = Some((book.clone(), 7, value));
     app.reload_book_resume_meters();
@@ -276,7 +268,7 @@ fn book_resume_meter_reload_preserves_latest_pending_resume_source() {
     assert_eq!(app.book_resume_meters.get(&book), value);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
-        Some((7, Some(8), Some(10), Some(1)))
+        Some((7, Some(8), Some(10)))
     );
 }
 
@@ -290,7 +282,7 @@ fn book_resume_meter_is_hidden_on_synthetic_surfaces_and_virtual_container_grids
     let mut app = setup_app();
     settle(&mut app);
     let book = app.tmp.path().join("surface-book");
-    let value = meter(2, 3, false);
+    let value = meter(2, 3);
     app.persist_book_resume(book.clone(), 1, value);
     set_pages(&mut app, vec![GridItem::Folder(book.clone())]);
     assert_eq!(app.thumbnail_book_resume_meter(0), value);
@@ -380,7 +372,7 @@ fn book_resume_meter_scope_removal_respects_boundaries_and_tile_kind() {
     let nested = PathBuf::from(format!("{}::child", root.display()));
     let child = root.join("child");
     let sibling = app.tmp.path().join("book.zip2");
-    let value = meter(2, 3, false);
+    let value = meter(2, 3);
     for path in [&root, &nested, &child, &sibling] {
         app.persist_book_resume(path.clone(), 1, value);
     }
@@ -446,10 +438,10 @@ fn book_resume_meter_rename_waits_for_unprocessed_record_and_moves_latest_row() 
     app.rename_migration_data_dir_override = Some(dir.clone());
     let old = dir.join("old.zip");
     let new = dir.join("new.zip");
-    app.persist_book_resume(old.clone(), 0, meter(1, 5, false));
+    app.persist_book_resume(old.clone(), 0, meter(1, 5));
     settle(&mut app);
     let resume = app.book_resume_writer.as_ref().unwrap().pause_for_test();
-    app.persist_book_resume(old.clone(), 3, meter(4, 5, true));
+    app.persist_book_resume(old.clone(), 3, meter(4, 5));
     assert!(app.rename_migration_writers_busy());
 
     app.spawn_rename_key_migration(
@@ -463,7 +455,7 @@ fn book_resume_meter_rename_waits_for_unprocessed_record_and_moves_latest_row() 
     assert_eq!(app.rename_migration_queue.len(), 1);
     assert_eq!(
         stored_row(&dir, &old),
-        Some((0, Some(1), Some(5), Some(0))),
+        Some((0, Some(1), Some(5))),
         "queued Record remains unprocessed"
     );
 
@@ -480,9 +472,9 @@ fn book_resume_meter_rename_waits_for_unprocessed_record_and_moves_latest_row() 
     }
     settle(&mut app);
     assert_eq!(stored_row(&dir, &old), None);
-    assert_eq!(stored_row(&dir, &new), Some((3, Some(4), Some(5), Some(1))));
+    assert_eq!(stored_row(&dir, &new), Some((3, Some(4), Some(5))));
     assert_eq!(app.book_resume_meters.get(&old), None);
-    assert_eq!(app.book_resume_meters.get(&new), meter(4, 5, true));
+    assert_eq!(app.book_resume_meters.get(&new), meter(4, 5));
 }
 
 #[test]
@@ -493,8 +485,8 @@ fn book_resume_meter_purge_retry_waits_for_unprocessed_record() {
     app.rename_migration_data_dir_override = Some(dir.clone());
     let deleted = dir.join("deleted.zip");
     let sibling = dir.join("deleted.zip2");
-    app.persist_book_resume(deleted.clone(), 0, meter(1, 5, false));
-    app.persist_book_resume(sibling.clone(), 1, meter(2, 4, false));
+    app.persist_book_resume(deleted.clone(), 0, meter(1, 5));
+    app.persist_book_resume(sibling.clone(), 1, meter(2, 4));
     settle(&mut app);
     assert!(crate::metadata_cleanup::journal_failed_delete_purge(
         &dir,
@@ -502,17 +494,14 @@ fn book_resume_meter_purge_retry_waits_for_unprocessed_record() {
         &[]
     ));
     let resume = app.book_resume_writer.as_ref().unwrap().pause_for_test();
-    app.persist_book_resume(deleted.clone(), 3, meter(4, 5, true));
+    app.persist_book_resume(deleted.clone(), 3, meter(4, 5));
     app.delete_purge_retry_needed = true;
     app.last_input_at = None;
     let ctx = egui::Context::default();
     app.poll_delete_purge_retry(&ctx);
     assert!(app.delete_purge_retry_pending.is_none());
     assert!(app.delete_purge_retry_needed);
-    assert_eq!(
-        stored_row(&dir, &deleted),
-        Some((0, Some(1), Some(5), Some(0)))
-    );
+    assert_eq!(stored_row(&dir, &deleted), Some((0, Some(1), Some(5))));
 
     resume.send(()).unwrap();
     writer_ack(app.book_resume_writer.as_ref().unwrap());
@@ -531,10 +520,7 @@ fn book_resume_meter_purge_retry_waits_for_unprocessed_record() {
         None,
         "latest old-path Record cannot resurrect purged row"
     );
-    assert_eq!(
-        stored_row(&dir, &sibling),
-        Some((1, Some(2), Some(4), Some(0)))
-    );
+    assert_eq!(stored_row(&dir, &sibling), Some((1, Some(2), Some(4))));
     assert_eq!(app.book_resume_meters.get(&deleted), None);
-    assert_eq!(app.book_resume_meters.get(&sibling), meter(2, 4, false));
+    assert_eq!(app.book_resume_meters.get(&sibling), meter(2, 4));
 }

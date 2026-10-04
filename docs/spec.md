@@ -1802,15 +1802,24 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
 
 ### 環境設定の持ち運び
 
-環境設定の「全体設定」末尾の「設定の持ち運び」から、移行先に依存しない閲覧・表示・
-ファイル処理の設定を書き出し・取り込みできる。詳細な分類と検証規則は
+設定メニューの「設定の復元…」にある「環境設定を書き出し…」「環境設定を取り込み…」から、
+移行先に依存しない閲覧・表示・ファイル処理の設定を書き出し・取り込みできる。
+環境設定の「全体設定」には持ち運びの入口を置かない。詳細な分類と検証規則は
 [settings-export-import-plan.md](settings-export-import-plan.md) を正本とする。
+環境設定が表示中は新しい二つの転送項目だけを無効にし、閉じてから行うよう理由を示す。
+既存の復元・操作カスタマイズの操作は変更しない。取り込みの読み込み完了時に環境設定が
+独立して開かれていれば中止を通知し、既存 draft と live 設定・DB を変更しない。
 
-- 書き出しは現在の環境設定 draft を使い、未確定の手編集も含む。書き出し自体は live 設定を
-  確定しない。環境設定をキャンセルしても書き出したファイルは残る。
-- 取り込みは正常な対象項目だけを draft へ反映し、結果・変更項目・不正項目を表示する。
+- 書き出し・取り込みは同じ見た目の説明 Modal から始める。書き出しは「書き出す」で保存先を
+  選び、確定済み Settings の preferences_snapshot() から worker で保存し、説明 Modal に結果通知を示す。
+  お気に入り専用値と未確定 draft は含めず、書き出し自体は live 設定や DB を変更しない。
+- 取り込み説明に、世代を選ぶ「この時点に戻す」と対象が異なり、移行可能な環境設定の一部だけを
+  変更し、移行先のパス・利用データ・操作カスタマイズ等を保持することを示す。「ファイルを選ぶ」で
+  ファイルを選び、worker の検証成功後だけ環境設定の「全体設定」(General) を開く。
+  正常な対象項目だけを新しい draft へ反映し、既存の結果・変更項目・不正項目欄を表示する。
   OK は手編集と同じ prepare → install → 副作用 → save_checked の経路で確定する。
-  Cancel / × は取り込みとそれ以前の未確定手編集をまとめて破棄する。
+  Cancel / × は取り込みと環境設定で行った未確定手編集をまとめて破棄する。
+  説明やファイル選択の Cancel、ファイル全体エラーでは環境設定を開かず設定を変更しない。
 - 全 432 フィールドを一つの policy で明示分類し、130 フィールドを転送対象、302 を除外する。
   利用データ (★・編集・本棚・お気に入り・タグ・コレクション・履歴・読書位置・キャッシュ)、
   PC 固有パス、フォント・外部ツール・LUT・Susie / VST3、性能 tuning、接続・自動通信、
@@ -1824,10 +1833,11 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   型違い・範囲外・未知 enum はその論理項目を無視し、既定値補完や clamp はしない。
   壊れた JSON、不正 UTF-8、重複キー、1 MiB / 深さ制限超過、形式・版の不一致は全体拒否し、
   draft を変えない。未来の形式版も推測して読み込まない。
-- PreferencesState の一つの転送 job が read / parse / serialize / write を worker で処理する。
-    処理中は環境設定の変更・確定・閉鎖を止める。メイン viewport の背面メニュー・ツールバーは
-    既存の環境設定/common modal に任せる。ファイル I/O と draft に無関係な別窓・fullscreen・
-    native 動画に転送専用の入力遮断は加えず、既存挙動を維持する。
+- SettingsRestoreState の一つの転送 job が read / parse / serialize / write を worker で処理する。
+  処理中は説明 Modal を busy 表示にし、設定復元の操作・閉鎖と説明の実行・キャンセルを止める。
+  メイン viewport の背面メニュー・ツールバーは show_settings_restore が登録済みの
+  common modal と説明 Modal に任せる。ファイル I/O と draft に無関係な別窓・fullscreen・
+  native 動画に転送専用の入力遮断は加えず、既存挙動を維持する。
   DB migration、専用 live rebuild、復旧 journal、再試行や世代バックアップは追加しない。
 - 対象外に import setter は持たない。ただし、既存 OK が環境設定外の最新値
   (`video_playback_speed` 等) を巻き戻す §1.305 と、`show_hidden_files` 等の変更後に
@@ -1994,7 +2004,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_show_media_duration` | bool | true | 動画・音声のサムネイル右下に長さを表示する。1 時間未満は `m:ss`、1 時間以上は `h:mm:ss`。フィルタ一致数と既存バッジを優先し、衝突時は上へ移し、空きがなければ非表示。可視 + 先読みだけ既存遅延メタ worker で取得する。設定項目がない既存 JSON / settings.db も true になる |
-| `thumb_show_book_resume_meter` | bool | true | 通常の一覧のフォルダ・ZIP・PDF サムネイル下端に保存済み読書位置の比率を表示する。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続き、ON に戻すと追加読み取りなしに表示できる。欠落した JSON / settings.db 設定と既定設定も true |
+| `thumb_show_book_resume_meter` | bool | true | 通常の一覧のフォルダ・ZIP・PDF サムネイル下端に保存済み読書位置の比率を常に左から右へ表示する。本の読み方向や `fullscreen_seek_direction` には連動しない。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続き、ON に戻すと追加読み取りなしに表示できる。欠落した JSON / settings.db 設定と既定設定も true |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
 | `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
 | `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |
@@ -2071,7 +2081,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
 | `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
-| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーと本サムネイルの読書位置メーターの左右方向。`FollowReading` は横の読み方向へ合わせ、メーターは保存時の RTL を使う。`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
+| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせる。`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
 | `fullscreen_keep_on_app_switch` | bool | false | 「メインに戻ったらフルスクリーンへ復帰」。他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を自動で閉じずにフルスクリーン側へフォーカスを戻す。メイン一覧も並行操作する場合は F12 別ウィンドウを使う |

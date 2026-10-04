@@ -25,6 +25,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    if state.transfer_feedback.is_some() {
+        super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
+        ui.separator();
+    }
     anchored(ui, state, "general/theme", |ui, state| {
         ui.label(egui::RichText::new("テーマ").strong());
         ui.add_space(4.0);
@@ -220,9 +224,6 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         )
         .weak(),
     );
-    });
-    anchored(ui, state, "general/settings-transfer", |ui, state| {
-        super::transfer::draw_settings_transfer(ui, state);
     });
 }
 
@@ -1613,7 +1614,7 @@ pub(super) fn draw_book_resume_meter_settings(
         "本のサムネイルに前回の読書位置を表示",
     );
     ui.small(
-        "記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません",
+        "メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません",
     );
 }
 
@@ -2643,7 +2644,7 @@ fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
 pub(super) fn page_command_settings(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    _ime_active: bool,
+    _keyboard_capture_blocked: bool,
 ) {
     ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
     ui.small("Esc / 修飾なし矢印 / サムネイル一覧の Shift+矢印は解除できない固定操作です。競合をなくすには、割り当てた側を変更または解除してください。");
@@ -2675,7 +2676,7 @@ pub(super) fn page_command_settings(
 pub(super) fn draw_operation_assignment_editor_dialog(
     ctx: &egui::Context,
     state: &mut PreferencesState,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     let Some(editor) = state.operation_assignment_editor.clone() else {
         return;
@@ -2710,7 +2711,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                 )
             );
             if chord_keyboard_editor {
-                draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                draw_operation_assignment_editor_body(ui, state, &editor, keyboard_capture_blocked);
             } else {
                 let available_h = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
@@ -2718,7 +2719,12 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                     .max_height(available_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                        draw_operation_assignment_editor_body(
+                            ui,
+                            state,
+                            &editor,
+                            keyboard_capture_blocked,
+                        );
                     });
             }
         });
@@ -3080,13 +3086,20 @@ fn draw_operation_assignment_editor_body(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     editor: &OperationAssignmentEditor,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     match (&editor.target, editor.tab) {
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::Keyboard) => {
             let keymap = Keymap::from_settings(&state.settings.keymap);
             let conflicts = keymap.binding_conflicts();
-            command_editor_for_action(ui, state, &keymap, &conflicts, ime_active, *action);
+            command_editor_for_action(
+                ui,
+                state,
+                &keymap,
+                &conflicts,
+                keyboard_capture_blocked,
+                *action,
+            );
         }
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::RingPad) => {
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
@@ -4025,13 +4038,13 @@ fn command_editor_for_action(
     state: &mut PreferencesState,
     keymap: &Keymap,
     conflicts: &[BindingConflict],
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
     action: KeyAction,
 ) {
     ui.label(egui::RichText::new("割り当て編集").strong());
     ensure_command_editor_loaded(state, keymap, action);
     if let Some(slot) = state.command_capture_slot
-        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, ime_active)
+        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, keyboard_capture_blocked)
     {
         match result {
             Ok(label) if slot < state.command_chord_inputs.len() => {
@@ -4440,9 +4453,9 @@ fn parse_command_chord_inputs_for_editor(
 fn poll_command_chord_capture(
     ctx: &egui::Context,
     action: KeyAction,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) -> Option<Result<String, String>> {
-    if ime_active {
+    if keyboard_capture_blocked {
         return None;
     }
     #[cfg(windows)]
@@ -9614,7 +9627,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     );
                 }
             });
-        ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグと、本のサムネイルの読書位置メーターに適用されます。メーターには記録時の読み方向を使います。");
+        ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグに適用されます。");
     });
     anchored(ui, state, "spread/cursor-direction", |ui, state| {
         let s = &mut state.settings;

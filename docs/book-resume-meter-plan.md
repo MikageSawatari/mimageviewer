@@ -1,7 +1,7 @@
 # §1.256 一覧の本サムネイルの読書位置メーター — 記録値を表示する設計
 
 作成・改訂: 2026-10-04。コード調査基準: `next-file-ops` / `e804db069`。
-状態: **実装完了・関連自動検証済み。全体ゲートはlauncher入力用release binaryの準備待ち。** 独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。確認用ビルドは前回完了。commit・アプリ起動は行っていない。
+状態: **実装完了・関連自動検証済み。全体ゲートはlauncher入力用release binaryの準備待ち。** 独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。常に左→右への変更とその確認用ビルドも完了。commit・アプリ起動は行っていない。
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
 
 ## 0. 合意した設計と前提
@@ -10,11 +10,11 @@
 
 2026-10-04の追加決定: 通常削除への共通待機拡張は採用しない。短い競合で存在しないpathの行が残ることを許容し、削除時にはmapの該当scopeを消す。rename / purge retryなど既存の待機経路だけにBookResumeWriterを加える。新しい未開始削除要求・専用barrier・UI待機を作らない (§7)。
 
-**記録時の「何ページ目 / 全何ページ / 右綴じ」を保存し、一覧はその値を表示する。** 読み順や中身を後から数え直さない。起動時の全行読込と稀なDB変更後の再読込を既存writerで行い、通常のスクロール・描画はメモリmap参照だけにする。
+**記録時の「何ページ目 / 全何ページ」を保存し、一覧はその値を表示する。** 読み順や中身を後から数え直さない。起動時の全行読込と稀なDB変更後の再読込を既存writerで行い、通常のスクロール・描画はメモリmap参照だけにする。
 
 利用者了承済みの割り切り: 旧行の追加列がNULLなら次に読むまで不表示。読んだ後に内容や並びが変わっても次の記録までは保存した比率を表示。旧版へ戻して読んだときに新列の古い値が残っても許容する。移行失敗はログとメーター非表示で扱い、従来の位置復元は維持する。proof JSON、trigger、内容版・manifest、監視、未開封本の方向解決、可視範囲worker、これらに付随する世代管理は採用しない。
 
-前提のコード上の注意: 保存済み `page` はページ番号ではなくraw `items` index。HUDには要求どおりの読めるページ列を使う計算があり (§1.5)、これを再利用できる。一方Remoteの検証結果にはordinal/totalはあるが右綴じ情報が無い (§6)。初版は合意されたNULL保存を選ぶ。backlog §2.2 の「右上/右下未着手」は現行layoutと異なるため、現行 `ThumbnailOverlayLayout` を基準に下端の帯だけを足す (§5)。記録値の表示方式は実施可能で、通常削除の順序保証は上記の割り切りで判断済み。
+前提のコード上の注意: 保存済み `page` はページ番号ではなくraw `items` index。HUDには要求どおりの読めるページ列を使う計算があり (§1.5)、これを再利用できる。Remoteは既存のNULL保存を維持する (§6)。backlog §2.2 の「右上/右下未着手」は現行layoutと異なるため、現行 `ThumbnailOverlayLayout` を基準に下端の帯だけを足す (§5)。記録値の表示方式は実施可能で、通常削除の順序保証は上記の割り切りで判断済み。
 
 ## 1. 現状のコード事実
 
@@ -80,7 +80,7 @@
 
 ## 2. 記録値・対象セル・鮮度の契約
 
-保存する補助値は `ReadingMeterValue { ordinal, total, rtl }`。`ordinal` はHUDと同じ読めるページ列での1-based位置、`total` はその列の長さ、`rtl` は記録時の実効 `reading_direction == ReadingDirection::Rtl`。`spread_mode.is_rtl()` だけではSingleの右綴じを落とすため使わない。記録時に既にあるdirectionを使い、追加DB readをしない。
+保存する補助値は `ReadingMeterValue { ordinal, total }`。`ordinal` はHUDと同じ読めるページ列での1-based位置、`total` はその列の長さ。塗る方向は常に左から右とし、読み方向を保存しない。追加DB readをしない。
 
 raw `page` と復元処理は変更しない。補助値は実際の読書時点のsnapshotであり、「現在の内容ならraw indexがどのページへ復元されるか」を保証する値ではない。読み順のfilter・sortに従って分母も変わる。親の一覧を絞り込み/並べ替えただけでは保存値を書き換えない。戻って読み直すとordinalも比率も減る。最大到達ページ・読了判定ではない。
 
@@ -98,7 +98,7 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 | PdfFile扱いのEPUB | resume保存keyと当該cell pathが一致して行があれば同じmap参照で表示。変換generation/内容を解き直さず、異なるkeyを推測で結ばない |
 | 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | 今回の描画変更の対象外。通常物理一覧のFolder/ZipFile/PdfFileセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootは非対象 (既存surface/positionとinstalled itemflagsを参照) |
 
-行無し、追加列が1つでもNULL、total==0、不正値 (ordinal<=0 / ordinal>total / rtlが0・1以外) ではtrackも含め描かない。0%への代用やclampはしない。既に保存された有効値は、内容の変更・外部削除・password状態・認識規則変更等と再照合しない。通常の一覧更新によりcellが消えると描画も消えるだけで、本ごとの監視は不要。
+行無し、追加列が1つでもNULL、total==0、不正値 (ordinal<=0 / ordinal>total) ではtrackも含め描かない。0%への代用やclampはしない。既に保存された有効値は、内容の変更・外部削除・password状態・認識規則変更等と再照合しない。通常の一覧更新によりcellが消えると描画も消えるだけで、本ごとの監視は不要。
 
 ## 3. 永続化・記録入口
 
@@ -109,18 +109,19 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 ```sql
 ALTER TABLE book_resume ADD COLUMN page_ordinal INTEGER;
 ALTER TABLE book_resume ADD COLUMN page_total INTEGER;
-ALTER TABLE book_resume ADD COLUMN reading_rtl INTEGER;
 ```
 
-既存writer自身の接続でPRAGMA table_infoを見て不足列だけ追加する。3列追加は1transactionで行い、旧行はNULL、新DBも同じ経路を使う。UI側の既存open/getにALTERや追加列照会を足さない。移行成功後に初回全行読込を行う。移行失敗ならログ、メーター利用不能とし、従来2列へのraw記録/SELECTと復元を継続する。読書位置を削除・初期化しない。trigger、JSON、schema専用journal、再試行loopを作らない。旧版のpage-only upsertで新列の古い値が残るのは了承済み。
+2026-10-04の方向変更: 元の `path/page` はリリース済みであり、旧2列DBからの移行を維持する。一方、メーターの追加列はこのブランチの未リリース変更なので、CLAUDE.md「永続データ・スキーマ変更時の判断」の未リリース扱いでordinal/totalの2列追加へ変更する。以前の3列追加版 (`reading_rtl` を含む) の開発用DBへの移行・列削除・互換分岐は作らない。実データをagentが削除することもない。
+
+既存writer自身の接続でPRAGMA table_infoを見て不足列だけ追加する。2列追加は1transactionで行い、旧行はNULL、新DBも同じ経路を使う。UI側の既存open/getにALTERや追加列照会を足さない。移行成功後に初回全行読込を行う。移行失敗ならログ、メーター利用不能とし、従来2列へのraw記録/SELECTと復元を継続する。読書位置を削除・初期化しない。trigger、JSON、schema専用journal、再試行loopを作らない。旧版のpage-only upsertで新列の古い値が残るのは了承済み。
 
 ### 3.2 ローカルの記録
 
-`record_book_resume` の既存画像種別/ZIP root条件を維持し、§1.5の共通計算からordinal/total、現在のdirectionからrtlを取得する。計算できなければ補助値無しとする。追加scan、read_dir、PDF/ZIP列挙、page-count DB readを行わない。HUDと同じcached列を参照し、必要なposition検索は記録時だけ行う。ページ送り毎の追加全列clone/別のfilter処理を作らない。
+`record_book_resume` の既存画像種別/ZIP root条件を維持し、§1.5の共通計算からordinal/totalを取得する。方向は保存しない。計算できなければ補助値無しとする。追加scan、read_dir、PDF/ZIP列挙、page-count DB readを行わない。HUDと同じcached列を参照し、必要なposition検索は記録時だけ行う。ページ送り毎の追加全列clone/別のfilter処理を作らない。
 
-writerへ `path / raw_idx / Option<ReadingMeterValue>` を送り、UI側のmapも同じ共通入口で更新する。既存 `last_book_resume` のdedupをpath/raw_idxだけで済ませず、補助値を含むrecord全体で比較する。同じidxでも読み順の分母・ordinal・direction、NULL→有効値が変われば更新する。direction変更は次の位置記録で保存する (変更だけを理由に全本の値を書き直さない)。ordinal/totalはusizeからSQLite INTEGERへのchecked変換を行い、表現できない値を丸めず補助値無しで記録する。
+writerへ `path / raw_idx / Option<ReadingMeterValue>` を送り、UI側のmapも同じ共通入口で更新する。既存 `last_book_resume` のdedupをpath/raw_idxだけで済ませず、補助値を含むrecord全体で比較する。同じidxでも読み順の分母・ordinal、NULL→有効値が変われば更新する。directionだけの変更は保存値を変更しない。ordinal/totalはusizeからSQLite INTEGERへのchecked変換を行い、表現できない値を丸めず補助値無しで記録する。
 
-通常モードのwriterは1回のupsertでraw pageと追加3列を同時保存する。補助値無しなら3列ともNULLに上書きし、旧meterを残さない。未移行モードのwriterは従来pageだけを書き、メーターは描画しない。書込を受け付けた最新値をmapへ即時反映するため、一覧へ戻るとDB commitを待たずに直近の位置が出る。書込失敗の割り切りは§7。
+通常モードのwriterは1回のupsertでraw pageと追加2列を同時保存する。補助値無しなら2列ともNULLに上書きし、旧meterを残さない。未移行モードのwriterは従来pageだけを書き、メーターは描画しない。書込を受け付けた最新値をmapへ即時反映するため、一覧へ戻るとDB commitを待たずに直近の位置が出る。書込失敗の割り切りは§7。
 
 ## 4. 一覧用メモリmapと稀な更新
 
@@ -128,7 +129,7 @@ writerへ `path / raw_idx / Option<ReadingMeterValue>` を送り、UI側のmap�
 
 App全体が正規化keyから保存補助値Optionへのmapを1つ持つ。mapと読込受付の所有者はBoxに置き、既存Appのstackサイズ上限を維持する (状態・所有・処理経路は不変)。NULL/不正値行はNoneとして保持し、表示しないが登録件数をmap.lenで求める (UIでCOUNTしない)。初回読込前/初期化失敗はmapのOptionがNone、利用可能時はSomeとし、別の準備完了/失敗boolを足さない。main/detachedのitemsやnavigation cacheにmapを複製しない。各viewerで記録する共通入口が同じmapを更新する。キーは既存book_resumeと同じDriveStripped正規化で、別ドライブ同名pathの衝突も現行仕様を引き継ぐ。
 
-既存 `BookResumeWriter` に全行読込command/結果を加え、新規workerを作らない。起動時は移行後にSELECTを1回行い、追加3列が有効な行のmapを構築してUIへ返す。初回のmapがまだ無くても一覧は通常表示し、到着後にrepaintする。初回待機中の記録は§4.3の差分へ保持し、移行/初回SELECT成功後のsnapshotに反映して初めて描く。初期化失敗ではNoneのままで、raw記録は続けてもmeterだけは出さない。UI側はDBを読まない。表示OFFでも起動時の1回読込と記録時更新を行い、ONへ戻す際の追加loadを不要にする。
+既存 `BookResumeWriter` に全行読込command/結果を加え、新規workerを作らない。起動時は移行後にSELECTを1回行い、追加2列が有効な行のmapを構築してUIへ返す。初回のmapがまだ無くても一覧は通常表示し、到着後にrepaintする。初回待機中の記録は§4.3の差分へ保持し、移行/初回SELECT成功後のsnapshotに反映して初めて描く。初期化失敗ではNoneのままで、raw記録は続けてもmeterだけは出さない。UI側はDBを読まない。表示OFFでも起動時の1回読込と記録時更新を行い、ONへ戻す際の追加loadを不要にする。
 
 ### 4.2 書き込み経路別の同期方法
 
@@ -142,7 +143,7 @@ App全体が正規化keyから保存補助値Optionへのmapを1つ持つ。map�
 | storeのcopy / 内容identityからの復元 | DB転記完了後だけ全行再読込。コピー先既存行優先などproduction SQLの結果を採用。内容identity復元は開始前のwriter待機・延期がなく、未処理Recordとの競合は§7の合意済み割り切り。通常file copyがresume DBを変更しないならこのための再読込は不要 |
 | 設定リセット/復元・データストア再接続 | resume DBをクリア/置換/再接続する経路ならmapもclearして、新接続workerで全行再読込。メーターcheckboxのdefault/resetだけならmapを消さない |
 
-rename/copyの全列移行は既存store registryを使用し、追加3列も一緒に運ぶ。稀な操作後の全行SELECTは許容し、独自prefix移行SQLや新しい差分DB監視は作らない。移行中は影響scopeの古いcell値を出さず、結果でrepaintする。他viewerのitems/worker/選択は変更しない。起動時の既存移行回復・後続cleanup完了も同じ再読込入口へ接続する。
+rename/copyの全列移行は既存store registryを使用し、追加2列も一緒に運ぶ。稀な操作後の全行SELECTは許容し、独自prefix移行SQLや新しい差分DB監視は作らない。移行中は影響scopeの古いcell値を出さず、結果でrepaintする。他viewerのitems/worker/選択は変更しない。起動時の既存移行回復・後続cleanup完了も同じ再読込入口へ接続する。
 
 **独立レビューP2の決定:** BookResumeWriterの未処理commandを既存 `rename_migration_writers_busy` に含める。enqueueからDB処理完了までを数え、worker内のcommit完了後に解除する。UIは既存のpredicate/poll経路で開始を繰り延べ、待機・join・DB照会をしない。既存待機があるrename / 明示メタデータ転記 / purge retry等では、Recordが旧keyへ着地してから操作が始まる順序を維持する。book_resume専用の直列化境界は作らない。通常deleteと内容identity復元は§7の割り切りを適用する。
 
@@ -174,9 +175,9 @@ inner下端の高さ3 logical pt、左右はinner端、上に2pt gapを初期値
 
 cell_h・cell rect・並び順・image fit・scroll content・hit-testは不変。回転/補正済bitmapやcatalog thumbnailに焼き込まない。選択borderは上層、cutは既存content painterのopacity、タグhit-testは同じBadgePlacementを使う。狭いcellでもmeterとbadgeは重ねない。
 
-### 5.2 保存された右綴じを使う方向
+### 5.2 常に左から右へ伸ばす
 
-`fullscreen_seek_direction.is_rtl(if saved.rtl { Rtl } else { Ltr })` を使う (`src/settings.rs:3480`, `src/settings.rs:3510`, `src/ui_fullscreen.rs:30568`)。FollowReadingは保存RTLなら右→左、それ以外は左→右。LeftToRightは常に左→右。現在開いている別本のdirectionや未開封本のspread DB/PDF文書方向を読み直さない。
+2026-10-04の利用者決定: メーターは常に左から右へ伸ばす。右綴じ・左綴じが混在する一覧の向きを揃えるため、`fullscreen_seek_direction` や本の実効読み方向とは連動させない。paint helperは方向引数を持たず、左端から `width * ordinal / total` だけ塗る。読み順での位置・見開きanchorの数え方は変えない。
 
 比率はordinal/total。1/N、途中、N/Nをそのまま描き、向きはrectの塗り起点だけを変える。seek方向設定の変更は全可視cellの次paintへ即時反映し、map/DBは変更しない。本の綴じ方向自体は次の位置記録で保存値が更新される。
 
@@ -184,15 +185,15 @@ cell_h・cell rect・並び順・image fit・scroll content・hit-testは不変�
 
 色は `os_theme::book_resume_meter_palette(effective_dark)` 相当のsemantic helperで所有し、paint側へLight/DarkのRGB分岐を分散させない (`src/os_theme.rs:291`, `src/os_theme.rs:343`)。trackは不透明の暗灰/明灰、fillはテーマ別青緑、1px境界を候補にsnapshotで確定する。白/黒/鮮やかな表紙上でもfillと未塗りを区別する。テーマは当該UIのresolved visualsを使い、OSテーマ固定値をcacheしない。テーマ変更はpalette再取得だけ。
 
-設定は **`thumb_show_book_resume_meter`、既定ON**、全体共通。環境設定 **表示 → サムネイル** に **「本のサムネイルに前回の読書位置を表示」**。説明は「記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません」。favorite/本別設定・方向独立設定は増やさない。閲覧表示の「ページシークバーの方向」説明にmeterにも適用する旨を足す (`src/ui_dialogs/preferences/pages.rs:1359`, `src/ui_dialogs/preferences/pages.rs:1623`, `src/ui_dialogs/preferences/pages.rs:9504`)。
+設定は **`thumb_show_book_resume_meter`、既定ON**、全体共通。環境設定 **表示 → サムネイル** に **「本のサムネイルに前回の読書位置を表示」**。説明は「メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません」。favorite/本別設定・方向独立設定は増やさない。閲覧表示の「ページシークバーの方向」には連動せず、以前追加したmeterへの適用説明を削除する。
 
 既存draft編集→OK→prepare/merge→ `install_preferences_settings` → `settings.save()` を使う (`src/ui_dialogs/preferences.rs:1924`, `src/ui_dialogs/preferences.rs:1957`, `src/ui_dialogs/preferences.rs:2448`, `src/ui_dialogs/preferences.rs:2592`)。OFFはpaintを止めるだけでmap/記録は保持、ONは保持mapから表示する。Cancelはruntimeへ適用しない。serde欠落既定値・settings.db roundtrip・default/reset・Preferences管理フィールドとしてのmergeを揃え、既存設定確定のrepaint経路へ接続する。
 
-## 6. Remoteの選択: 初版は追加3列をNULL保存
+## 6. Remoteの選択: 初版は追加2列をNULL保存
 
-Remoteの `ValidatedPageContext` はraw page_index / 1-based page_number / page_count /記録可否を持つが、rtlを持たない (`src/remote_ipc/container.rs:1985`)。Folderはmaterialize列の読めるpageだけを数え、ZIPも同様、PDFはpage_num+1/count。クライアント入力値は検証で書き換えられる (`src/remote_ipc/container.rs:2859`, `src/remote_ipc/container.rs:3468`, `src/remote_ipc/container.rs:3695`, `src/remote_ipc/container.rs:3748`, `src/remote_ipc/container.rs:7114`)。
+Remoteの `ValidatedPageContext` はraw page_index / 1-based page_number / page_count /記録可否を持つ (`src/remote_ipc/container.rs:1985`)。Folderはmaterialize列の読めるpageだけを数え、ZIPも同様、PDFはpage_num+1/count。クライアント入力値は検証で書き換えられる (`src/remote_ipc/container.rs:2859`, `src/remote_ipc/container.rs:3468`, `src/remote_ipc/container.rs:3695`, `src/remote_ipc/container.rs:3748`, `src/remote_ipc/container.rs:7114`)。
 
-ordinal/totalは既に得られるが、Remoteの閲覧directionは別のcontainer payload/settings経路にあり、今のwrite handoffの検証済みtupleに無い。本件でdirection再解決・session state・wire fieldを足さず、**Remote producerはraw indexを従来どおり記録し、追加3列は全てNULL、mapの当該keyの値はNone**とする (`src/remote_ipc/ui.rs:2754`)。件数には行を含めるがメーターは描かない。本体の無関係な `App.reading_direction` や過去mapのrtlを流用しない。Remoteで読んだ本のmeterはローカルで再び読むまで消える、という合意済みの見え方を採用する。非root ZIP等のrecord_resume=falseでは従来どおり保存せず、過去root行を消さない。
+Remote producerは従来のNULL記録を維持する。今回はRemoteの検証済みtupleからHUD読み順の位置へ変換する経路を追加せず、**raw indexを従来どおり記録し、追加2列は全てNULL、mapの当該keyの値はNone**とする (`src/remote_ipc/ui.rs:2754`)。件数には行を含めるがメーターは描かない。Remoteで読んだ本のmeterはローカルで再び読むまで消える、という合意済みの見え方を採用する。非root ZIP等のrecord_resume=falseでは従来どおり保存せず、過去root行を消さない。
 
 本体egui一覧だけの描画変更であり、IPC wire/Web DOM/CSS/HTTP thumbnailにmeterを追加しない。**protocol 63を維持** (`crates/remote-ipc/src/lib.rs:31`)。Remoteのraw復元・履歴・bookmarkは既存動作を保ち、remote-webにDB writerを作らない。NULL対応の共通record入口へ接続するcore内部変更だけ。
 
@@ -206,7 +207,7 @@ ordinal/totalは既に得られるが、Remoteの閲覧directionは別のcontain
 
 ### 合意済みのまれな競合: 内容identity復元に新しい延期状態を足さない
 
-条件は、復元元のページRecordが未処理の数ミリ秒の間に、利用者が確認ウィンドウの復元ボタンを押して転記が始まる場合。転記が先に旧行を読めばコピー先には古いordinal/total/rtl (旧NULLならメーター無し) が入り、後から元keyの最新Recordがcommitしてもコピー先は更新されない。raw位置も同じ旧行からコピーされる。完了後のmap再読込はDBの確定値を採用するため、この古い値も一覧に出る。コピー先をローカルで開いて記録すれば最新値に置き換わる。既存のraw位置転記にも同じ競合があり、今回だけのメーター監視・再転記を加えない。
+条件は、復元元のページRecordが未処理の数ミリ秒の間に、利用者が確認ウィンドウの復元ボタンを押して転記が始まる場合。転記が先に旧行を読めばコピー先には古いordinal/total (旧NULLならメーター無し) が入り、後から元keyの最新Recordがcommitしてもコピー先は更新されない。raw位置も同じ旧行からコピーされる。完了後のmap再読込はDBの確定値を採用するため、この古い値も一覧に出る。コピー先をローカルで開いて記録すれば最新値に置き換わる。既存のraw位置転記にも同じ競合があり、今回だけのメーター監視・再転記を加えない。
 
 §4.2のとおり既存の延期機構がないため、利用者指定の割り切りを採用する。確認ウィンドウで利用者がボタンを押してから始まる復元が記録直後の短い時間に重なることは実用上まれであり、未開始要求・追加状態機械・専用barrierは作らない。したがって「paused Recordから本番復元入口を通し、解除後に最新値がコピーされる」という順序保証も追加せず、その保証を前提とする回帰テストは作らない。既存待機があるrename / purge retryの順序テストは維持する。
 
@@ -223,13 +224,13 @@ DB書込失敗・稀な再読込失敗については次を設計責任者/利�
 
 | 対象 | 検証内容 |
 | --- | --- |
-| 移行/後方互換 | 出荷済2列DBに3列追加、旧path/page保持・NULL、再起動の冪等性、新DB、移行失敗でraw記録/復元維持。旧版SELECT/page-only upsertが動き、新列が残る了承済み挙動。新版NULL保存は3列を消す |
+| 移行/後方互換 | 出荷済2列DBに2列追加、旧path/page保持・NULL、再起動の冪等性、新DB、移行失敗でraw記録/復元維持。旧版SELECT/page-only upsertが動き、新列が残る了承済み挙動。新版NULL保存は2列を消す |
 | 記録/HUD共有 | helperとHUDの列/位置が同じ。Image/Video/Folder/ZipImage/PdfPageの混在、filter・通常/詳細sort・stack flat・本扱いOFF・製本順。raw idxとordinalの違い、anchor無し、0/1枚・途中・最後・後戻り、RTL Single、見開き/連結/Split/補助表紙。HUDに相手pageが出てもanchorだけ記録 |
-| 記録更新 | raw/3列の同時upsert、同idxでもtotal/ordinal/rtl/NULLが変わればdedupしない。読んで一覧へ戻るとmapが即時最新、OFFでも記録維持。内容/並びが変わっても読み直し前は保存値のまま |
+| 記録更新 | raw/2列の同時upsert、同idxでもtotal/ordinal/NULLが変わればdedupしない。読んで一覧へ戻るとmapが即時最新、OFFでも記録維持。内容/並びが変わっても読み直し前は保存値のまま |
 | map初回/再読込 | 初回worker全行read、NULL/不正値非表示、読込中のSet/Remove/Clear/RemoveScopeを古いsnapshotが上書きしない。再読込receiver差替え、起動回復、別viewer記録で共通map更新・他context不変 |
 | 他のDB変更 | Remoteで当該keyの値をNoneへ更新、非記録Remoteは不変。delete/rename/move/copy/内容identity復元のproduction DB結果とmapの一致。prefix境界、コピー先既存行優先、Clear後の再記録、DB再接続/reset。無関係なscopeを消さない |
 | writerとpath-key操作の順序 | Recordをworkerで決定的に未処理のまま保持してrename / purge retryを開始。開始predicateが待機し、Record commit後に操作が始まり、旧行が復活せず新行が最新となること。sleepの偶然やFIFO単体だけで検証しない。通常purgeは§7の許容競合とmap除去だけを確認 |
-| 対象セル/比率 | Folder/ZipFile/PdfFileだけ。変換書庫/Stack/個別page等は無し、旧NULL/行無し/total0はtrackも無し。1/N・途中・N/N、FollowReading×保存rtl、LeftToRight、方向設定変更は再read無し |
+| 対象セル/比率 | Folder/ZipFile/PdfFileだけ。変換書庫/Stack/個別page等は無し、旧NULL/行無し/total0はtrackも無し。1/N・途中・N/N、常に左→右、読み方向/シーク方向の変更でも保存値・塗り方向は不変 |
 | layout/snapshot | meterとbadge rect非交差 (右下filter件数を含む)、極小cellは既存badge保持/meter省略、cell_h/scroll/sort/hit-test不変。Light/Dark・最小幅/普通幅・DPI・選択/check・編集/tag/pin・形式/長名/評価/filter件数、cut opacity、動画長さ回帰。純fixtureとPreferences説明をsnapshot |
 | 設定の通し | 実PreferencesStateで編集→本番OK helper→保存→DB再load→開き直し。ON/OFF・方向保持、Cancel不変、欠落field/default/resetはON、favorite/runtime列設定mergeを破壊しない |
 | 速度/Remote | 通常paintからDB/FS/列挙へ到達しない。可視key memoを別idxへ誤流用しない。scrollしても全行SELECT/worker/thread/watchが増えず、idle repaint loop無し。IPC63/wire fixture・Remote raw復元/履歴/bookmark不変 |
@@ -244,13 +245,13 @@ DB書込失敗・稀な再読込失敗については次を設計責任者/利�
 
 §1のfile:lineは実装前の調査記録として保持する。以下は実装後の参照である。
 
-- `src/book_resume_db.rs:139` のtransactionで追加3列を移行し、同じwriterのRecord / Read / ClearをFIFOで処理する。`is_busy` はenqueueからcommand処理完了までを数える。既存UIのopen/getにALTERやメーターSELECTを追加していない。
-- `src/ui_fullscreen.rs:16055` のHUD用 `image_reading_position` を `src/app.rs:50854` の記録で共有する。見開きanchor、混在列、RTL Singleを既存読み順のまま扱う。
+- `src/book_resume_db.rs:135` のtransactionで追加2列を移行し、同じwriterのRecord / Read / ClearをFIFOで処理する。`is_busy` はenqueueからcommand処理完了までを数える。既存UIのopen/getにALTERやメーターSELECTを追加していない。
+- `src/ui_fullscreen.rs:16055` のHUD用 `image_reading_position` を `src/app.rs:50865` の記録で共有する。見開きanchor、混在列、RTL Singleを既存読み順のまま扱う。
 - `src/app/book_resume_meter.rs:112` にローカル/Remoteの共通記録と即時map更新を集約した。NULLも件数用に保持する。読込後の差分をsnapshotに適用し、receiver差替えで古い読込を捨てる。path自身をmemo keyにしてviewer/idxの世代を増やしていない。
 - `src/app.rs:40458` の既存待機predicateにwriterを追加した。通常削除は `:38721` のscope除去だけ、rename移行完了 `:40759` / purge retry完了 `:41009` / 明示整理 `src/ui_dialogs/metadata_cleanup.rs:64` / 内容identityの転記 `src/app/content_identity_restore.rs:416` はworker再読込へ接続した。通常file copyと設定リセット/復元はresume DBを変更しないため再読込しない。
-- `src/thumb_overlay_layout.rs:477` は右下badgeのcell基準にも予約を反映する。極小cellは既存badgeを維持してmeter無し。`os_theme` のpalette、保存RTLと既存seek方向、cut opacityをpaint helperから使う。
+- `src/thumb_overlay_layout.rs:477` は右下badgeのcell基準にも予約を反映する。極小cellは既存badgeを維持してmeter無し。`os_theme` のpalette、常に左→右の塗り方向、cut opacityをpaint helperから使う。
 - `src/settings.rs:4437` と `src/ui_dialogs/preferences/pages.rs:1609` に既定ONの全体設定を追加した。実PreferencesState、本番OK helper、save、settings.db再読込、開き直し、Cancelを通すテストを追加した。
-- Remoteは共通記録へ補助値Noneを渡して3列をNULLにする。非root ZIPの非記録入口は旧root行を維持する。`crates/remote-ipc/src/lib.rs:31` のprotocol 63とwireは変更していない。
+- Remoteは共通記録へ補助値Noneを渡して2列をNULLにする。非root ZIPの非記録入口は旧root行を維持する。`crates/remote-ipc/src/lib.rs:31` のprotocol 63とwireは変更していない。
 
 変更ファイル (この作業の差分):
 
@@ -288,7 +289,7 @@ DB書込失敗・稀な再読込失敗については次を設計責任者/利�
 
 確認用ビルドは `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 1` がexit 0。core / Remote service / EPUB PDF workerを `target/dev-runtime` に作成し、FFmpegとVC runtimeを配置した。VC runtimeのPE検証も成功 (runtime=4 / pe=3)。`-PreserveRuntime` により常駐製品を停止せず、製品binaryを起動していない。ログは `target/book-resume-build-dev.log`。既存vendorのEffeTune v0.12.0を使用した確認用coreのビルド成功であり、上記のrelease承認境界の不一致が解決したという意味ではない。
 
-利用者の手動確認は、インストール済み/トレイ常駐のmImageViewerを終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。既定では通常の `%APPDATA%\mimageviewer` を使い、実際の設定/データを更新し得る。Folder / ZIP / PDFを途中・最後まで読んで一覧へ戻る、保存RTLと方向設定の組合せ、表示ON/OFFのOK保存と開き直し、狭いセルの右下badgeとの非交差を確認する。agentによるアプリ起動・commitは行っていない。
+利用者の手動確認は、インストール済み/トレイ常駐のmImageViewerを終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。既定では通常の `%APPDATA%\mimageviewer` を使い、実際の設定/データを更新し得る。Folder / ZIP / PDFを途中・最後まで読んで一覧へ戻る、左右綴じやシーク方向にかかわらず常に左→右の表示、表示ON/OFFのOK保存と開き直し、狭いセルの右下badgeとの非交差を確認する。agentによるアプリ起動・commitは行っていない。
 
 ### 後続独立レビューへの対応・EffeTune差し替え後の再検証
 
@@ -302,3 +303,24 @@ DB書込失敗・稀な再読込失敗については次を設計責任者/利�
 | `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-full.ps1 -SuppressCrashDialogs` | 101、テスト実行前のbuild停止 (実行件数0)。EffeTune承認エラーは出ず、launcher入力の `target/release/mimageviewer-core.exe` / `mimageviewer-remote.exe` / `mimageviewer-epub-pdf.exe` が未作成。ログ `target/book-resume-test-full-retest.log` |
 
 現在の未解決gate条件はrelease版の上記3入力を準備して全体gateを完走すること。前回の10220 passed / 1 failedは履歴であり、今回の全体成功件数として足し合わせない。確認用dev-runtime成果物は前回のEffeTune v0.12.0を配置したものなので、今回のv0.11.1差し替え済み配布物としては扱わない。今回は文書修正と指定の再検証だけで確認用buildの再作成はしていない。製品binaryの起動・commitなし。
+
+### 常に左→右への方向変更 (2026-10-04)
+
+利用者の実機確認でメーター表示はOK。右綴じ・左綴じが混在する一覧を見やすくするため、常に左から右へ伸ばす決定を反映した。記録/DB/mapからrtlを除去し、追加列はordinal/totalだけ。既存2列DBの後方互換、NULL非表示、HUD読み順/見開きanchor、map更新と既存待機経路は維持する。方向・schema・描画と関連テスト/文書だけを変更し、他機能の既存差分は保持する。独立レビューはP1/P2指摘なし。commit・製品binary起動なし。
+
+指定検証は当該未コミット差分・通常featureで実行 (`CARGO_BUILD_JOBS=1`)。ログは `target/book-resume-ltr-*.log`。
+
+| コマンド | exit / 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 0 / 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 |
+| `cargo test -p mimageviewer --lib book_resume` | 0、30 passed。旧2列DBの移行後がpath/page/ordinal/totalだけであること、2列追加のtransaction rollback、anchor/比率/map/設定保存、方向変更でも記録値が不変を確認 |
+| `cargo test -p mimageviewer --lib thumb_overlay_layout` | 0、20 passed |
+| `cargo test --test ui_snapshot` | 0、71 passed。既存の他機能snapshotも通常比較で成功 |
+| `python scripts/check_ui_glyphs.py` | 0、dangerous glyphsなし |
+| `cargo test -p mimageviewer --lib remote_static_page_progress_is_the_next_pc_open_position` | 0、1 passed。2列NULL記録を確認 |
+| `cargo test -p mimageviewer --lib remote_nested_page_without_resume_preserves_previous_root_meter` | 0、1 passed。既存root位置/メーター不変 |
+
+`UPDATE_SNAPSHOTS=1` は `--lib book_resume_meter_snapshot` (exit 0、3 passed) と `--test ui_snapshot preferences_book_resume_meter` (exit 0、2 passed) にだけ指定。変更した5 PNGは目視で左→右の伸び・最後までの塗り・cut opacity・帯/badge非交差、Light/Dark/高DPIと設定の説明/折り返しを確認した。他機能だけの既存変更ファイルは作業開始時のhashと一致し、`tests/ui_snapshot.rs` も変更していない。既存差分がある `manual/grid.html` も本件ではメーター段落だけを変更し、ファイル整理先の段落は保持した。
+
+確認用ビルドも `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 1` がexit 0。core / Remote service / EPUB PDF workerを再作成し、現在の承認済みEffeTune v0.11.1、FFmpegとVC runtimeを配置した。VC runtime PE検証も成功。ログは `target/book-resume-ltr-build-dev.log`。通常profileの利用者向け起動コマンド・注意は上記と同じ。今回はFolder/ZIP/PDFを読んで一覧へ戻り、右綴じ/左綴じとシークバー方向にかかわらずメーターが左→右へ伸びることを確認する。製品binaryはagentが起動していない。

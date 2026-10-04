@@ -28,6 +28,51 @@
 use egui_kittest::Harness;
 
 #[test]
+fn preferences_transfer_entry_disabled_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_disabled_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_preferences_transfer_disabled_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_export_explanation_light() {
+    snapshot_with_theme(
+        "preferences_transfer_export_explanation_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_preferences_transfer_explanation_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_import_explanation_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_import_explanation_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_explanation_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_transfer_entry_light() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_preferences_transfer_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_entry_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_preferences_transfer_entry_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_transfer_light() {
     snapshot_with_theme(
         "preferences_transfer_light",
@@ -58,9 +103,11 @@ fn preferences_transfer_narrow_result() {
 
 #[test]
 fn preferences_transfer_busy_dark() {
-    snapshot_with_theme(
+    snapshot_with_theme_and_contrast_settling(
         "preferences_transfer_busy_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
         |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, true),
     );
 }
@@ -99,36 +146,100 @@ fn file_organize_destinations_light() {
         },
     ];
     let mut focus = Some((1, Some(ShellTransferOperation::Copy)));
-    snapshot_with_theme(
+    snapshot_file_organize_modal(
         "file_organize_destinations_light",
         mimageviewer::os_theme::ResolvedTheme::Light,
-        move |ui| {
-            ui.heading("ファイル整理先");
-            let _ = mimageviewer::ui_dialogs::file_organize::render_file_organize_contents(
-                ui,
-                &sources,
-                &destinations,
-                &mut focus,
-            );
-        },
+        egui::vec2(1000.0, 620.0),
+        sources,
+        destinations,
+        focus.take(),
     );
 }
 
 #[test]
 fn file_organize_empty_dark() {
-    snapshot_with_theme(
+    snapshot_file_organize_modal(
         "file_organize_empty_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        |ui| {
-            ui.heading("ファイル整理先");
-            let _ = mimageviewer::ui_dialogs::file_organize::render_file_organize_contents(
-                ui,
-                &[std::path::PathBuf::from(r"C:\写真\画像.jpg")],
-                &[],
-                &mut None,
-            );
-        },
+        egui::vec2(1000.0, 620.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        vec![],
+        None,
     );
+}
+
+#[test]
+fn file_organize_many_dark() {
+    snapshot_file_organize_modal(
+        "file_organize_many_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1000.0, 620.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        (0..30)
+            .map(|row| mimageviewer::settings::FileOrganizeDestination {
+                name: format!("整理先 {row}"),
+                path: r"\\server\share\長い名前の写真フォルダ\さらに長い名前のフォルダ\整理先"
+                    .into(),
+            })
+            .collect(),
+        Some((
+            2,
+            Some(mimageviewer::shell_file_ops::ShellTransferOperation::Move),
+        )),
+    );
+}
+
+#[test]
+fn file_organize_narrow_light() {
+    snapshot_file_organize_modal(
+        "file_organize_narrow_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(420.0, 320.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        vec![mimageviewer::settings::FileOrganizeDestination {
+            name: "長い名前の整理先".into(),
+            path: r"\\server\share\長い名前の写真フォルダ\整理先".into(),
+        }],
+        Some((
+            0,
+            Some(mimageviewer::shell_file_ops::ShellTransferOperation::Copy),
+        )),
+    );
+}
+
+fn snapshot_file_organize_modal(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    sources: Vec<std::path::PathBuf>,
+    destinations: Vec<mimageviewer::settings::FileOrganizeDestination>,
+    mut focus: Option<(
+        usize,
+        Option<mimageviewer::shell_file_ops::ShellTransferOperation>,
+    )>,
+) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(
+            ctx,
+            theme,
+            mimageviewer::settings::TextContrast::Standard,
+        );
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        let _ = mimageviewer::ui_dialogs::file_organize::show_file_organize_modal(
+            ctx,
+            &sources,
+            &destinations,
+            &mut focus,
+        );
+    });
+    harness.run();
+    harness.snapshot(name);
 }
 
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
@@ -182,6 +293,16 @@ fn snapshot_with_theme_and_contrast(
     name: &str,
     resolved: mimageviewer::os_theme::ResolvedTheme,
     contrast: mimageviewer::settings::TextContrast,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_and_contrast_settling(name, resolved, contrast, None, build_ui);
+}
+
+fn snapshot_with_theme_and_contrast_settling(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    animated_steps: Option<usize>,
     mut build_ui: impl FnMut(&mut egui::Ui),
 ) {
     let mut fonts_ready = false;
@@ -205,7 +326,11 @@ fn snapshot_with_theme_and_contrast(
                 });
         });
 
-    harness.run();
+    if let Some(steps) = animated_steps {
+        harness.run_steps(steps); // A production spinner intentionally never settles.
+    } else {
+        harness.run();
+    }
     harness.snapshot(name);
 }
 

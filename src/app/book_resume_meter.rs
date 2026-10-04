@@ -115,7 +115,7 @@ impl App {
         idx: usize,
         value: Option<ReadingMeterValue>,
     ) {
-        let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total, v.rtl));
+        let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
         let record = (path, idx, value);
         if self.last_book_resume.as_ref() == Some(&record) {
             return;

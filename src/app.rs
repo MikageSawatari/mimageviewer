@@ -50881,11 +50881,7 @@ impl App {
         let indices = self.get_still_image_indices();
         let meter =
             crate::ui_fullscreen::image_reading_position(&indices, idx).and_then(|ordinal| {
-                crate::book_resume_db::ReadingMeterValue::new(
-                    ordinal,
-                    indices.len(),
-                    self.reading_direction == crate::settings::ReadingDirection::Rtl,
-                )
+                crate::book_resume_db::ReadingMeterValue::new(ordinal, indices.len())
             });
         if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx, meter)) {
             return;

@@ -341,7 +341,6 @@ pub(crate) fn paint_book_resume_meter(
     cell: egui::Rect,
     layout: &ThumbnailOverlayLayout,
     value: Option<crate::book_resume_db::ReadingMeterValue>,
-    rtl: bool,
     is_cut: bool,
 ) {
     let (Some(rect), Some(value)) = (layout.book_resume_meter, value) else {
@@ -357,11 +356,7 @@ pub(crate) fn paint_book_resume_meter(
     let palette = crate::os_theme::book_resume_meter_palette(ui.visuals().dark_mode);
     painter.rect_filled(rect, 0.0, palette.track);
     let width = rect.width() * value.fraction();
-    let fill = if rtl {
-        egui::Rect::from_min_max(egui::pos2(rect.max.x - width, rect.min.y), rect.max)
-    } else {
-        egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + width, rect.max.y))
-    };
+    let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + width, rect.max.y));
     painter.rect_filled(fill, 0.0, palette.fill);
     // One physical pixel, inside the owned strip at every DPI.
     painter.rect_stroke(
@@ -1010,8 +1005,8 @@ mod book_resume_meter_tests {
     use crate::book_resume_db::ReadingMeterValue;
 
     #[test]
-    fn book_resume_meter_paint_uses_saved_fraction_direction_and_cut_opacity() {
-        for rtl in [false, true] {
+    fn book_resume_meter_paint_always_fills_left_to_right_with_saved_fraction_and_cut_opacity() {
+        for ordinal in [1, 4, 10] {
             for cut in [false, true] {
                 let ctx = egui::Context::default();
                 let cell =
@@ -1036,12 +1031,7 @@ mod book_resume_meter_tests {
                                     book_resume_meter: Some(meter),
                                     ..Default::default()
                                 },
-                                Some(ReadingMeterValue {
-                                    ordinal: 4,
-                                    total: 10,
-                                    rtl,
-                                }),
-                                rtl,
+                                Some(ReadingMeterValue { ordinal, total: 10 }),
                                 cut,
                             );
                         });
@@ -1061,14 +1051,10 @@ mod book_resume_meter_tests {
                         _ => None,
                     })
                     .expect("meter fill rectangle");
-                assert!((fill.rect.width() - meter.width() * 0.4).abs() < 0.001);
+                assert!((fill.rect.width() - meter.width() * ordinal as f32 / 10.0).abs() < 0.001);
                 assert_eq!(fill.rect.min.y, meter.min.y);
                 assert_eq!(fill.rect.max.y, meter.max.y);
-                if rtl {
-                    assert_eq!(fill.rect.max.x, meter.max.x);
-                } else {
-                    assert_eq!(fill.rect.min.x, meter.min.x);
-                }
+                assert_eq!(fill.rect.min.x, meter.min.x);
             }
         }
     }
@@ -1092,9 +1078,7 @@ mod book_resume_meter_tests {
                         has_value.then_some(ReadingMeterValue {
                             ordinal: 1,
                             total: 1,
-                            rtl: false,
                         }),
-                        false,
                         false,
                     );
                 });
@@ -1167,7 +1151,7 @@ mod book_resume_meter_tests {
             VideoThumbnailIndicator::default(),
             cut,
         );
-        paint_book_resume_meter(ui, rect, &layout, value, value.is_some_and(|v| v.rtl), cut);
+        paint_book_resume_meter(ui, rect, &layout, value, cut);
     }
 
     fn fixture(ui: &mut egui::Ui) {
@@ -1176,23 +1160,19 @@ mod book_resume_meter_tests {
         let zip = GridItem::ZipFile(PathBuf::from("book.zip"));
         let pdf = GridItem::PdfFile(PathBuf::from("book.pdf"));
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
-        ui.label("保存された位置: 1/10・途中 (右綴じ)・最後");
+        ui.label("保存された位置: 1/10・途中・最後 (常に左→右)");
         ui.horizontal(|ui| {
-            for (item, color, ordinal, rtl) in [
-                (&folder, egui::Color32::WHITE, 1, false),
-                (&zip, egui::Color32::BLACK, 4, true),
-                (&pdf, egui::Color32::from_rgb(245, 30, 110), 10, false),
+            for (item, color, ordinal) in [
+                (&folder, egui::Color32::WHITE, 1),
+                (&zip, egui::Color32::BLACK, 4),
+                (&pdf, egui::Color32::from_rgb(245, 30, 110), 10),
             ] {
                 fixture_cell(
                     ui,
                     egui::vec2(140.0, 94.0),
                     item,
                     color,
-                    Some(ReadingMeterValue {
-                        ordinal,
-                        total: 10,
-                        rtl,
-                    }),
+                    Some(ReadingMeterValue { ordinal, total: 10 }),
                     false,
                     false,
                 );
@@ -1206,7 +1186,6 @@ mod book_resume_meter_tests {
                     Some(ReadingMeterValue {
                         ordinal: 6,
                         total: 10,
-                        rtl: false,
                     }),
                     true,
                     false,
@@ -1216,7 +1195,6 @@ mod book_resume_meter_tests {
                     Some(ReadingMeterValue {
                         ordinal: 6,
                         total: 10,
-                        rtl: true,
                     }),
                     false,
                     true,
@@ -1245,7 +1223,6 @@ mod book_resume_meter_tests {
                     Some(ReadingMeterValue {
                         ordinal: 3,
                         total: 10,
-                        rtl: false,
                     }),
                     true,
                     false,

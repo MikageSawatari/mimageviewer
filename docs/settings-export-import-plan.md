@@ -1,7 +1,7 @@
 # §1.317 環境設定のエクスポート・インポート設計・実装記録
 
 作成: 2026-10-04。対象: `next-file-ops` / `C:\home\mimageviewer-fileops`。
-状態: **実装済み (レビュー前)。独立レビューの P2 2 件を受けて入力遮断の範囲を縮小し、限定独立再レビュー・修正後の全自動検証・確認用 build は完了。利用者の実機確認・設計担当の検収は未完了**。
+状態: **設定メニュー「設定の復元…」への入口移動と、設計担当の案 2 に従った同時表示時の未確定 draft 保護は実装済み (§8.6)。独立レビューで指摘された背面の操作カスタマイズのキー捕捉も修正し、限定独立再レビュー・自動検証・確認用 build は完了 (§8.7)。旧結果は §8 に履歴として保持する。今回の実機確認・検収は未完了**。
 要件の正本は [next-release-backlog.md §1.317](next-release-backlog.md)。
 前段 `e189fbe86` (§1.256)、`c608f0822` (§1.263) を含むツリーで調査した。
 設計段階では本書だけを作成し、製品コード・他文書・実装テストは変更していなかった。
@@ -18,7 +18,7 @@
 | `src/settings.rs:4265`、`src/ui_dialogs/preferences/pages.rs:8632` | ファイル整理先は環境設定で編集するが名前・パス・ID を持つ PC 固有情報。全体を除外する。 |
 | `src/settings.rs:7145`、`src/settings_db.rs:20` | Default / serde(default) は欠落を既定値で補う。今回の「欠落は現在値を保持」と異なるので、ファイルを Settings へ deserialize しない。 |
 | `src/settings_db.rs:48`、`:892`、`:937`、`:954` | DB schema family は 1。save_full は複合値と KV を既存 transaction に保存する。転送ファイル版は DB schema と独立。新テーブル・DB migration は不要。 |
-| `src/ui_dialogs/preferences.rs:722`、`:1278`、`src/settings.rs:8382` | PreferencesState.settings が draft。生成時は preferences_snapshot() が、お気に入り overlay を外した共通設定を渡す。転送元もこの draft にする。 |
+| `src/ui_dialogs/preferences.rs:722`、`:1278`、`src/settings.rs:8382` | PreferencesState.settings が draft。生成時は preferences_snapshot() が、お気に入り overlay を外した共通設定を渡す。取り込み先はこの draft。書き出し元は確定済み Settings の preferences_snapshot() とする。 |
 | `src/ui_dialogs/preferences.rs:1892`、`:1944`、`:1977`、`:2473`、`:2617` | OK は prepare_preferences_state_settings_for_commit → install_preferences_settings → 既存副作用 → save_checked。runtime / 利用データの移送、共通表示値の routing、保存失敗の通知を再利用する。 |
 | `src/settings.rs:9692`、`src/ui_dialogs/preferences.rs:1898` | overwrite_non_preferences_from は環境設定外の live 値を引き継ぐ関数。転送対象判定ではない。標準表示値は呼出前に退避し route_preferences_view_state へ通る。 |
 | `src/ui_dialogs/preferences.rs:1959`、`src/settings.rs:8393` | 再生位置・音声トラックは最新 live map を維持する。お気に入り専用の表示値を維持し、draft の表示値だけを標準へ反映する。import が map や clear_requested を触る必要はない。 |
@@ -37,8 +37,9 @@
 `docs/spec.md` §8、`docs/preferences-layout-guidelines.md`、`docs/ui-responsiveness.md` §4、
 `docs/keymap-spec.md`、`docs/key-customization-impl-plan.md`。
 
-採用案は **小さい純粋な変換モジュール + PreferencesState 所有のファイル処理**。
-取込完了で対象値だけを draft へ一度に載せ、画面で確認して OK。キャンセルなら draft を破棄する。
+採用案は **小さい純粋な変換モジュール + SettingsRestoreState 所有のファイル処理**。
+書き出しは確定済み設定を使う。取り込みの検証成功後に環境設定の全体設定を開き、
+対象値だけを draft へ一度に載せ、画面で確認して OK。キャンセルなら draft を破棄する。
 直接 Settings / SQLite / 他 DB を更新する案は、確認できず新しい確定経路も要るため採用しない。
 既存 OK の viewer 終了・再表示、一覧再読込、native presenter 更新を使い、
 import 専用の live rebuild や detached 述語・viewport 経路を新設しない。
@@ -182,7 +183,7 @@ import は UTF-8 の BOM も許容する。拡張子ではなく format で識�
 }
 ```
 
-例は一部だけ。通常 export は全対象の現在 draft 値を出す。
+例は一部だけ。通常 export は全対象の確定済み共通設定値を出す。
 app_version は build の定数から生成し、import の参考表示だけに用いる。
 ラベル、ユーザー名、PC 名、生成元 data-dir、ファイルパス、自由記述、時刻は埋め込まない。
 PreferencesState の UI 状態、Settings の保存メタ、DB の版番号も入れない。
@@ -260,7 +261,7 @@ setter が対象以外に触れるのは分類表で明示した互換 mirror �
 PreferencesState の補助入力値を同期する必要が生じた場合は対象 field の setter に集約し、
 PreferencesState 全体の new() や draft 全体の sanitize() を呼ばない。
 
-export も同じ validator を使う。既存 draft に不正値や許容外の任意文字列があれば
+export も同じ validator を使う。確定済み設定に不正値や許容外の任意文字列があれば
 該当項目を省いて一覧で知らせ、除外値を補充しない。
 出力 key 集合が policy の export wire_key 以下であることをテストする。
 正常な状態なら全項目を出す。不正を理由に任意の文字列をそのまま通知・ログへ埋め込まない。
@@ -268,65 +269,86 @@ export も同じ validator を使う。既存 draft に不正値や許容外の�
 
 ## 4. UI・非同期所有・OK / キャンセル
 
-環境設定の **「全体設定」ページ末尾**に「設定の持ち運び」欄を追加する。
-右ペイン共通 ScrollArea を使い、新ページやフッターの固定高は増やさない。
-`ui.horizontal_wrapped` に「書き出し…」「取り込み…」を置く。
-説明: 「この画面の移行できる設定をファイルに保存します。保存先や利用データ、操作カスタマイズは含みません。」
-「操作カスタマイズは設定メニューの専用画面から書き出せます」の案内も置く。
-検索索引に「持ち運び / 移行 / エクスポート / インポート」を登録する。
+入口は **設定メニュー →「設定の復元…」**に集約する。
+同ダイアログに「環境設定を書き出し…」「環境設定を取り込み…」ボタンを置く。
+環境設定の「全体設定」から「設定の持ち運び」欄とその検索索引を削除する。
+環境設定が表示中なら新しい二つの転送ボタンだけを無効にし、
+「環境設定を閉じてから行ってください」を disabled tooltip で示す。
+従来の復元・操作カスタマイズの入口と操作は制限しない。
+入口の無効化は書き出し・取り込みで揃えるが、受付済みの書き出しは後から環境設定が
+開いても確定済み値の保存を完了させる。
+書き出し・取り込みの説明には同じ見た目の egui Modal を使い、転送対象の範囲を
+ファイル選択前に伝える。世代を選んで「この時点に戻す」既存復元とは用途・対象が違う。
 
-書き出しは **現在の draft** を使う。「この画面の未確定の変更も含みます」を明記。
-rfd の JSON filter と既定名 preferences.mivprefs.json を使い、同名の上書き確認は
-既存の保存ダイアログに任せる。保存先の記憶を Settings に追加しない。
-書き出しはアプリ設定を確定しない。後で環境設定をキャンセルしても書き出したファイルは残る。
+書き出し説明では、移行先に依存しない環境設定の一部だけを保存し、パス・利用データ・
+操作カスタマイズは含まないことを示す。「書き出す」で保存先選択へ進む。
+書き出しは **確定済み Settings の preferences_snapshot()** を使い、お気に入り専用値や
+未確定 draft を含めない。rfd の JSON filter と既定名 preferences.mivprefs.json を使い、
+同名の上書き確認は既存の保存ダイアログに任せる。保存先の記憶を Settings に追加しない。
+選択後は worker でファイルを書き、完了・失敗の結果通知を説明 Modal に表示する。
+書き出しは live 設定や DB を変更しない。
 
-取り込みは rfd の open_file で 1 ファイル選択。別の差分承認画面は作らず、
-正常項目を draft へ載せた後に結果欄を表示する。
+取り込み説明では、「この時点に戻す」と対象が異なり、移行可能な環境設定の一部だけが
+変わること、移行先の保存先・利用データ・操作カスタマイズ等を保持することを明示する。
+「ファイルを選ぶ」で rfd の open_file へ進み、1 ファイルを選択する。
+worker の読込・検証が成功したら、受入境界一か所で既存の show_preferences を確認する。
+環境設定が独立して開かれていれば読み込み結果を捨てて中止を通知し、draft / live / DB は触らない。
+開かれていなければ設定の復元を閉じ、環境設定の「全体設定」
+(PreferencesPage::General) を開く。正常項目を新しい draft へ一度に載せ、既存の結果欄を表示する。
 「N 項目を読み込みました。OK で保存します。キャンセルで今回の変更を取り消します。」
 変更なしの有効項目数と実際に変わった項目数は区別できるようにする。
 折りたたみの一覧で、変わった項目の日本語名・不正項目の名と理由・未知項目の件数を表示。
 未知キーや値の原文を大量表示しない。利用者は通常のページへ移動して値を確認・再編集できる。
 有効項目が 0 の場合も成功したように見せず「取り込める項目がありませんでした」。
-ファイル全体エラーは赤のメッセージ欄 + ログ、draft を変更しない。
+ファイル全体エラーは説明 Modal の結果通知 + ログ、環境設定を開かず live / DB を変更しない。
 
 **組合せ削減の採用**: ファイル選択後の read/parse/write は短いモーダル処理にする。
-PreferencesState に `Idle / Importing(receiver) / Exporting(receiver)` の一つの job owner
-を置き、同時処理や後続 job の queue を作らない。
+SettingsRestoreState に説明・転送処理・完了/失敗を一つの enum で所有させる。
+`None` が Idle、`Explanation / Importing(receiver) / Exporting(receiver) / Exported`
+が各段階を表す一つの job owner とし、失敗は Explanation 内の結果として通知する。
+状態を別の bool / pending 欄に分散させない。
+同時処理や後続 job の queue を作らず、PreferencesState に転送 receiver を持たせない。
 App の環境設定と操作カスタマイズの draft は、それぞれ `Option<Box<PreferencesState>>` に格納する。
-大きな一時編集状態を App の常時スタック配置から外す収納変更で、job/receiver の owner、
-take・OK・Cancel・再開時の寿命は変えない。結果表示はその State 内の `Option<PreferencesTransferFeedback>` に置く。
-処理中は環境設定の編集・ページ操作・OK・キャンセル・×・Escape を無効にし、
-その job が完了/失敗してから戻す。結果受信は try_recv、worker 終了で repaint を要求する。
-root には既存 egui Modal の処理中表示を重ね、独立 UI layer の popup は閉じる。
-メイン viewport の背面メニュー・ツールバーへの入力は、環境設定が登録済みの
-`common_modal_dialog_open` とその root の modal に任せる。転送専用の menu/toolbar guard は作らない。
+大きな一時編集状態を App の常時スタック配置から外す収納変更は維持し、draft の
+take・OK・Cancel・再開時の寿命は変えない。取り込み結果だけを PreferencesState 内の
+`Option<PreferencesTransferFeedback>` に渡し、既存の結果表示を再利用する。
+処理中は説明 Modal を busy 表示にし、設定の復元の操作・閉鎖と説明 Modal の
+実行・キャンセル・Enter / Escape を無効にする。結果受信は try_recv、worker 終了で repaint を要求する。
+説明・処理中・結果通知のいずれも、転送 Modal が実際に表示される間は背後の環境設定の
+UI / Enter / Escape / 閉鎖受付 / 破棄確認を止める。表示は show_settings_restore と既存 owner
+から導出し、worker の busy 判定と区別する。通知を閉じるキーで既存 draft を変更しない。
+操作カスタマイズの「押して入力」捕捉も、IME と転送 Modal の実表示を同じキー捕捉の
+可否判定へ通す。Modal の表示中は待機 slot・入力欄・編集通知を変えず、閉じれば捕捉を再開する。
+通常の設定復元が表示されているだけなら捕捉を止めず、既存復元項目も無効化しない。
+メイン viewport の背面メニュー・ツールバーへの入力は、show_settings_restore が登録済みの
+`common_modal_dialog_open` と説明 Modal に任せる。転送専用の menu/toolbar guard は作らない。
 **別窓・fullscreen・native 動画の入力は転送のために止めない。** 転送はファイルの
 読み書きと draft への反映だけで、別窓の閲覧状態と関係しないためである。
 転送専用の viewport sanitizer、passive event batch の破棄、detached activation/watch close の拒否、
 native HUD dim、semantic event・hold/repeat/長押しの終了をすべて撤去する。
-従来の環境設定/common modal が持つ挙動は HEAD のままにし、別窓の入力経路・状態 owner を変更しない。
-detached に差分がなくなるため detached-rework-plan §11 の今回の記録も削除する。
+従来の設定復元・環境設定/common modal が持つ挙動を保ち、別窓の入力経路・状態 owner を変更しない。
 ファイル I/O、JSON parse/serialize、flush、置換は worker 上。UI で DB open / stat /
-ファイル読込 / 同期 join をしない。既存のフォント/LUT等の処理中は transfer 開始も待つ。
+ファイル読込 / 同期 join をしない。取り込み成功後は通常の環境設定を開くため、
+既存のフォント/LUT等の準備と OK の判定をそのまま使う。
 
-環境設定に対する既存の背面入力ブロックを使い、処理中にメイン viewport の
-設定復元・操作カスタマイズ・ツールバー操作が始まらないことを本番 UI の入力経路で確認する。
+設定復元に対する既存の背面入力ブロックを使い、処理中にメイン viewport の
+環境設定・操作カスタマイズ・ツールバー操作が始まらないことを本番 UI の入力経路で確認する。
 別窓切替の禁止や転送専用の共通入力 owner は追加しない。
 既存の裏で動く再生位置保存等は止めず、修正済みの再生位置・音声トラックは OK の live merge で維持する。
 他の環境設定外の最新値には §1.305 の限界が残る (§2.3)。
 通常の設定操作は Idle で従来どおり。長時間待ち対策の retry / sleep / supersession /
 resume / 保存中のキャンセル後 rollback は追加しない。
 
-App の終了等で PreferencesState が drop された場合は receiver も消えるので、
+App の終了等で SettingsRestoreState が drop された場合は receiver も消えるので、
 完了値は別のダイアログへ到達しない。worker は Settings / App / DB の参照を保持せず、
 export では捕捉済み対象値だけ、import ではファイルと結果だけを所有する。
 export はアプリ終了後でも選択済みファイルへの書き出しを完了し得る。
 その理由だけで実設定の保存や次のセッションへの pending 復元を作らない。
 
 OK は手編集と同じ prepare → install → 副作用 → save_checked の一経路。
-Cancel / × は今回の import とそれ以前の未確定手編集をまとめて取り消す。
+Cancel / × は今回の import と環境設定で行った未確定手編集をまとめて取り消す。
 import を始める前の draft に戻す専用ボタン・履歴・部分 rollback は設けない。
-ファイル選択の Cancel は draft と既存の結果欄を変更しない。
+説明 Modal の Cancel とファイル選択の Cancel は設定を変更せず、環境設定も開かない。
 独自ショートカットは追加しない。Enter / Escape は dialog_enter_pressed /
 dialog_escape_pressed を使い、IME 変換中の入力で import・OK・閉鎖が発火しない。
 
@@ -381,14 +403,14 @@ URL、実行ファイル、LUT、プラグインの読み込み指定として J
 | 全体不正 / 互換 | 空・壊れた JSON・不正 UTF-8・サイズ/深さ超過・重複キー・別 format・版欠落/0/未来 v2 は draft/live/DB 不変。旧アプリ v1 の項目欠落、新アプリ v1 の未知キー、未知 enum は単純規則どおり。初回出荷 v1 fixture を保持。 |
 | 状態 owner | still_bottom_chrome 全到達状態と不正状態、複合キー欠落による 3 値保持。ファイルで独立 bool キーを偽造しても不変。loop と archive の enum/互換 mirror の通し。Default の Legacy は export で Ask、旧 mirror=true の Legacy は Convert として出力し、import の Legacy は無視。 |
 | ファイル保存 | 一時 data-dir 外の tempfile へ書いて読める。既存 export に対する write/置換失敗で既存ファイル保持、通知あり。失敗 cleanup を再帰 recovery にしない。 |
-| 非同期 lifecycle | job 二重開始なし、処理中の OK/Cancel/×/Enter/Escape 無効、spawn失敗・channel切断で Idle に戻り通知、state drop の結果が次の PreferencesState に届かない。App/DB を worker が所有しない。 |
-| 入力 handler | 転送処理中にメイン viewport の設定メニューの「設定の復元」「操作カスタマイズ」、ツールバーの操作を、本番環境設定と処理中 modal を描画した UI へ raw pointer 入力しても開始されないこと。common modal と唯一の job が維持され、ダイアログを閉じた後に通常操作が通ること。転送専用 guard や共通述語だけのテストで代替しない。 |
-| draft / 実際の OK | 既存 PreferencesTestApp と handler-level/headless UI を利用 (`preferences.rs:3619`、`:3692` の整理先テストが precedent)。取込直後の live / DB 不変、OK → install → save_checked → DB 再読込 → 環境設定再 open で同値。Cancel は import と既存手編集を破棄。export は draft の変更を含み live を確定しない。 |
+| 非同期 lifecycle | SettingsRestoreState の job 二重開始なし、説明 Modal の busy 中は実行/Cancel/×/Enter/Escape 無効、spawn失敗・channel切断で Idle に戻り通知、state drop の結果が次の SettingsRestoreState や PreferencesState に届かない。App/DB を worker が所有しない。 |
+| 入力 handler | 転送処理中にメイン viewport の設定メニューの「環境設定」「操作カスタマイズ」、ツールバーの操作を、本番設定復元と説明 Modal を描画した UI へ raw pointer 入力しても開始されないこと。common modal と唯一の job が維持され、ダイアログを閉じた後に通常操作が通ること。転送専用 guard や共通述語だけのテストで代替しない。 |
+| 入口 / draft / 実際の OK | 書き出しと取り込みで同じ見た目の説明 Modal を表示。説明/ファイル選択の Cancel は設定不変、全体エラーでは環境設定を開かない。検証成功時だけ設定復元から環境設定 General へ移り、既存結果欄を表示する。既存 PreferencesTestApp と handler-level/headless UI を利用 (`preferences.rs:3619`、`:3692` の整理先テストが precedent)。取込直後の live / DB 不変、OK → install → save_checked → DB 再読込 → 環境設定再 open で同値。Cancel は import と手編集を破棄。export は確定済み標準値を使い、未確定 draft を含まず live を変更しない。 |
 | 別 data-dir 往復 | TempDir A/B に独立 DB を用意。A の対象を export、B は異なるパス・整理先・フォント・Susie/VST/LUT・操作共有・利用データを持たせ import→OK→save→再読込。対象だけが A に一致し B の対象外が保持される。global data-dir を使う試験は既存 guard / 直列化を使い APPDATA に触らない。 |
 | 利用データ / 全設定の通し | ★・編集・本棚・タグ・コレクション・履歴・読書位置・normalize 等の DB と cache 行を B に用意し、import で削除/変更されないこと。read-only 比較と既存の fixture API を使う。reading_history_limit 不変で prune なし、clear_requested/インストール要求なし。対象設定による既存表示 cache の失効は別 assertion。 |
 | 標準/専用値・再生 | お気に入り overlay 適用中に export は標準値だけ。import→OK で標準だけ更新、favorite の専用値/記録と修正済みの live 再生位置・音声トラック更新を維持。details_selection_bar_mode と stack_script_enabled は出力・取込対象外。§1.305 の未修正値まで保持できるとは判定しない。 |
 | 共有 / 回帰 | keymap、ring、menu、context menu、gamepad は出力にも setter にもない。既存操作共有テストを再利用。通常画像/ZIP/PDF/動画、main/detached/Remote の設定反映は既存 OK の検証を再利用し、import 固有の経路がないことを確認。 |
-| UI / IME | 全体設定の新欄、結果/不正一覧、処理中状態の snapshot。既定幅/狭幅、明暗テーマ、長いメッセージの折返し。IME fake-input で変換確定が OK/取り込み/キャンセルを起こさない。既存 EXIF 入力をついでに変更しない。 |
+| UI / IME | 設定復元の二つの入口、書き出し/取り込み説明 Modal、結果/不正一覧、処理中状態の snapshot。環境設定 General の旧入口がないことも確認。既定幅/狭幅、明暗テーマ、長いメッセージの折返し。IME fake-input で変換確定が実行/OK/キャンセルを起こさない。既存 EXIF 入力をついでに変更しない。 |
 
 実行順は純粋 `cargo test -p mimageviewer --lib settings_transfer`、関連 preferences/
 settings/operation_customize_share の狭い filter、core check、fmt / glyph check、
@@ -417,11 +439,11 @@ import→Cancel / import→OK→再起動、暗/明テーマ・狭幅、IME 中�
 実装時の文書更新先:
 
 - `docs/spec.md` §8: 対象の境界、draft/OK、ファイル形式・互換・不正項目の規則。
-- `docs/architecture-overview.md`: 変換モジュールと PreferencesState ownership、
+- `docs/architecture-overview.md`: 変換モジュールと SettingsRestoreState の job ownership、
   永続化ストア一覧に利用者指定の JSON (正本 DB ではない) を追加。
 - `docs/README.md` と本書: 索引、確定判断、実装/検証/独立レビューの記録。
-- `htdocs/mimageviewer/manual/settings.html`: 「全体設定 → 設定の持ち運び」の操作、
-  未確定値の export、import 後の OK/Cancel、非対象、操作カスタマイズ共有への案内。
+- `htdocs/mimageviewer/manual/settings.html`: 「設定メニュー → 設定の復元」の操作、
+  説明画面、確定済み値の export、import 後の環境設定・OK/Cancel、非対象、操作カスタマイズ共有への案内。
 - `htdocs/mimageviewer/index.html` と `privacy.html`: §5 の同一事実を同時更新。
 - `docs/keymap-spec.md`: ボタン操作・dialog helper の固定入力を必要な範囲で記録。
   新規 KeyAction / keymap.ini の変更は不要。
@@ -434,12 +456,16 @@ JSON の形式版は技術仕様の本書/spec に記録する。実装・独立
 ## 7. 利用者・設計担当の判断記録
 
 設計段階に返した以下の推奨案は、2026-10-04 に利用者がすべて承認した。
+その後、同日の追加指示で入口を設定の復元へ移し、書き出し元を確定済み値へ変更した。
+最初の draft 書き出し判断は履歴であり、現在は §4 と下表の追加判断を適用する。
 代案は判断の経緯として残す。追加で詳細表示下部バーのモードとスタック script 有効化を
 除外し、§1.305 / §1.295 の既存 OK の限界を今回の修正対象に含めないことを承認した。
 
 | 判断 | 推奨案 / 代案とコスト |
 | --- | --- |
-| 現在の draft を書き出すか | draft を出す。未確定も含むと表示。確定済み値だけにする案は画面で見ている値とファイルが違うため採らない。 |
+| 現在の draft を書き出すか (初期判断・変更済み) | 当初は draft を出し、未確定も含むと表示していた。下記の追加指示により確定済み値へ変更した。 |
+| 入口と書き出し元 (追加指示) | 設定メニュー「設定の復元…」に「環境設定を書き出し…」「環境設定を取り込み…」を置き、同じ見た目の説明 Modal から進む。環境設定 General の旧欄を削除し、確定済み共通設定から書き出す。書き出し元と取り込み先を分け、環境設定 draft にファイル処理の owner を持たせない。 |
+| 取り込み後の確認 (追加指示) | 説明に「この時点に戻す」と対象が異なることと、移行先の利用データ等を保持することを明記する。ファイル検証成功後だけ環境設定 General を開き、draft と既存結果欄へ反映する。既存 OK で保存し、Cancel で破棄する。 |
 | CPU/GPU/AI/キャッシュ tuning | §2 表の手動並列数・先読み・容量・backend 等は一組で除外。AI 利用範囲 ai_feature_mode は閲覧機能の選択として含め、性能注意は既存 UI で確認できる。tuning まで移すなら移行先性能の影響と対象分類を再検討する。 |
 | 接続・自動通信 | Remote 全関連値と update_check_enabled は除外して移行先を保持。「取り込みで自動的に通信を有効化しない」を簡単に守る。更新確認まで移す代案は通信 opt-in の扱いを別途説明する必要がある。 |
 | 起動フォルダのモードだけ移すか | パスと一組で除外。Specific だけ載せると移行先の古い specific path が採用されるので、部分移行をしない。 |
@@ -463,6 +489,10 @@ JSON の形式版は技術仕様の本書/spec に記録する。実装・独立
 上記は実装範囲の承認であり、実装・テスト・独立レビューの検収完了を意味しない。
 
 ## 8. 実装・検証の記録 (2026-10-04)
+
+以下の §8.1–§8.4 は、入口を環境設定の全体設定に置いていた時点の実装・検証履歴。
+SettingsRestoreState へ入口と job owner を移す今回の変更に対する検証結果ではない。
+変更がない分類・変換等の証拠は範囲を確認して再利用し、入口・所有・UI の現在の証拠は別途追記する。
 
 ### 8.1 変更ファイルと確認した境界
 
@@ -605,3 +635,149 @@ preferences.rs は finally で元 bytes を復元し、その後の限定再レ�
 | `git diff --check` | 0。 |
 | `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0、PASS。メイン lib は 10,259 passed / 52 ignored。workspace / integration / snapshot / doctest と vendor の egui / egui-wgpu / eframe まで完走。`target/preferences-transfer-scope-full.log`。 |
 | `.\scripts\build-dev.ps1 -PreserveRuntime` | 0。修正後ソースから core / remote / EPUB PDF worker を dev-runtime に再 build。VCRT 検査 runtime=4 / pe=3 も成功。`target/preferences-transfer-scope-build-dev.log`。製品起動なし。 |
+
+### 8.5 「設定の復元」への入口移動 (2026-10-04 利用者要望)
+
+利用者の実機確認後、§4 の入口を「設定の復元」へ移した。今回の変更は転送 UI・
+環境設定への受渡し・関連試験/文書だけ。開始時からあるファイル整理・本の読書位置等の
+未コミット差分を保持し、コミットや製品バイナリ起動は行わない。
+
+| 確認した file:line | 前提 / 変更 |
+| --- | --- |
+| `src/ui_dialogs/settings_restore.rs:1153`、`:1164` | 設定復元の既存画面に二つの入口を配置。他の復元・操作共有の処理や子ダイアログがある間は開始しない。 |
+| `src/app.rs:19783`、`:19835`、`:19843` | 環境設定と設定復元は既存 common modal に登録済み。新しい main / detached 入力 owner は作らない。 |
+| `src/ui_dialogs/settings_restore.rs:41`、`:413` | 説明・単一 worker receiver・結果を一つの Box owner に収納。説明中/処理中は親の操作・閉鎖を止め、child Escape を親へ漏らさない。 |
+| `src/ui_dialogs/preferences/transfer.rs:65`、`:102`、`src/settings.rs:8382` | 説明の確認後だけファイル選択へ進み、確定済み標準設定の preferences_snapshot から portable projection を書き出す。favorite overlay や未確定 draft は出さない。 |
+| `src/ui_dialogs/preferences/transfer.rs:130`、`src/ui_dialogs/preferences.rs:2143` | worker の検証成功後だけ、既存初期化 helper で新規 draft を生成し、取り込み結果を載せて General を開く。 |
+| `src/ui_dialogs/preferences/pages.rs:28` | 旧「設定の持ち運び」入口・検索 anchor を削除。取り込み結果欄は全体設定の先頭で表示。 |
+| `src/ui_dialogs/preferences.rs:2535`、`:2536`、`:2679` | OK の prepare → install → save_checked は既存経路のまま。Cancel は既存の破棄確認へ通す。 |
+
+独立 `gpt-6.1-sol` / `xhigh` は単一 owner → fresh draft → 既存 OK の設計境界を確認した。
+試験の補強として、背面の環境設定入口の遮断/解除と、非処理中の通常 Escape が
+説明だけを閉じることを追加した。初回の「製品コードに修正必須の指摘なし」は、
+以下の追加確認で見つかった未確定 draft の破棄経路について撤回した。
+`ui_main.rs:6657`、`:7690`、`:7713` のメニューには pointer の common-modal guard がなく、
+通常の環境設定は `egui::Window` である。common predicate の登録だけでは、環境設定と
+設定復元をどちらの順でも同時に開くことを止めない。現在の取り込み成功処理は新規 draft を
+作るため、その状況では既存の未確定 draft を捨てる。これは利用者の前提との矛盾であり、
+環境設定表示中の復元入口を拒否するか、既存復元 UI を保って転送入口だけを止めるかの
+判断を利用者へ照会した。設計担当は案 2 (既存復元を保ち、新しい転送だけを制限) を採用した。
+両順の保護と修正後の検証は §8.6 に記録する。§8.5 の成功はその修正前の履歴である。
+テストの初回コンパイルは新 fixture の型指定/借用順序で exit 101。製品 core check は 0。
+fixture を修正し、修正後の検証結果を以下へ記録する。
+
+| 今回のコマンド / 確認 | exit code / 結果 |
+| --- | --- |
+| `cargo fmt` | 0。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0。`target/preferences-transfer-entry-check.log`。 |
+| `cargo test -p mimageviewer --lib settings_transfer` | 0、15 件。`target/preferences-transfer-entry-settings_transfer.log`。分類・通信三フラグ・形式検証・atomic replace は変更していない。 |
+| `cargo test -p mimageviewer --lib preferences_transfer` | 0、9 件。`target/preferences-transfer-entry-preferences-transfer.log`。 |
+| `cargo test -p mimageviewer --lib preferences` | 0、103 件。`target/preferences-transfer-entry-preferences.log`。 |
+| `cargo test -p mimageviewer --lib settings_restore` | 0、28 件。`target/preferences-transfer-entry-settings_restore.log`。 |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot preferences_transfer` | 0、8 件。入口の明暗/書き出し・取り込み説明を追加し、結果の明暗/狭幅/処理中を更新。全 8 画像を目視確認。初回は busy spinner の継続 repaint で exit 101。処理中画像だけ run_steps(4) とし、他画像の既存 settle 動作は維持した。 |
+| `cargo test --test ui_snapshot` | 0、75 件。`target/preferences-transfer-entry-snapshot.log`。 |
+| `cargo fmt --check`、`python scripts/check_ui_glyphs.py`、`git diff --check` | 0。危険な glyph なし。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0、PASS。メイン lib は 10,261 passed / 52 ignored (873.13 秒)。workspace / integration / ui_snapshot (75 件) / doctest と vendor 3 crate を完走。`target/preferences-transfer-entry-full.log`。 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 未実施。同時表示時の draft 保護を含む前提修正を待つ。現在の自動 gate の成功を、未解決の入口問題の検収として扱わない。製品起動なし。 |
+
+別窓・native・メインメニューの source、App 本体、分類 module、製品ページ/privacy は
+今回変更していない。開始時の bytes と SHA-256 を比較して一致を確認した。
+記録: `target/preferences-transfer-entry-untouched-baseline.json`。
+
+### 8.6 案 2: 既存操作を保持し、転送入口と取り込み受入で draft を保護
+
+設計担当の決定 (2026-10-04) により、既存の「この時点に戻す」、完全リセット、
+操作カスタマイズの共有等は変更しない。表示述語は既存の show_preferences だけを使い、
+新しい状態を追加しない。書き出し・取り込みの入口は両方とも表示中に無効化して揃えた。
+受付済みの書き出しは確定値だけを読むため、後から環境設定が開いても完了させる。
+取り込みは poll の成功結果受入一か所で表示状態を確認し、開かれていれば既存の失敗通知へ
+移して終了する。新規 draft 生成・既存 draft の置換・live 変更・DB 保存を行わない。
+
+試験は両画面をどちらの順でも開いて新転送ボタンの disabled と既存復元ボタンの enabled を
+確認し、環境設定を閉じれば転送を再度使えることを確認する。逆順の読込完了では
+draft の pointer / 設定 / 検索入力、live 設定、DB と save generation の不変、通知の描画を確認する。
+追加確認で、失敗通知が busy=false のため背後の環境設定にも raw Escape が届くことを確認した。
+実際に転送 Modal を描く条件 (show_settings_restore と既存 owner の存在) を派生述語にし、
+環境設定の UI / Enter / Escape / 閉鎖受付 / 破棄確認の表示を同じ条件で止める。
+新しい永続状態や別窓の制約は追加しない。通知の Escape と書き出し結果の Enter は、
+本番の描画順 (環境設定 → 設定復元) で背後の検索入力・draft を保つことを試験する。
+修正後の自動検証・確認用 build の結果を以下に記録する。
+
+| 確認した file:line | 案 2 の境界 |
+| --- | --- |
+| `src/ui_dialogs/settings_restore.rs:1159`、`:1174`、`:1179`、`:1186` | show_preferences から新しい二つの入口だけを無効化し、disabled tooltip で理由を表示。既存の復元入口は変更しない。 |
+| `src/ui_dialogs/preferences/transfer.rs:175` | worker 成功結果の受入一か所で既存の表示 flag を確認し、独立して開いた draft を置き換えない。 |
+| `src/ui_dialogs/preferences/transfer.rs:48`、`src/ui_dialogs/preferences.rs:2079`、`:2251`、`:2836` | 実表示条件から UI / キー / 閉鎖 / 破棄確認を保護。worker busy とは別の派生述語で、状態は増やさない。 |
+| `src/ui_dialogs/preferences/transfer.rs:689`、`:741`、`:837` | 両順の入口無効化・既存復元維持、完了時の draft / live / DB 保護、通知 Escape / Enter の入力漏れを本番順で試験。 |
+
+限定独立再レビュー (`gpt-6.1-sol` / `xhigh`) は表示境界の製品修正に追加指摘なし。
+試験の本番描画順と一致する検索語についての助言を反映した。
+初回の保護追加後テストは 10 pass / 1 fail (exit 101)。再確認用の環境設定を開いたまま
+次の取り込みへ進む旧 fixture を、通常のキャンセルで閉じてから次の取り込みへ進む形に修正した。
+
+| 修正後のコマンド / 確認 | exit code / 結果 |
+| --- | --- |
+| `cargo fmt`、`cargo fmt --check` | 0。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0。`target/preferences-transfer-final-check.log`。 |
+| `cargo test -p mimageviewer --lib settings_transfer` | 0、15 件。`target/preferences-transfer-final-settings_transfer.log`。分類 gate・通信三フラグ・検証・atomic replace は維持。 |
+| `cargo test -p mimageviewer --lib preferences_transfer` | 0、12 件。`target/preferences-transfer-final-preferences_transfer.log`。両順の保護と通知のキーボード境界を含む。 |
+| `cargo test -p mimageviewer --lib preferences` | 0、106 件。`target/preferences-transfer-final-preferences.log`。 |
+| `cargo test -p mimageviewer --lib settings_restore` | 0、28 件。`target/preferences-transfer-final-settings_restore.log`。 |
+| `cargo test --test ui_snapshot` | 0、76 件。`target/preferences-transfer-final-snapshot.log`。新しい無効状態の dark snapshot は生成後に目視確認。 |
+| `python scripts/check_ui_glyphs.py` | 0、危険な glyph なし。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0、PASS。メイン lib は 10,264 passed / 52 ignored (884.84 秒)。workspace / integration / ui_snapshot (76 件) / doctest と vendor 3 crate を完走。`target/preferences-transfer-final-full.log`。 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0。core / remote / EPUB PDF worker を通常 feature の dev-runtime で作成。VCRT/PE 検査も成功。`target/preferences-transfer-final-build.log`。製品起動なし。 |
+| `git diff --check`、保護ファイルの SHA-256 比較 | 0。前段変更・別窓・native・分類・製品ページ/privacy の保護対象は開始時 bytes と一致。 |
+
+§1.263 の表形式化・§1.256 の左→右化のコードと関連画像は変更していない。
+開始時の SHA-256 と照合し、一致を確認 (`target/preferences-transfer-guard-protected-files.json`)。
+別窓・native・App・メインメニュー・分類・製品ページ/privacy の bytes も前記 baseline と一致。
+コミット・製品バイナリ起動は行わず、実機確認と設計担当の検収は利用者へ引き継ぐ。
+
+### 8.7 P2: 操作カスタマイズの「押して入力」を転送 Modal の背面で捕捉しない
+
+独立レビューで、操作カスタマイズは環境設定より後、設定復元より前に描かれるため
+(`src/app.rs:85115` / `:85117` / `:85118`)、転送 Modal の Enter / Escape を背面の
+割り当て編集が先に捕捉する経路が指摘された。既存の捕捉可否は IME だけを見ていた。
+`show_operation_customize_dialog` で IME または既存の preferences_transfer_dialog_open を
+使って判定し、割り当て編集から poll_command_chord_capture まで同じ値を渡す。
+引数名を keyboard_capture_blocked に揃え、IME の状態を偽装したり新しい状態を足したりしない。
+捕捉の入口で停止するため Win32 key edge と egui event の両経路で消費も draft 変更も行わない。
+
+本番順の Harness は説明の Escape / 通常キー、完了通知の Enter / Escape、処理中の Enter /
+Escape で、待機 slot・入力欄・編集対象・通知・エラー・live 設定と save generation の不変を
+検証する。説明の Enter による native ファイル選択は headless 試験で起動しない。
+Modal を閉じた後、通常の設定復元を開いたまま A が入力されて捕捉待機が終了することも確認する。
+既存の復元項目・分類・DB・別窓の入力経路は変更しない。修正後の検証結果は完了後に記録する。
+
+限定独立再レビュー (`gpt-6.1-sol` / `xhigh`) は追加指摘なし。native / egui の両捕捉経路より
+前に停止し、停止した key edge は次 frame に持ち越して後日捕捉しないことを確認した。
+実装境界は `src/ui_dialogs/preferences.rs:3033` と `pages.rs:4047` / `:4458`、
+本番順の回帰試験は `src/ui_dialogs/preferences/transfer.rs:837`。
+
+初回の全体 gate は exit 101。メイン lib は 10,266 pass / 1 fail / 52 ignored。
+失敗した既存の往復試験は、処理中 spinner の継続 repaint に Harness::run の max_steps=4
+で静止を要求していた (`transfer.rs:594`)。取り込み worker を待つ三つのループを
+run_steps(2) に揃え、deadline・設定・対象外・DB・利用データ・Cancel の assertion は維持した。
+製品の処理・待機・キャンセルは変更せず、修正した fixture で関連試験と全体 gate を再実行する。
+
+| 今回のコマンド / 確認 | exit code / 結果 |
+| --- | --- |
+| `cargo fmt`、`cargo fmt --check` | 0。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0。`target/preferences-transfer-capture-check.log`。 |
+| `cargo test -p mimageviewer --lib preferences_transfer` | 0、13 件。`target/preferences-transfer-capture-preferences_transfer.log`。 |
+| `cargo test -p mimageviewer --lib preferences` | 0、107 件。`target/preferences-transfer-capture-preferences.log`。 |
+| `cargo test -p mimageviewer --lib settings_restore` | 0、28 件。`target/preferences-transfer-capture-settings_restore.log`。 |
+| `cargo test --test ui_snapshot` | 0、76 件。`target/preferences-transfer-capture-snapshot.log`。画像変更なし。 |
+| `python scripts/check_ui_glyphs.py` | 0、危険な glyph なし。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 修正後 0、PASS。メイン lib は 10,267 passed / 52 ignored (669.72 秒)。workspace / integration / ui_snapshot (76 件) / doctest と vendor 3 crate を完走。`target/preferences-transfer-capture-full-final.log`。初回 exit 101 の記録は `target/preferences-transfer-capture-full.log`。 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0。通常 feature の core / remote / EPUB PDF worker を作成。VCRT/PE 検査も成功。`target/preferences-transfer-capture-build.log`。製品起動なし。 |
+| `git diff --check`、保護ファイルの SHA-256 比較 | 0。保護対象の bytes と一致。 |
+
+保護対象は `target/preferences-transfer-capture-protected-files.json` の SHA-256 と一致。
+今回編集前から存在する §1.263 / §1.256 の未コミット変更と snapshot、既存復元、分類、
+App・メインメニュー・別窓・native 動画、製品ページ/privacy は今回変更していない。
+修正したのは捕捉判定と引数名、回帰試験、設計記録と keymap-spec の対応記述だけ。
+spinner fixture の修正は cfg(test) の待機ループだけのため、製品コードと UI の変わらない
+core check / settings_restore / ui_snapshot / glyph の成功を再利用した。
+修正後の全体 gate でも設定復元と UI snapshot を再確認した。コミット・製品起動なし。

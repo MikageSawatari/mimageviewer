@@ -237,7 +237,7 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 メーターを重ねる。`ThumbnailOverlayLayout` が帯と2pt gapを予約し、左下だけでなく
 cell基準の右下件数もその上へ配置する。極小セルで既存バッジが失われる場合は帯を省略する。
 セル高・画像fit・並び順・hit-testは変更せず、内容bitmapへ焼き込まない。色は
-`os_theme::book_resume_meter_palette`、方向は保存右綴じと `fullscreen_seek_direction` で決定。
+`os_theme::book_resume_meter_palette`。メーターは常に左から右へ伸び、`fullscreen_seek_direction` と本の読み方向には連動しない。
 比率はHUDの読み順で記録したanchor ordinal/totalで、見開きの相手ページは加算しない。
 起動時writer全行readと稀なDB変更後read以外はAppのpath memo/mapだけを参照する。
 未読・NULL・不正値はtrackも出さず、設定OFFではpaintだけを止める。

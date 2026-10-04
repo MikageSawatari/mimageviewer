@@ -21,15 +21,15 @@ mod search_index;
 mod transfer;
 use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
-use self::transfer::{PreferencesTransferFeedback, PreferencesTransferJob};
+use self::transfer::PreferencesTransferFeedback;
+pub(crate) use self::transfer::{PreferencesTransferAction, PreferencesTransferState};
 
 #[doc(hidden)]
 pub fn draw_preferences_transfer_settings_snapshot_fixture(ui: &mut egui::Ui, busy: bool) {
     // Match the production right panel's fixed available width.
     ui.set_width(ui.available_width());
     if busy {
-        let (_tx, rx) = mpsc::channel();
-        transfer::render_settings_transfer(ui, &PreferencesTransferJob::Exporting(rx), false, None);
+        transfer::render_transfer_explanation(ui, PreferencesTransferAction::Export, true, None);
         return;
     }
     let feedback = PreferencesTransferFeedback::Imported(crate::settings_transfer::ImportReport {
@@ -41,7 +41,21 @@ pub fn draw_preferences_transfer_settings_snapshot_fixture(ui: &mut egui::Ui, bu
         }],
         unknown_count: 1,
     });
-    transfer::render_settings_transfer(ui, &PreferencesTransferJob::Idle, true, Some(&feedback));
+    transfer::render_transfer_feedback(ui, Some(&feedback));
+}
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_explanation_snapshot_fixture(ui: &mut egui::Ui, import: bool) {
+    transfer::render_transfer_explanation(
+        ui,
+        if import {
+            PreferencesTransferAction::Import
+        } else {
+            PreferencesTransferAction::Export
+        },
+        false,
+        None,
+    );
 }
 
 #[doc(hidden)]
@@ -745,7 +759,6 @@ impl Drop for ExternalToolPathCheckPending {
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
-    transfer_job: PreferencesTransferJob,
     transfer_feedback: Option<PreferencesTransferFeedback>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
@@ -1301,7 +1314,6 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
-            transfer_job: PreferencesTransferJob::Idle,
             transfer_feedback: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
@@ -2001,24 +2013,6 @@ fn merge_video_media_memory_for_preferences(
 }
 
 impl App {
-    pub(crate) fn preferences_transfer_busy(&self) -> bool {
-        self.pref_state
-            .as_ref()
-            .is_some_and(|state| state.transfer_job.is_busy())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_preferences_transfer_for_test(
-        &mut self,
-    ) -> mpsc::Sender<Result<crate::settings_transfer::ParsedPreferences, String>> {
-        let (tx, rx) = mpsc::channel();
-        let mut state = tests::preferences_state_for_test(&self.settings);
-        state.transfer_job = PreferencesTransferJob::Importing(rx);
-        self.pref_state = Some(Box::new(state));
-        self.show_preferences = true;
-        tx
-    }
-
     pub(crate) fn install_preferences_settings(&mut self, settings: Settings) {
         let media_duration_changed =
             self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
@@ -2082,7 +2076,7 @@ impl App {
     }
 
     fn request_close_preferences_dialog(&mut self) {
-        if self.preferences_transfer_busy() {
+        if self.preferences_transfer_busy() || self.preferences_transfer_dialog_open() {
             return;
         }
         if self.preferences_dialog_has_unsaved_changes() {
@@ -2146,20 +2140,7 @@ impl App {
         }
     }
 
-    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
-        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
-        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
-        // state が破棄されても次回 open で過去の id を再利用しない。
-        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
-            self.show_preferences,
-            &mut self.preferences_open_last_frame,
-            &mut self.preferences_right_panel_scroll_sequence,
-        );
-        if !self.show_preferences {
-            return;
-        }
-
-        // 初回: 一時コピーを作成
+    fn ensure_preferences_state(&mut self) {
         if self.pref_state.is_none() {
             let ai_runtime = self.ai_runtime_init.ready_runtime();
             let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
@@ -2193,6 +2174,23 @@ impl App {
             }
             self.pref_state = Some(Box::new(new_state));
         }
+    }
+
+    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
+        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
+        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
+        // state が破棄されても次回 open で過去の id を再利用しない。
+        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
+            self.show_preferences,
+            &mut self.preferences_open_last_frame,
+            &mut self.preferences_right_panel_scroll_sequence,
+        );
+        if !self.show_preferences {
+            return;
+        }
+
+        // 初回: 一時コピーを作成
+        self.ensure_preferences_state();
         if let Some(generation) = opened_scroll_generation {
             self.pref_state
                 .as_mut()
@@ -2250,22 +2248,19 @@ impl App {
         let mut apply = false;
         let mut cancel = false;
 
-        if let Some(state) = self.pref_state.as_mut() {
-            state.poll_preferences_transfer();
-        }
-        let transfer_busy = self.preferences_transfer_busy();
-        if transfer_busy {
+        let transfer_dialog_open = self.preferences_transfer_dialog_open();
+        if transfer_dialog_open {
             // Popups use independent UI layers and do not inherit a disabled
-            // parent. Remove that combination while the single modal job runs.
+            // parent. Remove that combination while the transfer modal is shown.
             egui::Popup::close_all(ctx);
         }
 
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed = !transfer_busy && self.dialog_enter_pressed(ctx);
-        let escape_pressed = !transfer_busy && self.dialog_escape_pressed(ctx);
+        let enter_pressed = !transfer_dialog_open && self.dialog_enter_pressed(ctx);
+        let escape_pressed = !transfer_dialog_open && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
-            .enabled(!transfer_busy)
+            .enabled(!transfer_dialog_open)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -2389,10 +2384,7 @@ impl App {
                         &state.settings.file_organize_destinations,
                     );
                     let ok = ui.add_enabled(
-                        font_ready
-                            && lut_ready
-                            && !state.transfer_job.is_busy()
-                            && organize_validation.is_ok(),
+                        font_ready && lut_ready && organize_validation.is_ok(),
                         egui::Button::new("  OK  "),
                     );
                     #[cfg(all(windows, feature = "test-script"))]
@@ -2402,16 +2394,13 @@ impl App {
                         // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
                     if ui
-                        .add_enabled(
-                            !state.transfer_job.is_busy(),
-                            egui::Button::new("キャンセル"),
-                        )
+                        .add_enabled(!transfer_dialog_open, egui::Button::new("キャンセル"))
                         .clicked()
                     {
                         cancel = true;
                     }
-                    if state.transfer_job.is_busy() {
-                        ui.small("ファイル処理の完了後に操作できます。");
+                    if transfer_dialog_open {
+                        ui.small("設定ファイルのダイアログを閉じると操作できます。");
                     } else if !font_ready {
                         ui.small("フォントの準備完了後に適用できます。");
                     } else if !lut_ready {
@@ -2844,20 +2833,8 @@ impl App {
             self.request_close_preferences_dialog();
         }
 
-        if !close_requested_this_frame {
+        if !close_requested_this_frame && !transfer_dialog_open {
             self.draw_preferences_discard_confirm(ctx);
-        }
-
-        // The job is the only busy owner. egui's modal layer also intercepts
-        // pointer input from every main-window panel without another flag.
-        if self.preferences_transfer_busy() {
-            egui::Modal::new(egui::Id::new("preferences_transfer_busy")).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("設定ファイルを処理しています…");
-                });
-                ui.small("完了後に環境設定へ戻ります。");
-            });
         }
 
         let clear_favorite_view_states_requested = self
@@ -3052,7 +3029,9 @@ impl App {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        let ime_active = self.ime_input_active(ctx);
+        // Foreground IME or a transfer Modal owns these events before assignment capture.
+        let keyboard_capture_blocked =
+            self.ime_input_active(ctx) || self.preferences_transfer_dialog_open();
         let content_rect = ctx.content_rect();
         let safe_rect = content_rect.shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::vec2(360.0, 300.0));
@@ -3095,7 +3074,7 @@ impl App {
                             .max_height(main_height)
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                draw_operation_customize_page(ui, state, ime_active);
+                                draw_operation_customize_page(ui, state, keyboard_capture_blocked);
                             });
                     },
                 );
@@ -3117,7 +3096,7 @@ impl App {
             });
 
         if let Some(state) = self.operation_customize_state.as_mut() {
-            draw_operation_assignment_editor_dialog(ctx, state, ime_active);
+            draw_operation_assignment_editor_dialog(ctx, state, keyboard_capture_blocked);
             draw_mouse_gesture_recorder_dialog(ctx, state);
         }
 
@@ -3368,7 +3347,7 @@ fn draw_operation_customize_tabs(ui: &mut egui::Ui, state: &mut PreferencesState
 fn draw_operation_customize_page(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     match state.operation_tab {
         OperationCustomizeTab::Settings => draw_operation_settings_page(ui, state),
@@ -3388,7 +3367,7 @@ fn draw_operation_customize_page(
             ui.add_space(8.0);
             ui.small("キー割り当てを編集します。一覧の「編集」またはキーボード図の割り当て済みキーを押すと、割り当て編集ダイアログを開きます。");
             ui.add_space(8.0);
-            page_command_settings(ui, state, ime_active);
+            page_command_settings(ui, state, keyboard_capture_blocked);
         }
         OperationCustomizeTab::MouseGesture => {
             draw_mouse_gesture_context_tabs(ui, state);

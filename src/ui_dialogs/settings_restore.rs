@@ -38,6 +38,8 @@ pub(crate) struct SettingsRestoreState {
     operation_message: Option<(bool, String)>,
     operation_task_rx: Option<std::sync::mpsc::Receiver<OperationTaskResult>>,
     family_operation: SettingsFamilyOperationState,
+    pub(crate) preferences_transfer:
+        Option<Box<crate::ui_dialogs::preferences::PreferencesTransferState>>,
 }
 
 impl Default for SettingsRestoreState {
@@ -51,6 +53,7 @@ impl Default for SettingsRestoreState {
             operation_message: None,
             operation_task_rx: None,
             family_operation: SettingsFamilyOperationState::Idle,
+            preferences_transfer: None,
         }
     }
 }
@@ -407,6 +410,12 @@ impl App {
 
         self.poll_operation_share_task(ctx);
         self.poll_settings_family_operation(ctx);
+        let preferences_transfer_was_open =
+            self.settings_restore_state.preferences_transfer.is_some();
+        self.show_preferences_transfer_dialog(ctx);
+        if !self.show_settings_restore {
+            return;
+        }
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
@@ -420,11 +429,14 @@ impl App {
         let result_open = self.settings_restore_state.result.is_some();
         let operation_modal_open = self.settings_restore_state.operation_modal.is_some();
         let family_operation_open = self.settings_restore_state.family_operation.blocks_close();
+        let preferences_transfer_open = preferences_transfer_was_open
+            || self.settings_restore_state.preferences_transfer.is_some();
 
         egui::Window::new("設定の復元")
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
+            .enabled(!preferences_transfer_open)
             .default_pos(dialog_pos)
             .default_width(860.0)
             .show(ctx, |ui| {
@@ -433,6 +445,7 @@ impl App {
 
         if (!open || (escape_pressed && !confirm_open && !result_open && !operation_modal_open))
             && !family_operation_open
+            && !preferences_transfer_open
         {
             self.show_settings_restore = false;
             self.settings_restore_state = SettingsRestoreState::default();
@@ -1022,6 +1035,12 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(8.0);
 
+    if app.settings_boot_problem_source.is_none() {
+        draw_preferences_transfer_entry(app, ui);
+        ui.separator();
+        ui.add_space(8.0);
+    }
+
     // 一覧テーブル。
     let now = SystemTime::now();
     egui::ScrollArea::both()
@@ -1129,6 +1148,58 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
             app.settings_restore_state.pending = Some(PendingAction::FullReset);
         }
     });
+}
+
+fn draw_preferences_transfer_entry(app: &mut App, ui: &mut egui::Ui) {
+    let ready = app.settings_restore_state.operation_task_rx.is_none()
+        && !app.settings_restore_state.family_operation.blocks_close()
+        && app.settings_restore_state.operation_modal.is_none()
+        && app.settings_restore_state.pending.is_none()
+        && app.settings_restore_state.result.is_none();
+    let disabled_reason = app
+        .show_preferences
+        .then_some("環境設定を閉じてから行ってください");
+    if let Some(action) = render_preferences_transfer_entry(ui, ready, disabled_reason) {
+        app.start_preferences_transfer(action);
+    }
+}
+
+fn render_preferences_transfer_entry(
+    ui: &mut egui::Ui,
+    ready: bool,
+    disabled_reason: Option<&str>,
+) -> Option<crate::ui_dialogs::preferences::PreferencesTransferAction> {
+    use crate::ui_dialogs::preferences::PreferencesTransferAction;
+    let mut action = None;
+    let ready = ready && disabled_reason.is_none();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("環境設定");
+        if ui
+            .add_enabled(ready, egui::Button::new("環境設定を書き出し…"))
+            .on_disabled_hover_text(disabled_reason.unwrap_or_default())
+            .clicked()
+        {
+            action = Some(PreferencesTransferAction::Export);
+        }
+        if ui
+            .add_enabled(ready, egui::Button::new("環境設定を取り込み…"))
+            .on_disabled_hover_text(disabled_reason.unwrap_or_default())
+            .clicked()
+        {
+            action = Some(PreferencesTransferAction::Import);
+        }
+    });
+    action
+}
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_entry_snapshot_fixture(ui: &mut egui::Ui) {
+    let _ = render_preferences_transfer_entry(ui, true, None);
+}
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_disabled_entry_snapshot_fixture(ui: &mut egui::Ui) {
+    let _ = render_preferences_transfer_entry(ui, true, Some("環境設定を閉じてから行ってください"));
 }
 
 impl App {

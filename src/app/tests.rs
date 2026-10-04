@@ -34311,11 +34311,7 @@ mod favorite_adjustment_defaults_tests {
 
         // 画像 (本ページ) idx 0 → 記録される
         app.record_book_resume(0);
-        let meter = crate::book_resume_db::ReadingMeterValue::new(
-            1,
-            1,
-            app.reading_direction == crate::settings::ReadingDirection::Rtl,
-        );
+        let meter = crate::book_resume_db::ReadingMeterValue::new(1, 1);
         assert_eq!(app.last_book_resume, Some((folder.clone(), 0, meter)));
 
         // フォルダタイル idx 1 → 対象外。直近記録は据え置き
@@ -39468,11 +39464,7 @@ mod favorite_adjustment_defaults_tests {
             Some((
                 zip_path,
                 0,
-                crate::book_resume_db::ReadingMeterValue::new(
-                    1,
-                    1,
-                    app.reading_direction == crate::settings::ReadingDirection::Rtl,
-                ),
+                crate::book_resume_db::ReadingMeterValue::new(1, 1),
             ))
         );
     }

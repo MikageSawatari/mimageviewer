@@ -2752,7 +2752,7 @@ impl crate::app::App {
         }
         let page_index = page_index as usize;
         if record_resume {
-            // 検証済みcontextに右綴じ情報がない。追加列をNULLにし、旧meterを消す。
+            // Remoteの従来のNULL記録を維持し、旧meterを消す。
             self.persist_book_resume(target.container_path.clone(), page_index, None);
         }
 
@@ -5937,13 +5937,13 @@ mod tests {
     fn persisted_book_resume_meter_row(
         data_dir: &std::path::Path,
         book: &std::path::Path,
-    ) -> (i64, Option<i64>, Option<i64>, Option<i64>) {
+    ) -> (i64, Option<i64>, Option<i64>) {
         rusqlite::Connection::open(data_dir.join("book_resume.db"))
             .unwrap()
             .query_row(
-                "SELECT page,page_ordinal,page_total,reading_rtl FROM book_resume WHERE path=?1",
+                "SELECT page,page_ordinal,page_total FROM book_resume WHERE path=?1",
                 [crate::path_key::normalize(book)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
     }
@@ -5959,7 +5959,7 @@ mod tests {
         let second = folder.join("02.jpg");
         std::fs::write(&first, b"page").unwrap();
         std::fs::write(&second, b"page").unwrap();
-        let old_meter = crate::book_resume_db::ReadingMeterValue::new(1, 2, true);
+        let old_meter = crate::book_resume_db::ReadingMeterValue::new(1, 2);
         app.persist_book_resume(folder.clone(), 0, old_meter);
         settle_book_resume_meter(&mut app);
         assert_eq!(app.book_resume_meters.get(&folder), old_meter);
@@ -5994,8 +5994,8 @@ mod tests {
         settle_book_resume_meter(&mut app);
         assert_eq!(
             persisted_book_resume_meter_row(app.tmp.path(), &folder),
-            (1, None, None, None),
-            "Remoteはraw indexを更新し、方向未確定のmeter列を全てNULLにする"
+            (1, None, None),
+            "Remoteはraw indexを更新し、meter列は従来どおりNULLにする"
         );
         drop(app.book_resume_writer.take());
 
@@ -6020,7 +6020,7 @@ mod tests {
         let archive = app.tmp.path().join("remote-book.zip");
         // producerの既存path guardを通す実ファイル。ZIP列挙は検証済みhandoffの前段。
         std::fs::write(&archive, b"zip").unwrap();
-        let old_meter = crate::book_resume_db::ReadingMeterValue::new(3, 8, true);
+        let old_meter = crate::book_resume_db::ReadingMeterValue::new(3, 8);
         app.persist_book_resume(archive.clone(), 2, old_meter);
         settle_book_resume_meter(&mut app);
         let previous_resume = app.last_book_resume.clone();
@@ -6050,7 +6050,7 @@ mod tests {
         settle_book_resume_meter(&mut app);
         assert_eq!(
             persisted_book_resume_meter_row(app.tmp.path(), &archive),
-            (2, Some(3), Some(8), Some(1)),
+            (2, Some(3), Some(8)),
             "非root階層のローカルindexは既存root位置やmeterを変更しない"
         );
     }
