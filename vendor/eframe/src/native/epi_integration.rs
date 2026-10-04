@@ -154,7 +154,6 @@ pub struct EpiIntegration {
     pub frame: epi::Frame,
     last_auto_save: Instant,
     pub beginning: Instant,
-    is_first_frame: bool,
     pub egui_ctx: egui::Context,
     pending_full_output: egui::FullOutput,
 
@@ -192,6 +191,7 @@ impl EpiIntegration {
             wgpu_render_state,
             raw_display_handle: window.display_handle().map(|h| h.as_raw()),
             raw_window_handle: window.window_handle().map(|h| h.as_raw()),
+            native_window_visible_commit_completed: false,
         };
 
         let icon = native_options
@@ -220,7 +220,6 @@ impl EpiIntegration {
             persist_window: native_options.persist_window,
             app_icon_setter,
             beginning: Instant::now(),
-            is_first_frame: true,
         }
     }
 
@@ -304,7 +303,14 @@ impl EpiIntegration {
 
     pub fn post_rendering(&mut self, window: &winit::window::Window) {
         profiling::function_scope!();
-        if std::mem::take(&mut self.is_first_frame) {
+        // The receipt belongs to ROOT even though this integration also paints children.
+        let is_root = window.window_handle().ok().is_some_and(|handle| {
+            self.frame
+                .raw_window_handle
+                .as_ref()
+                .is_ok_and(|root| *root == handle.as_raw())
+        });
+        if is_root && !self.frame.native_window_visible_commit_completed() {
             #[cfg(target_os = "windows")]
             let diagnostic_hwnd = if crate::startup_window_observer::enabled() {
                 window.window_handle().ok().and_then(|handle| {
@@ -323,7 +329,8 @@ impl EpiIntegration {
                 crate::startup_window_observer::emit("eframe.set_visible.begin", hwnd);
             }
             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
-            window.set_visible(true);
+            self.frame
+                .commit_initial_native_visibility(|| window.set_visible(true));
             #[cfg(target_os = "windows")]
             if let Some(hwnd) = diagnostic_hwnd {
                 crate::startup_window_observer::emit("eframe.set_visible.complete", hwnd);

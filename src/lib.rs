@@ -82,6 +82,7 @@ mod gpu_lanczos;
 pub mod metadata_transfer;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
@@ -1252,25 +1253,23 @@ pub fn run() -> eframe::Result {
 
     // 起動時の最大化。`--window-size` はスクリーンショット用に厳密なサイズを要求する
     // 経路なので、設定より優先して常に通常ウィンドウで起動する。
-    let start_maximized = parse_window_size_arg().is_none()
-        && crate::settings::resolve_startup_maximized(
-            saved.startup_window_state,
-            saved.window_maximized,
-        );
+    let startup_window_geometry = startup_window_geometry::StartupWindowGeometry::new(
+        size,
+        saved.startup_window_state,
+        saved.window_maximized,
+        parse_window_size_arg().is_some(),
+    );
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
         .with_window_level(crate::settings::viewer_window_level(saved.always_on_top))
         .with_inner_size(size)
         .with_min_inner_size(MIN_INNER_SIZE)
+        .with_maximized(false)
         .with_icon(icon);
 
-    // 最大化はウィンドウ生成の時点で指定する。初回フレームで
-    // `ViewportCommand::Maximized` を送る形にすると、通常サイズのウィンドウが一度
-    // 見えてから最大化するので、起動のたびにちらつく。
-    if start_maximized {
-        viewport = viewport.with_maximized(true);
-    }
+    // Hidden maximize in winit shows/hides the root before its first paint (1.327).
+    // Create normal; the app maximizes once after eframe's visible commit.
 
     // --window-size 指定時は位置を画面左上寄りに固定（保存済み位置は無視）
     if parse_window_size_arg().is_some() {
@@ -1322,7 +1321,8 @@ pub fn run() -> eframe::Result {
     startup_windows_diag::mark("app.native_options.decided", 0, || {
         serde_json::json!({
             "inner_size": [size[0], size[1]], "position": options.viewport.position.map(|p| [p.x, p.y]),
-            "maximized": start_maximized, "min_inner_size": MIN_INNER_SIZE,
+            "maximized": options.viewport.maximized.unwrap_or(false), "min_inner_size": MIN_INNER_SIZE,
+            "maximize_after_visible_commit": startup_window_geometry.maximized_to_save(false),
             "requested_visible": options.viewport.visible,
             "effective_eframe_create_visible": false, "ui_scale_factor": saved.ui_scale_factor,
         })
@@ -1525,13 +1525,10 @@ pub fn run() -> eframe::Result {
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
-            app.pending_initial_size = Some(size);
-            // 最大化起動では、この補正は最大化が解けるまで保留される
-            // (`App::apply_deferred_initial_size`)。
-            app.created_maximized = start_maximized;
-            // 追跡値の初期値は「こちらが要求した状態」。egui からの報告を待つ間に
-            // 終了しても、要求した状態がそのまま保存される。
-            app.last_window_maximized = start_maximized;
+            app.startup_window_geometry = startup_window_geometry;
+            // The actual initial window is normal. The startup owner separately preserves
+            // the desired maximized state for exit-save until the command has run.
+            app.last_window_maximized = false;
             #[cfg(all(feature = "test-script", windows))]
             if let Some(path) = test_script_path.clone() {
                 app.prepare_test_script_run();

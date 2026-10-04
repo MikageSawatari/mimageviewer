@@ -94449,26 +94449,6 @@ fn the_overflow_button_closes_the_panel_it_opened() {
     );
 }
 
-/// 起動時のウィンドウ状態 (§1.116)。最大化で起動したときに、初回フレームの
-/// mixed-DPI 補正が最大化を打ち消さないことを固定する。
-#[test]
-fn the_startup_size_correction_waits_while_the_window_is_maximized() {
-    use crate::app::deferred_initial_size_ready;
-
-    // 通常起動は従来どおり初回フレームで補正する。egui がまだ viewport を報告して
-    // いなくても待たない (待つと補正が永久に届かない環境がある)。
-    assert!(deferred_initial_size_ready(false, None));
-    assert!(deferred_initial_size_ready(false, Some(false)));
-
-    // 最大化起動では、報告が無い間は保留する。None を「最大化ではない」と読むと
-    // 初回フレームで InnerSize を送ってしまい、最大化が解けてしまう。
-    assert!(!deferred_initial_size_ready(true, None));
-    assert!(!deferred_initial_size_ready(true, Some(true)));
-
-    // 最大化が解けたと明示的に報告されたフレームで、はじめて補正を流す。
-    assert!(deferred_initial_size_ready(true, Some(false)));
-}
-
 /// 最小化中の maximized は当てにならないので、最後に見えていた状態を保つ。
 #[test]
 fn minimizing_does_not_erase_the_remembered_maximized_state() {

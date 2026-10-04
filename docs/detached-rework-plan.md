@@ -1455,6 +1455,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-04 §1.327 小規模startup maximize修正 (利用者承認の見た目変更)**
+
+利用者／ClaudeCode briefで、main rootをnormal-hiddenで作り、既存の初回visible commit後に
+appが一度だけmaximizeする案を採用。eframeの初回frame flagをFrameのroot-only receiptへ移し、
+root native handleで確認する。paint／show／output順、detached／fullscreenの述語・builder・
+host・placement owner・visible commitは変更しない。appの起動geometryだけをtyped ownerへ
+集約し、secondaryのreceiptやnative visibilityからroot startupを推測しない。
+小規模案の構造とtray／minimizeの保留、root receipt境界を独立Sol/xhighが確認した。
+detached症状へのguard／delay／再生成ではなく、mainの起動契約の変更である。大規模backend案は
+今回実装しない。受入範囲・診断は [§1.327調査 §8](section327-startup-window-flicker-investigation.md#8-採用した小規模修正-normal表示後に一度だけ最大化-2026-10-04)。
+
 **2026-10-04 §1.327 起動native window診断 (観測限定)**
 
 利用者／ClaudeCodeからのbounded brief「診断先行・修正は後」に従い、coreのopt-in

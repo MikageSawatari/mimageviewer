@@ -2,11 +2,12 @@
 
 2026-10-04 / `next-startup-flicker`、調査対象 `a0aea7fe2`。
 実装担当によるソース調査と、別 context の GPT-6.1 Sol / xhigh による独立設計レビュー。
-**表示修正未実装・エージェントは製品未起動。利用者ログによる原因確認と修正設計は §7。**
+**採用した小規模修正は §8。エージェントは製品未起動、修正後の実機診断は利用者確認待ち。**
 
 利用者の「診断先行・修正は後」の判断を受け、opt-inのnative診断を実装した。
 2026-10-04、調査文書commit `d82f94d76` の後続。表示／配置の挙動修正は含まない。
 採取方法・観測限界は §6。診断commit `0000df439` の利用者採取結果を §7 に追記した。
+§1〜§7は調査・診断・大規模設計の経緯。今回の実装契約は2026-10-04の利用者判断による§8。
 
 ## 1. 利用者の録画から読めること
 
@@ -565,3 +566,105 @@ foregroundを利用者が他へ切り替えた場合やno-activate／hidden／mi
 
 画面録画とログを一緒に残し、main最初の表示がmax frameで、三つの過渡表示が消えたことを
 利用者が確認してから修正を検収する。diagnostics commit `0000df439` 自体は未修正版のまま。
+
+## 8. 採用した小規模修正: normal表示後に一度だけ最大化 (2026-10-04)
+
+### 利用者判断と受入範囲
+
+利用者／ClaudeCodeの明示briefにより、§7のwinit vendor化、native geometry生成、eframe startup
+state machine、全native ShowWindow owner移管は今回は採用しない。起動cosmetic問題に対して
+変更範囲が大きいため、§7を将来案として残す。
+**通常窓が一瞬現れてから最大化する見た目を利用者が了承した。**
+§4／§7で不採用だった表示後の最大化を、この判断で採用する。初回frameが最大化client寸法で
+あることは保証しない。timer、追加repaint、透明化、cloak、ShowWindow消費用dummyは追加しない。
+
+rootを保存normal geometryでhidden生成し、eframeの既存初回paint呼出→set_visible(true)が
+戻った後に、appがROOTへMaximized(true)を一度だけ送る。通常ログでearly showがなかった
+native経路へ揃える修正であり、あらゆるSTARTUPINFO／外部ownerを直す§7の契約とは区別する。
+
+### 所有者と順序
+
+- `src/lib.rs`: root NativeOptionsは常にmaximized=false。saved normal size／position、最小値、
+  monitor無効時のWindows既定配置は維持。RememberLast／Normal／Maximizedはpost-visibleの
+  希望として解決する。`--window-size` はnormalを優先し、従来の位置(60,40)を維持する。
+- `src/startup_window_geometry.rs`: NormalSizePending→AwaitingVisibleMaximize→MaximizeQueued
+  →Completeが起動geometryを所有する。normal起動はsize補正後にComplete。
+  旧pending_initial_size／created_maximizedを置き換え、並行するpending boolを足さない。
+- App::update入口でnormal InnerSize補正を送り、startup overlayのearly returnでも保留しない。
+  UI scale→viewport pointsの既存変換を維持する。native適用は既存のeframe順序どおり
+  **paint／visible commit後**。次のApp updateでMAXを送るので、size補正はmaximizeより先に
+  適用される。show前の最終寸法保証ではなく、unmaximize時の旧InnerSize再送もない。
+- App::update末尾（tray／close処理後）で、eframe receipt、App.window_visible、live HWNDの
+  IsWindowVisible／IsIconic、viewport.minimizedを確認してMAXを発行する。直後にtrayへ
+  隠した／最小化した時は希望を保持し、既存の復帰後に発行する。外部activationだけをreceiptの
+  代用にせず、tray格納をMAXで取り消さない。
+- MAX queue直前にnormal rectを記録する。実状態の追跡はnormalで初期化し、未完了startupの
+  exit／tray保存では希望maxを投影する。MAX queueでlast_window_maximized=trueを設定し、
+  同じegui frameの追加layout passでは古いnormal報告でmax状態やnormal restoreを上書きしない。
+- MaximizeQueuedのcumulative_frame_nrは、全layout passを含むegui runとnative command適用の
+  境界。同じframeだけを保護し、次のroot frameから実報告へ戻す。時間待ち／MAX ack待ちでは
+  なく、直後のuser restoreが勝つ。最小化中の既存max状態保存は維持する。
+
+### 最小限のeframe変更が必要な理由
+
+App::updateは初回post_renderingより先なので、update回数やIsWindowVisibleだけではeframeの
+visible commit完了を証明できない。vendored eframeの既存is_first_frameをFrameのhistorical
+receiptへ移し、`Frame::native_window_visible_commit_completed()` で読めるようにした。
+root native handleと一致するpost_renderingでset_visible(true)が戻るまでfalse。
+boolを別に複製して同期せず、既存paint／show／output順やsurface skip時の挙動も変えない。
+receiptは現在の可視性やGPU present成功の証明ではない。
+
+**winit patch、新native生成API、全ShowWindow移管、detached／fullscreenの述語・builder・
+host・placement owner変更はない。** 共有eframeの変更範囲はroot receiptのみ。secondaryの
+表示をstartup MAXの根拠にしない。変更範囲はdetached-rework-plan §11にも記録する。
+single-instance転送／activation、tray設定と復帰API、既存DPI／monitor座標変換を維持する。
+
+### 診断と検証
+
+空のforeground起動を§6の `--diag-startup-windows` で採取する。NativeOptionsはmaximized=false、
+希望がmaxならmaximize_after_visible_commit=true。期待timeline:
+
+```text
+main CREATE / geometry preparation                 hidden、normal
+app.deferred_initial_size.command                  InnerSize、一度のみ
+eframe.first_paint.call_returned
+eframe.set_visible.begin -> SHOW / ACTIVATE         normal rectで最初の表示
+eframe.set_visible.complete
+normal InnerSizeのnative適用
+app.startup_maximize.command                       receipt=true、現在visible
+HCBT_MINMAX(3)                                     visible後のMAX、一度のみ
+```
+
+paint前のSHOW／ACTIVATEと旧3回のshow/hide往復がないことを確認する。
+first_paint.call_returnedは従来どおり成功presentの証明ではない。normal／fresh／CLI sizeでは
+startup_maximize.commandがない。tray hidden／minimizedでは復帰までMAXが出ない。
+WinEvent配送遅延があるので、順序はQPCと同期UI通知を優先する。
+診断は初回visible commit完了から1秒で保存するため、それ以降のtray／minimized復帰のMAXは
+この起動ログでは観測しない。長時間保留の復帰は状態テストと利用者の操作確認で検証する。
+
+利用者確認（エージェントは起動しない）:
+
+1. timestamp付き新規isolated data dirでnormal起動し、ログを別名保存。normal rectを設定して
+   最大化→終了→**同じdata dir**で再起動し、normal表示→MAX一回と元のnormal rectへの
+   unmaximizeを確認する。最大化のまま終了→再起動でもmax状態が保存されること。
+2. 設定3種／CLI size／UI scale／DPIの異なる2monitorの保存位置とnormal restoreを確認。
+   保存先monitor切断時のWindows fallbackも確認する。
+3. 表示直後のminimize→restore、tray→open、second-instance activation、その後のdetached／
+   fullscreenを確認。通常profileではinstalled／tray resident版を先に終了する。
+   normal dev buildは実 `%APPDATA%\mimageviewer` の設定／データを更新し得る。
+
+ログ場所とprinterは§6と同じ。起動ごとに上書きされるので録画と一緒に別名で残す。
+pure startup testsは設定／CLI優先、normal size→receipt後のMAX一度のみ、tray／minimize保留、
+複数layout pass、exit-saveとuser restoreを確認する。旧created-max解除待ちのテストはこの
+新仕様の状態テストへ置き換え、既存window state／minimize／normal rect回帰は残した。
+eframeのreceipt公開順序と一度だけのshowも純粋テストで固定する。
+
+自動検証 (2026-10-04): normal／portable cargo check、startup状態4件、maximized関連8件、
+receipt順序2件、root／vendor fmtを通過。full gateのcore libは10235件成功・51件ignored。
+workspaceの唯一の失敗は、このworktreeにSusie plugin fixtureがなかった3件。
+`MIV_TESTDATA=C:\home\mimageviewer\testdata`を読み取り専用で指定した対象再実行は8件すべて成功。
+他のworkspace成功結果を再利用し、残りのvendor全gate (egui 25件／egui-wgpu 9件／eframe 18件)
+も通過した。独立Sol/xhighレビューに指摘なし。
+`scripts/build-dev.ps1 -PreserveRuntime`はexit 0でnormal dev-runtime core／companionsを生成した。
+実行ログはtarget/flicker/small-*.log、引継ぎはtarget/flicker-msg.txt。
+製品は未起動。実機のshow回数／復元矩形の確認を利用者へ引き継ぐ。
