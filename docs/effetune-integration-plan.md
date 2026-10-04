@@ -927,7 +927,7 @@ Pro-L 2 を前段で有効にすると消えるため、EffeTune 入力の sampl
   PDC には実際の lookahead frame 数 / sample rate を足す（44.1 kHz の丸めも一致）。
 - local seek serial 更新、段の非適用、EffeTune generation 変更、最終 limiter reset に合わせて前段を reset。
   Remote は seek serial 変更と非適用で reset、新 worker / generation は初期 state から開始。
-- 簡素化を検討: 再生中の設定反映に新しい atomic / 遅延切り替えを足す代わりに、既存の開始時
+- 当初の簡素化（§15 の利用者決定で変更）: 再生中の設定反映に新しい atomic / 遅延切り替えを足す代わりに、既存の開始時
   snapshot を採用。`effetune_pre_limiter_enabled` は player 作成 / Remote 配信受付時に取り、
   Remote の seek・画質変更世代では維持。画面を閉じて開き直す／配信終了後の再開で反映する。
   pause/resume・既存 player の再利用では変えない。新再生の limiter は必ず空で始まる。
@@ -1056,7 +1056,7 @@ follow-up の確認用 build も `build-dev.ps1 -PreserveRuntime -WaitForOtherBu
   PDC を常に加える。通常 EOS で最終段を必ず排出する。前段は EffeTune 成功時かつ設定 ON のみ、
   failure / fallback では前段の音・遅延を除外し、最終段の 5ms は残す。plugin admission の 2秒には
   両 limiter を引き続き含めない。HUD は最終段の 1dB 以上の低減だけを通知する。
-- 設定 snapshot と checkbox は変更なし。即時反映の検討は backlog §1.324 に残す。
+- この時点では設定 snapshot と checkbox は変更なし。即時反映は §15（backlog §1.324）で対応。
 - 回帰は ROOT wake と tick の返す quiet deadline、stale / 重複完了、実 DSP → AAC / mux / finish
   の full manual-control ring、エフェクトなしの非ゼロ末尾、normalize gain の unity 越えを確認する。
 
@@ -1265,3 +1265,94 @@ dev-runtime core（PID 112920）と Remote（PID 117288）が使用中のため 
 `scripts/build-dev.ps1 -PreserveRuntime` を再実行する。旧 exe は今回の機能確認には使わない。
 利用者確認は、OFF の最小化・復帰、ON の最小化中の窓操作・復帰、
 Remote と最小化の両解除順、ユーザーが閉じた窓の非復帰、tray-only 格納、再起動後の設定保持。
+
+## 15. §1.324 前段ピーク保護の再生中反映 (2026-10-05)
+
+利用者決定: 「EffeTune に渡す前に 0dB を超える音を抑える」を、画面・配信を開き直さず反映する。
+本節は §13 の開始時 snapshot / OFF 時の遅延除外を置き換える。製品起動による実機確認は未実施。
+
+### 原因と全 consumer の所有境界
+
+従来は `Settings` → `App::local_audio_dsp_chain` → `AudioDspChain` → `run_pump` と、
+`App::remote_clockless_audio_processing` → `ClocklessAudioProcessing` → `ClocklessAudioProcessor` が
+作成時に bool をコピーしていた。pause/resume、再利用、Remote seek / 画質の世代更新は同じ snapshot を保持する。
+
+- ローカル動画は `build_video_player_for_open`、音楽は既存音楽 builder から同じ chain を渡す。
+  メイン／全画面／別窓と動画の音声表示モードも同じ player / pump を使う。viewport / detached 述語は変更しない。
+- `EffetuneController` が所有する既存 `Arc<EffetuneAudioSlot>` に `AtomicBool` を追加（明示的な既定 true）。
+  App 初期化で保存設定、`install_preferences_settings` で確定設定を公開する。未確定 checkbox / Cancel は公開しない。
+  bridge の publish / clear / failure / generation 更新では設定を変更しない。
+- local chain と Remote config / processor が同じ slot を保持し、通常 PCM と EOS の各ブロックで target を読む。
+  Remote seek / 画質更新の config clone でも同じ Arc を維持する。追加 IPC、worker 再作成は不要。
+  RemoteHeadless metadata player に DSP chain は付けず、配信音声は clockless worker が処理する。
+- limiter の delay / gain / mix は引き続き pump / processor ごとの所有物。設定変更は兄弟 context を reset しない。
+
+### 単純化・連続性・遅延
+
+既存の閉じる／開き直す方式は利用者の即時反映要求を満たさないため採らない。専用 graph rebuild、
+切替通知 queue、codec / resampler / timeline の再初期化も不要。atomic の目標値だけを変える。
+
+`EffetuneInputLimiter` は EffeTune を実際に通る間、ON/OFF とも同じ 5ms lookahead を保持する。
+OFF は同じ delay-line の raw、ON はその制限済み音。連続して peak / gain 履歴を更新し、
+設定変更では現在の mix から約5ms（丸めた lookahead frames 相当）の線形 ramp を行う。
+両 channel に同じ frame mix を使い、短い block / 途中反転でも ramp を継続する。
+初回・seek・段の非適用・generation 変更後はその時点の設定へ snap し、旧音を引き継がない。
+ON へ切替中は raw 成分が残り、完全な ceiling 保護まで最大約5msかかる。
+
+成功時の PDC と EOS 排出量は OFF でも前段分を加算する。EffeTune plugin は引き続き実際の bridge 遅延のみを報告し、
+2秒 admission は plugin 合計だけを判定する。最終 limiter は常時有効で演算・HUD・遅延を維持する。
+`composition::compose_samples` の原本 fallback は変えず、EffeTune 失敗時だけ従来どおり前段／EffeTune 分を除外する。
+設定切替では latency reconciler の trim / 無音挿入を発生させず、sample 数・audible PTS を連続させる。
+EOS plan の設定 snapshot は撤去し、末尾排出中も live target を読む。
+
+Remote は次の未処理 PCM block から反映する。すでに生成した HLS segment / 端末 buffer は旧音声のままなので、
+端末で聴こえる反映には先読み分の遅れがある。既存 segment の破棄・再encode・配信再開は行わない。
+
+### 検証・引き渡し
+
+検証結果を下表に記録する。実機の click/pop、EffeTune meter、native 各表示、Remote は利用者確認待ち。
+
+対象: `next-effetune-live-limit` worktree の §1.324 未コミット差分。製品は起動していない。
+
+| 自動検証 | 結果 | 記録 |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib effetune_pre_limiter` | 11 passed、exit 0 | `target/1324-test-toggle.log` |
+| 同上 `video::audio::tests` | 62 passed、exit 0 | `target/1324-test-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 39 passed、実ホスト profile 用 1 ignored、exit 0 | `target/1324-test-clockless.log` |
+| 同上 `effetune::composition::tests` | 3 passed、exit 0 | `target/1324-test-composition.log` |
+| `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/1324-check.log` |
+| 同上 `--features portable` | exit 0 | `target/1324-check-portable.log` |
+| `cargo test -j 1 -p mimageviewer --test ui_snapshot preferences_effetune_input_limit_dark` | 1 passed、exit 0。既存 PNG 変更なし | `target/1324-test-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | tool output |
+
+初回 lib test / 通常 check は Rust 検査前に libjpeg-turbo の CMake/MSBuild が exit 1 で停止。
+通常 check は依存 CMake を単一ジョブで build 後、`-j 1` で成功した。製品テスト失敗とは区別する。
+Remote 全体テストの旧 OFF 遅延期待値を固定 lookahead に合わせ、再実行は上記の全39件成功。
+
+- `scripts/test-full.ps1 -SuppressCrashDialogs`: exit 101 (`target/1324-test-full.log`)。
+  本体 lib は 10,461 passed / 1 failed / 51 ignored、718.45秒。唯一の失敗は未変更の
+  `indexer_manager::tests::incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls`。
+  初期類似索引が `ArrayPublication("similar index load failed: base publish failed: アクセスが拒否されました。 (0x80070005)")`
+  の `Degraded` で停止し、Complete 待機の期限で失敗した。アクセス拒否の原因は未特定。
+  workspace の残りの target（全67件の UI snapshot を含む）は成功。script は workspace 失敗で
+  後段の vendor 3 crate の test を実行しないため、全体 gate は未完了／green とは扱わない。
+  索引実装や期待値を変更せず、同じ feature の孤立実行で切り分ける。
+
+- 失敗した索引テストの孤立実行（`cargo test -j 1 -p mimageviewer --features pack-build-tools --lib indexer_manager::tests::incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls -- --exact`）:
+  exit 0、1 passed、2.69秒 (`target/1324-test-indexer-isolated.log`)。全体 gate の非ゼロ結果は維持する。
+- 最終 `cargo fmt --check` / `git diff --check`: ともに exit 0
+  (`target/1324-fmt-check.log` / `target/1324-diff-check.log`)。
+- 設計・完成実装の独立コードレビュー: 修正が必要な指摘なし。実機での観測ではなく source / 対象 test log のレビュー。
+
+- `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`: exit 0
+  (`target/1324-build-dev.log`)。`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` をこの実行の環境に指定。
+  既存 MSBuild node の待機を省き、使用中の staged executable は停止しない指定を使った。
+  normal feature / dev-runtime の core・Remote service・EPUB worker と runtime DLL を準備済み。portable は付けていない。
+  製品／smoke を起動せず、commit なし。英語コミット案は `target/1324-msg.txt`。
+
+利用者向け確認: インストール版／常駐tray版を終了後、repository root で
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` を実行する。
+引数なしでは実利用の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。
+EffeTune の効果を OFF にして meter を出し、動画／音楽の再生中に前段設定 ON→OFF→ON を OK で確定する。
+メイン／全画面／別窓／動画の音声表示モードで、開き直し不要・切替音や同期ずれがないことを確認する。
+Remote は配信を再開せず、先読み済み音声を待ってから入力ピークの変化を確認する。

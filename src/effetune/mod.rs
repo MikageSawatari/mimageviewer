@@ -212,15 +212,35 @@ impl EffectiveState {
     }
 }
 
-/// All local players observe this one slot. A pump reads it once per block.
-#[derive(Default)]
+/// All local players and Remote workers observe this one slot per audio block.
 pub struct EffetuneAudioSlot {
     current: Mutex<Option<(u64, Arc<DspBridge>)>>,
     failure_tx: Mutex<Option<mpsc::Sender<EffetuneFailure>>>,
     failed_generation: AtomicU64,
+    pre_limiter_enabled: AtomicBool,
+}
+
+impl Default for EffetuneAudioSlot {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(None),
+            failure_tx: Mutex::new(None),
+            failed_generation: AtomicU64::new(0),
+            pre_limiter_enabled: AtomicBool::new(true),
+        }
+    }
 }
 
 impl EffetuneAudioSlot {
+    /// The App publishes only accepted preferences, independently of bridge life.
+    pub(crate) fn set_pre_limiter_enabled(&self, enabled: bool) {
+        self.pre_limiter_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn pre_limiter_enabled(&self) -> bool {
+        self.pre_limiter_enabled.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> Option<(u64, Arc<DspBridge>)> {
         self.current
             .lock()
@@ -925,6 +945,7 @@ impl EffetuneController {
                 current: Mutex::new(None),
                 failure_tx: Mutex::new(Some(failure_tx)),
                 failed_generation: AtomicU64::new(0),
+                pre_limiter_enabled: AtomicBool::new(true),
             }),
             bridge: None,
             bundle_path: bundle.ok(),

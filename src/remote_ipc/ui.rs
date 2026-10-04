@@ -1336,7 +1336,7 @@ impl crate::app::App {
                 user_warning,
                 effetune_warning,
             )
-            .with_effetune_preferences(&self.settings)
+            .with_effetune_slot(std::sync::Arc::clone(&self.effetune.slot))
         }
     }
 

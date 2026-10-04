@@ -8034,7 +8034,7 @@ pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &m
         .on_hover_text(
             "音量を全体的に下げず、0dB を超えるピークを抑えます。音の可視化だけでも OVERLOAD が出るのを防ぎます。\n\
              EffeTune 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
-             変更後は動画・音声の画面を閉じて開き直してください。リモート配信は終了してから始め直してください。",
+             OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
         );
     }
     #[cfg(feature = "portable")]

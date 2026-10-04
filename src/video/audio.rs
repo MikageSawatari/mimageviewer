@@ -1133,6 +1133,18 @@ impl SafetyLimiter {
     /// 内部信号に作用するので、戻り値は「内部チェーンが 0 dBFS をどれだけ超えたか」を
     /// そのまま表す。
     pub(crate) fn process_block(&mut self, samples: &mut [f32]) -> bool {
+        self.process_block_with_mix(samples, &mut 1.0, 1.0, 0.0)
+    }
+
+    /// Mix limited and raw samples from the SAME delay line. The final limiter
+    /// always uses mix=1; only the EffeTune input stage ramps this value.
+    fn process_block_with_mix(
+        &mut self,
+        samples: &mut [f32],
+        mix: &mut f32,
+        target: f32,
+        step: f32,
+    ) -> bool {
         if samples.is_empty() || self.channels == 0 {
             return false;
         }
@@ -1167,8 +1179,16 @@ impl SafetyLimiter {
                 self.gain = target_gain + (self.gain - target_gain) * self.release_coeff;
             }
 
+            *mix += (target - *mix).clamp(-step, step);
             for (ch, &d) in self.delayed_frame.iter().enumerate() {
-                samples[in_base + ch] = (d * self.gain).clamp(-self.ceiling, self.ceiling);
+                let limited = (d * self.gain).clamp(-self.ceiling, self.ceiling);
+                samples[in_base + ch] = if *mix >= 1.0 {
+                    limited
+                } else if *mix <= 0.0 {
+                    d
+                } else {
+                    d + (limited - d) * *mix
+                };
             }
             self.write_frame = (self.write_frame + 1) % self.lookahead_frames;
         }
@@ -1176,12 +1196,13 @@ impl SafetyLimiter {
     }
 }
 
-/// Owns only the optional EffeTune input delay. Preserve the user-chain buffer so
+/// Owns the fixed EffeTune input delay and live wet/dry ramp. Preserve the user-chain buffer so
 /// a failed EffeTune block can fall back without either limiting or added latency.
 pub(crate) struct EffetuneInputLimiter {
     limiter: SafetyLimiter,
     samples: Vec<f32>,
     generation: Option<u64>,
+    mix: f32,
 }
 
 impl EffetuneInputLimiter {
@@ -1190,6 +1211,7 @@ impl EffetuneInputLimiter {
             limiter: SafetyLimiter::new(sample_rate, 2),
             samples: Vec::new(),
             generation: None,
+            mix: 1.0,
         }
     }
 
@@ -1204,18 +1226,22 @@ impl EffetuneInputLimiter {
         generation: u64,
         enabled: bool,
     ) -> (&'a [f32], f64) {
-        if !enabled {
-            self.reset();
-            return (input, 0.0);
-        }
         if self.generation != Some(generation) {
             self.reset();
             self.generation = Some(generation);
+            self.mix = if enabled { 1.0 } else { 0.0 };
         }
         self.samples.clear();
         self.samples.extend_from_slice(input);
         // The HUD indicator continues to describe the final output limiter only.
-        self.limiter.process_block(&mut self.samples);
+        // Keep peak/gain history warm while bypassed. Ramp over the same 5ms
+        // interval as lookahead, per frame (both channels share one mix).
+        self.limiter.process_block_with_mix(
+            &mut self.samples,
+            &mut self.mix,
+            if enabled { 1.0 } else { 0.0 },
+            1.0 / self.limiter.lookahead_frames as f32,
+        );
         (&self.samples, self.limiter.latency_secs())
     }
 }
@@ -1317,7 +1343,6 @@ pub(crate) struct AudioDspTailPlan {
     upstream_frames: usize,
     effetune_frames: usize,
     final_frames: usize,
-    pre_enabled: bool,
     gain: f32,
 }
 
@@ -1328,7 +1353,6 @@ impl AudioDspTail {
         effetune_frames: usize,
         pre_frames: usize,
         final_frames: usize,
-        pre_enabled: bool,
         gain: f32,
     ) {
         let metadata = ProcessedChunk {
@@ -1346,7 +1370,6 @@ impl AudioDspTail {
             upstream_frames: effetune_frames + pre_frames,
             effetune_frames,
             final_frames,
-            pre_enabled,
             gain,
         });
     }
@@ -1380,6 +1403,7 @@ impl AudioDspTail {
         sample_rate: u32,
         pre: &mut EffetuneInputLimiter,
         final_limiter: &mut SafetyLimiter,
+        pre_enabled: bool,
         mut process_effetune: impl FnMut(u64, usize, &[f32], &mut [f32]) -> bool,
         mut ceiling_hit: impl FnMut(),
     ) -> Option<ProcessedChunk> {
@@ -1397,7 +1421,7 @@ impl AudioDspTail {
                 .chunk
                 .effetune_generation
                 .expect("upstream tail has an EffeTune stage");
-            let (input, _) = pre.prepare(&zeros, generation, plan.pre_enabled);
+            let (input, _) = pre.prepare(&zeros, generation, pre_enabled);
             samples = vec![0.0; zeros.len()];
             if process_effetune(generation, plan.effetune_frames, input, &mut samples) {
                 plan.upstream_frames -= frames;
@@ -1586,8 +1610,6 @@ pub fn default_output_sample_rate() -> Option<u32> {
 pub struct AudioDspChain {
     pub user: Option<Arc<crate::video::dsp::DspBridge>>,
     pub effetune: Arc<crate::effetune::EffetuneAudioSlot>,
-    /// Snapshot for this playback; close and reopen to apply preference changes.
-    pub effetune_pre_limiter_enabled: bool,
     pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
 }
 
@@ -1952,13 +1974,9 @@ fn run_pump(
     #[cfg(windows)]
     boost_audio_pump_priority();
     #[cfg(windows)]
-    let (dsp_bridge, effetune_slot, effetune_pre_limiter_enabled) = match dsp_chain {
-        Some(chain) => (
-            chain.user,
-            Some(chain.effetune),
-            chain.effetune_pre_limiter_enabled,
-        ),
-        None => (None, None, true),
+    let (dsp_bridge, effetune_slot) = match dsp_chain {
+        Some(chain) => (chain.user, Some(chain.effetune)),
+        None => (None, None),
     };
 
     // VST3 process_block 用の出力バッファ。再利用して realloc を抑える。
@@ -2688,7 +2706,7 @@ fn run_pump(
                                         .prepare(
                                             &output_samples,
                                             generation,
-                                            effetune_pre_limiter_enabled,
+                                            slot.pre_limiter_enabled(),
                                         );
                                     match bridge.process_block(input, &mut effetune_out) {
                                         Ok(()) => {
@@ -2796,29 +2814,23 @@ fn run_pump(
                     effetune_generation: None,
                 };
                 #[cfg(windows)]
-                let (effect_frames, pre_frames, pre_enabled) = if effetune_applied {
-                    let pre_frames = if effetune_pre_limiter_enabled {
-                        effetune_input_limiter.limiter.lookahead_frames
-                    } else {
-                        0
-                    };
+                let (effect_frames, pre_frames) = if effetune_applied {
+                    let pre_frames = effetune_input_limiter.limiter.lookahead_frames;
                     (
                         ((applied_effetune_latency_secs * sample_rate as f64).round() as usize)
                             .saturating_sub(pre_frames),
                         pre_frames,
-                        effetune_pre_limiter_enabled,
                     )
                 } else {
-                    (0, 0, false)
+                    (0, 0)
                 };
                 #[cfg(not(windows))]
-                let (effect_frames, pre_frames, pre_enabled) = (0, 0, false);
+                let (effect_frames, pre_frames) = (0, 0);
                 dsp_tail.capture(
                     &full_chunk,
                     effect_frames,
                     pre_frames,
                     safety_limiter.lookahead_frames,
-                    pre_enabled,
                     pre_limiter_gain,
                 );
                 full_chunk
@@ -2848,6 +2860,18 @@ fn run_pump(
                     sample_rate,
                     &mut effetune_input_limiter,
                     &mut safety_limiter,
+                    {
+                        #[cfg(windows)]
+                        {
+                            effetune_slot
+                                .as_ref()
+                                .is_some_and(|slot| slot.pre_limiter_enabled())
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            false
+                        }
+                    },
                     |generation, latency_frames, input, output| {
                         #[cfg(windows)]
                         {
@@ -4079,7 +4103,6 @@ mod tests {
         let chain = AudioDspChain {
             user: None,
             effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
-            effetune_pre_limiter_enabled: true,
             coordinator: Arc::clone(&coordinator),
         };
         let (at_commit_tx, at_commit_rx) = bounded(1);
@@ -4172,7 +4195,6 @@ mod tests {
         AudioDspChain {
             user: None,
             effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
-            effetune_pre_limiter_enabled: true,
             coordinator,
         }
     }
@@ -4533,11 +4555,7 @@ mod tests {
                 for frames in [3, rate as usize / 50] {
                     let mut pre = EffetuneInputLimiter::new(rate);
                     let mut final_limiter = SafetyLimiter::new(rate, 2);
-                    let pre_frames = if enabled {
-                        final_limiter.lookahead_frames
-                    } else {
-                        0
-                    };
+                    let pre_frames = final_limiter.lookahead_frames;
                     let effect_frames = rate as usize / 200;
                     let mut delay = std::collections::VecDeque::from(vec![0.0; effect_frames * 2]);
                     let mut effect =
@@ -4568,16 +4586,20 @@ mod tests {
                         effect_frames,
                         pre_frames,
                         final_limiter.lookahead_frames,
-                        enabled,
                         1.0,
                     );
                     tail.start(0);
                     let mut end_pts = chunk.audible_pts_secs + chunk.duration_secs * 2.0;
                     while !tail.complete() {
                         let next = tail
-                            .next(rate, &mut pre, &mut final_limiter, &mut effect, || {
-                                panic!("no reduction expected")
-                            })
+                            .next(
+                                rate,
+                                &mut pre,
+                                &mut final_limiter,
+                                enabled,
+                                &mut effect,
+                                || panic!("no reduction expected"),
+                            )
                             .unwrap();
                         assert_eq!(
                             next.pdc_latency_secs_at_process,
@@ -4594,8 +4616,15 @@ mod tests {
                     // Repeated EOS cannot emit the same lookahead twice.
                     tail.start(0);
                     assert!(
-                        tail.next(rate, &mut pre, &mut final_limiter, &mut effect, || {})
-                            .is_none()
+                        tail.next(
+                            rate,
+                            &mut pre,
+                            &mut final_limiter,
+                            enabled,
+                            &mut effect,
+                            || {}
+                        )
+                        .is_none()
                     );
                 }
             }
@@ -4614,20 +4643,21 @@ mod tests {
         let mut chunk = make_chunk(output, 0.0, 2_000.0);
         chunk.effetune_generation = Some(7);
         let mut tail = AudioDspTail::default();
-        tail.capture(&chunk, 0, 5, 5, true, 1.0);
+        tail.capture(&chunk, 0, 5, 5, 1.0);
         tail.start(0);
         let next = tail
             .next(
                 rate,
                 &mut pre,
                 &mut final_limiter,
+                true,
                 |_, _, _, _| false,
                 || {},
             )
             .unwrap();
         assert_eq!(next.samples, vec![0.6; 10]);
         assert!(tail.complete());
-        tail.capture(&chunk, 0, 5, 5, true, 1.0);
+        tail.capture(&chunk, 0, 5, 5, 1.0);
         tail.discard_stale(1);
         tail.start(1);
         assert!(
@@ -4635,6 +4665,7 @@ mod tests {
                 rate,
                 &mut pre,
                 &mut final_limiter,
+                true,
                 |_, _, _, _| panic!("stale stage"),
                 || {}
             )
@@ -6117,7 +6148,7 @@ mod tests {
     }
 
     #[test]
-    fn effetune_pre_limiter_limits_a_copy_and_off_preserves_input() {
+    fn effetune_pre_limiter_limits_a_copy_and_off_preserves_delayed_input() {
         let input = vec![1.28, -1.27].repeat(32);
         let mut limiter = EffetuneInputLimiter::new(1_000);
         let (limited, latency) = limiter.prepare(&input, 1, true);
@@ -6126,28 +6157,87 @@ mod tests {
         assert!(limited.iter().any(|sample| sample.abs() > 0.9));
         assert_eq!(input[0], 1.28);
         let (dry, latency) = limiter.prepare(&input, 1, false);
-        assert_eq!(dry, input);
-        assert_eq!(latency, 0.0);
+        assert_eq!(&dry[12..], &input[12..]);
+        assert_eq!(latency, 0.005);
+        let mut bypassed = EffetuneInputLimiter::new(1_000);
+        let (dry, latency) = bypassed.prepare(&input, 1, false);
+        assert_eq!(&dry[..10], &[0.0; 10]);
+        assert_eq!(&dry[10..], &input[..input.len() - 10]);
+        assert_eq!(latency, 0.005);
     }
 
     #[test]
-    fn effetune_pre_limiter_reset_generation_and_toggle_clear_old_audio() {
+    fn effetune_pre_limiter_reset_and_generation_clear_old_audio() {
         let mut limiter = EffetuneInputLimiter::new(1_000);
-        for reset_kind in 0..3 {
+        for reset_kind in 0..2 {
             limiter.prepare(&[0.8, -0.8].repeat(3), 1, true);
             let generation = match reset_kind {
                 0 => {
                     limiter.reset();
                     1
                 }
-                1 => 2,
-                _ => {
-                    limiter.prepare(&[0.0; 2], 1, false);
-                    1
-                }
+                _ => 2,
             };
             let (samples, _) = limiter.prepare(&[0.0; 20], generation, true);
             assert!(samples.iter().all(|sample| *sample == 0.0));
+        }
+    }
+
+    #[test]
+    fn effetune_pre_limiter_live_toggle_keeps_frames_latency_and_history() {
+        for rate in [1_000, 44_100, 48_000] {
+            let mut pre = EffetuneInputLimiter::new(rate);
+            let delay = pre.limiter.lookahead_frames;
+            let input: Vec<_> = (0..delay * 9)
+                .flat_map(|i| {
+                    let x = (i + 1) as f32 / (delay * 10) as f32;
+                    [x, -x]
+                })
+                .collect();
+            let mut output = Vec::new();
+            // One-frame blocks, including rapid reversals, must neither drop nor
+            // duplicate even a sub-ceiling frame held across a setting change.
+            for (i, frame) in input.chunks_exact(2).enumerate() {
+                let enabled = i < delay * 2 || i >= delay * 5 || i == delay * 3;
+                let (samples, latency) = pre.prepare(frame, 7, enabled);
+                assert_eq!(latency, delay as f64 / rate as f64);
+                output.extend_from_slice(samples);
+                assert_eq!(pre.generation, Some(7));
+            }
+            let zeros = vec![0.0; delay * 2];
+            let (tail, _) = pre.prepare(&zeros, 7, true);
+            output.extend_from_slice(tail);
+            assert_eq!(&output[..delay * 2], vec![0.0; delay * 2]);
+            assert_eq!(&output[delay * 2..], input);
+        }
+    }
+
+    #[test]
+    fn effetune_pre_limiter_live_toggle_crossfades_without_reset_or_channel_skew() {
+        for rate in [1_000, 44_100, 48_000] {
+            let mut pre = EffetuneInputLimiter::new(rate);
+            let n = pre.limiter.lookahead_frames;
+            pre.prepare(&vec![2.0, -2.0].repeat(n * 2), 9, true);
+            let mut previous = 1.0_f32;
+            let input = [2.0, -2.0].repeat(n + 1);
+            for enabled in [false, true, false, true] {
+                let (samples, latency) = pre.prepare(&input, 9, enabled);
+                assert_eq!(latency, n as f64 / rate as f64);
+                for frame in samples.chunks_exact(2) {
+                    assert_eq!(frame[0], -frame[1]);
+                    assert!((frame[0] - previous).abs() <= 1.0 / n as f32 + 1e-5);
+                    assert!((1.0..=2.0).contains(&frame[0]));
+                    previous = frame[0];
+                }
+                assert!((previous - if enabled { 1.0 } else { 2.0 }).abs() < 1e-5);
+                assert_eq!(pre.limiter.gain, 0.5);
+                assert_eq!(pre.generation, Some(9));
+            }
+            // Reverse in the middle of the ramp, from its current mix.
+            pre.prepare(&[2.0, -2.0], 9, false);
+            let mix = pre.mix;
+            pre.prepare(&[2.0, -2.0], 9, true);
+            assert!(pre.mix > mix);
         }
     }
 
