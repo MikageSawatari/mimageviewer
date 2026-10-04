@@ -74,15 +74,6 @@
 - 方針: ゲートを開ける前に stats == 3 かつ active == 3 を待つ。assert は弱めない。
 - 規模 / 優先度: Small / P3 (全体テストのまれな偽失敗)。
 
-### 1.327 mIV を起動するとき、ウィンドウのようなものが一瞬出てちらつく — 利用者報告 (2026-10-04)
-
-- 観測 (利用者、v4.3.0 前後の開発ビルド): 起動時にウィンドウのようなものが一瞬表示されてちらつく。いつからかは不明。
-- 追加観測 (利用者、2026-10-04): 新規隔離 `--data-dir`、保存placementなし、VST3 / EffeTuneなしでも発生。録画24枚には大きい白窓、左上と中央の白窓の重なり、その後のfade-outが写る。各矩形のHWNDは未記録。
-- 調査 (利用者採取ログ + Codex再確認): saved maximizedの同一main HWNDでpaint前にmax→hide、restore→hide、max→hideの3回の過渡表示を確認。normal起動にはない。hidden最大化とegui-winitのnormal geometry再補正が原因経路。録画frameごとのDWM対応は未確定。overlayはROOT内描画、空起動でsecondaryを生成する根拠はない。
-- 採用判断 (利用者、2026-10-04): winit vendor化／全native API移管を含む大規模案は起動cosmetic問題に対して大きいため将来候補。**通常窓が一瞬出てから最大化する見た目を了承**し、小規模案を採用した。
-- 実装 / 次の一手: rootをsaved normal geometryでhidden生成し、normal size補正後、eframe visible commitの完了と現在の可視性を確認してMAXを一度だけ発行。旧created-max／deferred sizeの解除後再送をなくし、normal restore rectとexit-saveのmax状態を保持する。tray hidden／minimized中は復帰まで要求を保持。winit patchなし、eframe変更はroot receiptのみ。自動検証・独立レビュー・normal dev-runtime確認build完了。利用者がnormal／max保存・CLI・2monitor・trayで診断採取して検収する。正本: [調査 §8](section327-startup-window-flicker-investigation.md#8-採用した小規模修正-normal表示後に一度だけ最大化-2026-10-04)、採取方法は§6。製品はエージェント未起動、修正後の実機ログは未採取。
-- 規模 / 優先度: app startup geometryとeframe root receiptの限定変更 / P2。
-
 ### 1.325 Susie の初期化待ちが、予定の 5 秒を超えて延びることがある — §1.321 のレビューで判明 (2026-10-04)
 
 - 出典: §1.321 修正 (7bbbf6dd8) の独立レビュー (Sol xhigh) の P2。製品のリリース済みの挙動で、§1.321 の修正とは独立。
