@@ -662,7 +662,9 @@ mod tests {
 
         wait_until(|| {
             let stats = scheduler.stats();
-            stats.running + stats.cancelling == 3
+            // Admission precedes the worker's active/peak accounting. Keep the
+            // gate closed until all three admitted workers have entered it.
+            stats.running + stats.cancelling == 3 && active.load(Ordering::SeqCst) == 3
         });
         let stats = scheduler.stats();
         assert_eq!(stats.running, 3);

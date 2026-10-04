@@ -1562,6 +1562,9 @@ pub fn run() -> eframe::Result {
     if let Ok(runtime) = collection_runtime {
         runtime.shutdown_and_join();
     }
+    // Rendering and normal shutdown are complete. Preserve the buffered tail for
+    // every perf category without adding another periodic log write on the UI.
+    perf::flush();
     #[cfg(all(feature = "test-script", windows))]
     if scripted_run && run_result.is_ok() {
         test_script::exit_after_run_native();

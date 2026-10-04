@@ -72,6 +72,8 @@
 - 観測: §1.312 の作業中、`cargo test -p mimageviewer --lib` 全体 (10,247 件) でこのテストだけ 1 回失敗 (`peak == 3` の期待に対して 2、line 678)。単独で再実行すると成功。§1.312 の変更とは無関係 (実装担当の調査と独立レビューで確認)。
 - 原因 (コードの読み): stats が Running の許可を 3 つ出した時点で、worker が active / peak を更新する前にテストがゲートを開けてしまう。上限 (許可数) の違反ではない。
 - 方針: ゲートを開ける前に stats == 3 かつ active == 3 を待つ。assert は弱めない。
+- 実装済み (2026-10-05、独立レビュー待ち): Running / Cancelling 合計と active の両方が 3 になるまでゲートを閉じる。既存 assert は維持。同モジュールの他テストに、許可数だけで active / peak の測定ゲートを開く同型パターンはない。
+- 自動検証: `cargo test -p mimageviewer --lib fs_page_load_scheduler::tests`、9 件成功。元の全体実行での失敗は上記 §1.312 作業時の観測であり、今回の検証では再現を主張しない。
 - 規模 / 優先度: Small / P3 (全体テストのまれな偽失敗)。
 
 ### 1.325 Susie の初期化待ちが、予定の 5 秒を超えて延びることがある — §1.321 のレビューで判明 (2026-10-04)
@@ -81,6 +83,9 @@
 - 観測 (§1.321 の診断ログ): fallback 成立が 5.411 秒、他の走査が進み出したのは約 10.411 秒。個々の wakeup は記録していない。
 - 影響の見込み (推測): Susie の初期化が遅い・終わらない環境で、起動時の索引走査など `get_pool` を待つ処理の開始が 5 秒より遅れる。UI スレッドは待たない。
 - 方針: 絶対期限で待つ、fallback 時に notify_all する。回帰テスト: 初期化しない状態で複数の待機者が 5 秒前後でそろって進むこと。
+- 実装済み (2026-10-05、独立レビュー待ち): `get_pool` の待機開始からの絶対期限を維持し、init / reload / fallback の完了公開を `notify_all` 付き共通 helper に統一。process-global pool を変更しない回帰テストで仮想 2 秒の早期 wake 後の残り 3 秒と、仮想 5 秒で 1 waiter だけを起こした fallback による全 3 waiter の解放を検証する。sleep による同期は使わない。
+- 自動検証: `cargo test -p mimageviewer --lib susie_loader::tests`、回帰を含む 14 件成功。本番の 5 秒初期化待ちや製品起動は実行していない。
+- Codex P3 対応 (2026-10-05、7dada7053 の独立レビュー指摘): 回帰テストの cleanup を検証対象 helper から独立した `done = true` / `notify_all` に変更。結果の受信と worker join の待機はそれぞれ全体 5 秒の絶対期限に限定。`complete_init` の通知を一時的に除去した対照では `[Ok(5), Err(Timeout), Err(Timeout)]` でテスト実行 5.00 秒で期待どおり失敗し、ハングしなかった。通知を復元後、Susie 14 テスト成功。製品コードの変更は残していない。
 - 規模 / 優先度: Small / P3。
 
 ### 1.324 「EffeTune に渡す前に 0dB を超える音を抑える」を再生中に反映するか — 残り 1 件 (2026-10-04)
@@ -95,7 +100,12 @@
 - 観測 (サブPCの Windows Sandbox、利用者が確認): v4.3.0 の単体exe版を日本語を含む APPDATA で初回起動した約 26 秒後に WER 1001 `RADAR_PRE_LEAK_64` (P1 mimageviewer-core.exe 4.3.0.0、ダンプなし)。クラッシュ・ハングではなく、mIV は応答を続けて正常終了。インストール版の初回起動では出ていない。
 - 2 回目の配布ビルド (告知修正後) でもサブPCの自動計測で再度出た: 日本語 APPDATA の単体exe版を起動して約 29 秒後に 1 件、Fault bucket は前回と同じ 2116605665071906769 (type 5)、ダンプなし (WER\Temp は収集時点で消えていた)。初回・2 回目のインストール版起動では両ビルドとも出ていない。mIV は応答を続け 1.0 秒で正常終了。
 - 推測: 初回の展開 (AI モデル・ONNX Runtime・EffeTune など) と起動処理が重なって、確保済みメモリがしきい値を超えた。発生条件の違いは未確認。
-- 次の一手: 初回起動直後のメモリ使用量 (private bytes / working set) を perf ログに記録し、どの段階で増えるかを見る。必要なら展開や初期化を遅らせる。
+- 設計決定 (2026-10-05、利用者指定): core のみを計測する。EffeTune / DLL / exe の launcher 展開は core 起動前で、core の private bytes には含まれない。launcher logger / ログ受け渡しは追加しない。上記のメモリ増加原因は推測のままで、計装を追加しても RADAR の原因特定・修正とは扱わない。
+- 実装済み (2026-10-05、独立レビュー待ち): core の startup milestone と AI runtime / EffeTune / PDF pool / Susie init の begin/end に `process_memory` を追加。private commit / working set / peak working set / pagefile commit charge、PID、stage を記録し、perf 有効時だけ起動する 1 秒周期 sampler は core 起動から 60 秒で終了。初期化順・機能は変えない。正本は [ui-responsiveness.md §6.2](ui-responsiveness.md#62-core-の起動メモリ診断-1322)。
+- 自動検証: `perf::memory::tests` 2 件、AI runtime `init_owner_` 6 件、`python scripts/test_analyze_perf.py` 64 件成功。通常 / portable の core `cargo check`、`cargo fmt --check`、`git diff --check` 成功。メモリ API テストの計測対象は unit test process で、製品の起動観測ではない。
+- Codex P2/P3 対応 (2026-10-05、709e99426 の独立レビュー指摘): sampler の毎秒 flush を削除し、通常運転は既存の UI update 内の約1秒周期 flush を利用。正常終了時の flush が従来なかったため、利用者 / ClaudeCode の指定により UI ループと既存 shutdown 完了後の共通経路で1回 flush を追加。session に UTC Unix milliseconds / 対応する相対秒と、取得成功時の core 作成時刻を追加し、`memory` 解析器は各 sample の UTC を表示 (旧ログの相対表示は維持)。
+- 追補の自動検証: `cargo test -p mimageviewer --lib perf::` 15 件、Python 解析器 66 件成功。通常 / portable の core `cargo check`、`cargo fmt --check`、`git diff --check` 成功。`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` も正常プロファイルの core / remote / EPUB worker と VCRT PE 検証が成功 (core 増分ビルド 1分56秒、起動なし)。clock のテストは非ゼロの相対時刻との対応・FILETIME の変換・unit test process の作成時刻を検証し、Python は有効化前後の UTC 換算と旧 session ヘッダーを検証した。正常終了の flush 位置はソース確認で、製品を起動した採取検証ではない。
+- 次の一手: 利用者の初回 Sandbox 環境で単体 exe を `.\mimageviewer.exe --perf-log` として起動。launcher の展開後に core の PID / StartTime (UTC) を記録し、**core の StartTime から少なくとも60秒**経過後に正常終了する (launcher 起動からの60秒では不足しうる)。launcher が `--perf-log` を core に転送することをコードで確認済み。WER 1001 の TimeCreated (UTC) と本文も保存し、`%APPDATA%\mimageviewer\logs\perf_events.jsonl` の session PID / 作成時刻を同一実行として照合する。`python scripts/analyze_perf.py <log> memory` の UTC / stage と `startup` で WER 時刻を比較する。設定の性能ログ ON はモデル / Susie worker 展開後の有効化なので、初回の全区間を採取するには CLI を使う。上記26秒 / 29秒は利用者の launcher 起動基準の観測で、JSONL `t` の core 基準とは区別する。今回の実装担当は製品起動・RADAR 再現を行っていない。
 
 ### 1.321 search_metadata_e2e の負荷時失敗 — 初期化漏れ修正済み、強負荷での別失敗は未解決 (2026-10-04)
 

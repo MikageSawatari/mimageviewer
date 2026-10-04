@@ -838,7 +838,10 @@ fn wake_ui(context: &Mutex<Option<egui::Context>>) {
 
 impl EffetuneController {
     pub fn new() -> Self {
-        let bundle = resolve_bundle();
+        let bundle = {
+            let _memory = crate::perf::memory::span("effetune_bundle_resolve");
+            resolve_bundle()
+        };
         if let Err(reason) = &bundle {
             crate::logger::log(format!("[EffeTune] unavailable: {reason:?}"));
         }
@@ -1067,7 +1070,9 @@ impl EffetuneController {
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
+                let _memory = crate::perf::memory::span("effetune_load");
                 let bundle = if let Some(original) = retry {
+                    let _memory = crate::perf::memory::span("effetune_bundle_resolve");
                     let UnavailableReason::BundlePreparationFailed {
                         ref rejected_generation,
                         ..
