@@ -221,7 +221,7 @@ https://mikage.to/mimageviewer/privacy.html
     RAR 展開に使用します。ライセンス全文は UNRAR-LICENSE.txt を参照してください。
   - EffeTune Mixwright (MIT): Copyright (c) 2025-2026 Yoshiyuki Kobayashi
     同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate /
-    setImmediate / pako (zlib)、CHOC、および通知に記載されたその他の
+    setImmediate / pako (zlib)、CHOC、PFFFT、fdlibm、および通知に記載されたその他の
     ライブラリ）には、それぞれのライセンスが適用されます。
     ライセンス全文は、アプリの「ソフトウェア情報」（バージョン情報）の
     EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。

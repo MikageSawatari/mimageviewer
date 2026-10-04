@@ -8,7 +8,7 @@ use std::path::Path;
 #[allow(dead_code)]
 mod bundle_paths;
 
-const RECOVER: &str = "Restore the complete approved EffeTune Mixwright v0.11.1 vendor source. Do not regenerate the tracked manifest to accept local changes.";
+const RECOVER: &str = "Restore the complete approved EffeTune Mixwright v0.12.0 vendor source. Do not regenerate the tracked manifest to accept local changes.";
 
 fn failure(message: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("EffeTune source approval: {message}. {RECOVER}"))
@@ -72,7 +72,7 @@ fn changed_files(
 }
 
 pub fn validate(workspace: &Path, source: &Path) -> io::Result<()> {
-    let manifest_path = workspace.join("third_party/effetune-mixwright/v0.11.1/manifest.sha256");
+    let manifest_path = workspace.join("third_party/effetune-mixwright/v0.12.0/manifest.sha256");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let approved = parse_manifest(&std::fs::read_to_string(manifest_path)?)?;
     let original = workspace.join("vendor/effetune-mixwright");
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn approved_vendor_snapshot_matches_all_408_raw_files() {
+    fn approved_vendor_snapshot_matches_all_425_raw_files() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source = workspace.join("vendor/effetune-mixwright");
         if !source.exists() {
@@ -165,12 +165,12 @@ mod tests {
         }
         let manifest = parse_manifest(
             &std::fs::read_to_string(
-                workspace.join("third_party/effetune-mixwright/v0.11.1/manifest.sha256"),
+                workspace.join("third_party/effetune-mixwright/v0.12.0/manifest.sha256"),
             )
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest.len(), 408);
+        assert_eq!(manifest.len(), 425);
         assert!(
             changed_files(&manifest, &hashes(&source).unwrap())
                 .unwrap()

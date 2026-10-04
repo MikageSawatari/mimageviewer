@@ -1009,7 +1009,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全407ファイル、v0.11.1。入力は別の VERSION と計408ファイル)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全424ファイル、v0.12.0。入力は別の VERSION と計425ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -1678,8 +1678,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.11.1 の VERSION と全407ファイルを
-  `third_party/effetune-mixwright/v0.11.1/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.12.0 の VERSION と全424ファイルを
+  `third_party/effetune-mixwright/v0.12.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
   launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
@@ -1693,7 +1693,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
   成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
-  通知原文とmanifestは `third_party/effetune-mixwright/v0.11.1/` に追跡し、`.gitattributes -text`で
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.12.0/` に追跡し、`.gitattributes -text`で
   checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
@@ -2179,6 +2179,11 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
         (Store が再DLして再検証する)。
       - リダイレクト無しを確認: `curl -sI <URL>` が `200 OK` (301/302 が出ないこと)、
         `Content-Length` が署名済み setup.exe と一致すること。
+    - **①.5 申請前にクリーンな Windows で起動を確かめる**: 署名済み setup.exe を Windows Sandbox (VC++ ランタイム無し) に
+      同じサイレント引数で入れ、初回・2 回目の起動で窓が出て応答し続けることを見る (v3.6.0 / v4.1.0 は「起動中のまま」で却下された。
+      サブ PC の手順は `C:\miv-sandbox\`、経緯はバックログ §1.241)。Sandbox では WebView2 が動かないので、音響調整と EPUB 変換の失敗は対象外
+      ([EffeTune 計画 §10](docs/effetune-integration-plan.md#10-決定済みの配布方針と残る対象外事項))。
+    - **認定の注意事項**: EXE/MSI アプリは「プロパティ」ページの「認定の注意事項」(2,000 字) に書く (MSIX の「提出オプション」ではない)。
     - **② Partner Center で更新**: [partner.microsoft.com](https://partner.microsoft.com/) →
       mImageViewer → 「アプリを更新」→ **パッケージ**のパッケージ URL を新 URL に差し替え →
       **各ページで必ず「下書きの保存」** (保存せず「次へ」だと入力が消える) → 「すべて保存」→
