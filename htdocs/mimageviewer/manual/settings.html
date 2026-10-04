@@ -990,7 +990,7 @@
           </tr>
           <tr>
             <td>既定音量</td>
-            <td>動画を開いたときの初期音量（-∞dB〜+18dB）。0dB を超えるブースト部分には内蔵の safety limiter が働きます。</td>
+            <td>動画を開いたときの初期音量（-∞dB〜+18dB）。内蔵の音割れ防止は常に働き、元の音やブーストによる過大な出力を抑えます。</td>
             <td>0dB</td>
           </tr>
           <tr>
@@ -1104,9 +1104,9 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        VST3 チェーンの末尾と、音量を 0dB 超にブーストしたときには、内蔵の safety limiter
-        （0dBFS）が保険として働き、過大出力による音割れを抑えます。
-        この機能は <a href="https://github.com/steinbergmedia/vst3sdk">Steinberg VST3 SDK</a>（MIT ライセンス）を利用しています。
+        内蔵の音割れ防止は、VST3 や音響調整の使用、音量設定にかかわらず常に働きます。
+        動画・音楽とリモート配信で、過大な出力による音割れを抑えます。
+        VST3 プラグインへの対応は <a href="https://github.com/steinbergmedia/vst3sdk">Steinberg VST3 SDK</a>（MIT ライセンス）を利用しています。
       </div>
     </div>
 

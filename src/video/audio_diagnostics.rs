@@ -63,6 +63,13 @@ pub struct AudioDiagnostics {
     pub callback_seek_serial: AtomicU64,
     pub callback_engine_state: AtomicU64,
 
+    /// Actual PCM frames consumed by the output callback (excludes underrun silence).
+    pub output_frames_total: AtomicU64,
+    /// First non-silent device output in each seek generation. Callback publishes PTS
+    /// before the serial (Release); the pump emits the event outside the RT thread.
+    pub first_output_serial: AtomicU64,
+    pub first_output_pts_bits: AtomicU64,
+
     /// CPAL error callback writes only these atomics. Formatting and logging happen on audio-pump.
     pub device_error_count: AtomicU64,
     pub device_error_category: AtomicU64,
@@ -146,6 +153,9 @@ impl AudioDiagnostics {
             fill_duration_max_ns: AtomicU64::new(0),
             callback_seek_serial: AtomicU64::new(0),
             callback_engine_state: AtomicU64::new(0),
+            output_frames_total: AtomicU64::new(0),
+            first_output_serial: AtomicU64::new(u64::MAX),
+            first_output_pts_bits: AtomicU64::new(f64::NAN.to_bits()),
             device_error_count: AtomicU64::new(0),
             device_error_category: AtomicU64::new(0),
             device_error_wall_ns: AtomicU64::new(0),

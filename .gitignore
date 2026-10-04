@@ -28,6 +28,7 @@ bench_thumbs.tsv
 /testdata/*
 !/testdata/rating-sort/
 !/testdata/audio-tracks/
+!/testdata/audio-tail/
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
 /.claude/
 /codex-review*.md
