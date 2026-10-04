@@ -400,3 +400,43 @@ B のまま実際に終了 → 再起動で B と B の場所、A 切替で元 A
 この再起動テストは本 binary で A/B を設定・終了した後の保存値に対して行う。
 通常 profile の確認 build は `%APPDATA%/mimageviewer` の実データを更新し得るため、
 利用者が installed / tray 常駐版を閉じてから起動する（single-instance mutex 共通）。
+
+### Codex P2 対応 — 取消時の None 所有復元
+
+`e147a4067` の独立 xhigh review で、`restore_folder_nav_history` が snapshot の明示 `None`
+を `.or(Some(A))` で A に変更する既存経路を指摘された。None を保存した状態で cold PDF を
+起動復元し、worker が PasswordRequired を返すと、password Cancel → `restore_epub_open` →
+共通 history restore → settings 同期で A に変更され、終了時も A を保存する。
+旧 field 欠落に対する A default と、採用済み snapshot の明示 None は別の意味である。
+
+共通 restore は `snapshot.active_quick_folder_slot` をそのまま戻す。新しい sentinel や
+取消専用分岐は追加せず、PDF / EPUB / archive / history rollback の全利用者で同じ規則にする。
+`src/` の slot 代入と `or` / `unwrap_or` 系の A fallback を横断検索し、restore / cancel に
+該当するものはこの一か所だけと確認した。旧設定の serde default と、明示的な A/B クリア操作の
+A 選択は意味が異なるため維持する。
+
+回帰テスト `quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership` は
+使い捨て DB に None と独立した A/B workspace、cold PDF の last_folder を保存し、再読込と
+constructor → startup open → Direct password request → Cancel → exit → DB 再読込を通す。
+worker の typed PasswordRequired result だけを注入する headless 状態遷移テストであり、
+実アプリ / 実パスワード dialog は起動しない。再読込後の None、last_folder、さらに次の物理 load
+で両 workspace の target / MRU / drive map が変わらないことを検証する。
+
+変更前は exit / reload 後の所有が `Some(A)`（期待 None）となって失敗した
+（1 FAIL、exit 101、`target/quickslot-p2-fail-before.log`）。`e147a4067` からの追補差分で再検証:
+
+- `cargo test -p mimageviewer --lib quick_folder -- --test-threads=1`: 21 PASS。
+- `cargo test -p mimageviewer --lib phase_c_folder_nav_history_tests:: -- --test-threads=1`: 96 PASS。
+- `cargo test -p mimageviewer --lib pdf_password -- --test-threads=1`: 24 PASS。
+- `cargo test -p mimageviewer --lib epub_modal -- --test-threads=1`: 11 PASS。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と `--features portable`: 両方 PASS。
+- `cargo fmt --all -- --check` と `git diff --check`: PASS。
+
+ログは `target/quickslot-p2-{tests,history-tests,password-tests,epub-tests,check-normal,check-portable,fmt}.log`。
+上の full core lib / workspace gate 記録は `e147a4067` の元差分の証跡であり、
+この追補差分を含む全体 gate の成功とは扱わない。追補 dev build の結果を下に記録する。
+
+追補の `scripts/build-dev.ps1 -PreserveRuntime`: PASS（exit 0）。worktree 内の実行中 process が
+無いことを確認して実行し、normal / non-portable core と両 companion を作成した。
+CRT / PE dependency check も PASS（runtime 4 / PE 3）。
+ログは `target/quickslot-p2-build-dev.log`。製品 binary は未起動、利用者確認は未実施。

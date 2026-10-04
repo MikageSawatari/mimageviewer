@@ -21547,9 +21547,9 @@ impl App {
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
         self.quick_folder_workspaces = snapshot.quick_folder_workspaces;
-        self.active_quick_folder_slot = snapshot
-            .active_quick_folder_slot
-            .or(Some(QuickFolderSlotId::A));
+        // Preserve the snapshot's owner, including no active slot. The legacy
+        // A default belongs to settings deserialization, not rollback.
+        self.active_quick_folder_slot = snapshot.active_quick_folder_slot;
         self.sync_quick_folder_settings();
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
         self.tag_view.nav_stack = snapshot.tag_view_nav_stack;

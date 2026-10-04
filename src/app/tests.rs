@@ -18023,6 +18023,71 @@ mod folder_pane_open_nav_tests {
 mod quick_folder_restart_tests {
     use super::*;
 
+    #[test]
+    fn quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership() {
+        let mut env = phase_c_support::setup_app();
+        let pdf = env.tmp.path().join("cold-password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        for (idx, name) in ["slot-a", "slot-b"].into_iter().enumerate() {
+            let path = env.tmp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let key = drive_current_key_for_path(&path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path);
+        }
+        env.active_quick_folder_slot = None;
+        env.sync_quick_folder_settings();
+        env.settings.last_folder = Some(pdf.clone());
+        env.settings.save();
+        drop(env.app);
+        env.app = App::new_from_settings(crate::settings::Settings::load());
+        assert_eq!(env.active_quick_folder_slot, None);
+        let before = env.quick_folder_workspaces.clone();
+
+        env.open_default_startup_target();
+        assert!(matches!(
+            env.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+            Some(PdfOpenPhase::ColdCandidate { .. })
+        ));
+        // Inject the worker's typed password result; use the production startup,
+        // prompt cancellation, exit, and settings reload paths around that seam.
+        env.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        env.poll_pdf_enumerate();
+        assert!(matches!(
+            env.pdf_password_request
+                .as_ref()
+                .map(|request| &request.owner),
+            Some(PdfPasswordRequestOwner::Direct(_))
+        ));
+        assert!(env.cancel_pdf_password_dialog_request());
+        assert!(env.pdf_password_request.is_none());
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, None);
+        assert_eq!(saved.last_folder.as_ref(), Some(&pdf));
+        env.app = App::new_from_settings(saved);
+        assert_eq!(env.active_quick_folder_slot, None);
+
+        // A later successful open must still have no workspace owner.
+        let folder = env.tmp.path().join("after-cancel");
+        std::fs::create_dir(&folder).unwrap();
+        env.load_folder(folder);
+        assert_eq!(env.active_quick_folder_slot, None);
+        assert_eq!(env.quick_folder_workspaces, before);
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
     fn exit_and_restart(
         active: Option<QuickFolderSlotId>,
         exiting_folder: impl FnOnce(&Path) -> Option<PathBuf>,
