@@ -52,15 +52,12 @@
 - 方針: 絶対期限で待つ、fallback 時に notify_all する。回帰テスト: 初期化しない状態で複数の待機者が 5 秒前後でそろって進むこと。
 - 規模 / 優先度: Small / P3。
 
-### 1.324 安全リミッターの先読み分 (約 5 ms) が、通常の再生終了で出力されない — v4.3.0 は割り切り (2026-10-04)
+### 1.324 「EffeTune に渡す前に 0dB を超える音を抑える」を再生中に反映するか — 残り 1 件 (2026-10-04)
 
-- 背景: v4.3.0 で EffeTune の前に安全リミッター (別インスタンス、既定 ON) を追加した (b55403c5f)。独立レビューの P2: 通常の EOS で前段リミッターが保持する先読み分 (44.1 kHz で 221 フレーム) を出力する経路がなく、ローカル再生 (`flush_silence` は結果を捨てる) と Remote (encoder をそのまま終了) で末尾約 5 ms が欠ける。最終リミッターにも同じ末尾欠落が以前からある (VST3 / EffeTune / 手動ブースト時)。
-- EOS 修正版は branch `prelimiter-eos-drain` (47c28db2c、epubroot worktree)。EOS に serial を付け、排出完了まで EOF / ループを抑止する。v4.3.0 では利用者判断で入れずに末尾欠落を許容した。master 統合 78567823e 後の独立レビュー P2（完了時の UI wake 不足、最大 DSP tail による Remote 未読 fragment の追い出し）へ follow-up 対応。ROOT wake と live capacity + 4 の終端予約を追加する。
-- follow-up の独立レビュー（GPT-6.1 Sol / xhigh）は ACCEPT。関連 lib tests は計 208 passed / 2 ignored、通常 / portable check 成功。残る項目: 次版での実機確認（末尾に音がある素材のローカル / Remote、最大 EffeTune 遅延、ループ・連続再生の待ち、シーク・停止直後、常時 limiter の A/V sync）。EOS 排出と最終段常時適用は公開済み v4.3.0 には未収録。
-- 6bef20dd5 の独立再レビューで両 P2 は解決。追加 P3（0 秒開始時の負の audible PTS clamp により先頭の約 5ms 無音が残る）は、負の PTS を既存 trim まで保持して修正する。初回・実 EOF loop-to-zero・user seek-to-zero の dry PCM 全一致、入出力 frames と chunk 連続性を回帰で確認する。この follow-up の独立レビューは ACCEPT、関連テスト 81 passed と通常 / portable check 成功。公開済み v4.3.0 には未収録。
-- 5a569fb6f の実機確認で loop ON の末尾4ms / 10ms素材が2クリック、通常 profile は open ノイズも報告された。実 decoder / callback / EOF Full-loop を通る新回帰で、44.1kHz出力の seek Flush が SWR履歴を残し旧tailを周回先頭へ出すことを再現。通常 EOS の SWR排出と codec / SWR / timeline 一括 reset へ修正する。48kHz出力の headless 3周では単一burst。利用者の出力rate確認と修正版実機比較が残る。共有pluginのreset呼出しはv4.3.0から存在するため、通常profileの起動ノイズの原因は未確定。段ごとの初回非ゼロPTS、reset ID / ACK、排出framesを追加し、実機ログで照合する。強いplugin再初期化は未決定。このfollow-upも公開済みv4.3.0には未収録。
-- 関連: 「EffeTune に渡す前に 0dB を超える音を抑える」は、動画・音声の画面を開き直す (Remote は配信を始め直す) まで反映されない (状態の組み合わせを減らすための v4.3.0 の割り切り。2026-10-04 に利用者が実機で「開き直すと反映」を確認し、仕様かどうかを質問)。即時反映にするかは次版で検討する。
-- 関連の利用者決定（2026-10-04）: 最終安全リミッターを常時適用する。条件分岐と normalize ramp 中の有効 / 無効切り替えを撤去し、local / Remote とも約 5ms を常に PDC へ含めて通常 EOS で排出する。前段の設定・適用条件と最終段の HUD 判定は維持する。実装・検証は [EffeTune 計画 §13](effetune-integration-plan.md#13-2026-10-04-v430-リリース前-effetune-入力のピーク保護)。
+- 済み (次版、master 2b8a6d5c4、v4.3.0 には未収録): 最終安全リミッターを常に通す (利用者決定)、通常の EOS で前段・最終リミッターと resampler の保持分を出し切る、シーク / ループで codec・resampler・timeline を初期化 (44.1 kHz 出力で前周の末尾が次周の頭に再生されていた不具合)。`testdata/audio-tail/` の素材で、ループ 1 周 1 クリック・通常設定での開始ノイズ解消を利用者が実機で確認 (2026-10-04、再生デバイス 24bit / 44.1 kHz)。設計の正本は [EffeTune 計画](effetune-integration-plan.md)。
+- 残り: 「EffeTune に渡す前に 0dB を超える音を抑える」は、動画・音声の画面を開き直す (Remote は配信を始め直す) まで反映されない。即時反映にするかを検討する (利用者は 2026-10-04 に仕様かどうかを質問)。
+- 対象外のまま: ユーザー VST3 チェーン内部の先読み分は EOS で出し切らない。
+- 規模 / 優先度: Small / P3。
 
 ### 1.322 初回起動直後に Windows のメモリ使用量の報告 (RADAR_PRE_LEAK_64) が出る — Sandbox 記録 (2026-10-03)
 
