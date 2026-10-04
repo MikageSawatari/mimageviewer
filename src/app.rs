@@ -13881,11 +13881,12 @@ pub struct App {
     pub(crate) preferences_requested_page:
         Option<crate::ui_dialogs::preferences::PreferencesOpenRequest>,
     /// 統合環境設定の一時編集状態
-    pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    pub(crate) pref_state: Option<Box<crate::ui_dialogs::preferences::PreferencesState>>,
     pub(crate) show_preferences_discard_confirm: bool,
     /// 操作カスタマイズダイアログ (キーボード / 右ドラッグ / リング / ジェスチャ)
     pub(crate) show_operation_customize: bool,
-    pub(crate) operation_customize_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    pub(crate) operation_customize_state:
+        Option<Box<crate::ui_dialogs::preferences::PreferencesState>>,
     pub(crate) show_operation_customize_discard_confirm: bool,
 
     // ── 設定の復元ダイアログ ───────────────────────────────────────

@@ -18,8 +18,31 @@ use crate::settings::{Parallelism, Settings};
 
 mod pages;
 mod search_index;
+mod transfer;
 use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
+use self::transfer::{PreferencesTransferFeedback, PreferencesTransferJob};
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_settings_snapshot_fixture(ui: &mut egui::Ui, busy: bool) {
+    // Match the production right panel's fixed available width.
+    ui.set_width(ui.available_width());
+    if busy {
+        let (_tx, rx) = mpsc::channel();
+        transfer::render_settings_transfer(ui, &PreferencesTransferJob::Exporting(rx), false, None);
+        return;
+    }
+    let feedback = PreferencesTransferFeedback::Imported(crate::settings_transfer::ImportReport {
+        accepted_count: 128,
+        changed_fields: vec!["テーマ".into(), "文字のコントラスト".into()],
+        issues: vec![crate::settings_transfer::TransferIssue {
+            field: "スライドショーの間隔".into(),
+            reason: "範囲外の値です。".into(),
+        }],
+        unknown_count: 1,
+    });
+    transfer::render_settings_transfer(ui, &PreferencesTransferJob::Idle, true, Some(&feedback));
+}
 
 #[doc(hidden)]
 pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::Ui) {
@@ -722,6 +745,8 @@ impl Drop for ExternalToolPathCheckPending {
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    transfer_job: PreferencesTransferJob,
+    transfer_feedback: Option<PreferencesTransferFeedback>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
@@ -1276,6 +1301,8 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            transfer_job: PreferencesTransferJob::Idle,
+            transfer_feedback: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
@@ -1974,6 +2001,24 @@ fn merge_video_media_memory_for_preferences(
 }
 
 impl App {
+    pub(crate) fn preferences_transfer_busy(&self) -> bool {
+        self.pref_state
+            .as_ref()
+            .is_some_and(|state| state.transfer_job.is_busy())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_preferences_transfer_for_test(
+        &mut self,
+    ) -> mpsc::Sender<Result<crate::settings_transfer::ParsedPreferences, String>> {
+        let (tx, rx) = mpsc::channel();
+        let mut state = tests::preferences_state_for_test(&self.settings);
+        state.transfer_job = PreferencesTransferJob::Importing(rx);
+        self.pref_state = Some(Box::new(state));
+        self.show_preferences = true;
+        tx
+    }
+
     pub(crate) fn install_preferences_settings(&mut self, settings: Settings) {
         let media_duration_changed =
             self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
@@ -1992,6 +2037,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.preferences_transfer_busy() {
+            return;
+        }
         self.preferences_requested_page = Some(request);
         self.show_preferences = true;
     }
@@ -2034,6 +2082,9 @@ impl App {
     }
 
     fn request_close_preferences_dialog(&mut self) {
+        if self.preferences_transfer_busy() {
+            return;
+        }
         if self.preferences_dialog_has_unsaved_changes() {
             self.show_preferences = true;
             self.show_preferences_discard_confirm = true;
@@ -2140,7 +2191,7 @@ impl App {
             {
                 new_state.vst3_discovered = self.vst3_discovered.clone();
             }
-            self.pref_state = Some(new_state);
+            self.pref_state = Some(Box::new(new_state));
         }
         if let Some(generation) = opened_scroll_generation {
             self.pref_state
@@ -2199,11 +2250,22 @@ impl App {
         let mut apply = false;
         let mut cancel = false;
 
+        if let Some(state) = self.pref_state.as_mut() {
+            state.poll_preferences_transfer();
+        }
+        let transfer_busy = self.preferences_transfer_busy();
+        if transfer_busy {
+            // Popups use independent UI layers and do not inherit a disabled
+            // parent. Remove that combination while the single modal job runs.
+            egui::Popup::close_all(ctx);
+        }
+
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let enter_pressed = !transfer_busy && self.dialog_enter_pressed(ctx);
+        let escape_pressed = !transfer_busy && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
+            .enabled(!transfer_busy)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -2327,7 +2389,10 @@ impl App {
                         &state.settings.file_organize_destinations,
                     );
                     let ok = ui.add_enabled(
-                        font_ready && lut_ready && organize_validation.is_ok(),
+                        font_ready
+                            && lut_ready
+                            && !state.transfer_job.is_busy()
+                            && organize_validation.is_ok(),
                         egui::Button::new("  OK  "),
                     );
                     #[cfg(all(windows, feature = "test-script"))]
@@ -2336,10 +2401,18 @@ impl App {
                         apply = true;
                         // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui
+                        .add_enabled(
+                            !state.transfer_job.is_busy(),
+                            egui::Button::new("キャンセル"),
+                        )
+                        .clicked()
+                    {
                         cancel = true;
                     }
-                    if !font_ready {
+                    if state.transfer_job.is_busy() {
+                        ui.small("ファイル処理の完了後に操作できます。");
+                    } else if !font_ready {
                         ui.small("フォントの準備完了後に適用できます。");
                     } else if !lut_ready {
                         ui.small("LUTのコピー完了後に適用できます。");
@@ -2775,6 +2848,18 @@ impl App {
             self.draw_preferences_discard_confirm(ctx);
         }
 
+        // The job is the only busy owner. egui's modal layer also intercepts
+        // pointer input from every main-window panel without another flag.
+        if self.preferences_transfer_busy() {
+            egui::Modal::new(egui::Id::new("preferences_transfer_busy")).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("設定ファイルを処理しています…");
+                });
+                ui.small("完了後に環境設定へ戻ります。");
+            });
+        }
+
         let clear_favorite_view_states_requested = self
             .pref_state
             .as_mut()
@@ -2961,7 +3046,7 @@ impl App {
                     .unwrap_or(0),
             );
             state.operation_tab = OperationCustomizeTab::Settings;
-            self.operation_customize_state = Some(state);
+            self.operation_customize_state = Some(Box::new(state));
         }
 
         let mut open = true;
@@ -3053,7 +3138,7 @@ impl App {
         }
     }
 
-    fn apply_operation_customize_state(&mut self, state: PreferencesState) {
+    fn apply_operation_customize_state(&mut self, state: Box<PreferencesState>) {
         let mut bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
             &self.settings,
         );
@@ -3590,7 +3675,9 @@ mod tests {
         crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot()
     }
 
-    fn preferences_state_for_test(settings: &crate::settings::Settings) -> PreferencesState {
+    pub(super) fn preferences_state_for_test(
+        settings: &crate::settings::Settings,
+    ) -> PreferencesState {
         PreferencesState::from_settings(
             settings,
             crate::external_tool::LaunchTarget::None,
@@ -3882,7 +3969,7 @@ mod tests {
         app.settings
             .video_audio_track_choices
             .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
-        app.pref_state = Some(state);
+        app.pref_state = Some(Box::new(state));
         assert!(!app.preferences_dialog_has_unsaved_changes());
         let mut state = app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
@@ -3918,7 +4005,7 @@ mod tests {
                 prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
                 app.settings = state.settings;
             } else {
-                app.pref_state = Some(state);
+                app.pref_state = Some(Box::new(state));
                 assert!(!app.preferences_dialog_has_unsaved_changes());
                 app.discard_preferences_dialog();
             }
@@ -3950,7 +4037,7 @@ mod tests {
                     prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
                     app.settings = state.settings;
                 } else {
-                    app.pref_state = Some(state);
+                    app.pref_state = Some(Box::new(state));
                     app.discard_preferences_dialog();
                 }
                 assert_eq!(app.settings.video_audio_track_choices, expected);
@@ -3978,7 +4065,7 @@ mod tests {
         app.settings
             .video_audio_track_choices
             .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
-        app.pref_state = Some(state);
+        app.pref_state = Some(Box::new(state));
         app.discard_preferences_dialog();
         assert!(app.settings.video_audio_track_choices.contains_key(&key));
 
@@ -4037,7 +4124,7 @@ mod tests {
         );
         state.settings.gamepad_enabled = false;
 
-        app.operation_customize_state = Some(state);
+        app.operation_customize_state = Some(Box::new(state));
         assert!(
             app.operation_customize_dialog_has_unsaved_changes(),
             "切った状態は未保存の変更として数える"
@@ -4058,7 +4145,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
-        app.apply_operation_customize_state(operation_state);
+        app.apply_operation_customize_state(Box::new(operation_state));
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4070,7 +4157,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
-        app.pref_state = Some(preferences_state);
+        app.pref_state = Some(Box::new(preferences_state));
         assert!(
             app.preferences_dialog_has_unsaved_changes(),
             "Videoページで変えた通常ホイール設定は未保存変更として扱う"
@@ -4135,7 +4222,7 @@ mod tests {
             .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::AdjustVolume;
-        app.operation_customize_state = Some(operation_state);
+        app.operation_customize_state = Some(Box::new(operation_state));
         assert!(
             app.operation_customize_dialog_has_unsaved_changes(),
             "別の ring 項目の編集は未保存のまま数える"
@@ -4184,7 +4271,7 @@ mod tests {
         let untouched_operation = preferences_state_for_test(&app.settings);
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::AdjustVolume;
-        app.operation_customize_state = Some(untouched_operation);
+        app.operation_customize_state = Some(Box::new(untouched_operation));
         assert!(
             !app.operation_customize_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、操作カスタマイズの未保存変更にしない"
@@ -4208,7 +4295,7 @@ mod tests {
             "キャンセルは live 設定を変えない"
         );
 
-        let mut reopened_preferences = preferences_state_for_test(&app.settings);
+        let reopened_preferences = preferences_state_for_test(&app.settings);
         assert_eq!(
             reopened_preferences.initial_video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4216,12 +4303,12 @@ mod tests {
         );
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::NavigateItems;
-        app.pref_state = Some(reopened_preferences);
+        app.pref_state = Some(Box::new(reopened_preferences));
         assert!(
             !app.preferences_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、環境設定の未保存変更にしない"
         );
-        reopened_preferences = app.pref_state.take().unwrap();
+        let mut reopened_preferences = app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut reopened_preferences, &mut app.settings);
         assert_eq!(
             reopened_preferences
@@ -4249,7 +4336,7 @@ mod tests {
         let reopened_operation = preferences_state_for_test(&app.settings);
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::NavigateItems;
-        app.operation_customize_state = Some(reopened_operation);
+        app.operation_customize_state = Some(Box::new(reopened_operation));
         assert!(
             !app.operation_customize_dialog_has_unsaved_changes(),
             "操作カスタマイズの再表示も、その session の基準値で外部変更を判定する"
@@ -4322,7 +4409,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .mouse_ring_help_visible = !app.settings.ring_shortcuts.mouse_ring_help_visible;
-        app.apply_operation_customize_state(unrelated_commit);
+        app.apply_operation_customize_state(Box::new(unrelated_commit));
         assert_eq!(
             app.settings
                 .ring_shortcuts
@@ -4338,7 +4425,7 @@ mod tests {
             .ring_shortcuts
             .mouse_button_profile_mut(context)
             .back = RingActionId::VideoMute;
-        app.apply_operation_customize_state(replacement);
+        app.apply_operation_customize_state(Box::new(replacement));
         assert_eq!(
             app.settings
                 .ring_shortcuts

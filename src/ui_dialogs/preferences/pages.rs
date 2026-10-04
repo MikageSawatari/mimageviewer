@@ -221,6 +221,9 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .weak(),
     );
     });
+    anchored(ui, state, "general/settings-transfer", |ui, state| {
+        super::transfer::draw_settings_transfer(ui, state);
+    });
 }
 
 pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {

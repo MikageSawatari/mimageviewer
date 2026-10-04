@@ -28,6 +28,44 @@
 use egui_kittest::Harness;
 
 #[test]
+fn preferences_transfer_light() {
+    snapshot_with_theme(
+        "preferences_transfer_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_narrow_result() {
+    snapshot_with_theme_at_size(
+        "preferences_transfer_narrow_result",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(320.0, 420.0),
+        None,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_busy_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_busy_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
 fn preferences_file_organize_light() {
     snapshot_with_theme(
         "preferences_file_organize_light",

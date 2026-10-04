@@ -67344,7 +67344,7 @@ mod still_window_mode_key_tests {
         preferences.trt_engine_cache_size_mib = 400;
         preferences.trt_worker_active = true;
         preferences.settings.ai_backend = Some(crate::ai::AiBackend::TensorRt.as_str().to_owned());
-        app.pref_state = Some(preferences);
+        app.pref_state = Some(Box::new(preferences));
         app.trt_install_state = Some(crate::ui_dialogs::trt_install::TrtInstallState::new(None));
 
         assert!(!app.uninstall_trt_pack_now());

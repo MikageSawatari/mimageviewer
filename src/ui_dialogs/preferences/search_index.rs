@@ -23,6 +23,20 @@ macro_rules! entry {
 
 pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
+        "general/settings-transfer",
+        General,
+        super::transfer::SETTINGS_TRANSFER_LABEL,
+        [
+            "書き出し",
+            "取り込み",
+            "移行",
+            "エクスポート",
+            "インポート",
+            "export",
+            "import"
+        ]
+    ),
+    entry!(
         "general/theme",
         General,
         "テーマ",
@@ -1161,6 +1175,23 @@ pub(super) fn search_preferences(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preferences_transfer_search_keywords_reach_general_section() {
+        for query in [
+            "持ち運び",
+            "移行",
+            "書き出し",
+            "取り込み",
+            "エクスポート",
+            "インポート",
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "general/settings-transfer")
+                .expect(query);
+            assert_eq!(entry.page, PreferencesPage::General);
+        }
+    }
     use super::*;
     use std::collections::HashSet;
 
@@ -1296,6 +1327,12 @@ mod tests {
                 );
                 assert!(
                     PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
+                );
+            } else if entry.anchor == "general/settings-transfer" {
+                // This helper owns both production and snapshot labels.
+                assert_eq!(entry.title, super::super::transfer::SETTINGS_TRANSFER_LABEL);
+                assert!(
+                    PAGES_SOURCE.contains("super::transfer::draw_settings_transfer(ui, state)")
                 );
             } else {
                 assert!(

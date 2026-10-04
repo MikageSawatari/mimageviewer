@@ -1,11 +1,14 @@
-# §1.317 環境設定のエクスポート・インポート設計案
+# §1.317 環境設定のエクスポート・インポート設計・実装記録
 
 作成: 2026-10-04。対象: `next-file-ops` / `C:\home\mimageviewer-fileops`。
-状態: **設計担当へ返す提案。未実装・未検収**。
+状態: **実装済み (レビュー前)。独立レビューの P2 2 件を受けて入力遮断の範囲を縮小し、限定独立再レビュー・修正後の全自動検証・確認用 build は完了。利用者の実機確認・設計担当の検収は未完了**。
 要件の正本は [next-release-backlog.md §1.317](next-release-backlog.md)。
 前段 `e189fbe86` (§1.256)、`c608f0822` (§1.263) を含むツリーで調査した。
-今回の変更は本書だけ。製品コード・他文書の変更、コミット、製品起動、実装テストは行わない。
-以下は推奨案であり、実装着手前に設計担当が §7 の範囲・判断を確定する。
+設計段階では本書だけを作成し、製品コード・他文書・実装テストは変更していなかった。
+以下はその調査・判断の記録を保持し、2026-10-04 の利用者承認と現在の実装範囲を反映したもの。
+§7 の推奨案はすべて承認済み。追加で `details_selection_bar_mode` と
+`stack_script_enabled` を除外した。既存 OK の §1.305 / §1.295 は今回修正しない (§2.3)。
+検証結果は実施後に追記し、計画の列挙を実施済みの証拠として扱わない。
 
 ## 1. 現状のコード事実と採用する境界
 
@@ -56,13 +59,13 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 出す | `ui_theme`, `text_contrast`, `ai_feature_mode` | 全体設定のテーマ・文字と AI 利用範囲 (pages.rs:33 / 57 / 91)。性能の手動 tuning とは分ける。 | `src/settings.rs:5047` |
 | 出す | `detached_viewer_open_images_in_window`, `auto_fullscreen_zip_pdf`, `auto_fullscreen_image_folders`, `fullfeature_media_window` | 全体設定の閲覧モード (pages.rs:128)。実効値ではなく保存された選択値を出す。 | `src/settings.rs:5625` |
 | 出す | `restore_last_cursor`, `startup_window_state` | 起動時の振舞いだけ (pages.rs:409 / 476)。実際の場所・座標は出さない。 | `src/settings.rs:4288` |
-| 出す | `grid_click_selection_mode`, `grid_open_selected_item_on_click`, `grid_cursor_wrap`, `remember_favorite_view_state`, `grid_display_order`, `video_thumbnail_indicator`, `thumb_show_media_duration`, `thumb_show_book_resume_meter`, `selection_info_display_mode`, `details_selection_bar_mode` | 表示→サムネイルの操作・情報表示 (pages.rs:1362–1641)。カテゴリの行構成は環境設定内、名前等のソートは対象外。 | `src/settings.rs:4121` |
+| 出す | `grid_click_selection_mode`, `grid_open_selected_item_on_click`, `grid_cursor_wrap`, `remember_favorite_view_state`, `grid_display_order`, `video_thumbnail_indicator`, `thumb_show_media_duration`, `thumb_show_book_resume_meter`, `selection_info_display_mode` | 表示→サムネイルの操作・情報表示 (pages.rs:1362–1641)。カテゴリの行構成は環境設定内、名前等のソートは対象外。 | `src/settings.rs:4121` |
 | 出す | `thumb_tooltip_show_filename`, `thumb_tooltip_show_image_dimensions`, `thumb_tooltip_show_video_duration`, `thumb_tooltip_show_kind`, `thumb_tooltip_show_page_count`, `thumb_tooltip_show_file_size`, `thumb_tooltip_show_modified`, `thumb_tooltip_show_created`, `thumb_tooltip_show_video_dimensions`, `thumb_tooltip_show_video_codec`, `thumb_tooltip_show_location`, `thumb_tooltip_show_full_location` | 表示項目の bool のみ (pages.rs:1581)。名前・場所・履歴の実データを含めない。 | `src/settings.rs:4500` |
 | 出す | `thumb_tooltip_show_reading_history_last_read`, `thumb_tooltip_show_reading_history_progress` | 同上。閲覧履歴の内容ではなく表示するかどうか。 | `src/settings.rs:4536` |
 | 出す | `show_windows_context_menu_inline`, `skip_recycle_bin_delete_confirmation` | エクスプローラ連携の表示・削除確認方針 (pages.rs:1194 / 1329)。Shell 登録そのものは移さない。 | `src/settings.rs:4660` |
 | 出す | `rating_sort_unrated_position`, `slideshow_interval_secs`, `slideshow_continuous_wait_secs`, `slideshow_continuous_scroll_secs`, `slideshow_continuous_scroll_percent`, `slideshow_end_action` | 未評価位置・スライドショー方針 (pages.rs:1427 / 1652)。評価値やソート選択とは別。 | `src/settings.rs:4357` |
 | 出す | `capture_format`, `bake_stage_book`, `bake_stage_export`, `bake_stage_export_batch`, `bake_stage_external_tool` | キャプチャ形式・各出力の焼き込み方針 (pages.rs:1753 / 1845)。ツール登録、画像、保存先を含めない。 | `src/settings.rs:4725` |
-| 出す | `archive_file_handling`, `epub_file_handling`, `show_hidden_files`, `folder_thumb_sort`, `folder_thumb_depth`, `folder_skip_limit`, `edit_restore_prompt_enabled`, `sidecar_backup_enabled`, `tag_sidecar_backup_enabled`, `stack_script_enabled`, `skip_zip_if_folder_exists`, `skip_archive_if_zip_exists` | ファイル処理・代表選定・バックアップの方針 (pages.rs:7286 / 8637 / 8820)。実データ・パス・script 本体を含めない。 | `src/settings.rs:4442` |
+| 出す | `archive_file_handling`, `epub_file_handling`, `show_hidden_files`, `folder_thumb_sort`, `folder_thumb_depth`, `folder_skip_limit`, `edit_restore_prompt_enabled`, `sidecar_backup_enabled`, `tag_sidecar_backup_enabled`, `skip_zip_if_folder_exists`, `skip_archive_if_zip_exists` | ファイル処理・代表選定・バックアップの方針 (pages.rs:7286 / 8637 / 8820)。実データ・パスを含めない。 | `src/settings.rs:4442` |
 | 出す | `skip_epub_if_pdf_exists`, `skip_image_if_video_exists`, `skip_duplicate_images`, `image_ext_priority` | 同名ファイルの扱いと拡張子の優先順 (pages.rs:8837 / 8868)。拡張子列は組込み候補だけ (§3)。 | `src/settings.rs:4690` |
 | 出す | `minimize_to_tray_on_close`, `pause_indexer_while_minimized`, `write_rating_to_xmp`, `reading_history_enabled` | 常駐・索引一時停止・記録方針 (pages.rs:7444 / 7463 / 7503 / 10149)。保持件数・全件クリアを含めない。 | `src/settings.rs:5344` |
 | 出す | `default_spread_mode`, `follow_document_reading_direction`, `default_reading_flow`, `default_reading_direction`, `final_cover_spread_enabled`, `singleton_spread_first_enabled`, `singleton_spread_last_enabled`, `page_after_cover_alone_enabled`, `last_page_alone_enabled`, `spread_page_gap_px`, `continuous_reading_gap_px`, `fullscreen_image_margin_color` | 表示→閲覧表示の標準設定 (pages.rs:9405–9795)。本別設定・読書位置・補正を含めない。 | `src/settings.rs:4851` |
@@ -80,6 +83,8 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `thumb_idle_upgrade` | 同上。サムネイルの idle 品質更新は性能方針として除外。 | `src/settings.rs:4488` |
 | 除く | `remote_service_enabled`, `remote_video_streaming_enabled`, `remote_video_encoder`, `remote_video_quality_default`, `remote_video_segment_window`, `remote_video_mute_local_output`, `remote_video_hide_local_output`, `update_check_enabled` | 接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持。接続情報は Settings 外も転送しない。 | `src/settings.rs:5397` |
 | 除く | `reading_history_limit`, `exif_hidden_tags`, `video_seek_bar_locked`, `video_seek_strip_locked`, `video_deinterlace` | 保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning。推奨初期除外 (§7)。 | `src/settings.rs:5590` |
+| 除く | `details_selection_bar_mode` | Dedicated への変更を OK すると、除外対象の詳細列設定を既存 A→C 複製で書き換えるため。取り込みでは変更しない。 | `src/settings.rs` |
+| 除く | `stack_script_enabled` | 移行先の `stack_rules.rhai` に依存する有効化設定。本体を転送しないため一組で除外する。 | `src/settings.rs` |
 | 除く | `keymap`, `ring_shortcuts`, `menu_layout`, `context_menu_layout`, `gamepad_enabled` | 既存の操作カスタマイズ共有が正本。環境設定にも編集入口があっても重複転送しない。 | `src/settings.rs:5198` |
 | 除く | `favorites`, `smart_folders`, `tags`, `recent_folders`, `quick_folder_recent_folders`, `quick_folder_slots`, `quick_folder_drive_current_dirs`, `last_folder`, `last_cursor_name`, `last_cursor_rows_above`, `search_index_checks`, `active_book_name` | 利用データ・登録先・履歴・検索対象。名前や ID も含めない。 | `src/settings.rs:4262` |
 | 除く | `pinned_books`, `pinned_collections`, `toolbar_collection_target_id`, `video_resume_positions`, `video_audio_track_choices` | 同上。本棚・コレクション参照・再生位置・音声トラック選択。 | `src/settings.rs:4752` |
@@ -109,11 +114,11 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `video_seek_strip_span`, `video_autoplay`, `video_autoplay_mode`, `video_continuous_mode`, `video_muted`, `video_adjustments`, `video_scale_filter`, `video_downscale_smoothing_percent`, `video_anime4k_budget` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5467` |
 | 除く | `video_anime4k_measurement`, `video_preset_slots`, `video_tile_columns`, `video_in_window_mode`, `detached_viewer_enabled`, `vst3_gui_visible`, `vst3_video_compact`, `audio_normalize_enabled`, `audio_normalize_target_lufs_milli` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5544` |
 
-現時点の内訳: 出す 132 フィールド / 除く 300 フィールド。
+承認済みの内訳: 出す 130 フィールド / 除く 302 フィールド / 合計 432 フィールド。
 
 ### 2.2 実装時の唯一の policy と強制テスト
 
-新規 `src/settings_transfer.rs` (仮称) に、全フィールドを一度ずつ記す policy macro を置く。
+`src/settings_transfer.rs` に、全フィールドを一度ずつ記す policy macro を置く。
 各行は `export(field, wire_key, validator)` または `exclude(field, reason)`。
 論理的に一体の値だけは `export_group([fields...], wire_key, validator, draft_setter)`。
 型定義を生成する巨大な Settings macro への改造、reflection 用の全体シリアライズ、
@@ -145,11 +150,16 @@ import は対象外フィールドに setter を持たず、未知キーとし�
 LUT transaction、フォント準備、clear_requested、インストール要求を作り直さない。
 
 OK の既存副作用で生じる **導出状態**は区別する。video_loop / archive_convert_without_dialog
-の同期、details_selection_bar_mode を Dedicated にしたときの既存セット A→C 複製
-(`preferences.rs:1909`)、表示用キャッシュの失効や viewer の閉鎖は、同じ設定を手で
-変更した場合と同じでよい。これを「除外された設定の取り込み」に置き換えない。
-利用者が保持した列構成や開いた別窓に影響する点は結果説明・§6 で確認する。
+の同期、表示用キャッシュの失効や viewer の閉鎖は、同じ設定を手で変更した場合と同じ。
+`details_selection_bar_mode` は Dedicated への変更時に除外された列設定を A→C 複製するため、
+今回の対象から外す。転送してもこのモードを変更せず、既存の列構成を保持する。
 ★・編集・タグ・コレクション・履歴行等の利用データを消す副作用は認めない。
+
+**既存 OK の限界 (利用者承認済み、今回未修正)**: 取り込みで対象外に setter を持たないことと、
+OK が最新 live 値を必ず保持することは別。`video_playback_speed` 等が環境設定の表示中に
+変わると、既存の全体差し替えで開いた時点の値へ戻る §1.305 を取り込み後の OK も引き継ぐ。
+また `show_hidden_files` 等の変更後に OK すると、通常フォルダを UI スレッドで同期再読込する
+§1.295 を引き継ぐ。今回の worker 化は転送ファイルの処理だけで、OK 経路全体の非同期化ではない。
 
 ## 3. ファイル形式・版・検証規則
 
@@ -281,16 +291,29 @@ rfd の JSON filter と既定名 preferences.mivprefs.json を使い、同名の
 
 **組合せ削減の採用**: ファイル選択後の read/parse/write は短いモーダル処理にする。
 PreferencesState に `Idle / Importing(receiver) / Exporting(receiver)` の一つの job owner
-(型名は実装時確定) を置き、同時処理や後続 job の queue を作らない。
+を置き、同時処理や後続 job の queue を作らない。
+App の環境設定と操作カスタマイズの draft は、それぞれ `Option<Box<PreferencesState>>` に格納する。
+大きな一時編集状態を App の常時スタック配置から外す収納変更で、job/receiver の owner、
+take・OK・Cancel・再開時の寿命は変えない。結果表示はその State 内の `Option<PreferencesTransferFeedback>` に置く。
 処理中は環境設定の編集・ページ操作・OK・キャンセル・×・Escape を無効にし、
 その job が完了/失敗してから戻す。結果受信は try_recv、worker 終了で repaint を要求する。
+root には既存 egui Modal の処理中表示を重ね、独立 UI layer の popup は閉じる。
+メイン viewport の背面メニュー・ツールバーへの入力は、環境設定が登録済みの
+`common_modal_dialog_open` とその root の modal に任せる。転送専用の menu/toolbar guard は作らない。
+**別窓・fullscreen・native 動画の入力は転送のために止めない。** 転送はファイルの
+読み書きと draft への反映だけで、別窓の閲覧状態と関係しないためである。
+転送専用の viewport sanitizer、passive event batch の破棄、detached activation/watch close の拒否、
+native HUD dim、semantic event・hold/repeat/長押しの終了をすべて撤去する。
+従来の環境設定/common modal が持つ挙動は HEAD のままにし、別窓の入力経路・状態 owner を変更しない。
+detached に差分がなくなるため detached-rework-plan §11 の今回の記録も削除する。
 ファイル I/O、JSON parse/serialize、flush、置換は worker 上。UI で DB open / stat /
 ファイル読込 / 同期 join をしない。既存のフォント/LUT等の処理中は transfer 開始も待つ。
 
-環境設定に対する既存の背面入力ブロックを使い、処理中に別の open/navigation/
-設定共有/別窓切替が新しい job を開始できないことを入力経路で確認する。
-不足があれば common_modal_dialog_open / 共通入力 owner に接続し、二重の一覧を作らない。
-既存の裏で動く再生位置保存等は止めず、OK の live merge で維持する。
+環境設定に対する既存の背面入力ブロックを使い、処理中にメイン viewport の
+設定復元・操作カスタマイズ・ツールバー操作が始まらないことを本番 UI の入力経路で確認する。
+別窓切替の禁止や転送専用の共通入力 owner は追加しない。
+既存の裏で動く再生位置保存等は止めず、修正済みの再生位置・音声トラックは OK の live merge で維持する。
+他の環境設定外の最新値には §1.305 の限界が残る (§2.3)。
 通常の設定操作は Idle で従来どおり。長時間待ち対策の retry / sleep / supersession /
 resume / 保存中のキャンセル後 rollback は追加しない。
 
@@ -332,7 +355,7 @@ import 専用の DB rollback、バックアップ復旧、再起動時の自動�
 | `htdocs/mimageviewer/index.html:1203`「安心して使えます」、`:1212`、`:1234` | 通信は更新確認・任意 component 取得・Remote の 3 場面、設定や履歴は PC に保存と記載。新しいアプリ通信先・認証・自動送信は増えない。利用者が指定したファイルへの設定保存は説明を足す。 |
 | `htdocs/mimageviewer/privacy.html:135`「端末内に保存されるデータ」、`:151`、`:198`「ネットワーク通信」 | Settings は既存の data-dir に保存と記載。利用者指定の書き出しファイルは data-dir 外にも置けるので保存先の説明を両文書で補足する。通信の列挙は変更不要。 |
 
-実装時に両文書へ同じ事実を記す:
+両文書へ同じ事実を追記した:
 「環境設定のうち移行できる項目は、利用者が選んだファイルにも保存できます。
 ファイルに閲覧履歴・登録先・接続情報は含めず、アプリから外部へ送信しません。」
 「全設定のバックアップ」「機密情報が必ず全て消える」など本範囲以上の保証はしない。
@@ -352,16 +375,18 @@ URL、実行ファイル、LUT、プラグインの読み込み指定として J
 | --- | --- |
 | 分類 / projection | 全 432 フィールドを一回分類、wire_key 唯一、skip/carrier も含む。新フィールド未分類で target がコンパイル失敗することを一時的な追加で確認して戻す。出力キーは export policy だけ。 |
 | 個人情報・パス漏れ | 除外される PathBuf / String / ネストした利用データへ、ユーザー名・絶対パス・UNC・URL・PIN風文字列・タグ/本/コレクション名の固有 sentinel を入れた Settings から出力して、一つも含まれないことを確認。全対象値は妥当な非既定値。EXIF の任意文字列は除外、image_ext_priority のパス混入はその項目を出さない。serde(skip) の runtime overlay にも sentinel を置く。 |
+| 通信の自動有効化 | policy から生成しない明示テストで remote_service_enabled / remote_video_streaming_enabled / update_check_enabled をそれぞれ固定。true の source から出力 JSON にキーがないこと、true 入力でも移行先 false が draft / 本番 OK / DB 再読込で保持されること。正常なテーマ変更も同時に取り込んで取込成功を確認する。 |
 | 保持 / 差分 | 複数対象と複数対象外を異なる非既定値で埋めた移行先 draft に apply。対象が復元し、それ以外の全フィールドが不変 (互換 mirror の明示例外だけ別 assertion)。JSON の全体比較だけでなく skip フィールドも比較する生成テスト projection を使う。 |
 | 不正値 | 一つの型違い・範囲外・null・overflow・未知 enum と正常項目を同居させ、正常項目だけ draft 更新、不正項目は元値 + 警告一覧。範囲の両端/直外、複合欠落・重複・余分な配列要素も確認。 |
 | 全体不正 / 互換 | 空・壊れた JSON・不正 UTF-8・サイズ/深さ超過・重複キー・別 format・版欠落/0/未来 v2 は draft/live/DB 不変。旧アプリ v1 の項目欠落、新アプリ v1 の未知キー、未知 enum は単純規則どおり。初回出荷 v1 fixture を保持。 |
 | 状態 owner | still_bottom_chrome 全到達状態と不正状態、複合キー欠落による 3 値保持。ファイルで独立 bool キーを偽造しても不変。loop と archive の enum/互換 mirror の通し。Default の Legacy は export で Ask、旧 mirror=true の Legacy は Convert として出力し、import の Legacy は無視。 |
 | ファイル保存 | 一時 data-dir 外の tempfile へ書いて読める。既存 export に対する write/置換失敗で既存ファイル保持、通知あり。失敗 cleanup を再帰 recovery にしない。 |
 | 非同期 lifecycle | job 二重開始なし、処理中の OK/Cancel/×/Enter/Escape 無効、spawn失敗・channel切断で Idle に戻り通知、state drop の結果が次の PreferencesState に届かない。App/DB を worker が所有しない。 |
+| 入力 handler | 転送処理中にメイン viewport の設定メニューの「設定の復元」「操作カスタマイズ」、ツールバーの操作を、本番環境設定と処理中 modal を描画した UI へ raw pointer 入力しても開始されないこと。common modal と唯一の job が維持され、ダイアログを閉じた後に通常操作が通ること。転送専用 guard や共通述語だけのテストで代替しない。 |
 | draft / 実際の OK | 既存 PreferencesTestApp と handler-level/headless UI を利用 (`preferences.rs:3619`、`:3692` の整理先テストが precedent)。取込直後の live / DB 不変、OK → install → save_checked → DB 再読込 → 環境設定再 open で同値。Cancel は import と既存手編集を破棄。export は draft の変更を含み live を確定しない。 |
 | 別 data-dir 往復 | TempDir A/B に独立 DB を用意。A の対象を export、B は異なるパス・整理先・フォント・Susie/VST/LUT・操作共有・利用データを持たせ import→OK→save→再読込。対象だけが A に一致し B の対象外が保持される。global data-dir を使う試験は既存 guard / 直列化を使い APPDATA に触らない。 |
 | 利用データ / 全設定の通し | ★・編集・本棚・タグ・コレクション・履歴・読書位置・normalize 等の DB と cache 行を B に用意し、import で削除/変更されないこと。read-only 比較と既存の fixture API を使う。reading_history_limit 不変で prune なし、clear_requested/インストール要求なし。対象設定による既存表示 cache の失効は別 assertion。 |
-| 標準/専用値・再生 | お気に入り overlay 適用中に export は標準値だけ。import→OK で標準だけ更新、favorite の専用値/記録と live 再生位置・音声トラック更新を維持。Dedicated 切替は既存 A→C 複製を検証し他列を reset しない。 |
+| 標準/専用値・再生 | お気に入り overlay 適用中に export は標準値だけ。import→OK で標準だけ更新、favorite の専用値/記録と修正済みの live 再生位置・音声トラック更新を維持。details_selection_bar_mode と stack_script_enabled は出力・取込対象外。§1.305 の未修正値まで保持できるとは判定しない。 |
 | 共有 / 回帰 | keymap、ring、menu、context menu、gamepad は出力にも setter にもない。既存操作共有テストを再利用。通常画像/ZIP/PDF/動画、main/detached/Remote の設定反映は既存 OK の検証を再利用し、import 固有の経路がないことを確認。 |
 | UI / IME | 全体設定の新欄、結果/不正一覧、処理中状態の snapshot。既定幅/狭幅、明暗テーマ、長いメッセージの折返し。IME fake-input で変換確定が OK/取り込み/キャンセルを起こさない。既存 EXIF 入力をついでに変更しない。 |
 
@@ -371,7 +396,8 @@ settings/operation_customize_share の狭い filter、core check、fmt / glyph c
 cold compile は 10 分以上、broad/full test は 15 分以上の実行枠を確保する。
 有効な既存結果を再利用し、変更がない領域の検証を重ねない。
 その後、実装時には `.\scripts\build-dev.ps1` で確認用 core を用意する。
-**本設計書作成段階では cargo / build / 製品起動を実施しない。**
+設計書だけを作成した前段では cargo / build / 製品起動を実施していない。
+現在の実装に対する検証結果・確認用 build の証拠は実施後に追記する。
 
 ### 6.2 後の対話検証と更新する文書
 
@@ -405,10 +431,11 @@ import→Cancel / import→OK→再起動、暗/明テーマ・狭幅、IME 中�
 JSON の形式版は技術仕様の本書/spec に記録する。実装・独立レビューは別 context で、
 範囲と不変条件を本書から渡す。検証結果の所有は実装担当、検収は設計担当。
 
-## 7. 利用者・設計担当の判断事項 (推奨案)
+## 7. 利用者・設計担当の判断記録
 
-この段で回答待ちにせず、以下の推奨案を設計担当へ返す。既存機能を削除・制限する
-製品変更は提案しておらず、転送する初期範囲についての判断である。
+設計段階に返した以下の推奨案は、2026-10-04 に利用者がすべて承認した。
+代案は判断の経緯として残す。追加で詳細表示下部バーのモードとスタック script 有効化を
+除外し、§1.305 / §1.295 の既存 OK の限界を今回の修正対象に含めないことを承認した。
 
 | 判断 | 推奨案 / 代案とコスト |
 | --- | --- |
@@ -424,8 +451,157 @@ JSON の形式版は技術仕様の本書/spec に記録する。実装・独立
 | 未来の形式版 | 同じ v1 の未知項目は無視、破壊的な未来 v2 は全体拒否。未来版を読み取れる限り読む案は意味変更の推測を要するので採らない。 |
 | 結果確認 / 不正 / まれな失敗 | 正常値だけ draft に載せ、不正項目一覧を見て OK または Cancel。書込み/全体読込失敗は通知して転送の設定変更なし。DB 保存失敗は既存通知に委ねる。backup世代選択・途中保存・rollback・retry・journal は追加しない。 |
 | ファイル保存 | 同じ親の temp → 一度だけ既存 atomic replace helper。既存共有と同じ UI に揃えつつ、既存 export の truncate は避ける。失敗時の temp cleanup は best-effort、追加 recovery は設計しない。 |
+| 詳細表示下部バーのモード | details_selection_bar_mode を除外。Dedicated への変更による除外列の A→C 複製を取り込みから発生させない。 |
+| スタック script の有効化 | stack_script_enabled を除外。移行先の stack_rules.rhai に依存するため、本体を転送せず有効化だけ移す案は採らない。 |
+| 既存 OK の限界 | §1.305 の最新 live 値巻き戻りと §1.295 の UI 同期再読込は今回未修正。取り込みも手編集と同じ OK 経路を使い、各 backlog に継続影響を記録する。 |
+| 入力遮断の範囲 (独立レビュー後の変更) | メイン viewport の環境設定/common modal 内だけ。ファイル I/O と draft に無関係な別窓・fullscreen・native 動画の転送専用遮断はすべて撤去し、HEAD と同じ挙動へ戻す。detached 凍結ルールの構造合意は得られておらず、今回 detached を変更しない。 |
+| 通信除外の試験 (P2) | 三つの自動有効化 field の出力キー不在と true 入力時の false 保持を、policy 非依存の明示 assertion で固定する。生成された分類/保持 assertion のみでは受入条件を満たさない。 |
 
 受入条件は、(1) 全フィールドの分類 gate、(2) 個人情報・パスが出力されない、
-(3) 対象外と利用データを保持、(4) draft → 既存 OK の一経路、
+(3) 対象外 draft と利用データを保持 (既存 OK の限界は §2.3)、(4) draft → 既存 OK の一経路、
 (5) 壊れた入力/未来の破壊的形式は変更なし、(6) 通信・自動有効化を増やさない、の六点。
-実装指示へ進む前に、上記の初期除外と既存 OK の明示した導出副作用を設計担当が検収する。
+上記は実装範囲の承認であり、実装・テスト・独立レビューの検収完了を意味しない。
+
+## 8. 実装・検証の記録 (2026-10-04)
+
+### 8.1 変更ファイルと確認した境界
+
+- 変換と分類: `src/settings_transfer.rs` (新規)、登録 `src/lib.rs`。
+- draft と UI: `src/ui_dialogs/preferences/transfer.rs` (新規)、`preferences.rs`、
+  `preferences/pages.rs`、`preferences/search_index.rs`。
+- draft 収納: `src/app.rs` の二つの Box owner のみ。入力受付は既存 common modal を使い、
+  `src/ui_main.rs`、`src/ui_dialogs/settings_restore.rs`、別窓・native・sidecar の変更は撤去。
+- 試験: draft 収納に合わせた既存 fixture の `src/app/tests.rs`、`tests/ui_snapshot.rs` と
+  `tests/snapshots/preferences_transfer_{light,dark,narrow_result,busy_dark}.png`。
+- 文書: 本書、`docs/{README,architecture-overview,spec,keymap-spec,next-release-backlog}.md`、
+  `htdocs/mimageviewer/{index,privacy}.html`、`htdocs/mimageviewer/manual/settings.html`。
+
+| 実装時の根拠 | 確認した前提 |
+| --- | --- |
+| `src/settings_transfer.rs:179`、`:252` | 唯一の policy から全フィールドの列挙・対象 projection・型/範囲検証・適用・分類試験を生成。`..` のない Settings 分解で未分類をコンパイル拒否する。 |
+| `src/ui_dialogs/preferences.rs:1303`、`:1971`、`:2546`、`:2547`、`:2690` | 標準設定の draft 生成から、本番 OK の prepare → install → save_checked の一経路を使う。転送完了は draft のみ編集。 |
+| `src/ui_dialogs/preferences/transfer.rs:8`、`:40`、`:67`、`:99` | receiver は PreferencesState の一つの enum が所有する。worker に JSON/I/O を置き、UI は try_recv と型付き draft 適用だけを行う。 |
+| `src/settings_transfer.rs:794`、`:810`、`:827` | 上限付き読込、同じ親の一時ファイル、flush/sync、既存 atomic replace を利用。DB schema と Settings 本体には変更なし。 |
+| `src/settings.rs:9270`、`:9692`、`src/filename_stack_script.rs:81` | 列複製のモードと実ファイル依存の script 有効化を除外。既存 live merge の限界は §1.305 として維持。 |
+| `src/ui_dialogs/preferences.rs:2791`、`src/app.rs:22471` | 取り込み後の OK も既存の再読込を使うため、§1.295 の同期走査を継承。 |
+| `src/app.rs:19835`、`src/ui_dialogs/preferences.rs:2854` | show_preferences は既存 common modal に登録済み。メインの処理中 Modal を使い、転送専用の別窓/input guard は不要。HEAD 比較で撤去を確認する。 |
+| `src/app.rs:13884`、`:13888`、`src/ui_dialogs/preferences.rs:3141` | 大きな二つの draft は Box に収納し、private 操作カスタマイズ適用 helper も Box を消費する。owner / 確定経路は変えない。 |
+
+### 8.2 自動検証
+
+以下は入力遮断の範囲変更前の実行結果。初回の試験 fixture の前提違いは修正した。
+**今回の範囲変更後の結果は §8.4 に記録し、古い成功を修正後ソースの証拠として扱わない。**
+
+| コマンド / 確認 | exit code / 結果 |
+| --- | --- |
+| `cargo fmt`、`cargo fmt --check` | 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 |
+| `cargo test -p mimageviewer --lib settings_transfer` | 0、14 件 |
+| `cargo test -p mimageviewer --lib preferences_transfer` | 0、16 件 |
+| `cargo test -p mimageviewer --lib preferences` | 0、110 件 |
+| `cargo test -p mimageviewer --lib history_transition_storage_keeps_app_stack_footprint_bounded -- --nocapture` | 0、1 件。二つの draft の Box 化後の App は 90,312 bytes、既存上限 `<110,128` を維持。 |
+| `cargo test -p mimageviewer --lib capture_region_focus_and_escape_terminals_preserve_event_order -- --nocapture` | 0、1 件。標準スタックで既存試験を変更せず成功。 |
+| `cargo test --test ui_snapshot` | 0、69 件。新規 4 画像は実 renderer から生成し、明暗・狭幅・処理中を目視。fixture の幅だけ本番の右パネルへ揃えた最終画像も検証した。 |
+| `python scripts/check_ui_glyphs.py` | 0、危険な glyph なし |
+| `git diff --check` | 0 |
+| 未分類フィールドの一時追加 | `#[serde(skip)] pub(crate)` の unit フィールドと Default 初期値を一時追加し、`settings_transfer.rs:180` の網羅分解で cargo check が 101 (期待どおり)。元の settings.rs は byte 単位で復元し、通常 check は 0。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0、PASS。メイン lib は 10,265 passed / 52 ignored。workspace / integration / snapshot / doctest と vendor の egui / egui-wgpu / eframe まで完走。初回は launcher の release 入力 3 本の欠落 (exit 1)、次は App の既存サイズ gate (exit 1)、結果表示のみ Box 化した回は既存キャプチャ試験の stack overflow (exit 101)。最終収納修正後は標準スタックで成功。ログ `target/preferences-transfer-full-final.log`。 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0。範囲変更前のソースから core / remote / EPUB PDF worker を dev-runtime に用意。VCRT 検査 runtime=4 / pe=3 も成功。ログ `target/preferences-transfer-build-dev-final.log`。製品起動なし。 |
+
+全体テスト用の launcher 入力は、既存 `C:\home\mimageviewer\target\release` の
+2026-10-04 04:45 の core / remote / EPUB worker の実ファイルをこの worktree の
+`target/release` へコピーし、SHA-256 一致を確認した。履歴は
+`target/preferences-transfer-launcher-prerequisites.json`。これは launcher の埋込み試験の
+前提であり、今回の実装を確認する実行ファイルではない。今回の確認用 core は
+範囲変更前のソースから dev-runtime に前回 build 済み。範囲変更後の再 build は §8.4 に記録する。
+いずれの製品実行ファイルも起動していない。
+
+最終ログは `target/settings-transfer-test-final.log` (14 件)、
+`target/preferences-transfer-test-final.log` (16 件)、
+`target/preferences-regression-test-final.log` (110 件)、
+`target/preferences-transfer-check-final.log`、`target/preferences-transfer-snapshot-final.log` (69 件)、
+`target/preferences-transfer-stack-test-final.log`、`target/preferences-transfer-capture-test-final.log`。
+分類 gate の負例ログは `target/preferences-transfer-classification-probe.log`。
+
+通し試験では、実 PreferencesState に worker の結果を取り込み、本番 OK をクリックし、
+DB 再読込・load-time migration・開き直しまで確認した。別 data-dir の対象外全フィールド
+(互換 mirror の明示例外を除く)、★・履歴・タグ・collection の実ストアと編集/本/キャッシュの
+独立ファイルを比較した。Cancel は本番の破棄確認を通して DB が変わらないことを確認。
+IME fake-input、処理中の OK/Cancel/×/Escape、メインの背面メニュー・ツールバーの本番 UI 入力を試験する。
+別窓の遮断試験と native/passive の転送専用 fixture は撤去した。
+
+### 8.3 独立レビューと残る確認
+
+前回報告後の独立 `gpt-6.1-sol` / `xhigh` レビューで P2 が二件あり、detached の構造的修正への
+合意も得られなかった。設計担当は入力遮断をメインの環境設定/common modal 内へ縮小し、
+通信自動有効化の除外を独立した明示テストで固定すると決定した。処理中 DOWN → 完了 → UP を
+新しい短い右クリックとして解釈する P2-1 は、別窓の転送専用遮断を経路ごと撤去して解消する。
+以下の draft 収納は別窓の入力遮断とは別の変更で、維持する。修正後の限定独立再レビューと全体テストは完了し、新たな指摘なし。
+転送状態追加後の App は 110,200 bytes となり既存サイズ gate に失敗した。結果表示だけの
+Box 化では 110,088 bytes となってサイズ gate は通ったが、複数 App を生成する既存
+キャプチャ試験で標準スタックの overflow が残った。独立レビューの構造合意に基づき、
+App が持つ二つの draft を `Option<Box<PreferencesState>>` とし、結果表示の個別 Box は戻した。
+操作カスタマイズの private 適用 helper も Box を消費し、大きな State 全体をスタックへ戻さない。
+App は最終的に 90,312 bytes。実際の収納差分も独立再レビュー済みで、未解消の指摘なし。
+既存の `<110,128` bytes gate とキャプチャ試験、標準スタックサイズは変更しない。
+
+利用者の実機確認と設計担当の検収は未実施。§6.2 の別 data-dir 往復、取り込み後の
+OK/Cancel、対象外パス/操作設定と自動通信 OFF の保持、実 IME の Enter/Escape を確認する。
+別窓・native 動画の操作は転送のために遮断せず、既存挙動を使う。既知の §1.305 / §1.295 は承認どおり未修正。
+コミット・製品起動・通常 APPDATA のテスト操作は行っていない。
+
+### 8.4 入力遮断の範囲変更後の検証
+
+2026-10-04 の設計担当決定で、転送用の別窓・fullscreen・native 入力遮断と
+その fixture/test を撤去した。`src/ui_fullscreen.rs`、`src/app/native_video.rs`、
+`src/app/sidecar_restore.rs`、`src/ui_main.rs`、`src/ui_dialogs/settings_restore.rs`、
+`docs/detached-rework-plan.md` は HEAD と内容差分ゼロ。
+`src/app.rs` は二つの draft を Box に収納する差分のみで、別窓の関数・native HUD は HEAD と同じ。
+比較記録は `target/preferences-transfer-scope-head-comparison.json`。改行コードを正規化した
+全文の一致を assertion し、App も Box の二つの型変更以外の全文が HEAD と一致することを確認した。
+
+撤去した主な受付経路は `detached_window_can_activate`、
+`queue_deferred_detached_window_activation`、`queue_recognized_detached_right_drag_command`、
+`drain_deferred_detached_activation_watcher`、`execute_pending_right_drag_command_in_mounted_context`、
+`activate_detached_image_window_snapshot`、`native_video_hud_dimmed_for_current_poll`、
+`apply_detached_image_window_event_batch` と active/passive viewport の描画入口。
+`native_video_mouse_seek_hold_valid`、native event 受付、
+`maybe_open_native_video_secondary_long_press_menu` も HEAD へ復元した。
+追加していた `native_video_event_blocked_by_preferences_transfer`、
+`consume_blocked_modal_viewport_input`、`consume_preferences_transfer_viewport_input` は削除した。
+転送専用のメニュー/ツールバー disable と設定復元/操作カスタマイズの入口 guard も撤去した。
+新規だった `src/app/preferences_transfer_tests.rs` と `src/ui_fullscreen/preferences_transfer_tests.rs` は削除し、
+純粋な job 二重開始/drop とメイン UI の試験は環境設定の transfer test に残した。
+
+通信三フラグの出力キー不在/true 入力からの false 保持を、生成 helper を使わない純粋テストと
+実 PreferencesState の worker → 本番 OK → DB 再読込の明示 assertion で固定した。
+背面 UI 試験は本番環境設定/root modal を描画し、実メニューヘッダー・ツールバーへ
+raw pointer 入力する。単に消去済み popup 項目の旧座標をクリックするだけの証拠にはしない。
+完了だけでは環境設定の common modal は残り、閉鎖後に各メニュー handler とツールバーが通ることも確認する。
+
+関連試験の初回は本番の busy spinner が継続 repaint するため `Harness::run` の max_steps に達した
+(exit 101)。busy 中は時間制限を緩めず、既存の `run_steps` / `step` で必要な pass 数だけ実行する fixture に修正した。
+修正後の個別テスト・全体 gate・確認用 build の結果を以下に記録する。
+
+独立 `gpt-6.1-sol` / `xhigh` の限定再レビューで、メニュー試験は消去済み popup 項目の
+旧座標への click だけでは証拠にならないと指摘された。実ヘッダーへの入力・項目不在・
+閉鎖後の各 command handler の positive control を追加し、指摘を解消した。
+不在確認に `get_all_by_label` (不在なら panic) を使った試験のミスも `query_by_label` に修正した。
+本番の処理中 Modal だけを一時無効にした負例では、DateDesc から RatingDesc への
+背面 toolbar の不正変更を検出して exit 101。ログ `target/preferences-transfer-main-modal-negative.log`。
+preferences.rs は finally で元 bytes を復元し、その後の限定再レビューも新たな finding なし。
+転送 busy の本番参照は Preferences 内だけ、指定 6 ファイルと App の HEAD 比較も再確認済み。
+
+| 修正後のコマンド / 確認 | exit code / 結果 |
+| --- | --- |
+| `cargo fmt`、`cargo fmt --check` | 0 |
+| `cargo test -p mimageviewer --lib settings_transfer` | 0、15 件。`target/settings-transfer-scope-test.log`。 |
+| `cargo test -p mimageviewer --lib preferences_transfer` | 0、9 件。`target/preferences-transfer-scope-test.log`。 |
+| `cargo test -p mimageviewer --lib preferences` | 0、103 件。`target/preferences-scope-regression-test.log`。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0。`target/preferences-transfer-scope-check.log`。 |
+| `cargo test --test ui_snapshot` | 0、69 件。`target/preferences-transfer-scope-snapshot.log`。 |
+| `python scripts/check_ui_glyphs.py` | 0、危険な glyph なし。 |
+| 指定 6 ファイルの `git diff --exit-code` | 0。`--stat` の出力も空。 |
+| `git diff --check` | 0。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0、PASS。メイン lib は 10,259 passed / 52 ignored。workspace / integration / snapshot / doctest と vendor の egui / egui-wgpu / eframe まで完走。`target/preferences-transfer-scope-full.log`。 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0。修正後ソースから core / remote / EPUB PDF worker を dev-runtime に再 build。VCRT 検査 runtime=4 / pe=3 も成功。`target/preferences-transfer-scope-build-dev.log`。製品起動なし。 |
