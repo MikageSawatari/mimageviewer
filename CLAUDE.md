@@ -2179,6 +2179,11 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
         (Store が再DLして再検証する)。
       - リダイレクト無しを確認: `curl -sI <URL>` が `200 OK` (301/302 が出ないこと)、
         `Content-Length` が署名済み setup.exe と一致すること。
+    - **①.5 申請前にクリーンな Windows で起動を確かめる**: 署名済み setup.exe を Windows Sandbox (VC++ ランタイム無し) に
+      同じサイレント引数で入れ、初回・2 回目の起動で窓が出て応答し続けることを見る (v3.6.0 / v4.1.0 は「起動中のまま」で却下された。
+      サブ PC の手順は `C:\miv-sandbox\`、経緯はバックログ §1.241)。Sandbox では WebView2 が動かないので、音響調整と EPUB 変換の失敗は対象外
+      ([EffeTune 計画 §10](docs/effetune-integration-plan.md#10-決定済みの配布方針と残る対象外事項))。
+    - **認定の注意事項**: EXE/MSI アプリは「プロパティ」ページの「認定の注意事項」(2,000 字) に書く (MSIX の「提出オプション」ではない)。
     - **② Partner Center で更新**: [partner.microsoft.com](https://partner.microsoft.com/) →
       mImageViewer → 「アプリを更新」→ **パッケージ**のパッケージ URL を新 URL に差し替え →
       **各ページで必ず「下書きの保存」** (保存せず「次へ」だと入力が消える) → 「すべて保存」→

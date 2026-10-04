@@ -37,16 +37,6 @@
 - 関連: 「EffeTune に渡す前に 0dB を超える音を抑える」は、動画・音声の画面を開き直す (Remote は配信を始め直す) まで反映されない (状態の組み合わせを減らすための v4.3.0 の割り切り。2026-10-04 に利用者が実機で「開き直すと反映」を確認し、仕様かどうかを質問)。即時反映にするかは次版で検討する。
 - 関連 (別件): EffeTune も VST3 も使わず音量 100% 以下のときは、安全リミッターを通らないため 0 dBFS を超えた値がそのまま WASAPI へ渡る (リリース済みの挙動)。常に通すと約 5 ms の遅れが加わる。必要かどうかを次版で検討する。
 
-### 1.323 WebView2 ランタイムが壊れた環境で、EffeTune の画面が「12 秒以内に読み込みが終わらない」(EFFETUNE-UI-TIMEOUT) と出る — Sandbox 記録 (2026-10-03)
-
-- 観測 (サブPCの Windows Sandbox、利用者が確認、v4.3.0 配布ビルド 2 回目のインストール版): 「音響調整」で窓は出るが中身が出ず、EFFETUNE-UI-PENDING → EFFETUNE-UI-TIMEOUT。開き直しても同じ。45 秒間 msedgewebview2.exe は一度も起動しなかった (wv2-watch)。同じ Sandbox で EPUB 変換も「WebView2 Runtime が見つかりません」で失敗。
-- 環境: Sandbox 内の WebView2 登録 (EdgeUpdate Clients {F3017226-…}) は pv=152.0.4191.66 だが、フォルダには 153 / 154 しかない。サブPC本体は pv=154.0.4258.53 でフォルダと一致。ただし追加実験 (新しい Sandbox で EPUB worker を直接実行) で、登録をそのまま / 154 に修正 / キー削除の 3 状態とも `GetAvailableCoreWebView2BrowserVersionString(NULL)` が 0.1 秒で失敗 (HRESULT 0x80070002、文面は 0x80670016 STATEREPOSITORY_E_DEPENDENCY_NOT_RESOLVED)。登録のずれは原因ではなかった。Sandbox 内の WebView2 (パッケージ版の解決か EdgeWebView フォルダの中身) が使えない状態と見ている (推測)。同じ EPUB worker (配布 launcher 内のものとバイト一致) と同じ EPUB は、サブPC本体 (Windows 11 Pro 26200、WebView2 154.0.4258.53) では 1.4 秒で変換成功 (サブPCのスクリプト記録)。登録を直した Sandbox でも EffeTune は PENDING のまま (利用者が確認)。
-- mIV 側はホスト起動・同梱 CRT preload (source=bundled 14.50.35719.0)・プラグイン読み込み・createView / attached まで正常。エラー文はプラグイン自身のもので、mIV のログには出ない。
-- 原因の切り分け (2026-10-04、サブPCの自作診断 wv2diag、mIV と同じ WebView2LoaderStatic 1.0.3800.47): Sandbox では既定の探し方 (`GetAvailableCoreWebView2BrowserVersionString(NULL)` / `CreateCoreWebView2EnvironmentWithOptions(NULL, …)`) が 0x80070002 (IRestrictedErrorInfo 0x80670016) で即失敗する。`browserExecutableFolder` に `EdgeWebView\Application\154.0.4258.53` を明示すると環境・コントローラ・NavigationCompleted まで成功。`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` を設定したプロセスから起動した mIV では EffeTune の画面が出た (利用者が確認)。EPUB worker は `WEBVIEW2_*` を消すため失敗のまま。サブPC本体では既定の探し方で成功。
-- 結論 (2026-10-04、サブPC調査): 原因は `ClientState\{F3017226-…}\EBWebView` のパスが存在しない 152 のフォルダを指していること。EBWebView だけ直すと成功、pv だけ直すと失敗 (前回の「登録のずれは原因ではない」は pv だけを直した結果で、誤り)。Sandbox は EdgeUpdate が Disabled で、レジストリはベースイメージ時点のまま、ファイルはホストと共有の 153 / 154。同じ症状が WebView2Feedback #5697 (open、2026-09) に報告済みで Microsoft 側は未解決。普通の PC では更新の中断など例外的な場合だけで、WebView2 を使うアプリ全体が失敗し、ランタイムの修復で直る (Web 調査、一部コミュニティ回答)。**Sandbox の作りによるもので対処不要と判断** (利用者が判断できる根拠として記録)。
-- 予備の探し方の案 (サブPC提案、未採用): 既定で見つからないときだけ EdgeWebView\Application 配下の最新版フォルダを探して VST3 ホストの環境変数 / EPUB worker の `browserExecutableFolder` に渡す。懸念: Evergreen ランタイムのインストール先を直接指定するのは Microsoft の想定外で、更新時に旧版フォルダが消えると使用中に壊れる可能性がある (一般的な知識、要確認)。普通の PC で既定の探し方が失敗する例は未観測。
-- 改善候補 (次版以降): EPUB 変換と同じ WebView2 有無の判定を「音響調整」を押した時点で行い、無ければ mIV 側で「WebView2 Runtime が見つかりません」と案内する (TIMEOUT の文面では原因が分からないため)。EffeTune 作者へ、壊れたランタイム登録で RUNTIME ではなく TIMEOUT になる件を伝えるかも検討。
-
 ### 1.322 初回起動直後に Windows のメモリ使用量の報告 (RADAR_PRE_LEAK_64) が出る — Sandbox 記録 (2026-10-03)
 
 - 観測 (サブPCの Windows Sandbox、利用者が確認): v4.3.0 の単体exe版を日本語を含む APPDATA で初回起動した約 26 秒後に WER 1001 `RADAR_PRE_LEAK_64` (P1 mimageviewer-core.exe 4.3.0.0、ダンプなし)。クラッシュ・ハングではなく、mIV は応答を続けて正常終了。インストール版の初回起動では出ていない。
@@ -99,31 +89,12 @@
   2. 大文字小文字だけが違う ZIP 名を Windows へ展開すると同じファイルになるが、衝突を検出していない。
   3. 生成する `_miv_print_*` / `_miv_reflow_*` が既存メンバーと同名だと上書きする。
 
-### 1.314 サブフォルダ内の一時ファイル作成・削除で親一覧がちらつく — 最小設計で修正 (2026-10-01)
-
-- 観測者: 利用者 (2026-10-01)。ダウンローダーがサブフォルダ内で `.part` を作成・削除すると、親フォルダのグリッドが繰り返し更新される。
-- 原因 (設計担当のコード調査): NTFS が子フォルダ自身の mtime を更新し、親の NonRecursive watch (`poll_current_folder_watch`) が worker 再走査を起動する。`signature_from_scan` が実 Folder の `display_meta` mtime も含めるため、`apply_external_rescan` が `load_folder_with_scan` を呼び、全サムネイルの Pending 化と cache 破棄が発生する。
-- 修正 (利用者決定、2026-10-01、v4.3.0): scan の既存全 stamp hash と、実 `GridItem::Folder` の mtime だけを除く listing hash を比較する。path・種類・ファイル mtime / size・書庫 / ZIP / PDF / EPUB stamp が同じ再走査は適用済み signature／親 mtime だけを進める。items・image_metas・サムネイル・sort・遅延 metadata・cache は維持。それ以外は既存全面 reload／viewer 中の更新保留を維持する。外部再走査の signature 計算は worker 上で行う。
-- 受け入れ済みの仕様: 開いている一覧では子フォルダの「更新日時」列／tooltip／日付 sort と代表サムネ要求 stamp を一覧作成時のまま保つ。画面外からの再要求も同じ cache row を使い、再利用可能な cache hit なら子フォルダの mtime 変化だけでは再選定しない。既存の proof 失効／cache miss／idle 品質 upgrade の再生成は維持する。開き直し／「最新の情報に更新」で最新の mtime と代表を取得する。
-- **B1 (一覧 session ごとの自動代表固定) は実装しない**。代表は PC の各ビュー、aggregate、Remote、idle upgrade、pin seeds の共有 cached product なので、一覧ごとの選択には共有状態が必要で組み合わせが増える。旧 `v430-folder-refresh` では独立レビューのたび新しい P2 が見つかった。最小設計ですでに開いている一覧の代表が安定するため、旧 A+B1 は再利用せず、新しい session state／catalog／Remote・IPC 変更は加えない。
-- 回帰範囲: mtime-only 時の世代・サムネイル・metadata・cache 不変と適用 stamp 更新、無視後の実変更、追加／削除／改名／kind／mtime／size／書庫 stamp の全面 reload、viewer 保留維持、失敗／古い世代／別 owner／別 folder の非適用。製品バイナリ起動／UI smoke は行わず、利用者による修正後の実機確認は未実施。詳細は [UI 応答性 §2.6](ui-responsiveness.md#26-外部再走査-実サブフォルダの-mtime-だけでは一覧を差し替えない-v430)。
-
 ### 1.312 メイン最小化中も音響調整のビジュアライザーを表示する設定 — 利用者案 (2026-09-30)
 
 - 出典: 利用者 (開発者本人) の案。メインを最小化しても EffeTune のビジュアライザーを残せる設定がほしい。
 - 既定はメインと一緒に隠す。今回の owner / z-order 修正では設定を追加しない。
 - 実装時は [EffeTune 計画 §4](effetune-integration-plan.md#4-ウィンドウ) の一時非表示理由集合を使い、
   `Minimized` だけを設定で切り替える。`RemoteSession` による非表示と、元から隠していた窓を復帰させない規則を保つ。
-
-### 1.313 コレクションの実フォルダ子で代表サムネを固定すると親復帰先と履歴が変わる — 修正済み (2026-10-01)
-
-- 観測者: 利用者。2026-10-01、v430-integration のコレクションで登録実フォルダを開き、右クリック「📌 代表サムネに固定」を実行すると、BS が実フォルダの親へ移動し、戻る履歴に画像一覧が二重に現れる。固定しなければ collection root へ戻る。設計担当のコード調査では v4.2.0 にも同じ経路がある。
-- 原因: `consume_folder_thumb_pin_dirty` がスクロール復元用 `folder_history` を消して `load_folder(cur)` を通常 Navigation owner で実行し、CollectionPhysical の provenance を失う。可視場所の identity が変わるため navigation history にも別地点が追加される。
-- 修正: pin／unpin、video pin、遅延 export は現在ビューの共通 reload へ集約。外部再走査とスタック切替も同じ物理 reload owner を使う。Collection／Rating の物理子 owner に Refresh intent を持たせ、通常書庫の cache alias も論理 source identity で履歴を比較する。ZIP pin は階層と位置を保持する再 materialize、合成ビューは既存 metadata-pin worker／適用経路で資産だけを更新する。detached 固有述語・viewport 経路は変更しない。
-- 検証・同型経路の列挙: [pin-reload-audit.md](pin-reload-audit.md)。実アプリの起動・操作は行わず、利用者による修正後の実機確認は未実施。
-- 監査で別途判明した RatingPhysical 子のソート再表示も修正済み。Immediate／WorkerScan を F5 と同じ単一の `OpenRequestOwner` に揃え、親 chain と back／forward を保持する。古い owner の完了は選択 hint の変更前に共通採用境界で拒否する。detached consumer 内の変更は owner の機械的転送だけで、ClaudeCode と独立 Codex が構造修正に合意した。[detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録。
-- fix1 の自動検証で判明した、兄弟 context の pin worker が同時に DB を開く際のスキーマ初期化競合も修正。開始時に単一の schema writer を取得し、読取→書込 upgrade の deadlock をなくす。既存 timeout と revision／trigger の原子的導入を保持し、再試行・待機追加は行わない。
-- fix2: 独立 Codex レビューが検出した、合成ビュー pin 完了時の UI thread I/O（FS metadata、cascade DB、catalog DELETE、video pin read／seed write）を既存 pin／metadata worker へ移した。準備済み private cache と scalar identity だけを UI に渡し、世代／owner 検証後にメモリ適用する。共通 consumer を使う metadata import も同じ境界へ揃え、元の live map の不変・実 worker の保存完了・UI reader 不在での採用・変更済み cache owner の拒否を回帰で検査する。世代切替で旧 pin 永続化 owner を取消し、兄弟 context の要求は維持する。cancel と seed 失敗時の同一 key の旧 frame cleanup も catalog worker 境界で検査する。§11 は ClaudeCode と利用者指定独立レビューの合意日時／session を明記し、内部補助レビューと区別した。
 
 ### 1.288 多数のファイルをエクスプローラへドラッグしてコピーすると、コピーが終わるまで mIV が操作できない — コード調査 + 通常ログ (2026-09-27)
 
@@ -181,23 +152,6 @@
   残る違和感: プラグイン画面にフォーカスがあるとき、VST ボタンは 1 回目で mIV にフォーカスが戻り 2 回目で閉じる。
   従来からの動きなので利用者判断で現状維持 (1 回で閉じるかは将来の検討)。
 - 規模 / 優先度: Small〜Medium / P2 (常に最前面と VST を併用すると操作できなくなる)。
-
-### 1.286 新しいデータフォルダの初回起動で「編集内容の復元を利用できません」が出ることがある (2026-09-26)
-
-- 出典: 実アプリ smoke のスクリーンショット (`target/ui-smoke-runs/20260926T131244746Z-*-RatingSortCollection-*/screenshots/`)
-  に通知「コピー・移動したファイルの編集内容の復元を利用できません」が写っていた。観測は smoke のスクリーンショットと
-  ログから。利用者の実環境のログ (`%APPDATA%\mimageviewer\logs`) には同じ行が無い。
-- ログ: `content_identity: ledger unusable: detection index load failed: [create edit_origin: ]database is locked`
-  (起動 0.75〜0.82 秒)。使い捨てデータ (`target/portable-smoke/data`、毎回作り直し) の smoke 実行のうち、
-  2026-09-24 以降の多くの回 (MultiWindowStills / Pdf / RarNav / RatingSort / RatingSortCollection) で出ている。
-  §1.237B より前から出ており、評価順の変更とは関係しない。
-- 推測 (未確認): `content_identity.db` が無い状態で、台帳の作成と検出 index の読み込みが別接続で並走し、
-  schema 作成中の lock に busy timeout 無しで当たっている。新規インストールや、データフォルダを作り直した
-  利用者の初回起動で、この機能が無効になり通知が出る可能性がある。
-- 方針候補: schema 作成を 1 か所 (1 接続) に集約して他の open をその完了後にする、または読み込み側にも
-  busy timeout を設定する。失敗を機能無効として確定する前に、どの接続が lock を持っていたかをログに出す。
-  回帰テスト: 空のデータフォルダで ledger と検出 index を同時に開く。
-- 規模 / 優先度: Small / P2 (初回起動の見た目に出るため)。
 
 ### 1.285 起動直後にコレクションを開くと、起動時のフォルダ読み込みがあとから画面を置き換える (2026-09-26)
 
@@ -269,21 +223,6 @@
   (初回フレームの画像矩形) で確かめるのがよい。detached 経路に触れる修正は
   [detached-rework-plan.md](detached-rework-plan.md) の構造修正・レビュー規則に従う。
 - 規模 / 優先度: 原因判明後に再見積もり / P3。
-
-### 1.277 シーク位置プレビューの大きさを HUD から切り替える — §1.249 の追補 (2026-09-25)
-
-- 実装 (2026-09-30、`v430-video`): 静止画・動画の列ボタンのメニューに既存の 5 段階を追加する。通常の広さでは px 値も並べ、小さい別窓では収まる表記とスクロールで全段階へ届く。選択は各プレビュー段階だけを保存し、列の高さは変えない。動画は既存の native presenter 世代・session 照合付き出力イベントを通す。
-- 実機確認の追補 (2026-09-30): 静止画も動画と同じ「列の高さ | シーク位置プレビューの大きさ」の 2 列・5 行へ揃える。見出し、段階名、px 表記と行寸法は `seek_strip_menu.rs` に集約する。低い画面は行高と表記を詰め、それでも収まらない場合だけスクロールし、右列の文字と操作面にスクロールバーが重ならない幅を予約する。選択処理と main / second context の設定反映、popup の wheel 抑止は維持する。
-
-- 出典: v4.1.0 で §1.249 を実機確認した利用者の指摘。プレビューの大きさ (最小〜最大) は環境設定からしか
-  変えられず、段階を持たせた意味が薄い。
-- 方針: サムネイル列の高さと同じく、HUD のサムネイル列ボタンのポップアップ (「サムネイル列の表示と高さ」)
-  に「プレビューの大きさ」の段階選択を並べる。静止画は `draw_still_seek_strip_popup`、動画は native presenter
-  側のポップアップと `NativeVideoOutputEvent` の `SetSeekStripHeight` と同じ経路で設定を書く。設定の形は
-  §1.249 の段階 + px 値のままで移行は不要。
-- 回帰確認: 動画・静止画それぞれで HUD から切り替え → 表示と環境設定の値が一致、列の高さとは独立、
-  複数ウィンドウの別窓でも同じ。
-- 規模 / 優先度: Small / P3。
 
 ### 1.263 固定の「ファイル整理先」へ選択項目をコピー・移動する — >>444、>>447 (2026-09-21)
 
@@ -480,19 +419,10 @@
   再要求する形へ直し、deadline 前の別パスを挟む回帰テストを追加する。
 - 規模 / 優先度: Small / P2。Ctrl+G 本体や検索 worker は触らない。
 
-### 1.251 動画の複数音声トラックを選択できるようにする — 実装済み、実機確認待ち — >>429 (2026-09-17)
+### 1.251 動画の複数音声トラックを選択できるようにする — v4.3.0 で出荷、残りは確認 2 件 — >>429 (2026-09-17)
 
-- 出典: >>429。設計の正本は [音声トラック選択計画](audio-track-selection-plan.md)。
-- 対応段階とコミット:
-  - S1 `12d8470b8`、`7ee30628e`: 複数音声のテスト素材とトラック一覧。
-  - S2 `606e3c332`、`69c43ac9c`、`48fd37a7e`、`708839a98`、`d6a9d9e1b`: 再生中・一時停止中の切り替えと、末尾・音声のない位置での保留。
-  - S3 `82da169a4`、`4d983ad97`: トラックごとの音量ノーマライズ、波形・音楽解析。
-  - S4 `43f6c5f77`: 本体と音声モードの HUD、右パネル、キー操作。
-  - S5 `4d65bf812`、`9d30eeb20`: ファイルごとの選択記憶と、環境設定からのクリア。
-  - S6 `781bea3c6`: Remote のトラック一覧・切り替えと PC への選択記憶。
-  - S7 `e64b3c634`: Remote 接続時の閲覧ウィンドウ全閉じと、見た位置の PC への反映。
-  - S8-A `dde4b3107`: 実アプリの `AudioTracks` シナリオを追加。S8-B はマニュアル・仕様書・プライバシーポリシー・製品ページの文書更新。
-- 実機確認待ち: 使い捨ての検証環境で `AudioTracks` を実行する。Remote は PC で選んだトラックからの開始、端末での切り替えと位置の引き継ぎ、接続時の全閉じを確認する。実行前に利用者の了承と時間帯の確認が必要。
+- 出典: >>429。設計の正本は [音声トラック選択計画](audio-track-selection-plan.md)。v4.3.0 (2026-10-04) で出荷。
+- 残り: ① 実アプリの `AudioTracks` シナリオが毎回止まる件 (§1.319)。② Remote の実機確認 (PC で選んだトラックからの開始、端末での切り替えと位置の引き継ぎ) は未実施。ローカルの再生と切り替えは利用者がサブPCで確認済み (2026-10-03)。
 
 ### 1.243 TensorRT ワーカーの決定的な起動失敗の後も、AI 処理のたびに起動をやり直す — 修正済み、残りは確認 (2026-09-15)
 
@@ -517,7 +447,6 @@
   `target/section241-release-verification-20260915/RESULTS.md`): 配布 3 形態の初回・2 回目起動、DLL を読めない場合に AI なしで
   起動が続くこと、GPU 実機の DirectML / TensorRT / 被写体分離 / Remote AI。**いずれも署名なしの確認用ビルド。**
 - 残り:
-  - `build-dist.ps1` の**署名済み成果物**で、Sandbox の初回・2 回目起動をもう一度見る。
   - 「Defender 有効 かつ VC++ ランタイム無し」の環境は未確認 (Sandbox では Defender を有効にできない。クリーンな VM が要る)。
   - 正本 §5 の「Store 申請前にクリーンな Windows (Sandbox) で起動を確認する」が、CLAUDE.md リリース手順 Phase 5 step 19 に未反映。
   - **Store 再申請は修正版の正式リリース後。**
@@ -525,7 +454,8 @@
   OS build 26200.8246)。`dd96be073` は v4.1.0 に入っているので、同じ原因とは限らない。原因は未特定・こちらで未再現。
   利用者が Developer Support へスクリーンショット (「起動中…」の下の段階表示)・機種・ログを依頼済み。
   起動画面は startup-init の `IndexerManager::new` 完了まで出続ける (コードの参照、`poll_startup_init`)。
-  次: 返信待ち、v4.2.0 の署名済み setup.exe で Sandbox の初回・2 回目起動、その結果を見てから再申請。
+  2026-10-03〜04: v4.3.0 の**署名済み** setup.exe (Store と同じサイレント引数) をサブPCの Sandbox (VC++ 無し) で初回・2 回目起動し、どちらも数秒でウィンドウが出て 600 秒応答した (サブPCのスクリプト記録)。
+  2026-10-04 に v4.3.0 で再申請 (版付き直リンク、認定の注意事項で止まった場合のスクリーンショット・ログ・機種・待ち時間を依頼)。次: 認定結果待ち。
 - 規模 / 優先度: 確認と手順追記 / **P0** (Store の再申請を止めている)。
 
 ### 1.234 `settings.db-shm` を削除できず、設定の復元と完全リセットが両方失敗する — 根本原因は修正済み、残り 3 件 (2026-09-13)

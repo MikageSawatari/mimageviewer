@@ -498,6 +498,15 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 ## 10. 決定済みの配布方針と残る対象外事項
 
 - 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
+- **Windows Sandbox では音響調整 (と EPUB 変換) が動かない — 対処しない (2026-10-04 利用者判断)。** Sandbox では
+  `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\EBWebView` が
+  存在しない旧版フォルダ (152.0.4191.66) を指し、実フォルダはホストと共有の 153 / 154。EdgeUpdate が無効なのでずれが直らない。
+  WebView2 の既定の探し方が 0x80070002 で失敗し、EffeTune は PENDING → TIMEOUT、EPUB は「WebView2 Runtime が見つかりません」になる。
+  EBWebView だけを直すと成功、pv だけでは失敗 (サブPCの診断ツール wv2diag による実験、記録は サブPC `C:\miv-sandbox\wv2-diag\out\`)。
+  同じ症状は [WebView2Feedback #5697](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5697) に未解決で報告されている。
+  普通の PC では更新の中断などの例外時だけで、WebView2 を使うアプリ全体が失敗し、ランタイムの修復で直る (Web 調査、一部コミュニティ回答)。
+  予備の探し方 (EdgeWebView\Application の最新版を `browserExecutableFolder` / `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` で明示) は
+  Evergreen を想定した使い方ではなく、更新通知が来なくなるため採らない。壊れた環境向けの案内表示も追加しない (利用者判断)。
 
 - v4.3.0 の同梱・署名・ライセンス通知は §10.2 に確定。商標注記の追加要否は別途確認する。
 - マニュアル・製品ページ・privacy には、Mixwright の WebView データの保存先が mIV の data_dir の
