@@ -546,6 +546,8 @@ pub enum LoadRequestSource {
     RawHalfDeveloped {
         image: image::DynamicImage,
         developed_dims: [u32; 2],
+        /// Prior executor wait/develop time, retained for cache decisions and stats.
+        /// This is outside the re-enqueued thumbnail worker's diagnostic span.
         decode_ms: f64,
         folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
     },
@@ -3844,8 +3846,11 @@ fn resolve_folder_thumb_image_inner(
 /// この計装が唯一守ろうとしている信号なので、足せない形にしておく。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct ThumbLoadPhases {
-    /// デコード全体。PDF では render 往復と orientation を含む。
+    /// Decode within this worker span, including PDF render and orientation.
     decode_ms: f64,
+    /// Prior RAW executor wait/develop, outside this span and its thread cycles.
+    /// Diagnostic detail only; never add to or subtract from the worker total.
+    raw_async_decode_ms: Option<f64>,
     display_ms: f64,
     send_display_ms: f64,
     cache_encode_ms: f64,
@@ -4492,6 +4497,13 @@ pub fn load_one_cached(
     let orientation_ms = orientation_started.elapsed().as_secs_f64() * 1000.0;
 
     let decode_ms = raw_decode_ms.unwrap_or_else(|| t.elapsed().as_secs_f64() * 1000.0);
+    // Keep the existing cache/stat timing above. A RAW continuation's earlier
+    // executor wait/develop belongs outside this worker's wall/cycle window.
+    let diagnostic_decode_ms = if raw_decode_ms.is_some() && crate::perf::is_enabled() {
+        t.elapsed().as_secs_f64() * 1000.0
+    } else {
+        decode_ms
+    };
 
     // source_dims は常にピクセル座標系。PDF page box の正確な比率は layout_dims に
     // 分離し、リリース済みの source_* 契約を別の単位で上書きしない。
@@ -4735,7 +4747,8 @@ pub fn load_one_cached(
         let total_cycles = total_cycles_started.map(|start| start.finish());
         let total_ms = total_ended.duration_since(total_started).as_secs_f64() * 1000.0;
         let phases = ThumbLoadPhases {
-            decode_ms,
+            decode_ms: diagnostic_decode_ms,
+            raw_async_decode_ms: raw_decode_ms,
             display_ms,
             send_display_ms,
             cache_encode_ms,
@@ -4816,6 +4829,9 @@ pub fn load_one_cached(
         }
         if let Some(cycles) = total_cycles {
             extras.push(("total_cycles", cycles.into()));
+        }
+        if let Some(ms) = phases.raw_async_decode_ms {
+            extras.push(("raw_async_decode_ms", ms.into()));
         }
         crate::perf::event("thumb", "load_phases", Some(&key), input_seq, &extras);
     }
@@ -5393,6 +5409,79 @@ mod tests {
         };
 
         assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+    }
+
+    #[test]
+    fn raw_async_decode_is_outside_the_thumbnail_worker_span() {
+        let phases = ThumbLoadPhases {
+            decode_ms: 1.0,
+            raw_async_decode_ms: Some(500.0),
+            orientation_ms: 0.5,
+            display_ms: 5.0,
+            ..ThumbLoadPhases::default()
+        };
+        assert_eq!(phases.disjoint_total_ms(), 6.0);
+        assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+        assert_eq!(
+            phases.unaccounted_ms(10.0),
+            ThumbLoadPhases {
+                raw_async_decode_ms: None,
+                ..phases
+            }
+            .unaccounted_ms(10.0)
+        );
+    }
+
+    #[test]
+    fn raw_async_decode_still_drives_cache_policy_and_load_statistics() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let mut request = LoadRequest {
+            path: tmp.path().join("half.cr2"),
+            file_size: 1, // Below the size heuristic; only decode time should trigger cache.
+            priority: true,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            raw_source: LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(8, 8),
+                developed_dims: [16, 16],
+                decode_ms: 500.0,
+                folder_selection_proof: None,
+            },
+            ..Default::default()
+        };
+        process_load_request(
+            &mut request,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            32,
+            75,
+            32,
+            make_decision(CachePolicy::Auto, 250, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let display = rx.try_recv().unwrap();
+        let finalized = rx.try_recv().unwrap();
+        assert!(display.image.is_some() && !display.finalized);
+        assert!(finalized.finalized && !finalized.canceled);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        assert!(catalog.load_one("half.cr2").unwrap().is_some());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.count_raw, 1);
+        assert!(stats.time_raw >= 500.0);
     }
 
     /// これが落ちたら、`decode_ms` の内側にある区間が合計へ入っている。

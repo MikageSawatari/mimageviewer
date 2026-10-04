@@ -908,6 +908,10 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
   フル現像と一致する
 - `CacheDecision::should_cache` に RAW 専用の規則は足さない (RAW はファイルが大きく既存の
   `size_threshold` に掛かる見込み。未確認)
+- RAW half の後続 thumbnail worker の診断は、その worker 区間の `decode_ms` と、先行する
+  executor 待機・現像の `raw_async_decode_ms` を分離する。後者は worker の wall/cycles 合計や
+  `unaccounted_ms` に含めない。保存判断・既存統計には従来どおり先行時間を使う
+  ([計装の読み方](ui-responsiveness.md#恒久的に使える計装))。
 - キャッシュ一括作成 (D4)・画質サンプル (D9) は現状 RAW を扱えていない。同じ振り分けを入れて
   サムネイルと同じ結果にする (half 現像が要る RAW は executor の Background で)
 - 類似索引への prefill (`src/thumb_loader.rs:3512-3520`) は、`Other` 形式では「decode 長辺 ≥ source_dims
