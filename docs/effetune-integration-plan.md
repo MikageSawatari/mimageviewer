@@ -648,7 +648,7 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   直接削除できるため、新たな権限を与えない。既存のcanonical／reparse事前検査は維持するが、
   親directoryをhandleで固定した競合耐性を保証するものとは説明しない。
 - 同梱bundleだけが対象。EffeTune設定／プリセット／IR／測定データ、WebView保存領域は削除しない。
-- **旧版互換（利用者／ClaudeCode決定2026-10-05、方針1）**: workerが起動ごとに一度だけ
+- **旧版互換（ClaudeCode決定2026-10-05。利用者決定「今の版だけ残して削除」の範囲内で方針1を選択）**: workerが起動ごとに一度だけ
   `K32EnumProcesses` と `QueryFullProcessImageNameW`（query limited rights）でprocess画像を列挙し、
   候補tree内で実行中の画像があれば削除しない。世代内にexeが無い旧coreもあるため、現在版内の
   別 `mimageviewer-core.exe` が動く間は全旧世代を保守的に残す（自coreとremote等のhelperは除外）。

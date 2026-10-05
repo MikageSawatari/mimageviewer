@@ -138,39 +138,16 @@
 - `settings.db` の複製ではなく、対象項目だけを版付き形式で書き出し、取り込み時は対象外の既存設定・利用データを保持する。形式・値の検証と、新旧バージョンで項目が増減した場合の扱いを決める。環境設定外で管理する一覧の並び順・サムネイル画質・ツールバー配置などは、この初期範囲に自動で含めない。
 - 回帰確認: 別 data-dir への往復で対象設定だけが復元されること、対象外のデータや既存パス・プラグイン設定が変わらないこと、不正・旧版の入力を安全に扱えること。
 
-### 1.331 単体exe版・インストーラ版で、旧バージョンの runtime フォルダーが消えずに溜まる — 開発機の実測 (2026-10-05)
+### 1.332 runtime 以外にも、古い版・古い生成物が残り得るキャッシュ — §1.331 の棚卸し (2026-10-05)
 
-- 観測 (開発機の `%APPDATA%\mimageviewer\runtime\`、2026-10-05 に ClaudeCode が一覧と `du` で計測): 2.13.0〜4.3.0 の 20 版分が残り、各 400〜540 MiB、合計約 8.5 GiB。利用者の他の PC は未確認。
-- 原因 (コード / CLAUDE.md「FFmpeg LGPL DLL 管理」): launcher は版ごとに `runtime\<version>\` へ core・DLL・EffeTune を展開するが、従来は旧版を消す所有者が無かった。更新のたびに約 0.5 GiB ずつ増える。
-- §1.316 (EffeTune の旧世代) は同じ runtime 配下の、より小さい同種の問題 (修復 1 回あたり約 37 MiB)。掃除の仕組みは 1 つにまとめて考える。
-- 利用者決定 (2026-10-05): 「今の版だけ残して削除」。ダウングレード時は新しい版も削除する（そのlauncherを次に起動すると再展開）。portable は対象外。
-- 実装: core の起動完了・初回描画後に `runtime-cleanup` を一度spawn。resolved data-dirのruntime直下のSemVer名だけを対象に、現在版以外をbest-effort削除する。canonical confinementと全treeのreparse検査を行い、未知名・リンクは残す。失敗はlogのみ、部分削除可、次回起動で再試行。UI I/O、timer、待機、初期化とのjoinは無い。
-- owner選択: launcherは描画完了を持たず、使用中lockをcoreへ引き渡したら終了する。coreのstartup完了境界を利用し、EffeTune／AI初期化の経路には清掃を挿入しない。
-- P1/P2追補（2026-10-05）: coreはexe所属版と固定世代のshared leaseを寿命中保持する。launcherも抽出前からshared版leaseを持ち、抽出には新規exclusive lock、世代公開には既存exclusive lockを使う。清掃は各候補のexclusive leaseと版の抽出／公開lockを非blocking取得して削除完了まで保持し、別data-dirのcoreも保護する。launcher→coreはnamed eventでleaseを重ねて引き継ぐ。
-- P1/P3再レビュー追補（同日）: 全cooperative lockを削除対象外の `runtime/.locks/` に固定。`<version>.in-use`／`.extract`／`.effetune` と `<version>.gen-<generation>` はdelete sharingを禁止し、微小な旧fileも永久保持する。launcherは版directory作成前に外側shared leaseを取得する。旧publisher互換は外側→旧lockの順で併用し、版全体清掃の旧fileだけdelete sharingを許可する。製品cleanup_effetune内の削除操作hookで、実tree削除後も別handleが外側lockを取得できない回帰testへ変更（正本§10.2、`target/1331-msg-3.txt`）。
-- P1 #2の親junction差替えTOCTOUは利用者が受容。実行には同じ利用者権限の別processが必要で、そのprocessは直接削除できるため新たな権限を与えない。canonical／reparse事前検査は維持する。
-- 旧版互換の追補（同日の利用者／ClaudeCode決定、方針1）: workerが一度だけprocess画像を列挙し、候補tree内の実行中画像を検出したら保持する。同版の別coreが存在する間は未ロード旧世代のpinが分からないため全旧世代を保守的に保持する。missing leaseは事前検査後に作成してexclusive取得し、未使用の既存旧版も清掃する。列挙失敗は全清掃を見送り、query拒否／終了済みprocessは検査対象外。未対応旧launcherをsnapshot後に利用者が同時起動する競合は受容し、次回起動で再展開する（正本§10.2、`target/1331-msg-2.txt`）。
-- 棚卸し（今回の清掃対象外、別ownerで検討）:
+- 出典: §1.331 (旧 runtime 版の削除、2026-10-05 master 0bb1b8afc、利用者が開発機で確認) の実装担当の棚卸し。§1.331 / §1.316 は完了して削除した。
+- 今回の「今の版だけ残す」ルールに含めなかったもの (それぞれ別の所有者で保持方針を決める):
   - `vst3/hosts/<host+CRT SHA256>` は旧hashが残る。host抽出／実行中bridgeのownerでcurrentと読手を確定する必要があり、runtime配下の清掃には含めない。
   - `addons/editing/packs/<pack-version>` と `downloads/<zip>.partial` は利用者が取得する追加パック。active pointer／font・model読手／download再開を持つため、別途保持方針を決める。
   - `tensorrt-engines/<model-kind>` 内のTensorRT/ORT生成cacheはモデル・GPU・precision等のhashに依存する。複数の有効なvariantが共存するため「currentだけ」を適用しない。pack本体は固定の`tensorrt/`でありmIV版別世代ではないが、manifest asset名のzip／`.partial`が変更・再開用に残り得るためinstaller ownerで別途検討する。
   - `archive_cache/<hash前2文字>/<path-hash>/<basename>.zip`、`epub_cache/<hash前2文字>/<path-hash>/<stem>.g<id>.pdf` は閲覧元ごとのcacheで、既存のcache管理を使う。「current版だけ」のruntimeルールには含めない。
   - Susie32 exe、PDFium、ORT DLLはdata-dir直下の固定名、埋込みmodelは`models/<filename>`で置換するためmIV版別世代ではない。廃止model名は残り得るが、外部/追加modelと区別するmanifestが必要。
-- 検証: 一時data-dirで現在版保持、旧版／新しい版／inactive世代削除、未知名、junction、publisher busy、locked file、portable no-opを検査。コマンドと結果は実装引継ぎに記録。実アプリは未起動。
-- 規模 / 優先度: Small〜Medium / P2 (利用者のディスクを黙って使い続ける)。
-
-### 1.316 EffeTune 公開済み旧世代の best-effort cleanup — 2026-10-02
-
-- R2配布修正は使用中のtreeを移動／削除せず、不変世代を追加してcurrent pointerだけを更新する。
-  修復のたびに約37 MiBが残るため、繰り返すとruntime cacheが増える。
-- §1.331と同じ起動後workerで実装。currentと当該core／hostが固定した世代を保持し、
-  それ以外の認識済み世代名だけをbest-effort削除する。publisher lockは一度だけ非blocking取得し、
-  busy、current不明、core世代未確定／未知layoutなら今回は全世代を保持する。
-  候補のexclusive使用中lockと版のpublisher lockを削除完了まで保持する（P1/P2追補）。別coreも同じ世代のshared使用中lockを保持し、host未ロードの固定世代も削除しない。
-  P1/P3再レビューで世代／publisher lockを `runtime/.locks/` の永久fileへ移し、削除によるlock同一性の分裂を除いた。既存publisher互換も併用し、製品経路の削除中hookで保持期間を検証する。
-  ロック未対応旧coreも含め、同版の別coreのprocess画像があれば今回は全旧世代を保持する。世代内の実行中画像も保持対象とし、snapshot後の未対応旧launcher同時起動は利用者が受容（§1.331／正本§10.2）。
-  使用中・権限不足などの削除失敗はlogだけで起動／EffeTuneを阻害しない。lock不在だけでは未使用と判断しない。
-- 正本: [EffeTune配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01)。
+- 規模 / 優先度: Small〜Medium / P3 (vst3/hosts は host 更新のたびに増えるので最初に見る)。
 
 ### 1.315 EPUB 変換のパス解決で残した 3 件 — コード調査 (2026-10-01)
 
