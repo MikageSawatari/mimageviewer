@@ -23,8 +23,13 @@ pub enum LocationMenuEntry {
     DriveList,
     ReadingHistory,
     Bookmarks,
-    Rating { stars: Vec<u8> },
+    Rating {
+        stars: Vec<u8>,
+    },
     Bookshelf,
+    FileOrganizeDestinations {
+        destinations: Vec<crate::settings::FileOrganizeDestination>,
+    },
     Separator,
     QuickLocation(QuickLocation),
     DriveRoot(PathBuf),
@@ -67,6 +72,13 @@ fn location_menu_entries_from(
     }
     if settings.show_location_bookshelf {
         entries.push(LocationMenuEntry::Bookshelf);
+    }
+    if settings.show_location_file_organize_destinations
+        && !settings.file_organize_destinations.is_empty()
+    {
+        entries.push(LocationMenuEntry::FileOrganizeDestinations {
+            destinations: settings.file_organize_destinations.clone(),
+        });
     }
 
     let mut quick_locations = Vec::new();
@@ -571,5 +583,42 @@ mod tests {
             ),
             None
         );
+    }
+    #[test]
+    fn file_organize_destinations_location_visibility_and_order() {
+        use crate::settings::FileOrganizeDestination;
+        let mut settings = Settings::default();
+        let entries = |settings: &Settings| {
+            location_menu_entries_from(settings, None, None, None, Vec::new())
+        };
+        let is_destinations = |entry: &LocationMenuEntry| {
+            matches!(entry, LocationMenuEntry::FileOrganizeDestinations { .. })
+        };
+        assert!(settings.show_location_file_organize_destinations);
+        assert!(!entries(&settings).iter().any(is_destinations));
+        settings.file_organize_destinations = vec![
+            FileOrganizeDestination {
+                name: "要確認".into(),
+                path: PathBuf::from(r"Z:\unreachable"),
+            },
+            FileOrganizeDestination {
+                name: "保管".into(),
+                path: PathBuf::from(r"C:\archive"),
+            },
+            FileOrganizeDestination {
+                name: "要確認".into(),
+                path: PathBuf::from(r"Z:\unreachable"),
+            },
+        ];
+        let visible = entries(&settings);
+        assert_eq!(
+            visible.last(),
+            Some(&LocationMenuEntry::FileOrganizeDestinations {
+                destinations: settings.file_organize_destinations.clone(),
+            })
+        );
+        assert_eq!(visible[visible.len() - 2], LocationMenuEntry::Bookshelf);
+        settings.show_location_file_organize_destinations = false;
+        assert!(!entries(&settings).iter().any(is_destinations));
     }
 }

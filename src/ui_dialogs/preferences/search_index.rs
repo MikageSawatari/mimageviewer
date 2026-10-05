@@ -496,7 +496,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "folder/organize-destinations",
         Folder,
         "ファイル整理先",
-        ["コピー", "移動", "登録", "表示名", "パス", "順序"]
+        [
+            "コピー",
+            "移動",
+            "登録",
+            "表示名",
+            "パス",
+            "順序",
+            "場所",
+            "表示",
+            "Remote",
+            "メニュー"
+        ]
     ),
     entry!(
         "folder/hidden-files",

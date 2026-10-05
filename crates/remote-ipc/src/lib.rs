@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 65;
+pub const PROTOCOL_VERSION: u32 = 66;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1351,13 +1351,30 @@ pub struct SmartFolderSummary {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlaceSummary {
-    DriveList { name: String },
-    ReadingHistory { name: String },
-    Bookmarks { name: String },
-    Rating { name: String, stars: Vec<u8> },
-    Bookshelf { name: String },
+    DriveList {
+        name: String,
+    },
+    ReadingHistory {
+        name: String,
+    },
+    Bookmarks {
+        name: String,
+    },
+    Rating {
+        name: String,
+        stars: Vec<u8>,
+    },
+    Bookshelf {
+        name: String,
+    },
+    FileOrganizeDestinations {
+        name: String,
+        entries: Vec<RemoteEntry>,
+    },
     Separator,
-    Folder { entry: RemoteEntry },
+    Folder {
+        entry: RemoteEntry,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3218,7 +3235,7 @@ mod tests {
 
     #[test]
     fn protocol_v63_audio_track_control_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+        assert_eq!(PROTOCOL_VERSION, 66);
         let action = VideoStreamControlAction::AudioTrack {
             stream_index: 3,
             position_secs: 42.5,
@@ -3368,7 +3385,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+        assert_eq!(PROTOCOL_VERSION, 66);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3411,7 +3428,7 @@ mod tests {
 
     #[test]
     fn protocol_v62_raw_error_codes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+        assert_eq!(PROTOCOL_VERSION, 66);
         for (code, wire) in [
             (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
             (MediaErrorCode::RawCapacity, "raw_capacity"),
@@ -3433,7 +3450,7 @@ mod tests {
 
     #[test]
     fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+        assert_eq!(PROTOCOL_VERSION, 66);
         let expected = ClientMessage::RawPrefetchWindow {
             id: 65,
             owner: test_owner("window-client"),
@@ -3633,7 +3650,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+        assert_eq!(PROTOCOL_VERSION, 66);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4477,6 +4494,38 @@ mod tests {
     }
 
     #[test]
+    fn file_organize_destinations_home_roundtrips_typed_folder_entries() {
+        let entry = |name: &str, path: &str| RemoteEntry {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            kind: RemoteEntryKind::Folder,
+            thumbnail_address: None,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        };
+        let payload = HomePayload {
+            smart_folders: vec![],
+            places: vec![PlaceSummary::FileOrganizeDestinations {
+                name: "整理先".into(),
+                entries: vec![entry("保管", "C:/archive"), entry("未接続", "Z:/absent")],
+            }],
+        };
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HomePayload>(&encoded).unwrap(),
+            payload
+        );
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["places"][0]["kind"], "file_organize_destinations");
+        assert_eq!(json["places"][0]["entries"][0]["name"], "保管");
+        assert_eq!(json["places"][0]["entries"][1]["path"], "Z:/absent");
+        assert_eq!(json["places"][0]["entries"][1]["kind"], "folder");
+        assert_eq!(PROTOCOL_VERSION, 66);
+    }
+
+    #[test]
     fn zip_entry_address_rejects_traversal_and_windows_aliases() {
         for entry_name in [
             "../secret.jpg",
@@ -4671,7 +4720,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+        assert_eq!(PROTOCOL_VERSION, 66);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

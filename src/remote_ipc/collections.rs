@@ -1285,6 +1285,15 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
             crate::known_folders::LocationMenuEntry::Bookshelf => PlaceSummary::Bookshelf {
                 name: "本棚フォルダ".to_owned(),
             },
+            crate::known_folders::LocationMenuEntry::FileOrganizeDestinations { destinations } => {
+                PlaceSummary::FileOrganizeDestinations {
+                    name: "整理先".to_owned(),
+                    entries: destinations
+                        .into_iter()
+                        .map(|destination| remote_folder_entry(destination.name, destination.path))
+                        .collect(),
+                }
+            }
             crate::known_folders::LocationMenuEntry::Separator => PlaceSummary::Separator,
             crate::known_folders::LocationMenuEntry::QuickLocation(location) => {
                 remote_folder_place(location.label.to_owned(), location.path)
@@ -1298,16 +1307,20 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
 
 fn remote_folder_place(name: String, path: PathBuf) -> PlaceSummary {
     PlaceSummary::Folder {
-        entry: remote_entry_from_candidate(CandidateEntry {
-            path,
-            name,
-            kind: RemoteEntryKind::Folder,
-            detail: None,
-            progress_current: None,
-            progress_total: None,
-            rating: None,
-        }),
+        entry: remote_folder_entry(name, path),
     }
+}
+
+fn remote_folder_entry(name: String, path: PathBuf) -> RemoteEntry {
+    remote_entry_from_candidate(CandidateEntry {
+        path,
+        name,
+        kind: RemoteEntryKind::Folder,
+        detail: None,
+        progress_current: None,
+        progress_total: None,
+        rating: None,
+    })
 }
 
 #[cfg(test)]
@@ -1874,6 +1887,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn file_organize_destinations_places_keep_names_order_and_missing_paths() {
+        use crate::settings::FileOrganizeDestination;
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let missing = temp.path().join("missing");
+        let mut settings = Settings::default();
+        let group = |settings: &Settings| {
+            visible_places(settings)
+                .into_iter()
+                .find(|place| matches!(place, PlaceSummary::FileOrganizeDestinations { .. }))
+        };
+        assert!(group(&settings).is_none());
+        settings.file_organize_destinations = vec![
+            FileOrganizeDestination {
+                name: "未接続".into(),
+                path: missing.clone(),
+            },
+            FileOrganizeDestination {
+                name: "保管".into(),
+                path: existing.clone(),
+            },
+        ];
+        let PlaceSummary::FileOrganizeDestinations { name, entries } = group(&settings).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(name, "整理先");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["未接続", "保管"]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.kind == RemoteEntryKind::Folder)
+        );
+        assert_eq!(PathBuf::from(&entries[0].path), missing);
+        assert!(super::super::path_guard::resolve_existing(&entries[0].path).is_err());
+        assert!(super::super::path_guard::resolve_existing(&entries[1].path).is_ok());
+        settings.show_location_file_organize_destinations = false;
+        assert!(group(&settings).is_none());
     }
 
     #[test]

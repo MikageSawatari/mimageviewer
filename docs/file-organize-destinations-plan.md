@@ -71,7 +71,7 @@ settings_kv の同名キーへ保存する。旧 DB の欠落は空リスト。�
 
 ### 4.1 入口・対象
 
-入口はグリッドの項目右クリックの静的 leaf「ファイル整理先…」一つと、既定キーなしの `GridOrganizeFiles` だけ（利用者決定）。メニューバー・ツールバー・「その他のフォルダ…」は初版に追加しない。整理先をメニューへ全列挙しない。背景、ツリー、画像／動画 fullscreen、detached の viewer メニューにも新規入口を加えない。チェック優先、なければ右クリック項目／キーのカーソルを使い、同じ要求生成メソッドへ渡す。
+入口はグリッドの項目右クリックの静的 leaf「ファイル整理先…」一つと、既定キーなしの `GridOrganizeFiles` だけ（利用者決定）。メニューバー・ツールバー・「その他のフォルダ…」は初版に追加しない。コピー・移動の入口には整理先をメニューへ全列挙しない。閲覧用の場所▼サブメニューは §12 の追補。背景、ツリー、画像／動画 fullscreen、detached の viewer メニューにも新規入口を加えない。チェック優先、なければ右クリック項目／キーのカーソルを使い、同じ要求生成メソッドへ渡す。
 
 `context_menu_model` の `MenuCommand`、stable `ContextMenuItemId`、ALL、文字列名、label、command→item 対応、可否、shortcut label、preview を揃える。native HMENU と egui fallback は同じ MenuNode を使う。§1.221 の右クリックカスタマイズで新 leaf の表示・並び・区切りが扱えるようにする。既存レイアウトに未知だった ID が加わっても既定位置に出ることを確認する。
 
@@ -336,3 +336,90 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 | `.\scripts\build-dev.ps1 -PreserveRuntime` | 0。修正版の確認用 core／Remote service／EPUB PDF worker をビルドし、VCRT／PE 検査 runtime 4・PE 3 成功。成果物は起動していない。 |
 
 各 log は `target/file-organize-review-fixes-{focused,shell,preferences,check}.log`。コミットは行わない。
+
+## 12. §1.263 追補: 整理先を開く (2026-10-05)
+
+対象: `C:\home\mimageviewer-epubroot` / `next-organize-location`、base `4a4e75fd7`。
+
+利用者決定: フォルダバー「場所▼」に「整理先 ▶」を追加する。登録順の名称とパス tooltip を
+表示し、登録が空ならグループごと非表示。既定 ON の
+`Settings.show_location_file_organize_destinations` で両 UI の表示を切り替える。
+現行の場所表示項目は環境設定ではなくフォルダバー／場所▼の右クリックにあるため、
+他の `show_location_*` と同じ「場所▼に出す項目」へ追加する。指定の環境設定にも、
+「フォルダ・ファイル」のファイル整理先欄へ同じ表示チェックを追加し、OK／Cancel に従わせる。
+ツールバーの既定に戻す操作も対象。
+未リリースの機能なので設定移行は不要。serde 欠落時は true。§1.317 の環境設定転送 gate では
+他の `show_location_*` と同じ表示／ツールバー状態として除外する。環境設定でも編集するため、
+このフィールドは `overwrite_non_preferences_from` で live 値を上書きせず draft 値を確定する。
+
+一覧の唯一の正本は `known_folders::LocationMenuEntry::FileOrganizeDestinations`。
+ローカルは既存 `resolve_folder_bar_nav_path` → `AddressBarNav::Direct` を返すだけとし、
+履歴、戻る stack、viewer context、検索／★固定の入口 gate を既存場所移動に揃える。
+存在しない先も登録から消さず、他の場所項目と同じ解決・移動経路に委ねる。
+Remote Home は同じグループを `PlaceSummary` へ写像し、通常フォルダ route で開く。
+Remote IPC は 65 → 66、両 exe は共有 crate の同一定数を参照して一緒にビルドする。
+コピー・移動の実行、clipboard、ファイル変更の後始末には変更を加えない。
+
+既存の単発 navigation と Home 更新を再利用するので、追加の非同期 owner、live rebuild、
+rollback／resume は不要。表示切替は列挙時に読むだけで、登録先の走査や新しい同期 I/O は足さない。
+
+場所 UI の PNG は次の 2 枚を新規追加し、どちらも目視確認した。
+
+- `folder_bar_organize_destinations.png`: 本棚の後の「整理先 ▶」と、登録順の「要確認」「保管」を
+  開いた状態。通常の場所メニューの行、親メニューとの配置、名称の読みやすさを確認する。
+- `folder_bar_organize_destinations_toggle.png`: フォルダバー設定の「場所▼に出す項目」に
+  既定 ON の「整理先」が入った状態。前後の既存チェックと設定項目が欠けずに収まることを確認する。
+
+環境設定は次の既存 3 枚を更新し、すべて目視確認した。
+
+- `preferences_file_organize_dark.png`: 暗色の整理先登録欄に表示チェックを追加。登録済み 2 行の
+  名称・パス・参照／並べ替え／削除と追加ボタンが引き続き表示され、チェックの文字が欠けない。
+- `preferences_file_organize_light.png`: 同じ登録欄の明色表示。チェック、名称・パス入力欄、操作の
+  コントラストと配置が保たれている。
+- `preferences_folder_edit_restore.png`: フォルダ・ファイルページ先頭へ表示チェックを追加したため、
+  以降のセクションが 1 行分下へ移る。既存の編集内容復元／削除確認と、右端のスクロール領域が残る。
+
+自動検証 (この未コミット差分、製品起動・コミットなし):
+
+| コマンド | exit code／結果 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib file_organize_destinations_location` | 0、3 件。共有一覧の空／OFF／順序、実メニューの pointer 選択 → `AddressBarNav::Direct`、メニュー閉じ、表示切替／保存値往復／既定リセット。PNG 生成後の比較は全体 gate で確認する。 |
+| `cargo test -p mimageviewer --lib known_folders::tests` | 0、11 件。 |
+| `cargo test -p mimageviewer --lib remote_ipc::collections::tests` | 0、37 件。名称／登録順／空／OFF、不在先の保持と既存 path guard を含む。 |
+| `cargo test -p mimageviewer --lib settings_transfer::tests` | 0、16 件。全 440 設定の分類と除外値の保持。 |
+| `cargo test -p mimageviewer-ipc --lib` | 0、64 件。Home の新グループと typed folder の JSON 往復、protocol 66 と不一致拒否を含む。 |
+| `cargo test -p mimageviewer-remote --bin mimageviewer-remote` | 0、134 件成功・1 件 ignore。 |
+| Web の `*.test.mjs` 10 ファイルを各 `node <file>` で実行 | 0、478 件。新グループの表示順・名称・パス tooltip、通常 folder と同じ route／戻り先を含む。sandbox では `node --test` の子 runner が `spawn EPERM` になるため、同じ `node:test` をファイル直接実行した。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0。 |
+
+環境設定の表示チェック追加後の関連試験／全体 gate／normal・portable check／
+確認用 build の結果は下へ記録する。
+利用者確認: 2 つの使い捨て整理先を登録し、場所▼ → 整理先で順序・tooltip・移動と戻る／進むを確認。
+表示 OFF／登録なしでローカルと Remote Home の両方から消えることを確認する。
+Remote はホーム更新後の名称・順序、tap によるフォルダ表示と Home へ戻る、不在先の既存エラーを確認する。
+
+全体 gate の初回はコンパイル段階で exit 101。`rhai_codegen` の E0462 と `url`、`image`、
+`tantivy` 等の rlib 不足で integration target を作れなかった。UI／テスト期待値で回避せず、
+実体の `target/debug` がこの worktree 内で reparse point でないことを確認し、
+`cargo clean -p mimageviewer --profile dev` と、不足報告のあった依存 package の同じ profile の
+clean を行って再構築した。対象は生成済み dev/test cache のみで、`dev-runtime`／release と
+検証 log、通常 APPDATA は維持した。最終追試は次のとおり成功。
+
+| 最終差分の追試 | exit code／結果 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib file_organize` | 0、17 件。環境設定の表示 OFF の OK → 保存 → DB 再読込、開き直し、Cancel で保存値を変えない経路を含む。 |
+| `cargo test -p mimageviewer --lib ui_dialogs::preferences::tests` | 0、57 件。 |
+| `cargo test -p mimageviewer --test ui_snapshot` | 0、88 件。上記の 3 枚だけを更新し、新規 2 枚を含め目視確認した。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0、PASS。本体 lib 10,603 件成功・52 件 ignore、integration／UI snapshot 88 件／Remote／各 crate／doctest、vendor egui・egui-wgpu・eframe の全必須試験成功。PNG 比較は UPDATE フラグなし。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | 0。 |
+| `cargo fmt --check` / `python scripts/check_ui_glyphs.py` | 0、UI glyph の問題 0 件。 |
+| `git diff --check` | 0。 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 成功、DONE。normal feature set の core・Remote・EPUB worker を生成。同梱 runtime 4 件と PE 3 件の依存検査成功。起動・常駐アプリ停止は行っていない。 |
+
+検証 log は `target/orgloc-*.log`。全体 gate の最終 log は `target/orgloc-full-final.log`。
+確認用 build は `target/orgloc-build-dev.log`、依存検査は
+`target/vcrt-pe-reports/dev-runtime.json`。通常 profile を使うため、利用者が起動する際は
+インストール済み／tray 常駐の mImageViewer を先に終了する (single-instance mutex を共有)。
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` は通常の
+`%APPDATA%\mimageviewer` を使用し、実設定・データを更新し得る。

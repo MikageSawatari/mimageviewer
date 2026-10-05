@@ -8620,11 +8620,13 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 #[cfg(not(windows))]
 pub(super) fn page_vst3(_ui: &mut egui::Ui, _state: &mut PreferencesState) {}
 
-pub(super) fn draw_file_organize_destinations_settings(
-    ui: &mut egui::Ui,
-    destinations: &mut Vec<crate::settings::FileOrganizeDestination>,
-) {
+pub(super) fn draw_file_organize_destinations_settings(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.label(egui::RichText::new("ファイル整理先").strong());
+    ui.checkbox(
+        &mut settings.show_location_file_organize_destinations,
+        "場所▼と Remote の「場所」に整理先を表示する",
+    );
+    let destinations = &mut settings.file_organize_destinations;
     ui.label("一覧の右クリックから使うコピー・移動先を登録します。OK で確定します。");
     let count = destinations.len();
     let mut reorder = None;
@@ -8695,10 +8697,7 @@ pub(super) fn draw_file_organize_destinations_settings(
 
 pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "folder/organize-destinations", |ui, state| {
-        draw_file_organize_destinations_settings(
-            ui,
-            &mut state.settings.file_organize_destinations,
-        );
+        draw_file_organize_destinations_settings(ui, &mut state.settings);
     });
     ui.add_space(12.0);
     anchored(ui, state, "folder/hidden-files", |ui, state| {

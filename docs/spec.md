@@ -286,13 +286,17 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   `Backspace` / ⬆ で戻る、または親へ戻る遷移が発生した場合は root の通常フォルダ表示へ戻る。
   `Ctrl+↑/↓` と `Ctrl+PageUp/PageDown` は実フォルダ DFS へ落とさず no-op にする。
   展開後は `スタック` トグルでフォルダをまたいだ一覧を親フォルダ単位のスタック集約にできる
-- **場所▼ メニュー**: ドライブ一覧 / 閲覧履歴 / ブックマーク / レーティング / 本棚フォルダ / デスクトップ /
+- **場所▼ メニュー**: ドライブ一覧 / 閲覧履歴 / ブックマーク / レーティング / 本棚フォルダ / 整理先 / デスクトップ /
   ピクチャ / ダウンロード / 利用可能なドライブ (`C:\` など) へ移動する。
   既知フォルダは Windows Known Folder API を優先し、
   OneDrive やリダイレクトされた Desktop に追従する。検索中と ★固定中は disabled。
   場所▼ボタンまたはフォルダバー左端の `フォルダ:` ラベルを右クリックすると、
-  場所▼に表示する項目 (ドライブ一覧 / 閲覧履歴 / 本棚フォルダ / レーティング /
-  デスクトップ / ピクチャ / ダウンロード / 各ドライブ) を切り替えられる
+  場所▼に表示する項目 (ドライブ一覧 / 閲覧履歴 / 本棚フォルダ / 整理先 / レーティング /
+  デスクトップ / ピクチャ / ダウンロード / 各ドライブ) を切り替えられる。
+  整理先の表示チェックは環境設定「フォルダ・ファイル」の登録欄でも編集でき、OK／Cancel に従う。
+  「整理先 ▶」は登録順の名称を表示し、パスを tooltip で確認できる。登録なし／表示 OFF なら非表示。
+  選択は既存の場所移動と同じ `AddressBarNav::Direct` を返し、履歴・戻る・viewer 所有を維持する。
+  mIV Remote Home の場所タブも同じ一覧と表示設定を使い、既存フォルダ route から開く
 - **♡ / ♥ お気に入りボタン**: 未登録の現在フォルダではお気に入り追加ダイアログを開く。
   登録済みの現在フォルダではお気に入り編集ダイアログを開く。検索・索引の
   ルートになるため、追加対象は実フォルダのみで、ZIP / PDF / 変換済みアーカイブ
@@ -1933,6 +1937,8 @@ Explorer の SendTo 起動側が数秒単位で残らないようにする。
 
 固定の「ファイル整理先」は環境設定の「フォルダ・ファイル」で表示名・絶対パス・登録順を編集する。
 `Settings.file_organize_destinations: Vec<FileOrganizeDestination>` は空が既定で、不在先も維持する。
+閲覧用の「場所▼ > 整理先」と Remote Home から登録先を開ける。コピー・移動とは独立した操作で、
+`show_location_file_organize_destinations` は既定 ON、他の場所表示設定と同じく環境設定転送から除外する。
 追加・編集・削除・↑↓は環境設定の draft へ反映し、OK で保存、Cancel で破棄する。
 名称空欄、パス空欄、相対パス、NUL は OK を無効化する。お気に入りとツールバーには影響しない。
 グリッドの項目右クリック「ファイル整理先…」と既定キーなしの `GridOrganizeFiles` から同じ画面を開く。
@@ -2236,7 +2242,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `show_address_bar_favorite_button` | bool | true | フォルダバーにお気に入り追加/設定 (♡/♥) を表示 |
 | `show_address_bar_history_menu` | bool | true | フォルダバーに最近開いたフォルダ履歴メニューを表示 |
 | `show_address_bar_folder_pin` | bool | true | フォルダバーに代表サムネ固定 (📌) を表示 |
-| `show_location_{drive_list,reading_history,rating,bookshelf,desktop,pictures,downloads,drive_roots}` | bool | true | フォルダバーの場所▼に表示する項目を個別に切り替える。フォルダバー左端の `フォルダ:` ラベルまたは場所▼を右クリックして変更 |
+| `show_location_{drive_list,reading_history,rating,bookshelf,file_organize_destinations,desktop,pictures,downloads,drive_roots}` | bool | true | フォルダバーの場所▼に表示する項目を個別に切り替える。フォルダバー左端の `フォルダ:` ラベルまたは場所▼を右クリックして変更。整理先は環境設定の登録欄でも変更できる |
 | `show_toolbar_rating` | bool | true | ツールバーにレーティング（★）フィルタを表示 |
 | `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true（ソートの生成・リセット既定は false、旧設定の省略は true） | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
 | `show_facet_sort` | bool | true（旧設定の省略は false） | 絞り込みバー右側の独立したソートドロップダウン。上部表示とは独立、ソート状態と候補は共通。生成・リセット既定は ON、上部ソートは OFF。旧設定の省略時は OFF を維持する |

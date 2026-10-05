@@ -4177,13 +4177,22 @@ function renderSmartFolderTab(content) {
   content.append(list);
 }
 
-function renderPlacesTab(content) {
+export function renderPlacesTab(content, home = state.home, navigateTo = navigate) {
   if (state.homeLoadError) {
     content.append(ipcUnavailableMessage());
     return;
   }
   const list = element("div", "favorite-list place-list");
-  for (const place of state.home.places ?? []) {
+  const appendFolder = (parent, entry) => {
+    if (!entry || typeof entry.path !== "string" || !entry.path) return;
+    const button = homeCard("▣", entry.name ?? entry.path);
+    button.title = entry.path;
+    button.addEventListener("click", () =>
+      navigateTo(folderHash(entry.path), { returnHash: homeHash("places") })
+    );
+    parent.append(button);
+  };
+  for (const place of home.places ?? []) {
     if (place.kind === "separator") {
       list.append(element("hr", "place-separator"));
       continue;
@@ -4200,7 +4209,7 @@ function renderPlacesTab(content) {
         const button = textElement("button", `★${rating}`, "rating-star-button");
         button.type = "button";
         button.addEventListener("click", () =>
-          navigate(collectionHash("rating", String(rating)), {
+          navigateTo(collectionHash("rating", String(rating)), {
             returnHash: homeHash("places"),
           })
         );
@@ -4210,14 +4219,15 @@ function renderPlacesTab(content) {
       list.append(group);
       continue;
     }
+    if (place.kind === "file_organize_destinations") {
+      const group = element("section", "organize-destinations");
+      group.append(textElement("h3", place.name));
+      for (const entry of place.entries ?? []) appendFolder(group, entry);
+      list.append(group);
+      continue;
+    }
     if (place.kind === "folder") {
-      const entry = place.entry;
-      if (!entry || typeof entry.path !== "string" || !entry.path) continue;
-      const button = homeCard("▣", entry.name ?? entry.path);
-      button.addEventListener("click", () =>
-        navigate(folderHash(entry.path), { returnHash: homeHash("places") })
-      );
-      list.append(button);
+      appendFolder(list, place.entry);
       continue;
     }
     const icon = {
@@ -4228,7 +4238,7 @@ function renderPlacesTab(content) {
     }[place.kind] ?? "◇";
     const button = homeCard(icon, place.name);
     button.addEventListener("click", () =>
-      navigate(collectionHash(place.kind), { returnHash: homeHash("places") })
+      navigateTo(collectionHash(place.kind), { returnHash: homeHash("places") })
     );
     list.append(button);
   }

@@ -4653,6 +4653,9 @@ pub struct Settings {
     /// フォルダバーの「場所▼」に本棚フォルダを表示する。
     #[serde(default = "default_true")]
     pub show_location_bookshelf: bool,
+    /// フォルダバーの「場所▼」と Remote Home に整理先を表示する。
+    #[serde(default = "default_true")]
+    pub show_location_file_organize_destinations: bool,
     /// フォルダバーの「場所▼」にデスクトップを表示する。
     #[serde(default = "default_true")]
     pub show_location_desktop: bool,
@@ -7455,6 +7458,7 @@ impl Default for Settings {
             show_location_reading_history: true,
             show_location_rating: true,
             show_location_bookshelf: true,
+            show_location_file_organize_destinations: true,
             show_location_desktop: true,
             show_location_pictures: true,
             show_location_downloads: true,
@@ -9918,6 +9922,7 @@ impl Settings {
         self.show_location_reading_history = src.show_location_reading_history;
         self.show_location_rating = src.show_location_rating;
         self.show_location_bookshelf = src.show_location_bookshelf;
+        // 整理先の表示切替は環境設定でも編集するため draft 値を維持する。
         self.show_location_desktop = src.show_location_desktop;
         self.show_location_pictures = src.show_location_pictures;
         self.show_location_downloads = src.show_location_downloads;
@@ -11518,6 +11523,7 @@ mod tests {
                 && s.show_location_reading_history
                 && s.show_location_rating
                 && s.show_location_bookshelf
+                && s.show_location_file_organize_destinations
                 && s.show_location_desktop
                 && s.show_location_pictures
                 && s.show_location_downloads
@@ -13809,6 +13815,7 @@ mod tests {
         assert!(s.show_location_reading_history);
         assert!(s.show_location_rating);
         assert!(s.show_location_bookshelf);
+        assert!(s.show_location_file_organize_destinations);
         assert!(s.show_location_desktop);
         assert!(s.show_location_pictures);
         assert!(s.show_location_downloads);

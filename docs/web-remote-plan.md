@@ -756,7 +756,7 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 
 ホームは「お気に入り」「スマートフォルダ」「場所」の 3 タブとする。「場所」を初期表示にし、
 場所タブは本体のフォルダバー「場所▼」と同じ列挙結果を使う。順序はドライブ一覧、閲覧履歴、
-ブックマーク、レーティング ★1〜5、本棚フォルダ、区切り、デスクトップ／ピクチャ／ダウンロード、
+ブックマーク、レーティング ★1〜5、本棚フォルダ、整理先、区切り、デスクトップ／ピクチャ／ダウンロード、
 区切り、各ドライブとする。各項目は本体と同じ `show_location_*` 設定に従い、ブックマークだけは
 本体側にも専用の非表示設定がないため常に表示する。既知フォルダは取得できた実在フォルダだけを
 載せ、`folder_tree::path_eq` で重複を除く。
@@ -765,6 +765,18 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 payload を順に描画するだけで、既知フォルダやドライブを独自に列挙しない。ドライブ一覧は本体 IPC
 が `available_drives()` を `RemoteEntry::Folder` へ写像する collection として返し、既知フォルダと
 各ドライブは Home payload の絶対 path を持つ folder entry から既存フォルダ route を開く。
+
+2026-10-05 の §1.263 追補: `LocationMenuEntry::FileOrganizeDestinations` が設定の登録順・
+名称・パスを一つのグループとして所有する。登録なし、または既定 ON の
+`show_location_file_organize_destinations` が OFF なら両 UI とも非表示。表示切替はフォルダバーの
+場所表示項目と、環境設定のファイル整理先登録欄に置き、同じ設定を使う。
+IPC の `PlaceSummary::FileOrganizeDestinations { name, entries }` を Home に追加し、
+`PROTOCOL_VERSION` は 65 → 66。core と remote-web は同じ `mimageviewer-ipc` の定数を
+使い、`build-dev.ps1` で両方を一緒にビルドする。片側だけ古い版なら既存 handshake が拒否する。
+Remote は「整理先」見出しの下に通常の folder card を登録順で描画し、絶対パスを tooltip に
+持たせ、既存 `folderHash` / `navigate` 経路から開く。登録先の存在確認や独自除去を Home 生成へ
+追加せず、不在先は元の絶対パスを維持する。開く時の実在・種別・Remote path guard は他の
+folder entry と同じであり、UNC 等の既存拒否条件も変えない。設定変更は既存 Home 更新で反映する。
 
 スマートフォルダの定義一覧と、ドライブ一覧・読書履歴・レーティング・本棚・ブックマーク・
 スマートフォルダの評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を
