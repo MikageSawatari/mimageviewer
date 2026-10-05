@@ -45417,6 +45417,9 @@ impl App {
             // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
             // 残り続けるので無視する。
             if finalized {
+                // Source decode/cache replacement advances the representative identity. Ordinary
+                // cache reads and GPU eviction do not invalidate unchanged color results.
+                self.invalidate_color_representative(i);
                 // 仮想フォルダの先頭ページ完成を親 catalog にミラー (PDFium 再レンダ
                 // 防止のための writeback)。requested の cleanup より前にやることで、
                 // cache_map から WebP データが消える前に確実に読み出せる。
@@ -70481,6 +70484,7 @@ impl App {
     /// Remove every queued/materialized form of one grid thumbnail and make it
     /// eligible for a fresh LoadRequest on the next keep-range update.
     fn evict_thumbnail_for_reload(&mut self, idx: usize) {
+        self.invalidate_color_representative(idx);
         for queue in [&self.reload_queue, &self.heavy_io_queue]
             .into_iter()
             .flatten()
@@ -85910,7 +85914,7 @@ impl App {
         self.stack_reconcile_after_fullscreen_close(ctx);
 
         // ── ツールバー ───────────────────────────────────────────────
-        let toolbar_fav_nav = self.render_toolbar(ctx);
+        let (toolbar_fav_nav, address_nav) = self.render_toolbar(ctx);
         // ツールバーお気に入りクリックは「指定フォルダへ飛ぶ」操作なので、検索系
         // (Ctrl+F フォルダ内ファイル名フィルタ / Ctrl+S お気に入り横断検索 /
         //  Ctrl+G 全文検索) が立っていれば全部抜けてからナビゲートする。
@@ -85942,7 +85946,7 @@ impl App {
         }
 
         // ── アドレスバー ─────────────────────────────────────────────
-        let address_nav = self.render_address_bar(ctx);
+        // Folder navigation now comes from the integrated toolbar section.
         // 現在フォルダへ保存されたファイルや、監視再走査から先送りした変更、および
         // 📌 ボタン / グリッドコンテキストメニューで書き換えた代表サムネを、
         // 同フレーム内でグリッドに反映する。

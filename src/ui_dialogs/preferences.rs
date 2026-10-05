@@ -3767,6 +3767,145 @@ mod tests {
         crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot()
     }
 
+    #[test]
+    fn section292_sort_placements_survive_toolbar_ui_preferences_ok_save_and_reopen() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let mut env = crate::app::setup_app_for_test();
+        let boot = crate::settings_db::boot_settings_db(env.tmp.path());
+        assert!(boot.db.is_some());
+        env.settings.toolbar_section_order.reverse();
+        env.settings.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Buttons;
+        env.settings.toolbar_sort_items = vec![crate::settings::SortOrder::DateDesc];
+        let order = env.settings.toolbar_section_order.clone();
+        let app = Rc::new(RefCell::new(env));
+        for (top, facet) in [(true, true), (false, false), (false, true), (true, false)] {
+            let mut state = preferences_state_for_test(&app.borrow().settings);
+            // The actual toolbar UI edits live settings while Preferences holds an older copy.
+            app.borrow_mut().settings.show_toolbar_sort = !top;
+            app.borrow_mut().settings.show_facet_sort = !facet;
+            let render = Rc::clone(&app);
+            let fonts = Cell::new(false);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(500.0, 650.0))
+                .build(move |ctx| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render
+                            .borrow_mut()
+                            .draw_toolbar_visibility_menu(ui, false, false)
+                    });
+                });
+            harness.run();
+            harness.get_by_label("ソート (上部ツールバー)").click();
+            harness.run();
+            harness.get_by_label("ソート (絞り込みバー右側)").click();
+            harness.run();
+            let mut app = app.borrow_mut();
+            assert_eq!(
+                (app.settings.show_toolbar_sort, app.settings.show_facet_sort),
+                (top, facet)
+            );
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.settings = state.settings;
+            app.settings.save();
+            let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            let reopened = preferences_state_for_test(&loaded);
+            assert_eq!(
+                (
+                    reopened.settings.show_toolbar_sort,
+                    reopened.settings.show_facet_sort
+                ),
+                (top, facet)
+            );
+            assert_eq!(reopened.settings.toolbar_section_order, order);
+            assert_eq!(
+                reopened.settings.toolbar_sort_display,
+                crate::settings::ToolbarSectionDisplay::Buttons
+            );
+            assert_eq!(
+                reopened.settings.toolbar_sort_items,
+                vec![crate::settings::SortOrder::DateDesc]
+            );
+        }
+    }
+
+    #[test]
+    fn section207_folder_layout_survives_toolbar_ui_preferences_ok_db_and_reopen() {
+        use crate::settings::ToolbarSectionId as TS;
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let env = crate::app::setup_app_for_test();
+        let boot = crate::settings_db::boot_settings_db(env.tmp.path());
+        assert!(boot.db.is_some());
+        let app = Rc::new(RefCell::new(env));
+        for enabled in [false, true, false] {
+            let mut state = preferences_state_for_test(&app.borrow().settings);
+            let render = Rc::clone(&app);
+            let fonts = Cell::new(false);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(600.0, 1050.0))
+                .build(move |ctx| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render
+                            .borrow_mut()
+                            .draw_section_settings_menu(ui, TS::Folder);
+                    });
+                });
+            harness.run();
+            harness.get_by_label("行頭に表示").click();
+            harness.run();
+            harness.get_by_label("ドラッグで並べ替えを許可").click();
+            harness.run();
+            harness.get_by_label("履歴の戻る/進む (←/→)").click();
+            harness.run();
+            let mut app = app.borrow_mut();
+            assert_eq!(
+                app.settings.toolbar_section_new_row.contains(&TS::Folder),
+                enabled
+            );
+            app.settings.toolbar_section_order =
+                TS::default_order().iter().copied().rev().collect();
+            let order = app.settings.toolbar_section_order.clone();
+            let rows = app.settings.toolbar_section_new_row.clone();
+            let drag = app.settings.toolbar_section_drag_enabled;
+            let history = app.settings.show_address_bar_history_nav;
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.settings = state.settings;
+            app.settings.save();
+            let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            let reopened = preferences_state_for_test(&loaded);
+            assert_eq!(reopened.settings.toolbar_section_order, order);
+            assert_eq!(reopened.settings.toolbar_section_new_row, rows);
+            assert_eq!(reopened.settings.toolbar_section_drag_enabled, drag);
+            assert_eq!(reopened.settings.show_address_bar_history_nav, history);
+            assert!(reopened.settings.toolbar_folder_section_migrated);
+            assert!(reopened.settings.show_facet_sort);
+            assert!(!reopened.settings.show_toolbar_sort);
+        }
+    }
+
     fn preferences_state_for_test(settings: &crate::settings::Settings) -> PreferencesState {
         PreferencesState::from_settings(
             settings,
