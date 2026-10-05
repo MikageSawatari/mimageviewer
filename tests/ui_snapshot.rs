@@ -467,6 +467,221 @@ fn color_presets_narrow_width() {
     snapshot_color_presets("color_presets_narrow_dark", 224.0);
 }
 
+#[test]
+fn preferences_transfer_entry_disabled_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_disabled_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_preferences_transfer_disabled_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_export_explanation_light() {
+    snapshot_with_theme(
+        "preferences_transfer_export_explanation_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_preferences_transfer_explanation_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_import_explanation_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_import_explanation_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_explanation_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_transfer_entry_light() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_preferences_transfer_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_entry_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_preferences_transfer_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_light() {
+    snapshot_with_theme(
+        "preferences_transfer_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_narrow_result() {
+    snapshot_with_theme_at_size(
+        "preferences_transfer_narrow_result",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(320.0, 420.0),
+        None,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_busy_dark() {
+    snapshot_with_theme_and_contrast_settling(
+        "preferences_transfer_busy_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_file_organize_light() {
+    snapshot_with_theme(
+        "preferences_file_organize_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_file_organize_destinations_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_file_organize_dark() {
+    snapshot_with_theme(
+        "preferences_file_organize_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_file_organize_destinations_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_organize_destinations_light() {
+    use mimageviewer::settings::FileOrganizeDestination;
+    use mimageviewer::shell_file_ops::ShellTransferOperation;
+    let sources = vec![std::path::PathBuf::from(r"C:\写真\画像.jpg")];
+    let destinations = vec![
+        FileOrganizeDestination {
+            name: "保管".into(),
+            path: r"D:\写真\保管".into(),
+        },
+        FileOrganizeDestination {
+            name: "確認".into(),
+            path: r"\\server\share\長い名前の写真フォルダ\整理先".into(),
+        },
+    ];
+    let mut focus = Some((1, Some(ShellTransferOperation::Copy)));
+    snapshot_file_organize_modal(
+        "file_organize_destinations_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(1000.0, 620.0),
+        sources,
+        destinations,
+        focus.take(),
+    );
+}
+
+#[test]
+fn file_organize_empty_dark() {
+    snapshot_file_organize_modal(
+        "file_organize_empty_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1000.0, 620.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        vec![],
+        None,
+    );
+}
+
+#[test]
+fn file_organize_many_dark() {
+    snapshot_file_organize_modal(
+        "file_organize_many_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1000.0, 620.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        (0..30)
+            .map(|row| mimageviewer::settings::FileOrganizeDestination {
+                name: format!("整理先 {row}"),
+                path: r"\\server\share\長い名前の写真フォルダ\さらに長い名前のフォルダ\整理先"
+                    .into(),
+            })
+            .collect(),
+        Some((
+            2,
+            Some(mimageviewer::shell_file_ops::ShellTransferOperation::Move),
+        )),
+    );
+}
+
+#[test]
+fn file_organize_narrow_light() {
+    snapshot_file_organize_modal(
+        "file_organize_narrow_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(420.0, 320.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        vec![mimageviewer::settings::FileOrganizeDestination {
+            name: "長い名前の整理先".into(),
+            path: r"\\server\share\長い名前の写真フォルダ\整理先".into(),
+        }],
+        Some((
+            0,
+            Some(mimageviewer::shell_file_ops::ShellTransferOperation::Copy),
+        )),
+    );
+}
+
+fn snapshot_file_organize_modal(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    sources: Vec<std::path::PathBuf>,
+    destinations: Vec<mimageviewer::settings::FileOrganizeDestination>,
+    mut focus: Option<(
+        usize,
+        Option<mimageviewer::shell_file_ops::ShellTransferOperation>,
+    )>,
+) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(
+            ctx,
+            theme,
+            mimageviewer::settings::TextContrast::Standard,
+        );
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        let _ = mimageviewer::ui_dialogs::file_organize::show_file_organize_modal(
+            ctx,
+            &sources,
+            &destinations,
+            &mut focus,
+        );
+    });
+    harness.run();
+    harness.snapshot(name);
+}
+
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
 /// 絵文字混じりテキストの実際のレイアウトを検証できない。
@@ -551,6 +766,36 @@ fn snapshot_with_theme_contrast_and_size_with_interaction(
     resolved: mimageviewer::os_theme::ResolvedTheme,
     contrast: mimageviewer::settings::TextContrast,
     size: egui::Vec2,
+    build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
+) {
+    snapshot_with_theme_options(name, resolved, contrast, size, None, build_ui, interact);
+}
+
+fn snapshot_with_theme_and_contrast_settling(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    animated_steps: Option<usize>,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_options(
+        name,
+        resolved,
+        contrast,
+        egui::vec2(480.0, 360.0),
+        animated_steps,
+        build_ui,
+        |_| {},
+    );
+}
+
+fn snapshot_with_theme_options(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    animated_steps: Option<usize>,
     mut build_ui: impl FnMut(&mut egui::Ui),
     interact: impl FnOnce(&mut Harness<'_>),
 ) {
@@ -572,8 +817,11 @@ fn snapshot_with_theme_contrast_and_size_with_interaction(
                     .show(ui, |ui| build_ui(ui));
             });
     });
-
-    harness.run();
+    if let Some(steps) = animated_steps {
+        harness.run_steps(steps); // A production spinner intentionally never settles.
+    } else {
+        harness.run();
+    }
     interact(&mut harness);
     harness.snapshot(name);
 }
@@ -737,36 +985,21 @@ fn snapshot_with_theme_at_size(
     resolved: mimageviewer::os_theme::ResolvedTheme,
     size: egui::Vec2,
     hover_pos: Option<egui::Pos2>,
-    mut build_ui: impl FnMut(&mut egui::Ui),
+    build_ui: impl FnMut(&mut egui::Ui),
 ) {
-    let mut fonts_ready = false;
-    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
-        mimageviewer::os_theme::apply_resolved_with_contrast(
-            ctx,
-            resolved,
-            mimageviewer::settings::TextContrast::Standard,
-        );
-        if !fonts_ready {
-            install_app_fonts(ctx);
-            fonts_ready = true;
-            ctx.request_repaint();
-            return;
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
-                egui::Frame::central_panel(ui.style())
-                    .outer_margin(8.0)
-                    .inner_margin(0.0)
-                    .show(ui, |ui| build_ui(ui));
-            });
-    });
-    harness.run();
-    if let Some(pos) = hover_pos {
-        harness.hover_at(pos);
-        harness.run();
-    }
-    harness.snapshot(name);
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        resolved,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        build_ui,
+        |harness| {
+            if let Some(pos) = hover_pos {
+                harness.hover_at(pos);
+                harness.run();
+            }
+        },
+    );
 }
 
 #[test]
@@ -819,6 +1052,30 @@ fn preferences_effetune_input_limit_dark() {
         "preferences_effetune_input_limit_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_book_resume_meter_light() {
+    snapshot_with_theme(
+        "preferences_book_resume_meter_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_book_resume_meter_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
+fn preferences_book_resume_meter_dark() {
+    snapshot_with_theme(
+        "preferences_book_resume_meter_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_book_resume_meter_settings_snapshot_fixture(ui);
+        },
     );
 }
 
@@ -1265,6 +1522,7 @@ fn cell_filename_mixed_glyphs_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -1329,6 +1587,7 @@ fn compact_file_format_badges_light() {
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                         cell,
                         inner,
+                        book_resume_meter: false,
                         checked: false,
                         stack_count: None,
                         filter_match_count: None,
@@ -1443,6 +1702,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -1501,6 +1761,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: count,
@@ -1622,6 +1883,7 @@ fn bookmark_time_and_tag_badges_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,

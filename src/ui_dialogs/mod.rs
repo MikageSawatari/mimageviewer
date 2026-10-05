@@ -25,6 +25,7 @@ pub(crate) mod epub_convert;
 pub(crate) mod export_batch;
 mod fav_add;
 pub(crate) mod favorites_editor;
+pub mod file_organize;
 mod first_setup;
 mod metadata_cleanup;
 pub(crate) mod metadata_transfer;

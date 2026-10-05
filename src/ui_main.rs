@@ -4623,6 +4623,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 true,
                 None,
                 None,
+                false,
             );
             crate::app::draw_cell(
                 ui,
@@ -18731,6 +18732,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                 });
                                 let media_duration = self.thumbnail_media_duration_text(idx);
+                                let mut book_resume_meter = self.thumbnail_book_resume_meter(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -18761,6 +18763,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
+                                    book_resume_meter.is_some(),
                                 );
 
                                 primary_click_hit_cell |=
@@ -18790,7 +18793,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
                                 // A click may toggle the check state during interaction. Re-layout only
                                 // that changed cell so the new check and its reserved area agree in this frame.
-                                if self.checked.contains(&idx) != is_checked {
+                                let current_meter = self.thumbnail_book_resume_meter(idx);
+                                if self.checked.contains(&idx) != is_checked || current_meter != book_resume_meter {
+                                    book_resume_meter = current_meter;
                                     overlay_layout = crate::app::layout_cell_overlays(
                                         ui.painter(),
                                         cell_rect,
@@ -18805,6 +18810,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
+                                        book_resume_meter.is_some(),
                                     );
                                 }
 
@@ -18850,6 +18856,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.settings.video_thumbnail_indicator,
                                     is_cut,
                                 );
+                                crate::app::paint_book_resume_meter(ui, cell_rect, &overlay_layout, book_resume_meter, is_cut);
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {

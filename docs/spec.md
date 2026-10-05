@@ -516,6 +516,17 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 
 ## 3. サムネイルグリッド詳細
 
+- 通常の物理一覧の Folder / ZipFile / PdfFile セル下端には、最後に記録した
+  読めるページ列内の位置 / 総数を読書位置メーターとして表示する。画像以外の混在を
+  分母に含めず、見開きも navigation anchor の位置だけを使う。最大到達位置や読了判定ではない。
+  内容・並びが変わっても次の記録までは保存比率を表示する。行無し・旧行の追加情報無し・
+  不正な位置/総数では track も出さない。Remote で記録した本は補助情報を消し、
+  ローカルで再記録するまでメーター不表示とする。従来の raw index による位置復元は維持する。
+  Stack / 個別ページ / ConvertibleArchive / 詳細行 / 合成ビューのルート / Remote の一覧は対象外。
+  Tag / Smart / Collection から開いた物理子フォルダも通常の物理一覧として対象に含める。
+  メーターはセル内の下端帯を予約し、既存バッジと重ねない。極小セルではバッジを優先する。
+  一覧はメモリ上の記録を参照し、描画から本の走査・ページ数取得・DB 読み取りを行わない。
+
 ### 3.1 仮想スクロール
 
 ```
@@ -1122,7 +1133,8 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 保存済み再生位置 (動画) と読書位置 (ZIP/PDF/対応アーカイブ) の記憶件数の確認・全件クリアは
   **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画・音声の再生位置と動画の音声トラック選択、
   本の読書位置を対象)。再生位置とトラック選択のクリアは OK 適用時、本クリアは
-  `book_resume_clear_requested` one-shot 経由で App が即時 `book_resume_db.clear_all()`。
+  `book_resume_clear_requested` one-shot 経由で既存 writer に全件クリアを依頼する。
+  一覧のメモリ上の読書位置も同じ受付で消し、件数・完了表示は非同期結果で更新する。
 - 閲覧履歴は、ユーザー操作で開いた画像フォルダ / ZIP / PDF / 対応アーカイブと、
   動画・音声ファイルを %APPDATA%\mimageviewer\reading_history.db に MRU として保存する。
   画像の本は親コンテナ、動画・音声はファイルを記録単位とする。一覧からの open、
@@ -1826,6 +1838,52 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   タイトルバーの × / Escape は当該起動中だけ閉じる。「この保存先では今後表示しない」は現在の
   パスを設定へ保存し、正規化後に同じ場所である間は次回以降表示しない。保存先が変われば再表示する。
 
+### 環境設定の持ち運び
+
+設定メニューの「設定の復元…」にある「環境設定を書き出し…」「環境設定を取り込み…」から、
+移行先に依存しない閲覧・表示・ファイル処理の設定を書き出し・取り込みできる。
+環境設定の「全体設定」には持ち運びの入口を置かない。詳細な分類と検証規則は
+[settings-export-import-plan.md](settings-export-import-plan.md) を正本とする。
+環境設定が表示中は新しい二つの転送項目だけを無効にし、閉じてから行うよう理由を示す。
+既存の復元・操作カスタマイズの操作は変更しない。取り込みの読み込み完了時に環境設定が
+独立して開かれていれば中止を通知し、既存 draft と live 設定・DB を変更しない。
+
+- 書き出し・取り込みは同じ見た目の説明 Modal から始める。書き出しは「書き出す」で保存先を
+  選び、確定済み Settings の preferences_snapshot() から worker で保存し、説明 Modal に結果通知を示す。
+  お気に入り専用値と未確定 draft は含めず、書き出し自体は live 設定や DB を変更しない。
+- 取り込み説明に、世代を選ぶ「この時点に戻す」と対象が異なり、移行可能な環境設定の一部だけを
+  変更し、移行先のパス・利用データ・操作カスタマイズ等を保持することを示す。「ファイルを選ぶ」で
+  ファイルを選び、worker の検証成功後だけ環境設定の「全体設定」(General) を開く。
+  正常な対象項目だけを新しい draft へ反映し、既存の結果・変更項目・不正項目欄を表示する。
+  OK は手編集と同じ prepare → install → 副作用 → save_checked の経路で確定する。
+  Cancel / × は取り込みと環境設定で行った未確定手編集をまとめて破棄する。
+  説明やファイル選択の Cancel、ファイル全体エラーでは環境設定を開かず設定を変更しない。
+- 全 432 フィールドを一つの policy で明示分類し、130 フィールドを転送対象、302 を除外する。
+  利用データ (★・編集・本棚・お気に入り・タグ・コレクション・履歴・読書位置・キャッシュ)、
+  PC 固有パス、フォント・外部ツール・LUT・Susie / VST3、性能 tuning、接続・自動通信、
+  操作カスタマイズ、環境設定外の一覧・ツールバー・再生状態は対象外。
+  履歴保持件数、EXIF 非表示タグ、動画下部バーの固定、詳細表示下部バーのモード、
+  `stack_rules.rhai` に依存するスタック script の有効化も除外する。
+- 形式は UTF-8 JSON、`format="mimageviewer.preferences"`、`format_version=1`、
+  `preferences` object を必須とし、参考情報 `app_version` は任意。推奨名は
+  `preferences.mivprefs.json`。Settings 全体の JSON・DB・操作カスタマイズ JSON は受け付けない。
+  同じ形式版の未知キーは無視して件数を知らせ、欠落は現在 draft 値を保持する。
+  型違い・範囲外・未知 enum はその論理項目を無視し、既定値補完や clamp はしない。
+  壊れた JSON、不正 UTF-8、重複キー、1 MiB / 深さ制限超過、形式・版の不一致は全体拒否し、
+  draft を変えない。未来の形式版も推測して読み込まない。
+- SettingsRestoreState の一つの転送 job が read / parse / serialize / write を worker で処理する。
+  処理中は説明 Modal を busy 表示にし、設定復元の操作・閉鎖と説明の実行・キャンセルを止める。
+  メイン viewport の背面メニュー・ツールバーは show_settings_restore が登録済みの
+  common modal と説明 Modal に任せる。ファイル I/O と draft に無関係な別窓・fullscreen・
+  native 動画に転送専用の入力遮断は加えず、既存挙動を維持する。
+  DB migration、専用 live rebuild、復旧 journal、再試行や世代バックアップは追加しない。
+- 対象外に import setter は持たない。ただし、既存 OK が環境設定外の最新値
+  (`video_playback_speed` 等) を巻き戻す §1.305 と、`show_hidden_files` 等の変更後に
+  通常フォルダを UI スレッドで再読込する §1.295 は今回未修正で、取り込み後の OK も引き継ぐ。
+  再生位置と音声トラックは既存の修正済み live merge を使う。
+- 書き出し先は利用者が選ぶファイルで、data-dir 外にも置ける。アプリの通信や自動有効化は
+  増えない。ネットワーク共有・同期フォルダを選んだ場合の通信は OS・同期ソフトの扱いに従う。
+
 ### 起動引数
 
 `mimageviewer.exe <パス>` の最初の位置引数は起動時に開く対象として扱う。
@@ -1872,6 +1930,22 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 runtime 展開や本体起動を行う前に、最初の位置引数を Named Pipe へ転送してから
 activate event を送る。Pipe がまだ準備されていない起動直後だけ短く再試行し、
 Explorer の SendTo 起動側が数秒単位で残らないようにする。
+
+固定の「ファイル整理先」は環境設定の「フォルダ・ファイル」で表示名・絶対パス・登録順を編集する。
+`Settings.file_organize_destinations: Vec<FileOrganizeDestination>` は空が既定で、不在先も維持する。
+追加・編集・削除・↑↓は環境設定の draft へ反映し、OK で保存、Cancel で破棄する。
+名称空欄、パス空欄、相対パス、NUL は OK を無効化する。お気に入りとツールバーには影響しない。
+グリッドの項目右クリック「ファイル整理先…」と既定キーなしの `GridOrganizeFiles` から同じ画面を開く。
+チェック済み全件を優先し、なければ右クリック項目／キーのカーソルを使用する。実ファイルと実フォルダの
+混在は全件を対象とし、仮想・合成項目の混在は理由付きで全体を拒否する。検索等の一覧でも実項目は扱う。
+登録先の「移動」「コピー」で非同期 STA worker の `IFileOperation::MoveItem / CopyItem` へ直接依頼する。
+クリップボードは変更せず、競合・進捗・取消・部分失敗は Windows 標準 UI に任せ、整理先へ一覧を移動しない。
+状態は非表示／選択中／実行中の request enum が所有し、投入直前の共通入口で Remote 所有・終了要求を拒否する。
+選択要求は一度だけ消費し二重投入を防ぐ。開始後の独自取消・終了待機・再開は追加しない。
+終端の成否によらず、完了時の現在の実フォルダが元の親／整理先なら既存の Notified 外部変更確認を要求するだけ。
+保持一覧、チェック、検索、別窓、viewer の専用後始末は行わず、エクスプローラー移動相当の更新に従う。
+評価・タグ・編集の移行や削除は整理操作では行わず、記録済みの対象ファイルは先の通常フォルダの
+既存「編集内容の復元」確認に任せる。専用待機・強制ハッシュは追加しない。
 
 実ファイル / 実フォルダの native 右クリックメニューには、常に Win32 `IContextMenu` 由来の
 Windows 項目を含める。Shell 項目は既定で末尾の
@@ -1968,6 +2042,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_show_media_duration` | bool | true | 動画・音声のサムネイル右下に長さを表示する。1 時間未満は `m:ss`、1 時間以上は `h:mm:ss`。フィルタ一致数と既存バッジを優先し、衝突時は上へ移し、空きがなければ非表示。可視 + 先読みだけ既存遅延メタ worker で取得する。設定項目がない既存 JSON / settings.db も true になる |
+| `thumb_show_book_resume_meter` | bool | true | 通常の一覧のフォルダ・ZIP・PDF サムネイル下端に保存済み読書位置の比率を常に左から右へ表示する。本の読み方向や `fullscreen_seek_direction` には連動しない。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続き、ON に戻すと追加読み取りなしに表示できる。欠落した JSON / settings.db 設定と既定設定も true |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
 | `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
 | `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |
@@ -2045,7 +2120,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
 | `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
-| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
+| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせる。`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
 | `fullscreen_keep_on_app_switch` | bool | false | 「メインに戻ったらフルスクリーンへ復帰」。他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を自動で閉じずにフルスクリーン側へフォーカスを戻す。メイン一覧も並行操作する場合は F12 別ウィンドウを使う |

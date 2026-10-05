@@ -193,6 +193,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再生アイコン", "左下バッジ", "非表示"]
     ),
     entry!(
+        "thumbnail/book-resume-meter",
+        Thumbnail,
+        "本のサムネイルに前回の読書位置を表示",
+        ["読書", "ページ", "進捗", "メーター", "ZIP", "PDF"]
+    ),
+    entry!(
         "thumbnail/idle-upgrade",
         Thumbnail,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",
@@ -485,6 +491,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Cache,
         "容量上限を有効にする",
         ["変換済みアーカイブ", "キャッシュ", "無制限", "MB"]
+    ),
+    entry!(
+        "folder/organize-destinations",
+        Folder,
+        "ファイル整理先",
+        ["コピー", "移動", "登録", "表示名", "パス", "順序"]
     ),
     entry!(
         "folder/hidden-files",

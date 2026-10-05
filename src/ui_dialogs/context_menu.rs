@@ -1452,6 +1452,12 @@ impl crate::app::App {
                 crate::context_menu_model::ContextMenuShortcutLabels {
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
+                    organize: (target.surface == ContextMenuSurface::Grid)
+                        .then(|| {
+                            self.keymap
+                                .first_chord_label(crate::keymap::KeyAction::GridOrganizeFiles)
+                        })
+                        .flatten(),
                     rotate_left: self.keymap.first_chord_label(rotate_ccw),
                     rotate_right: self.keymap.first_chord_label(rotate_cw),
                     deselect: deselect.and_then(|action| self.keymap.first_chord_label(action)),
@@ -1639,6 +1645,12 @@ impl crate::app::App {
                     let target_is_file =
                         !matches!(&target.item, crate::grid_item::GridItem::Folder(_));
                     self.request_rename_dialog(path, target_is_file);
+                }
+                None
+            }
+            MenuCommand::OrganizeFiles => {
+                if target.surface == ContextMenuSurface::Grid && !target.is_folder_context {
+                    self.request_file_organize_dialog(target.item_index);
                 }
                 None
             }

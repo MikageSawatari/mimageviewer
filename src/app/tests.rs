@@ -2,6 +2,173 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[cfg(test)]
+mod file_organize_tests {
+    use super::*;
+    use crate::shell_file_ops::{
+        ShellTransferOperation, ShellTransferOutcome, ShellTransferRequest,
+    };
+    use crate::ui_dialogs::file_organize::{
+        FileOrganizeRequest, FileOrganizeRunning, FileOrganizeSelection,
+    };
+
+    #[test]
+    fn file_organize_completion_requests_existing_external_rescan_only_for_current_real_folder() {
+        let mut env = phase_c_support::setup_app();
+        let root = env.tmp.path().to_owned();
+        let source = root.join("organize-source");
+        let destination = root.join("organize-destination");
+        let unrelated = root.join("unrelated");
+        for folder in [&source, &destination, &unrelated] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let ctx = egui::Context::default();
+        for (folder, physical, should_refresh) in [
+            (&source, true, true),
+            (&destination, true, true),
+            (&unrelated, true, false),
+            (&source, false, false),
+        ] {
+            for terminal in 0..4 {
+                env.current_folder = Some(folder.clone());
+                env.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+                    folder: folder.clone(),
+                    counts: Default::default(),
+                });
+                env.top_level_grid_view.replace_surface(if physical {
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                } else {
+                    top_level_grid_view::TopLevelGridSurface::Search(
+                        top_level_grid_view::TopLevelSearchView::Global,
+                    )
+                });
+                let (tx, rx) = mpsc::channel();
+                match terminal {
+                    0 => tx
+                        .send(Ok(ShellTransferOutcome { aborted: false }))
+                        .unwrap(),
+                    1 => tx.send(Ok(ShellTransferOutcome { aborted: true })).unwrap(),
+                    2 => tx.send(Err("fake failure".into())).unwrap(),
+                    _ => {}
+                }
+                drop(tx);
+                env.file_organize_request =
+                    FileOrganizeRequest::Running(Box::new(FileOrganizeRunning {
+                        request: ShellTransferRequest {
+                            sources: vec![source.join("item.png")],
+                            destination: destination.clone(),
+                            operation: ShellTransferOperation::Move,
+                        },
+                        rx,
+                    }));
+                env.poll_file_organize(&ctx);
+                assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                ));
+                assert_eq!(env.external_rescan_pending.is_some(), should_refresh);
+                if let Some(pending) = env.external_rescan_pending.take() {
+                    assert_eq!(pending.folder, *folder);
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_organize_production_submission_rejects_shutdown_and_root_close() {
+        let mut env = phase_c_support::setup_app();
+        env.main_hwnd = Some(1); // A refused boundary must never pass this fake HWND to Shell.
+        for closing_event in [false, true] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            if closing_event {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            ctx.begin_pass(input);
+            env.shutdown_requested
+                .store(!closing_event, Ordering::SeqCst);
+            env.file_organize_request =
+                FileOrganizeRequest::Selecting(Box::new(FileOrganizeSelection {
+                    sources: vec![r"C:\source\a.png".into()],
+                    destinations: vec![crate::settings::FileOrganizeDestination {
+                        name: "target".into(),
+                        path: r"D:\target".into(),
+                    }],
+                    focus: None,
+                }));
+            env.submit_file_organize(&ctx, 0, ShellTransferOperation::Copy);
+            assert!(matches!(
+                env.file_organize_request,
+                FileOrganizeRequest::Hidden
+            ));
+            assert!(env.fs_feedback_toast.as_ref().unwrap().0.contains("終了"));
+            let _ = ctx.end_pass();
+        }
+        env.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn file_organize_enter_needs_explicit_operation_after_row_navigation() {
+        let mut env = phase_c_support::setup_app();
+        env.file_organize_request =
+            FileOrganizeRequest::Selecting(Box::new(FileOrganizeSelection {
+                sources: vec![r"C:\source\a.png".into()],
+                destinations: vec![crate::settings::FileOrganizeDestination {
+                    name: "target".into(),
+                    path: r"D:\target".into(),
+                }],
+                focus: None,
+            }));
+        // The final Enter is refused before any Shell call, allowing this to use fake paths.
+        env.main_hwnd = Some(1);
+        env.shutdown_requested.store(true, Ordering::SeqCst);
+        let ctx = egui::Context::default();
+        for (step, key) in [
+            egui::Key::ArrowDown,
+            egui::Key::Enter,
+            egui::Key::ArrowRight,
+            egui::Key::Enter,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            env.show_file_organize_dialog(&ctx);
+            let _ = ctx.end_pass();
+            match step {
+                0 | 1 => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Selecting(ref selection) if selection.focus == Some((0, None))
+                )),
+                2 => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Selecting(ref selection) if selection.focus == Some((0, Some(ShellTransferOperation::Copy)))
+                )),
+                _ => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                )),
+            }
+        }
+        env.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+}
+
 fn music_source_for_test(app: &App, path: PathBuf) -> MusicAnalysisSource {
     MusicAnalysisSource {
         owner_context_id: app.projected_viewer_context_id(),
@@ -1748,6 +1915,13 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     assert!(size_of::<PdfPasswordRequestOwner>() < 32);
     assert!(size_of::<PdfEnumeratePending>() < 1_200);
     assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
+    // Organize destinations also live in PreferencesState's Settings drafts. Keep
+    // a small explicit budget for that settings growth, and keep the rare request
+    // payload on the heap instead of storing it inline in every App.
+    assert!(
+        size_of::<crate::ui_dialogs::file_organize::FileOrganizeRequest>()
+            <= 2 * size_of::<usize>()
+    );
     assert!(size_of::<App>() < 110_000);
 }
 
@@ -18806,7 +18980,7 @@ mod phase_c_folder_nav_history_tests {
             .expect("book resume DB")
             .set(&book, 12)
             .expect("seed book resume");
-        app.last_book_resume = Some((book.clone(), 12));
+        app.last_book_resume = Some((book.clone(), 12, None));
         app.settings
             .video_resume_positions
             .insert("/miv-test/movie.mp4".to_string(), 91.5);
@@ -18858,7 +19032,7 @@ mod phase_c_folder_nav_history_tests {
 
         // 場所の記憶以外はこの操作の対象外。
         assert_eq!(app.checked, HashSet::from([1, 3]));
-        assert_eq!(app.last_book_resume, Some((book.clone(), 12)));
+        assert_eq!(app.last_book_resume, Some((book.clone(), 12, None)));
         assert_eq!(
             app.book_resume_db
                 .as_ref()
@@ -34489,14 +34663,16 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Folder(std::path::PathBuf::from(
             "c:/manga/series/sub",
         )));
+        app.rebuild_visible_indices();
 
         // 画像 (本ページ) idx 0 → 記録される
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 0)));
+        let meter = crate::book_resume_db::ReadingMeterValue::new(1, 1);
+        assert_eq!(app.last_book_resume, Some((folder.clone(), 0, meter)));
 
         // フォルダタイル idx 1 → 対象外。直近記録は据え置き
         app.record_book_resume(1);
-        assert_eq!(app.last_book_resume, Some((folder, 0)));
+        assert_eq!(app.last_book_resume, Some((folder, 0, meter)));
     }
 
     #[test]
@@ -39626,6 +39802,7 @@ mod favorite_adjustment_defaults_tests {
             zip_path: zip_path.clone(),
             entry_name: "bookA/p1.jpg".to_string(),
         });
+        app.rebuild_visible_indices();
 
         // 本の中 (深さ 2) → 記録されない
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
@@ -39641,7 +39818,14 @@ mod favorite_adjustment_defaults_tests {
         };
         app.zip_nav = Some(test_zip_nav(&["p1.jpg", "p2.jpg"]));
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, Some((zip_path, 0)));
+        assert_eq!(
+            app.last_book_resume,
+            Some((
+                zip_path,
+                0,
+                crate::book_resume_db::ReadingMeterValue::new(1, 1),
+            ))
+        );
     }
 
     /// ピンキーはルート表示では zip_path (= 外側 ZIP の代表、v1.2.x フラット UI 互換)、
@@ -67519,7 +67703,7 @@ mod still_window_mode_key_tests {
         preferences.trt_engine_cache_size_mib = 400;
         preferences.trt_worker_active = true;
         preferences.settings.ai_backend = Some(crate::ai::AiBackend::TensorRt.as_str().to_owned());
-        app.pref_state = Some(preferences);
+        app.pref_state = Some(Box::new(preferences));
         app.trt_install_state = Some(crate::ui_dialogs::trt_install::TrtInstallState::new(None));
 
         assert!(!app.uninstall_trt_pack_now());

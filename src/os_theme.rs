@@ -292,6 +292,30 @@ pub fn is_dark_effective(theme: UiTheme) -> bool {
     matches!(resolve(theme), ResolvedTheme::Dark)
 }
 
+/// Opaque reading-position colors, resolved from the painting UI's theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookResumeMeterPalette {
+    pub track: egui::Color32,
+    pub fill: egui::Color32,
+    pub boundary: egui::Color32,
+}
+
+pub fn book_resume_meter_palette(dark: bool) -> BookResumeMeterPalette {
+    if dark {
+        BookResumeMeterPalette {
+            track: egui::Color32::from_gray(45),
+            fill: egui::Color32::from_rgb(56, 200, 182),
+            boundary: egui::Color32::from_gray(155),
+        }
+    } else {
+        BookResumeMeterPalette {
+            track: egui::Color32::from_gray(232),
+            fill: egui::Color32::from_rgb(0, 108, 100),
+            boundary: egui::Color32::from_gray(85),
+        }
+    }
+}
+
 /// Windows の「アプリ用の色」(`HKCU\...\Personalize\AppsUseLightTheme`) を読んで
 /// Light / Dark を返す。取得失敗時は `None`。
 #[cfg(windows)]
@@ -366,6 +390,18 @@ pub(crate) fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f64 {
 mod tests {
     use super::*;
     use egui::Color32;
+
+    #[test]
+    fn book_resume_meter_palette_has_opaque_distinct_track_and_fill() {
+        for dark in [false, true] {
+            let palette = book_resume_meter_palette(dark);
+            assert_eq!(palette.track.a(), 255);
+            assert_eq!(palette.fill.a(), 255);
+            assert_eq!(palette.boundary.a(), 255);
+            assert!(contrast_ratio(palette.track, palette.fill) >= 3.0);
+            assert!(contrast_ratio(palette.track, palette.boundary) >= 2.0);
+        }
+    }
 
     /// 代表的な既知の値で `contrast_ratio` を検証 (WCAG 計算の自己チェック)。
     #[test]

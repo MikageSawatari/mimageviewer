@@ -1580,6 +1580,7 @@ pub enum KeyAction {
     GridDeselect,
     GridCutFiles,
     GridCopyFiles,
+    GridOrganizeFiles,
     GridToggleCheck,
     GridDelete,
     GridRename,
@@ -2144,6 +2145,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridCutFiles,
     KeyAction::GridCopyFiles,
+    KeyAction::GridOrganizeFiles,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridRename,
@@ -4142,6 +4144,7 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridCutFiles => "GridCutFiles",
             GridCopyFiles => "GridCopyFiles",
+            GridOrganizeFiles => "GridOrganizeFiles",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridRename => "GridRename",
@@ -4863,6 +4866,7 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridCutFiles => "選択中またはチェック済みの実ファイル/実フォルダを切り取る",
             GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
+            GridOrganizeFiles => "選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => {
                 "通常一覧では実ファイル/実フォルダを削除し、コレクション直下では参照登録を外す"
@@ -5418,6 +5422,7 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -5921,6 +5926,7 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -6469,7 +6475,7 @@ impl KeyAction {
             GridCopyFiles => ChordList::one(Chord::ctrl(C)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
-            GridRename | GridReload => ChordList::EMPTY,
+            GridRename | GridReload | GridOrganizeFiles => ChordList::EMPTY,
             GridOpenSelected => ChordList::one(Chord::key(Enter)),
             GridOpenSelectedAsPage | GridOpenSelectedAsList => ChordList::EMPTY,
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
@@ -11486,7 +11492,11 @@ mod tests {
 
     #[test]
     fn grid_rename_and_reload_are_default_unassigned() {
-        for action in [KeyAction::GridRename, KeyAction::GridReload] {
+        for action in [
+            KeyAction::GridRename,
+            KeyAction::GridReload,
+            KeyAction::GridOrganizeFiles,
+        ] {
             assert!(KeyAction::all().contains(&action));
             assert!(action.default_chords().is_empty());
             assert_eq!(action.context(), KeyContext::Grid);

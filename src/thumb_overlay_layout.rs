@@ -11,6 +11,8 @@ pub const TOP_LEFT_GAP: f32 = 2.0;
 pub const TOP_RIGHT_RESERVE: f32 = 28.0;
 pub const BOTTOM_LEFT_OFFSET: f32 = 3.0;
 pub const BOTTOM_ITEM_GAP: f32 = 4.0;
+pub const BOOK_RESUME_METER_HEIGHT: f32 = 3.0;
+pub const BOOK_RESUME_METER_GAP: f32 = 2.0;
 
 const FILE_BADGE_SCALE: f32 = 0.70;
 const FILE_BADGE_MIN_FONT_SIZE: f32 = 7.0;
@@ -182,6 +184,7 @@ impl BottomLeftOverlayLayout {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThumbnailOverlayLayout {
+    pub book_resume_meter: Option<egui::Rect>,
     pub check: Option<egui::Rect>,
     pub stack_count: Option<BadgePlacement>,
     pub top_left: TopLeftOverlayLayout,
@@ -238,6 +241,7 @@ pub struct BottomContainerInput<'a> {
 pub struct ThumbnailOverlayLayoutInput<'a> {
     pub cell: egui::Rect,
     pub inner: egui::Rect,
+    pub book_resume_meter: bool,
     pub checked: bool,
     pub stack_count: Option<usize>,
     pub filter_match_count: Option<u32>,
@@ -427,6 +431,51 @@ pub fn layout_thumbnail_overlays(
     input: ThumbnailOverlayLayoutInput<'_>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
+    let baseline = layout_badges(&input, None, &mut measure);
+    if !input.book_resume_meter
+        || input.inner.width() <= 0.0
+        || input.inner.height() < BOOK_RESUME_METER_HEIGHT + BOOK_RESUME_METER_GAP
+    {
+        return baseline;
+    }
+    let meter = egui::Rect::from_min_max(
+        egui::pos2(
+            input.inner.min.x,
+            input.inner.max.y - BOOK_RESUME_METER_HEIGHT,
+        ),
+        input.inner.max,
+    );
+    let mut reserved = layout_badges(&input, Some(meter), &mut measure);
+    // Small cells retain their existing badge content before reserving the meter strip.
+    let keeps_badges = baseline.badge_placements().all(|badge| {
+        reserved
+            .badge_placements()
+            .any(|candidate| candidate.kind == badge.kind && candidate.text == badge.text)
+    });
+    let clear_of_meter = !reserved.check.is_some_and(|rect| rect.intersects(meter))
+        && reserved
+            .badge_placements()
+            .all(|badge| badge.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP);
+    if keeps_badges && clear_of_meter {
+        reserved.book_resume_meter = Some(meter);
+        reserved
+    } else {
+        baseline
+    }
+}
+
+fn layout_badges(
+    input: &ThumbnailOverlayLayoutInput<'_>,
+    meter: Option<egui::Rect>,
+    mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
+) -> ThumbnailOverlayLayout {
+    let mut badges_inner = input.inner;
+    let mut badges_cell = input.cell;
+    if let Some(meter) = meter {
+        badges_inner.max.y = meter.min.y - BOOK_RESUME_METER_GAP;
+        // The right-bottom badges traditionally anchor to cell.max.y - 3, rather than inner.
+        badges_cell.max.y = badges_inner.max.y + 3.0;
+    }
     // The check state is the fixed-size interaction marker. Reserve its painted circle before
     // measuring any lower-priority badge, including the edit overflow summary.
     let check = input.checked.then(|| check_overlay_rect(input.cell));
@@ -563,7 +612,7 @@ pub fn layout_thumbnail_overlays(
     }
 
     let mut bottom_left = BottomLeftOverlayLayout::default();
-    let bottom_y = input.inner.max.y - BOTTOM_LEFT_OFFSET;
+    let bottom_y = badges_inner.max.y - BOTTOM_LEFT_OFFSET;
     let left_x = input.inner.min.x + BOTTOM_LEFT_OFFSET;
     let blocked_by_top = |rect: egui::Rect| {
         check.is_some_and(|check| check.intersects(rect))
@@ -709,7 +758,7 @@ pub fn layout_thumbnail_overlays(
                 .find(|text| measure(text, style).x <= available)
                 .and_then(|text| {
                     let size = measured_badge_size(&text, style, &mut measure);
-                    let rect = place_bottom_right(input.cell, size, &occupied)?;
+                    let rect = place_bottom_right(badges_cell, size, &occupied)?;
                     Some(BadgePlacement {
                         kind: BadgeKind::FilterMatchCount,
                         priority: BadgePriority::FilterMatchCount,
@@ -728,7 +777,7 @@ pub fn layout_thumbnail_overlays(
         .and_then(|text| {
             let style = media_duration_style();
             let size = measured_badge_size(text, style, &mut measure);
-            let rect = place_bottom_right(input.cell, size, &occupied)?;
+            let rect = place_bottom_right(badges_cell, size, &occupied)?;
             Some(BadgePlacement {
                 kind: BadgeKind::MediaDuration,
                 priority: BadgePriority::MediaDuration,
@@ -739,6 +788,7 @@ pub fn layout_thumbnail_overlays(
         });
 
     ThumbnailOverlayLayout {
+        book_resume_meter: None,
         check,
         stack_count,
         top_left,
@@ -827,6 +877,75 @@ fn fit_text(
 mod tests {
     use super::*;
 
+    #[test]
+    fn book_resume_meter_owns_bottom_strip_including_right_filter_count() {
+        let (cell, inner) = square_cell(100.0);
+        let mut input = duration_input(cell, inner);
+        input.media_duration = None;
+        input.book_resume_meter = true;
+        input.filter_match_count = Some(123);
+        let layout = layout_thumbnail_overlays(input, measure);
+        let meter = layout.book_resume_meter.expect("room for a meter");
+        assert_eq!(meter.min.x, inner.min.x);
+        assert_eq!(meter.max, inner.max);
+        assert_eq!(meter.height(), BOOK_RESUME_METER_HEIGHT);
+        let count = layout.filter_match_count.unwrap();
+        assert_eq!(count.rect.max.y, meter.min.y - BOOK_RESUME_METER_GAP);
+        assert!(!count.rect.intersects(meter));
+    }
+
+    #[test]
+    fn book_resume_meter_preserves_badges_and_never_intersects_any_corner() {
+        let tags = tags(&["#tag", "長い名前"]);
+        for width in [32.0, 48.0, 64.0, 100.0, 180.0, 240.0] {
+            let (cell, inner) = square_cell(width);
+            let mut input = ThumbnailOverlayLayoutInput {
+                tags: &tags,
+                ..duration_input(cell, inner)
+            };
+            input.media_duration = None;
+            input.checked = true;
+            input.filter_match_count = Some(42);
+            input.edit_badges = EditBadgeFlags {
+                page_override: true,
+                crop: true,
+                pin: true,
+                ..Default::default()
+            };
+            input.bottom_container = Some(BottomContainerInput {
+                kind: BottomContainerKind::Format(FormatBadgeKind::Pdf),
+                label: "PDF",
+            });
+            input.rating_text = Some("📁★★★★★");
+            input.filename = Some("long-book-name.pdf");
+            let baseline = layout_thumbnail_overlays(input.clone(), measure);
+            input.book_resume_meter = true;
+            let layout = layout_thumbnail_overlays(input, measure);
+            assert_placements_inside_cell(&layout, cell);
+            for badge in baseline.badge_placements() {
+                assert!(layout.badge_placements().any(|candidate| {
+                    candidate.kind == badge.kind && candidate.text == badge.text
+                }));
+            }
+            if let Some(meter) = layout.book_resume_meter {
+                assert!(cell.contains_rect(meter));
+                assert!(!layout.check.is_some_and(|check| check.intersects(meter)));
+                for badge in layout.badge_placements() {
+                    assert!(badge.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP);
+                }
+            } else {
+                assert_eq!(layout, baseline);
+            }
+            if width == 32.0 {
+                assert!(layout.book_resume_meter.is_none());
+            }
+            if width >= 100.0 {
+                assert!(layout.book_resume_meter.is_some());
+            }
+            assert_pairwise_non_intersecting(layout.badge_placements());
+        }
+    }
+
     fn measure(text: &str, style: BadgeTextStyle) -> egui::Vec2 {
         let width = text
             .chars()
@@ -855,6 +974,7 @@ mod tests {
         ThumbnailOverlayLayoutInput {
             cell,
             inner,
+            book_resume_meter: false,
             checked: false,
             stack_count: None,
             filter_match_count: None,
@@ -984,6 +1104,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: true,
                     stack_count: None,
                     filter_match_count: Some(123),
@@ -1043,6 +1164,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: Some(120),
                     filter_match_count: None,
@@ -1077,6 +1199,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: Some(42),
@@ -1105,6 +1228,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -1145,6 +1269,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -1204,6 +1329,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1238,6 +1364,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1282,6 +1409,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1314,6 +1442,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1350,6 +1479,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1383,6 +1513,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1416,6 +1547,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
@@ -1449,6 +1581,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,

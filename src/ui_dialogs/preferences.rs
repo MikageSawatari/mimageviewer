@@ -18,8 +18,60 @@ use crate::settings::{Parallelism, Settings};
 
 mod pages;
 mod search_index;
+mod transfer;
 use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
+use self::transfer::PreferencesTransferFeedback;
+pub(crate) use self::transfer::{PreferencesTransferAction, PreferencesTransferState};
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_settings_snapshot_fixture(ui: &mut egui::Ui, busy: bool) {
+    // Match the production right panel's fixed available width.
+    ui.set_width(ui.available_width());
+    if busy {
+        transfer::render_transfer_explanation(ui, PreferencesTransferAction::Export, true, None);
+        return;
+    }
+    let feedback = PreferencesTransferFeedback::Imported(crate::settings_transfer::ImportReport {
+        accepted_count: 128,
+        changed_fields: vec!["テーマ".into(), "文字のコントラスト".into()],
+        issues: vec![crate::settings_transfer::TransferIssue {
+            field: "スライドショーの間隔".into(),
+            reason: "範囲外の値です。".into(),
+        }],
+        unknown_count: 1,
+    });
+    transfer::render_transfer_feedback(ui, Some(&feedback));
+}
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_explanation_snapshot_fixture(ui: &mut egui::Ui, import: bool) {
+    transfer::render_transfer_explanation(
+        ui,
+        if import {
+            PreferencesTransferAction::Import
+        } else {
+            PreferencesTransferAction::Export
+        },
+        false,
+        None,
+    );
+}
+
+#[doc(hidden)]
+pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut destinations = vec![
+        crate::settings::FileOrganizeDestination {
+            name: "保管".into(),
+            path: PathBuf::from(r"D:\写真\保管"),
+        },
+        crate::settings::FileOrganizeDestination {
+            name: "要確認".into(),
+            path: PathBuf::from(r"\\server\写真\非常に長いフォルダ名\要確認"),
+        },
+    ];
+    pages::draw_file_organize_destinations_settings(ui, &mut destinations);
+}
 
 #[doc(hidden)]
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
@@ -36,6 +88,11 @@ pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
         ..Settings::default()
     };
     pages::draw_video_bar_visibility_settings(ui, &mut settings);
+}
+
+#[doc(hidden)]
+pub fn draw_book_resume_meter_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    pages::draw_book_resume_meter_settings(ui, &mut Settings::default());
 }
 
 #[doc(hidden)]
@@ -712,6 +769,7 @@ impl Drop for ExternalToolPathCheckPending {
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    transfer_feedback: Option<PreferencesTransferFeedback>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
@@ -1266,6 +1324,7 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            transfer_feedback: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
@@ -2009,6 +2068,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.preferences_transfer_busy() {
+            return;
+        }
         self.preferences_requested_page = Some(request);
         self.show_preferences = true;
     }
@@ -2051,6 +2113,9 @@ impl App {
     }
 
     fn request_close_preferences_dialog(&mut self) {
+        if self.preferences_transfer_busy() || self.preferences_transfer_dialog_open() {
+            return;
+        }
         if self.preferences_dialog_has_unsaved_changes() {
             self.show_preferences = true;
             self.show_preferences_discard_confirm = true;
@@ -2112,20 +2177,7 @@ impl App {
         }
     }
 
-    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
-        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
-        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
-        // state が破棄されても次回 open で過去の id を再利用しない。
-        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
-            self.show_preferences,
-            &mut self.preferences_open_last_frame,
-            &mut self.preferences_right_panel_scroll_sequence,
-        );
-        if !self.show_preferences {
-            return;
-        }
-
-        // 初回: 一時コピーを作成
+    fn ensure_preferences_state(&mut self) {
         if self.pref_state.is_none() {
             let ai_runtime = self.ai_runtime_init.ready_runtime();
             let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
@@ -2145,10 +2197,7 @@ impl App {
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
-                self.book_resume_db
-                    .as_ref()
-                    .map(|db| db.count())
-                    .unwrap_or(0),
+                self.book_resume_entry_count(),
                 self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
@@ -2160,8 +2209,25 @@ impl App {
             {
                 new_state.vst3_discovered = self.vst3_discovered.clone();
             }
-            self.pref_state = Some(new_state);
+            self.pref_state = Some(Box::new(new_state));
         }
+    }
+
+    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
+        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
+        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
+        // state が破棄されても次回 open で過去の id を再利用しない。
+        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
+            self.show_preferences,
+            &mut self.preferences_open_last_frame,
+            &mut self.preferences_right_panel_scroll_sequence,
+        );
+        if !self.show_preferences {
+            return;
+        }
+
+        // 初回: 一時コピーを作成
+        self.ensure_preferences_state();
         if let Some(generation) = opened_scroll_generation {
             self.pref_state
                 .as_mut()
@@ -2219,11 +2285,19 @@ impl App {
         let mut apply = false;
         let mut cancel = false;
 
+        let transfer_dialog_open = self.preferences_transfer_dialog_open();
+        if transfer_dialog_open {
+            // Popups use independent UI layers and do not inherit a disabled
+            // parent. Remove that combination while the transfer modal is shown.
+            egui::Popup::close_all(ctx);
+        }
+
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let enter_pressed = !transfer_dialog_open && self.dialog_enter_pressed(ctx);
+        let escape_pressed = !transfer_dialog_open && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
+            .enabled(!transfer_dialog_open)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -2343,20 +2417,33 @@ impl App {
                 ui.horizontal(|ui| {
                     let font_ready = state.ui_font_apply_ready();
                     let lut_ready = state.creative_lut_import_rx.is_none();
-                    let ok = ui.add_enabled(font_ready && lut_ready, egui::Button::new("  OK  "));
+                    let organize_validation = crate::settings::validate_file_organize_destinations(
+                        &state.settings.file_organize_destinations,
+                    );
+                    let ok = ui.add_enabled(
+                        font_ready && lut_ready && organize_validation.is_ok(),
+                        egui::Button::new("  OK  "),
+                    );
                     #[cfg(all(windows, feature = "test-script"))]
                     crate::test_script::register_clickable_widget("OK", &ok);
                     if ok.clicked() {
                         apply = true;
                         // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui
+                        .add_enabled(!transfer_dialog_open, egui::Button::new("キャンセル"))
+                        .clicked()
+                    {
                         cancel = true;
                     }
-                    if !font_ready {
+                    if transfer_dialog_open {
+                        ui.small("設定ファイルのダイアログを閉じると操作できます。");
+                    } else if !font_ready {
                         ui.small("フォントの準備完了後に適用できます。");
                     } else if !lut_ready {
                         ui.small("LUTのコピー完了後に適用できます。");
+                    } else if let Err(error) = organize_validation {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
                     }
                 });
             });
@@ -2626,7 +2713,9 @@ impl App {
                         self.enter_reading_history();
                     }
                 }
-                self.settings.save();
+                if !self.settings.save_checked() {
+                    self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
+                }
                 creative_lut_transaction.commit();
 
                 // Settings are global; every live native presenter receives the new display
@@ -2781,7 +2870,7 @@ impl App {
             self.request_close_preferences_dialog();
         }
 
-        if !close_requested_this_frame {
+        if !close_requested_this_frame && !transfer_dialog_open {
             self.draw_preferences_discard_confirm(ctx);
         }
 
@@ -2845,31 +2934,7 @@ impl App {
             }
         }
         if clear_book_resume_requested {
-            let result = match self.book_resume_db.as_ref() {
-                Some(db) => match db.clear_all() {
-                    Ok(deleted) => {
-                        crate::logger::log(format!(
-                            "[book_resume] cleared {deleted} reading positions"
-                        ));
-                        Ok((deleted, db.count()))
-                    }
-                    Err(e) => Err(format!("{e}")),
-                },
-                None => Err("読書位置 DB を開けませんでした".to_string()),
-            };
-            if let Some(ps) = self.pref_state.as_mut() {
-                match result {
-                    Ok((deleted, remaining)) => {
-                        ps.book_resume_entry_count = remaining;
-                        ps.book_resume_clear_result =
-                            Some(format!("ZIP/PDF の読書位置を {deleted} 件削除しました。"));
-                    }
-                    Err(err) => {
-                        ps.book_resume_clear_result =
-                            Some(format!("読書位置の削除に失敗しました: {err}"));
-                    }
-                }
-            }
+            self.clear_book_resume_async();
         }
 
         // 履歴と復元ページ: 閲覧履歴クリア (one-shot)。
@@ -2988,23 +3053,22 @@ impl App {
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
-                self.book_resume_db
-                    .as_ref()
-                    .map(|db| db.count())
-                    .unwrap_or(0),
+                self.book_resume_entry_count(),
                 self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
             );
             state.operation_tab = OperationCustomizeTab::Settings;
-            self.operation_customize_state = Some(state);
+            self.operation_customize_state = Some(Box::new(state));
         }
 
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        let ime_active = self.ime_input_active(ctx);
+        // Foreground IME or a transfer Modal owns these events before assignment capture.
+        let keyboard_capture_blocked =
+            self.ime_input_active(ctx) || self.preferences_transfer_dialog_open();
         let content_rect = ctx.content_rect();
         let safe_rect = content_rect.shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::vec2(360.0, 300.0));
@@ -3047,7 +3111,7 @@ impl App {
                             .max_height(main_height)
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                draw_operation_customize_page(ui, state, ime_active);
+                                draw_operation_customize_page(ui, state, keyboard_capture_blocked);
                             });
                     },
                 );
@@ -3069,7 +3133,7 @@ impl App {
             });
 
         if let Some(state) = self.operation_customize_state.as_mut() {
-            draw_operation_assignment_editor_dialog(ctx, state, ime_active);
+            draw_operation_assignment_editor_dialog(ctx, state, keyboard_capture_blocked);
             draw_mouse_gesture_recorder_dialog(ctx, state);
         }
 
@@ -3090,7 +3154,7 @@ impl App {
         }
     }
 
-    fn apply_operation_customize_state(&mut self, state: PreferencesState) {
+    fn apply_operation_customize_state(&mut self, state: Box<PreferencesState>) {
         let mut bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
             &self.settings,
         );
@@ -3320,7 +3384,7 @@ fn draw_operation_customize_tabs(ui: &mut egui::Ui, state: &mut PreferencesState
 fn draw_operation_customize_page(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     match state.operation_tab {
         OperationCustomizeTab::Settings => draw_operation_settings_page(ui, state),
@@ -3340,7 +3404,7 @@ fn draw_operation_customize_page(
             ui.add_space(8.0);
             ui.small("キー割り当てを編集します。一覧の「編集」またはキーボード図の割り当て済みキーを押すと、割り当て編集ダイアログを開きます。");
             ui.add_space(8.0);
-            page_command_settings(ui, state, ime_active);
+            page_command_settings(ui, state, keyboard_capture_blocked);
         }
         OperationCustomizeTab::MouseGesture => {
             draw_mouse_gesture_context_tabs(ui, state);
@@ -3906,7 +3970,9 @@ mod tests {
         }
     }
 
-    fn preferences_state_for_test(settings: &crate::settings::Settings) -> PreferencesState {
+    pub(super) fn preferences_state_for_test(
+        settings: &crate::settings::Settings,
+    ) -> PreferencesState {
         PreferencesState::from_settings(
             settings,
             crate::external_tool::LaunchTarget::None,
@@ -3951,6 +4017,265 @@ mod tests {
     }
 
     #[test]
+    fn file_organize_destinations_preferences_ok_save_db_reread_reopen_and_cancel() {
+        use crate::settings::FileOrganizeDestination;
+        let mut app = crate::app::setup_app_for_test();
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .file_organize_destinations
+                .is_empty()
+        );
+        let mut state = preferences_state_for_test(&app.settings);
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("absent"),
+            ));
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("second"),
+            ));
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("removed"),
+            ));
+        state.settings.file_organize_destinations.remove(2);
+        state.settings.file_organize_destinations[0].name = "保管".into();
+        state.settings.file_organize_destinations[0].path = app.tmp.path().join("edited absent");
+        state.settings.file_organize_destinations.swap(0, 1);
+        let expected = state.settings.file_organize_destinations.clone();
+        let toolbar = app.settings.toolbar_section_order.clone();
+        let favorite_path = app.tmp.path().join("favorite");
+        app.settings
+            .favorites
+            .push(crate::settings::FavoriteEntry::new(
+                "live favorite".into(),
+                favorite_path,
+            ));
+        let favorite_id = app.settings.favorites[0].id;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        assert_eq!(app.settings.file_organize_destinations, expected);
+        assert_eq!(app.settings.favorites[0].id, favorite_id);
+        assert_eq!(app.settings.toolbar_section_order, toolbar);
+        assert!(app.settings.save_checked());
+        let persisted = db.load_into_settings().unwrap();
+        let mut reopened = preferences_state_for_test(&persisted);
+        assert_eq!(reopened.settings.file_organize_destinations, expected);
+        reopened.settings.file_organize_destinations.clear();
+        drop(reopened); // 本番 Cancel と同じく draft を捨てるだけ。
+        assert_eq!(app.settings.file_organize_destinations, expected);
+        assert_eq!(
+            db.load_into_settings().unwrap().file_organize_destinations,
+            expected
+        );
+        let mut empty = preferences_state_for_test(&persisted);
+        empty.settings.file_organize_destinations.clear();
+        prepare_preferences_state_settings_for_commit(&mut empty, &mut app.settings);
+        app.install_preferences_settings(empty.settings);
+        assert!(app.settings.save_checked());
+        assert!(
+            preferences_state_for_test(&db.load_into_settings().unwrap())
+                .settings
+                .file_organize_destinations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn file_organize_destinations_preferences_ok_save_failure_keeps_memory_db_and_notifies() {
+        use crate::settings::FileOrganizeDestination;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.file_organize_destinations = vec![FileOrganizeDestination::from_path(
+            app.tmp.path().join("saved destination"),
+        )];
+        assert!(app.settings.save_checked());
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        let persisted_before = serde_json::to_value(db.load_into_settings().unwrap()).unwrap();
+        let saved_generation = crate::settings::save_generation();
+        let edited = vec![FileOrganizeDestination {
+            name: "今回の整理先".into(),
+            path: app.tmp.path().join("edited destination"),
+        }];
+
+        app.open_preferences_page(PreferencesPage::Folder);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .file_organize_destinations = edited.clone();
+        harness.run();
+        // The App fixture holds the process-global test lock and clears this flag
+        // on drop, including a panic. Exercise the real OK button and save boundary.
+        crate::settings_db::set_save_suppressed(true);
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.file_organize_destinations, edited);
+        let notice = &harness.state().fs_feedback_toast.as_ref().unwrap().0;
+        assert!(notice.contains("設定を保存できませんでした"));
+        assert!(notice.contains("今回の変更が残らない可能性があります"));
+        assert!(crate::settings_db::save_suppressed());
+        assert_eq!(crate::settings::save_generation(), saved_generation);
+        assert_eq!(
+            serde_json::to_value(db.load_into_settings().unwrap()).unwrap(),
+            persisted_before
+        );
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Folder);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .file_organize_destinations,
+            edited
+        );
+    }
+
+    #[test]
+    fn file_organize_destinations_input_validation() {
+        use crate::settings::{FileOrganizeDestination, validate_file_organize_destinations};
+        let mut item = FileOrganizeDestination::from_path(PathBuf::from(r"C:\offline\保管"));
+        assert!(item.validate().is_ok());
+        item.path = PathBuf::from(r"\\server\share\offline");
+        assert!(item.validate().is_ok());
+        assert!(validate_file_organize_destinations(&[item.clone(), item.clone()]).is_ok());
+        for path in [
+            "",
+            "relative",
+            r"C:relative",
+            r"\root-relative",
+            "C:\\nul\0path",
+        ] {
+            item.path = PathBuf::from(path);
+            assert!(item.validate().is_err(), "{path:?}");
+        }
+        item.path = PathBuf::from(r"D:\");
+        item.name = "  \t".into();
+        assert!(item.validate().is_err());
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.file_organize_destinations.is_empty());
+    }
+
+    #[test]
+    fn book_resume_meter_preferences_ok_save_db_reread_reopen_and_cancel() {
+        use crate::settings::FullscreenSeekDirection;
+
+        let mut app = crate::app::setup_app_for_test();
+        assert!(app.settings.thumb_show_book_resume_meter);
+        for (enabled, direction) in [
+            (false, FullscreenSeekDirection::LeftToRight),
+            (true, FullscreenSeekDirection::FollowReading),
+        ] {
+            let mut state = preferences_state_for_test(&app.settings);
+            state.settings.thumb_show_book_resume_meter = enabled;
+            state.settings.fullscreen_seek_direction = direction;
+
+            // Runtime and other-dialog changes made after opening Preferences must survive OK.
+            let width = app.settings.details_name_width + 17.0;
+            app.settings.details_name_width = width;
+            let favorite = crate::settings::FavoriteEntry::new(
+                "during preferences".to_owned(),
+                app.tmp.path().join("favorite"),
+            );
+            let favorite_id = favorite.id;
+            app.settings.favorites = vec![favorite];
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.install_preferences_settings(state.settings);
+            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            assert_eq!(app.settings.details_name_width, width);
+            assert_eq!(app.settings.favorites[0].id, favorite_id);
+            app.settings.save();
+
+            // Read the actual persisted DB, then construct a new real Preferences draft.
+            let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+            let persisted = db.load_into_settings().unwrap();
+            assert_eq!(persisted.thumb_show_book_resume_meter, enabled);
+            assert_eq!(persisted.fullscreen_seek_direction, direction);
+            let mut reopened = preferences_state_for_test(&persisted);
+            assert_eq!(reopened.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(reopened.settings.fullscreen_seek_direction, direction);
+
+            reopened.settings.thumb_show_book_resume_meter = !enabled;
+            reopened.settings.fullscreen_seek_direction =
+                if direction == FullscreenSeekDirection::LeftToRight {
+                    FullscreenSeekDirection::FollowReading
+                } else {
+                    FullscreenSeekDirection::LeftToRight
+                };
+            drop(reopened); // Cancel closes the draft without applying/saving it.
+            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            let after_cancel = db.load_into_settings().unwrap();
+            assert_eq!(after_cancel.thumb_show_book_resume_meter, enabled);
+            assert_eq!(after_cancel.fullscreen_seek_direction, direction);
+            assert_eq!(
+                preferences_state_for_test(&after_cancel)
+                    .settings
+                    .thumb_show_book_resume_meter,
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn book_resume_meter_preferences_missing_setting_and_default_draft_are_on() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(
+            preferences_state_for_test(&missing)
+                .settings
+                .thumb_show_book_resume_meter
+        );
+        assert!(
+            preferences_state_for_test(&Settings::default())
+                .settings
+                .thumb_show_book_resume_meter
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            preferences_state_for_test(&db.load_into_settings().unwrap())
+                .settings
+                .thumb_show_book_resume_meter
+        );
+    }
+
+    #[test]
     fn preferences_ok_keeps_track_choice_confirmed_while_dialog_is_open() {
         let mut app = crate::app::setup_app_for_test();
         let key = crate::adjustment_db::normalize_path(std::path::Path::new("media/confirmed.mkv"));
@@ -3958,7 +4283,7 @@ mod tests {
         app.settings
             .video_audio_track_choices
             .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
-        app.pref_state = Some(state);
+        app.pref_state = Some(Box::new(state));
         assert!(!app.preferences_dialog_has_unsaved_changes());
         let mut state = app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
@@ -3994,7 +4319,7 @@ mod tests {
                 prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
                 app.settings = state.settings;
             } else {
-                app.pref_state = Some(state);
+                app.pref_state = Some(Box::new(state));
                 assert!(!app.preferences_dialog_has_unsaved_changes());
                 app.discard_preferences_dialog();
             }
@@ -4026,7 +4351,7 @@ mod tests {
                     prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
                     app.settings = state.settings;
                 } else {
-                    app.pref_state = Some(state);
+                    app.pref_state = Some(Box::new(state));
                     app.discard_preferences_dialog();
                 }
                 assert_eq!(app.settings.video_audio_track_choices, expected);
@@ -4054,7 +4379,7 @@ mod tests {
         app.settings
             .video_audio_track_choices
             .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
-        app.pref_state = Some(state);
+        app.pref_state = Some(Box::new(state));
         app.discard_preferences_dialog();
         assert!(app.settings.video_audio_track_choices.contains_key(&key));
 
@@ -4113,7 +4438,7 @@ mod tests {
         );
         state.settings.gamepad_enabled = false;
 
-        app.operation_customize_state = Some(state);
+        app.operation_customize_state = Some(Box::new(state));
         assert!(
             app.operation_customize_dialog_has_unsaved_changes(),
             "切った状態は未保存の変更として数える"
@@ -4134,7 +4459,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
-        app.apply_operation_customize_state(operation_state);
+        app.apply_operation_customize_state(Box::new(operation_state));
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4146,7 +4471,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
-        app.pref_state = Some(preferences_state);
+        app.pref_state = Some(Box::new(preferences_state));
         assert!(
             app.preferences_dialog_has_unsaved_changes(),
             "Videoページで変えた通常ホイール設定は未保存変更として扱う"
@@ -4211,7 +4536,7 @@ mod tests {
             .video_normal_wheel_action = VideoNormalWheelActionId::NavigateItems;
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::AdjustVolume;
-        app.operation_customize_state = Some(operation_state);
+        app.operation_customize_state = Some(Box::new(operation_state));
         assert!(
             app.operation_customize_dialog_has_unsaved_changes(),
             "別の ring 項目の編集は未保存のまま数える"
@@ -4260,7 +4585,7 @@ mod tests {
         let untouched_operation = preferences_state_for_test(&app.settings);
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::AdjustVolume;
-        app.operation_customize_state = Some(untouched_operation);
+        app.operation_customize_state = Some(Box::new(untouched_operation));
         assert!(
             !app.operation_customize_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、操作カスタマイズの未保存変更にしない"
@@ -4284,7 +4609,7 @@ mod tests {
             "キャンセルは live 設定を変えない"
         );
 
-        let mut reopened_preferences = preferences_state_for_test(&app.settings);
+        let reopened_preferences = preferences_state_for_test(&app.settings);
         assert_eq!(
             reopened_preferences.initial_video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4292,12 +4617,12 @@ mod tests {
         );
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::NavigateItems;
-        app.pref_state = Some(reopened_preferences);
+        app.pref_state = Some(Box::new(reopened_preferences));
         assert!(
             !app.preferences_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、環境設定の未保存変更にしない"
         );
-        reopened_preferences = app.pref_state.take().unwrap();
+        let mut reopened_preferences = app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut reopened_preferences, &mut app.settings);
         assert_eq!(
             reopened_preferences
@@ -4325,7 +4650,7 @@ mod tests {
         let reopened_operation = preferences_state_for_test(&app.settings);
         app.settings.ring_shortcuts.video_normal_wheel_action =
             VideoNormalWheelActionId::NavigateItems;
-        app.operation_customize_state = Some(reopened_operation);
+        app.operation_customize_state = Some(Box::new(reopened_operation));
         assert!(
             !app.operation_customize_dialog_has_unsaved_changes(),
             "操作カスタマイズの再表示も、その session の基準値で外部変更を判定する"
@@ -4398,7 +4723,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .mouse_ring_help_visible = !app.settings.ring_shortcuts.mouse_ring_help_visible;
-        app.apply_operation_customize_state(unrelated_commit);
+        app.apply_operation_customize_state(Box::new(unrelated_commit));
         assert_eq!(
             app.settings
                 .ring_shortcuts
@@ -4414,7 +4739,7 @@ mod tests {
             .ring_shortcuts
             .mouse_button_profile_mut(context)
             .back = RingActionId::VideoMute;
-        app.apply_operation_customize_state(replacement);
+        app.apply_operation_customize_state(Box::new(replacement));
         assert_eq!(
             app.settings
                 .ring_shortcuts

@@ -80,12 +80,14 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全 432 フィールドの分類 (130 対象 / 302 除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
+| [book-resume-meter-plan.md](book-resume-meter-plan.md) | 一覧の本サムネイルの読書位置メーター。記録時のHUD位置/総数、常に左→右、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |
 | [backlog-on-hold.md](backlog-on-hold.md) | **保留・着手待ちバックログ**。判断待ち / 再現・確認待ち / 見送り。動かせるようになったら節ごと上へ戻す |
 | [release-verification-records.md](release-verification-records.md) | **リリース前確認の記録**。版ごとに実際に取った perf smoke / idle health / bench / 依存確認の測定値。次に何かが遅くなったときの比較対象。手順の正本は CLAUDE.md と release-operations.md |
 | [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画別ウィンドウの設計・実装履歴。冒頭 §§1〜2 は初期 v1 案、§3.0 は現行モード、§11 以降は CUT 前 pin 案を含む履歴 |
@@ -95,6 +97,7 @@
 | [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。§9 が唯一の現況表。R2b は部分完了、R3 は実質完了、R4 は未完 |
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | 現行リワーク出荷前 smoke matrix (F/W/V/P/R 系)。独立静止画窓の Ctrl 物理フォルダ移動と configurable 右クリックを含む |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
+| [file-organize-destinations-plan.md](file-organize-destinations-plan.md) | **実装済み (レビュー前)**。固定整理先の登録、Shell によるコピー・移動と実機確認 |
 | [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md) | **一部実装済み**。Windows Shell の `IFileOperation` とネイティブ右クリックメニューへ寄せるファイル整理機能の実装計画。A/B クイックフォルダ、実/仮想項目の native 右クリックメニュー、rename、delete-to-recycle は実装済み。copy/move/drop の `IFileOperation` 化は後続 |
 | [context-menu-unification-plan.md](context-menu-unification-plan.md) | **Phase A/B 実装済み**。実項目・仮想項目で共通の native 右クリックメニュー、mIV 項目の単一定義、混在選択の拒否、Windows 項目の遅延サブメニューと併記設定の正本 |
 | [key-customization-impl-plan.md](key-customization-impl-plan.md) | **実装済みメモ**。簡易版 (旧テキスト ini / GUI なし / 競合は警告のみ) の手順書と実装判断。現在の正本は `Settings.keymap` で、旧 `keymap.ini` は初回起動時に settings.db へ移行して `keymap.ini.imported*.bak` へ退避する。`src/keymap.rs` の型・`keymap.ini.default` 生成・旧 ini 仕様 (`Action.1` 形式)・exact match ヘルパー・native 動画転送対応・エッジケース規則・`KeyAction` インベントリ (付録 A)・キー変換ホワイトリスト (付録 B) |

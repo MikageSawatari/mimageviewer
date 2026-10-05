@@ -5,6 +5,60 @@ use uuid::Uuid;
 
 pub const MAX_FAVORITES: usize = 100;
 
+/// お気に入りとは独立した、登録順で表示するファイル整理先。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileOrganizeDestination {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl FileOrganizeDestination {
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string());
+        Self { name, path }
+    }
+
+    /// 入力の構文だけを検証する。不在・未接続のフォルダも登録を維持する。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() {
+            return Err("表示名を入力してください。");
+        }
+        let path = self.path.as_os_str();
+        if path.is_empty() {
+            return Err("フォルダのパスを入力してください。");
+        }
+        #[cfg(windows)]
+        let contains_nul = {
+            use std::os::windows::ffi::OsStrExt;
+            path.encode_wide().any(|unit| unit == 0)
+        };
+        #[cfg(not(windows))]
+        let contains_nul = path.to_string_lossy().contains('\0');
+        if contains_nul {
+            return Err("パスに NUL 文字は使用できません。");
+        }
+        if !self.path.is_absolute() {
+            return Err("フォルダの絶対パスを入力してください。");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_file_organize_destinations(
+    destinations: &[FileOrganizeDestination],
+) -> Result<(), String> {
+    for (index, destination) in destinations.iter().enumerate() {
+        if let Err(error) = destination.validate() {
+            return Err(format!("ファイル整理先 {}: {error}", index + 1));
+        }
+    }
+    Ok(())
+}
+
 pub const UI_SCALE_FACTOR_MIN: f32 = 0.5;
 pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
@@ -4215,6 +4269,9 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// 環境設定で編集する固定のコピー／移動先。Vec の順序が表示順。
+    #[serde(default)]
+    pub file_organize_destinations: Vec<FileOrganizeDestination>,
     /// お気に入り配下へ入ったとき、そのお気に入り専用の表示状態を適用・自動更新する。
     /// 既定 OFF。保存済みの専用状態は OFF にしても削除しない。
     #[serde(default)]
@@ -4449,6 +4506,9 @@ pub struct Settings {
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
+    /// 本のサムネイル下端に、記録済みの読書位置を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_book_resume_meter: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -7201,6 +7261,7 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            file_organize_destinations: Vec::new(),
             remember_favorite_view_state: false,
             favorite_view_overlay: None,
             smart_folders: Vec::new(),
@@ -7265,6 +7326,7 @@ impl Default for Settings {
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
+            thumb_show_book_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -10112,6 +10174,39 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thumb_show_book_resume_meter_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_book_resume_meter);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.thumb_show_book_resume_meter);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_book_resume_meter":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_book_resume_meter);
+    }
+
+    #[test]
+    fn thumb_show_book_resume_meter_missing_db_key_defaults_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_show_book_resume_meter
+        );
+    }
+
     #[test]
     fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_media_duration);

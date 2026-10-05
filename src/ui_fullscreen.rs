@@ -16115,7 +16115,7 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
     }
 }
 
-fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
+pub(crate) fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
     image_indices
         .iter()
         .position(|&image_idx| image_idx == idx)

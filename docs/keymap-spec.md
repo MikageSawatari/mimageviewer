@@ -1,5 +1,9 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+`GridOrganizeFiles` はサムネイル一覧のカーソル項目／チェック済み項目の「ファイル整理先」を開く。
+既定キーはなし。操作カスタマイズから割り当てられ、右クリックの同じ入口と対象解決を共有する。
+整理先画面内の矢印、Enter（明示選択済み操作のみ）、Escape はダイアログ専用で、IME 変換中は操作しない。
+
 mimageviewer のフルスクリーン操作におけるキー / マウス アサインの整理。
 画像 (静止画 / アニメーション GIF / PDF / ZIP 内画像) と動画でアサインが
 異なる項目を一覧化し、整合性 / 不整合を明らかにする。
@@ -300,6 +304,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 環境設定の持ち運び | 設定の復元の「環境設定を書き出し…」「環境設定を取り込み…」、説明 Modal の「書き出す」「ファイルを選ぶ」、取り込み後の環境設定の Enter / Escape | ダイアログ内だけのファイル操作で、新しい KeyAction は設けない。Enter / Escape は IME-safe な dialog helper を通す。環境設定表示中は新しい転送入口二つだけを無効化し、既存の復元操作は変更しない。取り込み完了時にも環境設定が開いていれば draft を変更せず通知する。転送 Modal の表示中は背後の環境設定へ Enter / Escape を渡さず、操作カスタマイズの「押して入力」も捕捉を停止する。待機状態と入力欄は保持し、Modal を閉じれば捕捉を再開する。通常の設定復元の表示だけでは捕捉を停止しない。転送 job 中は説明 Modal と設定復元の実行 / キャンセル / × / Enter / Escape を無効にし、メインの背面設定メニュー・ツールバーは既存の設定復元/common modal と説明 Modal で止める。別窓・fullscreen・native 動画への転送専用入力遮断は加えない。検証成功後の環境設定は既存 OK / キャンセルを使う。操作カスタマイズ自体は転送対象外で既存共有を使う |
 | モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>←</kbd> / <kbd>↑</kbd> = 削除を選択、<kbd>→</kbd> / <kbd>↓</kbd> = キャンセルを選択、<kbd>Enter</kbd> = 選択中を実行 | 破壊的操作の確認ダイアログだけで意味を持つフォーカスローカル入力のため keymap 対象外。ごみ箱へ移す確認は削除、完全削除の可能性がある確認はキャンセルを初期選択にする。表示中に各キーを消費して背面の KeyAction へ漏らさず、Enter は IME-safe helper で判定する。IME 変換中は Y / N / Esc / Enter の確認操作を行わない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。静止画 FS では raw-key permit を要求し、TextInput の全 phase では editor に残す一方、非テキスト `FocusedUi` はスライダー等にページ矢印を奪われないよう通す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
 | 画像連結読みのドラッグ | 左ドラッグ = 連結方向スクロール、<kbd>Ctrl</kbd>+左ドラッグ = 軸固定を解除して直交方向にもパン | 連結レイアウト中だけの連続ポインター操作。離散コマンドではなく、ドラッグ中の各フレームの修飾状態で拘束を切り替えるため keymap 対象外。ダブルクリックの表示変形リセットも固定入力として扱う |
