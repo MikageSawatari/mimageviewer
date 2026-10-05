@@ -1529,7 +1529,8 @@ mod tests {
     #[test]
     fn process_generation_pin_survives_path_consumers_and_failed_load() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("effetune").join("aaaaaaaaaaaa-Abc123");
+        let version = temp.path().join("runtime/4.3.0");
+        let root = version.join("effetune").join("aaaaaaaaaaaa-Abc123");
         let bundle = root.join(BUNDLE_NAME);
         fs::create_dir_all(&bundle).unwrap();
         let owner = std::sync::OnceLock::new();
@@ -1549,7 +1550,7 @@ mod tests {
         assert!(
             retain_process_generation(
                 &owner,
-                temp.path()
+                version
                     .join("effetune")
                     .join("aaaaaaaaaaaa-aBC123")
                     .join(BUNDLE_NAME)
@@ -1563,8 +1564,9 @@ mod tests {
     #[test]
     fn process_generation_pin_is_installed_by_retry_only_once() {
         let temp = tempfile::tempdir().unwrap();
-        let container = temp.path().join("effetune");
-        fs::create_dir(&container).unwrap();
+        let version = temp.path().join("runtime/4.3.0");
+        let container = version.join("effetune");
+        fs::create_dir_all(&container).unwrap();
         let owner = std::sync::OnceLock::new();
         // An unresolved startup leaves no successful owner; no retry load begins.
         assert!(
@@ -1585,7 +1587,7 @@ mod tests {
             bundle_location::encode_pointer(first).unwrap(),
         )
         .unwrap();
-        let retry = resolve_retry_at(temp.path(), None).unwrap();
+        let retry = resolve_retry_at(&version, None).unwrap();
         assert!(retain_process_generation(&owner, retry).is_ok());
         fs::write(
             container.join("current"),
@@ -1593,8 +1595,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            retain_process_generation(&owner, resolve_retry_at(temp.path(), None).unwrap())
-                .is_err()
+            retain_process_generation(&owner, resolve_retry_at(&version, None).unwrap()).is_err()
         );
         assert!(
             crate::runtime_locks::exclusive(&container.join(first), crate::runtime_locks::IN_USE)

@@ -147,6 +147,7 @@
 - 実装: core の起動完了・初回描画後に `runtime-cleanup` を一度spawn。resolved data-dirのruntime直下のSemVer名だけを対象に、現在版以外をbest-effort削除する。canonical confinementと全treeのreparse検査を行い、未知名・リンクは残す。失敗はlogのみ、部分削除可、次回起動で再試行。UI I/O、timer、待機、初期化とのjoinは無い。
 - owner選択: launcherは描画完了を持たず、使用中lockをcoreへ引き渡したら終了する。coreのstartup完了境界を利用し、EffeTune／AI初期化の経路には清掃を挿入しない。
 - P1/P2追補（2026-10-05）: coreはexe所属版と固定世代のshared leaseを寿命中保持する。launcherも抽出前からshared版leaseを持ち、抽出には新規exclusive lock、世代公開には既存exclusive lockを使う。清掃は各候補のexclusive leaseと版の抽出／公開lockを非blocking取得して削除完了まで保持し、別data-dirのcoreも保護する。launcher→coreはnamed eventでleaseを重ねて引き継ぐ。
+- P1/P3再レビュー追補（同日）: 全cooperative lockを削除対象外の `runtime/.locks/` に固定。`<version>.in-use`／`.extract`／`.effetune` と `<version>.gen-<generation>` はdelete sharingを禁止し、微小な旧fileも永久保持する。launcherは版directory作成前に外側shared leaseを取得する。旧publisher互換は外側→旧lockの順で併用し、版全体清掃の旧fileだけdelete sharingを許可する。製品cleanup_effetune内の削除操作hookで、実tree削除後も別handleが外側lockを取得できない回帰testへ変更（正本§10.2、`target/1331-msg-3.txt`）。
 - P1 #2の親junction差替えTOCTOUは利用者が受容。実行には同じ利用者権限の別processが必要で、そのprocessは直接削除できるため新たな権限を与えない。canonical／reparse事前検査は維持する。
 - 旧版互換の追補（同日の利用者／ClaudeCode決定、方針1）: workerが一度だけprocess画像を列挙し、候補tree内の実行中画像を検出したら保持する。同版の別coreが存在する間は未ロード旧世代のpinが分からないため全旧世代を保守的に保持する。missing leaseは事前検査後に作成してexclusive取得し、未使用の既存旧版も清掃する。列挙失敗は全清掃を見送り、query拒否／終了済みprocessは検査対象外。未対応旧launcherをsnapshot後に利用者が同時起動する競合は受容し、次回起動で再展開する（正本§10.2、`target/1331-msg-2.txt`）。
 - 棚卸し（今回の清掃対象外、別ownerで検討）:
@@ -166,6 +167,7 @@
   それ以外の認識済み世代名だけをbest-effort削除する。publisher lockは一度だけ非blocking取得し、
   busy、current不明、core世代未確定／未知layoutなら今回は全世代を保持する。
   候補のexclusive使用中lockと版のpublisher lockを削除完了まで保持する（P1/P2追補）。別coreも同じ世代のshared使用中lockを保持し、host未ロードの固定世代も削除しない。
+  P1/P3再レビューで世代／publisher lockを `runtime/.locks/` の永久fileへ移し、削除によるlock同一性の分裂を除いた。既存publisher互換も併用し、製品経路の削除中hookで保持期間を検証する。
   ロック未対応旧coreも含め、同版の別coreのprocess画像があれば今回は全旧世代を保持する。世代内の実行中画像も保持対象とし、snapshot後の未対応旧launcher同時起動は利用者が受容（§1.331／正本§10.2）。
   使用中・権限不足などの削除失敗はlogだけで起動／EffeTuneを阻害しない。lock不在だけでは未使用と判断しない。
 - 正本: [EffeTune配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01)。

@@ -8,6 +8,8 @@
 //! worker retains their trees (and all generations if another same-version core
 //! runs). Starting an unchanged old launcher after the snapshot remains an
 //! accepted race: it requires concurrent user launches, and re-extracts next time.
+//! Cooperative lock files are permanent runtime/.locks children; this worker
+//! explicitly skips that directory and never removes or rotates those files.
 
 use std::fs;
 use std::io;
@@ -98,6 +100,9 @@ fn cleanup_with_processes(
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
+            if name.eq_ignore_ascii_case(runtime_locks::LOCKS) {
+                continue;
+            }
             let Ok(candidate) = semver::Version::parse(name) else {
                 continue;
             };
@@ -106,7 +111,9 @@ fn cleanup_with_processes(
             }
         }
         if let Some(bundle) = pinned_bundle {
-            if let Err(error) = cleanup_effetune(&runtime, version, bundle, &processes) {
+            if let Err(error) = cleanup_effetune(&runtime, version, bundle, &processes, &|path| {
+                fs::remove_dir_all(path)
+            }) {
                 log_failure(&runtime.join(version).join("effetune"), &error);
             }
         }
@@ -126,6 +133,7 @@ fn cleanup_effetune(
     version: &str,
     bundle: &Path,
     processes: &[(u32, PathBuf)],
+    remove: &impl Fn(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let current = checked_child(runtime, &runtime.join(version))?;
     // A legacy core's executable is in the version, not its pinned generation.
@@ -163,11 +171,13 @@ fn cleanup_effetune(
     }
 
     let publisher = runtime_locks::exclusive(&current, runtime_locks::PUBLISHER)?;
+    let legacy_publisher = runtime_locks::exclusive_legacy_publisher(&current, false)?;
     let candidates = generation_candidates(&container, active_name.unwrap())?;
     for candidate in candidates {
-        remove_candidate(runtime, &container, &candidate, processes);
+        remove_candidate_with(runtime, &container, &candidate, processes, remove);
     }
     drop(publisher);
+    drop(legacy_publisher);
     Ok(())
 }
 
@@ -246,6 +256,18 @@ fn checked_tree(path: &Path) -> io::Result<()> {
 }
 
 fn remove_candidate(runtime: &Path, parent: &Path, path: &Path, processes: &[(u32, PathBuf)]) {
+    remove_candidate_with(runtime, parent, path, processes, &|path| {
+        fs::remove_dir_all(path)
+    });
+}
+
+fn remove_candidate_with(
+    runtime: &Path,
+    parent: &Path,
+    path: &Path,
+    processes: &[(u32, PathBuf)],
+    remove: &impl Fn(&Path) -> io::Result<()>,
+) {
     let result = (|| -> io::Result<()> {
         let target = checked_child(parent, path)?;
         if !target.starts_with(runtime) || target == runtime {
@@ -269,12 +291,13 @@ fn remove_candidate(runtime: &Path, parent: &Path, path: &Path, processes: &[(u3
             Some((
                 runtime_locks::exclusive(&target, runtime_locks::EXTRACTION)?,
                 runtime_locks::exclusive(&target, runtime_locks::PUBLISHER)?,
+                runtime_locks::exclusive_legacy_publisher(&target, true)?,
             ))
         } else {
             None
         };
         checked_child(parent, &target)?;
-        fs::remove_dir_all(&target)?;
+        remove(&target)?;
         drop(version_locks);
         drop(lease);
         crate::logger::log(format!("runtime cleanup: removed {}", target.display()));
@@ -413,7 +436,7 @@ mod tests {
             for name in ["2.13.0", "4.2.0", "4.3.0-rc.1", "5.0.0"] {
                 tree(&runtime.join(name));
             }
-            for name in ["notes", "4.3", "v4.2.0", "4.2.0.backup"] {
+            for name in ["notes", "4.3", "v4.2.0", "4.2.0.backup", ".locks"] {
                 tree(&runtime.join(name));
             }
             fs::write(runtime.join("1.0.0"), b"ordinary file").unwrap();
@@ -425,7 +448,7 @@ mod tests {
             for name in ["2.13.0", "4.2.0", "4.3.0-rc.1", "5.0.0"] {
                 assert!(!runtime.join(name).exists(), "{name}");
             }
-            for name in ["notes", "4.3", "v4.2.0", "4.2.0.backup", "1.0.0"] {
+            for name in ["notes", "4.3", "v4.2.0", "4.2.0.backup", "1.0.0", ".locks"] {
                 assert!(runtime.join(name).exists(), "{name}");
             }
             for name in [ACTIVE, POINTER, "unknown", "aaaaaaaaaaaa-bad", "current"] {
@@ -502,23 +525,78 @@ mod tests {
         #[test]
         fn publisher_stays_locked_through_generation_deletion() {
             let (temp, runtime, bundle) = fixture();
+            let runtime = fs::canonicalize(runtime).unwrap();
             let current = fs::canonicalize(runtime.join(VERSION)).unwrap();
             let container = current.join("effetune");
-            let publisher = runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).unwrap();
-            let candidates = generation_candidates(&container, ACTIVE).unwrap();
-            let runtime = fs::canonicalize(runtime).unwrap();
-            for candidate in candidates {
+            let removed = std::cell::Cell::new(false);
+            cleanup_effetune(&runtime, VERSION, &bundle, &[], &|candidate| {
+                assert_eq!(candidate, container.join(OLD));
                 assert!(runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).is_err());
-                remove_candidate(&runtime, &container, &candidate, &[]);
+                assert!(runtime_locks::exclusive_legacy_publisher(&current, false).is_err());
+                let lock_path = runtime_locks::lock_path(candidate, runtime_locks::IN_USE)?;
+                // Actual resource deletion has completed, while the product's
+                // guards still span this injected deletion operation.
+                fs::remove_dir_all(candidate)?;
+                assert!(lock_path.is_file());
+                assert!(runtime_locks::shared(candidate).is_err());
+                assert!(runtime_locks::exclusive(candidate, runtime_locks::IN_USE).is_err());
                 assert!(runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).is_err());
-            }
-            drop(publisher);
+                assert!(runtime_locks::exclusive_legacy_publisher(&current, false).is_err());
+                removed.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(removed.get());
             assert!(runtime_locks::exclusive(&current, runtime_locks::PUBLISHER).is_ok());
+            assert!(runtime_locks::exclusive_legacy_publisher(&current, false).is_ok());
+            assert!(runtime_locks::shared(&container.join(OLD)).is_ok());
             assert!(!container.join(OLD).exists());
             assert!(container.join(POINTER).exists());
             assert!(bundle.exists());
             // All I/O remained inside the fixture; no process-global data-dir.
             assert!(temp.path().exists());
+        }
+
+        #[test]
+        fn version_deletion_cannot_replace_cooperative_lock_identities() {
+            let (_temp, runtime, _) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            // Retain and honor a released publisher's legacy lock too.
+            fs::write(old.join(runtime_locks::PUBLISHER), b"").unwrap();
+            let runtime = fs::canonicalize(runtime).unwrap();
+            let old = runtime.join("3.0.0");
+            let removed = std::cell::Cell::new(false);
+            remove_candidate_with(&runtime, &runtime, &old, &[], &|target| {
+                let paths: Vec<_> = [
+                    runtime_locks::IN_USE,
+                    runtime_locks::EXTRACTION,
+                    runtime_locks::PUBLISHER,
+                ]
+                .into_iter()
+                .map(|kind| runtime_locks::lock_path(target, kind).unwrap())
+                .collect();
+                fs::remove_dir_all(target)?;
+                assert!(!target.exists());
+                assert!(paths.iter().all(|path| path.is_file()));
+                assert!(runtime_locks::shared(target).is_err());
+                for kind in [
+                    runtime_locks::IN_USE,
+                    runtime_locks::EXTRACTION,
+                    runtime_locks::PUBLISHER,
+                ] {
+                    assert!(runtime_locks::exclusive(target, kind).is_err());
+                }
+                // Even recreating the resource directory cannot change identity.
+                fs::create_dir(target)?;
+                assert!(runtime_locks::shared(target).is_err());
+                fs::remove_dir(target)?;
+                removed.set(true);
+                Ok(())
+            });
+            assert!(removed.get());
+            assert!(runtime_locks::shared(&old).is_ok());
+            assert!(runtime.join(runtime_locks::LOCKS).is_dir());
         }
 
         #[test]
@@ -824,6 +902,30 @@ mod tests {
             cleanup(temp.path(), VERSION, Some(&bundle));
             assert!(container.join(OLD).exists());
             fs::remove_dir(lock).unwrap();
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn refuses_reparse_lock_directory_and_lock_file() {
+            let (temp, runtime, bundle) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            let outside = temp.path().join("outside");
+            tree(&outside);
+            let locks = runtime.join(runtime_locks::LOCKS);
+            junction(&locks, &outside);
+            cleanup(temp.path(), VERSION, Some(&bundle));
+            assert!(old.join("nested/asset").exists());
+            assert_eq!(fs::read(outside.join("nested/asset")).unwrap(), b"asset");
+            fs::remove_dir(&locks).unwrap();
+            let lock = runtime_locks::lock_path(&old, runtime_locks::IN_USE).unwrap();
+            junction(&lock, &outside);
+            cleanup(temp.path(), VERSION, None);
+            assert!(old.join("nested/asset").exists());
+            assert_eq!(fs::read(outside.join("nested/asset")).unwrap(), b"asset");
+            fs::remove_dir(lock).unwrap();
+            cleanup(temp.path(), VERSION, None);
+            assert!(!old.exists());
         }
     }
 }

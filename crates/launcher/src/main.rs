@@ -133,15 +133,24 @@ fn run() -> Result<(), String> {
     }
 
     let runtime_dir = appdata_runtime_dir()?;
-    std::fs::create_dir_all(&runtime_dir)
-        .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
-
+    let runtime_parent = runtime_dir.parent().ok_or("runtime has no parent")?;
+    std::fs::create_dir_all(runtime_parent)
+        .map_err(|e| format!("create runtime parent failed: {e}"))?;
+    // Lock before creating the deletable version directory. A concurrent
+    // collector must not remove a directory we created before acquiring its lease.
     // Lease the real resource while preserving existing redirected APPDATA use.
     // Cleanup's reparse refusal must not turn a runnable install into an error.
-    let lock_dir =
-        std::fs::canonicalize(&runtime_dir).map_err(|e| format!("runtime identity failed: {e}"))?;
-    let _runtime_lease =
-        runtime_locks::shared(&lock_dir).map_err(|e| format!("runtime lease failed: {e}"))?;
+    let lock_dir = std::fs::canonicalize(runtime_parent)
+        .map_err(|e| format!("runtime identity failed: {e}"))?
+        .join(VERSION);
+    let _runtime_lease = effetune_bundle::wait_for_shared_lock(
+        runtime_locks::open(&lock_dir, runtime_locks::IN_USE)
+            .map_err(|e| format!("runtime lease failed: {e}"))?,
+        std::time::Duration::from_secs(60),
+    )
+    .map_err(|e| format!("runtime lease failed: {e}"))?;
+    std::fs::create_dir_all(&runtime_dir)
+        .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
     // Main assets had no extraction lock before this change. Serialize writers,
     // and share this lock with the collector of other versions.
     let extraction = effetune_bundle::wait_for_publish_lock(
@@ -734,8 +743,10 @@ mod tests {
     #[test]
     fn embedded_effetune_extracts_complete_bundle_beside_core() {
         let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
         let root = super::effetune_bundle::ensure_bundle(
-            temp.path(),
+            &runtime_dir,
             super::EFFETUNE_FILES,
             super::EFFETUNE_MANIFEST,
         )

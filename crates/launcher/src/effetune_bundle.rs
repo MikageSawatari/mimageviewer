@@ -90,19 +90,21 @@ fn ensure_bundle_inner(
         return Ok(root);
     }
     std::fs::create_dir_all(&container)?;
-    let lock_path = runtime.join(".effetune.lock");
-    if exists_checked(&lock_path)? && !checked_metadata(&lock_path)?.is_file() {
-        return Err(io::Error::other("bundle lock must be a regular file"));
-    }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
+    let started = std::time::Instant::now();
+    let lock = runtime_locks::open(runtime, runtime_locks::PUBLISHER)?;
     // Blocking OS locking runs on a worker, with a bounded launcher wait. A
     // timed-out worker only releases its lock: it never publishes anything.
     let _lock = match wait_for_publish_lock(lock, wait) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return ready_generation(&container, files, manifest, rejected_generation)
+                .or(Err(error));
+        }
+    };
+    // Released launchers only know the old in-tree publisher lock. Always take
+    // the permanent lock first, then this compatibility lock, within one budget.
+    let legacy = runtime_locks::open_legacy_publisher(runtime, false)?;
+    let _legacy = match wait_for_publish_lock(legacy, wait.saturating_sub(started.elapsed())) {
         Ok(lock) => lock,
         Err(error) => {
             return ready_generation(&container, files, manifest, rejected_generation)
@@ -119,20 +121,45 @@ pub(crate) fn wait_for_publish_lock(
     lock: std::fs::File,
     wait: Duration,
 ) -> io::Result<std::fs::File> {
-    if lock.try_lock_exclusive()? {
+    wait_for_lock(lock, wait, LockMode::Exclusive)
+}
+
+pub(crate) fn wait_for_shared_lock(
+    lock: std::fs::File,
+    wait: Duration,
+) -> io::Result<std::fs::File> {
+    wait_for_lock(lock, wait, LockMode::Shared)
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+fn wait_for_lock(lock: std::fs::File, wait: Duration, mode: LockMode) -> io::Result<std::fs::File> {
+    let acquired = match mode {
+        LockMode::Shared => fs4::fs_std::FileExt::try_lock_shared(&lock)?,
+        LockMode::Exclusive => lock.try_lock_exclusive()?,
+    };
+    if acquired {
         return Ok(lock);
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
-        .name("effetune-publish-lock".into())
+        .name("runtime-owner-lock".into())
         .spawn(move || {
-            let result = lock.lock_exclusive().map(|()| lock);
+            let result = match mode {
+                LockMode::Shared => fs4::fs_std::FileExt::lock_shared(&lock),
+                LockMode::Exclusive => lock.lock_exclusive(),
+            }
+            .map(|()| lock);
             let _ = tx.send(result);
         })?;
     rx.recv_timeout(wait).map_err(|error| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("EffeTune publisher wait failed after {wait:?}: {error}; retry 音響調整"),
+            format!("runtime owner wait failed after {wait:?}: {error}"),
         )
     })?
 }
@@ -322,7 +349,9 @@ mod tests {
             bytes: b"bundle",
             hash: Box::leak(crate::hex_lower(&Sha256::digest(b"bundle")).into_boxed_str()),
         }];
-        test(temp.path(), &files);
+        let runtime = temp.path().join("runtime").join("4.3.0");
+        std::fs::create_dir_all(&runtime).unwrap();
+        test(&runtime, &files);
     }
     #[test]
     fn extracts_and_reuses_complete_verified_tree() {
@@ -473,6 +502,23 @@ mod tests {
             assert_eq!(error.reason.kind(), io::ErrorKind::TimedOut);
             lock.unlock().unwrap();
             assert!(ensure_bundle(dir, files, "current").is_ok());
+        });
+    }
+
+    #[test]
+    fn shared_owner_wait_keeps_multiple_readers_and_excludes_collector() {
+        with_fixture(|dir, _| {
+            let first = wait_for_shared_lock(
+                runtime_locks::open(dir, runtime_locks::IN_USE).unwrap(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            let second = runtime_locks::shared(dir).unwrap();
+            assert!(runtime_locks::exclusive(dir, runtime_locks::IN_USE).is_err());
+            drop(first);
+            assert!(runtime_locks::exclusive(dir, runtime_locks::IN_USE).is_err());
+            drop(second);
+            assert!(runtime_locks::exclusive(dir, runtime_locks::IN_USE).is_ok());
         });
     }
 
