@@ -1424,11 +1424,30 @@ pub(crate) fn load_similar_preview_pixels(
                 },
                 crate::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
                     crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly,
+                    crate::canonical_image_loader::RawStage::Preview,
                 ),
             )
             .map_err(|error| error.to_string())?;
-            let crate::canonical_image_loader::CanonicalImageDecode::Static(image) = decoded else {
-                return Err("動画は画像として準備できません".to_owned());
+            let image = match decoded {
+                crate::canonical_image_loader::CanonicalImageDecode::Static(image) => image,
+                crate::canonical_image_loader::CanonicalImageDecode::RawPreview {
+                    preview: Some(preview),
+                    developed_dims,
+                    ..
+                } => crate::canonical_image_loader::CanonicalStaticImage {
+                    image: preview.image,
+                    source_dims: developed_dims,
+                    animation: crate::canonical_image_loader::CanonicalStaticAnimation::Still,
+                },
+                crate::canonical_image_loader::CanonicalImageDecode::RawPreview {
+                    unavailable,
+                    ..
+                } => {
+                    return Err(format!("RAW preview unavailable: {unavailable:?}"));
+                }
+                crate::canonical_image_loader::CanonicalImageDecode::Animated { .. } => {
+                    return Err("動画は画像として準備できません".to_owned());
+                }
             };
             let raster = image.into_gpu_raster();
             (
@@ -1463,11 +1482,30 @@ pub(crate) fn load_similar_preview_pixels(
                 },
                 crate::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
                     crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly,
+                    crate::canonical_image_loader::RawStage::Preview,
                 ),
             )
             .map_err(|error| error.to_string())?;
-            let crate::canonical_image_loader::CanonicalImageDecode::Static(image) = decoded else {
-                return Err("動画は画像として準備できません".to_owned());
+            let image = match decoded {
+                crate::canonical_image_loader::CanonicalImageDecode::Static(image) => image,
+                crate::canonical_image_loader::CanonicalImageDecode::RawPreview {
+                    preview: Some(preview),
+                    developed_dims,
+                    ..
+                } => crate::canonical_image_loader::CanonicalStaticImage {
+                    image: preview.image,
+                    source_dims: developed_dims,
+                    animation: crate::canonical_image_loader::CanonicalStaticAnimation::Still,
+                },
+                crate::canonical_image_loader::CanonicalImageDecode::RawPreview {
+                    unavailable,
+                    ..
+                } => {
+                    return Err(format!("RAW preview unavailable: {unavailable:?}"));
+                }
+                crate::canonical_image_loader::CanonicalImageDecode::Animated { .. } => {
+                    return Err("動画は画像として準備できません".to_owned());
+                }
             };
             let raster = image.into_gpu_raster();
             (

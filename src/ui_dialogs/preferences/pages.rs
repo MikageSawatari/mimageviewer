@@ -25,6 +25,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    if state.transfer_feedback.is_some() {
+        super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
+        ui.separator();
+    }
     anchored(ui, state, "general/theme", |ui, state| {
         ui.label(egui::RichText::new("テーマ").strong());
         ui.add_space(4.0);
@@ -1487,6 +1491,11 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
     });
 
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/book-resume-meter", |ui, state| {
+        draw_book_resume_meter_settings(ui, &mut state.settings);
+    });
+
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
@@ -1594,6 +1603,19 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "閲覧履歴: 閲覧位置",
         );
     });
+}
+
+pub(super) fn draw_book_resume_meter_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.checkbox(
+        &mut settings.thumb_show_book_resume_meter,
+        "本のサムネイルに前回の読書位置を表示",
+    );
+    ui.small(
+        "メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません",
+    );
 }
 
 pub(super) fn draw_video_thumbnail_indicator_settings(
@@ -2756,7 +2778,7 @@ fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
 pub(super) fn page_command_settings(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    _ime_active: bool,
+    _keyboard_capture_blocked: bool,
 ) {
     ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
     ui.small("Esc / 修飾なし矢印 / サムネイル一覧の Shift+矢印は解除できない固定操作です。競合をなくすには、割り当てた側を変更または解除してください。");
@@ -2788,7 +2810,7 @@ pub(super) fn page_command_settings(
 pub(super) fn draw_operation_assignment_editor_dialog(
     ctx: &egui::Context,
     state: &mut PreferencesState,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     let Some(editor) = state.operation_assignment_editor.clone() else {
         return;
@@ -2823,7 +2845,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                 )
             );
             if chord_keyboard_editor {
-                draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                draw_operation_assignment_editor_body(ui, state, &editor, keyboard_capture_blocked);
             } else {
                 let available_h = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
@@ -2831,7 +2853,12 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                     .max_height(available_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                        draw_operation_assignment_editor_body(
+                            ui,
+                            state,
+                            &editor,
+                            keyboard_capture_blocked,
+                        );
                     });
             }
         });
@@ -3193,13 +3220,20 @@ fn draw_operation_assignment_editor_body(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     editor: &OperationAssignmentEditor,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     match (&editor.target, editor.tab) {
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::Keyboard) => {
             let keymap = Keymap::from_settings(&state.settings.keymap);
             let conflicts = keymap.binding_conflicts();
-            command_editor_for_action(ui, state, &keymap, &conflicts, ime_active, *action);
+            command_editor_for_action(
+                ui,
+                state,
+                &keymap,
+                &conflicts,
+                keyboard_capture_blocked,
+                *action,
+            );
         }
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::RingPad) => {
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
@@ -4138,13 +4172,13 @@ fn command_editor_for_action(
     state: &mut PreferencesState,
     keymap: &Keymap,
     conflicts: &[BindingConflict],
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
     action: KeyAction,
 ) {
     ui.label(egui::RichText::new("割り当て編集").strong());
     ensure_command_editor_loaded(state, keymap, action);
     if let Some(slot) = state.command_capture_slot
-        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, ime_active)
+        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, keyboard_capture_blocked)
     {
         match result {
             Ok(label) if slot < state.command_chord_inputs.len() => {
@@ -4553,9 +4587,9 @@ fn parse_command_chord_inputs_for_editor(
 fn poll_command_chord_capture(
     ctx: &egui::Context,
     action: KeyAction,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) -> Option<Result<String, String>> {
-    if ime_active {
+    if keyboard_capture_blocked {
         return None;
     }
     #[cfg(windows)]
@@ -6527,6 +6561,12 @@ pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn page_raw_develop(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "raw-develop/settings", |ui, state| {
+        crate::ui_raw::draw_settings(ui, &mut state.settings);
+    });
+}
+
 pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "parallelism/mode", |ui, state| {
         let s = &mut state.settings;
@@ -7484,13 +7524,28 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
-/// v0.8.0: 自動インデクサの速度プロファイル設定ページ。
+/// 検索インデックスの起動時確認と速度プロファイル設定ページ。
 ///
 /// `IndexerSpeedProfile` は `GlobalIoSemaphore` の permit 数を決める。
 /// 値の変更は **次回起動時に反映** される (ランタイム差し替えは `sync_with_favorites`
 /// でも反映されないので現状は再起動が必要)。
 pub(super) fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::IndexerSpeedProfile;
+    anchored(ui, state, "indexer/offline-change-scan", |ui, state| {
+        crate::ui_helpers::draw_offline_change_scan_setting(
+            ui,
+            &mut state.settings.skip_offline_change_scan,
+        );
+        ui.label(
+            egui::RichText::new("[今すぐ確認] は「お気に入り > 編集」にあります。")
+                .weak()
+                .size(11.0),
+        );
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
     anchored(ui, state, "indexer/speed", |ui, state| {
         let s = &mut state.settings;
 
@@ -7546,8 +7601,9 @@ pub(super) fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesStat
             "アプリを閉じる代わりに、タスクトレイに常駐する",
         )
         .on_hover_text(
-            "OFF (既定): [×] でプロセス終了。次回起動時にインデックスが再スキャンされます。\n\
-         ON: [×] でウィンドウを隠してタスクトレイに常駐。notify-rs でファイル変更を\n\
+            "OFF (既定): [×] でアプリ終了。終了中の変更を次回起動時に確認するかは\n\
+         「ライブラリ > 検索インデックス」で選べます。\n\
+         ON: [×] でウィンドウを隠してタスクトレイに常駐。ファイル変更を\n\
          追い続けるため、次回開いたときは最新のインデックスがそのまま使えます。\n\
          終了はタスクトレイアイコンを右クリックして「終了」を選んでください。",
         );
@@ -8000,6 +8056,18 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
     }
 
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-input-limit", |ui, state| {
+        draw_effetune_input_limit_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-minimized", |ui, state| {
+        draw_effetune_minimized_settings(ui, &mut state.settings);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+    });
+
     anchored(ui, state, "video/normalize-cache", |ui, state| {
         draw_audio_normalize_cache_controls(ui, state);
     });
@@ -8121,6 +8189,40 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
             }
         }
     });
+}
+
+pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    {
+        ui.label(egui::RichText::new("音響調整 (EffeTune)").strong());
+        ui.checkbox(
+            &mut settings.effetune_pre_limiter_enabled,
+            "EffeTune に渡す前に 0dB を超える音を抑える",
+        )
+        .on_hover_text(
+            "音量を全体的に下げず、0dB を超えるピークを抑えます。音の可視化だけでも OVERLOAD が出るのを防ぎます。\n\
+             EffeTune 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
+             OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
+        );
+    }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_minimized_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_keep_visible_when_minimized,
+        "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+    )
+    .on_hover_text(
+        "表示していた音響調整の窓を、メインウィンドウの最小化中も残します。初期値は OFF です。\n\
+         OK を押すと反映します。最小化中でも切り替わります。自分で閉じた窓は開きません。\n\
+         リモート閲覧で操作している間は、この設定にかかわらず隠れます。\n\
+         タスクトレイへの格納だけでは窓は隠れません。",
+    );
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
 }
 
 fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -8652,7 +8754,87 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 #[cfg(not(windows))]
 pub(super) fn page_vst3(_ui: &mut egui::Ui, _state: &mut PreferencesState) {}
 
+pub(super) fn draw_file_organize_destinations_settings(
+    ui: &mut egui::Ui,
+    destinations: &mut Vec<crate::settings::FileOrganizeDestination>,
+) {
+    ui.label(egui::RichText::new("ファイル整理先").strong());
+    ui.label("一覧の右クリックから使うコピー・移動先を登録します。OK で確定します。");
+    let count = destinations.len();
+    let mut reorder = None;
+    let mut remove = None;
+    for (index, destination) in destinations.iter_mut().enumerate() {
+        ui.push_id(("organize-destination", index), |ui| {
+            ui.group(|ui| {
+                // 狭い右ペインでも編集欄と操作列を上下に分け、パスを隠さない。
+                ui.horizontal(|ui| {
+                    ui.label("表示名");
+                    let width = ui.available_width().max(80.0);
+                    crate::ime_focus::add_singleline(ui, &mut destination.name, None, |edit| {
+                        edit.desired_width(width)
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("パス");
+                    let mut path = destination.path.to_string_lossy().into_owned();
+                    let width = ui.available_width().max(80.0);
+                    let response = crate::ime_focus::add_singleline(ui, &mut path, None, |edit| {
+                        edit.desired_width(width)
+                    });
+                    if response.changed() {
+                        destination.path = PathBuf::from(path);
+                    }
+                    response.on_hover_text(destination.path.display().to_string());
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("参照…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        destination.path = path;
+                    }
+                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                        reorder = Some((index, index - 1));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < count, egui::Button::new("↓"))
+                        .clicked()
+                    {
+                        reorder = Some((index, index + 1));
+                    }
+                    if ui
+                        .button("削除")
+                        .on_hover_text("登録を外します。フォルダは削除しません。")
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+                if let Err(error) = destination.validate() {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        destinations.remove(index);
+    } else if let Some((from, to)) = reorder {
+        destinations.swap(from, to);
+    }
+    if ui.button("追加…").clicked()
+        && let Some(path) = rfd::FileDialog::new().pick_folder()
+    {
+        destinations.push(crate::settings::FileOrganizeDestination::from_path(path));
+    }
+}
+
 pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "folder/organize-destinations", |ui, state| {
+        draw_file_organize_destinations_settings(
+            ui,
+            &mut state.settings.file_organize_destinations,
+        );
+    });
+    ui.add_space(12.0);
     anchored(ui, state, "folder/hidden-files", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("ファイル・フォルダの表示").strong());

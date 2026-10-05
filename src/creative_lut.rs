@@ -357,6 +357,13 @@ pub struct CreativeLutLibrary {
 }
 
 impl CreativeLutLibrary {
+    #[cfg(test)]
+    pub(crate) fn from_builtin_for_test(builtin: BuiltinCreativeLut) -> Self {
+        Self {
+            loaded: HashMap::from([(builtin.id(), Arc::new(build_builtin_creative_lut(builtin)))]),
+            ..Self::default()
+        }
+    }
     pub fn new(entries: &[CreativeLutEntry]) -> Self {
         let mut this = Self::default();
         this.reload(entries);

@@ -1,13 +1,13 @@
 //! Windows Imaging Component (WIC) を使った汎用画像デコーダ。
 //!
-//! `image` クレートが対応していない HEIC/HEIF, AVIF, JPEG XL, RAW (CR2/NEF/ARW/DNG 等)
+//! `image` クレートが対応していない HEIC/HEIF, AVIF, JPEG XL
 //! などのフォーマットを Windows のネイティブコーデック経由でデコードする。
+//! RAW はこの境界で拒否し、上位から LibRaw に送る。
 //!
 //! 必要なコーデックは Microsoft Store から無料インストールできる:
 //! - HEIC/HEIF: HEIF Image Extensions
 //! - AVIF:      AV1 Video Extensions
 //! - JPEG XL:   JPEG XL Image Extensions
-//! - RAW:       Raw Image Extension
 //!
 //! インストールされていないフォーマットは `decode_to_dynamic_image` が `None` を返す。
 //!
@@ -65,9 +65,7 @@ pub const WIC_SUPPORTED_EXTENSIONS: &[&str] = &[
     // モダン形式
     "heic", "heif", "avif", "jxl",
     // TIFF (image クレートも対応するが WIC の方が高機能)
-    "tiff", "tif", // カメラ RAW (Raw Image Extension が必要)
-    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
-    "rwl", "iiq",
+    "tiff", "tif",
 ];
 
 /// 拡張子が WIC で扱える可能性があるか判定する。
@@ -85,6 +83,10 @@ pub fn is_wic_supported_extension(ext: &str) -> bool {
 /// COM は呼び出しごとに初期化・解放するため、ワーカースレッドから自由に呼べる。
 /// `S_FALSE` (= 既に初期化済み) も成功として扱う。
 pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
+    if crate::raw_format::is_raw_path(path) {
+        debug_assert!(false, "RAW must be routed to LibRaw before WIC");
+        return None;
+    }
     #[cfg(not(windows))]
     {
         let _ = path;
@@ -137,8 +139,15 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
 /// 戻り後は呼び出し側で `bytes` を解放してよい。
 ///
 /// 性能面: コピー 1 回 (典型的な 1〜50 MB の画像で 1 ms 未満) は WIC デコード本体
-/// (HEIC/AVIF/RAW で数十〜数百 ms) に比べ無視できる。
-pub fn decode_to_dynamic_image_from_bytes(bytes: &[u8]) -> Option<image::DynamicImage> {
+/// (HEIC/AVIF で数十〜数百 ms) に比べ無視できる。
+pub fn decode_to_dynamic_image_from_bytes(
+    bytes: &[u8],
+    extension: &str,
+) -> Option<image::DynamicImage> {
+    if crate::raw_format::is_raw_ext(extension) {
+        debug_assert!(false, "RAW must be routed to LibRaw before WIC");
+        return None;
+    }
     #[cfg(not(windows))]
     {
         let _ = bytes;
@@ -241,8 +250,12 @@ unsafe fn decode_first_frame(
 }
 
 /// WIC メタデータから EXIF Orientation 値を読み取る。
-/// rexif が対応しない RAW 形式 (ORF, CR2, NEF 等) でも取得できる。
+/// RAW の向きは LibRaw が適用するため、この境界では拒否する。
 pub fn read_wic_orientation(path: &Path) -> Option<u16> {
+    if crate::raw_format::is_raw_path(path) {
+        debug_assert!(false, "RAW orientation comes from LibRaw");
+        return None;
+    }
     #[cfg(not(windows))]
     {
         let _ = path;
@@ -328,17 +341,14 @@ mod tests {
         assert!(is_wic_supported_extension("heif"));
         assert!(is_wic_supported_extension("avif"));
         assert!(is_wic_supported_extension("jxl"));
-        assert!(is_wic_supported_extension("dng"));
-        assert!(is_wic_supported_extension("cr2"));
-        assert!(is_wic_supported_extension("nef"));
-        assert!(is_wic_supported_extension("arw"));
+        assert!(is_wic_supported_extension("tiff"));
     }
 
     #[test]
     fn is_wic_supported_extension_uppercase() {
         assert!(is_wic_supported_extension("HEIC"));
         assert!(is_wic_supported_extension("Avif"));
-        assert!(is_wic_supported_extension("CR2"));
+        assert!(is_wic_supported_extension("TIFF"));
     }
 
     #[test]
@@ -350,5 +360,25 @@ mod tests {
         assert!(!is_wic_supported_extension("gif"));
         assert!(!is_wic_supported_extension("txt"));
         assert!(!is_wic_supported_extension(""));
+        for &raw in crate::raw_format::RAW_EXTENSIONS {
+            assert!(!is_wic_supported_extension(raw));
+        }
+    }
+
+    #[test]
+    fn raw_path_and_bytes_are_refused_before_wic() {
+        for (path, extension) in [("sample.dng", "dng"), ("sample.CR2", "CR2")] {
+            let path_result = std::panic::catch_unwind(|| decode_to_dynamic_image(Path::new(path)));
+            let bytes_result = std::panic::catch_unwind(|| {
+                decode_to_dynamic_image_from_bytes(b"not a decodable image", extension)
+            });
+            if cfg!(debug_assertions) {
+                assert!(path_result.is_err());
+                assert!(bytes_result.is_err());
+            } else {
+                assert!(path_result.unwrap().is_none());
+                assert!(bytes_result.unwrap().is_none());
+            }
+        }
     }
 }

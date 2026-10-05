@@ -2184,6 +2184,7 @@ impl crate::app::App {
             }
         });
         Ok(MaterializeRequest {
+            raw_brightness: self.settings.raw_brightness,
             source,
             policy: materialize_policy(tool.payload),
             page_edits: page_edits.map(MaterializePageEdits::Single),
@@ -2277,6 +2278,7 @@ impl crate::app::App {
             _ => return Err("見開き右ページの編集情報を準備できません".to_string()),
         };
         Ok(crate::materializer::MaterializeRequest {
+            raw_brightness: self.settings.raw_brightness,
             source: crate::materializer::MaterializeSource::MergedSpread {
                 label,
                 left: Box::new(left.source),

@@ -332,6 +332,7 @@ pub struct FtsIndex {
     index: Index,
     reader: IndexReader,
     fields: Fields,
+    recreated_on_open: bool,
 }
 
 impl FtsIndex {
@@ -358,6 +359,9 @@ impl FtsIndex {
         };
         drop(mmap_dir);
 
+        let recreated_on_open = existing
+            .as_ref()
+            .is_none_or(|idx| schema_is_stale(&idx.schema()));
         let index = match existing {
             Some(idx) if schema_is_stale(&idx.schema()) => {
                 drop(idx);
@@ -381,7 +385,13 @@ impl FtsIndex {
             index,
             reader,
             fields,
+            recreated_on_open,
         })
+    }
+
+    /// 新規作成・schema 再構築を同じ起動の省略判断へ渡す。
+    pub(crate) fn recreated_on_open(&self) -> bool {
+        self.recreated_on_open
     }
 
     pub fn fields(&self) -> &Fields {

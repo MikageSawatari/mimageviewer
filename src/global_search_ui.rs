@@ -37,7 +37,7 @@ use crate::indexer_manager::SearchHandle;
 /// 変更時は `reset_for_new_query` と同じ経路で検索を再実行する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSearchFilters {
-    /// None = 登録済み全お気に入りを対象。Some(id) なら単一 favorite に限定。
+    /// None = 登録済み全お気に入りを対象。Some(id) なら当 favorite 配下に限定。
     pub favorite: Option<Uuid>,
     /// None = 全タイプ (画像/PDF/動画/音声)。Some(k) で単一種別に限定。
     pub kind: Option<IndexKind>,
@@ -55,6 +55,25 @@ impl Default for GlobalSearchFilters {
             target: SearchTarget::All,
             or_mode: false,
         }
+    }
+}
+
+fn resolve_favorite_filter(
+    selected: &mut Option<Uuid>,
+    favorites: &[crate::settings::FavoriteEntry],
+    ownership: &crate::metadata_ownership::MetadataOwnership,
+) -> Vec<Uuid> {
+    // 選択できるかは保存フラグで判定する。同 root の非所有者も ON なら選択を保つ。
+    if selected.is_some_and(|id| {
+        !favorites
+            .iter()
+            .any(|favorite| favorite.id == id && favorite.auto_index_metadata)
+    }) {
+        *selected = None;
+    }
+    match *selected {
+        Some(id) => ownership.filter_set(id),
+        None => ownership.effective_ids(),
     }
 }
 
@@ -1890,7 +1909,11 @@ impl App {
         }
         // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
         // 検索結果向けに再起動 + fts_meta から tags_cache を再プリウォーム。
-        self.prewarm_grid_tags();
+        {
+            let _section =
+                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::TagPrewarm);
+            self.prewarm_grid_tags();
+        }
         // Ctrl+G 結果の動画サムネ抽出スレッドを (必要に応じて) 再 spawn する。
         // streaming 中は pin 持ち動画のみ、`done=true` 後は全動画を Shell API で展開する。
         self.respawn_search_video_thread();
@@ -2016,12 +2039,15 @@ impl App {
         // 周期で走り、検索結果に動画が数千〜数万件あると 1 件ずつ `db.lookup()` を
         // 呼ぶと UI スレッドで大量の SQLite I/O が発生する。`lookup_webps_many` で
         // `IN` 句に集約することで 500 件チャンク × N 回の prepared statement に圧縮。
+        let pin_fetch_section =
+            crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::VideoPinFetch);
         let pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>> =
             if let Some(db) = self.video_pin_db.as_ref() {
                 db.lookup_webps_many(&not_loaded_paths)
             } else {
                 std::collections::HashMap::new()
             };
+        drop(pin_fetch_section);
         let pin_paths: HashSet<std::path::PathBuf> = pin_blobs.keys().cloned().collect();
         let streaming = !self.global_search.done;
         let candidates = Self::compute_search_video_candidates(
@@ -2201,6 +2227,8 @@ impl App {
             ctx.request_repaint_after(debounce - elapsed);
             return;
         }
+        let _section =
+            crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::SearchDebounce);
         self.spawn_global_search(ctx);
     }
 
@@ -2239,18 +2267,15 @@ impl App {
         // 選択中の favorite が削除された / auto_index_metadata を外された場合、UI ラベルと
         // 検索スコープが食い違う (ラベル = 名前表示、スコープ = 全対象) のを避けるため
         // フィルタ側を None に倒して UI も「すべて」に戻す。
-        let all_favs: Vec<uuid::Uuid> = self
-            .settings
-            .favorites
-            .iter()
-            .filter(|f| f.auto_index_metadata)
-            .map(|f| f.id)
-            .collect();
-        if let Some(id) = self.global_search.filters.favorite {
-            if !all_favs.contains(&id) {
-                self.global_search.filters.favorite = None;
-            }
-        }
+        let ownership = crate::metadata_ownership::metadata_ownership(
+            &self.settings.favorites,
+            &[self.settings.books_root_path()],
+        );
+        let favs = resolve_favorite_filter(
+            &mut self.global_search.filters.favorite,
+            &self.settings.favorites,
+            &ownership,
+        );
 
         let Some(mgr) = self.indexer_manager.as_ref() else {
             self.global_search.reject_message =
@@ -2260,10 +2285,6 @@ impl App {
             return;
         };
 
-        let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
-            Some(id) => vec![id],
-            None => all_favs,
-        };
         let scope = crate::global_search::SearchScope {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
@@ -2348,8 +2369,16 @@ impl App {
         let mut events_processed = 0;
         let mut changed = false;
         let mut stats_changed = false;
+        let mut search_perf_section = None;
         while events_processed < MAX_EVENTS_PER_FRAME {
-            match rx.try_recv() {
+            let event = rx.try_recv();
+            if !matches!(event, Err(crossbeam_channel::TryRecvError::Empty)) {
+                crate::perf::stall::PollSection::ensure(
+                    &mut search_perf_section,
+                    crate::perf::stall::PollPart::SearchEvents,
+                );
+            }
+            match event {
                 Ok(SearchStreamEvent::Batch {
                     hits,
                     scanned_candidates,
@@ -2439,6 +2468,7 @@ impl App {
         };
         let mut rebuild = false;
         let mut writes_after_read = Vec::new();
+        let mut search_perf_section = None;
         for _ in 0..MAX_EVENTS_PER_FRAME {
             #[cfg(test)]
             if prepare.hold_ready_for_test && prepare.held_ready_for_test.is_some() {
@@ -2456,11 +2486,19 @@ impl App {
                 Ok(output) => output,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    crate::perf::stall::PollSection::ensure(
+                        &mut search_perf_section,
+                        crate::perf::stall::PollPart::SearchEvents,
+                    );
                     prepare.in_flight = None;
                     prepare.desired = None;
                     break;
                 }
             };
+            crate::perf::stall::PollSection::ensure(
+                &mut search_perf_section,
+                crate::perf::stall::PollPart::SearchEvents,
+            );
             match output {
                 SearchPrepareOutput::RatedBatch(sequence, hits) => {
                     if sequence == prepare.rated_batch_sequence.wrapping_add(1) {
@@ -2488,6 +2526,9 @@ impl App {
                     }
                 }
                 SearchPrepareOutput::Ready(wish, prepared) => {
+                    let _section = crate::perf::stall::PollSection::start(
+                        crate::perf::stall::PollPart::PreparedAdoption,
+                    );
                     #[cfg(test)]
                     if prepare.hold_ready_for_test {
                         prepare.held_ready_for_test =
@@ -2603,6 +2644,10 @@ impl App {
         }
         if self.global_search.active && prepare.in_flight.is_none() && !rebuild {
             if let Some(wish) = prepare.desired.as_mut() {
+                crate::perf::stall::PollSection::ensure(
+                    &mut search_perf_section,
+                    crate::perf::stall::PollPart::SearchEvents,
+                );
                 prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
                 wish.sequence = prepare.next_sequence;
                 wish.source_generation = self.items_generation;
@@ -3633,6 +3678,62 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    fn favorite_filter_fixture(id: u128, path: &str, on: bool) -> crate::settings::FavoriteEntry {
+        crate::settings::FavoriteEntry {
+            id: Uuid::from_u128(id),
+            name: String::new(),
+            path: path.into(),
+            auto_index_metadata: on,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        }
+    }
+
+    #[test]
+    fn favorite_filter_clears_off_outer_even_with_enabled_child() {
+        let favorites = vec![
+            favorite_filter_fixture(1, "c:/photos", false),
+            favorite_filter_fixture(2, "c:/photos/inner", true),
+            favorite_filter_fixture(3, "c:/other", true),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut selected = Some(favorites[0].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[1].id, favorites[2].id]
+        );
+        assert_eq!(selected, None);
+        selected = Some(favorites[1].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[1].id]
+        );
+        assert_eq!(selected, Some(favorites[1].id));
+    }
+
+    #[test]
+    fn favorite_filter_keeps_on_non_owner_and_clears_deleted_selection() {
+        let favorites = vec![
+            favorite_filter_fixture(1, "c:/photos", true),
+            favorite_filter_fixture(2, "C:/PHOTOS", true),
+            favorite_filter_fixture(3, "c:/other", true),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut selected = Some(favorites[1].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[0].id]
+        );
+        assert_eq!(selected, Some(favorites[1].id));
+        selected = Some(Uuid::from_u128(99));
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[0].id, favorites[2].id]
+        );
+        assert_eq!(selected, None);
+    }
 
     #[test]
     fn search_membership_keeps_survivor_order_and_appends_candidates() {

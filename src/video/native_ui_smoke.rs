@@ -1792,18 +1792,7 @@ pub(crate) fn click_native_audio_control(
     validate_os_target(&target)?;
     {
         let state = lock_broker_state(broker())?;
-        let current = coherent_audio_control_targets(&state, owner_hwnd, name)?;
-        if !matches!(current.as_slice(), [(fresh, fresh_token)]
-            if *fresh_token == token
-                && fresh.host.publisher == target.host.publisher
-                && fresh.render.publisher == target.render.publisher
-                && fresh.client_point.x == target.client_point.x
-                && fresh.client_point.y == target.client_point.y)
-        {
-            return Err(format!(
-                "native audio control {name:?} changed before input"
-            ));
-        }
+        validate_audio_control_before_input(&state, owner_hwnd, name, &target, token)?;
     }
     require_unexpired_deadline(deadline, "clicking native audio control")?;
     // Move, press and release are one ordered SendInput batch. The observed
@@ -1846,6 +1835,40 @@ pub(crate) fn click_native_audio_control(
         ));
     }
     Ok((token, target.client_point.x, target.client_point.y))
+}
+
+fn validate_audio_control_before_input(
+    state: &BrokerState,
+    owner_hwnd: u64,
+    name: NativeUiSmokeAudioControl,
+    target: &PreparedTarget,
+    token: u64,
+) -> Result<(), String> {
+    let current = coherent_audio_control_targets(state, owner_hwnd, name)?;
+    // The control token already covers its complete Response and area, and is
+    // stable across identical commits. Keep it: comparing only name/center would
+    // accept a replaced or resized control. Canvas validation also binds the
+    // control to the original source, host, overlay owner and geometry lifetime.
+    if target.still_matches(state, PreparedTargetValidationPhase::BeforeInput)
+        && matches!(current.as_slice(), [(fresh, fresh_token)]
+            if *fresh_token == token
+                && fresh.host.publisher == target.host.publisher
+                && fresh.render.publisher == target.render.publisher
+                && fresh.area == target.area
+                && fresh.client_point.x == target.client_point.x
+                && fresh.client_point.y == target.client_point.y)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "native audio control {name:?} changed before input: expected token={token}, area={:?}, current={:?}",
+            target.area,
+            current
+                .iter()
+                .map(|(fresh, token)| (*token, fresh.area))
+                .collect::<Vec<_>>()
+        ))
+    }
 }
 
 fn coherent_audio_control_targets(
@@ -4868,6 +4891,160 @@ mod tests {
         fn completion(&self) -> Result<Option<[i32; 2]>, String> {
             let state = lock_broker_state(&self.broker).unwrap();
             completed_actual_point(&state, self.metadata.token, &self.prepared)
+        }
+    }
+
+    fn audio_test_logical(owner: &Arc<NativeUiSmokeOverlayOwner>) -> NativeUiSmokeLogicalInventory {
+        NativeUiSmokeLogicalInventory::new(
+            owner,
+            None,
+            None,
+            NativeUiSmokePanoramaClassification::Unknown,
+            false,
+            false,
+            false,
+            2.0,
+            400,
+            240,
+        )
+        .with_audio_controls(
+            vec![(
+                NativeUiSmokeAudioControl::Row(0),
+                test_fixture_panorama_observation(true),
+            )],
+            true,
+        )
+    }
+
+    #[test]
+    fn audio_control_recheck_accepts_identical_commits_and_unrelated_controls() {
+        let fixture = ReceiptFixture::new();
+        let mut state = lock_broker_state(&fixture.broker).unwrap();
+        let key = fixture.prepared.target.render.publisher;
+        state.renders.get_mut(&key).unwrap().inventory = NativeUiSmokeCommittedInventory::commit(
+            None,
+            audio_test_logical(&fixture._ui_smoke_owner),
+        );
+        let name = NativeUiSmokeAudioControl::Row(0);
+        let (target, token) = coherent_audio_control_targets(&state, 0x100, name)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut logical = audio_test_logical(&fixture._ui_smoke_owner);
+        logical.audio_controls.push((
+            NativeUiSmokeAudioControl::Button,
+            test_fixture_panorama_observation(true),
+        ));
+        let render = state.renders.get_mut(&key).unwrap();
+        let previous_serial = render.inventory.commit_serial;
+        render.inventory =
+            NativeUiSmokeCommittedInventory::commit(Some(&render.inventory), logical);
+        assert_ne!(render.inventory.commit_serial, previous_serial);
+        assert!(render.inventory.target_version > target.render.inventory.target_version);
+        assert!(validate_audio_control_before_input(&state, 0x100, name, &target, token).is_ok());
+    }
+
+    #[test]
+    fn audio_control_recheck_rejects_moved_replaced_or_ambiguous_targets() {
+        for change in [
+            "move",
+            "resize_same_center",
+            "clip",
+            "layer",
+            "sense",
+            "disabled",
+            "hidden_reappeared",
+            "disabled_reenabled",
+            "renamed",
+            "dpi",
+            "client_size",
+            "source",
+            "requested_source",
+            "generation",
+            "host_request",
+            "host_epoch",
+            "host_retired",
+            "render_retired",
+            "overlay_owner",
+            "geometry",
+            "geometry_version",
+            "ambiguous",
+        ] {
+            let fixture = ReceiptFixture::new();
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let key = fixture.prepared.target.render.publisher;
+            let host_key = fixture.prepared.target.host.publisher;
+            state.renders.get_mut(&key).unwrap().inventory =
+                NativeUiSmokeCommittedInventory::commit(
+                    None,
+                    audio_test_logical(&fixture._ui_smoke_owner),
+                );
+            let name = NativeUiSmokeAudioControl::Row(0);
+            let (target, token) = coherent_audio_control_targets(&state, 0x100, name)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let replacement_owner = allocate_overlay_owner();
+            let mut logical = audio_test_logical(&fixture._ui_smoke_owner);
+            let observation = &mut logical.audio_controls[0].1;
+            match change {
+                "move" => {
+                    observation.rect = observation.rect.translate(egui::vec2(1.0, 0.0));
+                    observation.interact_rect = observation.rect;
+                }
+                "resize_same_center" => {
+                    observation.rect = observation.rect.shrink(1.0);
+                    observation.interact_rect = observation.rect;
+                }
+                "clip" => observation.clip_rect = observation.clip_rect.shrink(1.0),
+                "layer" => observation.layer_id.id = egui::Id::new("replacement_layer"),
+                "sense" => observation.sense = egui::Sense::hover(),
+                "disabled" | "disabled_reenabled" => observation.enabled = false,
+                "hidden_reappeared" => logical.audio_controls.clear(),
+                "renamed" => logical.audio_controls[0].0 = NativeUiSmokeAudioControl::Row(1),
+                "dpi" => logical.pixels_per_point = 1.5,
+                "client_size" => logical.client_width += 1,
+                "overlay_owner" => logical = audio_test_logical(&replacement_owner),
+                _ => {}
+            }
+            let render = state.renders.get_mut(&key).unwrap();
+            render.inventory =
+                NativeUiSmokeCommittedInventory::commit(Some(&render.inventory), logical);
+            if matches!(change, "hidden_reappeared" | "disabled_reenabled") {
+                render.inventory = NativeUiSmokeCommittedInventory::commit(
+                    Some(&render.inventory),
+                    audio_test_logical(&fixture._ui_smoke_owner),
+                );
+            }
+            match change {
+                "source" => {
+                    render.actual_source_epoch += 1;
+                    fixture
+                        .requested
+                        .store(render.actual_source_epoch, Ordering::Release);
+                }
+                "requested_source" => fixture.requested.store(8, Ordering::Release),
+                "generation" => render.generation += 1,
+                "geometry" => render.geometry.region.origin_points[0] += 1.0,
+                "geometry_version" => render.geometry_version += 1,
+                "host_request" => state.hosts.get_mut(&host_key).unwrap().request += 1,
+                "host_epoch" => state.hosts.get_mut(&host_key).unwrap().epoch += 1,
+                "host_retired" => {
+                    state.hosts.remove(&host_key);
+                }
+                "render_retired" => {
+                    state.renders.remove(&key);
+                }
+                "ambiguous" => {
+                    let mut duplicate = state.renders[&key].clone();
+                    duplicate.publisher.nonce += 100;
+                    state.renders.insert(duplicate.publisher, duplicate);
+                }
+                _ => {}
+            }
+            let error = validate_audio_control_before_input(&state, 0x100, name, &target, token)
+                .unwrap_err();
+            assert!(error.contains("changed before input"), "{change}: {error}");
         }
     }
 

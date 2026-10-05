@@ -23,6 +23,7 @@ App は受付判定後だけ前面化し、拒否時は小窓の文面を差し�
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
 | クリップボード画像の取り込み (S1) | message-only window STA (`clipboard-capture-listener`) + reader STA (`clipboard-capture-reader`) + bounded 保存 worker (`clipboard-capture-save`) + Win32 / GDI (`clipboard-capture-popup`) | App / process ごとに各 1 | 最初に監視を有効にしたときに非同期起動し、両 OFF でも App 終了まで保持。起動時の読取はしない。通知ごとに不変 `Arc` スナップショットと request serial / sequence を latest slot へ置く。reader は要求・直前・直後の sequence と現在世代の一致だけを受理し、不一致なら最新要求優先、なければ同じスナップショットで 1 回だけ再読取。debounce は使わない。clipboard を開いている間は上限付き生バイトのコピーだけを行い、閉じてから分類・デコード・ハッシュ計算を行う。保存 queue は 1 件に制限し、保存開始前に世代を確認する。開始済みの保存は完了まで行い、古い世代の小窓は表示しない。設定変更で小窓を隠す。UI は typed event と repaint だけを受ける。終了時は listener へ shutdown を post できた場合だけ join し、外部呼出中の reader / 保存 worker は待たない。切り取り監視とは独立。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |
+| 旧 runtime / EffeTune 世代清掃 | `std::thread` (`runtime-cleanup`、短命) | 起動ごとに最大1本、portable／App単体testでは生成しない | core のstartup完了かつ初回egui frame後、UIはdata-dirと固定bundle pathを渡すだけ。workerが他SemVer版／inactive世代をcanonical confinement・全tree reparse検査後にbest-effort削除する。workerでprocess画像を一度だけ列挙し、候補内の実行中画像／同版別coreによる旧世代を保守的に保持する。全cooperative lockを削除しないruntime/.locksの永久fileに置く。候補の使用中lockをexclusiveで一度だけ非blocking取得し、版の抽出／公開lockも削除完了まで保持する。coreはexe所属版のshared leaseをrun入口から保持し、世代解決とpinはegui構築前／既存retry workerで実行。旧publisher互換lockも外側publisherの後で併用する。launcherは版directory作成前にshared leaseを取り、保持したままcoreの引き渡しeventまたは終了をOS waitし、core側は待たない。未確定reader／未知layout／current異常／busyは清掃を見送る。失敗はlogのみ、次回起動へ回す。清掃のtimer・retry loop・UI通知・終了joinは無い。詳細は[配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01) |
 | 合成ビューの pin 資産更新 (§1.313) | `std::thread` + 既存 `metadata_import_refresh::run` | viewer context ごとに最新要求 1 件 | `CurrentViewRefresh::Pins` が変更コンテナ／動画集合を所有。同一 items generation の先行範囲を統合し、FS metadata・cascade DB・catalog DELETE・video pin read／seed write を既存 metadata worker 内で完了し、live cache を変更せず private map を準備する。完了は egui を起こし、mounted context／generation と cache／catalog／policy identity が一致する結果だけを既存 metadata-pin 適用へ渡す。UI terminal は DB handle を持たず準備済みメモリだけを採用する。無関係な Loaded 資産を保持し、token 交換時は変更／未完了動画の producer を再開する。置換・世代切替・retired context・App drop で cancel。同世代の metadata import が pin materialization を置き換える場合も、準備済み対象要求を確定して旧 context owner を取消してから successor worker を開始する。取消する unpin の可視 container keys は既存の無効化対象集合へ引き継ぐ。pin 以外の import や対象外 context は退役させない。詳細は [pin-reload-audit.md](pin-reload-audit.md) |
 | Windows file clipboard cut 観測 | message-only window STA (`cut-clipboard-listener`) + OLE reader STA (`cut-clipboard-reader`) | process ごとに各 1 | production install は UI を待たず `Starting` を返し、同じ backend generation の reader / listener `Ready` が揃った時だけ `Running` にする。起動中の通知・読取結果は順序を保って後から適用し、失敗時は `Disabled` へ収束する。listener は `WM_CLIPBOARDUPDATE` を sequence と単調 request serialで latest slotへ発行するだけで、OLE/clipboard I/Oを行わない。readerが `IDataObject` を自thread内で読み、path正規化と不変集合構築を完了してApp-global reducerへ返す。sequence変更時は旧表示をPendingへ失効し、競合中だけ上限付きbackoffで再取得する。SetData完了もprivate tokenで同じreducerへ入りrepaintを要求する。終了時はlistenerを解除・joinし、起動中または外部COM内で停止不能なthreadは無条件joinしない。testの既定backendはinertで、実clipboard/HWNDを作らない |
 | 類似候補の長押し画像準備 | `std::thread` (`similar-preview`) + request専用mpsc/cancel | viewer ownerごとに実行中1件（取消drainを含む）＋最新待機1件 | `SimilarPanelState.preview` が要求・表示gesture・assetを所有し、既存viewer bundleと交換する。workerは毎pressのsource stamp確認と必要時の通常画像/ZIP/PDF decodeを行う。release/focus lossは表示だけを終了し、同じ要求の有効な遅延完了は隠れたcacheとして受ける。source/page/session変更やcloseは当該ownerを失効し、取消中に次workerを重ねない。ROOT updateがmounted/AtRest双方の終端をpollし、worker完了がROOTを一度起こす。UIはDB/ファイル待ちやdecodeを行わない。R4段階検証の現況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
@@ -30,13 +31,14 @@ App は受付判定後だけ前面化し、拒否時は小窓の文面を差し�
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
 | 製本並べ替えサムネイル | `std::thread` + mpsc | 最大 4 in-flight | 本の並べ替え専用ビューの焼き込み済みページを小サムネとして先行 decode。通常グリッドのキャッシュ/drag-out 経路とは分離し、UI 側は結果 backlog から `load_texture` を 1 フレーム 1 枚だけ実行する |
 | フルスクリーンロード | `std::thread` (使い捨て) | 1 枚ごとに spawn | フルサイズ画像デコード + アニメ展開 |
+| RAW 現像 | App 共有 `RawDevelopExecutor` | 設定 1〜10、既定 3 | High / Normal / Background の優先度付き LibRaw Full / half 現像。RAW fullscreen worker は ZIP/verified bytes を fs scheduler permit 内で解決し、permit を返してから Full の結果 channel を待つ。fs ticket の cancel flag は permit 解放後も executor job と共有し、executor ticket は context-owned `fs_pending` が保持して prefetch → displayed の High 昇格と cancel を行う。UI drop は queued job を取消し、実行中 native call は join しない |
 | PDF ワーカー | **別プロセス** (`--pdf-worker`) + 各プロセス専用のディスパッチャースレッド | 設定 3〜10、既定 5 (うち 1 を Critical 予約) | PDFium は非スレッドセーフ → マルチプロセスで並列化。設定は App 起動時に static snapshot へ固定し、遅延初期化時には読み直さない。要求は JobQueue に enqueue。同時 open は 3 件 (背景は 2 件) に別途制限する (下表 `pdf_pool.queue` 参照) |
 | PDF ページ列挙 | `std::thread` (`pdf-enumerate-nav`) + `PdfEnumerateCoordinator` | 実行中の `(実読込パス, password, want_direction)` ごとに 1 | 通常 PDF と固定済み EPUB は I/O 無しで読込パスを得て UI 呼出中に待ち手を登録する。新ハンドル受領後に旧ハンドルを捨てる App の handoff でも同じ要求に合流する。未固定 EPUB は背景スレッドで source stat・DB 照合・合流登録・要求エンコードを行う。固定表 mutex はメモリ検索だけを保護し、stat・DB 照合中は保持しない。PDF pool は列挙スレッドで遅延初期化する。登録前 cancel・spawn 失敗も receiver を完了させる。合流した全 waiter へ `PdfReadError` (`PasswordRequired` / `NotConverted` / `EpubUnavailable` / `Other`) を型を保ったまま配る。1 waiter の離脱では他を維持し、全 waiter が離れた時だけ source request を cancel する。EPUB の方向は世代行から、通常 PDF の方向は要求時だけ PDFium の追加 open から応答に載せる |
 | PDF メタ catch-up / 隣接 prefetch | `std::thread` (常駐、`pdf-meta-catchup`) | 1 | `pdf_meta` テーブルへの背景書き込みを統括 (v1.0.0)。WebP cache hit で render_page を skip した PDF (= アップグレードユーザーの既存サムネ) の `pdf_meta` 補完 (`MetaOnly`、low lane) と、`load_pdf_as_folder` 直後の ±1 隣接 PDF の page 0 render + WebP 温め (`NeighborPrefetch`、high lane) を、`CatchupQueue` 経由でシリアル処理する。重複は pending HashSet で dedup、low → high の優先昇格あり |
 | mIV Remote Page 最終合成 | 既存 `remote-ipc-worker-*` heavy lane 上で同期実行 | server ごとに 1〜2 本、うち prefetch 最大 1 | Page 要求ごとに committed な mask / local-adjust / conceal / page / favorite / global 補正 / comic / export-crop を DB から読み、raw decode 後の `ColorImage` を共有 edit-source executor、共有 `FinalCompositePlan`、comic、crop の順に通して turbojpeg q85 の JPEG にする。protocol v29 では container address、物理表示 slot、見開き相手 address も受け、既存 `view_trim.db` の read-only handle から `None` / `Book` / enabled `Page` / `Auto` を本体と同じ優先順位で解決し、最終合成 cache の後かつ resize / JPEG の前だけ表示 crop する。`Auto` は補正前 raw raster を走査し、`page_key + source mtime/size + target_px` の 64 件 LRU へ `None` も含めて保存する。見開きは自ページを先に登録し、相手 miss 時は待機せず同じ worker / cancel token で相手の full-page raw decode だけを行うため、heavy worker 1 本でも deadlock しない。したがって合成済み pixels LRU は表示トリム前を保持し、bbox を composite cache key に含めない。端末からの書き込みは後段。App の cache / `egui::Context` は触らず、remote が read-only DB handles、合成 cache、App-installed `RemoteAiExecutionBridge` 経由の singleton Runtime / ModelManager、合成済み pixels LRU (8 件 / 128 MiB)、stamp / parsed LUT cache、session operation cancel token を所有する。`ContainerEngine` は別 Runtime を持たない。worker 起動時に DB open が失敗した handle は Page ごとに再 open し、一過性失敗を latch しない。新しい prefetch と foreground は進行中 prefetch を cancel し、decode / edit / colorize / executor 境界が同じ token を見る。cache key は source stat、target_px、edit snapshot SHA-256、解決済み全補正と LUT entry を含む。target は端末別の画質設定（8192 / 4096 / 2048 / 1024、既定 4096）から決まり、先読みも同じ target で前方 3 / 後方 1 ページを直列取得する。staged MI-GAN を含むため Page IPC transport timeout は 10 分、各段時間は `remote_ipc: edit_materialize` / `remote_ipc: final_composite` log に出す。詳細は [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) の段 1 実装結果 |
 | mIV Remote AI job | `RemoteAiJobRegistry` + job ごとの `std::thread` (`remote-ai-{job_id}`) + trait `RemoteAiExecutor` | 通常は client ごとに nonterminal 1 件。supersede 時だけ旧 executor の cancel ack まで一時重複し得るが、共有 `AiRuntime` が推論を直列化 | POST は 2 秒の admission 期限内に registry へ登録し、`WaitingForLocalDrain` から `SessionOperation` が active になった後だけ executor を dispatch する。`RemoteAiJobLease` が executor の終端 / cancel ack まで operation を保持するため、disconnect / supersede / background expiry は既存 drain barrier に参加する。state / recoverable / cancel / result の参照 IPC は operation を増やさず、terminal metadata と Finalizing 済み JPEG bytes を 10 分読める。executor は worker 側で source / edit / settings snapshot を取得し、共有 canonical decoder → MI-GAN → `ai/final_pipeline` → final composite → comic / crop → 1 回だけ resize / turbojpeg q85 encode の順に処理する。native AI LRU は local cache と分離するが、上限は既存 `retained_final_ai_cache_max_entries` / `_max_mib` を使う。公開直前に worker が snapshot を再取得し、不一致は `Superseded` として公開しない。見開きはページ別に `Ready` / `NotApplicable` を持ち、aggregate は全ページ対象外でも `Ready`、実行失敗だけ `Failed` とする。session presence は `Foreground` / `Detached { since }` の typed state で、nonterminal job 中の liveness timeout は PC ownership を維持したまま detached へ移り、同じ client の接触で foreground 復帰する。SPA は foreground 500 ms、通信失敗 1 / 2 / 5 s の state 取得だけを行い、background timer を止め、復帰時は recoverable を先に照会する。最終 activity から 10 分で `BackgroundExpired` cancel + drain に入る |
 | mIV Remote service lifetime | `remote-service-owner` worker + owned child + stderr reader + remote の既存 IPC maintainer | opt-in 時に owned child 最大 1。外部起動分は所有しない | local-only / current-user-only の named pipe server は core 起動中常設する。設定ダイアログの OK は希望状態を channel へ送り、専用 worker が同じディレクトリの remote exe を開始・終了するため UI thread は spawn / kill / wait しない。子には同じ `--data-dir` と `--managed-by-core` を渡し、Bearer token を含む stdout は破棄する。通常終了は owner が owned child を kill / wait してから IPC server を閉じる。強制終了時は管理 marker を受けた remote だけが IPC 接続不能の累積 15 秒で自ら終了する。marker のない手動起動は 250 ms〜5 秒 backoff で無期限に再接続を待つ |
-| Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
+| Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる。`get_pool` の初期化待ちは待機開始から絶対期限 5 秒 (lib unit test は 100 ms)。早期 wake でも期限を延ばさず、init / reload / timeout fallback は pool 公開後に全 waiter へ通知する |
 | AI runtime 初期化 | `std::thread` (`ai-runtime-init`) + `AiRuntimeInitOwner` の Mutex / Condvar | GUI process 全体で constructor 1 回 | App 構築後に worker を開始し、DLL 展開と `ort::init_from` を UI thread 外で行う。App / Remote / materializer は同じ `Arc` owner の `Ready` / `Failed` terminal だけを消費する。background consumer は request cancel / generation を見ながら Condvar を待ち、App の UI producer は毎 frame snapshot を poll する。初期化中の final AI は provisional composite を保持し、terminal repaint 後に job が無ければ Ready へ投入または Failed 完了へ再評価する。spawn failure / panic も Failed を publish し、owner 外 constructor と process 内 retry は行わない |
 | AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
 | カラー化 / 最終エフェクト | `std::thread` (`miv-final-effect-{idx}` / `miv-final-effect-prefetch-{idx}`、要求ごとの短命 worker) + 個別 mpsc | 表示要求 + 背景先読み最大 1 本 | final AI / sharpen 後の `ColorImage` に、モノクロ系判定、スクリーントーン濃淡変換、階調カラー LUT、ポストフィルタを順に適用する。AI と共通の前後枚数を候補にし、ページ送りでは従来どおり、連結読みでは `fs_vertical_cache_keep_set` との積に絞り、実テクスチャ会計が共有 pool 由来の LOW 未満のときだけ遠方ページを先読みする。厳密可視の前後 1 ユニットの準備帯は LOW をバイパスして非表示ページを 1 枚ずつ先行処理し、色調補正・smart sharpen も worker 上で行う。可視ページの表示要求は水位をバイパスする。先読み／表示開始時とも無着色の provisional texture を upload せず、完成結果だけを `final_composite_cache` へ upload する。表示要求が先読み中の同じ key に来た場合は job を昇格して再利用し、同一 viewer のページ送りでは完成まで直前ページを holdover する。連結読みでは keep-set 内の各表示済みページがページ別 transition texture を持ち、raw source 差し替えや incomplete → complete 再合成で live final が一時的に消えても黒い読込表示へ戻さない。complete final の GPU 登録後に差し替え、keep-set 離脱時は旧 texture も破棄する。ページ入場だけでは完成 cache / pending を破棄しない。別 key の表示要求、設定変更、keep-set 除外、context close / drop では `Arc<AtomicBool>` を立て、`items_generation` と composite key が一致する結果だけを採用する。pending map とページ別 transition は viewer context の swap / park と一緒に所有権移動するため、別ウィンドウの要求や表示を誤って共有しない |
@@ -74,9 +76,9 @@ App は受付判定後だけ前面化し、拒否時は小窓の文面を差し�
 | 動画 demux | `std::thread` (`video-demux`、= `run_decoder` の本体) | 動画 1 つにつき 1 本 | FFmpeg `Input` の packet を `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) へ振り分ける。packet channel は `Packet/Eof`、seek の `Flush` は各 bounded=8 の `video_ctl_tx` / `audio_ctl_tx` へ分離し、decode 側は control を優先受信する。seek 要求は demux thread が単独 pull。packet の serial は demux の処理済み世代で、存在する全 decode lane の Flush 送信受理後に進む。cancel を伴わない audio lane 切断時は routing を外し、映像があれば継続する。`AudioInactive` は engine event lane が満杯でも EOF 待機中に再送する。packet 送信待ち中の新 seek は旧 packet を捨てて loop に戻る。thread panic は `info_tx(Err)` + `DecoderEvent::Failed` に変換する |
 | 動画 video decode | `std::thread` (`video-decode`、= `run_video_decode`) | 動画 1 つにつき 1 本 | `VideoPacketMsg::{Packet,Eof}` と別 channel の `VideoControlMsg::Flush` を受け、HW (D3D11VA + GPU blit) / SW (readback + swscale) で frame を生成して `video_tx` (bounded=8) へ送る。PLAYING の Full は drop 可、Loading/Buffering/Seeking の Full は pending frame を保持して cancel/seek-aware retry。Paused/Eof は park。mIV Remote video tap は decoded PTS / seek / preroll 確定後かつ GPU/CPU 分岐前で、D3D11 frame だけ producer 上で即時 SW download、SW frame は shallow-ref し、SW-only bounded queue へ `try_send` する。queue 内の decoder HW surface 上限は容量に関係なく 0、同期処理中は 1。満杯時は readback / ref 作成前に drop を計上する。stream scale / H.264 encode は将来の session worker 側 `VideoStreamEncoder` が行い、未接続時は一切走らない |
 | mIV Remote headless video output | `std::thread` (`remote-headless-video-output`) | remote-owned video player につき 1 本 | native presenter を持たない remote player の `video_tx` を連続 drain し、通常出力 frame を GPU slot 返却後に破棄する。tap は decoder 側の別分岐なので配信用 frame は維持する。seek 世代ごとの最初の frame で `FirstFrameReady` を発火し、event queue が Full でも video drain を止めず再試行する。通常 player は起動せず presenter / UI receiver が従来どおり consumer。player cancel / shutdown / Drop で停止・join する。remote UI は Opening / Starting / Streaming の全状態で player を tick して engine event を drain する |
-| 動画 audio decode | `std::thread` (`video-audio-decode`、= `run_audio_decode`) | 動画 1 つにつき 1 本 (音声無し動画では起動しない) | `AudioPacketMsg::{Packet,Eof}` と別 channel の `AudioControlMsg::Flush` を受け、avcodec decode + swresample で output device rate の f32 stereo に変換し、`audio_tx` (bounded=32) へ送る。device rate を取得できない場合だけ 48kHz fallback。解析用 `audio_decode.rs` の 48kHz 固定とは別。Paused/Eof は park、EOF は decoder delay を drain |
-| 動画音声 pump | `std::thread` (`audio-pump`) | 動画 1 つにつき 1 本 | `audio_tx` のフレームを ring buffer に押し込む。入力切断時は raw / processed と AudioBookkeeping を破棄する。RT 出力は cpal。1.0x 以外では Signalsmith Stretch で pitch を維持し、normalize → 共有ユーザー VST → 共有音響調整 → safety limiter の順に処理する。札を持つ pump は raw dequeue から processed commit まで DSP permit を保持し、札のない pump は host を呼ばず素通し、受け取り中は raw dequeue を止める。音声トラック変更は seek serial を進め、旧ブロックを格納時に破棄する |
-| mIV Remote streaming generation | `std::thread` (`remote-stream-generation`) + `Mutex` / `Condvar` / bounded segment ring | 現 generation につき 1 本。process-wide resource lease が新旧の FFmpeg 使用を直列化 | `clockless_transcode` が独立した FFmpeg `Input`、decoder、H.264/AAC encoder、fMP4 segmenter/ring を所有する。選択音声 stream index を transcode と世代 worker の読み取り専用 Norm DB lookup に渡し、開始時の設定 snapshot で fixed gain を決める。音声は normalize → 共有ユーザー VST → 共有音響調整 → safety limiter の順。session ID は最初の worker より前に割り当て、世代 worker は `(session, generation)` の DSP token を取得し、旧 permit の終了後に handoff reset してから処理する。remote owner cancel、seek、画質・音声トラック変更、session drop は世代を終了し、FFmpeg teardown の join は別 worker に逃がす |
+| 動画 audio decode | `std::thread` (`video-audio-decode`、= `run_audio_decode`) | 動画 1 つにつき 1 本 (音声無し動画では起動しない) | `AudioPacketMsg::{Packet,Eof}` と別 channel の `AudioControlMsg::Flush` を受け、avcodec decode + swresample で output device rate の f32 stereo に変換し、`audio_tx` (bounded=32) へ送る。device rate を取得できない場合だけ 48kHz fallback。解析用 `audio_decode.rs` の 48kHz 固定とは別。Paused/Eof は park、EOF は demux serial 付きで stale を拒否し、decoder delay を drain 後に AvClock の AudioEos を Decoded へ進める |
+| 動画音声 pump | `std::thread` (`audio-pump`) | 動画 1 つにつき 1 本 | `audio_tx` のフレームを ring buffer に押し込む。入力切断時は raw / processed と AudioBookkeeping を破棄する。RT 出力は cpal。1.0x 以外では Signalsmith Stretch で pitch を維持し、normalize → 共有ユーザー VST → 共有音響調整 → safety limiter の順に処理する。札を持つ pump は raw dequeue から processed commit まで DSP permit を保持し、札のない pump は host を呼ばず素通し、受け取り中は raw dequeue を止める。音声トラック変更は seek serial を進め、旧ブロックを格納時に破棄する。通常 EOS のみ、実フレーム処理後に AudioDspTail を小ブロックで refill し、前段 limiter → 同じ EffeTune → 最終 limiter の保持音声を排出する。queue commit 後に AudioEos を Complete とし、native/非 native の EOF/loop はこれを待つ。seek/cancel/stop は排出しない |
+| mIV Remote streaming generation | `std::thread` (`remote-stream-generation`) + `Mutex` / `Condvar` / bounded segment ring | 現 generation につき 1 本。process-wide resource lease が新旧の FFmpeg 使用を直列化 | `clockless_transcode` が独立した FFmpeg `Input`、decoder、H.264/AAC encoder、fMP4 segmenter/ring を所有する。選択音声 stream index を transcode と世代 worker の読み取り専用 Norm DB lookup に渡し、開始時の設定 snapshot で fixed gain を決める。音声は normalize → 共有ユーザー VST → 共有音響調整 → safety limiter の順。session ID は最初の worker より前に割り当て、世代 worker は `(session, generation)` の DSP token を取得し、旧 permit の終了後に handoff reset してから処理する。remote owner cancel、seek、画質・音声トラック変更、session drop は世代を終了し、FFmpeg teardown の join は別 worker に逃がす。通常 EOS は decoder/resampler drain 後、AAC finish 前に AudioDspTail を checkpoint/permit 下で排出する。cancel/seek/stop/source-limit は排出しない |
 | mIV Remote 時計なし benchmark | 呼出側 worker + production と同じ `clockless_transcode` | benchmark ごとに 1 本 | production と同じ demux/decode/encode/mux 駆動部を dev-tools から呼ぶ。完成 segment が ring 上限に達したら `Condvar` で park し、cancel は各重処理境界で確認する |
 | mIV Remote streaming IPC | `std::thread` (`remote-stream-ipc-0..3`) + bounded queue (32) | remote IPC server ごとに 4 本 | start/control/seek/playlist/segment/state/stop 専用 lane。start/state は共有 DSP 段の active slot と warning、選択音声トラックを返す。stream queue の飽和は Busy を即応答し、heavy / Home / write worker の枠を消費しない |
 | Normalize 測定値 lookup | `std::thread` (`normalize-lookup`) + mpsc | player の stream ごとに最大 1 つの実行中 request | App は `VideoInfo.opened_audio_stream_index` または選択先 stream が確定してから worker を起動する。worker は独立の読み取り専用 DB 接続を持つ。結果は開始元 `ViewerContextId` ごとに振り分け、所有 context の poll でのみ path と表の epoch・request 番号・stream・目標 LUFS が完全一致する `Pending` に適用する。一覧再配置で `fs_idx` が変わっても request identity から現在の index を求める。context が閉じた結果は破棄する。live-media fork で player が新 context に移った場合は旧 request を epoch で失効させ、移動先から再発行する。pump はその stream の raw frame を解決まで保持する |
@@ -106,7 +108,7 @@ App は受付判定後だけ前面化し、拒否時は小窓の文面を差し�
 | メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
 | メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
-| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
+| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | 有効な正規化 root ごとに 1 本 (`auto_index_structure=true`) | manager が stop/join/clear/start を直列化し、完走印も同じ root の所有。印一致の起動は watcher 開始後の初回 Full だけ省く。手動 Full は owner mailbox で構成採用後・pause 再開後に実行 |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
 | タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Add / Remove / Clear / SetTags を serial に処理し、**`tags.db` だけ**を更新する。メディア本体 / XMP / Tantivy には書かない (`docs/tag-catalog-redesign-plan.md` D13)。サイドカー `mimageviewer.dat` へのミラーは結果を受けた UI スレッド側が行う |
 | 補正レイヤー書き込みワーカー | `std::thread` (常駐、最初の保存で遅延起動) | 1 | 補正レイヤー文書の直列化 (q8 量子化 → deflate → base64) + `local_adjust.db` 書き込み。24MP で 70.6ms、かつマスク系スライダーのドラッグ中は毎フレーム走っていた。**同じ page key は最新 generation だけ書く** (要求 1 件が原寸マスクを抱えるので、合体しないとキューにメモリが積み上がる)。サイドカー `mimageviewer.dat` へのミラーは、結果 (`EditStoreOutcome`) が `Committed` のときだけ UI スレッド側が行う (R-26、§5.7) |
@@ -180,6 +182,18 @@ stream 不在・非対応 codec / container だけを `Unreadable` とする。�
 UI は既存 `DetailsLazyMeta` を読むだけ。古い source identity の読取結果は公開前に破棄する。
 catalog の詳細・aggregate lookup・簡素化判断は [catalog-design.md](catalog-design.md) を参照。
 
+### 色スキャンの RAW half 現像
+
+色スキャンは既存の専有 worker と scan cancel flag を所有し、通常 RAW・ZIP 内 RAW・
+ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedWorker` へ渡す。
+プレビューの判定と half 現像はキャッシュ作成/画質サンプルと同じ worker 用 decoder、
+実行枠は App 共通 `RawDevelopExecutor` の Background を使う。色 worker は他の permit を
+保持せずに channel で待ち、executor の枠が返った後に縮小・保存・パレット抽出を行う。
+50 ms の channel wait ごとに取消を観測し、自分の ticket を cancel して worker を終了する。
+待機中の job は列から除去し、実行中の native call は join せず実終了まで枠を保持する。
+`canceled` な thumbnail 結果は scan を取消し、空パレットを Item として公開しない。
+既存 scan_id / scope signature / 代表 identity による適用境界と grid の RAW 所有状態は変更しない。
+
 ## 2. スレッド間通信
 
 ### 2.1 共有アトミック
@@ -240,6 +254,7 @@ catalog の詳細・aggregate lookup・簡素化判断は [catalog-design.md](ca
 | キュー | 型 | 内容 |
 | --- | --- | --- |
 | `reload_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | 通常サムネイル要求 (Image/ZipImage/PdfPage に加え、PdfFile のフォルダ代表画も IPC 待ちのためここに振る)。**スクロール中 / visible 待ち中は `prefetch_allowed_now` gate で `req.priority=false` の prefetch enqueue が抑制され、queue 内の既存 prefetch も `q.retain` で prune される** (= PDF pool に prefetch が流れる前に止めて in-flight 占有を防ぐ、docs/prefetch-suppression-during-scroll-plan.md) |
+| RAW half handoff (`raw_thumb_develop`) | viewer context ごとの `ItemsGenerationMap<RawThumbPending>` と既存 `reload_queue` | thumbnail worker は half を submit して `ThumbMsg` を送らず次の要求へ進む。executor は現像枠を返してから画像付き `LoadRequest::RawHalfDeveloped` を queue へ戻し、thumbnail worker が縮小、cache、画像と finalized の 2 通、`gen_done` を担当する。同 idx の新旧 submission ID を照合し、旧完了が新 ticket を外さない。keep 範囲外、items generation、folder 変更、mounted context の pause/park、drop は ticket を cancel し canceled `ThumbMsg` を送る。queue 済み follow-up が keep 外で skip されても `gen_done` を進める |
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile/ConvertibleArchive/ZipDir 要求 (本物の同期 I/O または ZIP 内 prefix の代表解決)。Folder の再帰 pin 伝播で行う既存 catalog の read-only open / exact-row WebP lookup もここで実行し、UI スレッドへ SQLite cold open を持ち込まない。reload_queue と同じ prefetch suppression gate を共有 |
 | `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (起動時の設定数で固定、worker_id index) を同一 Mutex で保護。起動失敗した worker_id は詰めないため、実際に起動した数ではなく設定数で Vec を確保する。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。正式 pool の設定範囲は 3〜10 で、3 / 4 / 10 worker 時も同じ式から HighNormal / Normal cap がそれぞれ 2 / 1、3 / 2、9 / 8 になる。1〜2 の clamp は純関数の防御性と旧構成の回帰テスト用で、初期化結果としては公開しない。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 **Open admission gate (2026-08-21)**: lane cap とは別に、**同時に走る文書 open を 3 件 (うち背景 HighNormal/Normal が使えるのは 2 件) に制限する**。open はディスク律速、render は CPU 律速で性質が正反対なため、1 つの並列度で両方を縛らない。ワーカーが既に保持している文書への要求は open を必要としないので **枠を消費せず常に通る** (= ページ送りの定常状態は影響を受けない)。親は `worker_documents: Vec<Option<PdfDocumentIdentity>>` で各ワーカーの保持文書を追跡し、open が要る job は `MSG_OPEN` を 1 往復送ってから本要求を送る。**枠は MSG_OPEN の往復だけを覆い、render 中は保持しない**。さらに上位 lane に「どのワーカーも保持していない文書」の job が待っている間、下位 lane の open は開始しない (前面優先)。判定は `decide_open_admission` / `higher_priority_open_pending` / `decide_lane_dispatch` の純関数で、実行時の待ち時間やストレージ種別には適応させない。 |
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
@@ -590,6 +605,24 @@ worker は結果チャネルとは別の進捗チャネルで、モデル準備 
 diffusion fallback を UI へ通知する。UI は pending が存在する間だけ持続ステータスを描き、
 保存済みマスクの自動再生成を含めて、短時間トーストが消えた後も処理中であることを示す。
 
+### 3.3.1 RAW fullscreen の要求所有権 (S3)
+
+`RawPageStore` は viewer context ごとに preview / development の独立した型付き状態、items 世代、物理 source 指紋、要求 ID、結果 channel と需要集合を持つ。RAW の寸法・preview・development 結果はすべて `apply_result` で検証し、RAW の `fs_cache` はここだけが書く。物理 source がまだ worker で確定していない要求は `Resolving` として分離し、UI は stat / LibRaw / decode を実行しない。
+
+実際に表示する全ページ (見開き相方・表紙補助・連結読み可視ページを含む) は High、表示順の先 2 / 前 1 は Normal。両者の和で取消を判定し、保持は既存 keep range とこの需要集合の和にする。`Preparing` は source 解決の scheduler ticket と最高優先度を保持し、D1 permit を解放してから executor へ submit する。ticket 発行前の取消・昇格も同じ owner に届く。ページ送りの admission は producer と upload の両方に適用する。
+
+park は Requested preview を NotRequested に戻し Preparing / Submitted を取消すが、Done / Blocked は残す。mount / swap は結果 channel も交換し、drop / generation 更新は owning context の要求だけを取消す。idx 単位の破棄は `discard_fs_page`、snapshot 再構築は entry と owner の原子的 transfer を使う。
+
+先読み・連結読み・ページ送り中の receiver 取消は `cancel_fs_page_load` に集約する。receiver と scheduler ticket を外すと同時に、未解決の source は破棄し、Requested preview は NotRequested に戻す。次の要求は新しい ID を持つため、遅れた info / preview は owner で拒否される。完了結果を upload backlog に渡す際の ticket disarm はこの取消とは分け、upload まで要求 ID を有効に保つ。
+
+現像軸が Blocked の RAW は `raw_development_blocked` から処理不可と判定し、カラー化 / LUT の待機対象から外す。検証済み preview があれば加工せず表示し、既存の共通 readiness と実提示によってナビゲーションを終える。catalog rendition があっても同じ表示とし、専用 worker や lock 解除経路は追加しない。明るさ変更で Failed が Idle へ戻ると通常の色 gate が再評価される (計画 7.10 K)。
+
+worker は info / preview / develop の前後、および executor が queued source を開くときに高精度 mtime と size を検証する。現在要求の typed `Stale` は RAW source transaction に進み、source を取り直す。古い要求の Stale は要求 ID で拒否する。明るさ変更も同じページ単位の入力・派生結果失効を使うが、preview と寸法の要求・backlog は残す。mounted / parked の双方を処理し、retained final AI は source 指紋 + 明るさの key と完了検証で失効させる。App-global retained epoch は進めないので、無関係な JPEG の AI 完了は保存できる。
+
+現在ページの現像中だけ 100ms の repaint を要求し、queued / running / cancelling は `RawTicketState` で区別する。RAW source preparation と preview は既存の読み込み経路、完了は worker の repaint 通知で進む。
+
+連結読みでも、表示可能な画素を待つ RAW の現像待ちは次フレームで進める処理の集合から外す。PreviewShown でもカラー化 / LUT の色忠実 rendition が必要で、catalog texture と画素のどちらかが未取得なら入力待ちに含める。両方が揃えば既存の 1 ページずつの処理 admission を維持し、thumbnail / 現像の完了通知で入力待ちから復帰する。通常画像の読み込みや処理待ちがあれば従来の 16ms、RAW 現像待ちだけなら現在ページの 100ms を使う。Running の進捗 0〜34 は source の open / unpack 区間なので「読み込み中」、処理区間の 35 以降は「現像中 NN%」とする。画面外の RAW Full 完了は source texture の bounded upload だけを行い、同期の色調補正・追加 texture 作成を開始しない。表示時の既存 final pipeline が処理を所有する。
+
 ### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
 
 Source生成結果には、実寸と別に`ThumbLoadOrigin::SourceGenerated { evaluated_display_px }`
@@ -687,6 +720,21 @@ ingest worker と tag_write_worker が共有する。独自に `fts.writer()` �
 共有 writer を使う。
 
 #### Indexer shutdown の有界化 (v2.3.0 第12弾)
+
+walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
+列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
+生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
+あり、Complete として返さない。この型は FS 観測だけの結果で、Full 全体の typed な
+完了結果とは分離する。S2 の停止は既存 cancel のまま。metadata manager worker が
+重複グループの cancel・join・cleanup・spawn を固定 snapshot で直列化し、後続要求は
+最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
+を唯一所有する。Shutdown は停止中の control にも到達し、spawn 採用と同じ短時間 lock
+で直列化する。4秒の期限には worker 自身と worker 所有の handle を含む。
+similar のお気に入り・PDF password 構成も、この worker が受理した固定 snapshot で反映する。
+App は後続要求を similar へ先行反映せず、OFF→ON の集約時に既存 watch を維持する。
+名前索引も正規化 root ごとの owner を manager worker に集約し、stop・clear・start の
+順序を起動と編集で共有する。`scanned_once` は完全な Full の後だけ立て、clear/rebuild と同じ
+transaction で消す。起動設定は最初の構成でだけ採用し、実行中の再構成は Full を維持する。
 
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、
@@ -885,6 +933,19 @@ delete では処理中 descriptor の transaction を rollback する。完了�
 同名 path や親へ到達不能な path は新しいメタを誤削除しないよう journal に残して繰り延べる。
 
 ### 5.3 UI スレッドで重処理
+
+読書位置メーターは既存 `BookResumeWriter` のFIFOでRecord / ReadAll / Clearを扱う。
+起動時workerがordinal/totalのnullable2列を移行し、全行を1回読んでApp共通mapへ返す。UIはSQLiteを読まず、
+受理したローカル/Remote記録とscope除去/Clearをmapと読込中差分へ適用する。
+ReadAllのreceiverを差し替えることで古い結果を捨て、最新結果へ待機中差分を重ねる。
+rename・purge retry・明示整理等の既存writer待機predicateにはBookResumeWriterの未処理数も含める。
+DB変更完了後の再読込はrename/copy復元・明示整理・purge retryに接続する。
+通常削除には新しい待機を足さず、mapの該当scopeを除去する。直前Recordとの短い競合で
+存在しないpathの行が残ることは合意済み。移行失敗時はログ/不表示でraw復元を維持する。
+内容identityのcopy復元にも開始前の延期機構はなく、確認済みの未開始要求を保持する新状態は
+追加しない。直前の未処理Recordとの競合ではコピー先の位置・比率が古いままになることを
+合意済みの割り切りとし、復元完了後のmap再読込は維持する。
+詳細は [book-resume-meter-plan.md](book-resume-meter-plan.md)。
 
 `App::update` 内で CPU 重めの処理をすると fps が落ちる。
 - 補正の LUT 計算: 軽いので同期 OK (`maybe_apply_adjustment`)
@@ -1323,6 +1384,11 @@ installer shutdown はこの遮断を迂回して通常終了する。
 - `ui`     — UI フレーム: `tail_repaint` / `slow_frame_breakdown` / `pre_grid_breakdown`。
   `pre_grid_breakdown` は `n` / `total_ms` と、検索・お気に入り・タグ・ファセット・遅延状態・
   下部情報・フォルダペイン・選択 overlay・scroll routing・stack reconcile の各 `*_ms` を持つ
+- `log` — 共用 logger の `slow_io`（wait / hold が50 ms以上のときのみ）と `diagnostic_dropped`。
+  通常 / perf logger の待ち・保持・write/flush と holder snapshot を有界メモリキューに記録し、
+  後続perf書込で再帰なしに排出する。`ui.other_worker_polls_breakdown` と
+  `thumb.load_phases` の追加区間も含む詳細・入れ子・時刻の読み方は
+  [UI応答性の計装一覧](ui-responsiveness.md#恒久的に使える計装) を参照。
 - `folder_pane` — 左フォルダツリーペイン: `scan_subfolders` (子ディレクトリ列挙の ms / 件数 / cancel)
 
 ### 7.4 解析

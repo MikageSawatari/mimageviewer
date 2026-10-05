@@ -5,6 +5,60 @@ use uuid::Uuid;
 
 pub const MAX_FAVORITES: usize = 100;
 
+/// お気に入りとは独立した、登録順で表示するファイル整理先。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileOrganizeDestination {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl FileOrganizeDestination {
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string());
+        Self { name, path }
+    }
+
+    /// 入力の構文だけを検証する。不在・未接続のフォルダも登録を維持する。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() {
+            return Err("表示名を入力してください。");
+        }
+        let path = self.path.as_os_str();
+        if path.is_empty() {
+            return Err("フォルダのパスを入力してください。");
+        }
+        #[cfg(windows)]
+        let contains_nul = {
+            use std::os::windows::ffi::OsStrExt;
+            path.encode_wide().any(|unit| unit == 0)
+        };
+        #[cfg(not(windows))]
+        let contains_nul = path.to_string_lossy().contains('\0');
+        if contains_nul {
+            return Err("パスに NUL 文字は使用できません。");
+        }
+        if !self.path.is_absolute() {
+            return Err("フォルダの絶対パスを入力してください。");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_file_organize_destinations(
+    destinations: &[FileOrganizeDestination],
+) -> Result<(), String> {
+    for (index, destination) in destinations.iter().enumerate() {
+        if let Err(error) = destination.validate() {
+            return Err(format!("ファイル整理先 {}: {error}", index + 1));
+        }
+    }
+    Ok(())
+}
+
 pub const UI_SCALE_FACTOR_MIN: f32 = 0.5;
 pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
@@ -1717,6 +1771,7 @@ pub enum ToolbarSectionId {
     Favorites,
     SmartFolders,
     Tags,
+    Folder,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1758,6 +1813,7 @@ impl ToolbarSectionId {
             Self::Favorites,
             Self::SmartFolders,
             Self::Tags,
+            Self::Folder,
         ]
     }
 
@@ -3739,6 +3795,13 @@ where
 // StartupFolderMode (起動時に開く場所)
 // -----------------------------------------------------------------------
 
+/// Persistent identity of an A/B quick-folder workspace.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickFolderSlotId {
+    A,
+    B,
+}
+
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFolderMode {
@@ -4206,6 +4269,9 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// 環境設定で編集する固定のコピー／移動先。Vec の順序が表示順。
+    #[serde(default)]
+    pub file_organize_destinations: Vec<FileOrganizeDestination>,
     /// お気に入り配下へ入ったとき、そのお気に入り専用の表示状態を適用・自動更新する。
     /// 既定 OFF。保存済みの専用状態は OFF にしても削除しない。
     #[serde(default)]
@@ -4251,6 +4317,10 @@ pub struct Settings {
     pub quick_folder_recent_folders: [Vec<PathBuf>; 2],
     #[serde(default = "default_quick_folder_slots")]
     pub quick_folder_slots: [Option<PathBuf>; 2],
+    /// Accepted A/B workspace. Missing in older settings means A; explicit None
+    /// keeps startup navigation outside both workspaces.
+    #[serde(default = "default_active_quick_folder_slot")]
+    pub active_quick_folder_slot: Option<QuickFolderSlotId>,
     /// A/B クイックフォルダごとに保持するドライブ別の最後の場所。
     /// キーは `"C:"` のような大文字ドライブ表記。
     #[serde(default = "default_quick_folder_drive_current_dirs")]
@@ -4275,6 +4345,10 @@ pub struct Settings {
     pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
+    #[serde(default = "default_raw_develop_parallelism")]
+    pub raw_develop_parallelism: u8,
+    #[serde(default)]
+    pub raw_brightness: crate::raw::RawBrightness,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
     #[serde(default = "default_pdf_worker_count")]
     pub pdf_worker_count: u32,
@@ -4432,6 +4506,9 @@ pub struct Settings {
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
+    /// 本のサムネイル下端に、記録済みの読書位置を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_book_resume_meter: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -5120,11 +5197,17 @@ pub struct Settings {
     /// ツールバーに「ソート」セクションを表示する (v2.0.0)。
     #[serde(default = "default_true")]
     pub show_toolbar_sort: bool,
+    /// Show an independent dropdown on the right of the facet bar. Old settings omit it.
+    #[serde(default)]
+    pub show_facet_sort: bool,
     /// 「行頭に表示」= そのセクションの前で改行するセクション集合 (v2.0.0)。
     /// 自動折返し (horizontal_wrapped) に加え、ユーザーが行区切りを固定できる。
     /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
     #[serde(default)]
     pub toolbar_section_new_row: Vec<ToolbarSectionId>,
+    /// One-time upgrade of the released toolbar layout. Missing in old DB/JSON.
+    #[serde(default)]
+    pub(crate) toolbar_folder_section_migrated: bool,
     /// ツールバーセクションのドラッグ並べ替えを許可するか (v2.0.0、既定 false)。
     /// 既定 OFF にする理由: 常時ドラッグ可能にすると、通常操作中にラベル上で頻繁に
     /// マウスカーソルが「移動可能」形状へ変わって煩わしいため (実機フィードバック 2026-06-20)。
@@ -5293,6 +5376,11 @@ pub struct Settings {
     /// OFF (既定) では従来どおり閉じるボタンでプロセス終了。
     #[serde(default)]
     pub minimize_to_tray_on_close: bool,
+
+    /// 完全走査済みの索引は起動時に終了中の変更を確認しない。起動時だけ採用する。
+    /// 終了中の変更は「今すぐ確認」で反映する。旧設定の欠落キーは false。
+    #[serde(default)]
+    pub skip_offline_change_scan: bool,
 
     /// タスクトレイに常駐している間 (= ウィンドウ非表示中) にバックグラウンドインデクサ
     /// (初回スキャン + notify-rs 経由の ingest) を一時停止する。ウィンドウを開き直すと
@@ -5606,6 +5694,12 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+    /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。設定の確定時に音声処理へ公開する。
+    #[serde(default = "default_true")]
+    pub effetune_pre_limiter_enabled: bool,
+    /// メイン最小化中も、表示していた音響調整の窓を残す。
+    #[serde(default)]
+    pub effetune_keep_visible_when_minimized: bool,
     /// EffeTune GUI の最後の位置と外枠サイズ。
     #[serde(default)]
     pub effetune_gui_pos: Option<(i32, i32)>,
@@ -6835,6 +6929,9 @@ fn default_active_book_name() -> String {
 fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
     [None, None]
 }
+fn default_active_quick_folder_slot() -> Option<QuickFolderSlotId> {
+    Some(QuickFolderSlotId::A)
+}
 fn default_quick_folder_recent_folders() -> [Vec<PathBuf>; 2] {
     [Vec::new(), Vec::new()]
 }
@@ -6943,16 +7040,37 @@ pub fn default_exif_hidden_tags() -> Vec<String> {
 }
 pub fn default_image_ext_priority() -> Vec<String> {
     // ロスレス系 > ロッシー系 > RAW 系
-    [
+    let mut priority = [
         "png", "bmp", "gif", "tiff", "tif", // ロスレス
         "webp", "jxl", "avif", "heic", "heif", // モダン (ロッシー/ロスレス混在)
         "jpg", "jpeg", // ロッシー
-        "dng", "cr2", "cr3", "nef", "nrw", "arw", // RAW (現像困難な場合が多い)
-        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect::<Vec<_>>();
+    priority.extend(
+        crate::raw_format::RAW_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string()),
+    );
+    priority
+}
+
+/// Complete saved priorities without changing user entries, their casing or their order.
+pub(crate) fn normalize_image_ext_priority(priority: &mut Vec<String>) -> bool {
+    let previous_len = priority.len();
+    for extension in default_image_ext_priority() {
+        if !priority
+            .iter()
+            .any(|saved| saved.eq_ignore_ascii_case(&extension))
+        {
+            priority.push(extension);
+        }
+    }
+    priority.len() != previous_len
+}
+fn default_raw_develop_parallelism() -> u8 {
+    3
 }
 fn default_slideshow_interval() -> f32 {
     3.0
@@ -7154,6 +7272,7 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            file_organize_destinations: Vec::new(),
             remember_favorite_view_state: false,
             favorite_view_overlay: None,
             smart_folders: Vec::new(),
@@ -7166,6 +7285,7 @@ impl Default for Settings {
             recent_folders: Vec::new(),
             quick_folder_recent_folders: default_quick_folder_recent_folders(),
             quick_folder_slots: default_quick_folder_slots(),
+            active_quick_folder_slot: default_active_quick_folder_slot(),
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
@@ -7173,6 +7293,8 @@ impl Default for Settings {
             always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
+            raw_develop_parallelism: default_raw_develop_parallelism(),
+            raw_brightness: crate::raw::RawBrightness::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
@@ -7215,6 +7337,7 @@ impl Default for Settings {
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
+            thumb_show_book_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -7391,8 +7514,10 @@ impl Default for Settings {
             toolbar_section_order: Vec::new(),
             show_toolbar_cols: true,
             show_toolbar_aspect: true,
-            show_toolbar_sort: true,
-            toolbar_section_new_row: Vec::new(),
+            show_toolbar_sort: false,
+            show_facet_sort: true,
+            toolbar_section_new_row: vec![ToolbarSectionId::Folder],
+            toolbar_folder_section_migrated: true,
             toolbar_section_drag_enabled: false,
             menu_layout: crate::keymap::MenuLayoutSettings::default(),
             context_menu_layout: crate::context_menu_model::ContextMenuLayoutSettings::default(),
@@ -7428,6 +7553,7 @@ impl Default for Settings {
             susie_enabled: true,
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
+            skip_offline_change_scan: false,
             pause_indexer_while_minimized: false,
             write_rating_to_xmp: false,
             update_check_enabled: true,
@@ -7500,6 +7626,8 @@ impl Default for Settings {
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
+            effetune_pre_limiter_enabled: true,
+            effetune_keep_visible_when_minimized: false,
             effetune_gui_pos: None,
             effetune_gui_size: None,
             vst3_video_compact: false,
@@ -7986,7 +8114,7 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
 /// 3. `migrate_legacy_archive_file_handling`
-/// 4. ツールバーの列数・ソート候補の一度きりの補完
+/// 4. ツールバーの列数・ソート候補・フォルダセクションの一度きりの補完
 /// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
@@ -7996,6 +8124,7 @@ pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_toolbar_sort_size_options();
     settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.migrate_toolbar_sort_rating_options();
+    settings.migrate_toolbar_folder_section();
     settings.sanitize();
 }
 
@@ -8672,6 +8801,22 @@ impl Settings {
         true
     }
 
+    fn migrate_toolbar_folder_section(&mut self) -> bool {
+        if self.toolbar_folder_section_migrated {
+            return false;
+        }
+        self.toolbar_section_order =
+            ToolbarSectionId::ordered_with_fallback(&self.toolbar_section_order);
+        if !self
+            .toolbar_section_new_row
+            .contains(&ToolbarSectionId::Folder)
+        {
+            self.toolbar_section_new_row.push(ToolbarSectionId::Folder);
+        }
+        self.toolbar_folder_section_migrated = true;
+        true
+    }
+
     /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
     ///
     /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
@@ -8711,6 +8856,7 @@ impl Settings {
         let autoplay_mode_migrated =
             settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
         let video_volume_before_sanitize = settings.video_volume;
+        let image_ext_priority_len_before_sanitize = settings.image_ext_priority.len();
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let video_seek_thumbnail_tolerance_before_sanitize =
             settings.video_seek_thumbnail_tolerance_secs;
@@ -8726,6 +8872,7 @@ impl Settings {
         let toolbar_sort_name_numeric_desc_options_migrated =
             settings.migrate_toolbar_sort_name_numeric_desc_options();
         let toolbar_sort_rating_options_migrated = settings.migrate_toolbar_sort_rating_options();
+        let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
         let legacy_keymap_import =
@@ -8856,6 +9003,7 @@ impl Settings {
         // 最初の 1 回」と定義されており、`load()` 内の migration/version 書き戻しで
         // rotation を消費すると次の真の user save が in-place 書込みになってしまう。
         let bootstrap_save_needed = vst3_migrated
+            || settings.image_ext_priority.len() != image_ext_priority_len_before_sanitize
             || autoplay_mode_migrated
             || video_loop_migrated
             || archive_file_handling_migrated
@@ -8871,6 +9019,7 @@ impl Settings {
             || toolbar_sort_size_options_migrated
             || toolbar_sort_name_numeric_desc_options_migrated
             || toolbar_sort_rating_options_migrated
+            || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
             || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -9239,6 +9388,7 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        normalize_image_ext_priority(&mut self.image_ext_priority);
         self.restore_post_filter_variants_after_load();
         self.restore_toolbar_name_filter_after_load();
         self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
@@ -9711,6 +9861,7 @@ impl Settings {
         self.show_toolbar_cols = src.show_toolbar_cols;
         self.show_toolbar_aspect = src.show_toolbar_aspect;
         self.show_toolbar_sort = src.show_toolbar_sort;
+        self.show_facet_sort = src.show_facet_sort;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
@@ -9751,6 +9902,7 @@ impl Settings {
         self.facet_name_filter_width = src.facet_name_filter_width;
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
+        self.toolbar_folder_section_migrated = src.toolbar_folder_section_migrated;
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
         // ── 操作カスタマイズ (設定メニューの専用ダイアログで編集) ──
         // 環境設定を開いたままキー / 右ドラッグ / リング / ジェスチャ設定を変更して OK した場合、
@@ -9813,6 +9965,7 @@ impl Settings {
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
+        self.active_quick_folder_slot = src.active_quick_folder_slot;
         self.quick_folder_drive_current_dirs =
             std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;
@@ -10036,26 +10189,38 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn clipboard_capture_settings_default_off_and_roundtrip() {
-        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
-        assert!(!defaults.clipboard_capture_image_enabled);
-        assert!(!defaults.clipboard_capture_html_enabled);
-        assert!(defaults.clipboard_capture_output_dir.is_none());
-        let configured = super::Settings {
-            clipboard_capture_image_enabled: true,
-            clipboard_capture_html_enabled: true,
-            clipboard_capture_output_dir: Some(std::path::PathBuf::from("C:/captures/clipboard")),
-            ..defaults
-        };
-        let restored: super::Settings =
-            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
-        assert!(restored.clipboard_capture_image_enabled);
-        assert!(restored.clipboard_capture_html_enabled);
-        assert_eq!(
-            restored.clipboard_capture_output_dir,
-            configured.clipboard_capture_output_dir
+    fn thumb_show_book_resume_meter_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_book_resume_meter);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.thumb_show_book_resume_meter);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_book_resume_meter":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_book_resume_meter);
+    }
+
+    #[test]
+    fn thumb_show_book_resume_meter_missing_db_key_defaults_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_show_book_resume_meter
         );
     }
+
     #[test]
     fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_media_duration);
@@ -10097,6 +10262,154 @@ mod tests {
     }
 
     use super::*;
+
+    fn released_image_ext_priority() -> Vec<String> {
+        // Literal master/v4.2.0 default: 12 other image formats and 15 RAW formats.
+        [
+            "png", "bmp", "gif", "tiff", "tif", "webp", "jxl", "avif", "heic", "heif", "jpg",
+            "jpeg", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2",
+            "pef", "ptx", "rwl", "iiq",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn image_ext_priority_released_default_appends_exactly_eight_raw_formats() {
+        let original = released_image_ext_priority();
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        apply_load_time_migrations(&mut settings);
+        assert_eq!(&settings.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            &settings.image_ext_priority[original.len()..],
+            ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"]
+        );
+        assert_eq!(settings.image_ext_priority, default_image_ext_priority());
+    }
+
+    #[test]
+    fn image_ext_priority_custom_order_and_entries_survive_completion() {
+        let original = vec![
+            "mos".into(),
+            "custom".into(),
+            "jpg".into(),
+            "png".into(),
+            "jpg".into(),
+        ];
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        apply_load_time_migrations(&mut settings);
+        assert_eq!(&settings.image_ext_priority[..original.len()], original);
+        let expected_tail: Vec<_> = default_image_ext_priority()
+            .into_iter()
+            .filter(|extension| !original.contains(extension))
+            .collect();
+        assert_eq!(
+            &settings.image_ext_priority[original.len()..],
+            expected_tail
+        );
+    }
+
+    #[test]
+    fn image_ext_priority_complete_list_is_unchanged_on_repeated_load_migrations() {
+        let mut original = default_image_ext_priority();
+        original.reverse();
+        original.push("custom".into());
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        for _ in 0..2 {
+            apply_load_time_migrations(&mut settings);
+            assert_eq!(settings.image_ext_priority, original);
+        }
+    }
+
+    #[test]
+    fn image_ext_priority_completion_compares_case_insensitively() {
+        let original = vec!["CRW".into(), "crw".into(), "PNG".into(), "mOs".into()];
+        let mut priority = original.clone();
+        assert!(normalize_image_ext_priority(&mut priority));
+        assert_eq!(&priority[..original.len()], original);
+        let expected_tail: Vec<_> = default_image_ext_priority()
+            .into_iter()
+            .filter(|extension| {
+                !original
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(extension))
+            })
+            .collect();
+        assert_eq!(&priority[original.len()..], expected_tail);
+        let completed = priority.clone();
+        assert!(!normalize_image_ext_priority(&mut priority));
+        assert_eq!(priority, completed);
+    }
+
+    #[test]
+    fn image_ext_priority_sqlite_load_persists_completion_without_version_change() {
+        let _env = setup_backup_env();
+        // Finish unrelated first-load migrations so they cannot trigger the writeback for us.
+        let mut old = Settings::load();
+        old.image_ext_priority = released_image_ext_priority();
+        crate::settings_db::with_db_result(|db| db.save_full(&old)).unwrap();
+
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.previous_last_seen_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::LoadedExistingDb
+        );
+        assert_eq!(
+            loaded.settings.image_ext_priority,
+            default_image_ext_priority()
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.image_ext_priority,
+            loaded.settings.image_ext_priority
+        );
+        assert_eq!(
+            Settings::load().image_ext_priority,
+            stored.image_ext_priority
+        );
+    }
+
+    #[test]
+    fn image_ext_priority_json_migration_persists_completion() {
+        let env = setup_backup_env();
+        let old = Settings {
+            image_ext_priority: released_image_ext_priority(),
+            ..Settings::default()
+        };
+        std::fs::write(
+            env._tmp.path().join("settings.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.image_ext_priority,
+            default_image_ext_priority()
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.image_ext_priority,
+            loaded.settings.image_ext_priority
+        );
+    }
 
     #[test]
     fn rating_view_sort_defaults_roundtrips_and_survives_preferences_merge() {
@@ -11204,6 +11517,7 @@ mod tests {
         assert!(s.show_toolbar_cols);
         assert!(s.show_toolbar_aspect);
         assert!(s.show_toolbar_sort);
+        assert!(!s.show_facet_sort);
         assert!(
             s.toolbar_section_new_row.is_empty(),
             "新規 new_row 集合は欠落時 空"
@@ -15723,6 +16037,155 @@ mod tests {
         }
     }
 
+    #[test]
+    fn section207_folder_migration_json_is_once_and_preserves_customization() {
+        use ToolbarSectionId as TS;
+        let mut old: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_section_order": ["Tags", "Cols", "Tags", "FutureSection"],
+            "toolbar_section_new_row": ["Cols"],
+            "show_toolbar_sort": true,
+            "show_facet_sort": false,
+            "show_toolbar_folder": false,
+            "show_address_bar_history_nav": false
+        }))
+        .unwrap();
+        assert!(!old.toolbar_folder_section_migrated);
+        assert!(old.migrate_toolbar_folder_section());
+        assert_eq!(&old.toolbar_section_order[..2], &[TS::Tags, TS::Cols]);
+        assert_eq!(old.toolbar_section_order.last(), Some(&TS::Folder));
+        assert_eq!(
+            old.toolbar_section_order
+                .iter()
+                .filter(|&&id| id == TS::Folder)
+                .count(),
+            1
+        );
+        assert_eq!(old.toolbar_section_new_row, [TS::Cols, TS::Folder]);
+        assert!(!old.show_toolbar_folder);
+        assert!(!old.show_address_bar_history_nav);
+        assert!(old.show_toolbar_sort);
+        assert!(!old.show_facet_sort);
+        old.toolbar_section_new_row.retain(|&id| id != TS::Folder);
+        old.toolbar_section_order.rotate_right(1);
+        let order = old.toolbar_section_order.clone();
+        let mut restart: Settings =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        assert!(!restart.migrate_toolbar_folder_section());
+        apply_load_time_migrations(&mut restart);
+        assert_eq!(restart.toolbar_section_order, order);
+        assert_eq!(restart.toolbar_section_new_row, [TS::Cols]);
+        let mut empty: Settings = serde_json::from_str("{}").unwrap();
+        apply_load_time_migrations(&mut empty);
+        assert!(empty.toolbar_folder_section_migrated);
+        assert_eq!(empty.toolbar_section_order, TS::default_order());
+        assert_eq!(empty.toolbar_section_new_row, [TS::Folder]);
+        assert_eq!(Settings::default().toolbar_section_new_row, [TS::Folder]);
+    }
+
+    #[test]
+    fn section207_folder_migration_db_writes_marker_and_keeps_later_off() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut old = Settings::default();
+        old.toolbar_section_order = ToolbarSectionId::default_order()
+            .iter()
+            .copied()
+            .filter(|&id| id != ToolbarSectionId::Folder)
+            .rev()
+            .collect();
+        old.toolbar_section_new_row = vec![ToolbarSectionId::Tags];
+        old.show_toolbar_folder = false;
+        old.show_toolbar_sort = true;
+        old.show_facet_sort = false;
+        let expected_order = old.toolbar_section_order.clone();
+        old.save();
+        drop(crate::settings_db::SettingsDb::open(&dir).unwrap());
+        let db = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        db.execute(
+            "DELETE FROM settings_kv WHERE key = 'toolbar_folder_section_migrated'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        reset_backup_state_for_test();
+        let mut migrated = Settings::load();
+        assert_eq!(
+            &migrated.toolbar_section_order[..expected_order.len()],
+            expected_order
+        );
+        assert_eq!(
+            migrated.toolbar_section_order.last(),
+            Some(&ToolbarSectionId::Folder)
+        );
+        assert_eq!(
+            migrated.toolbar_section_new_row,
+            [ToolbarSectionId::Tags, ToolbarSectionId::Folder]
+        );
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.toolbar_folder_section_migrated);
+        assert_eq!(
+            persisted.toolbar_section_new_row,
+            migrated.toolbar_section_new_row
+        );
+        migrated
+            .toolbar_section_new_row
+            .retain(|&id| id != ToolbarSectionId::Folder);
+        migrated.toolbar_section_order.rotate_right(1);
+        migrated.save();
+        reset_backup_state_for_test();
+        let restart = Settings::load();
+        assert_eq!(restart.toolbar_section_new_row, [ToolbarSectionId::Tags]);
+        assert_eq!(
+            restart.toolbar_section_order,
+            migrated.toolbar_section_order
+        );
+        assert!(!restart.show_toolbar_folder);
+        assert!(restart.show_toolbar_sort);
+        assert!(!restart.show_facet_sort);
+    }
+
+    #[test]
+    fn section207_folder_migration_legacy_json_uses_production_bootstrap() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("toolbar_folder_section_migrated");
+        object.insert(
+            "toolbar_section_order".into(),
+            serde_json::json!(["Tags", "Cols"]),
+        );
+        object.insert("toolbar_section_new_row".into(), serde_json::json!([]));
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.toolbar_section_order.last(),
+            Some(&ToolbarSectionId::Folder)
+        );
+        assert_eq!(
+            loaded.settings.toolbar_section_new_row,
+            [ToolbarSectionId::Folder]
+        );
+        assert!(
+            crate::settings_db::SettingsDb::open(&dir)
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .toolbar_folder_section_migrated
+        );
+    }
+
     // -- CachePolicy --
 
     #[test]
@@ -17818,5 +18281,27 @@ mod tests {
             );
             let _ = env;
         }
+    }
+
+    #[test]
+    fn clipboard_capture_settings_default_off_and_roundtrip() {
+        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.clipboard_capture_image_enabled);
+        assert!(!defaults.clipboard_capture_html_enabled);
+        assert!(defaults.clipboard_capture_output_dir.is_none());
+        let configured = super::Settings {
+            clipboard_capture_image_enabled: true,
+            clipboard_capture_html_enabled: true,
+            clipboard_capture_output_dir: Some(std::path::PathBuf::from("C:/captures/clipboard")),
+            ..defaults
+        };
+        let restored: super::Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert!(restored.clipboard_capture_image_enabled);
+        assert!(restored.clipboard_capture_html_enabled);
+        assert_eq!(
+            restored.clipboard_capture_output_dir,
+            configured.clipboard_capture_output_dir
+        );
     }
 }

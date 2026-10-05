@@ -47,6 +47,7 @@ impl ContextMenuParentId {
 pub enum ContextMenuItemId {
     CutFiles,
     CopyFiles,
+    OrganizeFiles,
     NewFolder,
     Paste,
     Rename,
@@ -79,6 +80,7 @@ impl ContextMenuItemId {
     pub const ALL: &'static [Self] = &[
         Self::CutFiles,
         Self::CopyFiles,
+        Self::OrganizeFiles,
         Self::NewFolder,
         Self::Paste,
         Self::Rename,
@@ -111,6 +113,7 @@ impl ContextMenuItemId {
         match self {
             Self::CutFiles => "CutFiles",
             Self::CopyFiles => "CopyFiles",
+            Self::OrganizeFiles => "OrganizeFiles",
             Self::NewFolder => "NewFolder",
             Self::Paste => "Paste",
             Self::Rename => "Rename",
@@ -158,6 +161,7 @@ impl ContextMenuItemId {
         match self {
             Self::CutFiles => "切り取り",
             Self::CopyFiles => "コピー",
+            Self::OrganizeFiles => "ファイル整理先…",
             Self::NewFolder => "新しいフォルダ…",
             Self::Paste => "貼り付け",
             Self::Rename => "名前の変更…",
@@ -194,6 +198,7 @@ impl ContextMenuItemId {
             MenuCommand::Rename => Self::Rename,
             MenuCommand::CutFiles => Self::CutFiles,
             MenuCommand::CopyFiles => Self::CopyFiles,
+            MenuCommand::OrganizeFiles => Self::OrganizeFiles,
             MenuCommand::CopyPath => Self::CopyPath,
             MenuCommand::CopyFileName => Self::CopyFileName,
             MenuCommand::CopyPageName => Self::CopyPageName,
@@ -701,6 +706,7 @@ pub enum MenuCommand {
     Rename,
     CutFiles,
     CopyFiles,
+    OrganizeFiles,
     CopyPath,
     CopyFileName,
     CopyPageName,
@@ -925,6 +931,7 @@ impl CollectionReferenceAvailability {
 pub struct ContextMenuShortcutLabels {
     pub cut: Option<String>,
     pub copy: Option<String>,
+    pub organize: Option<String>,
     pub rotate_left: Option<String>,
     pub rotate_right: Option<String>,
     pub deselect: Option<String>,
@@ -1195,6 +1202,16 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 },
             ],
         );
+        if input.surface == ContextMenuSurface::Grid && !input.is_folder_context {
+            push_group(
+                &mut nodes,
+                [item(
+                    MenuCommand::OrganizeFiles,
+                    with_key("ファイル整理先…", input.shortcuts.organize.as_ref()),
+                )],
+            );
+        }
+
         push_group(
             &mut nodes,
             [item(
@@ -1302,6 +1319,16 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                     with_key("コピー", input.shortcuts.copy.as_ref()),
                 ),
             ],
+        );
+    }
+
+    if input.surface == ContextMenuSurface::Grid && !input.is_folder_context {
+        push_group(
+            &mut nodes,
+            [item(
+                MenuCommand::OrganizeFiles,
+                with_key("ファイル整理先…", input.shortcuts.organize.as_ref()),
+            )],
         );
     }
 
@@ -1602,6 +1629,7 @@ mod tests {
             shortcuts: ContextMenuShortcutLabels {
                 cut: (surface == ContextMenuSurface::Grid).then(|| "Ctrl+X".to_string()),
                 copy: (surface == ContextMenuSurface::Grid).then(|| "Ctrl+C".to_string()),
+                organize: None,
                 rotate_left: Some("L".to_string()),
                 rotate_right: Some("R".to_string()),
                 deselect: Some("Ctrl+D".to_string()),
@@ -1814,6 +1842,7 @@ mod tests {
         input.shortcuts = ContextMenuShortcutLabels {
             cut: Some("Alt+X".to_string()),
             copy: Some("Alt+C".to_string()),
+            organize: None,
             rotate_left: Some("Shift+F1".to_string()),
             rotate_right: Some("Shift+F2".to_string()),
             deselect: Some("Alt+Q".to_string()),
@@ -1886,6 +1915,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1905,6 +1935,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1920,6 +1951,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1935,6 +1967,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1946,6 +1979,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1961,6 +1995,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1976,6 +2011,7 @@ mod tests {
                 &[
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
+                    "ファイル整理先…",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -1989,6 +2025,7 @@ mod tests {
             (
                 ContextMenuItemKind::ZipImage,
                 &[
+                    "ファイル整理先…",
                     "パスをコピー",
                     "ファイル名をコピー",
                     "画像をクリップボードにコピー",
@@ -2004,6 +2041,7 @@ mod tests {
             (
                 ContextMenuItemKind::PdfPage,
                 &[
+                    "ファイル整理先…",
                     "パスをコピー",
                     "ページ名をコピー",
                     "編集内容をコピー",
@@ -2018,13 +2056,20 @@ mod tests {
             (
                 ContextMenuItemKind::Stack,
                 &[
+                    "ファイル整理先…",
                     "代表画像のパスをコピー",
                     "アプリケーションで開く…",
                     "外部ツールの設定…",
                 ][..],
             ),
-            (ContextMenuItemKind::ZipDir, &["パスをコピー"][..]),
-            (ContextMenuItemKind::SearchContainer, &["パスをコピー"][..]),
+            (
+                ContextMenuItemKind::ZipDir,
+                &["ファイル整理先…", "パスをコピー"][..],
+            ),
+            (
+                ContextMenuItemKind::SearchContainer,
+                &["ファイル整理先…", "パスをコピー"][..],
+            ),
         ];
         for (kind, expected) in cases {
             assert_labels(input(kind, ContextMenuSurface::Grid), expected);
@@ -2145,6 +2190,7 @@ mod tests {
             &[
                 "切り取り [5件] (Ctrl+X)",
                 "コピー [5件] (Ctrl+C)",
+                "ファイル整理先…",
                 "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
@@ -2436,6 +2482,8 @@ mod tests {
                 "CutFiles",
                 "CopyFiles",
                 "|",
+                "OrganizeFiles",
+                "|",
                 "Rename",
                 "|",
                 "CopyPath",
@@ -2475,6 +2523,8 @@ mod tests {
             [
                 "CutFiles",
                 "CopyFiles",
+                "|",
+                "OrganizeFiles",
                 "|",
                 "CopyPath",
                 "|",
@@ -2656,7 +2706,7 @@ mod tests {
         let mut saved: Vec<_> = canonical
             .iter()
             .copied()
-            .filter(|item| *item != ContextMenuItemId::NewFolder)
+            .filter(|item| *item != ContextMenuItemId::OrganizeFiles)
             .collect();
         saved.swap(0, 1);
         let settings = ContextMenuLayoutSettings {
@@ -2679,11 +2729,11 @@ mod tests {
         let resolved = settings.resolved_order(ContextMenuParentId::Root);
         assert_eq!(resolved[0], ContextMenuItemId::CopyFiles);
         assert_eq!(resolved[1], ContextMenuItemId::CutFiles);
-        assert_eq!(resolved[2], ContextMenuItemId::NewFolder);
+        assert_eq!(resolved[2], ContextMenuItemId::OrganizeFiles);
         let known_without_new: Vec<_> = resolved
             .iter()
             .copied()
-            .filter(|item| *item != ContextMenuItemId::NewFolder)
+            .filter(|item| *item != ContextMenuItemId::OrganizeFiles)
             .collect();
         assert_eq!(known_without_new, saved);
     }

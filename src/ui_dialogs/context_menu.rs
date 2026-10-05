@@ -1080,14 +1080,25 @@ impl crate::app::App {
         let rotation = self.get_rotation(idx);
         match item {
             GridItem::Image(path) => {
-                copy_image_to_clipboard(&path, rotation);
+                copy_image_to_clipboard(
+                    &path,
+                    rotation,
+                    self.raw_develop_executor.clone(),
+                    self.settings.raw_brightness,
+                );
                 true
             }
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
             } => {
-                copy_zip_image_to_clipboard(&zip_path, &entry_name, rotation);
+                copy_zip_image_to_clipboard(
+                    &zip_path,
+                    &entry_name,
+                    rotation,
+                    self.raw_develop_executor.clone(),
+                    self.settings.raw_brightness,
+                );
                 true
             }
             _ => false,
@@ -1441,6 +1452,12 @@ impl crate::app::App {
                 crate::context_menu_model::ContextMenuShortcutLabels {
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
+                    organize: (target.surface == ContextMenuSurface::Grid)
+                        .then(|| {
+                            self.keymap
+                                .first_chord_label(crate::keymap::KeyAction::GridOrganizeFiles)
+                        })
+                        .flatten(),
                     rotate_left: self.keymap.first_chord_label(rotate_ccw),
                     rotate_right: self.keymap.first_chord_label(rotate_cw),
                     deselect: deselect.and_then(|action| self.keymap.first_chord_label(action)),
@@ -1631,6 +1648,12 @@ impl crate::app::App {
                 }
                 None
             }
+            MenuCommand::OrganizeFiles => {
+                if target.surface == ContextMenuSurface::Grid && !target.is_folder_context {
+                    self.request_file_organize_dialog(target.item_index);
+                }
+                None
+            }
             MenuCommand::CutFiles | MenuCommand::CopyFiles => {
                 let verb = if command == MenuCommand::CutFiles {
                     crate::native_context_menu::ShellClipboardVerb::Cut
@@ -1682,11 +1705,22 @@ impl crate::app::App {
                 if let Some(idx) = target.item_index {
                     let rotation = self.get_rotation(idx);
                     match &target.item {
-                        GridItem::Image(path) => copy_image_to_clipboard(path, rotation),
+                        GridItem::Image(path) => copy_image_to_clipboard(
+                            path,
+                            rotation,
+                            self.raw_develop_executor.clone(),
+                            self.settings.raw_brightness,
+                        ),
                         GridItem::ZipImage {
                             zip_path,
                             entry_name,
-                        } => copy_zip_image_to_clipboard(zip_path, entry_name, rotation),
+                        } => copy_zip_image_to_clipboard(
+                            zip_path,
+                            entry_name,
+                            rotation,
+                            self.raw_develop_executor.clone(),
+                            self.settings.raw_brightness,
+                        ),
                         _ => {}
                     }
                 }
@@ -2363,6 +2397,14 @@ fn clipboard_seq_is_latest(my_seq: u64) -> bool {
     CLIPBOARD_SEQ.load(std::sync::atomic::Ordering::Relaxed) == my_seq
 }
 
+fn decode_clipboard_raw(
+    source: crate::raw::RawOwnedSource,
+    executor: &crate::raw::RawDevelopExecutor,
+    brightness: crate::raw::RawBrightness,
+) -> Result<image::DynamicImage, crate::raw::RawError> {
+    crate::raw::develop_full_on_worker(executor, source, brightness, None)
+}
+
 /// Path を PowerShell の単一引用符文字列リテラル (`'...'`、内部の `'` を `''` へ
 /// エスケープ) に変換する。外部 D&D 受け取りのスクリプト生成で使う。
 #[cfg(windows)]
@@ -2378,34 +2420,57 @@ fn ps_quote(path: &std::path::Path) -> String {
 /// 数百ms〜秒単位かかるため、UI スレッドから同期実行すると右クリック操作で固まる。
 /// 発行時に `CLIPBOARD_SEQ` を bump し、set 直前に最新 seq と比較、自分が古ければ
 /// set をスキップする — 遅い A が速い B を追い越して上書きするのを防ぐ。
-fn copy_image_to_clipboard(path: &std::path::Path, rotation: crate::rotation_db::Rotation) {
+fn copy_image_to_clipboard(
+    path: &std::path::Path,
+    rotation: crate::rotation_db::Rotation,
+    raw_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+    raw_brightness: crate::raw::RawBrightness,
+) {
     let path = path.to_path_buf();
     let my_seq = bump_clipboard_seq();
     std::thread::Builder::new()
         .name("clipboard-image-copy".into())
         .spawn(move || {
-            let img = match image::open(&path) {
-                Ok(i) => i,
-                Err(_) => {
-                    #[cfg(windows)]
-                    {
-                        match crate::wic_decoder::decode_to_dynamic_image(&path)
-                            .or_else(|| crate::susie_loader::decode_file(&path, true, None).ok())
-                        {
-                            Some(i) => i,
-                            None => return,
-                        }
+            let img = if crate::raw_format::is_raw_path(&path) {
+                match decode_clipboard_raw(
+                    crate::raw::RawOwnedSource::Path(path.clone()),
+                    &raw_executor,
+                    raw_brightness,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        crate::logger::log(format!("RAW clipboard decode failed: {error}"));
+                        return;
                     }
-                    #[cfg(not(windows))]
-                    {
-                        match crate::susie_loader::decode_file(&path, true, None) {
-                            Ok(i) => i,
-                            Err(_) => return,
+                }
+            } else {
+                match image::open(&path) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        #[cfg(windows)]
+                        {
+                            match crate::wic_decoder::decode_to_dynamic_image(&path).or_else(|| {
+                                crate::susie_loader::decode_file(&path, true, None).ok()
+                            }) {
+                                Some(i) => i,
+                                None => return,
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            match crate::susie_loader::decode_file(&path, true, None) {
+                                Ok(i) => i,
+                                Err(_) => return,
+                            }
                         }
                     }
                 }
             };
-            let img = crate::thumb_loader::apply_exif_orientation(img, &path);
+            let img = if crate::raw_format::is_raw_path(&path) {
+                img
+            } else {
+                crate::thumb_loader::apply_exif_orientation(img, &path)
+            };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
             // 正式な stale 判定は `set_image_to_clipboard` 内部で
@@ -2425,6 +2490,8 @@ fn copy_zip_image_to_clipboard(
     zip_path: &std::path::Path,
     entry_name: &str,
     rotation: crate::rotation_db::Rotation,
+    raw_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+    raw_brightness: crate::raw::RawBrightness,
 ) {
     let zip_path = zip_path.to_path_buf();
     let entry_name = entry_name.to_string();
@@ -2435,16 +2502,42 @@ fn copy_zip_image_to_clipboard(
             let Ok(bytes) = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) else {
                 return;
             };
-            let Some(img) = image::load_from_memory(&bytes)
-                .ok()
-                .or_else(|| crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes))
-                .or_else(|| {
-                    crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
-                })
-            else {
-                return;
+            let raw = std::path::Path::new(&entry_name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(crate::raw_format::is_raw_ext);
+            let img = if raw {
+                match decode_clipboard_raw(
+                    crate::raw::RawOwnedSource::Bytes(bytes.clone().into()),
+                    &raw_executor,
+                    raw_brightness,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        crate::logger::log(format!("ZIP RAW clipboard decode failed: {error}"));
+                        return;
+                    }
+                }
+            } else {
+                let Some(img) = image::load_from_memory(&bytes)
+                    .ok()
+                    .or_else(|| {
+                        crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                            &bytes,
+                            std::path::Path::new(&entry_name)
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or(""),
+                        )
+                    })
+                    .or_else(|| {
+                        crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
+                    })
+                else {
+                    return;
+                };
+                crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes)
             };
-            let img = crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes);
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は
             // `set_image_to_clipboard` 側の mutex 内で行う。
@@ -3064,288 +3157,31 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 }
 
 #[cfg(test)]
-mod clipboard_image_writer_tests {
+mod raw_clipboard_tests {
     use super::*;
+    use image::GenericImageView;
 
-    const DIB_FORMAT: u32 = 8;
-    const ORIGIN_FORMAT: u32 = 0xc001;
-    const DIB: &[u8] = b"image bytes";
-    const NONCE: &[u8] = b"process nonce";
-
-    #[derive(Default)]
-    struct FakeClipboardImageApi {
-        failures: Vec<&'static str>,
-        events: Vec<&'static str>,
-        logs: Vec<String>,
-        next_memory: usize,
-        allocated: Vec<usize>,
-        freed: Vec<usize>,
-        transferred: Vec<(u32, usize)>,
-        payloads: Vec<(usize, Vec<u8>)>,
-        opened: bool,
-    }
-
-    impl FakeClipboardImageApi {
-        fn with_failures(failures: &[&'static str]) -> Self {
-            Self {
-                failures: failures.to_vec(),
-                ..Self::default()
-            }
-        }
-
-        fn result(&mut self, event: &'static str) -> Result<(), &'static str> {
-            self.events.push(event);
-            if self.failures.contains(&event) {
-                Err(event)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn write(&mut self) -> bool {
-            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, || true)
-        }
-    }
-
-    impl ClipboardImageApi for FakeClipboardImageApi {
-        type Memory = usize;
-        type Error = &'static str;
-
-        fn allocate(&mut self, _size: usize) -> Result<usize, Self::Error> {
-            self.next_memory += 1;
-            let memory = self.next_memory;
-            self.result(if memory == 1 {
-                "alloc_image"
-            } else {
-                "alloc_origin"
-            })?;
-            self.allocated.push(memory);
-            Ok(memory)
-        }
-
-        fn lock_and_copy(&mut self, memory: usize, bytes: &[u8]) -> Result<(), Self::Error> {
-            self.result(if memory == 1 {
-                "lock_image"
-            } else {
-                "lock_origin"
-            })?;
-            self.payloads.push((memory, bytes.to_vec()));
-            Ok(())
-        }
-
-        fn unlock(&mut self, memory: usize) -> Result<(), Self::Error> {
-            self.result(if memory == 1 {
-                "unlock_image"
-            } else {
-                "unlock_origin"
-            })
-        }
-
-        fn free(&mut self, memory: usize) -> Result<(), Self::Error> {
-            assert!(self.allocated.contains(&memory));
-            assert!(!self.freed.contains(&memory), "no double free");
-            assert!(
-                !self.transferred.iter().any(|(_, h)| *h == memory),
-                "system-owned memory"
-            );
-            self.result("free")?;
-            self.freed.push(memory);
-            Ok(())
-        }
-
-        fn open(&mut self) -> Result<(), Self::Error> {
-            assert!(!self.opened);
-            self.result("open")?;
-            self.opened = true;
-            Ok(())
-        }
-
-        fn empty(&mut self) -> Result<(), Self::Error> {
-            assert!(self.opened);
-            self.result("empty")
-        }
-
-        fn set_data(&mut self, format: u32, memory: usize) -> Result<(), Self::Error> {
-            assert!(self.opened);
-            assert!(!self.freed.contains(&memory));
-            assert!(!self.transferred.iter().any(|(_, h)| *h == memory));
-            self.result(if format == DIB_FORMAT {
-                "set_image"
-            } else {
-                "set_origin"
-            })?;
-            self.transferred.push((format, memory));
-            Ok(())
-        }
-
-        fn register_origin(&mut self) -> Result<u32, Self::Error> {
-            assert!(self.opened);
-            assert_eq!(self.transferred, vec![(DIB_FORMAT, 1)]);
-            self.result("register_origin")?;
-            Ok(ORIGIN_FORMAT)
-        }
-
-        fn close(&mut self) -> Result<(), Self::Error> {
-            assert!(self.opened);
-            self.result("close")?;
-            self.opened = false;
-            Ok(())
-        }
-
-        fn log(&mut self, message: String) {
-            self.logs.push(message);
-        }
-    }
-
+    #[cfg(windows)]
     #[test]
-    fn successful_image_and_marker_transfer_in_one_open_without_free() {
-        let mut api = FakeClipboardImageApi::default();
-        assert!(api.write());
-        assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
-        assert_eq!(api.payloads, vec![(1, DIB.to_vec()), (2, NONCE.to_vec())]);
-        assert!(api.freed.is_empty());
-        assert!(api.logs.is_empty());
-        assert_eq!(
-            api.events,
-            vec![
-                "alloc_image",
-                "lock_image",
-                "unlock_image",
-                "open",
-                "empty",
-                "set_image",
-                "register_origin",
-                "alloc_origin",
-                "lock_origin",
-                "unlock_origin",
-                "set_origin",
-                "close",
-            ]
-        );
-        assert!(!api.opened);
-    }
-
-    #[test]
-    fn image_failures_release_only_owned_memory_and_close_only_after_open() {
-        for (failure, allocated, freed, closes) in [
-            ("alloc_image", vec![], vec![], 0),
-            ("lock_image", vec![1], vec![1], 0),
-            ("open", vec![1], vec![1], 0),
-            ("empty", vec![1], vec![1], 1),
-            ("set_image", vec![1], vec![1], 1),
-        ] {
-            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
-            assert!(!api.write(), "{failure}");
-            assert_eq!(api.allocated, allocated, "{failure}");
-            assert_eq!(api.freed, freed, "{failure}");
-            assert!(api.transferred.is_empty(), "{failure}");
-            assert!(!api.events.contains(&"register_origin"), "{failure}");
+    fn raw_clipboard_file_and_zip_bytes_use_full_libraw() {
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        for name in ["1018.cr2", "885.dng"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(&path).unwrap();
+            let info = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes)).unwrap();
+            let source = if name.ends_with(".cr2") {
+                crate::raw::RawOwnedSource::Path(path)
+            } else {
+                crate::raw::RawOwnedSource::Bytes(bytes.into())
+            };
+            let image =
+                decode_clipboard_raw(source, &executor, crate::raw::RawBrightness::None).unwrap();
             assert_eq!(
-                api.events.iter().filter(|event| **event == "close").count(),
-                closes,
-                "{failure}"
+                image.dimensions(),
+                (info.developed_dims[0], info.developed_dims[1])
             );
-            assert_eq!(api.logs.len(), 1, "{failure}");
-            assert!(api.logs[0].contains(failure), "{failure}");
-            assert!(!api.opened, "{failure}");
         }
-    }
-
-    #[test]
-    fn marker_failures_log_without_undoing_image_and_release_owned_marker() {
-        for (failure, allocated, freed) in [
-            ("register_origin", vec![1], vec![]),
-            ("alloc_origin", vec![1], vec![]),
-            ("lock_origin", vec![1, 2], vec![2]),
-            ("set_origin", vec![1, 2], vec![2]),
-        ] {
-            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
-            assert!(api.write(), "{failure}");
-            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1)], "{failure}");
-            assert_eq!(api.allocated, allocated, "{failure}");
-            assert_eq!(api.freed, freed, "{failure}");
-            assert_eq!(
-                api.events.iter().filter(|event| **event == "empty").count(),
-                1,
-                "{failure}"
-            );
-            assert_eq!(api.events.last(), Some(&"close"), "{failure}");
-            assert_eq!(api.logs.len(), 1, "{failure}");
-            assert!(api.logs[0].contains(failure), "{failure}");
-            assert!(api.logs[0].contains("origin"), "{failure}");
-            assert!(!api.opened, "{failure}");
-        }
-    }
-
-    #[test]
-    fn obsolete_generation_does_not_allocate_open_or_write() {
-        let mut api = FakeClipboardImageApi::default();
-        let mut checks = 0;
-        assert!(!write_image_clipboard_if_latest(
-            &mut api,
-            DIB,
-            DIB_FORMAT,
-            NONCE,
-            || {
-                checks += 1;
-                false
-            }
-        ));
-        assert_eq!(checks, 1);
-        assert!(api.events.is_empty());
-        assert!(api.logs.is_empty());
-    }
-
-    #[test]
-    fn final_unlock_zero_with_no_error_is_success() {
-        assert!(clipboard_unlock_succeeded(false, 0));
-        assert!(clipboard_unlock_succeeded(true, 0));
-        assert!(clipboard_unlock_succeeded(true, 123));
-        assert!(!clipboard_unlock_succeeded(false, 123));
-    }
-
-    #[test]
-    fn unlock_failures_log_and_do_not_undo_successfully_transferred_data() {
-        for failure in ["unlock_image", "unlock_origin"] {
-            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
-            assert!(api.write(), "{failure}");
-            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
-            assert!(api.freed.is_empty());
-            assert_eq!(api.logs.len(), 1);
-            assert!(api.logs[0].contains(failure));
-            assert!(!api.opened);
-        }
-    }
-
-    #[test]
-    fn close_failure_is_logged_after_empty_failure_and_successful_transfers() {
-        for failures in [&["empty", "close"][..], &["close"][..]] {
-            let mut api = FakeClipboardImageApi::with_failures(failures);
-            assert_eq!(api.write(), !failures.contains(&"empty"));
-            assert_eq!(api.events.last(), Some(&"close"));
-            assert_eq!(api.logs.len(), failures.len());
-            assert!(api.logs.last().unwrap().contains("CloseClipboard"));
-            if failures.contains(&"empty") {
-                assert_eq!(api.freed, vec![1]);
-            } else {
-                assert!(api.freed.is_empty());
-                assert_eq!(api.transferred.len(), 2);
-            }
-        }
-    }
-
-    #[test]
-    fn free_failure_is_logged_without_retry_and_opened_clipboard_is_closed() {
-        let mut api = FakeClipboardImageApi::with_failures(&["empty", "free"]);
-        assert!(!api.write());
-        assert_eq!(api.logs.len(), 2);
-        assert!(api.logs[1].contains("image free failed"));
-        assert_eq!(
-            api.events.iter().filter(|event| **event == "free").count(),
-            1
-        );
-        assert_eq!(api.events.last(), Some(&"close"));
-        assert!(!api.opened);
     }
 }
 
@@ -4875,5 +4711,291 @@ mod delete_confirm_tests {
         assert!(windows_drive_type_may_permanently_delete(2));
         assert!(windows_drive_type_may_permanently_delete(4));
         assert!(!windows_drive_type_may_permanently_delete(3));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_image_writer_tests {
+    use super::*;
+
+    const DIB_FORMAT: u32 = 8;
+    const ORIGIN_FORMAT: u32 = 0xc001;
+    const DIB: &[u8] = b"image bytes";
+    const NONCE: &[u8] = b"process nonce";
+
+    #[derive(Default)]
+    struct FakeClipboardImageApi {
+        failures: Vec<&'static str>,
+        events: Vec<&'static str>,
+        logs: Vec<String>,
+        next_memory: usize,
+        allocated: Vec<usize>,
+        freed: Vec<usize>,
+        transferred: Vec<(u32, usize)>,
+        payloads: Vec<(usize, Vec<u8>)>,
+        opened: bool,
+    }
+
+    impl FakeClipboardImageApi {
+        fn with_failures(failures: &[&'static str]) -> Self {
+            Self {
+                failures: failures.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn result(&mut self, event: &'static str) -> Result<(), &'static str> {
+            self.events.push(event);
+            if self.failures.contains(&event) {
+                Err(event)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn write(&mut self) -> bool {
+            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, || true)
+        }
+    }
+
+    impl ClipboardImageApi for FakeClipboardImageApi {
+        type Memory = usize;
+        type Error = &'static str;
+
+        fn allocate(&mut self, _size: usize) -> Result<usize, Self::Error> {
+            self.next_memory += 1;
+            let memory = self.next_memory;
+            self.result(if memory == 1 {
+                "alloc_image"
+            } else {
+                "alloc_origin"
+            })?;
+            self.allocated.push(memory);
+            Ok(memory)
+        }
+
+        fn lock_and_copy(&mut self, memory: usize, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.result(if memory == 1 {
+                "lock_image"
+            } else {
+                "lock_origin"
+            })?;
+            self.payloads.push((memory, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn unlock(&mut self, memory: usize) -> Result<(), Self::Error> {
+            self.result(if memory == 1 {
+                "unlock_image"
+            } else {
+                "unlock_origin"
+            })
+        }
+
+        fn free(&mut self, memory: usize) -> Result<(), Self::Error> {
+            assert!(self.allocated.contains(&memory));
+            assert!(!self.freed.contains(&memory), "no double free");
+            assert!(
+                !self.transferred.iter().any(|(_, h)| *h == memory),
+                "system-owned memory"
+            );
+            self.result("free")?;
+            self.freed.push(memory);
+            Ok(())
+        }
+
+        fn open(&mut self) -> Result<(), Self::Error> {
+            assert!(!self.opened);
+            self.result("open")?;
+            self.opened = true;
+            Ok(())
+        }
+
+        fn empty(&mut self) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            self.result("empty")
+        }
+
+        fn set_data(&mut self, format: u32, memory: usize) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            assert!(!self.freed.contains(&memory));
+            assert!(!self.transferred.iter().any(|(_, h)| *h == memory));
+            self.result(if format == DIB_FORMAT {
+                "set_image"
+            } else {
+                "set_origin"
+            })?;
+            self.transferred.push((format, memory));
+            Ok(())
+        }
+
+        fn register_origin(&mut self) -> Result<u32, Self::Error> {
+            assert!(self.opened);
+            assert_eq!(self.transferred, vec![(DIB_FORMAT, 1)]);
+            self.result("register_origin")?;
+            Ok(ORIGIN_FORMAT)
+        }
+
+        fn close(&mut self) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            self.result("close")?;
+            self.opened = false;
+            Ok(())
+        }
+
+        fn log(&mut self, message: String) {
+            self.logs.push(message);
+        }
+    }
+
+    #[test]
+    fn successful_image_and_marker_transfer_in_one_open_without_free() {
+        let mut api = FakeClipboardImageApi::default();
+        assert!(api.write());
+        assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+        assert_eq!(api.payloads, vec![(1, DIB.to_vec()), (2, NONCE.to_vec())]);
+        assert!(api.freed.is_empty());
+        assert!(api.logs.is_empty());
+        assert_eq!(
+            api.events,
+            vec![
+                "alloc_image",
+                "lock_image",
+                "unlock_image",
+                "open",
+                "empty",
+                "set_image",
+                "register_origin",
+                "alloc_origin",
+                "lock_origin",
+                "unlock_origin",
+                "set_origin",
+                "close",
+            ]
+        );
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn image_failures_release_only_owned_memory_and_close_only_after_open() {
+        for (failure, allocated, freed, closes) in [
+            ("alloc_image", vec![], vec![], 0),
+            ("lock_image", vec![1], vec![1], 0),
+            ("open", vec![1], vec![1], 0),
+            ("empty", vec![1], vec![1], 1),
+            ("set_image", vec![1], vec![1], 1),
+        ] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(!api.write(), "{failure}");
+            assert_eq!(api.allocated, allocated, "{failure}");
+            assert_eq!(api.freed, freed, "{failure}");
+            assert!(api.transferred.is_empty(), "{failure}");
+            assert!(!api.events.contains(&"register_origin"), "{failure}");
+            assert_eq!(
+                api.events.iter().filter(|event| **event == "close").count(),
+                closes,
+                "{failure}"
+            );
+            assert_eq!(api.logs.len(), 1, "{failure}");
+            assert!(api.logs[0].contains(failure), "{failure}");
+            assert!(!api.opened, "{failure}");
+        }
+    }
+
+    #[test]
+    fn marker_failures_log_without_undoing_image_and_release_owned_marker() {
+        for (failure, allocated, freed) in [
+            ("register_origin", vec![1], vec![]),
+            ("alloc_origin", vec![1], vec![]),
+            ("lock_origin", vec![1, 2], vec![2]),
+            ("set_origin", vec![1, 2], vec![2]),
+        ] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(api.write(), "{failure}");
+            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1)], "{failure}");
+            assert_eq!(api.allocated, allocated, "{failure}");
+            assert_eq!(api.freed, freed, "{failure}");
+            assert_eq!(
+                api.events.iter().filter(|event| **event == "empty").count(),
+                1,
+                "{failure}"
+            );
+            assert_eq!(api.events.last(), Some(&"close"), "{failure}");
+            assert_eq!(api.logs.len(), 1, "{failure}");
+            assert!(api.logs[0].contains(failure), "{failure}");
+            assert!(api.logs[0].contains("origin"), "{failure}");
+            assert!(!api.opened, "{failure}");
+        }
+    }
+
+    #[test]
+    fn obsolete_generation_does_not_allocate_open_or_write() {
+        let mut api = FakeClipboardImageApi::default();
+        let mut checks = 0;
+        assert!(!write_image_clipboard_if_latest(
+            &mut api,
+            DIB,
+            DIB_FORMAT,
+            NONCE,
+            || {
+                checks += 1;
+                false
+            }
+        ));
+        assert_eq!(checks, 1);
+        assert!(api.events.is_empty());
+        assert!(api.logs.is_empty());
+    }
+
+    #[test]
+    fn final_unlock_zero_with_no_error_is_success() {
+        assert!(clipboard_unlock_succeeded(false, 0));
+        assert!(clipboard_unlock_succeeded(true, 0));
+        assert!(clipboard_unlock_succeeded(true, 123));
+        assert!(!clipboard_unlock_succeeded(false, 123));
+    }
+
+    #[test]
+    fn unlock_failures_log_and_do_not_undo_successfully_transferred_data() {
+        for failure in ["unlock_image", "unlock_origin"] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(api.write(), "{failure}");
+            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+            assert!(api.freed.is_empty());
+            assert_eq!(api.logs.len(), 1);
+            assert!(api.logs[0].contains(failure));
+            assert!(!api.opened);
+        }
+    }
+
+    #[test]
+    fn close_failure_is_logged_after_empty_failure_and_successful_transfers() {
+        for failures in [&["empty", "close"][..], &["close"][..]] {
+            let mut api = FakeClipboardImageApi::with_failures(failures);
+            assert_eq!(api.write(), !failures.contains(&"empty"));
+            assert_eq!(api.events.last(), Some(&"close"));
+            assert_eq!(api.logs.len(), failures.len());
+            assert!(api.logs.last().unwrap().contains("CloseClipboard"));
+            if failures.contains(&"empty") {
+                assert_eq!(api.freed, vec![1]);
+            } else {
+                assert!(api.freed.is_empty());
+                assert_eq!(api.transferred.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn free_failure_is_logged_without_retry_and_opened_clipboard_is_closed() {
+        let mut api = FakeClipboardImageApi::with_failures(&["empty", "free"]);
+        assert!(!api.write());
+        assert_eq!(api.logs.len(), 2);
+        assert!(api.logs[1].contains("image free failed"));
+        assert_eq!(
+            api.events.iter().filter(|event| **event == "free").count(),
+            1
+        );
+        assert_eq!(api.events.last(), Some(&"close"));
+        assert!(!api.opened);
     }
 }

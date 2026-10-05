@@ -1,0 +1,12 @@
+[package]
+name = "libraw-sys"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[target.'cfg(windows)'.dependencies]
+turbojpeg-sys = "1.2.0"
+
+[build-dependencies]
+cc = "1"

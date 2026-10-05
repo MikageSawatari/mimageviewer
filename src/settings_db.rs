@@ -428,6 +428,7 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) erase_inpaint_mono_tolerance: u8,
     pub(crate) retained_final_ai_cache_max_entries: usize,
     pub(crate) retained_final_ai_cache_max_mib: u64,
+    pub(crate) raw_brightness: crate::raw::RawBrightness,
 }
 
 impl AdjustmentRenderSettings {
@@ -445,6 +446,7 @@ impl AdjustmentRenderSettings {
             erase_inpaint_mono_tolerance: settings.erase_inpaint_mono_tolerance,
             retained_final_ai_cache_max_entries: settings.retained_final_ai_cache_max_entries,
             retained_final_ai_cache_max_mib: settings.retained_final_ai_cache_max_mib,
+            raw_brightness: settings.raw_brightness,
         }
     }
 }
@@ -802,6 +804,9 @@ impl SettingsDb {
                     "retained_final_ai_cache_max_mib",
                     || defaults.retained_final_ai_cache_max_mib,
                 )?,
+                raw_brightness: read_settings_kv_typed(&inner.conn, "raw_brightness", || {
+                    defaults.raw_brightness
+                })?,
             },
             lock_wait_ms,
         ))
@@ -820,6 +825,7 @@ impl SettingsDb {
         for (key, raw) in read_remote_listing_settings(&inner.conn)? {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
+        crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
         Ok(settings)
     }
 
@@ -4398,6 +4404,30 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn skip_offline_change_scan_roundtrip_and_released_missing_key() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        assert!(!settings.skip_offline_change_scan);
+        settings.skip_offline_change_scan = true;
+        settings.grid_cols = 7;
+        db.save_full(&settings).unwrap();
+        assert!(db.load_into_settings().unwrap().skip_offline_change_scan);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'skip_offline_change_scan'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.skip_offline_change_scan);
+        assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
     fn effetune_editor_rect_round_trips_with_the_normal_full_save() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
@@ -4413,6 +4443,86 @@ mod tests {
     }
 
     #[test]
+    fn effetune_pre_limiter_default_missing_blob_and_db_roundtrip() {
+        assert!(Settings::default().effetune_pre_limiter_enabled);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_pre_limiter_enabled");
+        assert!(
+            serde_json::from_value::<Settings>(blob)
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let settings = Settings {
+            effetune_pre_limiter_enabled: false,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_pre_limiter_enabled'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+    }
+
+    #[test]
+    fn effetune_minimized_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_keep_visible_when_minimized);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_keep_visible_when_minimized");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_keep_visible_when_minimized);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_keep_visible_when_minimized: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_keep_visible_when_minimized'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_keep_visible_when_minimized
+        );
+    }
+
+    #[test]
     fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
@@ -4424,6 +4534,60 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert_eq!(loaded.grid_cols, 20);
         assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+    }
+
+    #[test]
+    fn quick_folder_active_slot_roundtrip_and_missing_key_default() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for active in [
+            Some(crate::settings::QuickFolderSlotId::A),
+            Some(crate::settings::QuickFolderSlotId::B),
+            None,
+        ] {
+            let mut settings = Settings::default();
+            settings.active_quick_folder_slot = active;
+            let mut stale_preferences = Settings::default();
+            let mut live = settings.clone();
+            stale_preferences.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_preferences.active_quick_folder_slot, active);
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().active_quick_folder_slot,
+                active
+            );
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Settings>(json)
+                    .unwrap()
+                    .active_quick_folder_slot,
+                active
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'active_quick_folder_slot'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
+        let mut old_json = serde_json::to_value(Settings::default()).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("active_quick_folder_slot");
+        assert_eq!(
+            serde_json::from_value::<Settings>(old_json)
+                .unwrap()
+                .active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
     }
 
     fn sample_settings() -> Settings {
@@ -5409,11 +5573,42 @@ mod tests {
             .unwrap()
             .apply_to(&mut startup_snapshot);
 
+        crate::settings::normalize_image_ext_priority(&mut live.image_ext_priority);
         assert_eq!(
             RemoteListingSettings::from_settings(&startup_snapshot),
             RemoteListingSettings::from_settings(&live)
         );
         assert_eq!(startup_snapshot.thumb_quality, 17);
+    }
+
+    #[test]
+    fn image_ext_priority_remote_overlay_completes_old_lists_without_writing() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let original = vec!["MOS".into(), "custom".into(), "png".into()];
+        let old = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        db.save_full(&old).unwrap();
+        let mut mirror = Settings::default();
+        db.load_remote_listing_settings(&mirror)
+            .unwrap()
+            .apply_to(&mut mirror);
+        assert_eq!(&mirror.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            mirror.image_ext_priority.len(),
+            crate::settings::default_image_ext_priority().len() + 1
+        );
+        assert!(
+            !mirror
+                .image_ext_priority
+                .iter()
+                .any(|extension| extension == "mos")
+        );
+        assert_eq!(
+            db.load_into_settings().unwrap().image_ext_priority,
+            original
+        );
     }
 
     #[test]
@@ -5633,6 +5828,7 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::BlackFill;
         settings.conceal_fill_opacity_percent = 73;
         settings.erase_inpaint_mono_tolerance = 9;
+        settings.raw_brightness = crate::raw::RawBrightness::MatchPreview;
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
@@ -5641,6 +5837,10 @@ mod tests {
         assert_eq!(first.favorites[0].path, favorite.path);
         assert_eq!(first.global_preset.brightness, 11.0);
         assert_eq!(first.erase_inpaint_mono_tolerance, 9);
+        assert_eq!(
+            first.raw_brightness,
+            crate::raw::RawBrightness::MatchPreview
+        );
         assert_eq!(first.creative_luts, settings.creative_luts);
         assert_eq!(
             first.conceal_preset,
@@ -5653,12 +5853,14 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::Blur;
         settings.conceal_blur_radius_px = 41.0;
         settings.erase_inpaint_mono_tolerance = 27;
+        settings.raw_brightness = crate::raw::RawBrightness::None;
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
         assert_eq!(second.erase_inpaint_mono_tolerance, 27);
+        assert_eq!(second.raw_brightness, crate::raw::RawBrightness::None);
         assert!(second.creative_luts.is_empty());
         assert_eq!(
             second.conceal_preset,
@@ -7541,6 +7743,92 @@ mod tests {
     }
 
     #[test]
+    fn section292_clean_install_defaults_persist_only_once() {
+        let guard = DataDirOverrideGuard::new();
+        let first = boot_settings_db(guard.path());
+        assert_eq!(first.source, BootSource::CleanInstall);
+        assert!(!first.settings.show_toolbar_sort);
+        assert!(first.settings.show_facet_sort);
+        let mut edited = first.settings.clone();
+        edited.show_toolbar_sort = true;
+        edited.show_facet_sort = false;
+        first.db.unwrap().save_full(&edited).unwrap();
+        let second = boot_settings_db(guard.path());
+        assert_eq!(second.source, BootSource::LoadedExistingDb);
+        assert!(second.settings.show_toolbar_sort);
+        assert!(!second.settings.show_facet_sort);
+    }
+
+    #[test]
+    fn section292_legacy_db_and_json_keep_top_sort_customization() {
+        for json in [false, true] {
+            for top in [None, Some(false), Some(true)] {
+                let guard = DataDirOverrideGuard::new();
+                let mut original = Settings::default();
+                original.show_toolbar_sort = top.unwrap_or(true);
+                original.toolbar_section_order.reverse();
+                original.toolbar_sort_items = vec![crate::settings::SortOrder::DateDesc];
+                original.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Buttons;
+                if json {
+                    let mut value = serde_json::to_value(&original).unwrap();
+                    value.as_object_mut().unwrap().remove("show_facet_sort");
+                    if top.is_none() {
+                        value.as_object_mut().unwrap().remove("show_toolbar_sort");
+                    }
+                    std::fs::write(
+                        guard.path().join("settings.json"),
+                        serde_json::to_vec(&value).unwrap(),
+                    )
+                    .unwrap();
+                } else {
+                    let db = SettingsDb::create_new(guard.path()).unwrap();
+                    db.save_full(&original).unwrap();
+                    db.inner
+                        .lock()
+                        .unwrap()
+                        .conn
+                        .execute("DELETE FROM settings_kv WHERE key = 'show_facet_sort'", [])
+                        .unwrap();
+                    if top.is_none() {
+                        db.inner
+                            .lock()
+                            .unwrap()
+                            .conn
+                            .execute(
+                                "DELETE FROM settings_kv WHERE key = 'show_toolbar_sort'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                }
+                let boot = boot_settings_db(guard.path());
+                assert_eq!(
+                    boot.source,
+                    if json {
+                        BootSource::MigratedFromJson
+                    } else {
+                        BootSource::LoadedExistingDb
+                    }
+                );
+                assert_eq!(boot.settings.show_toolbar_sort, top.unwrap_or(true));
+                assert!(!boot.settings.show_facet_sort);
+                assert_eq!(
+                    boot.settings.toolbar_section_order,
+                    original.toolbar_section_order
+                );
+                assert_eq!(
+                    boot.settings.toolbar_sort_items,
+                    original.toolbar_sort_items
+                );
+                assert_eq!(
+                    boot.settings.toolbar_sort_display,
+                    original.toolbar_sort_display
+                );
+            }
+        }
+    }
+
+    #[test]
     fn boot_clean_install() {
         let guard = DataDirOverrideGuard::new();
         let outcome = boot_settings_db(guard.path());
@@ -7836,6 +8124,8 @@ mod tests {
         let outcome = boot_settings_db(dir);
         assert_eq!(outcome.source, BootSource::FailedFallbackDefault);
         assert!(outcome.db.is_none());
+        assert!(!outcome.settings.show_toolbar_sort);
+        assert!(outcome.settings.show_facet_sort);
         // SAVE_SUPPRESSED が立っており、後続の with_db は SaveSuppressed で fail-fast する
         // (Codex P2 v8b-3 2026-05-14)。
         assert!(save_suppressed());

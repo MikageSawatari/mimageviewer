@@ -74,6 +74,34 @@ impl ExportFormat {
 mod composite_tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_export_composite_decodes_full_libraw_pixels() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&path))
+            .unwrap()
+            .developed_dims;
+        let raw = crate::raw::RawDecodeContext::new(
+            Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+            crate::raw::RawBrightness::None,
+        );
+        let composite = ExportComposite::Single(ExportPageComposite {
+            source: crate::books::CompositeSource::File { path },
+            edits: perf_identity_edits(),
+            pdf_render_long_edge: 4096,
+            predicted_size: [dims[0] as usize, dims[1] as usize],
+            has_conceal_mask: false,
+        });
+        let decoded =
+            decode_export_composite(&composite, &Arc::new(AtomicBool::new(false)), Some(&raw))
+                .unwrap();
+        let DecodedExportComposite::Single(page) = decoded else {
+            panic!("expected one page")
+        };
+        assert_eq!(page.image.size, [dims[0] as usize, dims[1] as usize]);
+    }
+
     fn perf_identity_edits() -> crate::books::BakedEditSnapshot {
         crate::books::BakedEditSnapshot {
             params: crate::adjustment::AdjustParams::default(),
@@ -165,7 +193,7 @@ mod composite_tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         let started = Instant::now();
-        let decoded = decode_export_composite(&composite, &cancel).unwrap();
+        let decoded = decode_export_composite(&composite, &cancel, None).unwrap();
         let decode = started.elapsed();
 
         let started = Instant::now();
@@ -410,6 +438,7 @@ pub struct ExportRequest {
     /// remote 側の acquire barrier へ見せ続ける lease。AI を使わない export では `None`。
     /// lease は crate 内でしか作れないので、外から組み立てるときは常に `None`。
     pub local_ai_activity: Option<crate::app::LocalAiActivityLease>,
+    pub raw: Option<crate::raw::RawDecodeContext>,
 }
 
 pub struct ExportPageComposite {
@@ -776,7 +805,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         ..Default::default()
     };
     let extension = request.output_format.extension();
-    let decoded = match decode_export_composite(&request.composite, &cancel) {
+    let decoded = match decode_export_composite(&request.composite, &cancel, request.raw.as_ref()) {
         Ok(decoded) => decoded,
         Err(ExportRenderError::Cancelled) => {
             let _ = tx.send(ExportEvent::Cancelled);
@@ -941,11 +970,13 @@ enum DecodedExportComposite<'a> {
 fn decode_export_page<'a>(
     page: &'a ExportPageComposite,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<DecodedExportPage<'a>, ExportRenderError> {
     let image = crate::books::decode_composite_source_for_materialization(
         &page.source,
         page.pdf_render_long_edge,
         Arc::clone(cancel),
+        raw,
     )
     .map_err(|message| {
         if cancel.load(Ordering::Relaxed) {
@@ -960,14 +991,15 @@ fn decode_export_page<'a>(
 fn decode_export_composite<'a>(
     composite: &'a ExportComposite,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<DecodedExportComposite<'a>, ExportRenderError> {
     match composite {
         ExportComposite::Single(page) => Ok(DecodedExportComposite::Single(decode_export_page(
-            page, cancel,
+            page, cancel, raw,
         )?)),
         ExportComposite::Spread { left, right } => Ok(DecodedExportComposite::Spread {
-            left: decode_export_page(left, cancel)?,
-            right: decode_export_page(right, cancel)?,
+            left: decode_export_page(left, cancel, raw)?,
+            right: decode_export_page(right, cancel, raw)?,
         }),
     }
 }

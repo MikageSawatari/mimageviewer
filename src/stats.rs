@@ -24,10 +24,12 @@ pub enum DecodeSource {
     /// `image` クレート (PNG/JPEG/GIF/WebP/BMP) または TurboJPEG / PDFium / アニメーション GIF
     #[default]
     Native,
-    /// Windows Imaging Component (HEIC/AVIF/JXL/RAW など)
+    /// Windows Imaging Component (HEIC/AVIF/JXL など)
     Wic,
     /// Susie プラグイン (32bit ワーカー経由、MAG/PI/PIC/Q4/MAKI など)
     Susie,
+    /// LibRaw embedded preview or half development.
+    Raw,
 }
 
 #[derive(Default, Clone)]
@@ -63,7 +65,11 @@ pub struct ThumbStats {
     /// 読み込みが FAIL した件数
     pub count_failed: u64,
 
-    // ── デコーダ経路別 (Native/Wic/Susie) ──
+    // ── デコーダ経路別 (Native/Wic/Susie/Raw) ──
+    /// LibRaw の埋め込みプレビューまたは half 現像経由で読み込んだ件数
+    pub count_raw: u64,
+    /// LibRaw 経由の累計ロード時間 (ms)
+    pub time_raw: f64,
     /// Susie プラグイン経由で読み込んだ件数
     pub count_susie: u64,
     /// Susie プラグイン経由の累計ロード時間 (ms)
@@ -128,6 +134,10 @@ impl ThumbStats {
         // デコーダ経路 (フォーマット集計とは独立。同じ画像は両方に 1 件ずつ加算される。)
         match source {
             DecodeSource::Native => {}
+            DecodeSource::Raw => {
+                self.count_raw += 1;
+                self.time_raw += total_ms;
+            }
             DecodeSource::Wic => {
                 self.count_wic += 1;
                 self.time_wic += total_ms;

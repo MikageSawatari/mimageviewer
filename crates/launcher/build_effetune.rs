@@ -20,7 +20,7 @@ pub fn generate(workspace: &Path) {
     } else {
         workspace.join(source)
     };
-    let recover = "Restore vendor/effetune-mixwright/VERSION and the complete EffeTune Mixwright.vst3 bundle (v0.11.1); or run scripts/build-release.ps1 to stage it. MIMV_EFFETUNE_DIR must point to a root containing VERSION and the bundle.";
+    let recover = "Restore vendor/effetune-mixwright/VERSION and the complete EffeTune Mixwright.vst3 bundle (v0.12.0); or run scripts/build-release.ps1 to stage it. MIMV_EFFETUNE_DIR must point to a root containing VERSION and the bundle.";
     source_approval::validate(workspace, &source).unwrap_or_else(|e| panic!("{e}. {recover}"));
     bundle_paths::checked_metadata(&source)
         .unwrap_or_else(|e| panic!("EffeTune source {}: {e}. {recover}", source.display()));

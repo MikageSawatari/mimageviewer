@@ -25,7 +25,662 @@
 //! - [egui_kittest docs](https://docs.rs/egui_kittest/)
 //! - mimageviewer 側のポリシー: [docs/ui-snapshot-policy.md](../docs/ui-snapshot-policy.md)
 
-use egui_kittest::Harness;
+use egui_kittest::{Harness, kittest::Queryable};
+
+#[test]
+fn raw_license_information_light() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_license_information_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 340.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_license_information_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_license_information_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 340.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_license_information_expanded_dark() {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "raw_license_information_expanded_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 920.0),
+        mimageviewer::ui_dialogs::draw_raw_license_snapshot_fixture,
+        |harness| {
+            for title in [
+                "LibRaw ライセンス・著作権表記 全文",
+                "zlib License 全文",
+                "libjpeg-turbo ライセンス・著作権表記 全文",
+            ] {
+                harness.get_by_label(title).click();
+                harness.run();
+            }
+            harness.remove_cursor();
+            harness.run();
+        },
+    );
+}
+
+#[test]
+fn raw_settings_light() {
+    // Render the actual dedicated preferences page, including its heading.
+    snapshot_with_theme(
+        "raw_settings_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_raw_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_settings_dark() {
+    snapshot_with_theme(
+        "raw_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_raw_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_progress_dark() {
+    snapshot_with_theme(
+        "raw_progress_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_raw_progress_snapshot_fixture,
+    );
+}
+
+#[test]
+fn raw_blocked_preview_notice_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "raw_blocked_preview_notice_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(800.0, 120.0),
+        mimageviewer::draw_raw_blocked_preview_snapshot_fixture,
+    );
+}
+
+/// The status label must yield a row to the minimum-width field, and may itself
+/// wrap within that row. Persist only the two distinct inline/stacked layouts.
+#[test]
+fn folder_toolbar_snapshot_status_label() {
+    use egui_kittest::kittest::Queryable;
+    use mimageviewer::ui_toolbar_layout as layout;
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for width in [240.0, 360.0, 960.0] {
+        for zoom in [1.0, 1.5] {
+            for changed in [false, true] {
+                let label = if changed {
+                    "(スナップショット中 674件 / filter 変更後)"
+                } else {
+                    "(スナップショット中 674件)"
+                };
+                let mut fonts_ready = false;
+                let mut path = String::from(r"C:\Pictures\日本語フォルダ");
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(width * zoom, 120.0 * zoom))
+                    .build(move |ctx| {
+                        ctx.set_zoom_factor(zoom);
+                        mimageviewer::os_theme::apply_resolved(
+                            ctx,
+                            mimageviewer::os_theme::ResolvedTheme::Dark,
+                        );
+                        if !fonts_ready {
+                            install_app_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        let panel = egui::TopBottomPanel::top("folder").show(ctx, |ui| {
+                            let input = layout::address_input(
+                                ui,
+                                Some(
+                                    egui::RichText::new(label)
+                                        .color(egui::Color32::from_rgb(58, 110, 165))
+                                        .into(),
+                                ),
+                                |ui| {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::TextEdit::singleline(&mut path)
+                                            .desired_width(f32::INFINITY),
+                                    )
+                                    .rect
+                                },
+                            );
+                            assert!(input.inner.width() >= layout::ADDRESS_INPUT_MIN_WIDTH);
+                            input.response.rect
+                        });
+                        assert!(panel.response.rect.expand(0.5).contains_rect(panel.inner));
+                    });
+                harness.run();
+                let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+                let label_rect = harness.get_by_label(label).rect();
+                if width == 240.0 || (width == 360.0 && changed) {
+                    assert!(
+                        label_rect.bottom() <= input.top(),
+                        "width={width} zoom={zoom} changed={changed}: {label_rect:?} {input:?}"
+                    );
+                } else if width == 960.0 {
+                    assert!(label_rect.right() <= input.left());
+                    assert!(label_rect.top() < input.bottom() && input.top() < label_rect.bottom());
+                } else {
+                    assert!(
+                        label_rect.bottom() <= input.top() || label_rect.right() <= input.left()
+                    );
+                }
+                for rect in [input, label_rect] {
+                    assert!(rect.left() >= 0.0 && rect.right() <= width * zoom);
+                }
+                if changed && zoom == 1.0 && width >= 360.0 {
+                    harness.snapshot(format!(
+                        "folder_toolbar_snapshot_label_{}",
+                        if width == 360.0 { "stacked" } else { "inline" }
+                    ));
+                    snapshots.extend(harness.take_snapshot_results());
+                }
+            }
+        }
+    }
+}
+
+/// Actual control styles, including the reported count and omitted-entry badge.
+/// All positions/row settings get geometry checks; persist only unique pixels.
+#[test]
+fn folder_toolbar_flexible_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    let mut unique = std::collections::HashSet::new();
+    for (size, width, zoom) in [
+        ("normal", 1120.0, 1.0),
+        ("narrow", 360.0, 1.0),
+        ("dpi150", 1080.0, 1.5),
+    ] {
+        for (position, before) in [("first", 0), ("middle", 1), ("last", 2)] {
+            for new_row in [true, false] {
+                for buttons in [true, false] {
+                    let mut fonts_ready = false;
+                    let mut path = String::from(r"C:\Pictures\日本語フォルダ");
+                    let mut harness = Harness::builder()
+                        .with_size(egui::vec2(width, 240.0 * zoom))
+                        .build(move |ctx| {
+                            ctx.set_zoom_factor(zoom);
+                            mimageviewer::os_theme::apply_resolved(
+                                ctx,
+                                mimageviewer::os_theme::ResolvedTheme::Dark,
+                            );
+                            if !fonts_ready {
+                                install_app_fonts(ctx);
+                                fonts_ready = true;
+                                ctx.request_repaint();
+                                return;
+                            }
+                            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                                draw_folder_toolbar_fixture(
+                                    ui, before, new_row, buttons, &mut path,
+                                );
+                            });
+                        });
+                    harness.run();
+                    // Verify the alias policy with pixels too, so a regression
+                    // cannot silently turn a required baseline into a duplicate.
+                    // First position: no preceding row. Narrow: every combination
+                    // wraps. Full controls also wrap at the last normal position
+                    // and both non-first positions at 150% DPI.
+                    let duplicate = !new_row
+                        && (before == 0
+                            || size == "narrow"
+                            || (buttons && (size == "dpi150" || before == 2)));
+                    let pixels = harness.render().unwrap();
+                    assert_eq!(
+                        unique.insert((pixels.width(), pixels.height(), pixels.into_raw())),
+                        !duplicate,
+                        "unexpected snapshot alias: {size} {position} row={new_row} buttons={buttons}"
+                    );
+                    if !duplicate {
+                        let name = format!(
+                            "folder_toolbar_{size}_{position}_{}{}",
+                            if new_row { "row" } else { "inline" },
+                            if buttons { "" } else { "_minimal" }
+                        );
+                        println!("folder baseline: {name}");
+                        harness.snapshot(name);
+                        snapshots.extend(harness.take_snapshot_results());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_folder_toolbar_fixture(
+    ui: &mut egui::Ui,
+    before: usize,
+    new_row: bool,
+    buttons: bool,
+    path: &mut String,
+) {
+    use mimageviewer::ui_toolbar_layout as layout;
+    ui.horizontal_wrapped(|ui| {
+        for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
+            .iter()
+            .take(before)
+        {
+            let _ = ui.button(*text);
+        }
+        let count = if buttons { "(674/674)" } else { "(25/120)" };
+        let mut measured = layout::FolderBarWidth::with_input();
+        measured.label(ui, "フォルダ:");
+        if buttons {
+            for text in ["←", "→"] {
+                measured.button(ui, text, 0.0);
+            }
+            for text in ["A", "B"] {
+                measured.button(ui, egui::RichText::new(text).monospace(), 24.0);
+            }
+            measured.space(6.0 + ui.spacing().item_spacing.x);
+            for text in ["⬆", "▲", "▼"] {
+                measured.button(ui, text, 0.0);
+            }
+            measured.space(6.0 + ui.spacing().item_spacing.x);
+        }
+        measured.button(ui, "場所▼", 0.0);
+        measured.space(4.0 + 6.0 + ui.spacing().item_spacing.x);
+        let mut right_width = layout::FolderBarWidth::controls();
+        if buttons {
+            right_width.button(
+                ui,
+                egui::RichText::new("非表示 321 件").small().strong(),
+                0.0,
+            );
+            right_width.space(4.0);
+        }
+        right_width.label(ui, egui::RichText::new(count).size(11.0).monospace());
+        right_width.space(4.0);
+        if buttons {
+            for text in ["スタック", "サブ展開", "📌", "履歴▼", "♡"] {
+                right_width.button_with_frame(ui, text, 0.0, !matches!(text, "📌" | "♡"));
+                right_width.space(4.0);
+            }
+        }
+        let minimum = (measured.width() + right_width.width()).ceil();
+        let slot = layout::flexible_section(ui, minimum, new_row, |ui, compact| {
+            layout::folder_controls(ui, compact, |ui| {
+                let mut left = vec![ui.label("フォルダ:").rect];
+                if buttons {
+                    for text in ["←", "→"] {
+                        left.push(ui.button(text).rect);
+                    }
+                    for text in ["A", "B"] {
+                        left.push(
+                            ui.add(
+                                egui::Button::new(egui::RichText::new(text).monospace())
+                                    .min_size(egui::vec2(24.0, 20.0)),
+                            )
+                            .rect,
+                        );
+                    }
+                    ui.separator();
+                    for text in ["⬆", "▲", "▼"] {
+                        left.push(ui.button(text).rect);
+                    }
+                    ui.separator();
+                }
+                left.push(layout::folder_menu_button(ui, true, "場所▼", |_| {}).rect);
+                ui.add_space(4.0);
+                ui.separator();
+                let mut right = Vec::new();
+                let mut input = None;
+                layout::folder_tail(
+                    ui,
+                    layout::FolderBarWidth::with_input().width(),
+                    right_width.width(),
+                    |ui, part| match part {
+                        layout::FolderTailPart::RightControls => {
+                            if buttons {
+                                right.push(
+                                    egui::containers::menu::MenuButton::new(
+                                        egui::RichText::new("非表示 321 件").small().strong(),
+                                    )
+                                    .ui(ui, |_| {})
+                                    .0
+                                    .rect,
+                                );
+                                ui.add_space(4.0);
+                            }
+                            right.push(
+                                ui.label(
+                                    egui::RichText::new(count)
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .rect,
+                            );
+                            ui.add_space(4.0);
+                            if buttons {
+                                right.push(ui.selectable_label(false, "スタック").rect);
+                                ui.add_space(4.0);
+                                right
+                                    .push(ui.add(egui::Button::selectable(false, "サブ展開")).rect);
+                                ui.add_space(4.0);
+                                right.push(ui.add(egui::Button::new("📌").frame(false)).rect);
+                                ui.add_space(4.0);
+                                right.push(
+                                    layout::folder_menu_button(ui, true, "履歴▼", |_| {}).rect,
+                                );
+                                ui.add_space(4.0);
+                                right.push(ui.add(egui::Button::new("♡").frame(false)).rect);
+                                ui.add_space(4.0);
+                            }
+                        }
+                        layout::FolderTailPart::Input => {
+                            layout::address_input(ui, None, |ui| {
+                                input = Some(
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut *path)
+                                            .desired_width(f32::INFINITY),
+                                    )
+                                    .rect,
+                                );
+                            });
+                        }
+                    },
+                );
+                let input = input.unwrap();
+                let precedes = |a: egui::Rect, b: egui::Rect| {
+                    a.bottom() <= b.top() + 0.5
+                        || (a.right() <= b.left() + 0.5
+                            && a.top() < b.bottom()
+                            && b.top() < a.bottom())
+                };
+                assert!(
+                    left.iter().all(|rect| precedes(*rect, input)),
+                    "left/input order: {left:?} {input:?}"
+                );
+                assert!(
+                    right.iter().all(|rect| precedes(input, *rect)),
+                    "input/right order: {input:?} {right:?}"
+                );
+                assert!(input.width() >= layout::ADDRESS_INPUT_MIN_WIDTH);
+                assert!(input.right() <= ui.clip_rect().right() + 0.5);
+            });
+        })
+        .response
+        .rect;
+        for text in ["ツリー / 列: 5", "比率: 自動 / タグ: 旅行"]
+            .iter()
+            .skip(before)
+        {
+            let following = ui.button(*text).rect;
+            assert!(
+                following.top() >= slot.bottom(),
+                "subsequent sections need their own row"
+            );
+        }
+    });
+}
+
+fn snapshot_color_presets(name: &str, width: f32) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(width, 160.0))
+        .build(move |ctx| {
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                mimageviewer::os_theme::ResolvedTheme::Dark,
+            );
+            if !fonts_ready {
+                install_app_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let available = ui.available_width();
+                let response = mimageviewer::draw_color_presets_snapshot_fixture(ui);
+                assert!(response.rect.width() <= available + 0.1);
+                assert!(response.rect.height() >= 48.0);
+            });
+        });
+    harness.run();
+    harness.snapshot(name);
+}
+
+#[test]
+fn color_presets_popup_width() {
+    snapshot_color_presets("color_presets_popup_dark", 308.0);
+}
+
+#[test]
+fn color_presets_narrow_width() {
+    snapshot_color_presets("color_presets_narrow_dark", 224.0);
+}
+
+#[test]
+fn preferences_transfer_entry_disabled_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_disabled_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_preferences_transfer_disabled_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_export_explanation_light() {
+    snapshot_with_theme(
+        "preferences_transfer_export_explanation_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_preferences_transfer_explanation_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_import_explanation_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_import_explanation_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_explanation_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_transfer_entry_light() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_preferences_transfer_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_entry_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_entry_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_preferences_transfer_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_transfer_light() {
+    snapshot_with_theme(
+        "preferences_transfer_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_dark() {
+    snapshot_with_theme(
+        "preferences_transfer_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_narrow_result() {
+    snapshot_with_theme_at_size(
+        "preferences_transfer_narrow_result",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(320.0, 420.0),
+        None,
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn preferences_transfer_busy_dark() {
+    snapshot_with_theme_and_contrast_settling(
+        "preferences_transfer_busy_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| mimageviewer::draw_preferences_transfer_settings_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_file_organize_light() {
+    snapshot_with_theme(
+        "preferences_file_organize_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_file_organize_destinations_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_file_organize_dark() {
+    snapshot_with_theme(
+        "preferences_file_organize_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_file_organize_destinations_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_organize_destinations_light() {
+    use mimageviewer::settings::FileOrganizeDestination;
+    use mimageviewer::shell_file_ops::ShellTransferOperation;
+    let sources = vec![std::path::PathBuf::from(r"C:\写真\画像.jpg")];
+    let destinations = vec![
+        FileOrganizeDestination {
+            name: "保管".into(),
+            path: r"D:\写真\保管".into(),
+        },
+        FileOrganizeDestination {
+            name: "確認".into(),
+            path: r"\\server\share\長い名前の写真フォルダ\整理先".into(),
+        },
+    ];
+    let mut focus = Some((1, Some(ShellTransferOperation::Copy)));
+    snapshot_file_organize_modal(
+        "file_organize_destinations_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(1000.0, 620.0),
+        sources,
+        destinations,
+        focus.take(),
+    );
+}
+
+#[test]
+fn file_organize_empty_dark() {
+    snapshot_file_organize_modal(
+        "file_organize_empty_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1000.0, 620.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        vec![],
+        None,
+    );
+}
+
+#[test]
+fn file_organize_many_dark() {
+    snapshot_file_organize_modal(
+        "file_organize_many_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1000.0, 620.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        (0..30)
+            .map(|row| mimageviewer::settings::FileOrganizeDestination {
+                name: format!("整理先 {row}"),
+                path: r"\\server\share\長い名前の写真フォルダ\さらに長い名前のフォルダ\整理先"
+                    .into(),
+            })
+            .collect(),
+        Some((
+            2,
+            Some(mimageviewer::shell_file_ops::ShellTransferOperation::Move),
+        )),
+    );
+}
+
+#[test]
+fn file_organize_narrow_light() {
+    snapshot_file_organize_modal(
+        "file_organize_narrow_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(420.0, 320.0),
+        vec![r"C:\写真\画像.jpg".into()],
+        vec![mimageviewer::settings::FileOrganizeDestination {
+            name: "長い名前の整理先".into(),
+            path: r"\\server\share\長い名前の写真フォルダ\整理先".into(),
+        }],
+        Some((
+            0,
+            Some(mimageviewer::shell_file_ops::ShellTransferOperation::Copy),
+        )),
+    );
+}
+
+fn snapshot_file_organize_modal(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    sources: Vec<std::path::PathBuf>,
+    destinations: Vec<mimageviewer::settings::FileOrganizeDestination>,
+    mut focus: Option<(
+        usize,
+        Option<mimageviewer::shell_file_ops::ShellTransferOperation>,
+    )>,
+) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(
+            ctx,
+            theme,
+            mimageviewer::settings::TextContrast::Standard,
+        );
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        let _ = mimageviewer::ui_dialogs::file_organize::show_file_organize_modal(
+            ctx,
+            &sources,
+            &destinations,
+            &mut focus,
+        );
+    });
+    harness.run();
+    harness.snapshot(name);
+}
 
 #[test]
 fn preferences_clipboard_capture_light() {
@@ -61,6 +716,32 @@ fn install_app_fonts(ctx: &egui::Context) {
     mimageviewer::ui_fonts::configure_fonts(ctx);
 }
 
+#[test]
+fn offline_change_scan_setting_light() {
+    let mut skip = false;
+    snapshot_with_theme(
+        "offline_change_scan_setting_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        move |ui| {
+            mimageviewer::ui_helpers::draw_offline_change_scan_setting(ui, &mut skip);
+            mimageviewer::ui_helpers::draw_index_full_check_button(ui);
+        },
+    );
+}
+
+#[test]
+fn offline_change_scan_setting_dark() {
+    let mut skip = true;
+    snapshot_with_theme(
+        "offline_change_scan_setting_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        move |ui| {
+            mimageviewer::ui_helpers::draw_offline_change_scan_setting(ui, &mut skip);
+            mimageviewer::ui_helpers::draw_index_full_check_button(ui);
+        },
+    );
+}
+
 /// テストハーネスのユーティリティ: 指定テーマで UI を描画し、`name` でスナップショットを取る。
 fn snapshot_with_theme(
     name: &str,
@@ -79,30 +760,96 @@ fn snapshot_with_theme_and_contrast(
     name: &str,
     resolved: mimageviewer::os_theme::ResolvedTheme,
     contrast: mimageviewer::settings::TextContrast,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_contrast_and_size(
+        name,
+        resolved,
+        contrast,
+        egui::vec2(480.0, 360.0),
+        build_ui,
+    );
+}
+
+fn snapshot_with_theme_contrast_and_size(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        resolved,
+        contrast,
+        size,
+        build_ui,
+        |_| {},
+    );
+}
+
+fn snapshot_with_theme_contrast_and_size_with_interaction(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
+) {
+    snapshot_with_theme_options(name, resolved, contrast, size, None, build_ui, interact);
+}
+
+fn snapshot_with_theme_and_contrast_settling(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    animated_steps: Option<usize>,
+    build_ui: impl FnMut(&mut egui::Ui),
+) {
+    snapshot_with_theme_options(
+        name,
+        resolved,
+        contrast,
+        egui::vec2(480.0, 360.0),
+        animated_steps,
+        build_ui,
+        |_| {},
+    );
+}
+
+fn snapshot_with_theme_options(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    animated_steps: Option<usize>,
     mut build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(480.0, 360.0))
-        .build(move |ctx| {
-            mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
-            if !fonts_ready {
-                install_app_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    egui::Frame::central_panel(ui.style())
-                        .outer_margin(8.0)
-                        .inner_margin(0.0)
-                        .show(ui, |ui| build_ui(ui));
-                });
-        });
-
-    harness.run();
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                egui::Frame::central_panel(ui.style())
+                    .outer_margin(8.0)
+                    .inner_margin(0.0)
+                    .show(ui, |ui| build_ui(ui));
+            });
+    });
+    if let Some(steps) = animated_steps {
+        harness.run_steps(steps); // A production spinner intentionally never settles.
+    } else {
+        harness.run();
+    }
+    interact(&mut harness);
     harness.snapshot(name);
 }
 
@@ -265,36 +1012,21 @@ fn snapshot_with_theme_at_size(
     resolved: mimageviewer::os_theme::ResolvedTheme,
     size: egui::Vec2,
     hover_pos: Option<egui::Pos2>,
-    mut build_ui: impl FnMut(&mut egui::Ui),
+    build_ui: impl FnMut(&mut egui::Ui),
 ) {
-    let mut fonts_ready = false;
-    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
-        mimageviewer::os_theme::apply_resolved_with_contrast(
-            ctx,
-            resolved,
-            mimageviewer::settings::TextContrast::Standard,
-        );
-        if !fonts_ready {
-            install_app_fonts(ctx);
-            fonts_ready = true;
-            ctx.request_repaint();
-            return;
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
-                egui::Frame::central_panel(ui.style())
-                    .outer_margin(8.0)
-                    .inner_margin(0.0)
-                    .show(ui, |ui| build_ui(ui));
-            });
-    });
-    harness.run();
-    if let Some(pos) = hover_pos {
-        harness.hover_at(pos);
-        harness.run();
-    }
-    harness.snapshot(name);
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        resolved,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        build_ui,
+        |harness| {
+            if let Some(pos) = hover_pos {
+                harness.hover_at(pos);
+                harness.run();
+            }
+        },
+    );
 }
 
 #[test]
@@ -336,6 +1068,40 @@ fn preferences_video_bar_visibility_dark() {
         |ui| {
             ui.set_width(440.0);
             mimageviewer::draw_video_bar_visibility_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_input_limit_dark() {
+    snapshot_with_theme(
+        "preferences_effetune_input_limit_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_book_resume_meter_light() {
+    snapshot_with_theme(
+        "preferences_book_resume_meter_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_book_resume_meter_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
+fn preferences_book_resume_meter_dark() {
+    snapshot_with_theme(
+        "preferences_book_resume_meter_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_book_resume_meter_settings_snapshot_fixture(ui);
         },
     );
 }
@@ -783,6 +1549,7 @@ fn cell_filename_mixed_glyphs_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -847,6 +1614,7 @@ fn compact_file_format_badges_light() {
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                         cell,
                         inner,
+                        book_resume_meter: false,
                         checked: false,
                         stack_count: None,
                         filter_match_count: None,
@@ -961,6 +1729,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
@@ -1019,6 +1788,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                book_resume_meter: false,
                 checked: false,
                 stack_count: None,
                 filter_match_count: count,
@@ -1140,6 +1910,7 @@ fn bookmark_time_and_tag_badges_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    book_resume_meter: false,
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,

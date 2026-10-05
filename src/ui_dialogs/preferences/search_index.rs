@@ -11,7 +11,7 @@ pub(super) struct PrefSearchEntry {
 }
 
 macro_rules! entry {
-    ($anchor:literal, $page:ident, $title:literal, [$($keyword:literal),* $(,)?]) => {
+    ($anchor:literal, $page:ident, $title:expr, [$($keyword:literal),* $(,)?]) => {
         PrefSearchEntry {
             anchor: $anchor,
             page: PreferencesPage::$page,
@@ -193,6 +193,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再生アイコン", "左下バッジ", "非表示"]
     ),
     entry!(
+        "thumbnail/book-resume-meter",
+        Thumbnail,
+        "本のサムネイルに前回の読書位置を表示",
+        ["読書", "ページ", "進捗", "メーター", "ZIP", "PDF"]
+    ),
+    entry!(
         "thumbnail/idle-upgrade",
         Thumbnail,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",
@@ -354,6 +360,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["自動", "スレッド", "CPU", "並列", "parallel"]
     ),
     entry!(
+        "raw-develop/settings",
+        RawDevelop,
+        "同時現像数:",
+        [
+            "RAW",
+            "現像",
+            "明るさ",
+            "プレビュー",
+            "補正しない",
+            "LibRaw",
+            "メモリ"
+        ]
+    ),
+    entry!(
         "parallelism/pdf",
         Parallelism,
         "PDF の同時処理数",
@@ -496,6 +516,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Cache,
         "容量上限を有効にする",
         ["変換済みアーカイブ", "キャッシュ", "無制限", "MB"]
+    ),
+    entry!(
+        "folder/organize-destinations",
+        Folder,
+        "ファイル整理先",
+        ["コピー", "移動", "登録", "表示名", "パス", "順序"]
     ),
     entry!(
         "folder/hidden-files",
@@ -910,6 +936,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再読み込み", "reload", "フォルダー", "ロード済み"]
     ),
     entry!(
+        "indexer/offline-change-scan",
+        IndexerSpeed,
+        crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL,
+        [
+            "起動",
+            "終了",
+            "スキャン",
+            "索引",
+            "今すぐ確認",
+            "検索",
+            "offline"
+        ]
+    ),
+    entry!(
         "indexer/speed",
         IndexerSpeed,
         "速度プロファイル",
@@ -1070,6 +1110,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "リモート端末への動画配信を有効にする",
         ["リモート", "remote", "配信", "ストリーミング"]
     ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-input-limit",
+        Video,
+        "EffeTune に渡す前に 0dB を超える音を抑える",
+        ["音響調整", "OVERLOAD", "ピーク", "EffeTune"]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-minimized",
+        Video,
+        "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+        ["音響調整", "ビジュアライザー", "最小化", "EffeTune"]
+    ),
     entry!(
         "video/normalize-cache",
         Video,
@@ -1165,6 +1219,7 @@ mod tests {
 
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
+    const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1287,12 +1342,32 @@ mod tests {
                 entry.anchor
             );
             assert!(!entry.title.is_empty(), "title が空です: {}", entry.anchor);
-            assert!(
-                PAGES_SOURCE.contains(entry.title),
-                "title が pages.rs の表示文字列と一致しません: {} / {}",
-                entry.anchor,
-                entry.title
-            );
+            if entry.anchor == "indexer/offline-change-scan" {
+                // この項目はお気に入り編集と共有する描画 helper が表示文字列を所有する。
+                assert_eq!(
+                    entry.title,
+                    crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL
+                );
+                assert!(
+                    PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
+                );
+            } else {
+                let title_source = if entry.anchor == "raw-develop/settings" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
+                    );
+                    RAW_SETTINGS_SOURCE
+                } else {
+                    PAGES_SOURCE
+                };
+                assert!(
+                    title_source.contains(entry.title),
+                    "title が pages.rs の表示文字列と一致しません: {} / {}",
+                    entry.anchor,
+                    entry.title
+                );
+            }
             let mut keywords = HashSet::new();
             for keyword in entry.keywords {
                 assert!(
@@ -1367,6 +1442,18 @@ mod tests {
     }
 
     #[test]
+    fn effetune_minimized_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 最小化", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-minimized")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn title_prefix_precedes_title_substring() {
         let results = search_preferences("表示", test_tree_position);
         let prefix = results
@@ -1396,16 +1483,40 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_capture_search_finds_monitor_and_output_folder() {
-        for (query, anchor) in [
-            ("clipboard 自動保存", "clipboard-capture/image"),
-            ("クリップボード 保存場所", "clipboard-capture/folder"),
+    fn raw_settings_search_targets_dedicated_page() {
+        for query in [
+            "raw",
+            "RAW 現像",
+            "同時現像数",
+            "RAW 明るさ",
+            "LibRaw",
+            "補正しない",
+        ] {
+            let results = search_preferences(query, test_tree_position);
+            assert!(!results.is_empty(), "no RAW settings result for {query}");
+            assert!(results.iter().all(|entry| {
+                entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
+            }));
+        }
+    }
+
+    #[test]
+    fn offline_scan_and_full_check_keywords_open_the_indexer_setting_anchor() {
+        for query in [
+            "終了 スキャン",
+            "今すぐ確認",
+            "offline",
+            "検索インデックス 起動",
         ] {
             let result = search_preferences(query, test_tree_position)
                 .into_iter()
-                .find(|entry| entry.anchor == anchor)
-                .expect("clipboard capture settings must be discoverable");
-            assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+                .find(|entry| entry.anchor == "indexer/offline-change-scan")
+                .unwrap();
+            assert_eq!(result.page, PreferencesPage::IndexerSpeed);
+            assert_eq!(
+                result.title,
+                crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL
+            );
         }
     }
 
@@ -1445,5 +1556,19 @@ mod tests {
             .find(|entry| entry.anchor == "spread/seek-strip")
             .expect("静止画サムネイル列の最大高さが検索できる");
         assert_eq!(still_height.page, PreferencesPage::SpreadMode);
+    }
+
+    #[test]
+    fn clipboard_capture_search_finds_monitor_and_output_folder() {
+        for (query, anchor) in [
+            ("clipboard 自動保存", "clipboard-capture/image"),
+            ("クリップボード 保存場所", "clipboard-capture/folder"),
+        ] {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("clipboard capture settings must be discoverable");
+            assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
     }
 }

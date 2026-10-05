@@ -101,6 +101,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 - ZIP / PDF ページと Stack、動画の `CurrentFrame`、見開きの
   `Merged` / `BothPages` / `MainPageOnly` は materializer の実体化対象。
 - 環境設定は左ツリー上部の検索欄で項目名・関連語・ページ名・カテゴリ名を AND 部分一致検索でき、結果を選ぶと該当ページの項目へスクロールして一時的に強調表示する。
+- 環境設定「ファイル処理 → RAW 現像」（「Susie プラグイン」の直後）に「同時現像数」(`raw_develop_parallelism`: 1〜10、既定 3) と「明るさ」(`raw_brightness: RawBrightness`: `MatchPreview` = プレビューに合わせる / `None` = 補正しない、既定 MatchPreview) を置く。「並列読み込み」には通常画像と PDF の設定を置く。検索は RAW・現像・同時現像数・明るさ・プレビューなどから専用ページへ移動する。現像数は executor の変更が成功したときだけ設定へ反映し、途中の worker 起動失敗では以前の上限を維持して画面へエラーを返す。明るさ変更は全 viewer context の RAW 入力を再現像し、サムネイルと非 RAW ページは保持する。未リリース設定なので migration は作らない。
 - v2.7.0では「メタ情報をエクスポート / インポート」を安定化のため一時非表示にしたが、
   v2.8.0の継続開発で再表示する。実フォルダ表示中だけ使用できる。既存の自動
   sidecar `mimageviewer.dat` とは別に、対象フォルダ直下の `mimageviewer.meta.miv`
@@ -220,7 +221,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   (`subfolder_expansion_root`) からの相対パスに統一する。root 自身は「(直下)」、root 外など
   相対化できないパスはフルパスへフォールバックする。このラベルは場所 facet、選択情報、
   ツールチップ、詳細表示の任意列「場所」で共有する。
-  画像色フィルタは画像だけを対象にし、大量件数では通常フォルダと同じ確認ゲートを挟む。表示順は現在のソート設定に従い、
+  画像色フィルタは画像と ZIP / PDF の代表画像を対象にし、大量件数では通常フォルダと同じ確認ゲートを挟む。表示順は現在のソート設定に従い、
   同値は root 相対の親フォルダとフルパスで安定化する。ソート変更時は保持中の
   スナップショットをメモリ内で再ソートし、ファイルシステムは再走査しない。サブ展開ビュー上でも
   `スタック` トグルを使える。この場合は親フォルダ単位で分類し、別フォルダの同名 prefix や
@@ -353,10 +354,33 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
     (★ レーティングのみ、左右がフィルタに使われているため付与は右クリックメニューの項目)。
 - ウィンドウ幅が不足する場合、ツールバー項目はボタン単位で次の行へ折り返す。`行頭に表示` を
   指定したセクションはその手前で必ず改行する。ボタン内の日本語ラベルが縦に潰れるような内部折り返しは行わない
-- セクション設定の値 (表示/並び順/表示形式/出す項目) は永続化される。フォルダバー (アドレス行) も
-  「並べ替えできないだけのセクション」として扱い、出すボタンの詳細設定は他セクションと同様
+- フォルダバー全体は入力欄・付属ボタンを含む 1 セクションとして並べ替える。既定は末尾・
+  行頭 ON で独立した行。行頭 OFF は直前セクションと同じ行の残り幅を使い、入力欄 160 論理 pt と
+  表示中の補助操作の幅が足りなければ全体を次行へ送る。後続セクションは次行へ送る。
+  内部は左操作群 → 入力欄 → 右操作群の順を維持する。全体が収まれば 1 行、不足時は
+  左操作群 / (入力欄 + 右操作群)、後半も全幅に入らなければ左操作群 / 入力欄 / 右操作群。
+  左右の操作群自身は必要に応じて折り返す。件数・非表示件数と実際の文字書式・ボタン余白を
+  含めて計測し、通常の文字スタイルと右寄せを保持する。メニューも親で実測幅を確保してから
+  描画し、ボタンの文字だけを内部で折り返さない。
+  ★固定中の説明ラベルと入力欄の最小幅が同じ行に収まらない場合は、説明ラベルを入力欄の
+  上の行へ送り、ラベル自身も領域幅内で折り返す。入力欄の最小幅を説明のために削らない。
+  旧設定は既存移行経路と保存印 `toolbar_folder_section_migrated` で末尾・行頭 ON を一度だけ補い、
+  その後の OFF を再起動時に戻さない。
+- セクション設定の値 (表示/並び順/表示形式/出す項目) は永続化される。フォルダバー (アドレス行) の
+  出すボタンの詳細設定は他セクションと同様
   **ツールバー上の操作 = アドレスバー左端の `フォルダ:` ラベル右クリック**に統一する
   (`設定` メニュー → `ツールバー` には表示 ON/OFF チェックのみ。専用の環境設定ページは廃止)
+
+絞り込みバー右側にもソートのドロップダウンを表示できる。設定 → ツールバーで
+上部と絞り込みバーの表示を個別に ON/OFF にし、両方表示・両方非表示も選べる。
+絞り込みラベルの右クリックでも右側の表示を変更できる。並び順は両表示で共通で、
+コレクション等の専用順序・固定理由も既存の所有者から描く。条件が多い・狭幅の場合は
+ソートを次行の右側へ送り、popup の wheel は背面一覧へ通さない。
+既存設定の上部表示・並び替え設定は保持し、追加表示の省略は OFF、上部表示の省略は ON と読む。
+`Settings::default()` の生成値は追加表示 ON・上部 OFF とし、新規作成・読込失敗時の既定・
+ツールバーの既定復元で共通に使う。固定中も補助操作のある popup は開ける。
+ソート選択だけを無効化し、サブ展開のグループ順と「最新の情報に更新」は利用できる。
+バー自体を隠しても上部を ON にすればソート操作を続けられる。
 
 #### 名前付きコレクション
 
@@ -491,6 +515,17 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 ---
 
 ## 3. サムネイルグリッド詳細
+
+- 通常の物理一覧の Folder / ZipFile / PdfFile セル下端には、最後に記録した
+  読めるページ列内の位置 / 総数を読書位置メーターとして表示する。画像以外の混在を
+  分母に含めず、見開きも navigation anchor の位置だけを使う。最大到達位置や読了判定ではない。
+  内容・並びが変わっても次の記録までは保存比率を表示する。行無し・旧行の追加情報無し・
+  不正な位置/総数では track も出さない。Remote で記録した本は補助情報を消し、
+  ローカルで再記録するまでメーター不表示とする。従来の raw index による位置復元は維持する。
+  Stack / 個別ページ / ConvertibleArchive / 詳細行 / 合成ビューのルート / Remote の一覧は対象外。
+  Tag / Smart / Collection から開いた物理子フォルダも通常の物理一覧として対象に含める。
+  メーターはセル内の下端帯を予約し、既存バッジと重ねない。極小セルではバッジを優先する。
+  一覧はメモリ上の記録を参照し、描画から本の走査・ページ数取得・DB 読み取りを行わない。
 
 ### 3.1 仮想スクロール
 
@@ -1069,7 +1104,9 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   CPU (= D3D11 → CPU 転送 + bwdif + swscale + CPU upload) になる。
 - 動画音量は既定 0dB。下部 HUD / Shift+↑↓ / 環境設定から -∞dB〜+18dB の
   dB フェーダーで手動調整でき、音量バーの右クリックまたはダブルクリックで 0dB に戻せる。
-  0dB 超の boost 部分は HUD で黄色表示し、音声ポンプ側の safety limiter を通す。
+  0dB 超の boost 部分は HUD で黄色表示する。音声ポンプ側の最終 safety limiter は
+  動画・音楽・Remote の全音声で常時有効とし、約 5ms の先読みを常に PDC / A/V sync へ含める。
+  常時適用と通常 EOS の末尾排出は公開済み v4.3.0 には未収録の follow-up。
   safety limiter のゲインリダクション量が 1dB 以上に達した場合は音量表示右側に
   赤いインジケータを約 500ms 表示する (ceiling に触れただけ・タイムストレッチ由来の
   微小オーバーでは点かない)。
@@ -1096,7 +1133,8 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 保存済み再生位置 (動画) と読書位置 (ZIP/PDF/対応アーカイブ) の記憶件数の確認・全件クリアは
   **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画・音声の再生位置と動画の音声トラック選択、
   本の読書位置を対象)。再生位置とトラック選択のクリアは OK 適用時、本クリアは
-  `book_resume_clear_requested` one-shot 経由で App が即時 `book_resume_db.clear_all()`。
+  `book_resume_clear_requested` one-shot 経由で既存 writer に全件クリアを依頼する。
+  一覧のメモリ上の読書位置も同じ受付で消し、件数・完了表示は非同期結果で更新する。
 - 閲覧履歴は、ユーザー操作で開いた画像フォルダ / ZIP / PDF / 対応アーカイブと、
   動画・音声ファイルを %APPDATA%\mimageviewer\reading_history.db に MRU として保存する。
   画像の本は親コンテナ、動画・音声はファイルを記録単位とする。一覧からの open、
@@ -1279,8 +1317,9 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   から次へ進む (末尾切れ防止)。
 - **ブックマーク**: 動画と同じ path-keyed の DB を共有し、音声 / 動画で相互に見える。既存
   ブックマークの ±1 秒以内への追加は拒否する。
-- **VST3**: 動画と同一チェーンを共有 (デコード → ノーマライズ gain → VST3 → 出力リミッタ →
-  cpal)。動画→音声モードでも VST は引き継がれ、音声モード中も VST GUI を表示できる。
+- **VST3**: 動画と同一チェーンを共有 (デコード → ノーマライズ gain → VST3 → 任意の
+  EffeTune 前段 limiter → EffeTune → 手動 boost → 常時有効の最終 limiter → cpal)。
+  動画→音声モードでも VST は引き継がれ、音声モード中も VST GUI を表示できる。
 
 #### 解析ワーカー
 
@@ -1365,15 +1404,26 @@ identity としたまま変換 cache ZIP の先頭画像または内部 pin を�
 | WebP | .webp |
 | BMP | .bmp |
 
+#### RAW（内蔵 LibRaw）
+
+対応拡張子（`src/raw_format.rs` の 23 種）: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS。
+追加の Store 拡張は不要。フルスクリーンは埋め込みプレビューを先に表示し、現像後に
+差し替える。使えるプレビューがなければ現像完了を待つ。編集は現像後に有効になる。
+Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応で、使える埋め込みプレビューのみ表示する。
+拡張子だけでは全カメラ・圧縮方式の現像対応を保証しない。Remote は PC 側でフル現像し、
+表示位置から先読みする。未編集 RAW の製本は元ファイルをそのまま格納し、編集時は焼き込む。
+設定は「ファイル処理 → RAW 現像」（同時現像数 1〜10、既定 3 / 明るさは
+「プレビューに合わせる」既定・「補正しない」）を使う。詳細は §1 の設定と
+[raw-libraw-plan.md](raw-libraw-plan.md) を参照。
+
 #### WIC 経由（Windows Imaging Component）
 
 | フォーマット | 拡張子 | 必要なコーデック |
 |------------|--------|----------------|
-| HEIC / HEIF | .heic, .heif | HEIF 画像拡張機能 |
-| AVIF | .avif | AV1 Video Extension |
-| JPEG XL | .jxl | JPEG XL Image Extension |
+| HEIC / HEIF | .heic, .heif | HEIF 画像表示オプション。HEIC は HEVC 非対応の PC では HEVC ビデオ拡張機能も必要（有料の場合あり） |
+| AVIF | .avif | AV1 ビデオ拡張機能 |
+| JPEG XL | .jxl | JPEG XL 画像表示オプション |
 | TIFF | .tiff, .tif | 標準搭載 |
-| RAW（各社カメラ） | .dng, .cr2, .cr3, .nef, .nrw, .arw, .srf, .sr2, .raf, .orf, .rw2, .pef, .ptx, .rwl, .iiq | Raw Image Extension |
 
 #### 動画（サムネイル表示 + フルスクリーンインライン再生）
 
@@ -1788,6 +1838,52 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   タイトルバーの × / Escape は当該起動中だけ閉じる。「この保存先では今後表示しない」は現在の
   パスを設定へ保存し、正規化後に同じ場所である間は次回以降表示しない。保存先が変われば再表示する。
 
+### 環境設定の持ち運び
+
+設定メニューの「設定の復元…」にある「環境設定を書き出し…」「環境設定を取り込み…」から、
+移行先に依存しない閲覧・表示・ファイル処理の設定を書き出し・取り込みできる。
+環境設定の「全体設定」には持ち運びの入口を置かない。詳細な分類と検証規則は
+[settings-export-import-plan.md](settings-export-import-plan.md) を正本とする。
+環境設定が表示中は新しい二つの転送項目だけを無効にし、閉じてから行うよう理由を示す。
+既存の復元・操作カスタマイズの操作は変更しない。取り込みの読み込み完了時に環境設定が
+独立して開かれていれば中止を通知し、既存 draft と live 設定・DB を変更しない。
+
+- 書き出し・取り込みは同じ見た目の説明 Modal から始める。書き出しは「書き出す」で保存先を
+  選び、確定済み Settings の preferences_snapshot() から worker で保存し、説明 Modal に結果通知を示す。
+  お気に入り専用値と未確定 draft は含めず、書き出し自体は live 設定や DB を変更しない。
+- 取り込み説明に、世代を選ぶ「この時点に戻す」と対象が異なり、移行可能な環境設定の一部だけを
+  変更し、移行先のパス・利用データ・操作カスタマイズ等を保持することを示す。「ファイルを選ぶ」で
+  ファイルを選び、worker の検証成功後だけ環境設定の「全体設定」(General) を開く。
+  正常な対象項目だけを新しい draft へ反映し、既存の結果・変更項目・不正項目欄を表示する。
+  OK は手編集と同じ prepare → install → 副作用 → save_checked の経路で確定する。
+  Cancel / × は取り込みと環境設定で行った未確定手編集をまとめて破棄する。
+  説明やファイル選択の Cancel、ファイル全体エラーでは環境設定を開かず設定を変更しない。
+- 全 432 フィールドを一つの policy で明示分類し、130 フィールドを転送対象、302 を除外する。
+  利用データ (★・編集・本棚・お気に入り・タグ・コレクション・履歴・読書位置・キャッシュ)、
+  PC 固有パス、フォント・外部ツール・LUT・Susie / VST3、性能 tuning、接続・自動通信、
+  操作カスタマイズ、環境設定外の一覧・ツールバー・再生状態は対象外。
+  履歴保持件数、EXIF 非表示タグ、動画下部バーの固定、詳細表示下部バーのモード、
+  `stack_rules.rhai` に依存するスタック script の有効化も除外する。
+- 形式は UTF-8 JSON、`format="mimageviewer.preferences"`、`format_version=1`、
+  `preferences` object を必須とし、参考情報 `app_version` は任意。推奨名は
+  `preferences.mivprefs.json`。Settings 全体の JSON・DB・操作カスタマイズ JSON は受け付けない。
+  同じ形式版の未知キーは無視して件数を知らせ、欠落は現在 draft 値を保持する。
+  型違い・範囲外・未知 enum はその論理項目を無視し、既定値補完や clamp はしない。
+  壊れた JSON、不正 UTF-8、重複キー、1 MiB / 深さ制限超過、形式・版の不一致は全体拒否し、
+  draft を変えない。未来の形式版も推測して読み込まない。
+- SettingsRestoreState の一つの転送 job が read / parse / serialize / write を worker で処理する。
+  処理中は説明 Modal を busy 表示にし、設定復元の操作・閉鎖と説明の実行・キャンセルを止める。
+  メイン viewport の背面メニュー・ツールバーは show_settings_restore が登録済みの
+  common modal と説明 Modal に任せる。ファイル I/O と draft に無関係な別窓・fullscreen・
+  native 動画に転送専用の入力遮断は加えず、既存挙動を維持する。
+  DB migration、専用 live rebuild、復旧 journal、再試行や世代バックアップは追加しない。
+- 対象外に import setter は持たない。ただし、既存 OK が環境設定外の最新値
+  (`video_playback_speed` 等) を巻き戻す §1.305 と、`show_hidden_files` 等の変更後に
+  通常フォルダを UI スレッドで再読込する §1.295 は今回未修正で、取り込み後の OK も引き継ぐ。
+  再生位置と音声トラックは既存の修正済み live merge を使う。
+- 書き出し先は利用者が選ぶファイルで、data-dir 外にも置ける。アプリの通信や自動有効化は
+  増えない。ネットワーク共有・同期フォルダを選んだ場合の通信は OS・同期ソフトの扱いに従う。
+
 ### 起動引数
 
 `mimageviewer.exe <パス>` の最初の位置引数は起動時に開く対象として扱う。
@@ -1834,6 +1930,22 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 runtime 展開や本体起動を行う前に、最初の位置引数を Named Pipe へ転送してから
 activate event を送る。Pipe がまだ準備されていない起動直後だけ短く再試行し、
 Explorer の SendTo 起動側が数秒単位で残らないようにする。
+
+固定の「ファイル整理先」は環境設定の「フォルダ・ファイル」で表示名・絶対パス・登録順を編集する。
+`Settings.file_organize_destinations: Vec<FileOrganizeDestination>` は空が既定で、不在先も維持する。
+追加・編集・削除・↑↓は環境設定の draft へ反映し、OK で保存、Cancel で破棄する。
+名称空欄、パス空欄、相対パス、NUL は OK を無効化する。お気に入りとツールバーには影響しない。
+グリッドの項目右クリック「ファイル整理先…」と既定キーなしの `GridOrganizeFiles` から同じ画面を開く。
+チェック済み全件を優先し、なければ右クリック項目／キーのカーソルを使用する。実ファイルと実フォルダの
+混在は全件を対象とし、仮想・合成項目の混在は理由付きで全体を拒否する。検索等の一覧でも実項目は扱う。
+登録先の「移動」「コピー」で非同期 STA worker の `IFileOperation::MoveItem / CopyItem` へ直接依頼する。
+クリップボードは変更せず、競合・進捗・取消・部分失敗は Windows 標準 UI に任せ、整理先へ一覧を移動しない。
+状態は非表示／選択中／実行中の request enum が所有し、投入直前の共通入口で Remote 所有・終了要求を拒否する。
+選択要求は一度だけ消費し二重投入を防ぐ。開始後の独自取消・終了待機・再開は追加しない。
+終端の成否によらず、完了時の現在の実フォルダが元の親／整理先なら既存の Notified 外部変更確認を要求するだけ。
+保持一覧、チェック、検索、別窓、viewer の専用後始末は行わず、エクスプローラー移動相当の更新に従う。
+評価・タグ・編集の移行や削除は整理操作では行わず、記録済みの対象ファイルは先の通常フォルダの
+既存「編集内容の復元」確認に任せる。専用待機・強制ハッシュは追加しない。
 
 実ファイル / 実フォルダの native 右クリックメニューには、常に Win32 `IContextMenu` 由来の
 Windows 項目を含める。Shell 項目は既定で末尾の
@@ -1930,6 +2042,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_show_media_duration` | bool | true | 動画・音声のサムネイル右下に長さを表示する。1 時間未満は `m:ss`、1 時間以上は `h:mm:ss`。フィルタ一致数と既存バッジを優先し、衝突時は上へ移し、空きがなければ非表示。可視 + 先読みだけ既存遅延メタ worker で取得する。設定項目がない既存 JSON / settings.db も true になる |
+| `thumb_show_book_resume_meter` | bool | true | 通常の一覧のフォルダ・ZIP・PDF サムネイル下端に保存済み読書位置の比率を常に左から右へ表示する。本の読み方向や `fullscreen_seek_direction` には連動しない。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続き、ON に戻すと追加読み取りなしに表示できる。欠落した JSON / settings.db 設定と既定設定も true |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
 | `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
 | `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |
@@ -1967,6 +2080,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
+| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所の選択は従来の `last_folder` / 起動設定のまま |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |
@@ -2006,7 +2120,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
 | `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
-| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
+| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせる。`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
 | `fullscreen_keep_on_app_switch` | bool | false | 「メインに戻ったらフルスクリーンへ復帰」。他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を自動で閉じずにフルスクリーン側へフォーカスを戻す。メイン一覧も並行操作する場合は F12 別ウィンドウを使う |
@@ -2108,11 +2222,14 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
 | `music_open_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 一覧から開く」。既定 FromStart=最初から / Resume=続き。位置は動画と同じ `video_resume_positions` に path キーで保存 |
 | `music_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 移動 (↓↑/ホイールの前後ファイル移動 + Ctrl+↑↓/キー)」。既定 FromStart=最初から (誤って別曲へ行って戻っても頭から) |
+| `effetune_pre_limiter_enabled` | bool | true | EffeTune へ渡す前に 0 dBFS 超のピークを抑える。ユーザー VST3 後・EffeTune 前に独立した SafetyLimiter を通す。環境設定 OK 時に共有 atomic へ公開し、動画・音楽・Remote は既存 worker の各音声 block で参照。ON/OFF とも前段約5msの遅延を維持して約5msでクロスフェード。Remote の生成済み・先読み済み音声には遡及しない。portable では設定 UI と検索候補を非表示。欠落 field は ON、最終出力 limiter は常時有効・変更不可 |
+| `effetune_keep_visible_when_minimized` | bool | false | メイン最小化中も表示希望のある音響調整の窓を残す。Preferences OK で即時反映（最小化中も切替）。host の `Minimized` 理由だけを無効にし、`RemoteSession`・user-hidden・未表示 open の最小化取消・非アクティブ復帰は維持。tray-only `SW_HIDE` は最小化ではなく、両設定とも既存どおり窓を残す。ownerless tool window・非 TOPMOST。released settings の欠落 field / DB key は serde default false、既存 `settings_kv` で保存し schema 変更なし。portable の UI・検索候補は非表示 |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズの全体 ON/OFF。ON のとき、選択中の音声トラックの測定値を使い -14 LUFS 相当の音量にする。測定結果はトラックごとに保存し、再生開始前から適用する。未測定のトラックは再生前に自動測定し、長い動画では途中の測定値で再生を始めて、測定完了後に音量を徐々に合わせる。測定を中止したトラックは、同じ動画を表示している間は自動で測り直さず、Norm ボタンから再開できる。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
+| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動や途中終了による未反映は [今すぐ確認] で反映する。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_sort` | SortOrder | FileName | フォルダ代表画像の自動選定順。通常一覧の `sort_order` とは独立して設定できる。FileName / Numeric / DateAsc / DateDesc |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
@@ -2139,7 +2256,8 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `show_address_bar_folder_pin` | bool | true | フォルダバーに代表サムネ固定 (📌) を表示 |
 | `show_location_{drive_list,reading_history,rating,bookshelf,desktop,pictures,downloads,drive_roots}` | bool | true | フォルダバーの場所▼に表示する項目を個別に切り替える。フォルダバー左端の `フォルダ:` ラベルまたは場所▼を右クリックして変更 |
 | `show_toolbar_rating` | bool | true | ツールバーにレーティング（★）フィルタを表示 |
-| `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
+| `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true（ソートの生成・リセット既定は false、旧設定の省略は true） | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
+| `show_facet_sort` | bool | true（旧設定の省略は false） | 絞り込みバー右側の独立したソートドロップダウン。上部表示とは独立、ソート状態と候補は共通。生成・リセット既定は ON、上部ソートは OFF。旧設定の省略時は OFF を維持する |
 | `show_toolbar_facet_filter` | bool | true | ツールバー下のスマートフィルタ（絞り込みバー）を表示 |
 | `toolbar_facet_filter_items` | Vec\<ToolbarFacetFilterItem\> | 全項目 | スマートフィルタバーに表示するボタンとファイル名欄の並び。空 Vec は全項目を隠すが、適用中条件のチップと `全解除` は表示する。保存時は新しい `NameFilter` を配列から退避し、旧版が未知 variant として読み捨てても並びを失わない形にする |
 | `toolbar_facet_name_filter_index_stash` | Option\<usize\> | None | 保存時に `NameFilter` の位置を退避するダウングレード互換用フィールド。`usize::MAX` は利用者が明示的に非表示にした状態を表す。読込時に `toolbar_facet_filter_items` へ戻して消費し、フィールド自体が無い旧設定では従来の常設入力を維持するため末尾へ追加する |
@@ -2147,7 +2265,8 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `toolbar_cols_details_visible` | bool | true | ツールバーの列セクションに `詳細` 切替を表示 |
 | `toolbar_cols_items` | Vec\<usize\> | 1〜20 | ツールバーの列セクションに表示する列数候補。旧既定の 1〜10 全部と完全一致する保存値は、初回読み込み時だけ 11〜20 を補完する。部分集合・並び替え済みの値は維持し、補完後に候補を外しても復活させない。表示方式は判定に影響しない |
 | `toolbar_section_order` | Vec\<ToolbarSectionId\> | [] (=既定順) | ツールバーセクションの並び順 (v2.0.0、ラベルのドラッグで変更)。未登録は既定順で末尾補完、未知の variant は描画前に除外 |
-| `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
+| `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [Folder] | 「行頭に表示」(= その手前で改行) するセクションの集合 |
+| `toolbar_folder_section_migrated` | bool | true (旧設定欠落時 false) | フォルダバーの末尾・行頭 ON 補完が済んだ印。既存 KV 保存形式の追加でスキーマ変更なし |
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_collections_display` | ToolbarSectionDisplay | Buttons | コレクションの固定ショートカットの表示形式。追加先コンボと追加 / 開くは常時表示し、展開 / 折りたたみから選ぶ。旧Dropdown / UnknownはButtonsへ正規化する。管理は上部`コレクション`メニューから開く |
 | `pinned_collections` | Vec&lt;Uuid&gt; | 空 | ツールバーへ固定するコレクションのID。名前ではなく安定UUIDを保持し、コレクションの改名に追従する |
@@ -2177,7 +2296,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `skip_epub_if_pdf_exists` | bool | true | 同じフォルダに同名の PDF がある EPUB をグリッド・スマートフォルダ・Ctrl+↑↓ の候補から非表示にする。名前の大小文字は区別しない |
 | `skip_image_if_video_exists` | bool | true | 同名動画がある画像をスキップ（画像は動画サムネイルとして使用） |
 | `skip_duplicate_images` | bool | true | 同名で複数拡張子がある画像を優先度でフィルタ |
-| `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先） |
+| `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先）。設定ロード時は、現在の既定リストにある未登録の拡張子を末尾へ補完する（大文字・小文字を区別しない）。既存の順序・表記・独自項目は維持する |
 
 #### 検索クエリ構文（Ctrl+F / Ctrl+G / Ctrl+S 共通）
 
@@ -2610,7 +2729,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - [x] 非ソリッド・入れ子なし・暗号化なし RAR / CBR を UnRAR で直接閲覧。ソリッド・入れ子あり・暗号化 RAR と 7z / LZH は無圧縮 ZIP キャッシュへ変換（分割 RAR は先頭パートのみ表示）
 - [x] 変換メニューから RAR / CBR / 7z / CB7 / LZH / LHA と同じフォルダへ同名 ZIP を明示作成
 - [x] ZIP/PDF ファイルのサムネイル＋バッジ表示（フォルダ一覧で 1 枚目/1 ページ目を表示、キャッシュ対応）
-- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF / RAW）
+- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF）と内蔵 LibRaw による RAW 表示・現像
 - [x] 動画サムネイル（Windows Shell API 経由）
 - [x] アニメーション再生（GIF / APNG / WebP）
 - [x] AppleDouble メタデータファイル自動除外
@@ -2859,6 +2978,7 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 ## 11. セキュリティ方針
 
 - 画像デコードは `image` クレート（純粋Rust・メモリ安全）を基本とする
-- HEIC / AVIF / JXL / TIFF / RAW は Windows の WIC (Windows Imaging Component) 経由でデコード。
+- RAW は他の decoder より先に LibRaw へ振り分け、FFI は `crates/libraw-sys` に局所化。
+- HEIC / AVIF / JXL / TIFF は Windows の WIC (Windows Imaging Component) 経由でデコード。
   WIC 呼び出しは `unsafe` ブロックに局所化（`src/wic_decoder.rs`）
 - NVIDIA NGX 呼び出し部分も `unsafe` ブロックに局所化（Phase 2、未実装）

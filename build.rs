@@ -43,6 +43,7 @@ fn main() {
 
     // 同梱 FFmpeg のビルド識別子を焼き込む (バージョン情報ダイアログの LGPL 通知)。
     emit_ffmpeg_build_id();
+    emit_libraw_build_id();
 
     // FFmpeg DLL は `target/release/` には自動でコピーしない。
     //
@@ -500,6 +501,24 @@ fn emit_ffmpeg_build_id() {
         .and_then(|raw| parse_ffmpeg_build_id(raw.trim()))
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=MIV_FFMPEG_BUILD_ID={id}");
+}
+
+/// RAW のライセンス通知と対応ソース URL を、実際にビルドする同梱版から生成する。
+fn emit_libraw_build_id() {
+    println!("cargo:rerun-if-changed=vendor/libraw/VERSION");
+    let recovery = "Recovery: bash scripts/setup-libraw.sh (or bash scripts/bootstrap-vendor.sh)";
+    let version = std::fs::read_to_string("vendor/libraw/VERSION")
+        .unwrap_or_else(|error| panic!("Cannot read vendor/libraw/VERSION: {error}\n{recovery}"));
+    let version = version.trim();
+    let parts: Vec<_> = version.split('.').collect();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "Invalid vendor/libraw/VERSION: {version:?}\n{recovery}"
+    );
+    println!("cargo:rustc-env=MIV_LIBRAW_BUILD_ID={version}");
 }
 
 /// BtbN の資産名からビルド識別子を取り出す。

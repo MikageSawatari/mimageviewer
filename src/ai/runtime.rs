@@ -159,6 +159,7 @@ impl AiRuntimeInitOwner {
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
         let repaint_worker = Arc::clone(&repaint);
         let task: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let memory = crate::perf::memory::span("ai_runtime_init");
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(initialize))
                 .unwrap_or_else(|_| {
                     let error =
@@ -167,6 +168,7 @@ impl AiRuntimeInitOwner {
                     Err(error)
                 });
             owner.publish_terminal(created);
+            drop(memory);
             repaint_worker();
         });
         let spawned = spawn(

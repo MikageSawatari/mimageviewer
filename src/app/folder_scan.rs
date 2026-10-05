@@ -463,10 +463,20 @@ pub(crate) fn image_folder_page_count_options(
 }
 
 /// ZIP と画像フォルダのページ数 cache が共有する画像認識規則 fingerprint。
-/// Susie の有効/無効と対応拡張子集合も identity に含め、プラグイン構成変更後に
-/// 古いページ数を恒久再利用しない。
+/// ネイティブ対応拡張子、Susie の有効/無効と対応拡張子集合も identity に含め、
+/// 形式追加やプラグイン構成変更後に古いページ数を恒久再利用しない。
 pub(crate) fn image_page_recognition_fingerprint(settings: &crate::settings::Settings) -> i64 {
-    // 永続 cache 用の決定的 FNV-1a。判定規則を変えたときは version bytes を上げる。
+    image_page_recognition_fingerprint_with_native_extensions(
+        settings,
+        crate::folder_tree::SUPPORTED_EXTENSIONS,
+    )
+}
+
+fn image_page_recognition_fingerprint_with_native_extensions(
+    settings: &crate::settings::Settings,
+    native_extensions: &[&str],
+) -> i64 {
+    // 永続 cache 用の決定的 FNV-1a。拡張子以外の判定規則を変えたときは version bytes を上げる。
     let mut hash = 0xcbf29ce484222325u64;
     let mut mix = |bytes: &[u8]| {
         for &byte in bytes {
@@ -482,6 +492,14 @@ pub(crate) fn image_page_recognition_fingerprint(settings: &crate::settings::Set
     )]);
     mix(&[u8::from(!settings.epub_file_handling_ignores_epub())]);
     mix(&[u8::from(settings.susie_enabled)]);
+    // Use the scanner's native list, independently of the user's saved priority list.
+    // New native formats must invalidate cached counts even if priorities already contain them.
+    mix(b"native-image-extensions\0");
+    for extension in native_extensions {
+        mix(extension.as_bytes());
+        mix(&[0]);
+    }
+    mix(b"image-extension-priority\0");
     for extension in &settings.image_ext_priority {
         mix(extension.as_bytes());
         mix(&[0]);
@@ -1950,5 +1968,80 @@ mod page_count_tests {
             image_page_recognition_fingerprint(&disabled),
             image_page_recognition_fingerprint(&enabled)
         );
+    }
+
+    #[test]
+    fn image_ext_priority_completion_changes_page_count_fingerprint_only_once() {
+        let mut settings = crate::settings::Settings::default();
+        settings.susie_enabled = false;
+        settings.image_ext_priority.truncate(27);
+        let old = image_page_recognition_fingerprint(&settings);
+        crate::settings::apply_load_time_migrations(&mut settings);
+        let completed = image_page_recognition_fingerprint(&settings);
+        assert_ne!(old, completed);
+        crate::settings::apply_load_time_migrations(&mut settings);
+        assert_eq!(completed, image_page_recognition_fingerprint(&settings));
+    }
+
+    #[test]
+    fn native_raw_addition_invalidates_page_counts_with_already_complete_priorities() {
+        use crate::catalog::{CatalogDb, ContainerPageKind, ContainerPageMeta};
+
+        let mut settings = crate::settings::Settings::default();
+        settings.susie_enabled = false;
+        let saved_priority = settings.image_ext_priority.clone();
+        assert!(!crate::settings::normalize_image_ext_priority(
+            &mut settings.image_ext_priority
+        ));
+        crate::settings::apply_load_time_migrations(&mut settings);
+        assert_eq!(settings.image_ext_priority, saved_priority);
+
+        // Model format support before the eight RAW additions, keeping every setting unchanged.
+        let added_raw = ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"];
+        let released_native: Vec<_> = crate::folder_tree::SUPPORTED_EXTENSIONS
+            .iter()
+            .copied()
+            .filter(|extension| !added_raw.contains(extension))
+            .collect();
+        let old_fingerprint =
+            image_page_recognition_fingerprint_with_native_extensions(&settings, &released_native);
+        let options = image_folder_page_count_options(&settings);
+        assert_ne!(old_fingerprint, options.fingerprint);
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let catalog = CatalogDb::open(&temp.path().join("cache"), temp.path()).unwrap();
+        let kind = ContainerPageKind::Folder;
+        // Keep the source identity unchanged: only native recognition changed across the upgrade.
+        for (name, stale_count, expected_count) in [("raw-only", None, 1), ("pictures", Some(1), 2)]
+        {
+            let folder = temp.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(folder.join("001.crw"), b"not decoded during scan").unwrap();
+            if stale_count.is_some() {
+                std::fs::write(folder.join("002.jpg"), b"not decoded during scan").unwrap();
+            }
+            catalog
+                .set_container_page_meta(name, kind, 200, 0, old_fingerprint, stale_count)
+                .unwrap();
+            assert_eq!(
+                catalog
+                    .get_container_page_meta(name, kind, 200, 0, old_fingerprint)
+                    .unwrap(),
+                Some(ContainerPageMeta {
+                    page_count: stale_count
+                })
+            );
+            assert_eq!(
+                catalog
+                    .get_container_page_meta(name, kind, 200, 0, options.fingerprint)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                image_folder_page_count(&folder, &options).unwrap(),
+                Some(expected_count)
+            );
+        }
+        assert_eq!(settings.image_ext_priority, saved_priority);
     }
 }

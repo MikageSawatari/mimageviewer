@@ -844,6 +844,10 @@ session owner、生存 timeout、放置 timeout は A/V と audio-only で同じ
 保持し、空きが無ければ `Condvar` wait、consumer release で resume する。cancel は各 FFmpeg
 段の前後で同じ flag を検査するため、長い段の途中へ別 state field を持ち込まない。本番の
 remote session と `dev-tools` の `clockless_transcode_bench` は同じ driver と終端 flush を使う。
+通常 EOF 後は capacity 待ちを解除し、ring は live capacity + 4 本を保持する。従来の working /
+codec 終端用 2 本に、最大 plugin 遅延 2秒 + 両 limiter 約 10ms の排出が、作成中の fragment の
+位置によって越える最大 2 境界分を予約する。同じ容量を metadata と A/V・audio-only mux に使い、
+最古の未読 fragment を排出・finish で追い出さない（公開済み v4.3.0 には未収録）。
 音声 stream index は driver の入力で明示する。診断 CLI は既定 stream を入口で決め、
 必要なら `--audio-stream-index N` で指定できる。本番 session は headless player の
 opened stream を渡し、driver 内では選び直さない。
@@ -1310,6 +1314,19 @@ seek 要求は入力終端をクリアし、同じ demux worker を起こすた�
 設計の簡素化として既存 engine state を唯一の再生終了 owner に再利用し、追加の終端 bool や
 時間待ち、操作制限は設けない。pause/resume をモーダル化すると通常操作を変えるため採用しない。
 
+**通常 EOS と seek の SWR 所有境界（2026-10-04 follow-up、公開済み v4.3.0 には未収録）**:
+48kHz → 44.1kHz の末尾バーストで、codec だけの Flush が SWR の履歴を残し、
+実 EOF Full-loop の次世代先頭へ旧音声を出すことを回帰で確認した。audio worker は
+codec / SWR / `AudioResampleTimeline` を同じ Flush で初期化する。通常 EOS は codec
+を drain した後に SWR の実出力が0になるまで drain し、既存の trim / serial fence /
+queue accounting を持つ共通 PCM sender へ流してから decoded EOS を公開する。
+seek / cancel / stop は排出せず破棄する。pause は共通 PCM sender の pending frame を
+捨てず、bounded send の空きまたは resume を待つ（pause 中の空きへ enqueue しても
+callback は非 Playing gate で保持）。seek / cancel は待機中も fence と accounting rollback を行う。
+timeline は入力端と実 sample 数で進む出力端を
+一つの owner に保持する。timestamp の stream time-base 丸めを吸収し、forward gap は
+旧 SWR の排出・初期化後に新 source PTS へ anchor する。PDC と最終 limiter の遅延は変更しない。
+
 **swresample 出力 frame の pre-allocation (⚠ 重要)**: `emit_audio_frame` は
 `setup.resampler.run(input, output)` を呼ぶ前に **output frame を正しいサイズで
 明示確保** する。`ffmpeg-the-third 3.0.2` の `Context::run()` 実装は `output.is_empty()`
@@ -1763,6 +1780,50 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 短い park 後の `Buffering` 中でも stale audio frame が `audio_tx` を塞ぎ続けない。
 
 #### `audio.rs`
+
+- EffeTune 適用時の DSP 順序は normalize → ユーザー VST3 → 任意の EffeTune 前段
+  SafetyLimiter → EffeTune → 手動 boost → 常時有効の最終 SafetyLimiter → 出力音量。
+  前段は別 instance の ceiling 0 dBFS / lookahead 5 ms / release 100 ms で、
+  `effetune_pre_limiter_enabled`（既定 ON）は App の `EffetuneAudioSlot` の atomic に公開し、
+  local pump / Remote `ClocklessAudioProcessor` が通常処理・EOS の各ブロックで読む。
+  環境設定の OK 後に反映し、画面・配信の再開は不要。動画・音楽・動画の音声表示モード、
+  メイン・全画面・別窓で同じ slot を共有する。Remote は生成済み音声には遡及しない。
+  OFF でも前段 delay / PDC / EOS 保持量は同じ約5msを維持し、同じ delay-line の制限済み音と
+  raw 音を約5msでクロスフェードする（ON 完了までの ramp 中は 0dB 超を含み得る）。
+  codec / resampler / timeline / DSP graph は設定切替で reset しない。
+  原音を保持した scratch だけを制限するため、EffeTune 失敗時はユーザー VST3 後へ戻り、
+  前段・EffeTune の遅延をともに除外する。成功時だけ前段の実サンプル数による遅延を PDC に加算。
+  2 秒 admission は従来どおり plugin のみ（両 limiter と stretch は上限外）。
+  seek / 非適用 / EffeTune 世代変更では前段 delay を reset。Remote 世代ごとの再作成も初期化する。
+  最終 limiter はエフェクト・音量・normalize gain に関係なく毎ブロック処理し、実 lookahead
+  frames / rate（約 5ms）を常に PDC に加える。前段の非適用・失敗でも最終段は残る。
+  HUD ピーク表示は最終 limiter の 1dB 以上の低減のみ。詳細は `effetune-integration-plan.md` §13。
+  EOS 排出・完了 wake・Remote の終端予約拡張・最終段常時適用は公開済み v4.3.0 には未収録。
+
+- 通常 EOS は `AudioDspTail` が前段 limiter の保持音声を同じ EffeTune generation へ流し、
+  常時有効の最終 limiter の保持音声も必ず出力する。上流段の排出（前段 lookahead + EffeTune の報告遅延）と、
+  最終 limiter に直接無音を入れる排出を分け、最大 10ms 相当のブロックで処理する。
+  local は既存の processed cap / permit / trim / seek 確認 / tap / commit を使い、Remote は
+  decoder・resampler drain 後、AAC encoder finish 前に同じ処理を行う。PDC は最後の実ブロックの
+  値を維持し、audible PTS を連続させる。ユーザー VST3 / stretch / 任意長の残響は排出しない。
+  seek / cancel / stop / Remote source-limit は保持音声を捨てる。
+  audio packet EOF は demux serial 付きで stale EOF を拒否し、`AvClock` が所有する `AudioEos` の
+  Decoding → Decoded → Draining → Complete を共有する。native / 非 native の EOF・loop 判定は、
+  音声 lane がある限り Complete と出力 drain を待つ（lane 喪失は既存の例外）。
+  pump は現 serial の Complete 遷移成功時に `wake_ui()` で ROOT を即時起床させる。
+  in-flight 中に deadline が無くても、起床後の tick が既存の 48ms quiet timer を開始できる。
+  `audible_pts_after_latency` は負の audible PTS を trim まで保持する。0 秒開始でも先頭の
+  delay-line silence を sample 単位で除き、EOS 排出と合わせて dry chain の入出力 frames を
+  一致させる。初回・loop-to-zero・seek-to-zero で同じ pump の trim を使う
+  （2026-10-04 P3 follow-up、公開済み v4.3.0 には未収録）。
+
+- open / seek / loop の診断は `audio_epoch` の reset / drain_begin / drain_complete /
+  first_non_silent / first_device_output を使う。serial、rate、limiter reset、排出 frames、
+  段ごとの先頭非ゼロ PTS と callback が実際に渡した先頭非ゼロ PTS を記録する。
+  VST IPC reset は reset ID と ACK を通常ログへ記録する。callback は atomics のみ、
+  formatting / perf writer は pump スレッド。fixture 回帰は実 decoder と EOF-loop tick を通し、
+  実消費 PCM に加えて underrun padding を含む全 callback 出力も検査する。
+
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
 - AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)
@@ -1798,12 +1859,12 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `Settings.video_volume` の線形ゲインのまま保持し、UI で dB フェーダー位置へ相互変換する。
   0dB 超の分は `audio-pump` で safety limiter の前に preamp gain として掛け、
   `fill_output` 側の RT 音量は最大 0dB に抑える。これにより 0dB 以下の音量変更は従来通り
-  低レイテンシで、boost 時だけ limiter の 5ms lookahead を PDC latency として扱う。
+  低レイテンシで、最終 limiter の約 5ms lookahead は常に PDC latency として扱う。
   safety limiter の ceiling は 0 dBFS (= フルスケール) で、これを超えた分だけゲインを
   下げて hard clip を防ぐ。**赤いピークインジケータは「ceiling に触れた瞬間」ではなく、
   ゲインリダクション量が `SAFETY_LIMITER_INDICATOR_GR_DB` (1 dB) 以上に達したブロックで
   だけ点灯する** — タイムストレッチ由来の 1 dB 未満の微小オーバーや f32 演算誤差では
-  点かず、VST / 音量 boost / normalize boost で実際に gain staging が破綻したときだけ
+  点かず、元の音源・VST / 音量 boost / normalize boost による 1dB 以上の低減で
   点く。点灯時は `AvClock` の sequence を増やし、native HUD の音量表示右側に約 500ms
   表示する。判定は音量フェーダーに依存しない (リミッターはフェーダー前段で内部信号に
   作用するため、戻り値は内部チェーンが 0 dBFS をどれだけ超えたかをそのまま表す)。

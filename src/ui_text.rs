@@ -1977,6 +1977,9 @@ impl App {
             return;
         }
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
 
         let Some(key) = self.page_path_key(target_idx) else {
             return;
@@ -2039,6 +2042,9 @@ impl App {
     /// 抜けたときに見開きへ戻れなくなる (2026-08-26 の実機報告: 右ページを選んで抜けると
     /// 単ページのままになる)。消しゴムの [`Self::switch_erase_target_in_spread`] と同じ約束。
     pub(crate) fn switch_text_target_in_spread(&mut self, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -3093,10 +3099,22 @@ impl App {
                         if let Some((left, right)) = spread_lr {
                             ui.horizontal(|ui| {
                                 let is_left = fs_idx == left;
-                                if ui.selectable_label(is_left, "左ページ").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        self.raw_edit_target_gate(left),
+                                        egui::Button::selectable(is_left, "左ページ"),
+                                    )
+                                    .clicked()
+                                {
                                     switch_target_to = Some(left);
                                 }
-                                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        self.raw_edit_target_gate(right),
+                                        egui::Button::selectable(!is_left, "右ページ"),
+                                    )
+                                    .clicked()
+                                {
                                     switch_target_to = Some(right);
                                 }
                             });

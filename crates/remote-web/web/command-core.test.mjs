@@ -65,6 +65,7 @@ import {
   nextFitMode,
   pagePrefetchFailurePlan,
   pageAdmissionRetryDelayMs,
+  pageRequestIsDemandCongestion,
   pageDecodeAheadUnitIndexes,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
@@ -3094,6 +3095,16 @@ test("admission retry honours Retry-After and stays within a usable range", () =
   assert.equal(pageAdmissionRetryDelayMs(60_000, 0), 2000);
   assert.equal(pageAdmissionRetryDelayMs(1, 0), 100);
   assert.equal(pageAdmissionRetryDelayMs("bad", 0), 250);
+});
+
+test("only named admission and RAW capacity errors allow demand-scoped retry", () => {
+  for (const code of ["ipc_busy", "admission_busy", "raw_busy"]) {
+    assert.equal(pageRequestIsDemandCongestion(503, code), true);
+  }
+  for (const code of ["miv_media_error", "ipc_timeout", "other"]) {
+    assert.equal(pageRequestIsDemandCongestion(503, code), false);
+  }
+  assert.equal(pageRequestIsDemandCongestion(409, "raw_busy"), false);
 });
 
 test("a drifted visual viewport is pulled back and recorded", () => {

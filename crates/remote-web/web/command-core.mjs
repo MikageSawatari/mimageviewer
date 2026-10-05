@@ -2655,12 +2655,15 @@ export function pageResourceAdmissionPlan({
 
 export const FOREGROUND_ADMISSION_RETRY_LIMIT = 3;
 
-/// 503 は「いま容量が無い」であって、その要求が無効だという返事ではない。
-/// remote-web の admission は `ipc_busy`、本体側の混雑は `miv_media_error` として
-/// 届く。コード名で絞ると本体由来の混雑を終端失敗として扱い、そのページを計画から
-/// 落としてしまう (実機で「次の 1 枚だけ穴が空く」形で観測)。
+/// All 503 responses retain the legacy bounded retry behavior. Named admission
+/// congestion gets additional retries only while a display member still needs it.
 export function pageRequestIsTransientlyBusy(status) {
   return Number(status) === 503;
+}
+
+export function pageRequestIsDemandCongestion(status, errorCode) {
+  return Number(status) === 503 &&
+    ["ipc_busy", "admission_busy", "raw_busy"].includes(errorCode);
 }
 
 /// A displayed page must not fail because the server was momentarily full. Honour

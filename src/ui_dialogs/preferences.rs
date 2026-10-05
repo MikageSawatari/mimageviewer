@@ -18,8 +18,66 @@ use crate::settings::{Parallelism, Settings};
 
 mod pages;
 mod search_index;
+mod transfer;
 use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
+use self::transfer::PreferencesTransferFeedback;
+pub(crate) use self::transfer::{PreferencesTransferAction, PreferencesTransferState};
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_settings_snapshot_fixture(ui: &mut egui::Ui, busy: bool) {
+    // Match the production right panel's fixed available width.
+    ui.set_width(ui.available_width());
+    if busy {
+        transfer::render_transfer_explanation(ui, PreferencesTransferAction::Export, true, None);
+        return;
+    }
+    let feedback = PreferencesTransferFeedback::Imported(crate::settings_transfer::ImportReport {
+        accepted_count: 128,
+        changed_fields: vec!["テーマ".into(), "文字のコントラスト".into()],
+        issues: vec![crate::settings_transfer::TransferIssue {
+            field: "スライドショーの間隔".into(),
+            reason: "範囲外の値です。".into(),
+        }],
+        unknown_count: 1,
+    });
+    transfer::render_transfer_feedback(ui, Some(&feedback));
+}
+
+#[doc(hidden)]
+pub fn draw_preferences_transfer_explanation_snapshot_fixture(ui: &mut egui::Ui, import: bool) {
+    transfer::render_transfer_explanation(
+        ui,
+        if import {
+            PreferencesTransferAction::Import
+        } else {
+            PreferencesTransferAction::Export
+        },
+        false,
+        None,
+    );
+}
+
+#[doc(hidden)]
+pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut destinations = vec![
+        crate::settings::FileOrganizeDestination {
+            name: "保管".into(),
+            path: PathBuf::from(r"D:\写真\保管"),
+        },
+        crate::settings::FileOrganizeDestination {
+            name: "要確認".into(),
+            path: PathBuf::from(r"\\server\写真\非常に長いフォルダ名\要確認"),
+        },
+    ];
+    pages::draw_file_organize_destinations_settings(ui, &mut destinations);
+}
+
+#[doc(hidden)]
+pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
+    pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
+    pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
+}
 
 #[doc(hidden)]
 pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
@@ -30,6 +88,11 @@ pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
         ..Settings::default()
     };
     pages::draw_video_bar_visibility_settings(ui, &mut settings);
+}
+
+#[doc(hidden)]
+pub fn draw_book_resume_meter_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    pages::draw_book_resume_meter_settings(ui, &mut Settings::default());
 }
 
 #[doc(hidden)]
@@ -165,6 +228,7 @@ pub(crate) enum PreferencesPage {
     /// 履歴と復元 (閲覧履歴、読書/再生位置の復元)
     PlaybackResume,
     SusiePlugins,
+    RawDevelop,
     /// v0.8.0: 検索インデックスの速度プロファイル
     IndexerSpeed,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
@@ -253,6 +317,7 @@ impl PreferencesPage {
         Self::SpreadMode,
         Self::PlaybackResume,
         Self::SusiePlugins,
+        Self::RawDevelop,
         Self::IndexerSpeed,
         Self::TrayResidency,
         Self::Rating,
@@ -290,6 +355,7 @@ impl PreferencesPage {
             Self::SpreadMode => "閲覧表示",
             Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
+            Self::RawDevelop => "RAW 現像",
             Self::IndexerSpeed => "検索インデックス",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
@@ -546,6 +612,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::DuplicateFiles,
             PreferencesPage::ExifDisplay,
             PreferencesPage::SusiePlugins,
+            PreferencesPage::RawDevelop,
         ],
     },
     TreeCategory {
@@ -747,6 +814,7 @@ pub fn draw_clipboard_capture_settings_pending_snapshot_fixture(ui: &mut egui::U
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    transfer_feedback: Option<PreferencesTransferFeedback>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
@@ -1337,6 +1405,7 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            transfer_feedback: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
@@ -2044,12 +2113,43 @@ fn merge_video_media_memory_for_preferences(
 }
 
 impl App {
-    pub(crate) fn install_preferences_settings(&mut self, settings: Settings) {
+    pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
+        let old_raw_brightness = self.settings.raw_brightness;
+        let requested_raw_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
+        if requested_raw_parallelism != self.settings.raw_develop_parallelism {
+            if let Err(error) = self
+                .raw_develop_executor
+                .set_parallelism(requested_raw_parallelism as usize)
+            {
+                settings.raw_develop_parallelism = self.settings.raw_develop_parallelism;
+                self.show_feedback_toast(format!(
+                    "RAW の同時現像数を変更できませんでした: {error}"
+                ));
+            } else {
+                settings.raw_develop_parallelism = requested_raw_parallelism;
+            }
+        }
         let media_duration_changed =
             self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
+        let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
+        if old_raw_brightness != self.settings.raw_brightness {
+            self.raw_brightness_changed();
+        }
+        #[cfg(windows)]
+        {
+            self.effetune.set_keep_visible_when_minimized(
+                self.settings.effetune_keep_visible_when_minimized,
+            );
+            self.effetune
+                .slot
+                .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
+        }
         if media_duration_changed {
             self.invalidate_details_meta_requirements();
+        }
+        if books_root_changed {
+            self.sync_shared_favorite_indexers();
         }
     }
 
@@ -2058,6 +2158,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.preferences_transfer_busy() {
+            return;
+        }
         self.preferences_requested_page = Some(request);
         self.show_preferences = true;
     }
@@ -2100,6 +2203,9 @@ impl App {
     }
 
     fn request_close_preferences_dialog(&mut self) {
+        if self.preferences_transfer_busy() || self.preferences_transfer_dialog_open() {
+            return;
+        }
         if self.preferences_dialog_has_unsaved_changes() {
             self.show_preferences = true;
             self.show_preferences_discard_confirm = true;
@@ -2161,20 +2267,7 @@ impl App {
         }
     }
 
-    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
-        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
-        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
-        // state が破棄されても次回 open で過去の id を再利用しない。
-        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
-            self.show_preferences,
-            &mut self.preferences_open_last_frame,
-            &mut self.preferences_right_panel_scroll_sequence,
-        );
-        if !self.show_preferences {
-            return;
-        }
-
-        // 初回: 一時コピーを作成
+    fn ensure_preferences_state(&mut self) {
         if self.pref_state.is_none() {
             let ai_runtime = self.ai_runtime_init.ready_runtime();
             let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
@@ -2194,10 +2287,7 @@ impl App {
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
-                self.book_resume_db
-                    .as_ref()
-                    .map(|db| db.count())
-                    .unwrap_or(0),
+                self.book_resume_entry_count(),
                 self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
@@ -2211,6 +2301,23 @@ impl App {
             }
             self.pref_state = Some(Box::new(new_state));
         }
+    }
+
+    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
+        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
+        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
+        // state が破棄されても次回 open で過去の id を再利用しない。
+        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
+            self.show_preferences,
+            &mut self.preferences_open_last_frame,
+            &mut self.preferences_right_panel_scroll_sequence,
+        );
+        if !self.show_preferences {
+            return;
+        }
+
+        // 初回: 一時コピーを作成
+        self.ensure_preferences_state();
         if let Some(generation) = opened_scroll_generation {
             self.pref_state
                 .as_mut()
@@ -2273,11 +2380,19 @@ impl App {
         let mut apply = false;
         let mut cancel = false;
 
+        let transfer_dialog_open = self.preferences_transfer_dialog_open();
+        if transfer_dialog_open {
+            // Popups use independent UI layers and do not inherit a disabled
+            // parent. Remove that combination while the transfer modal is shown.
+            egui::Popup::close_all(ctx);
+        }
+
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed = self.dialog_enter_pressed(ctx);
-        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let enter_pressed = !transfer_dialog_open && self.dialog_enter_pressed(ctx);
+        let escape_pressed = !transfer_dialog_open && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
+            .enabled(!transfer_dialog_open)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -2398,8 +2513,14 @@ impl App {
                     let font_ready = state.ui_font_apply_ready();
                     let lut_ready = state.creative_lut_import_rx.is_none();
                     let clipboard_folder_ready = state.clipboard_capture_folder_apply_ready();
+                    let organize_validation = crate::settings::validate_file_organize_destinations(
+                        &state.settings.file_organize_destinations,
+                    );
                     let ok = ui.add_enabled(
-                        font_ready && lut_ready && clipboard_folder_ready,
+                        font_ready
+                            && lut_ready
+                            && clipboard_folder_ready
+                            && organize_validation.is_ok(),
                         egui::Button::new("  OK  "),
                     );
                     #[cfg(all(windows, feature = "test-script"))]
@@ -2408,15 +2529,22 @@ impl App {
                         apply = true;
                         // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui
+                        .add_enabled(!transfer_dialog_open, egui::Button::new("キャンセル"))
+                        .clicked()
+                    {
                         cancel = true;
                     }
-                    if !font_ready {
+                    if transfer_dialog_open {
+                        ui.small("設定ファイルのダイアログを閉じると操作できます。");
+                    } else if !font_ready {
                         ui.small("フォントの準備完了後に適用できます。");
                     } else if !lut_ready {
                         ui.small("LUTのコピー完了後に適用できます。");
                     } else if !clipboard_folder_ready {
                         ui.small("保存先フォルダの操作完了後に適用できます。");
+                    } else if let Err(error) = organize_validation {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
                     }
                 });
             });
@@ -2686,7 +2814,9 @@ impl App {
                         self.enter_reading_history();
                     }
                 }
-                self.settings.save();
+                if !self.settings.save_checked() {
+                    self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
+                }
                 creative_lut_transaction.commit();
 
                 // Settings are global; every live native presenter receives the new display
@@ -2841,7 +2971,7 @@ impl App {
             self.request_close_preferences_dialog();
         }
 
-        if !close_requested_this_frame {
+        if !close_requested_this_frame && !transfer_dialog_open {
             self.draw_preferences_discard_confirm(ctx);
         }
 
@@ -2905,31 +3035,7 @@ impl App {
             }
         }
         if clear_book_resume_requested {
-            let result = match self.book_resume_db.as_ref() {
-                Some(db) => match db.clear_all() {
-                    Ok(deleted) => {
-                        crate::logger::log(format!(
-                            "[book_resume] cleared {deleted} reading positions"
-                        ));
-                        Ok((deleted, db.count()))
-                    }
-                    Err(e) => Err(format!("{e}")),
-                },
-                None => Err("読書位置 DB を開けませんでした".to_string()),
-            };
-            if let Some(ps) = self.pref_state.as_mut() {
-                match result {
-                    Ok((deleted, remaining)) => {
-                        ps.book_resume_entry_count = remaining;
-                        ps.book_resume_clear_result =
-                            Some(format!("ZIP/PDF の読書位置を {deleted} 件削除しました。"));
-                    }
-                    Err(err) => {
-                        ps.book_resume_clear_result =
-                            Some(format!("読書位置の削除に失敗しました: {err}"));
-                    }
-                }
-            }
+            self.clear_book_resume_async();
         }
 
         // 履歴と復元ページ: 閲覧履歴クリア (one-shot)。
@@ -3048,10 +3154,7 @@ impl App {
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
-                self.book_resume_db
-                    .as_ref()
-                    .map(|db| db.count())
-                    .unwrap_or(0),
+                self.book_resume_entry_count(),
                 self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
@@ -3064,7 +3167,9 @@ impl App {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        let ime_active = self.ime_input_active(ctx);
+        // Foreground IME or a transfer Modal owns these events before assignment capture.
+        let keyboard_capture_blocked =
+            self.ime_input_active(ctx) || self.preferences_transfer_dialog_open();
         let content_rect = ctx.content_rect();
         let safe_rect = content_rect.shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::vec2(360.0, 300.0));
@@ -3107,7 +3212,7 @@ impl App {
                             .max_height(main_height)
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                draw_operation_customize_page(ui, state, ime_active);
+                                draw_operation_customize_page(ui, state, keyboard_capture_blocked);
                             });
                     },
                 );
@@ -3129,14 +3234,14 @@ impl App {
             });
 
         if let Some(state) = self.operation_customize_state.as_mut() {
-            draw_operation_assignment_editor_dialog(ctx, state, ime_active);
+            draw_operation_assignment_editor_dialog(ctx, state, keyboard_capture_blocked);
             draw_mouse_gesture_recorder_dialog(ctx, state);
         }
 
         let mut close_requested_this_frame = false;
         if apply {
             if let Some(state) = self.operation_customize_state.take() {
-                self.apply_operation_customize_state(*state);
+                self.apply_operation_customize_state(state);
             }
             self.show_operation_customize = false;
             self.show_operation_customize_discard_confirm = false;
@@ -3150,7 +3255,7 @@ impl App {
         }
     }
 
-    fn apply_operation_customize_state(&mut self, state: PreferencesState) {
+    fn apply_operation_customize_state(&mut self, state: Box<PreferencesState>) {
         let mut bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
             &self.settings,
         );
@@ -3380,7 +3485,7 @@ fn draw_operation_customize_tabs(ui: &mut egui::Ui, state: &mut PreferencesState
 fn draw_operation_customize_page(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     match state.operation_tab {
         OperationCustomizeTab::Settings => draw_operation_settings_page(ui, state),
@@ -3400,7 +3505,7 @@ fn draw_operation_customize_page(
             ui.add_space(8.0);
             ui.small("キー割り当てを編集します。一覧の「編集」またはキーボード図の割り当て済みキーを押すと、割り当て編集ダイアログを開きます。");
             ui.add_space(8.0);
-            page_command_settings(ui, state, ime_active);
+            page_command_settings(ui, state, keyboard_capture_blocked);
         }
         OperationCustomizeTab::MouseGesture => {
             draw_mouse_gesture_context_tabs(ui, state);
@@ -3607,6 +3712,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
+        PreferencesPage::RawDevelop => page_raw_develop(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
@@ -3620,15 +3726,355 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 
 // 個別ページ実装は `preferences/pages.rs` に分離。
 
+pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.selected = PreferencesPage::RawDevelop;
+    draw_page(ui, &mut state, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPageLoadState};
+        use crate::raw::RawBrightness;
+        use egui_kittest::{Harness, kittest::Queryable};
+        for executor_closed in [false, true] {
+            let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+            let ctx = egui::Context::default();
+            let image = std::sync::Arc::new(egui::ColorImage::filled([3, 2], egui::Color32::GRAY));
+            let tex = ctx.load_texture(
+                "raw-settings-source",
+                image.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Static {
+                    tex,
+                    pixels: image,
+                    source_dims: Some([12000, 8000]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            let page = app.raw_pages.page_mut(0).unwrap();
+            page.stage = RawInstalledStage::Developed;
+            *page.develop.lock().unwrap() = RawDevelopPhase::Done;
+            let old_parallelism = app.settings.raw_develop_parallelism;
+            app.raw_develop_executor
+                .set_parallelism(old_parallelism as usize)
+                .unwrap();
+            let old_generation = app.input_generation.get(&0).copied().unwrap_or(0);
+            assert_eq!(
+                app.raw_develop_executor.desired_parallelism_for_test(),
+                old_parallelism as usize
+            );
+            if executor_closed {
+                app.raw_develop_executor.shutdown();
+            }
+            app.open_preferences_page(PreferencesPage::RawDevelop);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1100.0, 850.0))
+                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            harness.run();
+            harness.get_by_label("補正しない").click();
+            harness.run();
+            // Select the actual RAW DragValue by its unique allowed range, focus
+            // its numeric editor, and replace the selected text. No draft writes.
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0) && node.max_numeric_value() == Some(10.0)
+                })
+                .focus();
+            harness.run();
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0) && node.max_numeric_value() == Some(10.0)
+                })
+                .type_text("1");
+            harness.run();
+            harness.get_by_label("補正しない").click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .raw_develop_parallelism,
+                1
+            );
+            assert_eq!(
+                harness.state().settings.raw_develop_parallelism,
+                old_parallelism
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .raw_develop_executor
+                    .desired_parallelism_for_test(),
+                old_parallelism as usize
+            );
+            assert_eq!(
+                harness.state().settings.raw_brightness,
+                RawBrightness::MatchPreview
+            );
+            assert_eq!(
+                harness.state().raw_pages.classify(0),
+                RawPageLoadState::Developed
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            let expected_parallelism = if executor_closed { old_parallelism } else { 1 };
+            let app = harness.state();
+            assert!(!app.show_preferences);
+            assert_eq!(app.settings.raw_develop_parallelism, expected_parallelism);
+            assert_eq!(
+                app.raw_develop_executor.desired_parallelism_for_test(),
+                expected_parallelism as usize
+            );
+            assert_eq!(app.settings.raw_brightness, RawBrightness::None);
+            assert_eq!(
+                app.raw_pages.classify(0),
+                RawPageLoadState::PreviewNotRequested
+            );
+            assert!(app.fs_cache.get(&0).is_none());
+            assert!(app.input_generation.get(&0).copied().unwrap_or(0) > old_generation);
+            let saved = crate::settings::Settings::load();
+            assert_eq!(saved.raw_brightness, RawBrightness::None);
+            assert_eq!(saved.raw_develop_parallelism, expected_parallelism);
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::RawDevelop);
+            harness.run();
+            let reopened = &harness.state().pref_state.as_ref().unwrap().settings;
+            assert_eq!(reopened.raw_brightness, saved.raw_brightness);
+            assert_eq!(
+                reopened.raw_develop_parallelism,
+                saved.raw_develop_parallelism
+            );
+        }
+    }
+
+    #[test]
+    fn preferences_books_root_change_submits_new_exclusion_to_name_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let favorite_root = app.tmp.path().join("preference-name-root");
+        std::fs::create_dir_all(&favorite_root).unwrap();
+        std::fs::write(favorite_root.join("indexed.zip"), b"").unwrap();
+        app.settings.book_root = Some(app.tmp.path().join("old-books-root"));
+        let mut favorite =
+            crate::settings::FavoriteEntry::new("name owner".into(), favorite_root.clone());
+        favorite.auto_index_structure = true;
+        let favorite_id = favorite.id;
+        app.settings.favorites = vec![favorite];
+        app.activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+        let db = app.search_index_db.as_ref().cloned().unwrap();
+        app.spawn_initial_name_index_supervisors();
+        let wait = |app: &App, expected_rows: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let complete = app
+                    .name_index_manager
+                    .as_ref()
+                    .unwrap()
+                    .all_initial_scans_done();
+                if complete && db.count_for_favorite(&favorite_root).unwrap() == expected_rows {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "name owner did not apply preferences exclusion"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait(&app, 1);
+        let mut edited = app.settings.clone();
+        edited.book_root = Some(favorite_root.clone());
+        app.install_preferences_settings(edited);
+        wait(&app, 0);
+        let stats = app.name_index_stats_by_id();
+        assert_eq!(
+            stats[&favorite_id].last_full_scan,
+            Some(crate::name_index_supervisor::NameFullScanOutcome::Complete)
+        );
+    }
+
+    #[test]
+    fn preferences_unchanged_effective_books_root_does_not_submit_index_configuration() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.book_root = None;
+        assert!(app.name_index_manager.is_none());
+        let mut edited = app.settings.clone();
+        // None と明示的 default の保存値が違っても、実効除外 root は同じ。
+        edited.book_root = Some(app.settings.books_root_path());
+        app.install_preferences_settings(edited);
+        assert!(
+            app.name_index_manager.is_none(),
+            "unchanged exclusion must not start/reconfigure the name owner"
+        );
+    }
 
     fn disabled_trt_worker_snapshot() -> crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot {
         crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot()
     }
 
-    fn preferences_state_for_test(settings: &crate::settings::Settings) -> PreferencesState {
+    #[test]
+    fn section292_sort_placements_survive_toolbar_ui_preferences_ok_save_and_reopen() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let mut env = crate::app::setup_app_for_test();
+        let boot = crate::settings_db::boot_settings_db(env.tmp.path());
+        assert!(boot.db.is_some());
+        env.settings.toolbar_section_order.reverse();
+        env.settings.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Buttons;
+        env.settings.toolbar_sort_items = vec![crate::settings::SortOrder::DateDesc];
+        let order = env.settings.toolbar_section_order.clone();
+        let app = Rc::new(RefCell::new(env));
+        for (top, facet) in [(true, true), (false, false), (false, true), (true, false)] {
+            let mut state = preferences_state_for_test(&app.borrow().settings);
+            // The actual toolbar UI edits live settings while Preferences holds an older copy.
+            app.borrow_mut().settings.show_toolbar_sort = !top;
+            app.borrow_mut().settings.show_facet_sort = !facet;
+            let render = Rc::clone(&app);
+            let fonts = Cell::new(false);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(500.0, 650.0))
+                .build(move |ctx| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render
+                            .borrow_mut()
+                            .draw_toolbar_visibility_menu(ui, false, false)
+                    });
+                });
+            harness.run();
+            harness.get_by_label("ソート (上部ツールバー)").click();
+            harness.run();
+            harness.get_by_label("ソート (絞り込みバー右側)").click();
+            harness.run();
+            let mut app = app.borrow_mut();
+            assert_eq!(
+                (app.settings.show_toolbar_sort, app.settings.show_facet_sort),
+                (top, facet)
+            );
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.settings = state.settings;
+            app.settings.save();
+            let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            let reopened = preferences_state_for_test(&loaded);
+            assert_eq!(
+                (
+                    reopened.settings.show_toolbar_sort,
+                    reopened.settings.show_facet_sort
+                ),
+                (top, facet)
+            );
+            assert_eq!(reopened.settings.toolbar_section_order, order);
+            assert_eq!(
+                reopened.settings.toolbar_sort_display,
+                crate::settings::ToolbarSectionDisplay::Buttons
+            );
+            assert_eq!(
+                reopened.settings.toolbar_sort_items,
+                vec![crate::settings::SortOrder::DateDesc]
+            );
+        }
+    }
+
+    #[test]
+    fn section207_folder_layout_survives_toolbar_ui_preferences_ok_db_and_reopen() {
+        use crate::settings::ToolbarSectionId as TS;
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let env = crate::app::setup_app_for_test();
+        let boot = crate::settings_db::boot_settings_db(env.tmp.path());
+        assert!(boot.db.is_some());
+        let app = Rc::new(RefCell::new(env));
+        for enabled in [false, true, false] {
+            let mut state = preferences_state_for_test(&app.borrow().settings);
+            let render = Rc::clone(&app);
+            let fonts = Cell::new(false);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(600.0, 1050.0))
+                .build(move |ctx| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render
+                            .borrow_mut()
+                            .draw_section_settings_menu(ui, TS::Folder);
+                    });
+                });
+            harness.run();
+            harness.get_by_label("行頭に表示").click();
+            harness.run();
+            harness.get_by_label("ドラッグで並べ替えを許可").click();
+            harness.run();
+            harness.get_by_label("履歴の戻る/進む (←/→)").click();
+            harness.run();
+            let mut app = app.borrow_mut();
+            assert_eq!(
+                app.settings.toolbar_section_new_row.contains(&TS::Folder),
+                enabled
+            );
+            app.settings.toolbar_section_order =
+                TS::default_order().iter().copied().rev().collect();
+            let order = app.settings.toolbar_section_order.clone();
+            let rows = app.settings.toolbar_section_new_row.clone();
+            let drag = app.settings.toolbar_section_drag_enabled;
+            let history = app.settings.show_address_bar_history_nav;
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.settings = state.settings;
+            app.settings.save();
+            let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            let reopened = preferences_state_for_test(&loaded);
+            assert_eq!(reopened.settings.toolbar_section_order, order);
+            assert_eq!(reopened.settings.toolbar_section_new_row, rows);
+            assert_eq!(reopened.settings.toolbar_section_drag_enabled, drag);
+            assert_eq!(reopened.settings.show_address_bar_history_nav, history);
+            assert!(reopened.settings.toolbar_folder_section_migrated);
+            assert!(reopened.settings.show_facet_sort);
+            assert!(!reopened.settings.show_toolbar_sort);
+        }
+    }
+
+    pub(super) fn preferences_state_for_test(
+        settings: &crate::settings::Settings,
+    ) -> PreferencesState {
         PreferencesState::from_settings(
             settings,
             crate::external_tool::LaunchTarget::None,
@@ -3639,6 +4085,25 @@ mod tests {
             0,
             0,
         )
+    }
+
+    #[test]
+    fn image_ext_priority_preferences_exposes_new_raw_entries_after_sqlite_load() {
+        use crate::settings::Settings;
+        let app = crate::app::setup_app_for_test();
+        let mut saved = app.settings.clone();
+        saved.image_ext_priority.truncate(27);
+        saved.save();
+        let loaded = Settings::load();
+        let preferences = preferences_state_for_test(&loaded);
+        assert_eq!(
+            preferences.settings.image_ext_priority,
+            crate::settings::default_image_ext_priority()
+        );
+        assert_eq!(
+            &preferences.settings.image_ext_priority[27..],
+            ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"]
+        );
     }
 
     fn saved_audio_choice_for_preferences_test(
@@ -3654,88 +4119,262 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_capture_picker_result_on_another_page_is_polled_before_ok_commit() {
-        use egui_kittest::{Harness, kittest::Queryable};
-
+    fn file_organize_destinations_preferences_ok_save_db_reread_reopen_and_cancel() {
+        use crate::settings::FileOrganizeDestination;
         let mut app = crate::app::setup_app_for_test();
-        app.open_preferences_page(PreferencesPage::ClipboardCapture);
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
-        // Opening requests the page; the first dialog frame creates its draft.
-        harness.run();
-        let (tx, rx) = mpsc::channel();
-        let state = harness.state_mut().pref_state.as_mut().unwrap();
-        assert_eq!(state.selected, PreferencesPage::ClipboardCapture);
-        state.clipboard_capture_folder_task = Some(rx);
-        state.selected = PreferencesPage::Cache;
-        harness.run();
-        let state = harness.state().pref_state.as_ref().unwrap();
-        assert_eq!(state.selected, PreferencesPage::Cache);
-        assert!(!state.clipboard_capture_folder_apply_ready());
-        assert_eq!(state.settings.clipboard_capture_output_dir, None);
-
-        // A click while the picker owns the draft cannot close or commit it.
-        harness.get_by_label("  OK  ").click();
-        harness.run();
-        assert!(harness.state().show_preferences);
-        assert!(harness.state().pref_state.is_some());
-
-        let selected = harness.state().tmp.path().join("clipboard-picker-result");
-        tx.send(Ok(ClipboardCaptureFolderResult::Selected(Some(
-            selected.clone(),
-        ))))
-        .unwrap();
-        harness.run();
-        let state = harness.state().pref_state.as_ref().unwrap();
-        assert_eq!(state.selected, PreferencesPage::Cache);
-        assert!(state.clipboard_capture_folder_apply_ready());
-        assert_eq!(
-            state.settings.clipboard_capture_output_dir,
-            Some(selected.clone())
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .file_organize_destinations
+                .is_empty()
         );
+        let mut state = preferences_state_for_test(&app.settings);
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("absent"),
+            ));
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("second"),
+            ));
+        state
+            .settings
+            .file_organize_destinations
+            .push(FileOrganizeDestination::from_path(
+                app.tmp.path().join("removed"),
+            ));
+        state.settings.file_organize_destinations.remove(2);
+        state.settings.file_organize_destinations[0].name = "保管".into();
+        state.settings.file_organize_destinations[0].path = app.tmp.path().join("edited absent");
+        state.settings.file_organize_destinations.swap(0, 1);
+        let expected = state.settings.file_organize_destinations.clone();
+        let toolbar = app.settings.toolbar_section_order.clone();
+        let favorite_path = app.tmp.path().join("favorite");
+        app.settings
+            .favorites
+            .push(crate::settings::FavoriteEntry::new(
+                "live favorite".into(),
+                favorite_path,
+            ));
+        let favorite_id = app.settings.favorites[0].id;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        assert_eq!(app.settings.file_organize_destinations, expected);
+        assert_eq!(app.settings.favorites[0].id, favorite_id);
+        assert_eq!(app.settings.toolbar_section_order, toolbar);
+        assert!(app.settings.save_checked());
+        let persisted = db.load_into_settings().unwrap();
+        let mut reopened = preferences_state_for_test(&persisted);
+        assert_eq!(reopened.settings.file_organize_destinations, expected);
+        reopened.settings.file_organize_destinations.clear();
+        drop(reopened); // 本番 Cancel と同じく draft を捨てるだけ。
+        assert_eq!(app.settings.file_organize_destinations, expected);
         assert_eq!(
-            state.clipboard_capture_output_dir_input,
-            selected.display().to_string()
+            db.load_into_settings().unwrap().file_organize_destinations,
+            expected
         );
-        harness.get_by_label("  OK  ").click();
-        harness.run();
-        assert!(!harness.state().show_preferences);
-        assert_eq!(
-            harness.state().settings.clipboard_capture_output_dir,
-            Some(selected)
+        let mut empty = preferences_state_for_test(&persisted);
+        empty.settings.file_organize_destinations.clear();
+        prepare_preferences_state_settings_for_commit(&mut empty, &mut app.settings);
+        app.install_preferences_settings(empty.settings);
+        assert!(app.settings.save_checked());
+        assert!(
+            preferences_state_for_test(&db.load_into_settings().unwrap())
+                .settings
+                .file_organize_destinations
+                .is_empty()
         );
     }
 
     #[test]
-    fn clipboard_capture_picker_cancel_error_and_disconnect_release_apply_gate() {
-        for result in [
-            Some(Ok(ClipboardCaptureFolderResult::Selected(None))),
-            Some(Err("選択失敗".to_owned())),
-            None,
+    fn file_organize_destinations_preferences_ok_save_failure_keeps_memory_db_and_notifies() {
+        use crate::settings::FileOrganizeDestination;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.file_organize_destinations = vec![FileOrganizeDestination::from_path(
+            app.tmp.path().join("saved destination"),
+        )];
+        assert!(app.settings.save_checked());
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        let persisted_before = serde_json::to_value(db.load_into_settings().unwrap()).unwrap();
+        let saved_generation = crate::settings::save_generation();
+        let edited = vec![FileOrganizeDestination {
+            name: "今回の整理先".into(),
+            path: app.tmp.path().join("edited destination"),
+        }];
+
+        app.open_preferences_page(PreferencesPage::Folder);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .file_organize_destinations = edited.clone();
+        harness.run();
+        // The App fixture holds the process-global test lock and clears this flag
+        // on drop, including a panic. Exercise the real OK button and save boundary.
+        crate::settings_db::set_save_suppressed(true);
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.file_organize_destinations, edited);
+        let notice = &harness.state().fs_feedback_toast.as_ref().unwrap().0;
+        assert!(notice.contains("設定を保存できませんでした"));
+        assert!(notice.contains("今回の変更が残らない可能性があります"));
+        assert!(crate::settings_db::save_suppressed());
+        assert_eq!(crate::settings::save_generation(), saved_generation);
+        assert_eq!(
+            serde_json::to_value(db.load_into_settings().unwrap()).unwrap(),
+            persisted_before
+        );
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Folder);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .file_organize_destinations,
+            edited
+        );
+    }
+
+    #[test]
+    fn file_organize_destinations_input_validation() {
+        use crate::settings::{FileOrganizeDestination, validate_file_organize_destinations};
+        let mut item = FileOrganizeDestination::from_path(PathBuf::from(r"C:\offline\保管"));
+        assert!(item.validate().is_ok());
+        item.path = PathBuf::from(r"\\server\share\offline");
+        assert!(item.validate().is_ok());
+        assert!(validate_file_organize_destinations(&[item.clone(), item.clone()]).is_ok());
+        for path in [
+            "",
+            "relative",
+            r"C:relative",
+            r"\root-relative",
+            "C:\\nul\0path",
         ] {
-            let mut state = preferences_state_for_test(&Settings::default());
-            let original = PathBuf::from("C:/original-clipboard-output");
-            state.settings.clipboard_capture_output_dir = Some(original.clone());
-            state.clipboard_capture_output_dir_input = original.display().to_string();
-            state.selected = PreferencesPage::Cache;
-            let (tx, rx) = mpsc::channel();
-            state.clipboard_capture_folder_task = Some(rx);
-            if let Some(result) = result {
-                tx.send(result).unwrap();
-            }
-            drop(tx);
-            state.poll_clipboard_capture_folder_task();
-            assert!(state.clipboard_capture_folder_apply_ready());
-            assert_eq!(
-                state.settings.clipboard_capture_output_dir,
-                Some(original.clone())
+            item.path = PathBuf::from(path);
+            assert!(item.validate().is_err(), "{path:?}");
+        }
+        item.path = PathBuf::from(r"D:\");
+        item.name = "  \t".into();
+        assert!(item.validate().is_err());
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.file_organize_destinations.is_empty());
+    }
+
+    #[test]
+    fn book_resume_meter_preferences_ok_save_db_reread_reopen_and_cancel() {
+        use crate::settings::FullscreenSeekDirection;
+
+        let mut app = crate::app::setup_app_for_test();
+        assert!(app.settings.thumb_show_book_resume_meter);
+        for (enabled, direction) in [
+            (false, FullscreenSeekDirection::LeftToRight),
+            (true, FullscreenSeekDirection::FollowReading),
+        ] {
+            let mut state = preferences_state_for_test(&app.settings);
+            state.settings.thumb_show_book_resume_meter = enabled;
+            state.settings.fullscreen_seek_direction = direction;
+
+            // Runtime and other-dialog changes made after opening Preferences must survive OK.
+            let width = app.settings.details_name_width + 17.0;
+            app.settings.details_name_width = width;
+            let favorite = crate::settings::FavoriteEntry::new(
+                "during preferences".to_owned(),
+                app.tmp.path().join("favorite"),
             );
+            let favorite_id = favorite.id;
+            app.settings.favorites = vec![favorite];
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.install_preferences_settings(state.settings);
+            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            assert_eq!(app.settings.details_name_width, width);
+            assert_eq!(app.settings.favorites[0].id, favorite_id);
+            app.settings.save();
+
+            // Read the actual persisted DB, then construct a new real Preferences draft.
+            let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+            let persisted = db.load_into_settings().unwrap();
+            assert_eq!(persisted.thumb_show_book_resume_meter, enabled);
+            assert_eq!(persisted.fullscreen_seek_direction, direction);
+            let mut reopened = preferences_state_for_test(&persisted);
+            assert_eq!(reopened.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(reopened.settings.fullscreen_seek_direction, direction);
+
+            reopened.settings.thumb_show_book_resume_meter = !enabled;
+            reopened.settings.fullscreen_seek_direction =
+                if direction == FullscreenSeekDirection::LeftToRight {
+                    FullscreenSeekDirection::FollowReading
+                } else {
+                    FullscreenSeekDirection::LeftToRight
+                };
+            drop(reopened); // Cancel closes the draft without applying/saving it.
+            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            let after_cancel = db.load_into_settings().unwrap();
+            assert_eq!(after_cancel.thumb_show_book_resume_meter, enabled);
+            assert_eq!(after_cancel.fullscreen_seek_direction, direction);
             assert_eq!(
-                state.clipboard_capture_output_dir_input,
-                original.display().to_string()
+                preferences_state_for_test(&after_cancel)
+                    .settings
+                    .thumb_show_book_resume_meter,
+                enabled
             );
         }
+    }
+
+    #[test]
+    fn book_resume_meter_preferences_missing_setting_and_default_draft_are_on() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(
+            preferences_state_for_test(&missing)
+                .settings
+                .thumb_show_book_resume_meter
+        );
+        assert!(
+            preferences_state_for_test(&Settings::default())
+                .settings
+                .thumb_show_book_resume_meter
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            preferences_state_for_test(&db.load_into_settings().unwrap())
+                .settings
+                .thumb_show_book_resume_meter
+        );
     }
 
     #[test]
@@ -3908,7 +4547,7 @@ mod tests {
         );
 
         let state = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(*state);
+        app.apply_operation_customize_state(state);
         assert!(!app.settings.gamepad_enabled, "OK で本体へ届く");
     }
 
@@ -3922,7 +4561,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .video_normal_wheel_action = VideoNormalWheelActionId::AdjustVolume;
-        app.apply_operation_customize_state(operation_state);
+        app.apply_operation_customize_state(Box::new(operation_state));
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4005,7 +4644,7 @@ mod tests {
             "別の ring 項目の編集は未保存のまま数える"
         );
         let operation_state = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(*operation_state);
+        app.apply_operation_customize_state(operation_state);
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4054,7 +4693,7 @@ mod tests {
             "他方のダイアログだけが変更した値を、操作カスタマイズの未保存変更にしない"
         );
         let untouched_operation = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(*untouched_operation);
+        app.apply_operation_customize_state(untouched_operation);
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume
@@ -4072,7 +4711,7 @@ mod tests {
             "キャンセルは live 設定を変えない"
         );
 
-        let mut reopened_preferences = preferences_state_for_test(&app.settings);
+        let reopened_preferences = preferences_state_for_test(&app.settings);
         assert_eq!(
             reopened_preferences.initial_video_normal_wheel_action,
             VideoNormalWheelActionId::AdjustVolume,
@@ -4085,7 +4724,7 @@ mod tests {
             !app.preferences_dialog_has_unsaved_changes(),
             "他方のダイアログだけが変更した値を、環境設定の未保存変更にしない"
         );
-        reopened_preferences = *app.pref_state.take().unwrap();
+        let mut reopened_preferences = app.pref_state.take().unwrap();
         prepare_preferences_state_settings_for_commit(&mut reopened_preferences, &mut app.settings);
         assert_eq!(
             reopened_preferences
@@ -4119,7 +4758,7 @@ mod tests {
             "操作カスタマイズの再表示も、その session の基準値で外部変更を判定する"
         );
         let reopened_operation = app.operation_customize_state.take().unwrap();
-        app.apply_operation_customize_state(*reopened_operation);
+        app.apply_operation_customize_state(reopened_operation);
         assert_eq!(
             app.settings.ring_shortcuts.video_normal_wheel_action,
             VideoNormalWheelActionId::NavigateItems
@@ -4186,7 +4825,7 @@ mod tests {
             .settings
             .ring_shortcuts
             .mouse_ring_help_visible = !app.settings.ring_shortcuts.mouse_ring_help_visible;
-        app.apply_operation_customize_state(unrelated_commit);
+        app.apply_operation_customize_state(Box::new(unrelated_commit));
         assert_eq!(
             app.settings
                 .ring_shortcuts
@@ -4202,7 +4841,7 @@ mod tests {
             .ring_shortcuts
             .mouse_button_profile_mut(context)
             .back = RingActionId::VideoMute;
-        app.apply_operation_customize_state(replacement);
+        app.apply_operation_customize_state(Box::new(replacement));
         assert_eq!(
             app.settings
                 .ring_shortcuts
@@ -4859,6 +5498,42 @@ mod tests {
     }
 
     #[test]
+    fn raw_develop_page_follows_susie_in_file_processing() {
+        let (label, category_idx, raw_idx) = preference_category(PreferencesPage::RawDevelop);
+        assert_eq!(label, "ファイル処理");
+        let category = &TREE[category_idx];
+        assert_eq!(
+            category.children[raw_idx - 1],
+            PreferencesPage::SusiePlugins
+        );
+        assert!(PreferencesPage::ALL.contains(&PreferencesPage::RawDevelop));
+    }
+
+    #[test]
+    fn raw_controls_only_appear_on_dedicated_page() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.selected = PreferencesPage::Parallelism;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        assert!(harness.query_by_label("プレビューに合わせる").is_none());
+        assert!(harness.query_by_label("PDF の同時処理数").is_some());
+        harness.state_mut().selected = PreferencesPage::RawDevelop;
+        harness.run();
+        assert!(harness.query_by_label("RAW 現像").is_some());
+        assert!(harness.query_by_label("プレビューに合わせる").is_some());
+        assert!(harness.query_by_label("補正しない").is_some());
+        assert!(harness.query_by_label("PDF の同時処理数").is_none());
+    }
+
+    #[test]
     fn font_page_is_under_display_not_general() {
         let display = TREE
             .iter()
@@ -5116,6 +5791,154 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["two.jpg", "one.jpg", "unrated.jpg"],
         );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        // Retain consumers BEFORE opening preferences: an existing player/pump
+        // and existing Remote admission/generation must see OK without reopening.
+        let chain = app.local_audio_dsp_chain();
+        let sibling_chain = app.local_audio_dsp_chain();
+        let remote = app.remote_clockless_audio_processing(1.0);
+        let generation = remote.for_remote_generation(13, 1);
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-input-limit",
+        ));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // The search anchor intentionally animates a highlight; settle the scroll
+        // then stop that animation before querying controls in this headless test.
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        harness
+            .get_by_label("EffeTune に渡す前に 0dB を超える音を抑える")
+            .click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .effetune_pre_limiter_enabled
+        );
+        assert!(harness.state().settings.effetune_pre_limiter_enabled);
+        assert!(chain.effetune.pre_limiter_enabled());
+        assert!(remote.effetune_pre_limiter_enabled());
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert!(!harness.state().settings.effetune_pre_limiter_enabled);
+        let reloaded = Settings::load();
+        assert!(!reloaded.effetune_pre_limiter_enabled);
+        harness.state_mut().settings = reloaded;
+        assert!(!chain.effetune.pre_limiter_enabled());
+        assert!(!sibling_chain.effetune.pre_limiter_enabled());
+        assert!(!remote.effetune_pre_limiter_enabled());
+        assert!(!generation.effetune_pre_limiter_enabled());
+        // Exercise the existing local consumer's shared live value.
+        let input = [1.28, -1.27].repeat(12);
+        let mut limiter = crate::video::audio::EffetuneInputLimiter::new(1_000);
+        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune.pre_limiter_enabled());
+        assert_eq!(&samples[10..], &input[..input.len() - 10]);
+        assert_eq!(latency, 0.005);
+        assert!(
+            !harness
+                .state()
+                .remote_clockless_audio_processing(1.0)
+                .effetune_pre_limiter_enabled()
+        );
+        let mut enabled = harness.state().settings.clone();
+        enabled.effetune_pre_limiter_enabled = true;
+        harness.state_mut().install_preferences_settings(enabled);
+        assert!(chain.effetune.pre_limiter_enabled());
+        assert!(sibling_chain.effetune.pre_limiter_enabled());
+        assert!(remote.effetune_pre_limiter_enabled());
+        assert!(generation.effetune_pre_limiter_enabled());
+        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune.pre_limiter_enabled());
+        assert!(samples[12..].iter().all(|sample| sample.abs() <= 1.0));
+        assert_eq!(latency, 0.005);
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_pre_limiter_loaded_preferences_initialize_shared_owner() {
+        let app = crate::app::setup_app_for_test();
+        let mut settings = app.settings.clone();
+        settings.effetune_pre_limiter_enabled = false;
+        let app = crate::app::App::new_from_settings(settings);
+        assert!(!app.local_audio_dsp_chain().effetune.pre_limiter_enabled());
+        assert!(
+            !app.remote_clockless_audio_processing(1.0)
+                .effetune_pre_limiter_enabled()
+        );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_minimized_preferences_ok_publishes_saved_policy() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.effetune_keep_visible_when_minimized = true;
+        let app = crate::app::App::new_from_settings(app.settings.clone());
+        assert!(app.effetune.keep_visible_when_minimized());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for enabled in [false, true] {
+            harness
+                .state_mut()
+                .open_preferences_request(PreferencesOpenRequest::anchored(
+                    PreferencesPage::Video,
+                    "video/effetune-minimized",
+                ));
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            harness
+                .get_by_label("メインウィンドウを最小化しても音響調整の窓を表示したままにする")
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+            assert_eq!(
+                harness.state().effetune.keep_visible_when_minimized(),
+                !enabled
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness
+                    .state()
+                    .settings
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+            assert_eq!(
+                harness.state().effetune.keep_visible_when_minimized(),
+                enabled
+            );
+            assert_eq!(
+                Settings::load().effetune_keep_visible_when_minimized,
+                enabled
+            );
+        }
     }
 
     #[test]
@@ -5405,5 +6228,89 @@ mod tests {
         let mut changed_live = live.clone();
         prepare_preferences_settings_for_commit(&mut changed, &mut changed_live);
         assert!(!settings_equal_for_close_prompt(&changed, &live));
+    }
+
+    #[test]
+    fn clipboard_capture_picker_result_on_another_page_is_polled_before_ok_commit() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_page(PreferencesPage::ClipboardCapture);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // Opening requests the page; the first dialog frame creates its draft.
+        harness.run();
+        let (tx, rx) = mpsc::channel();
+        let state = harness.state_mut().pref_state.as_mut().unwrap();
+        assert_eq!(state.selected, PreferencesPage::ClipboardCapture);
+        state.clipboard_capture_folder_task = Some(rx);
+        state.selected = PreferencesPage::Cache;
+        harness.run();
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Cache);
+        assert!(!state.clipboard_capture_folder_apply_ready());
+        assert_eq!(state.settings.clipboard_capture_output_dir, None);
+
+        // A click while the picker owns the draft cannot close or commit it.
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_some());
+
+        let selected = harness.state().tmp.path().join("clipboard-picker-result");
+        tx.send(Ok(ClipboardCaptureFolderResult::Selected(Some(
+            selected.clone(),
+        ))))
+        .unwrap();
+        harness.run();
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Cache);
+        assert!(state.clipboard_capture_folder_apply_ready());
+        assert_eq!(
+            state.settings.clipboard_capture_output_dir,
+            Some(selected.clone())
+        );
+        assert_eq!(
+            state.clipboard_capture_output_dir_input,
+            selected.display().to_string()
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.clipboard_capture_output_dir,
+            Some(selected)
+        );
+    }
+    #[test]
+    fn clipboard_capture_picker_cancel_error_and_disconnect_release_apply_gate() {
+        for result in [
+            Some(Ok(ClipboardCaptureFolderResult::Selected(None))),
+            Some(Err("選択失敗".to_owned())),
+            None,
+        ] {
+            let mut state = preferences_state_for_test(&Settings::default());
+            let original = PathBuf::from("C:/original-clipboard-output");
+            state.settings.clipboard_capture_output_dir = Some(original.clone());
+            state.clipboard_capture_output_dir_input = original.display().to_string();
+            state.selected = PreferencesPage::Cache;
+            let (tx, rx) = mpsc::channel();
+            state.clipboard_capture_folder_task = Some(rx);
+            if let Some(result) = result {
+                tx.send(result).unwrap();
+            }
+            drop(tx);
+            state.poll_clipboard_capture_folder_task();
+            assert!(state.clipboard_capture_folder_apply_ready());
+            assert_eq!(
+                state.settings.clipboard_capture_output_dir,
+                Some(original.clone())
+            );
+            assert_eq!(
+                state.clipboard_capture_output_dir_input,
+                original.display().to_string()
+            );
+        }
     }
 }

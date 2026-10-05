@@ -201,7 +201,7 @@ dual-window approach.
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
 - **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
-- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF, RAW)
+- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
 - **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](docs/dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
@@ -290,7 +290,7 @@ mimageviewer/
 │   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
 │   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード
-│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
+│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF。RAW は src/raw/）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
 │   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
@@ -361,15 +361,17 @@ bash scripts/bootstrap-vendor.sh           # 不足分のみ取得
 bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デバッグ用)
 ```
 
+上の bash はエージェント自身が実行するセットアップ手順であり、利用者へ渡すコマンドではない。
 このスクリプトは以下を順に実行する:
 
 1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
-2. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
-3. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
-4. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
-5. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
+2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.2 と zlib 1.3.1 のソース、`VERSION` を取得
+3. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
+4. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
+5. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
+6. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
-6. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+7. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
 
 ### bootstrap で取れないもの
@@ -397,7 +399,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 
 ### 消えると再取得できないもの — ツリー外バックアップ必須
 
-`bootstrap-vendor.sh` で再取得できる物 (pdfium / ort / ffmpeg / susie) と違い、
+`bootstrap-vendor.sh` で再取得できる物 (pdfium / libraw / ort / ffmpeg / susie) と違い、
 **以下は失うと復旧手段が限られる / 無い**:
 
 - **`vendor/models/*.onnx`** — DL スクリプトが**存在しない**。`%APPDATA%\mimageviewer\
@@ -586,7 +588,7 @@ egui::Window::new("...").show(ctx, |ui| {
 
 ### セキュリティ
 - `image` クレート（純粋Rust、メモリ安全）で画像デコード。
-- HEIC/AVIF/JXL/TIFF/RAW は WIC 経由（`unsafe` ブロックに局所化）。
+- HEIC/AVIF/JXL/TIFF は WIC 経由（`unsafe` ブロックに局所化）。RAW は LibRaw へ先に振り分け、FFI は `crates/libraw-sys` に局所化。
 - ONNX Runtime (ort crate) 経由の AI 推論は safe Rust API。DirectML EP で GPU アクセラレーション。
 
 ### 並行処理: try_lock + sleep は使わない ⚠️
@@ -834,7 +836,9 @@ print(c.most_common())
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
-- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF, DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ
+- **RAW（内蔵 LibRaw）**: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS
+  - Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応。使える埋め込みプレビューは表示可能。
+- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF
 - **動画（サムネイルのみ）**: MP4, AVI, MOV, MKV, WMV, MPG, MPEG
 
 ## Performance Notes
@@ -1009,7 +1013,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全407ファイル、v0.11.1。入力は別の VERSION と計408ファイル)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全424ファイル、v0.12.0。入力は別の VERSION と計425ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -1023,7 +1027,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
        EffeTune は同ディレクトリ下の不変世代へ全hash検証して公開し、atomic更新するのはcurrent pointerだけ。
        一覧・サイズ・更新時刻・作成時刻とstampが一致すれば再hash／write lockなし。修復失敗もcore起動を継続。
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
-    3. ランチャー即終了 (GUI なので exit code を待たない)
+    3. core が使用中lockを引き継いだ通知後にランチャー終了 (coreの通常終了は待たない)
 ```
 
 ランチャーは **FFmpeg API を一切呼ばない** ので Windows ローダの DLL 解決問題に
@@ -1032,8 +1036,16 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
 古い core / remote / EPUB worker が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
-(Codex レビュー助言)。古いバージョンの runtime ディレクトリはユーザーが手動で
-削除可能 (将来的にランチャー側で「最新 N 世代だけ残す」掃除処理を追加するかも)。
+(Codex レビュー助言)。core の起動完了・初回描画後、短命の背景 worker が現在実行中の
+`CARGO_PKG_VERSION` と使用中lockで保護された版を残し、他の版を best-effort 削除する。
+coreはexeの版directoryと固定EffeTune世代のshared leaseを寿命中保持し、launcherもcoreへの
+引き渡しまで保持する。清掃はcandidateのexclusive leaseと抽出／公開lockを非blocking取得し、
+削除完了まで保持する。cooperative lockは削除対象外の `runtime/.locks/` に置き、微小なfileを永久保持する。
+launcherは版directoryを作る前に外側版leaseを取得する。旧launcherのpublisher互換用lockも併用する。
+workerが実行中process画像を一度だけ列挙し、候補内の画像があれば旧版も
+保持する。同版の別coreが存在する間は全旧EffeTune世代を保守的に保持する。未知の名前と再解析ポイントは
+残し、削除失敗はログだけで次回起動へ回す。ダウングレード時には新しい版も削除対象となり、
+その版を再び起動すると launcher が再展開する。portable は清掃しない。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
 `scripts/build-release.{sh,ps1}` が 4 段階に分けて呼ぶ:
@@ -1178,6 +1190,25 @@ x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコー
 ワーカー exe のパスを直接指定できる。`setup-susie-worker.sh` を走らせて
 `vendor/susie-worker/` に配置済みであれば、テストは自動でそれを拾う。
 
+## LibRaw ソース・ライセンス管理
+
+RAW は LibRaw 0.22.2 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
+libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加しない。
+エージェント用セットアップは `bash scripts/setup-libraw.sh`（bootstrap に含む）、
+更新確認は `bash scripts/setup-libraw.sh check`。この bash 手順は利用者には渡さない。
+`vendor/libraw/VERSION` はセットアップが生成し、`build.rs` が `MIV_LIBRAW_BUILD_ID` に
+焼き込んでアプリ内の同梱版と対応ソース URL を揃える。欠落・不正なら復旧手順付きで失敗する。
+
+- tracked notice はルートの `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` /
+  `LIBJPEG-TURBO-LICENSE.txt`。installer / portable の双方へ同梱する。
+  3 本とも root ファイルから `include_str!` で本体へ埋め込み、バージョン情報で全文を表示する。
+  単体 exe 版でも全文と IJG 帰属文を読めることを維持する。
+- LibRaw 本体は無改変の公式 tarball、shim は本リポジトリの MIT コード。
+- 対応ソースは [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) に従って
+  SHA-256 を照合し、mikage.to へ配置する。tarball は git に入れず、`.sha256` を追跡する。
+- LibRaw 更新時はソース・checksum・notice・製品ページの同梱版とリンクを同時に更新し、
+  古い配布版の対応ソースも残す。
+
 ## VST3 host bridge 管理 (v0.9.0+)
 
 動画音声に VST3 プラグインを挿入する機能 (LUFS 測定 / EQ / 等) のために、
@@ -1190,6 +1221,11 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 
 Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
 明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
+2026-10-03 v4.3.0 release check: pluginが観測するmodule／CRT load pathは、通常絶対pathが
+260 UTF-16単位未満かつ同一pathへの正規化round-tripが成立する場合だけ通常Win32形式にする。
+末尾dot／spaceやDOS device名、正規化差分／失敗、260以上は拡張形式を維持する (Codex P2/P3 対応)。
+UNC namespace markerは大小文字を区別しない。host内FS検査は拡張形式を維持する。
+`GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
 現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
 identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
@@ -1241,8 +1277,10 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 (https://github.com/steinbergmedia/vst3sdk) under the MIT License.
 ```
 
-**VST トレードマーク (ロゴ) は使わない**。「VST3 プラグインをサポート」テキスト表記のみで運用
-(= トレードマークガイドライン回避)。
+**VST トレードマークについての採用方針**: VST3 プラグインへの対応を文字で説明し、
+VST のロゴは使用しない。名称の文字表記も商標ガイドラインの対象となり得るため、
+文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
+示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
 
 ## Markdown / テキストファイルのエンコーディング (BOM 必須ケース)
 
@@ -1671,22 +1709,29 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.11.1 の VERSION と全407ファイルを
-  `third_party/effetune-mixwright/v0.11.1/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.12.0 の VERSION と全424ファイルを
+  `third_party/effetune-mixwright/v0.12.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
   launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
-  検証済み世代を一度だけ公開する。既存・使用中treeの移動、置換、削除はしない。**atomicなのは
+  検証済み世代を一度だけ公開する。公開処理は既存・使用中treeの移動、置換、削除をしない。**atomicなのは
   完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
   正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
-  不一致は別世代を全hash検証して公開する。公開済み旧世代のcleanupは起動経路外に保留する。
+  不一致は別世代を全hash検証して公開する。core の起動後の runtime 清掃 worker が、current と
+  使用中の固定世代以外を best-effort 削除する。各coreが世代shared leaseを保持し、
+  清掃はcandidateのexclusive leaseと版の公開lockを削除完了まで保持する。
+  lease／抽出／公開lockは削除tree外の `runtime/.locks/` に固定して削除しない。
+  publisherは外側lock→既存 `.effetune.lock` の順に両方を取得して旧launcherとも直列化する。
+  ロック未対応旧coreもprocess画像で確認し、同版の別coreが動く間は全旧世代を保持する。
+  公開用 OS lock が busy、current が不明、
+  core の固定世代が未確定・未知の配置なら世代清掃を見送り、初期化は待たせない。
   hash12はcontent SHA256先頭12桁（stampはfull hashを比較）。公開前に最深fileのUTF-16長を確認し、
   260以上なら明示理由で拒否する。publisher busyはworkerのOS lockを最大60秒待ってpointerを再確認する。
   repair不能／timeoutでもcoreは起動し、理由と実際に拒否した世代をenvで渡してUnavailableにする。
   音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
   成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
-  通知原文とmanifestは `third_party/effetune-mixwright/v0.11.1/` に追跡し、`.gitattributes -text`で
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.12.0/` に追跡し、`.gitattributes -text`で
   checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
@@ -1959,6 +2004,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     `vendor/ffmpeg/VERSION`・実 DLL の `ProductVersion`・対応ソースを同じ commit に揃え、
     `src/video/ffmpeg_loader.rs` の DLL 名も一致するか確認。LGPL 通知の更新も忘れずに
     (本ファイル「FFmpeg LGPL DLL 管理」節)
+10.1. LibRaw の更新確認（エージェント用 `bash scripts/setup-libraw.sh check`）。
+    リリース前に [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) の SHA-256 と
+    同梱版を照合し、LibRaw の対応ソースを mikage.to に配置する。installer / portable に
+    `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` / `LIBJPEG-TURBO-LICENSE.txt` が入ることも確認する。
 11. VST3 host bridge の確認 (v0.9.0+):
     - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
     - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み
@@ -2172,6 +2221,11 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
         (Store が再DLして再検証する)。
       - リダイレクト無しを確認: `curl -sI <URL>` が `200 OK` (301/302 が出ないこと)、
         `Content-Length` が署名済み setup.exe と一致すること。
+    - **①.5 申請前にクリーンな Windows で起動を確かめる**: 署名済み setup.exe を Windows Sandbox (VC++ ランタイム無し) に
+      同じサイレント引数で入れ、初回・2 回目の起動で窓が出て応答し続けることを見る (v3.6.0 / v4.1.0 は「起動中のまま」で却下された。
+      サブ PC の手順は `C:\miv-sandbox\`、経緯はバックログ §1.241)。Sandbox では WebView2 が動かないので、音響調整と EPUB 変換の失敗は対象外
+      ([EffeTune 計画 §10](docs/effetune-integration-plan.md#10-決定済みの配布方針と残る対象外事項))。
+    - **認定の注意事項**: EXE/MSI アプリは「プロパティ」ページの「認定の注意事項」(2,000 字) に書く (MSIX の「提出オプション」ではない)。
     - **② Partner Center で更新**: [partner.microsoft.com](https://partner.microsoft.com/) →
       mImageViewer → 「アプリを更新」→ **パッケージ**のパッケージ URL を新 URL に差し替え →
       **各ページで必ず「下書きの保存」** (保存せず「次へ」だと入力が消える) → 「すべて保存」→

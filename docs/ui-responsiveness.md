@@ -108,8 +108,50 @@ perf ログ有効時のみ動作し、無効時は時計を読まない:
   EPUB のフォルダ代表ピンも UI で stat せず、要求には worker 解決印だけを付ける。
 
 - `frame.begin` の `prev_update_ms` / `prev_update_cycles_per_ms` — フレーム全体の実行率
+- `frame.begin` の `prev_update_start_t` / `prev_update_end_t` — 前フレームのouter update実区間。
+  既存の終端Instantと経過msを使い、時計読取を増やさない。frame.beginはupdateの途中なので
+  そのtを開始時刻とみなさない。旧ログの開始推定は近似として表示する。
 - `frame.begin` の `prev_outside_ms` — eframe の描画と present (= 自分のコードの外)
 - `ui.update_breakdown` (23 段) / `ui.fs_render_breakdown` (56 段) — 各段の `_ms` と `_cycles`
+- `ui.other_worker_polls_breakdown` — OtherWorkerPolls が **50 ms 以上**のときだけ、
+  `n` / `start_t` / `end_t` / total と details_meta、search_debounce、global_search_events、
+  prepared_adoption、tag_prewarm（結果 poll と検索結果への prewarm）、video_pin_fetch、other の
+  `_ms` / `_cycles` を記録する。子区間へ入る間は親の計測を止めるため、各段は排他的で加算可能。
+  全体の開始・終了は既存update recorderのmarkを共有し、外枠用のcycles syscallを増やさない。
+  空の結果pollや期限前のdebounceでは区間を開始せず、軽い確認時間はotherに含める。
+- `log.slow_io` — 通常 / perf logger の mutex 待ちまたは保持が **50 ms 以上**のときだけ、
+  `logger` / `operation` / 呼出元 `call_site` / 実行 `tid`、`start_t` / `acquired_t` / `end_t`、
+  `wait_ms` / `hold_ms` / `write_ms` / `flush_ms` / `auxiliary_ms` を記録する。
+  auxiliary は通常 logger では rotation、perf logger では診断キュー出力の時間。
+  write / flush / auxiliary は hold の内訳であり、hold へ再加算しない。
+  `holder_tid` / `holder_site` は待ち開始時の best-effort atomic snapshot（不在・更新中なら null）。
+  長い待ちの途中で保持者が交代し得るため、同じ区間の保持側イベントとも照合する。
+  mutex 解放後に128件の固定配列へ登録し、後続の perf event / flush が再帰しない raw write
+  経路で出力する。登録・取り出しはそれぞれキューの `try_lock` を一度だけ試し、競合時に待たない。
+  登録競合・満杯等の欠落は `log.diagnostic_dropped.count` に出る。取り出し競合では記録を保持して
+  次回へ回す。キューのguardはJSON構築・ファイル書込の前に解放する。
+  `t` は出力時刻でなく計測終了時刻なので JSONL の行順は時刻順とは限らない。
+  終了・永久停止など後続の書込がない場合は未出力記録が残り得る。
+- `thumb.load_phases` — 従来イベントに `offer_raster` / `stats` / `normal_log` / `perf_log` の
+  `_ms` と計測区間の `start_t` / `end_t` を追加し、排他的合計から `unaccounted_ms` を求める。
+  cyclesは各小区間でなくload全体の `total_ms` / `total_cycles` の対で測り、成功時の追加OS計測を
+  2回に抑える。未計測の候補別 `_cycles` は省略し、ゼロで埋めない（旧ログの値は解析器で読める）。
+  `prefill_db_ms` は offer_raster 内の類似索引 DB mutex + SQL の内訳で、二重に引かない。
+  catalog mutex + SQL は既存 `cache_save_ms` 内。decode 内の render / orientation も引き続き内訳扱い。
+  RAW half 現像の後続要求では `decode_ms` も再投入後の worker 区間内だけを測る。
+  先行する executor 待機・half 現像時間は `raw_async_decode_ms` に分離し、
+  `total_ms` / `total_cycles` / `unaccounted_ms` に含めない。解析器は区間外の参考値として表示し、
+  その値から worker の重複区間を広げない。キャッシュ保存判断・既存統計の decode 時間は変更しない。
+
+`python scripts/analyze_perf.py <path> hitches --ms 500` は遅い update の `n` で UI 内訳を対応させ、
+明示区間または `t-total_ms` の重なりから logger / thumbnail を表示し、全カテゴリの時刻空白も出す。
+`frame.begin.prev_update_ms` のouter App::update全体と、`ui.update_breakdown` のinner update_frame
+段別内訳を同じnで併記し、innerが短くてもouterが閾値以上なら報告する。末尾perf書込等はinnerの外。
+次のframe.beginがない末尾フレーム等ではouter未計測と示し、innerを全体とみなさない。
+通常ログの長い hold/write/flush と複数 tid の wait が一致すれば共用 logger 待ちの根拠になる。
+UI の tag/pin だけ長ければ同期 DB 経路を調べる。低 cycles と全体の空白だけでは paging と断定せず、
+未計測時間が残る場合は OS trace の待機スタック・disk I/O・hard fault を併用する。
+process memory の毎フレーム sample は追加していない（page-fault 種別の確定には OS trace が必要）。
 
 **待ちを疑うときは `_ms` と `_cycles` を必ず対で読む。**
 
@@ -532,6 +574,78 @@ JIT コンパイル + 初回テクスチャアップロードがある。`t=0.98
 
 ---
 
+### 6.2 core の起動メモリ診断 (§1.322)
+
+perf 有効時の `process_memory` イベントは、core 自身の
+`GetProcessMemoryInfo` / `PROCESS_MEMORY_COUNTERS_EX` を次の byte 値で記録する。
+launcher や PDF / Susie / VST / TensorRT 子プロセスのメモリは合算しない。
+
+| 属性 | Win32 の値 / 意味 |
+| --- | --- |
+| `private_bytes` | `PrivateUsage`、core の private commit |
+| `working_set_bytes` | `WorkingSetSize`、現在の working set |
+| `peak_working_set_bytes` | `PeakWorkingSetSize`、プロセス起動以来の peak working set |
+| `pagefile_bytes` | `PagefileUsage`、commit charge (実際の pagefile 上の使用量とは異なる) |
+
+成功レコードには `pid`、`stage`、`kind` (`milestone` / `begin` / `end` / `sample`) と、
+既存共通属性 `t` (core 起動から秒) が付く。取得失敗は `kind=query_failed`、`stage` と
+Win32 `error` で記録する。
+`session.start` は既存の core `pid` に加え、`wall_unix_ms` (UTC Unix milliseconds) と
+その取得時点の相対秒 `wall_t` を記録する。`memory` 解析器は
+`wall_unix_ms + (sample.t - wall_t) * 1000` から各 sample の UTC を表示する。
+perf 有効化が遅れても session の `t` を起動時刻とみなさない。
+`GetProcessTimes` が成功すれば `process_start_unix_ms` (OS のプロセス作成時刻) も付く。
+共通 `t=0` は core の `run()` 入口で取得した Instant で、OS の StartTime や launcher 起動時刻とは異なる。
+壁時計との対応は session で1回取得するため、採取中に OS 時計を変更しない。
+時刻属性のない旧ログは従来どおり相対時刻だけ表示する。
+既存の全 `startup.*` イベント (モデル / Susie worker 展開、設定読込、DB、first_frame など)
+でメモリを 1 回取得する。AI runtime init worker、Susie init、PDF pool spawn、
+EffeTune bundle resolve / load には begin/end が付く。これらの span は開始が core 起動後
+60 秒未満の場合だけ採取し、end は完了時に記録する (失敗・早期 return も含む)。
+UI 上の milestone は 1 回のメモリ情報取得だけで、列挙や待機を追加しない。
+
+perf 有効化時の baseline と、専用 `startup-memory-sampler` thread による約 1 秒周期の
+sample も記録する。周期の基準は perf 有効化時ではなく core 起動時で、60 秒で thread は終了。
+遅れた tick をまとめて出す catch-up や repaint はない。perf 無効時は thread を作らず、
+追加の時計読み・メモリ API 呼出しも行わない。Span と共通 helper で既存の初期化順を維持し、
+ログのための待機状態や launcher との受け渡しは追加していない。
+sampler は強制 flush を行わない。既存の `App::update` 内の約1秒ごとの flush で通常は
+ディスクへ出力し、UI 更新のない間はバッファに残りうる。正常終了時は UI ループと既存の
+shutdown 処理が終わった共通経路で1回 flush し、全カテゴリの末尾を保存する。
+強制終了・クラッシュ時の保存は保証しない。
+
+初回起動を採取するには、起動前に単体 exe に `--perf-log` を付ける。
+launcher の `cmd.args(&user_args)` が core へ転送することをコードで確認した。
+保存設定の性能ログ ON はモデル / Susie worker 展開と設定読込の後に適用されるため、
+初回の全区間の採取には使えない。launcher の展開は core がまだ存在しない段階で行われ、
+core の private bytes に含まれない。WER の P1 が core だった利用者記録の調査対象も core に限定する。
+
+```powershell
+# 利用者が初回環境で単体 exe を起動する
+.\mimageviewer.exe --perf-log
+# launcher の展開完了後、core が起動してから別の PowerShell で記録する
+# PDF ワーカーも同じ core exe なので、プロセス名では選ばない。perf ログの session start の PID で確定する
+$Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
+$Session = Get-Content $Perf -Encoding utf8 | ForEach-Object { $_ | ConvertFrom-Json } |
+    Where-Object { $_.cat -eq 'session' -and $_.kind -eq 'start' } | Select-Object -Last 1
+$Core = Get-Process -Id $Session.pid
+$CoreStart = $Core.StartTime
+$Core | Select-Object Id, @{Name='StartTimeUtc'; Expression={$_.StartTime.ToUniversalTime().ToString('o')}}
+# core の StartTime から少なくとも60秒待ち、アプリを正常終了してログを回収する
+# launcher 起動から60秒では、展開にかかった時間だけ core の採取区間が短くなる
+Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Windows Error Reporting'; Id=1001; StartTime=$CoreStart} |
+    Select-Object @{Name='TimeCreatedUtc'; Expression={$_.TimeCreated.ToUniversalTime().ToString('o')}}, Id, Message
+python scripts\analyze_perf.py $Perf memory  # UTC / 相対秒 / PID / MiB / stage を時刻順に表示
+python scripts\analyze_perf.py $Perf startup
+```
+
+core の PID / StartTime と JSONL の session を同一実行として照合し、WER 1001 の
+`TimeCreated` (UTC)・本文 (P1 / RADAR_PRE_LEAK_64) を保存する。WER が出なかった場合もその旨を記録する。
+launcher 起動からの利用者観測の秒数を、そのまま JSONL の `t` に当てはめない。
+
+この計装は原因の特定やメモリリークの判定自体を行うものではない。
+利用者の Sandbox 再採取と WER 時刻との照合は未実施。
+
 ## 7. 測定手順
 
 起動時 + ナビゲーションを計測する標準手順。
@@ -547,7 +661,6 @@ JIT コンパイル + 初回テクスチャアップロードがある。`t=0.98
 # 5. アプリを終了
 
 # 6. 分析
-$Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
 python scripts\analyze_perf.py $Perf startup   # 起動時間ブレークダウン
 python scripts\analyze_perf.py $Perf nav       # Ctrl+↑↓ 区間別統計
 python scripts\analyze_perf.py $Perf pre-grid  # グリッド直前のバー/ペイン/scroll 内訳

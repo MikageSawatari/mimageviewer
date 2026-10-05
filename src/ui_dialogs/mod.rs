@@ -8,6 +8,8 @@
 //! 加えるだけで `update()` から `self.show_new_dialog(ctx)` として呼べる。
 
 mod about;
+#[doc(hidden)]
+pub use about::draw_raw_license_snapshot_fixture;
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
 pub(crate) mod batch_convert;
@@ -23,6 +25,7 @@ pub(crate) mod epub_convert;
 pub(crate) mod export_batch;
 mod fav_add;
 pub(crate) mod favorites_editor;
+pub mod file_organize;
 mod first_setup;
 mod metadata_cleanup;
 pub(crate) mod metadata_transfer;

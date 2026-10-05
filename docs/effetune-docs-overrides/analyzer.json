@@ -1,0 +1,23 @@
+[
+  {
+    "operation": "insert_note",
+    "heading_id": "アナライザープラグイン",
+    "repeat_on_plugins": true,
+    "note": "mImageViewer の音響調整は左右2チャンネルで処理します。以下の多チャンネルの例は、デスクトップ版 EffeTune 向けの説明です。",
+    "reason": "Stereo-only bridge; apply the same boundary to Analog Meter as existing analyzers."
+  },
+  {
+    "operation": "replace_paragraph",
+    "scope_heading_id": "analog-meter",
+    "anchor": "処理が止まっている間は測定に含まれません。無音時の省電力による停止中、Master Bypass がオンのときや Analog Meter がオフのとき、設定の **非表示時は表示専用DSPをスキップ** がオン（初期状態）で Effect Pipeline が表示されていない間（Music Library の表示中、最小化中、ミニプレーヤー使用中など）がこれに当たります。再開すると、止まる前の値から測定を続けます。",
+    "replacement": "処理が止まっている間は測定に含まれません。Master Bypass がオンのときや Analog Meter がオフのときがこれに当たります。再開すると、止まる前の値から測定を続けます。",
+    "reason": "Do not claim standalone power-saving/display-only DSP policy for native VST processing."
+  },
+  {
+    "operation": "replace_paragraph",
+    "scope_heading_id": "rhythm-analyzer",
+    "anchor": "**ファイルを処理する前にクリックを切る**：**Metronome Click** がオンのままだと、処理したファイルにクリック音が書き込まれます。先にオフにしてください。",
+    "replacement": "**クリック音も再生・配信される**：**Metronome Click** がオンのときはクリック音が mImageViewer の再生音とリモート配信にも加わります。解析結果を見るだけならオフにしてください。",
+    "reason": "mIV has no EffeTune offline file processor; generated clicks enter its playback/Remote DSP path."
+  }
+]

@@ -905,7 +905,7 @@ fn load_similar_thumbnail(job: SimilarThumbJob) -> Option<egui::ColorImage> {
             .and_then(|passwords| passwords.get(&path))
     });
     let (tx, rx) = std::sync::mpsc::channel();
-    let request = crate::thumb_loader::LoadRequest {
+    let mut request = crate::thumb_loader::LoadRequest {
         path,
         zip_entry,
         pdf_page,
@@ -925,7 +925,7 @@ fn load_similar_thumbnail(job: SimilarThumbJob) -> Option<egui::ColorImage> {
     let keep_start = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let keep_end = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
     crate::thumb_loader::process_load_request(
-        &request,
+        &mut request,
         &cache_map,
         &tx,
         None,
@@ -938,6 +938,7 @@ fn load_similar_thumbnail(job: SimilarThumbJob) -> Option<egui::ColorImage> {
         Some(&job.cancel),
         &keep_start,
         &keep_end,
+        None,
         None,
         None,
         None,

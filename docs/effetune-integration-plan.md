@@ -7,7 +7,7 @@ Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 
 
 ## 0. 目的と決定済み事項
 
-EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.11.1、WebView2 UI、AVX2/FMA 必須) を
+EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.12.0、WebView2 UI、AVX2/FMA 必須) を
 mIV の音声経路へ組み込み、エフェクト処理とビジュアライザーを使えるようにする。
 
 利用者と合意済みの方針 (2026-09-27):
@@ -55,7 +55,8 @@ mIV の音声経路へ組み込み、エフェクト処理とビジュアライ�
   したがって UI スレッドからの `getState` が `process` を止める経路はソース上は無い。
   **実機での負荷試験 (§8) で裏付ける。**
 - 音声 pump は `Option<Arc<DspBridge>>` を open 時に受け取り pump へ move する (open 時点の固定値)。
-  リミッター条件は `vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active`。
+  当初のリミッター条件は `vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active`。
+  2026-10-04 の follow-up 決定で最終段は常時有効に変更（§13、公開済み v4.3.0 には未収録）。
   `DspBridge::total_latency_samples` は自分のスロットだけで 2 秒上限を見る。
 - GUI の owner は `current_gui_owner_hwnd()` が「fullscreen owner → カーソル下／前面の mIV ウィンドウ
   → main」の順で選ぶ。`set_main_hwnd` だけではメインウィンドウになる保証がない。
@@ -67,8 +68,9 @@ mIV の音声経路へ組み込み、エフェクト処理とビジュアライ�
 ## 2. 構成
 
 ```
-decode → normalize → [ユーザー VST3 チェーン: dsp_bridge] → [EffeTune: 専用 bridge]
-       → 手動ブースト → 安全リミッター → 出力
+decode → normalize → [ユーザー VST3 チェーン: dsp_bridge] → [任意の EffeTune 前段リミッター]
+       → [EffeTune: 専用 bridge]
+       → 手動ブースト → 常時有効の最終安全リミッター → 出力
 ```
 
 ## 3. 所有者と状態遷移
@@ -140,6 +142,7 @@ enum EffetuneFailure {
 - 終了時の `flush_silence` を EffeTune 段にも行う。
 - **遅延 (PDC)**: チャンクごとに「実際に適用した段」の遅延だけを合算して記録する。
   - プラグイン遅延の合計 = ユーザーチェーン (適用時) + EffeTune (適用時)。
+    §13 の前段 limiter を通した場合はその実遅延も PDC へ加算する。
   - **2 秒上限はプラグイン遅延の合計に掛ける** (リミッター・time stretch の遅延は上限の外)。
     優先順位は **ユーザーチェーン優先**。ユーザーチェーンは既存どおり自分の中で上限を守る。
   - EffeTune 段を **適用する前に** 「ユーザーチェーンの遅延 + EffeTune の現在の遅延」を確認し、
@@ -150,7 +153,8 @@ enum EffetuneFailure {
     latency 方針 `AutoBypass` (既存) / `ReportOnly` を持たせ、EffeTune は `ReportOnly`)。
     自動 bypass で「Running なのに素通し」になる別の持ち主を作らないため。
   - 途中挿入で遅延が増えた場合は、既存の per-chunk PDC 公開と decoder の追従に任せる。
-- 安全リミッター: EffeTune 段を適用したチャンクでは常にリミッターを通す (決定的な規則)。
+- 最終安全リミッター: エフェクト・音量・normalize gain に関係なく常時適用する。
+  約 5ms の実 lookahead 遅延を常に PDC へ含める（2026-10-04 follow-up、公開済み v4.3.0 には未収録）。
 
 ### 3.4 起動時の読み込みとメディアオープンの遅延
 
@@ -191,6 +195,10 @@ enum EffetuneFailure {
 - **mIV による一時非表示は host の `GuiVisibility` が単独で所有**する。表示希望と非表示理由の集合
   (`Minimized` / `RemoteSession`) を持ち、理由がすべて解除され、表示希望が残るときだけ非アクティブで戻す。
   最小化や Remote による hide で `user_hidden`、設定保存、state capture、音声の実行状態を変えない。
+  §1.312: `effetune_keep_visible_when_minimized`（既定 false）で `Minimized` だけを解除できる。
+  起動保存値と Preferences OK を既存 gate に公開し、変更時だけ worker の既存 reconcile を通知する。
+  最小化中も即時反映し、表示希望のない窓は開かない。`RemoteSession` は常に優先する。
+  tray-only `SW_HIDE` は OS の最小化ではなく、両設定とも既存どおり窓を残す。主窓が iconic なら設定に従う。
   最小化はメインの `WM_SIZE` で共有 atomic の連番を更新し、worker に通知する。
   WndProc は bridge を参照せず、`DspBridge.inner` のロック・列挙・IPC は worker 側だけで行う。
   実際の表示直前にも現在の `IsIconic(main)` を確認する。
@@ -209,8 +217,8 @@ enum EffetuneFailure {
   attach 中に最小化／Remote の開始と終了が両方済んだ場合も取消し、
   まだ表示していなかった窓を「復帰」として開かない。時間窓や独自 Remote revision は使わない。
   **配送後の取消しも host の GUI thread で確定する** (2026-10-01 review fix1)。
-  32 byte の専用共有 mapping は native 最小化連番と Remote の取得連番・phase の read-only projection
-  だけを運ぶ。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
+  専用共有 mapping は native 最小化連番と Remote の取得連番・phase、および最小化中の表示設定の read-only projection
+  を運ぶ（§1.312 で version 2 / 40 byte、設定 atomic は offset 32）。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
   worker に復帰判定を通知する。worker は source を weak に参照し、通知 sender の循環で残留しない。
   `set_gui_visibility_checked` は request ID と発行時の連番を運び、GUI thread が共有値と最小化を
   表示・アクティブ化の直前に照合する。取消しは未表示の窓の表示希望を作らず、既に表示希望のある
@@ -370,7 +378,7 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
+- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.12.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
 - 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
@@ -495,7 +503,16 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 
 ## 10. 決定済みの配布方針と残る対象外事項
 
-- 最小化中もビジュアライザーを残す設定は今回の対象外。既定は一緒に隠す。バックログ §1.312 を参照。
+- 最小化中もビジュアライザーを残す設定は当初の配布作業では対象外。公開後の §1.312 で実装、既定は一緒に隠す。§14 を参照。
+- **Windows Sandbox では音響調整 (と EPUB 変換) が動かない — 対処しない (2026-10-04 利用者判断)。** Sandbox では
+  `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}\EBWebView` が
+  存在しない旧版フォルダ (152.0.4191.66) を指し、実フォルダはホストと共有の 153 / 154。EdgeUpdate が無効なのでずれが直らない。
+  WebView2 の既定の探し方が 0x80070002 で失敗し、EffeTune は PENDING → TIMEOUT、EPUB は「WebView2 Runtime が見つかりません」になる。
+  EBWebView だけを直すと成功、pv だけでは失敗 (サブPCの診断ツール wv2diag による実験、記録は サブPC `C:\miv-sandbox\wv2-diag\out\`)。
+  同じ症状は [WebView2Feedback #5697](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5697) に未解決で報告されている。
+  普通の PC では更新の中断などの例外時だけで、WebView2 を使うアプリ全体が失敗し、ランタイムの修復で直る (Web 調査、一部コミュニティ回答)。
+  予備の探し方 (EdgeWebView\Application の最新版を `browserExecutableFolder` / `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` で明示) は
+  Evergreen を想定した使い方ではなく、更新通知が来なくなるため採らない。壊れた環境向けの案内表示も追加しない (利用者判断)。
 
 - v4.3.0 の同梱・署名・ライセンス通知は §10.2 に確定。商標注記の追加要否は別途確認する。
 - マニュアル・製品ページ・privacy には、Mixwright の WebView データの保存先が mIV の data_dir の
@@ -525,20 +542,20 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 
 ### 10.2 v4.3.0 の配布同梱 (2026-10-01)
 
-- **単体exe版とインストーラ版に Mixwright v0.11.1 の bundle 全体を同梱する**。インストーラは
+- **単体exe版とインストーラ版に Mixwright v0.12.0 の bundle 全体を同梱する**。インストーラは
   launcher をインストールする。portable は §10.1 の決定どおり bundle と VST host を同梱しない。
 - launcher の build.rs が `vendor/effetune-mixwright/` (または `MIMV_EFFETUNE_DIR` で指定した
   staging) の VERSION と bundle を必須検証し、相対パス順に全ファイルを列挙して埋め込む。
-  v0.11.1 の bundle は 407 ファイル、38,491,437 bytes (約36.71 MiB)。bundle 外の VERSION を含む
-  入力は計408ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
+  v0.12.0 の bundle は 424 ファイル、32,320,639 bytes (約30.82 MiB)。bundle 外の VERSION を含む
+  入力は計425ファイル。VERSION、ファイル一覧、サイズと SHA-256 から bundle の同一性を記録する。
   無ければ取得・配置の復旧手順付きで build を停止する。
-- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋407ファイルの一覧とSHA-256を
+- **R1修正 (2026-10-02)**: 承認済み `manifest.sha256` にVERSION＋424ファイルの一覧とSHA-256を
   固定し、vendor原本の欠落・追加・改変を署名前／埋め込み前に拒否する。署名stageも全非PEが一致、
   PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
 - 起動時は `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/`
   へ新しい世代を構築する。全ファイルのhashと一覧を検証してから、小さな `effetune/current`
-  pointerだけをatomicに更新する。公開済みtreeは使用中の読手から見えるため一切移動・削除しない。
-  旧世代のcleanupは起動経路では行わない。修復は別世代の公開でありin-placeの置換ではない。
+  pointerだけをatomicに更新する。公開処理は公開済みtreeを移動・削除しない。
+  旧世代のcleanupは起動後のcore背景workerで行う（下記2026-10-05追補）。修復は別世代の公開でありin-placeの置換ではない。
   正常stampの一覧・サイズ・更新時刻・作成時刻が一致するときは全量再hashもwrite lockも不要。
   metadataを保持したままの内容改変は通常起動での検出対象外。書込不能／publisher busyなどで
   repairできなくてもcoreは起動する。失敗理由と拒否世代を専用envからUnavailable UI／ログへ伝え、古いtreeを
@@ -568,14 +585,110 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   UTF-16長が260以上なら公開せず、UIにパスが長すぎる理由を示す。SDK directory checkのNotFound以外のerrorも
   単体DLL pathへfallbackせず報告し、Win32にはnative backslash wide pathを渡す。
   hostはCMakeで現trackedソースhash markerを埋め、署名前／core埋込前／bare cargo releaseのgateで照合する。
-  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは[バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)へ延期する。
-- 3種類の通知全文を `third_party/effetune-mixwright/v0.11.1/` に原文のまま追跡し、about の
+  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは下記追補および
+  [バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)を参照。
+- 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
   でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
   一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+  2026-10-03 の公開前レビュー対応で、JSZip 内の lie / immediate / setImmediate と
+  pako の zlib 由来コードの原文を `supplemental/NOTICES.txt` として第4の折り畳み通知に
+  埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
 - EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
   アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
+
+#### 起動後の旧世代清掃（§1.331 / §1.316、2026-10-05）
+
+- 利用者決定は「今の版だけ残して削除」。core の起動完了・初回描画後、`runtime-cleanup` worker
+  が `<data_dir>/runtime` 直下の SemVer として読める他版を削除する。ダウングレードでも新しい版を
+  削除し、再度その版を起動すれば launcher が再展開する。portable は完全な no-op。
+- **P1/P2対応の利用者決定（2026-10-05）**: 各coreはexeの属する `runtime/<version>` と、
+  固定したEffeTune世代の外側lockをsharedでプロセス寿命中保持する。`--data-dir` が異なる
+  coreも同じ実体のlockを使う。成功した世代解決はpathとleaseを持つ単一ownerとして固定し、
+  初回はegui構築前、準備失敗後の再解決は既存load worker内で取得する。UI updateにI/Oを追加しない。
+  版の使用権はWindowsのcase aliasも認識してcanonical実体で取得する。APPDATAのredirect自体は
+  起動を妨げず、清掃の祖先reparse拒否だけを適用する。
+- **P1/P3再レビュー対応（2026-10-05）**: cooperative lockは削除tree外の `runtime/.locks/` に
+  固定する。版は `<version>.in-use`／`<version>.extract`、publisherは `<version>.effetune`、
+  世代は `<version>.gen-<hash12>-<generation>`。`.locks` はSemVerではなく、列挙でも明示skip。
+  lockは微小な永久fileとして残し、古いlockも削除・rotateしない。tree内のlockを消すと別fileへ
+  排他が分裂するため、削除処理の工夫で対応せず、削除範囲から除外する単純な所有配置を採用する。
+  外側lockは `FILE_SHARE_READ | FILE_SHARE_WRITE` のみでopenし、delete sharingを許可しない。
+  runtime親のcanonical identityとversion／generation名から算出し、削除済みtreeの存在を要求しない。
+  `.locks` directoryと各lock fileもreparse拒否・canonical confinement／regular file検査を行う。
+- launcherはruntime親を作成・canonical化し、外側版shared leaseを取得してから版directoryを
+  作成・展開する。清掃が先に取得した場合の起動を維持するため、launcher側の版shared取得だけは
+  従来publisherと同じOS workerによる最大60秒待機を使う（清掃側は一度だけ非blocking）。
+  exe/DLL抽出は外側exclusive extract lockで直列化する。
+  正常世代を使う経路でも外側世代shared leaseを取得してから検査し、新規世代も公開前に取得する。
+  新しい世代tree内にlease fileは置かない。旧 `.in-use.lock` があるtreeのstamp互換のため、
+  この旧管理fileだけは引き続きasset inventoryから除外し、regular fileかは検査する。
+- **released publisher互換**: `runtime/<version>/.effetune.lock` は既存launcherが使うため、
+  新publisherは外側lock→旧lockの順に両方exclusive取得し、1回分の従来最大60秒budget内で待つ。
+  清掃は外側publisherを非blocking取得後、旧fileがあればそのlockも非blocking取得して保持する。
+  世代だけの削除なら旧fileは削除範囲外でありdelete sharingを禁止できる。版全体の削除時に限り
+  内側旧fileはdelete sharingを許可してtreeと削除する（外側lockは永久保持したまま）。
+  旧file名の消失による未対応旧launcherの新規同時起動は、末尾の既存受容raceの範囲。
+  新対応launcherは外側版／publisher lockで同一性を維持するため、この旧fileへ依存しない。
+- spawn直後にlauncherがleaseを放す隙間を作らない。coreが自身の版leaseと初回の世代pin／Unavailableを
+  確定してnamed eventで通知するまで、launcherはshared leaseを保持してOS waitする。
+  coreはこの通知に対して待機しない。coreが先に終了した場合もlauncherは終了できる。
+  生存中coreのpinをtimeoutで放すことはしない。通常はこの引き渡し直後にlauncherが終了する。
+- 現在版の `effetune` はcurrentと当該coreの固定世代を残す。canonical化した世代名を比較し、
+  nonceの大文字・小文字違いも同じ実体として扱う。清掃は各候補の外側使用中lockをexclusiveで
+  非blocking取得し、版全体なら外側extract／publisher lockも取得する。
+  現在版の世代清掃も外側publisherと存在する旧publisherを取得し、**tree削除完了まで保持**する。
+  busy/errorなら資産の削除を始めず今回は見送る。初回世代未確定、未知配置、current異常も見送る。
+- 各targetはcanonical化してruntime内の直下child関係を確認する。root／祖先／全subtreeの
+  symlink・junction・reparse pointは明示的に拒否し、そのtreeを残す。削除失敗はlogのみ。
+  部分削除は許容し、次回起動で再度試す。timer、retry loop、UI通知、終了時joinは持たない。
+- **P1 #2は受容（利用者決定2026-10-05）**: 事前検査後に親directoryをjunctionへ差し替える
+  TOCTOUは対処しない。成立には利用者と同じ権限で動く別processが必要で、そのprocessは同じfileを
+  直接削除できるため、新たな権限を与えない。既存のcanonical／reparse事前検査は維持するが、
+  親directoryをhandleで固定した競合耐性を保証するものとは説明しない。
+- 同梱bundleだけが対象。EffeTune設定／プリセット／IR／測定データ、WebView保存領域は削除しない。
+- **旧版互換（ClaudeCode決定2026-10-05。利用者決定「今の版だけ残して削除」の範囲内で方針1を選択）**: workerが起動ごとに一度だけ
+  `K32EnumProcesses` と `QueryFullProcessImageNameW`（query limited rights）でprocess画像を列挙し、
+  候補tree内で実行中の画像があれば削除しない。世代内にexeが無い旧coreもあるため、現在版内の
+  別 `mimageviewer-core.exe` が動く間は全旧世代を保守的に残す（自coreとremote等のhelperは除外）。
+  この事前検査はlock対応版にも適用し、既存のshared／exclusive lock保護も維持する。
+  missing leaseは事前検査後に清掃側で外側へ新規作成してexclusive取得するので、未使用の既存旧版も
+  清掃できる。作成不能／権限不足は通常の削除失敗と同じくlogして次回起動へ回す。
+  process画像はcanonical化して比較し、列挙失敗／固定bufferの不足は全清掃を見送る。
+  終了済み／query拒否のprocessは画像を取得できないため検査対象外。全画像の一度の列挙だけで、
+  module列挙・VM read・待機・再試行は行わず、UI／起動／初期化の経路には置かない。
+  API仕様: [EnumProcesses](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-enumprocesses)、
+  [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)。
+  開発機のheadless test実測は525画像の列挙＋canonical化で約123ms（性能保証ではない）。
+- **旧launcher同時開始raceも受容（同決定）**: snapshot後に新規起動する未対応旧launcherは
+  lockを取得しないため、清掃との競合を完全には防げない。新旧版を利用者が同時に起動する必要が
+  あり、旧launcherは次回起動で再展開する。上記親junction TOCTOUと併記する受容範囲であり、
+  lock対応版同士は版lease／抽出／公開lockで保護する。
+- 回帰testは製品の `cleanup_effetune` を呼び、注入した削除操作内で実tree削除後も別handleの
+  publisher exclusive／世代shared取得が失敗することを確認する。版全体も削除・再作成の途中で
+  同じ外側lockへの取得が失敗し、guard解放後だけ成功する。sleepやtest自身による代理guardは無い。
+
+### 10.3 同梱版更新 (2026-10-04、v4.3.0 公開前)
+
+- 利用者決定: 同梱 EffeTune は未リリースのため、v0.11.1 で保存した EffeTune 状態の
+  移行・互換処理は追加しない。旧版ソース確認・実機観測の記録は履歴として残す。
+- 承認元は Mixwright v0.12.0、release commit `6f4e2ee`、Windows x64 ZIP の SHA-256 は
+  `31df641d9da41aa36a5e5dc3e684282bd534e9e26ef9c5e6ff3b8c47c4f95408`。
+  vendor の bundle 全424ファイルが ZIP と一致。旧407ファイルから17追加、削除なし。
+- 新しい第三者成分は Rhythm Analyzer の fdlibm 5.3 (atan / atan2)。上流 DSP NOTICE に
+  Sun Microsystems の原文が追加済み。その他2通知と JSZip は旧版と同一。
+  lie / immediate / setImmediate / pako の zlib ヘッダーは今も上流通知に無いため補足を維持。
+- 日本語資料は external/effetune commit `03bffda352287f4f438d063d9660aad7864e553a` の
+  verbatim snapshot に更新。Analog Meter / Rhythm Analyzer / Tonal Balance EQ と Visualizer
+  拡張を収録し、今回表示されたコントローラーマッピングの設定入口も説明書に追加。
+  独立プレーヤー、Clean Feed、外部音声設定など VST で使えない説明は override で訂正。
+- 非起動 PE gate は plugin の x64 と VC import closure を確認。最長の相対名は104 UTF-16単位。
+  40文字のユーザー名、generation最大45文字を使う通常profile例の最深pathは252単位 (<260)。
+- 製品・plugin は起動しない。従来の v0.11.1 実機観測を v0.12.0 の実行結果として扱わない。
+  通常 launcher test は release core / remote / EPUB worker が未buildのため保留。
+  公開前に release lead が最終 full gate と release build、および実機確認を行う。
+
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
@@ -863,3 +976,455 @@ EffeTune の controller が持つ bridge) をそのまま使う**。
   これにより切り替えが素通しの一時停止 seek へ変わらず、旧表示フレームの位置へ戻らない。
 - §12.9 の旧 P5 の保持 player 再 seek テストは廃止。取得 barrier の全 viewer close テストと、
   player 破棄後も残る pump permit が返るまで Remote の最初の host 操作を待つ調停者テストで確認する。
+
+
+## 13. 2026-10-04 v4.3.0 リリース前: EffeTune 入力のピーク保護
+
+### 原因・承認済み仕様
+
+利用者の 2 台で、加工なし・音量 100% の AAC 音楽動画でも Level Meter が OVERLOAD を表示。
+デコード後 sample peak は +2.04 / +2.10 dBFS。mIV は f32 をそのまま渡し、Mixwright
+v0.11.1 の meter は `|sample| > 1.0` を検出する（true peak ではない）。ユーザーの
+Pro-L 2 を前段で有効にすると消えるため、EffeTune 入力の sample peak が原因。
+利用者承認に従い、音量を全体的に下げる pre-gain は加えず、ユーザー VST3 後・EffeTune 前に
+独立 SafetyLimiter（0 dBFS、5 ms、100 ms release、ceiling へ clamp）を追加。
+既存最終 limiter は順序・有効化条件・HUD 通知を維持する。前段の低減で HUD は点灯させない。
+
+### 所有境界・単純化・遅延
+
+- `EffetuneInputLimiter` は各 local pump / clockless processor が所有し、scratch にコピーして処理。
+  原本は `compose_samples` の fallback 用に保持。成功時だけ前段 + EffeTune latency を採用し、
+  failure / Ok(false) / 無効 / admission 不成立 / permit なしでは原本とユーザー側 latency を維持。
+- admission は従来の plugin 合計 2 秒という契約を維持。前段 5 ms は最終 limiter 同様に上限外。
+  PDC には実際の lookahead frame 数 / sample rate を足す（44.1 kHz の丸めも一致）。
+- local seek serial 更新、段の非適用、EffeTune generation 変更、最終 limiter reset に合わせて前段を reset。
+  Remote は seek serial 変更と非適用で reset、新 worker / generation は初期 state から開始。
+- 当初の簡素化（§15 の利用者決定で変更）: 再生中の設定反映に新しい atomic / 遅延切り替えを足す代わりに、既存の開始時
+  snapshot を採用。`effetune_pre_limiter_enabled` は player 作成 / Remote 配信受付時に取り、
+  Remote の seek・画質変更世代では維持。画面を閉じて開き直す／配信終了後の再開で反映する。
+  pause/resume・既存 player の再利用では変えない。新再生の limiter は必ず空で始まる。
+- 独立設計レビュー（GPT-6.1 Sol / xhigh）: ACCEPT、blocking finding なし。
+
+### 設定・UI・経路確認
+
+既定 ON、serde `default_true`。settings_db は残り全 field を settings_kv へ保存するため
+schema / allow-list 変更不要。runtime 所有の GUI rect と異なり preferences-owned field とし、
+`overwrite_non_preferences_from` に加えない。動画ページに音響調整節を追加し portable の描画と検索を除外。
+ラベル案: 「EffeTune に渡す前に 0dB を超える音を抑える」。説明は全体音量を下げないこと、
+可視化時の OVERLOAD、OFF と最終出力保護、閉じて開き直す／配信再開の反映時点。
+
+確認した producer / consumer:
+- `App::local_audio_dsp_chain` → 動画 builder / 音楽 builder → `audio.rs` pump（動画の音声表示モードも同じ）。
+- Remote 動画 / 音楽 → `remote_clockless_audio_processing` → shared bridge adapter → `ClocklessAudioProcessor`。
+- RemoteHeadless metadata player は音声 DSP chain を持たず、配信は clockless worker のみが処理。
+- `SharedEffeTuneProcessor` の process は上記 clockless consumer 経由のみ。
+- 終了時の `flush_silence` はゼロ入力で、メディア音声の迂回経路ではない。
+
+### 検証記録
+
+本 worktree の未コミット差分で実施（製品 exe は起動していない）:
+
+| コマンド / 対象 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/prelimiter-check.log` |
+| 同上 `--features portable` | exit 0 | `target/prelimiter-check-portable.log` |
+| `cargo test -p mimageviewer --lib effetune_pre_limiter` | 7 passed / exit 0。設定 UI→checkbox→OK→保存→再読込→local consumer / Remote admission、上限、OFF、遅延、reset | `target/prelimiter-unit.log` |
+| 同上 `video::audio::tests` | 52 passed / exit 0 | `target/prelimiter-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 33 passed、実ホスト profile 用 1 ignored / exit 0。前段 ON の AAC fallback 連続性も確認 | `target/prelimiter-clockless.log` |
+| 同上 `effetune::composition::tests` | 3 passed / exit 0 | `target/prelimiter-compose.log` |
+| 同上 `settings_db::tests` | 120 passed / exit 0 | `target/prelimiter-settings-db.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 60 passed / exit 0 | `target/prelimiter-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | `target/prelimiter-glyphs.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+
+追加した画像は `preferences_effetune_input_limit_dark.png` のみ。既存画像は変更せず、
+新規画像の日本語・行の収まりを目視確認した。AAC fixture は前段＋最終＋plugin 遅延を
+先頭 block 内に収めるため 512→1024 frames とし、既存の部分 trim 検証の意味を維持。
+独立完了レビューも ACCEPT（文書の encoding 指摘は修正して再確認済み）。
+
+`test-full.ps1` は vendor の `mimageviewer-vst3-host.exe` を起動する handler test を含むため、
+利用者の `mimageviewer*.exe` 起動禁止に従い未実施。全体 gate と実機の Level Meter / A/V sync / seek / OFF / Remote 確認は
+リリース担当の検証枠に残す。
+
+確認用 build は `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功（exit 0、
+normal feature set / dev-runtime、core 9m36s、Remote / EPUB worker も成功、VCRT PE check は runtime=4 / pe=3）。
+初回は turbojpeg-sys の並列 MSBuild が失敗したため、当該依存を単一ジョブでビルド後、
+今回の invocation のみ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を指定した。
+設定ファイル・build script は変更せず、コマンド終了時に env を元へ戻した。
+`target/dev-runtime/mimageviewer-core.exe` を利用者確認用に用意し、起動はしていない。
+この normal build は既定で実利用中の `%APPDATA%/mimageviewer` を使う。
+
+### Codex P2 対応: 通常 EOS の保持音声排出（2026-10-04、公開済み v4.3.0 には未収録）
+
+47c28db2c は利用者判断により v4.3.0 へ入れず、末尾欠落を許容して公開した。以下は次版向けの実装・検証記録。
+
+独立レビュー指摘: `b55403c5f` では前段 limiter の lookahead が通常 EOS に出力されず、
+設定 ON で 44.1kHz の 221 / 48kHz の 240 frames が追加で失われていた。
+local pump は EOS 後も seek を待つため、終了時の `flush_silence` の結果を使う修正では届かない。
+
+- `AudioDspTail` に最後の適用済み段・遅延・boost・連続 PTS を trim/reconcile 前に保存する。
+  通常 EOS のみ、ユーザー VST3 後へ無音を入れ、前段 → 同じ EffeTune → 最終 limiter を通す。
+  前段 lookahead + EffeTune の報告遅延を排出後、最終 limiter へ直接無音を入れてその 5ms も排出する。
+  同じ仕組みで安全に出せるため、最終 limiter の既存の末尾欠落も修正する（前段 OFF / EffeTune 不在でも適用）。
+- PDC は最後の実ブロックと同じ値を保持し、audible PTS は連続。normalize / stretch /
+  ユーザー VST3 を再適用しない。前段だけの低減は HUD に反映せず、最終段の従来の判定を使う。
+  任意長の EffeTune 残響やユーザー VST3 / stretch の tail、local resampler の既存の微小欠落は対象外。
+- local は decoded EOS の後に rx / deferred / raw を出し切り、既存 refill の最大 10ms ブロックで
+  processed cap・所有 permit・seek 確認・pre-target trim・tap・queue commit を維持する。
+  Remote は decoder / resampler drain 後、AAC finish 前に checkpoint / permit / mux 経由で排出する。
+  cancel / stop / seek / Remote source-limit は排出しない。段の置換・無効化・失敗時は前段保持音声を捨て、
+  既に最終 limiter が保持する出力だけを排出する。
+- 設計の簡素化: channel 全体を新 enum に変えず、時計上の短い mutex 内の typed `AudioEos`
+  （Decoding / Decoded / Draining / Complete）を decoder・pump・tick の単一完了所有者にする。
+  seek serial 更新と EOS reset/publication を同じ lock で直列化し、IPC や buffer lock を保持しない。
+  audio packet EOF も demux serial 付きにして、優先 Flush 後の古い EOF を拒否する。
+  native / 非 native tick は tail commit 完了まで EOF/loop に進まない。
+  長い plugin delay を一括 IPC に渡さず、通常の小ブロックへ分ける。
+- 独立設計レビュー（GPT-6.1 Sol / xhigh）: amended design ACCEPT。
+
+完了時の独立コードレビューも ACCEPT。空の新 seek 世代で EOS になった場合は、pump の stale clear で
+buffer owner を現 serial へ進め、両 limiter / tail を捨てて完了できるようにした。
+排出の IPC 直前にも seek / cancel / permit を確認し、失敗時は通常の StageHealth 閾値を維持する。
+
+| follow-up 検証 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib video::audio::tests` | 56 passed。非ゼロ末尾、ON/OFF、44.1/48kHz、短い入力の trim、cancel、世代、host admission | `target/eos-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 36 passed / 実ホスト用 1 ignored。長い plugin delay の分割、reconcile が全削除した末尾、failure 閾値 | `target/eos-clockless.log` |
+| 同上 `video::clock::tests` / `video::decoder::demux_serial_tests` | 14 / 5 passed。世代付き EOS と完了 state | `target/eos-clock.log` / `target/eos-demux.log` |
+| 同上 `eos_tick` / `eos_empty_audio_seek` | 各 1 passed。native/headless の in-flight gate、空 seek の実 pump → tick | `target/eos-tick.log` / `target/eos-empty-seek.log` |
+| 同上 `video::tests::native_tick_` / `reaches_eof_with_real_pump` | 4 / 2 passed。既存 deadline と実 decoder の動画・audio-only EOF | `target/eos-native-tick.log` / `target/eos-real-pump-eof.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/eos-check.log` / `target/eos-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0。UI・snapshot は変更なし | `target/eos-glyphs.log` |
+
+製品 exe は未起動。任意長の effect tail と local resampler の既存の微小欠落は引き続き対象外。
+
+follow-up の確認用 build も `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功
+（exit 0、normal feature set、core 10m21s、Remote / EPUB worker 成功、PE runtime=4 / pe=3）。
+今回の process 内だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を設定し、終了時に戻した。
+ログは `target/eos-build-dev.log`（stdout の build/staging 記録）。
+`target/dev-runtime/mimageviewer-core.exe` を更新したが起動せず、確認は利用者へ引き渡す。
+最終の `cargo fmt` / `cargo fmt --check` / `git diff --check` も exit 0。
+コミットせず、follow-up 専用メッセージを `target/prelimiter-msg.txt` に UTF-8 / BOM なしで上書きした。
+
+
+### Codex P2 対応: 完了 wake・Remote 終端容量・最終 limiter 常時適用（2026-10-04）
+
+この follow-up は公開済み v4.3.0 には未収録。47c28db2c に master（Mixwright v0.12.0）を
+統合した 78567823e に対する独立レビューの P2 2件と、同日の利用者決定に対応する。
+
+- local の Complete publication は現 seek serial の Draining → Complete が成功したときだけ
+  `EngineEventSender::wake_ui()` で ROOT を即時起床させる。tail IPC 中に tick の deadline が
+  None でも完了を観測し、既存の 48ms quiet timer を開始する。stale / 重複完了では起床しない。
+- Remote の finishing は引き続き capacity 待ちを解除する。終端待機を増やす単純化は、
+  未公開 fragment を端末が release できない循環を再導入するため採らない。既存の working /
+  codec 終端用 2 slot に `ceil((最大 plugin 2秒 + 両 limiter 約10ms) / fragment 2秒)` の
+  2 slot を予約する。ring 保持数は live capacity + 4。metadata と A/V / audio-only mux を
+  同じ helper で設定する。作成中 fragment がほぼ満杯でも、最大 tail と AAC finish が最古の
+  未読 fragment を追い出さない。通常時の先読み admission / release 規則は維持する。
+- 最終 limiter は local 動画・音楽（audio-only / 動画の音声表示を含む）と Remote 動画・音楽で
+  常時実行。`limiter_required` / `limiter_active` / normalize の最大 boost 追跡 / inactive reset を撤去。
+  normalize の 4秒 ramp が gain 1.0 をまたいでも遅延線を保ち、約 5ms の実 frame 数による
+  PDC を常に加える。通常 EOS で最終段を必ず排出する。前段は EffeTune 成功時かつ設定 ON のみ、
+  failure / fallback では前段の音・遅延を除外し、最終段の 5ms は残す。plugin admission の 2秒には
+  両 limiter を引き続き含めない。HUD は最終段の 1dB 以上の低減だけを通知する。
+- この時点では設定 snapshot と checkbox は変更なし。即時反映は §15（backlog §1.324）で対応。
+- 回帰は ROOT wake と tick の返す quiet deadline、stale / 重複完了、実 DSP → AAC / mux / finish
+  の full manual-control ring、エフェクトなしの非ゼロ末尾、normalize gain の unity 越えを確認する。
+
+独立完了レビュー（GPT-6.1 Sol / xhigh）は ACCEPT。対象は 78567823e に対する本 round の未コミット差分。
+
+| 本 round の検証 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib video::audio::` | 58 passed | `target/limiter-round-audio.log` |
+| 同上 `video::clockless_transcode::` | 38 passed / 実ホスト用 1 ignored | `target/limiter-round-clockless.log` |
+| 同上 `effetune::composition::` / `video::decoder::` / `video::clock::` | 3 / 80（性能計測 1 ignored）/ 14 passed | `target/limiter-round-test-1.log`〜`-3.log` |
+| 同上 `eos_tick` / `eos_empty_audio_seek` / `video::tests::native_tick_` / `reaches_eof_with_real_pump` | 1 / 1 / 4 / 2 passed | `target/limiter-round-test-4.log`〜`-7.log` |
+| 同上 `video::stream::segmenter::` | 7 passed。関連 lib tests 計 208 passed / 2 ignored | `target/limiter-round-segmenter.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/limiter-round-check.log` / `target/limiter-round-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0。UI / snapshot は変更なし | `target/limiter-round-glyphs.log` |
+
+自動検証の初回失敗は新しい常時遅延の期待値と normalize の浮動小数点許容差を修正して解消。
+製品 exe は未起動。全体 gate は実 VST host 起動を含むため従来の禁止に従い未実施。
+実機での A/V sync、ループ・連続再生、末尾に音がある素材、最大遅延の Remote は次版の検証枠に残す。
+
+本 round の確認用 build は `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功
+（exit 0、normal feature set、core 6m41s、Remote / EPUB worker 成功、PE runtime=4 / pe=3）。
+この invocation のみ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` とし、終了時に復元した。
+製品 exe は起動せず、`target/dev-runtime/mimageviewer-core.exe` を利用者へ引き渡す。
+既定は実利用中の `%APPDATA%/mimageviewer`。起動前に installed / tray-resident mIV を閉じる。
+ビルド結果の要約を `target/limiter-round-build-dev.log` に記録し、this round 専用の commit message は
+`target/prelimiter-msg.txt` に UTF-8 / BOM なしで上書きした。コミットはしていない。
+
+### Codex P3 対応: 0 秒開始の初期遅延補正（2026-10-04）
+
+6bef20dd5 に対する独立再レビューで、`audible_pts_after_latency` が負の PTS を 0 に clamp し、
+初回・0 秒への seek / loop で最終 limiter の先頭無音を trim できない P3 を確認。
+20ms の 2 chunk は最初が PTS 20ms まで伸び、次が 15ms に始まり、EOS までの出力が
+入力より約 5ms 多くなる。常時 limiter により dry 再生にも影響する。この follow-up も
+公開済み v4.3.0 には未収録。
+
+- source timeline への遅延換算は保ち、`max(0.0)` のみを除く。負の audible PTS は
+  `ProcessedChunk` / `AudioDspTail` の未 trim metadata に保持し、既存 pre-target trim で除去する。
+  Remote は既に負の PTS を保持し、AAC 入口で trim するため変更しない。
+- 新しい補正フラグや開始時専用分岐は追加しない。同じ通常処理 / tail / seek reset を使う。
+- 回帰は 44.1 / 48kHz、native / headless の実 pump と callback を通す。先読みより短い入力、
+  先読みと同じ長さ、1 frame 長い入力、短い分割入力、20ms の 2 chunk をそれぞれ
+  初回 → 実 EOF tick の loop-to-zero → user seek-to-zero で再生する。
+  全 PCM の一致、入力 frames == EOS までの出力 frames、PTS の連続と終端時刻、PDC を検証する。
+
+独立 follow-up レビュー（GPT-6.1 Sol / xhigh）は ACCEPT。対象は 6bef20dd5 に対する未コミット差分。
+
+| P3 follow-up 検証 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib zero_start_pump` | 1 passed。上記 60 組み合わせを実 pump / callback で確認 | `target/p3-zero-start.log` |
+| 同上 `video::audio::` | 59 passed（新しい回帰を含む） | `target/p3-audio.log` |
+| 同上 `video::tests::native_tick_` / `eos_tick` / `eos_empty_audio_seek` / `reaches_eof_with_real_pump` | 4 / 1 / 1 / 2 passed | `target/p3-test-1.log`〜`-4.log` |
+| 同上 `video::clock::` | 14 passed。上記関連テスト計 81 passed、重複する狭い回帰を除く | `target/p3-test-5.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/p3-check.log` / `target/p3-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 実施、check は exit 0 | — |
+
+Remote / composition / decoder の処理と UI は変更なし。前 round の有効な検証結果を再利用し、
+UI snapshot と glyph check の再実行は不要。製品 exe は未起動。実機の A/V sync / seek / loop と
+任意長の残響・ユーザー VST3 tail についての前 round の残事項は維持する。
+
+P3 の確認用 build も `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` で成功
+（exit 0、normal features、core 3m06s、Remote / EPUB worker 成功、PE runtime=4 / pe=3）。
+この invocation 内だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` とし、終了時に復元。
+build / staging の information stream は `target/p3-build-dev.log` に記録した。
+`target/dev-runtime/mimageviewer-core.exe` を更新したが起動していない。通常 APPDATA を使うため、
+利用者の確認前に installed / tray-resident mIV を閉じる。実機確認の残事項は前 round と同じ。
+コミットせず、`target/prelimiter-msg.txt` はこの P3 follow-up のみの内容で UTF-8 / BOM なしに上書き済み。
+
+
+### 実機フィードバック: 周回先頭への resampler 末尾混入（2026-10-04）
+
+5a569fb6f の dev-runtime を利用者が確認。2秒 / 48kHz stereo の可逆素材で、
+末尾4ms・10msのバーストは loop ON のとき2クリック、OFFなら1クリック。
+中央4msの対照素材は1回。通常 profile の Pro-L 2 + EffeTune では末尾4ms素材に
+open 直後のノイズもあった。これらは利用者の聴感結果であり、PCM測定ではない。
+この調査・修正も公開済み v4.3.0 には未収録。codec だけの Flush と SWR の EOS 未排出は
+v4.3.0 のソースにも存在する。利用者は installed v4.3.0 と聴感比較していないため、
+クリック全体を今回の EOS 変更による退行と断定しない。
+
+- 従来の P3 回帰は AudioFrame を注入し、Complete 後にまとめて callback で消費した。
+  decoder / swresample の履歴や、callback 間の underrun 無音を検査していなかった。
+  新しい回帰は実 WAV / MKV decoder → pump → callback → UI の EOF Full-loop tick →
+  demux seek / Flush を通し、全 callback 出力と実消費 PCM を別々に保持する。
+  48kHz 出力では各素材3周の単一バーストを確認。44.1kHz 出力では末尾4ms WAV の
+  次周先頭に peak 約0.69995 を再現し、単体 decoder と実 EOF-loop の両方が修正前に失敗した。
+- 原因は audio worker の Flush が codec だけを初期化し、SWR の delay / filter 履歴を
+  次 serial へ持ち越したこと。単なる seek reset では保持音声を捨てるため、通常 EOS では
+  codec → SWR → 共通 PCM sender → decoded EOS → 既存 DSP tail の順に排出する。
+  seek / stop / cancel では履歴を捨て、codec・SWR・sample timeline を同じ所有境界で初期化する。
+- SWR の出力は入力 frame の PTS へ毎回貼り直さず、一つの timeline owner が入力端と
+  実出力 sample 数による出力端を管理する。stream time-base の丸めは連続扱いにし、
+  実際の forward discontinuity は旧 SWR を排出・初期化してから新 PTS へ移る。
+  missing / backwards timestamp の既存の単調補完を保つ。新しい待ち時間・transport flag は設けない。
+- 排出中の pause は保持音声を捨てない。共通 sender が現在の PCM を stack 上に保持し、
+  bounded channel の空きを待つ。pause 中に enqueue できても callback の Playing gate は
+  音を出さず、次 packet の取得前に decoder が park する。seek / cancel は既存 serial /
+  cancel fence で pending PCM を破棄し、queue accounting を戻す。専用 EOS mode や queue は追加しない。
+- 成功した SWR 変換が0出力でも入力端を進め、後続入力と EOS で回復するケースを検査する。
+  ただし48kHz→44.1kHzで全体1入力 frameだけの極短媒体は、標準SWR NULL flush自体が
+  0出力となることを別テストで確認した。これは今回の2秒素材の欠落／混入とは別の上流制約で、
+  padding / crop による新しい回復処理は今回の範囲に含めない。
+- user VST / EffeTune の reset 呼出しは open の DSP handoff と、新 serial の最初の有効 frame に
+  既に存在し、v4.3.0 と条件は同じ。user VST は今回の EOS drain に入力されない。
+  従って通常 profile の open ノイズを「reset 呼び忘れ」や今回の drain だけで説明する根拠はない。
+  setProcessing の切替と報告 latency 分の無音処理は plugin 内部状態の完全消去を保証しない。
+  強い再初期化は visualizer 履歴、GUI thread、latency 再確認、owner handoff に影響するため、
+  reset ACK と段ごとの最初の非ゼロ出力を実機で照合してから判断する。
+- 診断は worker の通常ログと `audio_epoch` perf events に reset、drain frames、sample rate、
+  decoded / user VST 後 / EffeTune 後 / 出力準備の最初の非ゼロ PTS を記録する。
+  callback の `first_device_output` は全出力 PCM（underrun 無音を含む）のうち最初の非ゼロ PTS。
+  RT callback は既存 buffer lock 内で atomics だけを更新し、ログ出力は pump が行う。
+  VST reset は request ID / ACK / latency frames を記録する。マイク測定や OS / device 内の
+  buffering を測るものではない。新 profile と通常 profile の open・loop の比較に使う。
+
+forward discontinuity の保証は decoder / SWR の区間境界まで。既存の下流 DSP は同一 serial の
+PTS gap を区間別に管理せず、保持した旧 PCM を次 chunk の時刻へ割り当てる制約がある。
+v4.3.0 にも存在する別の pipeline 設計事項であり、この loop / seek-to-zero 修正では変更しない。
+
+独立 follow-up レビュー（GPT-6.1 Sol / xhigh）は ACCEPT。実機ノイズ全体の解決という判定ではなく、
+再現した decoder / SWR の混入、pause 所有境界と診断の差分に対する判定。
+
+| 実機フィードバック round の検証 | 結果 | ログ |
+| --- | --- | --- |
+| 修正前の実 decoder seek / UI EOF Full-loop 回帰 | 44.1kHz の次周先頭に旧末尾バーストを検出し失敗（意図した再現） | `target/audio-tail-seek-before.log` / `target/audio-tail-loop-before.log` |
+| `cargo test -p mimageviewer --lib audio_tail_seek_fixture_tests` | 6 passed。実素材、timeline、forward gap、cancel、pause / resume / seek、0出力後の回復 | `target/audio-tail-test-0.log` |
+| 同上 `video::audio::` / `video::decoder::` / `video::clockless_transcode::` | 60 / 86 / 38 passed、decoder / clockless 各1 ignored | `target/audio-tail-test-1.log`〜`-3.log` |
+| 同上 `effetune::composition::` / `video::clock::` | 3 / 14 passed | `target/audio-tail-test-4.log` / `-5.log` |
+| 同上 `real_decoder_eof_full_loop` | 1 passed。WAV / MKV × 44.1 / 48kHz × tail4ms / tail10ms / mid4ms × 3周、計36周。全 callback 出力と実消費 PCM を検査 | `target/audio-tail-test-6.log` |
+| 同上 `video::tests::native_tick_` / `eos_tick` / `eos_empty_audio_seek` / `reaches_eof_with_real_pump` | 4 / 1 / 1 / 2 passed | `target/audio-tail-test-7.log`〜`-10.log` |
+| 関連テスト計（重複する狭い6件を除く） | 210 passed / 2 ignored | 上記 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / 同上 `--features portable` | 両方 exit 0 | `target/audio-tail-check.log` / `target/audio-tail-check-portable.log` |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` / glyph check | 成功。UI文字列変更なし、dangerous glyph 0 | `target/audio-tail-fmt.log` / `target/audio-tail-glyphs.log` |
+
+製品 exe は起動せず、元の実機素材は読み取りだけで、通常 profile の設定・データを操作していない。
+検査用の実コピーを `testdata/audio-tail/` に収録した。実機確認手順と perf log の比較方法は
+`target/audio-tail-hardware-verification.md` に記録。通常 profile の open ノイズと利用者の出力 rate、
+修正後の末尾／先頭の聴感は利用者の確認待ち。
+
+確認用 build は `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` を実行したが、
+dev-runtime core（PID 112920）と Remote（PID 117288）が使用中のため exit 1 で更新を拒否した。
+実行中アプリを停止せず、旧確認用 exe は保持。利用者の通常終了後に同じ script を再実行する。
+この invocation だけ `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` を設定し、終了時に復元した。
+
+## 14. 最小化中の窓表示設定 (§1.312、2026-10-04)
+
+- 利用者が実装を承認。`Settings.effetune_keep_visible_when_minimized` を追加し、既定 false。
+  released settings を維持する加算的変更で、旧 JSON field / `settings_kv` key の欠落は serde default false。
+  `settings_db` は既存の全 field serialization / deserialization 経路で保存し、schema version は変更しない。
+- 環境設定「動画・音声 → 動画」の音響調整グループで入力ピーク保護の次にチェックボックスを配置。
+  portable build flavor は描画・検索索引とも cfg で除外する。保存済み設定自体は保持する。
+- 表示設定は起動時と Preferences OK 時に既存 `GuiGate` へ atomic で公開する。
+  mapping の version 2 / 40 byte は C++ と Rust で検査し、末尾 offset 32 がこの bool の u64 projection。
+  値が変わったときだけ既存 host-control worker の `ReconcileVisibility` を通知する。
+  GUI thread が現在値を読み `GuiVisibility::reconcile_main` で `Minimized` 理由だけを設定する。
+  `RemoteSession` と requested-visible の所有者は変更しない。main HWND 消失時は ON でも抑止する。
+- 単純化: 次回最小化までの保留値や追加の表示状態を作る案より、既存 reason-set の即時再評価を採用。
+  最小化中の OK も即時反映し、accepted な表示希望だけを非アクティブ復帰する。
+  未表示の初回 open / attach は従来どおり最小化イベントで取消し、ON にしただけで新しく開かない。
+  エディター再生成・モーダル化は、窓を残す目的と通常操作を妨げるため不要。
+- owner HWND 0 / tool window / 非 TOPMOST、既存の復帰 `SW_SHOWNA` を維持。owner・z-order・fullscreen・
+  detached・DSP・state capture・`user_hidden` の経路は変更しない。
+  tray-only `SW_HIDE` は `IsIconic` ではなく、現行コードも EffeTune を抑止しないため両設定でこの挙動を維持。
+  新しい tray reason や tray visibility の共有状態を追加しない。格納前から iconic なら最小化設定に従う。
+- 独立設計レビュー: GPT-6.1 Sol / xhigh が §4 と現行コードを確認し、上記所有境界・単純化に同意。
+  実装担当が自動検証を所有し、同じ Cargo target への重複実行を避ける。
+
+### 検証記録
+
+対象: `next-effetune-minimized` / base `d3cd4152a` の未コミット差分。実アプリは起動せず、利用者確認待ち。
+独立 completion source review は GPT-6.1 Sol / xhigh が ACCEPT（重大な指摘なし）。
+
+- `cmake --build crates/vst3-host/build --config Release`: exit 0。既存と追加の GUI 純状態 compile-time 回帰を含む。
+  `scripts/vst3-host-identity.ps1 -ValidateRepo .` も exit 0、source identity
+  `b981fb61b8ad8ba64a80eb8e16ad75f98754d2baa3465aef97f3120c9167207e`。
+  新 host は 835,584 bytes、SHA256 `582f47aa1f061080a61dc7c3bbfaaac65489ba44c9f49fa2ee2a9105deac1f49`。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。
+- 同 check `--features portable`: exit 0（`target/minvis/check-portable.log`）。
+- `cargo test -p mimageviewer --lib effetune`: exit 0、57 passed（`target/minvis/effetune-tests.log`）。
+  gate の policy 配送・連番維持、旧 blob / DB key 欠落、DB round trip、起動保存値、Preferences edit → OK → gate、既存 host handler を含む。
+- `cargo test -p mimageviewer --lib effetune_minimized --features portable`: exit 0、2 passed
+  （`target/minvis/portable-tests.log`）。保存設定の互換性と検索候補の除外を確認。
+- `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test ui_snapshot preferences_effetune_input_limit_dark`:
+  exit 0、1 passed（`target/minvis/snapshot-update.log`）。更新 PNG を目視確認し、初期値 OFF・入力保護の次の配置・日本語ラベルの欠けなしを確認。
+- `python scripts/check_ui_glyphs.py`: exit 0、危険な glyph 0。`cargo fmt --all --check` と `git diff --check` も clean。
+- `scripts/test-full.ps1 -SuppressCrashDialogs`: exit 101、launcher build の前提となる
+  `target/release/mimageviewer-{core,remote,epub-pdf}.exe` がこの worktree にないため、テスト実行前に停止。
+  product test failure ではなく不足前提。ログ `target/minvis/test-full.log`。full gate は未完了。
+- `scripts/build-dev.ps1 -PreserveRuntime`: exit 1、同じ worktree の dev-runtime core（PID 10696）が使用中のため更新を拒否。
+  実行中 core / Remote を停止せず、既存の確認 exe は更新されていない（`target/minvis/build-dev.log`）。
+  利用者の通常終了後に同じ script を再実行する。今回の指示に従い build-dev を選択し、C++ bridge 自体は先に再 build 済み。
+
+- `cargo test -p mimageviewer --lib`: exit 101、10,247 passed / 1 failed / 51 ignored、644.76 秒
+  （`target/minvis/core-lib-tests.log`）。唯一の失敗は未変更の
+  `fs_page_load_scheduler::tests::slow_read_and_decode_stay_within_process_budget` の最終 `peak == 3`（実際 2）。
+  scheduler が Running を公開してから worker が active/peak を更新する前に gate を解放できるテスト同期の隙間を、
+  実装者・独立 reviewer が確認した。permit 上限違反ではなく、機能差分の ACCEPT は維持。full-lib 全体は green と扱わない。
+  同じテストを `-- --exact` で孤立再実行すると exit 0 / 1 passed（`target/minvis/scheduler-isolated.log`）。
+  別の test-only follow-up は gate 解放前に `stats == 3 && active == 3` を待つ。期待値は緩和せず、今回の差分には入れない。
+- `cargo test -p mimageviewer --test ui_snapshot`: 並列実行は 17 件成功後に `0xc0000005 / STATUS_ACCESS_VIOLATION` で異常終了
+  （`target/minvis/snapshot-compare.log`）。原因は未特定で、snapshot 比較失敗とは区別して記録する。
+  同じ比較を `-- --test-threads=1` で直列実行し、exit 0 / 60 passed（25.62 秒、`target/minvis/snapshot-compare-serial.log`）。
+  更新した EffeTune snapshot も更新モードなしで一致を確認した。
+
+実アプリ起動・commit は行っていない。引き継ぎは `target/minvis-msg.txt`（英語 subject、UTF-8 BOM なし）。
+確認用 core を更新するには利用者がこの worktree の dev-runtime core / Remote を通常終了してから
+`scripts/build-dev.ps1 -PreserveRuntime` を再実行する。旧 exe は今回の機能確認には使わない。
+利用者確認は、OFF の最小化・復帰、ON の最小化中の窓操作・復帰、
+Remote と最小化の両解除順、ユーザーが閉じた窓の非復帰、tray-only 格納、再起動後の設定保持。
+
+## 15. §1.324 前段ピーク保護の再生中反映 (2026-10-05)
+
+利用者決定: 「EffeTune に渡す前に 0dB を超える音を抑える」を、画面・配信を開き直さず反映する。
+本節は §13 の開始時 snapshot / OFF 時の遅延除外を置き換える。製品起動による実機確認は未実施。
+
+### 原因と全 consumer の所有境界
+
+従来は `Settings` → `App::local_audio_dsp_chain` → `AudioDspChain` → `run_pump` と、
+`App::remote_clockless_audio_processing` → `ClocklessAudioProcessing` → `ClocklessAudioProcessor` が
+作成時に bool をコピーしていた。pause/resume、再利用、Remote seek / 画質の世代更新は同じ snapshot を保持する。
+
+- ローカル動画は `build_video_player_for_open`、音楽は既存音楽 builder から同じ chain を渡す。
+  メイン／全画面／別窓と動画の音声表示モードも同じ player / pump を使う。viewport / detached 述語は変更しない。
+- `EffetuneController` が所有する既存 `Arc<EffetuneAudioSlot>` に `AtomicBool` を追加（明示的な既定 true）。
+  App 初期化で保存設定、`install_preferences_settings` で確定設定を公開する。未確定 checkbox / Cancel は公開しない。
+  bridge の publish / clear / failure / generation 更新では設定を変更しない。
+- local chain と Remote config / processor が同じ slot を保持し、通常 PCM と EOS の各ブロックで target を読む。
+  Remote seek / 画質更新の config clone でも同じ Arc を維持する。追加 IPC、worker 再作成は不要。
+  RemoteHeadless metadata player に DSP chain は付けず、配信音声は clockless worker が処理する。
+- limiter の delay / gain / mix は引き続き pump / processor ごとの所有物。設定変更は兄弟 context を reset しない。
+
+### 単純化・連続性・遅延
+
+既存の閉じる／開き直す方式は利用者の即時反映要求を満たさないため採らない。専用 graph rebuild、
+切替通知 queue、codec / resampler / timeline の再初期化も不要。atomic の目標値だけを変える。
+
+`EffetuneInputLimiter` は EffeTune を実際に通る間、ON/OFF とも同じ 5ms lookahead を保持する。
+OFF は同じ delay-line の raw、ON はその制限済み音。連続して peak / gain 履歴を更新し、
+設定変更では現在の mix から約5ms（丸めた lookahead frames 相当）の線形 ramp を行う。
+両 channel に同じ frame mix を使い、短い block / 途中反転でも ramp を継続する。
+初回・seek・段の非適用・generation 変更後はその時点の設定へ snap し、旧音を引き継がない。
+ON へ切替中は raw 成分が残り、完全な ceiling 保護まで最大約5msかかる。
+
+成功時の PDC と EOS 排出量は OFF でも前段分を加算する。EffeTune plugin は引き続き実際の bridge 遅延のみを報告し、
+2秒 admission は plugin 合計だけを判定する。最終 limiter は常時有効で演算・HUD・遅延を維持する。
+`composition::compose_samples` の原本 fallback は変えず、EffeTune 失敗時だけ従来どおり前段／EffeTune 分を除外する。
+設定切替では latency reconciler の trim / 無音挿入を発生させず、sample 数・audible PTS を連続させる。
+EOS plan の設定 snapshot は撤去し、末尾排出中も live target を読む。
+
+Remote は次の未処理 PCM block から反映する。すでに生成した HLS segment / 端末 buffer は旧音声のままなので、
+端末で聴こえる反映には先読み分の遅れがある。既存 segment の破棄・再encode・配信再開は行わない。
+
+### 検証・引き渡し
+
+検証結果を下表に記録する。実機の click/pop、EffeTune meter、native 各表示、Remote は利用者確認待ち。
+
+対象: `next-effetune-live-limit` worktree の §1.324 未コミット差分。製品は起動していない。
+
+| 自動検証 | 結果 | 記録 |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib effetune_pre_limiter` | 11 passed、exit 0 | `target/1324-test-toggle.log` |
+| 同上 `video::audio::tests` | 62 passed、exit 0 | `target/1324-test-audio.log` |
+| 同上 `video::clockless_transcode::tests` | 39 passed、実ホスト profile 用 1 ignored、exit 0 | `target/1324-test-clockless.log` |
+| 同上 `effetune::composition::tests` | 3 passed、exit 0 | `target/1324-test-composition.log` |
+| `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/1324-check.log` |
+| 同上 `--features portable` | exit 0 | `target/1324-check-portable.log` |
+| `cargo test -j 1 -p mimageviewer --test ui_snapshot preferences_effetune_input_limit_dark` | 1 passed、exit 0。既存 PNG 変更なし | `target/1324-test-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | tool output |
+
+初回 lib test / 通常 check は Rust 検査前に libjpeg-turbo の CMake/MSBuild が exit 1 で停止。
+通常 check は依存 CMake を単一ジョブで build 後、`-j 1` で成功した。製品テスト失敗とは区別する。
+Remote 全体テストの旧 OFF 遅延期待値を固定 lookahead に合わせ、再実行は上記の全39件成功。
+
+- `scripts/test-full.ps1 -SuppressCrashDialogs`: exit 101 (`target/1324-test-full.log`)。
+  本体 lib は 10,461 passed / 1 failed / 51 ignored、718.45秒。唯一の失敗は未変更の
+  `indexer_manager::tests::incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls`。
+  初期類似索引が `ArrayPublication("similar index load failed: base publish failed: アクセスが拒否されました。 (0x80070005)")`
+  の `Degraded` で停止し、Complete 待機の期限で失敗した。アクセス拒否の原因は未特定。
+  workspace の残りの target（全67件の UI snapshot を含む）は成功。script は workspace 失敗で
+  後段の vendor 3 crate の test を実行しないため、全体 gate は未完了／green とは扱わない。
+  索引実装や期待値を変更せず、同じ feature の孤立実行で切り分ける。
+
+- 失敗した索引テストの孤立実行（`cargo test -j 1 -p mimageviewer --features pack-build-tools --lib indexer_manager::tests::incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls -- --exact`）:
+  exit 0、1 passed、2.69秒 (`target/1324-test-indexer-isolated.log`)。全体 gate の非ゼロ結果は維持する。
+- 最終 `cargo fmt --check` / `git diff --check`: ともに exit 0
+  (`target/1324-fmt-check.log` / `target/1324-diff-check.log`)。
+- 設計・完成実装の独立コードレビュー: 修正が必要な指摘なし。実機での観測ではなく source / 対象 test log のレビュー。
+
+- `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`: exit 0
+  (`target/1324-build-dev.log`)。`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` をこの実行の環境に指定。
+  既存 MSBuild node の待機を省き、使用中の staged executable は停止しない指定を使った。
+  normal feature / dev-runtime の core・Remote service・EPUB worker と runtime DLL を準備済み。portable は付けていない。
+  製品／smoke を起動せず、commit なし。英語コミット案は `target/1324-msg.txt`。
+
+利用者向け確認: インストール版／常駐tray版を終了後、repository root で
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` を実行する。
+引数なしでは実利用の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。
+EffeTune の効果を OFF にして meter を出し、動画／音楽の再生中に前段設定 ON→OFF→ON を OK で確定する。
+メイン／全画面／別窓／動画の音声表示モードで、開き直し不要・切替音や同期ずれがないことを確認する。
+Remote は配信を再開せず、先読み済み音声を待ってから入力ピークの変化を確認する。

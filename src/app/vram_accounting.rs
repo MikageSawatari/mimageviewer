@@ -11,6 +11,11 @@ fn add_fs_cache_entry(
     entry: &FsCacheEntry,
 ) {
     match entry {
+        FsCacheEntry::RawPreview { preview, .. } => {
+            if let Some(preview) = preview {
+                accountant.add_texture(subsystem, &preview.tex, true);
+            }
+        }
         FsCacheEntry::Static { tex, .. } => accountant.add_texture(subsystem, tex, true),
         FsCacheEntry::Animated { frames, .. } => {
             for (texture, _) in frames {

@@ -2380,7 +2380,7 @@ fn draw_native_top_button_enabled(
                 clip_rect: ui.clip_rect(),
                 layer_id: resp.layer_id,
                 sense: resp.sense,
-                enabled,
+                enabled: enabled && resp.enabled(),
             },
         );
     }
@@ -7871,32 +7871,40 @@ pub(crate) mod tests {
             let mut popup_open = false;
             let mut popup_rect = None;
             let mut commands = Vec::new();
-            let _ = ctx.run(input, |ctx| {
-                let _ = draw_native_top_bar(
-                    ctx,
-                    1_200.0,
-                    80.0,
-                    0.0,
-                    100.0,
-                    metadata,
-                    None,
-                    None,
-                    &mut popup_open,
-                    &mut popup_rect,
-                    "test-video.mp4",
-                    false,
-                    false,
-                    false,
-                    false,
-                    crate::settings::FsSidePanelMode::Hover,
-                    false,
-                    false,
-                    &mut commands,
-                    &mut observation,
-                    None,
-                    &mut None,
-                );
-            });
+            for frame in 0..2 {
+                let _ = ctx.run(input.clone(), |ctx| {
+                    let _ = draw_native_top_bar(
+                        ctx,
+                        1_200.0,
+                        80.0,
+                        0.0,
+                        100.0,
+                        metadata,
+                        None,
+                        None,
+                        &mut popup_open,
+                        &mut popup_rect,
+                        "test-video.mp4",
+                        false,
+                        false,
+                        false,
+                        false,
+                        crate::settings::FsSidePanelMode::Hover,
+                        false,
+                        false,
+                        &mut commands,
+                        &mut observation,
+                        None,
+                        &mut None,
+                    );
+                });
+                if frame == 0 {
+                    assert!(
+                        !observation.as_ref().unwrap().enabled,
+                        "sizing pass is not interactive"
+                    );
+                }
+            }
             observation.expect("native_top_panorama response observation")
         }
 

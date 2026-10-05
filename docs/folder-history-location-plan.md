@@ -318,3 +318,125 @@ park した時点で terminal になり、parked update が何も進めないこ
 binding テスト 1 件が失敗した。cold direct の grid 効果を早期確定するコードを
 `DirectPdfAdoption` への預託に変え、前者は直接 PDF worker の成功・password Cancel を
 通すテストへ更新した。後者は released warm placeholder の即時表示を検査する。
+
+## 13. A/B クイックフォルダの起動時所有復元（§1.326）
+
+2026-10-04、`next-quickslot-restore` で実装。利用者の再起動時の選択違いは報告済み、
+以下の target / MRU / drive map 上書き経路を source inspection で確認し、修正後の保持を
+状態遷移テストで検証する。実アプリの起動・上書き再現は行わない。
+
+### 原因と保存・復元境界
+
+constructor は `quick_folder_slots` / `quick_folder_recent_folders` /
+`quick_folder_drive_current_dirs` から両 workspace を復元する一方、active を常に A とした。
+初回 update の `open_default_startup_target` は `known_folders::startup_folder` が選ぶ
+`last_folder` を通常 open 経路へ渡す。B の場所を成功採用すると
+`record_folder_nav_transition_from_current` → `remember_recent_folder` /
+`update_active_quick_folder_target` が A の MRU、target、同一ドライブの map 値を更新する。
+`sync_quick_folder_settings` は workspace を Settings へコピーし、load 終端の save が
+その更新を永続化する。起動時だけ記録を抑止するのではなく、記録先の所有者を復元する。
+明示的な起動引数、別の起動場所設定、ZIP/PDF/変換書庫も、既存の成功採用時の記録規約を保つ。
+
+`on_exit_inner` は最後に `persist_window_state_and_flush(ProcessIsStopping)` を通る。
+トレイ退避も同じ関数の `ProcessKeepsRunning` を通る。両者の settings save より前に
+`sync_quick_folder_settings` で active と両 workspace を同期する。場所を load せずに成功する
+同一場所 / 未訪問スロットのドライブ一覧切替も、この境界で確定した active を保存できる。
+`last_folder` は既存どおり物理 load 成功時 / ドライブ一覧採用時に保存し、終了時に
+合成ビューの marker で置換しない。失敗・取消・未採用の A/B 切替は元 active のまま保存する。
+
+### None と互換性・簡素化
+
+`Settings.active_quick_folder_slot: Option<QuickFolderSlotId>` の欠落は `Some(A)` と読み替える。
+新規設定の既定も A。`Some(B)` と明示 `None` は constructor で最初の open より先に復元する。
+旧版が保存していなかった終了時 slot を欠落 field から推定しない。欠落時は指定どおり
+従来の A に所属する起動 open となり、既に上書きされた過去の場所はこの修正では復元しない。
+None で終了した場合も起動場所は既存 `last_folder` / 起動設定から選び、A/B の target、MRU、
+drive map を変更しない。合成ビューや Collection / Smart session の再起動復元は追加しない。
+この checkout の production Collection / Smart / 合成ビュー entry は active を None にする
+経路ではなく、None 代入は主にテスト fixture にある。従って特殊ビューからの終了で
+新たに None へ変える仕様変更も行わない。
+
+既存のリリース済み settings データへ項目を追加する。旧 JSON / SQLite の欠落 field は
+serde default により従来の A として互換読取し、既存 workspace の値を保持する。
+SQLite の `settings_kv` は Settings の通常 field を自動保存・復元し、専用テーブル除外の
+`COMPLEX_FIELDS` や Remote listing の限定読取リストには該当しない。DB schema version /
+SQL migration は不要。Preferences の古い draft を適用するときも runtime 値を継承する。
+
+簡素化として既存 typed slot を共有し、既存 constructor / save 境界に載せる。
+最後に選んだ非 None slot の別 field、起動専用 pending / rollback / live rebuild は追加しない。
+モーダル化を要する新たな長い処理や I/O はなく、既存非同期 open の採用規約を変更しない。
+
+### 検証
+
+`quick_folder_restart_tests` は使い捨て data-dir 内の実フォルダ A/B を使い、終了処理 →
+Settings DB 再読込 → production constructor → `open_default_startup_target` を通す。
+B / A / None の各終了状態、起動場所不変、両 target / MRU / drive map の保持を確認する。
+DB / JSON roundtrip、旧データの項目欠落による A default は settings_db の focused test で確認する。
+`6d1354235` からの本未コミット差分での自動検証（2026-10-04）:
+
+- `cargo test -p mimageviewer --lib quick_folder -- --test-threads=1`: 20 PASS。
+- `cargo test -p mimageviewer --lib phase_c_folder_nav_history_tests:: -- --test-threads=1`: 96 PASS。
+- `cargo test -p mimageviewer --lib settings::tests:: -- --test-threads=1`: 263 PASS / 12 ignored。
+- `cargo test -p mimageviewer --lib settings_db::tests:: -- --test-threads=1`: 121 PASS。
+- `cargo test -p mimageviewer --lib --no-fail-fast`: 10,207 PASS / 51 ignored / 0 FAIL。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と `--features portable`: 両方 PASS。
+- `cargo fmt --all -- --check`、`python scripts/check_ui_glyphs.py`（危険 glyph 0）、`git diff --check`: PASS。
+- `scripts/test-full.ps1 -SuppressCrashDialogs`: exit 101。launcher build が必要とする
+  `target/release/mimageviewer-{core,remote,epub-pdf}.exe` がこの worktree に無いため、
+  workspace / vendor gate は未完了。製品テストの失敗ではなく build 前提不足として記録する。
+  上記 full core lib run の成功で workspace gate の成功を代用しない。
+
+ログは `target/quickslot-{tests,history-tests,settings-tests,settings-db-tests,lib-full,check-normal,check-portable,fmt,full}.log`。
+製品 binary は起動していない。verification build の結果を下に記録する。
+
+`scripts/build-dev.ps1 -PreserveRuntime`: PASS（exit 0）。この worktree の実行中 process が
+無いことを確認してから実行し、normal feature set の core / remote / EPUB worker を
+`target/dev-runtime` へ作成した。CRT companion / PE dependency 検査も PASS（runtime 4 / PE 3）。
+ログは `target/quickslot-build-dev.log`。`portable` は有効化せず、binary は未起動。
+利用者確認では、起動場所を「前回終了した場所」にし、別々の場所を A/B に持たせ、
+B のまま実際に終了 → 再起動で B と B の場所、A 切替で元 A の場所・履歴・ドライブ別の場所を
+確認する。A 終了でも再確認し、Collection / Smart の root からの終了では既存 `last_folder`
+へ戻り、特殊ビュー自体を再開しないことを確認する。旧設定の field 欠落は A default であり、
+この再起動テストは本 binary で A/B を設定・終了した後の保存値に対して行う。
+通常 profile の確認 build は `%APPDATA%/mimageviewer` の実データを更新し得るため、
+利用者が installed / tray 常駐版を閉じてから起動する（single-instance mutex 共通）。
+
+### Codex P2 対応 — 取消時の None 所有復元
+
+`e147a4067` の独立 xhigh review で、`restore_folder_nav_history` が snapshot の明示 `None`
+を `.or(Some(A))` で A に変更する既存経路を指摘された。None を保存した状態で cold PDF を
+起動復元し、worker が PasswordRequired を返すと、password Cancel → `restore_epub_open` →
+共通 history restore → settings 同期で A に変更され、終了時も A を保存する。
+旧 field 欠落に対する A default と、採用済み snapshot の明示 None は別の意味である。
+
+共通 restore は `snapshot.active_quick_folder_slot` をそのまま戻す。新しい sentinel や
+取消専用分岐は追加せず、PDF / EPUB / archive / history rollback の全利用者で同じ規則にする。
+`src/` の slot 代入と `or` / `unwrap_or` 系の A fallback を横断検索し、restore / cancel に
+該当するものはこの一か所だけと確認した。旧設定の serde default と、明示的な A/B クリア操作の
+A 選択は意味が異なるため維持する。
+
+回帰テスト `quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership` は
+使い捨て DB に None と独立した A/B workspace、cold PDF の last_folder を保存し、再読込と
+constructor → startup open → Direct password request → Cancel → exit → DB 再読込を通す。
+worker の typed PasswordRequired result だけを注入する headless 状態遷移テストであり、
+実アプリ / 実パスワード dialog は起動しない。再読込後の None、last_folder、さらに次の物理 load
+で両 workspace の target / MRU / drive map が変わらないことを検証する。
+
+変更前は exit / reload 後の所有が `Some(A)`（期待 None）となって失敗した
+（1 FAIL、exit 101、`target/quickslot-p2-fail-before.log`）。`e147a4067` からの追補差分で再検証:
+
+- `cargo test -p mimageviewer --lib quick_folder -- --test-threads=1`: 21 PASS。
+- `cargo test -p mimageviewer --lib phase_c_folder_nav_history_tests:: -- --test-threads=1`: 96 PASS。
+- `cargo test -p mimageviewer --lib pdf_password -- --test-threads=1`: 24 PASS。
+- `cargo test -p mimageviewer --lib epub_modal -- --test-threads=1`: 11 PASS。
+- `cargo check -p mimageviewer --bin mimageviewer-core` と `--features portable`: 両方 PASS。
+- `cargo fmt --all -- --check` と `git diff --check`: PASS。
+
+ログは `target/quickslot-p2-{tests,history-tests,password-tests,epub-tests,check-normal,check-portable,fmt}.log`。
+上の full core lib / workspace gate 記録は `e147a4067` の元差分の証跡であり、
+この追補差分を含む全体 gate の成功とは扱わない。追補 dev build の結果を下に記録する。
+
+追補の `scripts/build-dev.ps1 -PreserveRuntime`: PASS（exit 0）。worktree 内の実行中 process が
+無いことを確認して実行し、normal / non-portable core と両 companion を作成した。
+CRT / PE dependency check も PASS（runtime 4 / PE 3）。
+ログは `target/quickslot-p2-build-dev.log`。製品 binary は未起動、利用者確認は未実施。

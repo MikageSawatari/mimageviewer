@@ -412,6 +412,9 @@ impl App {
             );
         }
         self.apply_content_identity_ledger_updates(report.ledger_entries);
+        if report.requested_restores > 0 {
+            self.reload_book_resume_meters();
+        }
         self.apply_content_restore_sidecar_mirrors(report.sidecar_mirrors, report.sidecar_bases);
         self.apply_content_restore_presence(report.presence);
         if report.requested_restores > 0 {

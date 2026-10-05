@@ -58,11 +58,26 @@ impl DirEntryKind {
 }
 
 pub fn classify_dir_entry(entry: &DirEntry, file_type: &FileType) -> DirEntryKind {
+    try_classify_dir_entry(entry, file_type).unwrap_or_else(|_| {
+        if file_type.is_symlink() {
+            DirEntryKind::File
+        } else {
+            DirEntryKind::Other
+        }
+    })
+}
+
+/// Walkers that infer absence must retain classification failures instead of
+/// treating an unobserved entry as an unsupported item.
+pub(crate) fn try_classify_dir_entry(
+    entry: &DirEntry,
+    file_type: &FileType,
+) -> std::io::Result<DirEntryKind> {
     if file_type.is_dir() {
-        return DirEntryKind::Directory;
+        return Ok(DirEntryKind::Directory);
     }
     if file_type.is_file() {
-        return DirEntryKind::File;
+        return Ok(DirEntryKind::File);
     }
     classify_special_dir_entry(entry, file_type)
 }
@@ -100,40 +115,40 @@ pub fn should_hide_fs_entry(entry: &DirEntry, show_hidden_files: bool) -> bool {
 }
 
 #[cfg(windows)]
-fn classify_special_dir_entry(entry: &DirEntry, file_type: &FileType) -> DirEntryKind {
+fn classify_special_dir_entry(
+    entry: &DirEntry,
+    file_type: &FileType,
+) -> std::io::Result<DirEntryKind> {
     use std::os::windows::fs::{FileTypeExt, MetadataExt};
 
     if file_type.is_symlink_dir() {
-        return DirEntryKind::ReparseDirectory;
+        return Ok(DirEntryKind::ReparseDirectory);
     }
     if file_type.is_symlink_file() {
-        return DirEntryKind::File;
+        return Ok(DirEntryKind::File);
     }
 
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
-    let Ok(meta) = entry.metadata() else {
-        return if file_type.is_symlink() {
-            DirEntryKind::File
-        } else {
-            DirEntryKind::Other
-        };
-    };
+    let meta = entry.metadata()?;
     let attrs = meta.file_attributes();
     let is_reparse = file_type.is_symlink() || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-    if is_reparse && attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+    Ok(if is_reparse && attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
         DirEntryKind::ReparseDirectory
     } else if is_reparse {
         DirEntryKind::File
     } else {
         DirEntryKind::Other
-    }
+    })
 }
 
 #[cfg(not(windows))]
-fn classify_special_dir_entry(_entry: &DirEntry, _file_type: &FileType) -> DirEntryKind {
-    DirEntryKind::Other
+fn classify_special_dir_entry(
+    _entry: &DirEntry,
+    _file_type: &FileType,
+) -> std::io::Result<DirEntryKind> {
+    Ok(DirEntryKind::Other)
 }
 
 pub fn directory_visit_key(path: &Path) -> String {

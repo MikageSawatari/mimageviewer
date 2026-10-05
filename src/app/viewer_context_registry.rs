@@ -758,6 +758,7 @@ pub(in crate::app) struct ViewerContextBundle {
     scroll_to_selected: bool,
     pending_grid_scroll: Option<GridScrollIntent>,
     requested: ThumbnailRequests,
+    raw_thumb_develop: Arc<Mutex<ItemsGenerationMap<crate::thumb_loader::RawThumbPending>>>,
     idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
@@ -904,6 +905,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
+    raw_pages: Box<RawPageStore>,
     fs_pending: ItemsGenerationMap<FsPendingValue>,
     fullscreen_pdf_promotion: FullscreenPdfPromotionState,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
@@ -1104,6 +1106,7 @@ pub(in crate::app) enum ContextAsyncOwner {
     EpubConversion,
     PdfPassword,
     FullscreenDecode,
+    RawPages,
     FinalAi,
     LocalAdjustment,
     ComicBake,
@@ -1120,7 +1123,7 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 18] = [
+    pub(in crate::app) const ALL: [Self; 19] = [
         Self::EpubConversion,
         Self::PdfPassword,
         Self::PathClassification,
@@ -1134,6 +1137,7 @@ impl ContextAsyncOwner {
         Self::PdfEnumeration,
         Self::ZipEnumeration,
         Self::FullscreenDecode,
+        Self::RawPages,
         Self::FinalAi,
         Self::LocalAdjustment,
         Self::ComicBake,
@@ -1175,6 +1179,7 @@ impl ContextAsyncOwner {
                     Self::EpubConversion => $owner.epub_convert.is_some(),
                     Self::PdfPassword => $owner.pdf_password_request.is_some(),
                     Self::FullscreenDecode => $owner.fs_pending.iter().next().is_some(),
+                    Self::RawPages => $owner.raw_pages.has_pending(),
                     Self::FinalAi => !$owner.final_ai_pending.is_empty(),
                     Self::LocalAdjustment => !$owner.local_adjust_pending.is_empty(),
                     Self::ComicBake => !$owner.comic_bake_pending.is_empty(),
@@ -1194,7 +1199,7 @@ impl ContextAsyncOwner {
     /// Collection/rating/bookmark polls also create or retire work from their visible surface.
     /// All other owners need a live request before a mounted frame calls their worker service.
     pub(in crate::app) fn needs_mounted_service(self, context: ContextRef<'_>) -> bool {
-        if self == Self::FullscreenDecode {
+        if matches!(self, Self::FullscreenDecode | Self::RawPages) {
             // Prefetch depends on the frame's freshly computed keep range. The frame calls
             // this variant's service at that exact point instead of the early open-owner poll.
             return false;
@@ -1251,7 +1256,9 @@ impl ContextAsyncOwner {
             Self::PdfEnumeration => app.poll_pdf_enumerate(),
             Self::ZipEnumeration => app.poll_zip_enumerate(),
             Self::EpubConversion | Self::PdfPassword => {}
-            Self::FullscreenDecode => app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel),
+            Self::FullscreenDecode | Self::RawPages => {
+                app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel)
+            }
             Self::FinalAi => app.poll_final_ai(ctx),
             Self::LocalAdjustment => app.poll_local_adjust_render(ctx),
             Self::ComicBake => {
@@ -1332,6 +1339,7 @@ impl ContextAsyncOwner {
             Self::PdfPassword => {
                 let _ = app.finish_pdf_password_request_in_mounted_context(PdfPasswordExit::Parked);
             }
+            Self::RawPages => app.raw_pages.park(),
             Self::FullscreenDecode => {
                 for (_, pending) in app.fs_pending.drain() {
                     pending.cancel();
@@ -1395,6 +1403,13 @@ impl<'a> ContextRef<'a> {
         match self.source {
             ContextRefSource::Mounted(app) => &app.fs_cache,
             ContextRefSource::AtRest(bundle) => &bundle.fs_cache,
+        }
+    }
+
+    pub(in crate::app) fn raw_pages(self) -> &'a RawPageStore {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.raw_pages,
+            ContextRefSource::AtRest(bundle) => &bundle.raw_pages,
         }
     }
 
@@ -1596,6 +1611,7 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.cancel_token.store(true, Ordering::Relaxed);
         if let Some(q) = &self.reload_queue {
             q.1.notify_all();
@@ -1625,6 +1641,7 @@ impl ViewerContextBundle {
             pending.cancel.store(true, Ordering::Relaxed);
         }
 
+        self.raw_pages.cancel_development_all();
         for pending in self.fs_pending.values() {
             pending.cancel();
         }
@@ -1667,6 +1684,11 @@ const _: () = {
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
+            self.raw_thumb_develop
+                .lock()
+                .unwrap()
+                .set_items_generation(items_generation);
             self.still_seek_thumbnail_pages.clear();
             if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
                 shared.clear();
@@ -1678,6 +1700,7 @@ impl ViewerContextBundle {
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
+        self.raw_pages.set_items_generation(items_generation);
         self.fs_early_dims.set_items_generation(items_generation);
         self.fs_upload_backlog
             .set_items_generation(items_generation);
@@ -1728,6 +1751,7 @@ impl ViewerContextBundle {
             scroll_to_selected: false,
             pending_grid_scroll: None,
             requested: ThumbnailRequests::default(),
+            raw_thumb_develop: Arc::new(Mutex::new(ItemsGenerationMap::new("raw_thumb_develop"))),
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
@@ -1836,6 +1860,7 @@ impl ViewerContextBundle {
             ),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
+            raw_pages: Box::new(RawPageStore::new()),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
@@ -1995,6 +2020,7 @@ impl App {
         self.continuous_page_transitions.clear();
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
+        crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.texture_backlog.clear();
         debug_assert!(
             ContextAsyncOwner::ALL
@@ -2094,6 +2120,7 @@ impl App {
             scroll_to_selected,
             pending_grid_scroll,
             requested,
+            raw_thumb_develop,
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
@@ -2197,6 +2224,7 @@ impl App {
             fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
+            raw_pages,
             fs_pending,
             fullscreen_pdf_promotion,
             fs_pdf_display_target,
@@ -2362,6 +2390,7 @@ impl App {
         swap_field!(scroll_to_selected);
         swap_field!(pending_grid_scroll);
         swap_field!(requested);
+        swap_field!(raw_thumb_develop);
         swap_field!(idle_upgrade_cache_bypass_ineligible);
         swap_field!(keep_range);
         swap_field!(keep_set);
@@ -2476,6 +2505,7 @@ impl App {
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
+        swap_field!(raw_pages);
         swap_field!(fullscreen_pdf_promotion);
         swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
@@ -2634,6 +2664,7 @@ impl App {
     pub(in crate::app) fn split_current_context_preserving_main_grid(
         &mut self,
     ) -> Box<ViewerContextBundle> {
+        crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         // Forking changes the exact viewer owner even when the new payload retains the same
         // fullscreen index. Never carry a physical right-button sequence across that boundary.
         self.fs_secondary_press.cancel();
@@ -2689,6 +2720,7 @@ impl App {
             scroll_to_selected,
             pending_grid_scroll,
             requested,
+            raw_thumb_develop,
             metadata_import_refresh_index,
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
@@ -2792,6 +2824,7 @@ impl App {
             fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
+            raw_pages,
             fs_pending,
             fullscreen_pdf_promotion,
             fs_pdf_display_target,
@@ -3031,6 +3064,7 @@ impl App {
             fullscreen_page_layout,
             fs_margin_bbox_cache,
             input_generation,
+            raw_pages,
             fs_pending,
             fullscreen_pdf_promotion,
             fs_pdf_display_target,
@@ -3115,6 +3149,7 @@ impl App {
             stack_script_pending,
             facet_name_cache_pending,
             requested,
+            raw_thumb_develop,
             metadata_import_refresh_index,
             idle_upgrade_cache_bypass_ineligible,
             details_thumb_suppression_applied,
@@ -4372,6 +4407,48 @@ mod tests {
             SimilarMoveTrace::terminal_reasons_for_test(navigation_id),
             vec!["context_parked"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parking_mounted_context_cancels_its_raw_thumbnail_ticket() {
+        let mut app = crate::app::setup_app_for_test();
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let _blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        let ticket = executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            result_tx,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let generation = app.items_generation;
+        let pending = crate::thumb_loader::RawThumbPending::for_test(
+            ticket,
+            tx,
+            Arc::clone(&done),
+            generation,
+        );
+        {
+            let mut map = app.raw_thumb_develop.lock().unwrap();
+            map.set_items_generation(generation);
+            map.insert(0, pending);
+        }
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .canceled
+        );
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+        assert!(app.raw_thumb_develop.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
     }
 
     #[cfg(windows)]

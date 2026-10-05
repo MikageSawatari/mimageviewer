@@ -1,3 +1,4 @@
+import { RawPrefetchWindowPublisher, rawPrefetchWindow } from "./raw-prefetch-window.mjs";
 import {
   CommandName,
   FitMode,
@@ -43,6 +44,7 @@ import {
   pageAdmissionRetryDelayMs,
   pageDecodeAheadUnitIndexes,
   pageRequestIsTransientlyBusy,
+  pageRequestIsDemandCongestion,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
   pagePrefetchPlan,
@@ -848,11 +850,13 @@ export class PageDemandAdapter {
     prefetchConcurrency = PAGE_PREFETCH_CONCURRENCY,
     wirePrefix = null,
     onStatusChange = () => {},
+    recordTelemetry = enqueueTelemetry,
   }) {
     this.cache = cache;
     this.fetchResource = fetchResource;
     this.postDemand = postDemand;
     this.onStatusChange = onStatusChange;
+    this.recordTelemetry = recordTelemetry;
     this.wirePrefix = wirePrefix ?? pageWirePrefix();
     this.requestsByKey = new Map();
     this.jobs = new Map();
@@ -1079,10 +1083,13 @@ export class PageDemandAdapter {
 
   async runJob(job) {
     let outcome = PageJobState.FAILED;
+    let congestionRetries = 0;
+    let congestionWaitMs = 0;
     try {
       let resource;
-      let foregroundBusyRetries = 0;
+      let boundedBusyRetries = 0;
       for (let attempt = 0; ; attempt += 1) {
+        if (job.controller.signal.aborted) throw abortError();
         const prefetch = job.priority === PageJobPriority.PREFETCH;
         const request = {
           ...job.request,
@@ -1097,26 +1104,42 @@ export class PageDemandAdapter {
           resource = await this.fetchResource(
             request,
             job.controller.signal,
-            prefetch
+            prefetch,
+            () => this.coordinator.hasPendingDisplayDemand(job.keyId)
           );
           break;
         } catch (error) {
+          const demandCongestion = pageRequestIsDemandCongestion(
+            error?.status,
+            error?.code
+          ) && this.coordinator.hasPendingDisplayDemand(job.keyId);
           if (
             job.controller.signal.aborted ||
             !pageRequestIsTransientlyBusy(error?.status) ||
-            (!prefetch &&
-              foregroundBusyRetries >= FOREGROUND_ADMISSION_RETRY_LIMIT)
+            (!demandCongestion &&
+              boundedBusyRetries >= FOREGROUND_ADMISSION_RETRY_LIMIT)
           ) {
             throw error;
           }
-          if (!prefetch) foregroundBusyRetries += 1;
-          await delayWithAbort(
-            pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
-            job.controller.signal
-          );
+          if (demandCongestion) congestionRetries += 1;
+          else boundedBusyRetries += 1;
+          const waitStarted = performance.now();
+          try {
+            await delayWithAbort(
+              pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
+              job.controller.signal
+            );
+          } finally {
+            if (demandCongestion) congestionWaitMs += performance.now() - waitStarted;
+          }
         }
       }
       if (job.controller.signal.aborted) throw abortError();
+      if (resource?.kind === "skipped") {
+        outcome = PageJobState.SKIPPED;
+        this.recordTelemetry({ type: "page_prefetch", status: "skip" });
+        return;
+      }
       const prefetchStatus =
         job.effectPriority === PageJobPriority.PREFETCH
           ? job.priority === PageJobPriority.FOREGROUND
@@ -1127,7 +1150,7 @@ export class PageDemandAdapter {
       this.cache.remember(job.keyId, resource);
       rememberMediaImageInfo(job.request, resource.info);
       if (job.priority === PageJobPriority.PREFETCH) {
-        enqueueTelemetry({
+        this.recordTelemetry({
           type: "page_prefetch",
           status: "ready",
           fetch_ms: roundMs(resource.fetchMs),
@@ -1141,13 +1164,21 @@ export class PageDemandAdapter {
         ? PageJobState.ABORTED
         : PageJobState.FAILED;
       if (error?.name !== "AbortError") {
-        enqueueTelemetry({
+        this.recordTelemetry({
           type: "page_prefetch",
           status: "failed",
           message: limitText(error instanceof Error ? error.message : error, 240),
         });
       }
     } finally {
+      if (congestionRetries > 0) {
+        this.recordTelemetry({
+          type: "page_congestion",
+          retry_count: congestionRetries,
+          wait_ms: roundMs(congestionWaitMs),
+          outcome,
+        });
+      }
       this.jobs.delete(job.jobId);
       this.applyEffects(this.coordinator.settle(job.jobId, { status: outcome }));
     }
@@ -1622,6 +1653,28 @@ export function persistentCollectionRouteOwnerTransition(
 }
 
 let recentPointerSource = { source: "mouse", at: 0 };
+const rawPrefetchPublisher = new RawPrefetchWindowPublisher({
+  delay: abortableDelay,
+  send: async (body, session, signal) => {
+    const headers = remoteHeaders({ "Content-Type": "application/json" });
+    headers.set("X-mIV-Remote-Session", session);
+    const response = await fetch("/api/raw-prefetch-window", { method: "POST", headers, body: JSON.stringify(body), signal });
+    if (state.remoteSessionId !== session || signal.aborted) return response;
+    if (response.ok && response.headers.get("X-mIV-Remote-Session") !== session) {
+      const error = new Error("RAW 先読み窓のセッションが一致しません。");
+      error.retryable = false;
+      throw error;
+    }
+    if (response.status === 409 || response.status === 428) {
+      const detail = await response.clone().json().catch(() => ({}));
+      const status = remoteSessionFailureStatus({ sessionStatus: detail.status, httpStatus: response.status, errorCode: detail.error });
+      if (state.remoteSessionId !== session || signal.aborted) return response;
+      if (status) setRemoteSessionStatus(status, detail.message || "操作権がありません。再接続してください。", { observer: "api_request", observedStatus: detail.status, httpStatus: response.status });
+    }
+    return response;
+  },
+});
+
 
 /// 再読み込み直後のシークバーに青枠が出るという報告の切り分け用。
 /// 誰も focus を当てていないので、ブラウザが復元した focus が
@@ -1808,6 +1861,20 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
   return state.remoteSessionAcquirePromise;
 }
 
+function committedRawPrefetchPresentation(snapshot) {
+  if (!state.viewer || !snapshot || snapshot.viewer !== state.viewer || snapshot.pageGroups !== state.pageGroups) return null;
+  const visibleIndexes = pageGroupNavigationEntries(snapshot.group)
+    .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
+    .filter((index) => index >= 0);
+  return {
+    unit: [snapshot.contextIdentity, snapshot.groupIdentity],
+    direction: state.pageDirection,
+    entries: rawPrefetchWindow({ images: state.images, visibleIndexes, direction: state.pageDirection, addressOf: entryAddress }),
+  };
+}
+
+
+
 function newRemoteSessionCacheEpoch() {
   return (
     globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
@@ -1830,6 +1897,7 @@ export function applyRemoteSessionId(
   // Identity is the admission boundary. Publish its revocation before invoking an optional
   // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
+  rawPrefetchPublisher.setSession(next);
   activateVideoProgressWriter(next, state.viewer?.progressRemoteSessionId);
   state.remoteSessionCorrelation = "";
   if (next) {
@@ -3742,6 +3810,7 @@ function cleanupScreen(preserveRequestController = null) {
   state.remoteAiController = null;
   state.archiveOpenController?.destroy();
   state.archiveOpenController = null;
+  rawPrefetchPublisher.leave();
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -5562,6 +5631,10 @@ function openViewerPagePosition(viewer, groupIndex) {
   })) return snapshot;
   reanchorViewerPageGroups();
   return null;
+}
+
+export function viewerPagePresentationForTest() {
+  return RUNTIME_TEST_MODE ? viewerPagePresentation() : null;
 }
 
 export function openViewerPagePositionForTest(viewer, groupIndex) {
@@ -14505,6 +14578,7 @@ export class ImageViewer {
     if (livePositionSnapshot) {
       viewerPositionOwner.display(livePositionSnapshot);
     }
+    if (livePositionSnapshot && state.viewer === this) rawPrefetchPublisher.commit(committedRawPrefetchPresentation(livePositionSnapshot));
     this.displayedSeekState = { ...seekState };
     if (!this.requestedPagePresentation) {
       this.initializePagePresentation({
@@ -16020,7 +16094,11 @@ function currentVisualViewportScale() {
 }
 
 async function observedFetch(url, options = {}, sessionRecoveryAttempted = false) {
-  const { sessionEpochBound = false, ...requestOptions } = options;
+  const {
+    sessionEpochBound = false,
+    suppressErrorTelemetryFor = null,
+    ...requestOptions
+  } = options;
   const fetchOptions = {
     ...requestOptions,
     headers: remoteHeaders(requestOptions.headers),
@@ -16084,19 +16162,26 @@ async function observedFetch(url, options = {}, sessionRecoveryAttempted = false
         }
       }
     }
-    recordClientError(
-      "fetch_non_2xx",
-      new Error(`HTTP ${response.status} ${response.statusText}`),
-      {
-        resource: safeResourcePath(url),
-        status: response.status,
-      }
-    );
+    if (!suppressErrorTelemetryFor?.(response, detail)) {
+      recordClientError(
+        "fetch_non_2xx",
+        new Error(`HTTP ${response.status} ${response.statusText}`),
+        {
+          resource: safeResourcePath(url),
+          status: response.status,
+        }
+      );
+    }
   }
   return response;
 }
 
-async function fetchPageResource(request, signal, prefetch) {
+export async function fetchPageResource(
+  request,
+  signal,
+  prefetch,
+  hasPendingDisplayDemand = () => false
+) {
   const startedAt = performance.now();
   const options = {
     signal,
@@ -16106,7 +16191,13 @@ async function fetchPageResource(request, signal, prefetch) {
   };
   const response = prefetch
     ? await fetch(request.url, options)
-    : await observedFetch(request.url, { ...options, sessionEpochBound: true });
+    : await observedFetch(request.url, {
+      ...options,
+      sessionEpochBound: true,
+      suppressErrorTelemetryFor: (response, detail) =>
+        hasPendingDisplayDemand() &&
+        pageRequestIsDemandCongestion(response.status, detail.error),
+    });
   if (!response.ok) {
     throw await pageResourceResponseError(response);
   }
@@ -16117,8 +16208,12 @@ async function fetchPageResource(request, signal, prefetch) {
     error.code = "remote_session_unattested";
     throw error;
   }
-  requirePageResponseIdentity(request.address, response);
   requirePageResponseGeneration(request, response);
+  if (response.status === 204 &&
+      response.headers.get("X-mIV-Page-Skip") === "raw-prefetch") {
+    return { kind: "skipped" };
+  }
+  requirePageResponseIdentity(request.address, response);
   const width = Number(response.headers.get("X-mIV-Image-Width"));
   const height = Number(response.headers.get("X-mIV-Image-Height"));
   const pageRenderHeader = response.headers.get("X-mIV-Page-Render-Ms");

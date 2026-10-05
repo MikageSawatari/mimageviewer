@@ -499,6 +499,13 @@ struct ItemQueryTestHook {
 }
 
 impl SimilarIndexManager {
+    pub(crate) fn set_raw_executor(&self, executor: Arc<crate::raw::RawDevelopExecutor>) {
+        *self
+            .scheduler
+            .raw_executor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(executor);
+    }
     pub(crate) fn new_if_enabled(
         capability: SimilarFeatureCapability,
         data_dir: PathBuf,
@@ -557,6 +564,7 @@ impl SimilarIndexManager {
                 memory: Arc::clone(&memory),
                 summary: Arc::clone(&summary),
                 memory_epoch: Arc::clone(&memory_epoch),
+                memory_load_elapsed_us: AtomicU64::new(0),
                 item_query: Arc::clone(&item_query),
                 book_query,
                 #[cfg(test)]
@@ -564,10 +572,16 @@ impl SimilarIndexManager {
                 known_book_store: Mutex::new(ObservedBookStore::Unobserved),
                 prefill_db: Arc::new(Mutex::new(None)),
                 enabled_roots: Arc::clone(&enabled_roots),
+                raw_executor: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
                 array_update: Mutex::new(ArrayUpdateState::default()),
                 array_changed: Condvar::new(),
                 compaction_running: AtomicBool::new(false),
+                skip_offline_change_scan: AtomicBool::new(false),
+                #[cfg(test)]
+                startup_test_probe: Mutex::new(None),
+                #[cfg(test)]
+                user_check_all_requests: AtomicU64::new(0),
                 #[cfg(test)]
                 full_jobs_started: AtomicU64::new(0),
                 #[cfg(test)]
@@ -609,28 +623,8 @@ impl SimilarIndexManager {
         activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
         excluded_roots: Vec<PathBuf>,
     ) {
-        let roots: Vec<ConfiguredRoot> = favorites
-            .iter()
-            .filter(|favorite| favorite.auto_index_similar)
-            .map(|favorite| ConfiguredRoot {
-                favorite_id: favorite.id,
-                key: crate::search_index_db::normalize_path(&favorite.path),
-                path: favorite.path.clone(),
-            })
-            .collect();
-        let should_load = !roots.is_empty();
-        self.scheduler
-            .configure(roots, pdf_passwords, activity_gate, excluded_roots);
-        if should_load {
-            start_memory_load(
-                &self.data_dir,
-                &self.memory,
-                &self.memory_epoch,
-                &self.item_query,
-                MemoryLoadTrigger::Configure,
-                Some(Arc::downgrade(&self.scheduler)),
-            );
-        }
+        self.notifier()
+            .configure(favorites, pdf_passwords, activity_gate, excluded_roots);
     }
 
     /// メタデータ索引 supervisor の watcher から再照合を要求する軽量 notifier。
@@ -638,6 +632,22 @@ impl SimilarIndexManager {
         SimilarIndexNotifier {
             scheduler: Arc::downgrade(&self.scheduler),
         }
+    }
+
+    /// 起動時の設定値を初回 configure 前に渡す。実行中の構成は変えない。
+    pub(crate) fn set_skip_offline_change_scan(&self, skip: bool) {
+        self.notifier().set_skip_offline_change_scan(skip);
+    }
+
+    pub(crate) fn request_full_all(&self) {
+        self.notifier().request_full_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_check_request_count_for_test(&self) -> u64 {
+        self.scheduler
+            .user_check_all_requests
+            .load(Ordering::Acquire)
     }
 
     pub fn progress(&self) -> IndexProgress {
@@ -992,6 +1002,14 @@ fn start_memory_load(
             if epoch_guard.load(Ordering::Acquire) != epoch {
                 return;
             }
+            // Diagnostic only: publish the actual load time with the matching memory epoch.
+            // Configure may start this load before the index worker's eager-load call.
+            if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
+                scheduler.memory_load_elapsed_us.store(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             *state = match loaded {
                 Ok(Some(index)) => MemoryState::Ready(index),
                 Ok(None) => MemoryState::Missing,
@@ -1069,6 +1087,41 @@ impl SchedulerConfig {
     }
 }
 
+/// 入力: 正規化・整列・重複除去した有効 root 集合と共通除外 root、DB schema / hash /
+/// page order の版、走査・本分類に使う拡張子集合 (Susie の申告も含む)。
+/// 構成 epoch と PDF password revision は永続的な入力ではないので含めない。
+fn similar_scan_fingerprint(config: &SchedulerConfig) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut extensions = crate::folder_tree::SUPPORTED_EXTENSIONS
+        .iter()
+        .chain(crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS)
+        .chain(crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS)
+        .copied()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    extensions.extend(["zip", "cbz", "pdf"].map(str::to_owned));
+    extensions.extend(crate::susie_loader::get_pool().extensions());
+    extensions.sort();
+    extensions.dedup();
+    let input = serde_json::to_vec(&(
+        config.normalized_roots(),
+        &config.excluded_root_keys,
+        crate::similar_db::SCHEMA_VERSION,
+        current_hash_version(),
+        crate::similar_db::PAGE_ORDER_VERSION,
+        extensions,
+    ))
+    .expect("fingerprint inputs serialize");
+    format!("{:x}", Sha256::digest(input))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletedReconcileKind {
+    ScannedFull,
+    ReusedInitial,
+    Incremental,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfiguredRoot {
     favorite_id: Uuid,
@@ -1081,6 +1134,9 @@ enum WatchHealth {
     Pending,
     Ready,
     Unavailable,
+    /// Stopped lifecycle: no watcher, and the replacement registration is not issued yet.
+    /// Unlike a temporary failure, this is a barrier rather than a degraded scan terminal.
+    Revoked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1102,6 +1158,7 @@ pub struct SimilarWatchRegistration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FullReason {
     Initial,
+    UserCheck,
     Reconfigure,
     Overflow,
     WatchRecovery,
@@ -1113,6 +1170,7 @@ impl FullReason {
     fn label(self) -> &'static str {
         match self {
             Self::Initial => "initial",
+            Self::UserCheck => "user_check",
             Self::Reconfigure => "reconfigure",
             Self::Overflow => "overflow",
             Self::WatchRecovery => "watch_recovery",
@@ -1123,7 +1181,7 @@ impl FullReason {
 
     fn container_preopen_policy(self) -> ContainerPreopenPolicy {
         match self {
-            Self::Initial => ContainerPreopenPolicy::InitialMetadataTrust,
+            Self::Initial | Self::UserCheck => ContainerPreopenPolicy::InitialMetadataTrust,
             Self::Reconfigure
             | Self::Overflow
             | Self::WatchRecovery
@@ -1440,6 +1498,7 @@ struct ReconcileRunTelemetry {
     next_progress_log_ms: AtomicU64,
     terminal_logged: AtomicBool,
     work: ReconcileWorkCounters,
+    reused_cleanup_time: ReconcileDurationCounter,
     #[cfg(test)]
     phase_trace: Mutex<Vec<&'static str>>,
 }
@@ -1455,6 +1514,7 @@ impl ReconcileRunTelemetry {
             next_progress_log_ms: AtomicU64::new(RECONCILE_PROGRESS_LOG_INTERVAL_MS),
             terminal_logged: AtomicBool::new(false),
             work: ReconcileWorkCounters::default(),
+            reused_cleanup_time: ReconcileDurationCounter::default(),
             #[cfg(test)]
             phase_trace: Mutex::new(Vec::new()),
         }
@@ -1462,6 +1522,22 @@ impl ReconcileRunTelemetry {
 
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn reused_initial_log(
+        &self,
+        page_order_elapsed: Duration,
+        memory_load_elapsed_us: u64,
+        ack_elapsed: Duration,
+    ) -> String {
+        // The eager memory load overlaps cleanup and the ack wait; these are not additive.
+        format!(
+            "similar reconcile reused initial: skipped=true cleanup_ms={:.1} page_order_ms={:.1} memory_ms={:.1} ack_ms={:.1}",
+            self.reused_cleanup_time.snapshot().total_us as f64 / 1000.0,
+            page_order_elapsed.as_secs_f64() * 1000.0,
+            memory_load_elapsed_us as f64 / 1000.0,
+            ack_elapsed.as_secs_f64() * 1000.0,
+        )
     }
 
     fn prefix(&self) -> String {
@@ -1711,19 +1787,70 @@ impl Default for SchedulerState {
 }
 
 impl SchedulerState {
+    fn can_reuse_initial(&self, plan: &ReconcileJobPlan) -> bool {
+        matches!(
+            plan.running.kind,
+            ReconcileJobKind::Full(FullIntent {
+                reason: FullReason::Initial,
+                ..
+            })
+        ) && self.config_epoch == plan.running.config_epoch
+            && self.pending_full.is_none()
+            && plan.config.roots.iter().all(|root| {
+                self.watch_by_root
+                    .get(&root.favorite_id)
+                    .is_some_and(|watch| {
+                        watch.health == WatchHealth::Ready
+                            && watch.gap_epoch == watch.repaired_gap_epoch
+                    })
+            })
+    }
     fn merge_full_intent(&mut self, intent: FullIntent) {
-        let should_replace = self.pending_full.is_none_or(|pending| {
-            intent.config_epoch > pending.config_epoch
-                || intent.config_epoch == pending.config_epoch
-                    && (intent.required_gap_epoch > pending.required_gap_epoch
-                        || intent.required_gap_epoch == pending.required_gap_epoch
-                            && pending.reason.container_preopen_policy()
-                                == ContainerPreopenPolicy::InitialMetadataTrust
-                            && intent.reason.container_preopen_policy()
-                                == ContainerPreopenPolicy::MustOpen)
-        });
-        if should_replace {
-            self.pending_full = Some(intent);
+        match self.pending_full {
+            None => self.pending_full = Some(intent),
+            Some(pending) if intent.config_epoch > pending.config_epoch => {
+                self.pending_full = Some(intent);
+            }
+            Some(pending) if intent.config_epoch == pending.config_epoch => {
+                // Keep the strongest check independently of the newest required gap.
+                // UserCheck also dominates Initial so an explicit check cannot be skipped.
+                let reason = match (
+                    pending.reason.container_preopen_policy(),
+                    intent.reason.container_preopen_policy(),
+                ) {
+                    (
+                        ContainerPreopenPolicy::MustOpen,
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                    ) => pending.reason,
+                    (
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                        ContainerPreopenPolicy::MustOpen,
+                    ) => intent.reason,
+                    (
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                        ContainerPreopenPolicy::InitialMetadataTrust,
+                    ) => {
+                        if pending.reason == FullReason::UserCheck {
+                            pending.reason
+                        } else {
+                            intent.reason
+                        }
+                    }
+                    (ContainerPreopenPolicy::MustOpen, ContainerPreopenPolicy::MustOpen) => {
+                        if intent.required_gap_epoch > pending.required_gap_epoch {
+                            intent.reason
+                        } else {
+                            pending.reason
+                        }
+                    }
+                };
+                self.pending_full = Some(FullIntent {
+                    reason,
+                    required_gap_epoch: pending.required_gap_epoch.max(intent.required_gap_epoch),
+                    ..pending
+                });
+            }
+            Some(_) => {}
         }
     }
 
@@ -1757,14 +1884,19 @@ impl SchedulerState {
         config.roots.iter().all(|root| {
             self.watch_by_root
                 .get(&root.favorite_id)
-                .is_some_and(|watch| watch.health != WatchHealth::Pending)
+                .is_some_and(|watch| {
+                    matches!(watch.health, WatchHealth::Ready | WatchHealth::Unavailable)
+                })
         })
     }
 
     fn has_unavailable_watch(&self) -> bool {
-        self.watch_by_root
-            .values()
-            .any(|watch| watch.health == WatchHealth::Unavailable)
+        self.watch_by_root.values().any(|watch| {
+            matches!(
+                watch.health,
+                WatchHealth::Unavailable | WatchHealth::Revoked
+            )
+        })
     }
 
     fn has_runnable_work(&self) -> bool {
@@ -1869,8 +2001,24 @@ impl SchedulerState {
         self.phase = SchedulerPhase::Idle;
     }
 
+    #[cfg(test)]
     fn finish_successful_job(&mut self, plan: &ReconcileJobPlan) -> SuccessfulJobDisposition {
-        if let ReconcileJobKind::Full(intent) = plan.running.kind {
+        let kind = if matches!(plan.running.kind, ReconcileJobKind::Full(_)) {
+            CompletedReconcileKind::ScannedFull
+        } else {
+            CompletedReconcileKind::Incremental
+        };
+        self.finish_completed_job(plan, kind)
+    }
+
+    fn finish_completed_job(
+        &mut self,
+        plan: &ReconcileJobPlan,
+        kind: CompletedReconcileKind,
+    ) -> SuccessfulJobDisposition {
+        if let (CompletedReconcileKind::ScannedFull, ReconcileJobKind::Full(intent)) =
+            (kind, plan.running.kind)
+        {
             self.dirty.retain_after(plan.running.start_event_seq);
             for watch in self.watch_by_root.values_mut() {
                 if plan.running.repairs_watch_gap && watch.gap_epoch <= intent.required_gap_epoch {
@@ -1926,6 +2074,8 @@ struct SimilarIndexScheduler {
     memory: Arc<Mutex<MemoryState>>,
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
+    // Last current-epoch eager load duration; it never participates in scheduler decisions.
+    memory_load_elapsed_us: AtomicU64,
     item_query: Arc<Mutex<ItemQueryCache>>,
     book_query: BookQueryExecutor<Arc<BookQuery>>,
     #[cfg(test)]
@@ -1934,10 +2084,16 @@ struct SimilarIndexScheduler {
     known_book_store: Mutex<ObservedBookStore>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
+    raw_executor: Mutex<Option<Arc<crate::raw::RawDevelopExecutor>>>,
     state: Mutex<SchedulerState>,
     array_update: Mutex<ArrayUpdateState>,
     array_changed: Condvar,
     compaction_running: AtomicBool,
+    skip_offline_change_scan: AtomicBool,
+    #[cfg(test)]
+    startup_test_probe: Mutex<Option<Arc<dyn Fn(&'static str) + Send + Sync>>>,
+    #[cfg(test)]
+    user_check_all_requests: AtomicU64,
     #[cfg(test)]
     full_jobs_started: AtomicU64,
     #[cfg(test)]
@@ -2233,6 +2389,97 @@ impl ArrayRefreshNotifier {
 }
 
 impl SimilarIndexNotifier {
+    pub(crate) fn set_skip_offline_change_scan(&self, skip: bool) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler
+                .skip_offline_change_scan
+                .store(skip, Ordering::Release);
+        }
+    }
+
+    /// 全 root の起動時と同じ確認を一つの UserCheck にまとめる。watch registration は不要。
+    pub(crate) fn request_full_all(&self) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            #[cfg(test)]
+            scheduler
+                .user_check_all_requests
+                .fetch_add(1, Ordering::AcqRel);
+            let should_start = {
+                let mut state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.shutdown || state.desired_config.is_none() {
+                    return;
+                }
+                let intent = FullIntent {
+                    config_epoch: state.config_epoch,
+                    required_gap_epoch: state.next_gap_epoch,
+                    reason: FullReason::UserCheck,
+                };
+                state.merge_full_intent(intent);
+                state.reserve_worker_if_runnable()
+            };
+            if should_start {
+                scheduler.spawn_worker();
+            }
+        }
+    }
+    /// Apply the committed shared-watcher snapshot, including its credential revision.
+    pub(crate) fn configure(
+        &self,
+        favorites: &[crate::settings::FavoriteEntry],
+        pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+        activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+        excluded_roots: Vec<PathBuf>,
+    ) {
+        let Some(scheduler) = self.scheduler.upgrade() else {
+            return;
+        };
+        let roots: Vec<ConfiguredRoot> = favorites
+            .iter()
+            .filter(|favorite| favorite.auto_index_similar)
+            .map(|favorite| ConfiguredRoot {
+                favorite_id: favorite.id,
+                key: crate::search_index_db::normalize_path(&favorite.path),
+                path: favorite.path.clone(),
+            })
+            .collect();
+        let should_load = !roots.is_empty();
+        scheduler.configure(roots, pdf_passwords, activity_gate, excluded_roots);
+        if should_load {
+            start_memory_load(
+                &scheduler.data_dir,
+                &scheduler.memory,
+                &scheduler.memory_epoch,
+                &scheduler.item_query,
+                MemoryLoadTrigger::Configure,
+                Some(Arc::downgrade(&scheduler)),
+            );
+        }
+    }
+
+    pub(crate) fn password_snapshot(&self) -> Option<crate::pdf_passwords::PdfPasswordStore> {
+        let scheduler = self.scheduler.upgrade()?;
+        let state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .desired_config
+            .as_ref()
+            .map(|config| config.pdf_passwords.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watch_is_ready_for_test(&self, id: Uuid) -> bool {
+        self.scheduler.upgrade().is_some_and(|scheduler| {
+            scheduler
+                .state
+                .lock()
+                .unwrap()
+                .watch_by_root
+                .get(&id)
+                .is_some_and(|watch| {
+                    watch.registration_generation != 0 && watch.health == WatchHealth::Ready
+                })
+        })
+    }
+
     /// Reserve one watcher generation before its thread starts.  Every terminal and event call
     /// must carry the returned token; a late supervisor can then never mutate a reconfigured root.
     pub fn begin_watch(&self, favorite_id: Uuid, root: &Path) -> Option<SimilarWatchRegistration> {
@@ -2252,6 +2499,14 @@ impl SimilarIndexNotifier {
     ) {
         if let Some(scheduler) = self.scheduler.upgrade() {
             scheduler.set_watch_health(registration, WatchHealth::Unavailable, Some(reason.into()));
+        }
+    }
+
+    /// Stop lifecycle only: revoke this generation, rejecting every late Ready and event.
+    /// Temporary watcher failures keep using watch_unavailable so retry can reuse its token.
+    pub fn revoke_watch(&self, registration: &SimilarWatchRegistration) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.revoke_watch(registration);
         }
     }
 
@@ -2488,10 +2743,13 @@ impl SimilarIndexScheduler {
         }
         let previous = state.watch_by_root.get(&favorite_id).cloned()?;
         let replacement = previous.registration_generation != 0;
-        if replacement {
+        // A stopped lifecycle already owns its gap. Its replacement closes that same gap;
+        // a direct replacement of a live watcher creates a new gap here instead.
+        let inherit_revoked_gap = previous.health == WatchHealth::Revoked;
+        if replacement && !inherit_revoked_gap {
             state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
         }
-        let gap_epoch = if replacement {
+        let gap_epoch = if replacement && !inherit_revoked_gap {
             state.next_gap_epoch
         } else {
             previous.gap_epoch
@@ -2625,6 +2883,47 @@ impl SimilarIndexScheduler {
             }
             state.reserve_worker_if_runnable()
         };
+        if should_start {
+            self.spawn_worker();
+        }
+    }
+
+    fn revoke_watch(self: &Arc<Self>, registration: &SimilarWatchRegistration) {
+        let should_start = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown || !Self::registration_is_current(&state, registration) {
+                return;
+            }
+            let watch = state
+                .watch_by_root
+                .get(&registration.favorite_id)
+                .expect("validated watch");
+            let gap_epoch = if watch.gap_epoch > watch.repaired_gap_epoch {
+                watch.gap_epoch
+            } else {
+                state.next_gap_epoch = state.next_gap_epoch.wrapping_add(1).max(1);
+                state.next_gap_epoch
+            };
+            // Reserve an unissued generation and wait for replacement under the same lock.
+            state.next_watch_generation = state.next_watch_generation.wrapping_add(1).max(1);
+            let generation = state.next_watch_generation;
+            let watch = state
+                .watch_by_root
+                .get_mut(&registration.favorite_id)
+                .expect("validated watch");
+            watch.health = WatchHealth::Revoked;
+            watch.registration_generation = generation;
+            watch.gap_epoch = gap_epoch;
+            let config_epoch = state.config_epoch;
+            state.merge_full_intent(FullIntent {
+                config_epoch,
+                required_gap_epoch: gap_epoch,
+                reason: FullReason::WatchRecovery,
+            });
+            state.phase.cancel();
+            state.reserve_worker_if_runnable()
+        };
+        self.mark_awaiting_watch_if_terminal();
         if should_start {
             self.spawn_worker();
         }
@@ -2831,7 +3130,9 @@ impl SimilarIndexScheduler {
                 return;
             }
         };
+        let page_order_started = std::time::Instant::now();
         repair_page_order_if_stale(&db);
+        let page_order_elapsed = page_order_started.elapsed();
         // configure と DB 作成が競合しても、実行中の worker が必ず eager load を開始する。
         // この呼び出しは既に Loading / Ready なら no-op で、パネル照会には依存しない。
         start_memory_load(
@@ -2860,14 +3161,52 @@ impl SimilarIndexScheduler {
                 continue;
             }
             #[cfg(test)]
+            self.probe_startup("before_initial_decision");
+            let fingerprint = if matches!(plan.running.kind, ReconcileJobKind::Full(_)) {
+                similar_scan_fingerprint(&plan.config)
+            } else {
+                String::new()
+            };
+            let reused_initial = matches!(
+                plan.running.kind,
+                ReconcileJobKind::Full(FullIntent {
+                    reason: FullReason::Initial,
+                    ..
+                })
+            ) && self.skip_offline_change_scan.load(Ordering::Acquire)
+                && db
+                    .scanned_once_matches(&fingerprint)
+                    .unwrap_or_else(|error| {
+                        crate::logger::log(format!("similar scanned_once read failed: {error}"));
+                        false
+                    })
+                && self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .can_reuse_initial(&plan);
+            let completed_kind = if reused_initial {
+                CompletedReconcileKind::ReusedInitial
+            } else if matches!(plan.running.kind, ReconcileJobKind::Full(_)) {
+                CompletedReconcileKind::ScannedFull
+            } else {
+                CompletedReconcileKind::Incremental
+            };
+            #[cfg(test)]
+            self.probe_startup(if reused_initial {
+                "reused_initial"
+            } else {
+                "scanned_or_delta"
+            });
+            #[cfg(test)]
             match plan.running.kind {
-                ReconcileJobKind::Full(_) => {
+                ReconcileJobKind::Full(_) if !reused_initial => {
                     self.full_jobs_started.fetch_add(1, Ordering::AcqRel);
                 }
                 ReconcileJobKind::Delta => {
                     self.delta_jobs_started.fetch_add(1, Ordering::AcqRel);
                 }
-                ReconcileJobKind::Purge => {}
+                ReconcileJobKind::Purge | ReconcileJobKind::Full(_) => {}
             }
             let telemetry = ReconcileRunTelemetry::new(&plan.running);
             telemetry.log_start(
@@ -2897,6 +3236,10 @@ impl SimilarIndexScheduler {
                 &purge_result,
                 Ok(crate::similar_db::ConditionalCommit::Committed(_))
             );
+            #[cfg(test)]
+            if purge_committed && matches!(plan.running.kind, ReconcileJobKind::Purge) {
+                self.probe_startup("configuration_purge_committed");
+            }
             let outcome = purge_result.and_then(|purge| {
                 let purged = match purge {
                     crate::similar_db::ConditionalCommit::Committed(removed) => removed,
@@ -2920,6 +3263,12 @@ impl SimilarIndexScheduler {
                     scheduler: Arc::downgrade(&self),
                 };
                 let scan = match plan.running.kind {
+                    ReconcileJobKind::Full(_) if reused_initial => run_reused_initial_job(
+                        &db,
+                        &plan.config,
+                        &plan.running.cancel,
+                        Some(&telemetry),
+                    ),
                     ReconcileJobKind::Full(intent) => run_index_job(
                         &db,
                         &plan.config.scan_roots(),
@@ -2931,6 +3280,7 @@ impl SimilarIndexScheduler {
                         &self.progress,
                         &array_refresh,
                         Some(&telemetry),
+                        &fingerprint,
                     ),
                     ReconcileJobKind::Delta => run_delta_index_job(
                         &db,
@@ -3062,6 +3412,9 @@ impl SimilarIndexScheduler {
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::AwaitingArray(outcome.report.clone());
             telemetry.log_phase("awaiting_array", Some(&outcome.report));
+            #[cfg(test)]
+            self.probe_startup("before_array_request");
+            let ack_started = std::time::Instant::now();
             self.request_array_refresh_through(watermark);
             if let Err(error) = self.wait_for_array_ack(watermark, &plan.running.cancel) {
                 match error {
@@ -3091,6 +3444,7 @@ impl SimilarIndexScheduler {
                 }
             }
 
+            let ack_elapsed = ack_started.elapsed();
             if !self.job_is_current(&plan.running) {
                 telemetry.log_terminal("stale", &outcome.report);
                 match self.settle_interrupted_plan(&plan, purge_committed, outcome.report) {
@@ -3103,7 +3457,33 @@ impl SimilarIndexScheduler {
                 }
             }
 
-            let disposition = self.finish_successful_plan(&plan);
+            if completed_kind == CompletedReconcileKind::ScannedFull {
+                if let Err(error) = db.mark_scanned_once(&fingerprint) {
+                    crate::logger::log(format!("similar scanned_once write failed: {error}"));
+                }
+            }
+            if reused_initial {
+                crate::logger::log(telemetry.reused_initial_log(
+                    page_order_elapsed,
+                    self.memory_load_elapsed_us.load(Ordering::Relaxed),
+                    ack_elapsed,
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "similar",
+                        "initial_scan_done",
+                        None,
+                        0,
+                        &[("skipped", serde_json::Value::from(true))],
+                    );
+                }
+            }
+            let disposition = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.finish_completed_job(&plan, completed_kind)
+            };
+            #[cfg(test)]
+            self.probe_startup("array_acked");
             telemetry.log_terminal(
                 match disposition {
                     SuccessfulJobDisposition::Complete => "complete",
@@ -3148,9 +3528,12 @@ impl SimilarIndexScheduler {
         state.restore_unfinished_job(plan, purge_committed);
     }
 
-    fn finish_successful_plan(&self, plan: &ReconcileJobPlan) -> SuccessfulJobDisposition {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.finish_successful_job(plan)
+    #[cfg(test)]
+    fn probe_startup(&self, phase: &'static str) {
+        let probe = self.startup_test_probe.lock().unwrap().clone();
+        if let Some(probe) = probe {
+            probe(phase);
+        }
     }
 
     fn settle_interrupted_plan(
@@ -4848,6 +5231,49 @@ struct ScanJobOutcome {
     watermark: Option<crate::similar_db::StoreWatermark>,
 }
 
+fn run_reused_initial_job(
+    db: &SimilarDb,
+    config: &SchedulerConfig,
+    cancel: &Arc<AtomicBool>,
+    telemetry: Option<&ReconcileRunTelemetry>,
+) -> Result<ScanJobOutcome, String> {
+    let interrupted = || ScanJobOutcome {
+        report: IndexReport::default(),
+        prune_safe: false,
+        requires_full: false,
+        watermark: None,
+    };
+    if !wait_for_full_inventory_start(config.activity_gate.as_deref(), cancel) {
+        return Ok(interrupted());
+    }
+    let cleanup_started = std::time::Instant::now();
+    if db
+        .cleanup_incomplete_if(cancel)
+        .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?
+        .is_none()
+    {
+        return Ok(interrupted());
+    }
+    // Matching roots/exclusions already have a completed corpus. Configuration changes revoke
+    // the marker before discarding that corpus; startup reuse need not enumerate any scope keys.
+    let report = IndexReport::default();
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .reused_cleanup_time
+            .observe(cleanup_started.elapsed());
+        telemetry.log_phase("reused_initial", Some(&report));
+    }
+    Ok(ScanJobOutcome {
+        report,
+        prune_safe: true,
+        requires_full: false,
+        watermark: Some(
+            db.change_watermark()
+                .map_err(|error| format!("reuse watermark failed: {error}"))?,
+        ),
+    })
+}
+
 #[derive(Default)]
 struct DeltaPublication {
     loose_items: Mutex<Vec<StoredItem>>,
@@ -4906,7 +5332,15 @@ fn run_index_job(
     progress: &Arc<Mutex<IndexProgress>>,
     array_refresh: &ArrayRefreshNotifier,
     telemetry: Option<&ReconcileRunTelemetry>,
+    fingerprint: &str,
 ) -> Result<ScanJobOutcome, String> {
+    let raw_executor = array_refresh.scheduler.upgrade().and_then(|scheduler| {
+        scheduler
+            .raw_executor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    });
     if !wait_for_full_inventory_start(activity_gate, cancel) {
         return Ok(ScanJobOutcome {
             report: IndexReport::default(),
@@ -4916,7 +5350,7 @@ fn run_index_job(
         });
     }
     if db
-        .cleanup_incomplete_if(cancel)
+        .cleanup_incomplete_for_full_if(cancel, fingerprint)
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?
         .is_none()
     {
@@ -4926,6 +5360,10 @@ fn run_index_job(
             requires_full: false,
             watermark: None,
         });
+    }
+    #[cfg(test)]
+    if let Some(scheduler) = array_refresh.scheduler.upgrade() {
+        scheduler.probe_startup("full_prepared");
     }
     set_stage(progress, IndexStage::Opening, None);
     let Some(inventory) = db
@@ -4971,6 +5409,7 @@ fn run_index_job(
                     array_refresh,
                     ScanPass::Full(&inventory),
                     telemetry,
+                    raw_executor.as_ref(),
                 )
             }));
         }
@@ -5049,6 +5488,13 @@ fn run_delta_index_job(
     _array_refresh: &ArrayRefreshNotifier,
     telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
+    let raw_executor = _array_refresh.scheduler.upgrade().and_then(|scheduler| {
+        scheduler
+            .raw_executor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    });
     if !wait_for_full_inventory_start(config.activity_gate.as_deref(), cancel) {
         return Ok(ScanJobOutcome {
             report: IndexReport::default(),
@@ -5245,6 +5691,7 @@ fn run_delta_index_job(
                         publication: &publication,
                     },
                     telemetry,
+                    raw_executor.as_ref(),
                 )
             }));
         }
@@ -5349,6 +5796,7 @@ struct ScanContext<'a> {
     prune_safe: bool,
     array_refresh: &'a ArrayRefreshNotifier,
     pass: ScanPass<'a>,
+    raw_executor: Option<&'a Arc<crate::raw::RawDevelopExecutor>>,
 }
 
 #[derive(Clone)]
@@ -5371,6 +5819,7 @@ fn scan_worker_loop(
     array_refresh: &ArrayRefreshNotifier,
     pass: ScanPass<'_>,
     telemetry: Option<&ReconcileRunTelemetry>,
+    raw_executor: Option<&Arc<crate::raw::RawDevelopExecutor>>,
 ) {
     while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
         let work = lease.take_task();
@@ -5402,6 +5851,7 @@ fn scan_worker_loop(
             prune_safe: true,
             array_refresh,
             pass,
+            raw_executor,
         };
         let result = if context.cancelled() {
             Ok(Vec::new())
@@ -6204,12 +6654,13 @@ impl ScanContext<'_> {
         if let Some(prefill) = self.load_prefill(key, candidate)? {
             return Ok(with_identity(prefill, kind, container_key, page_index));
         }
-        let canonical = proxy_from_source(
+        let canonical = crate::similar_image::proxy_from_source_with_raw(
             ProxySource::File {
                 path: &candidate.path,
                 verified_bytes: None,
             },
             Some(self.cancel),
+            self.raw_executor,
         )
         .map_err(|error| error.to_string())?;
         stored_from_proxy(key, kind, container_key, page_index, candidate, canonical)
@@ -6238,12 +6689,13 @@ impl ScanContext<'_> {
             self.cancel,
         )
         .map_err(|error| error.to_string())?;
-        let canonical = proxy_from_source(
+        let canonical = crate::similar_image::proxy_from_source_with_raw(
             ProxySource::Encoded {
                 filename_hint: entry_name,
                 bytes: &bytes,
             },
             Some(self.cancel),
+            self.raw_executor,
         )
         .map_err(|error| error.to_string())?;
         stored_from_proxy(
@@ -6636,7 +7088,7 @@ pub(crate) fn offer_thumbnail_raster(
     file_size: i64,
     image: &image::DynamicImage,
     source_dims: (u32, u32),
-) {
+) -> crate::perf::stall::Timing {
     offer_thumbnail_raster_with_capability(
         PRODUCT_SIMILAR_FEATURE_CAPABILITY,
         path,
@@ -6646,7 +7098,7 @@ pub(crate) fn offer_thumbnail_raster(
         file_size,
         image,
         source_dims,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6659,7 +7111,7 @@ fn offer_thumbnail_raster_with_capability(
     file_size: i64,
     image: &image::DynamicImage,
     source_dims: (u32, u32),
-) {
+) -> crate::perf::stall::Timing {
     offer_thumbnail_raster_with_target_resolver(
         capability,
         path,
@@ -6670,7 +7122,7 @@ fn offer_thumbnail_raster_with_capability(
         image,
         source_dims,
         prefill_target,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6684,15 +7136,15 @@ fn offer_thumbnail_raster_with_target_resolver(
     image: &image::DynamicImage,
     source_dims: (u32, u32),
     resolve_target: impl FnOnce() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)>,
-) {
+) -> crate::perf::stall::Timing {
     // This direct capability gate is intentional.  A stale process-global test registration (or
     // a future accidental manager construction) must not turn ordinary thumbnail decoding into
     // similar-index signature work or DB writes while the feature is paused.
     if !capability.is_enabled() {
-        return;
+        return crate::perf::stall::Timing::default();
     }
     let Some((db, enabled_roots)) = resolve_target() else {
-        return;
+        return crate::perf::stall::Timing::default();
     };
     let prepared = match prepare_thumbnail_prefill(
         &enabled_roots,
@@ -6705,21 +7157,25 @@ fn offer_thumbnail_raster_with_target_resolver(
         source_dims,
     ) {
         Ok(Some(prepared)) => prepared,
-        Ok(None) => return,
+        Ok(None) => return crate::perf::stall::Timing::default(),
         Err(error) => {
             crate::logger::log(format!(
                 "similar prefill {} failed for {}: {}",
                 error.stage, error.item_key, error.message
             ));
-            return;
+            return crate::perf::stall::Timing::default();
         }
     };
-    if let Err(error) = store_offered_thumbnail_prefill(&db, &enabled_roots, &prepared) {
+    let db_started = crate::perf::stall::Span::start();
+    let result = store_offered_thumbnail_prefill(&db, &enabled_roots, &prepared);
+    let db_timing = db_started.map(|at| at.finish()).unwrap_or_default();
+    if let Err(error) = result {
         crate::logger::log(format!(
             "similar prefill write failed for {}: {error}",
             prepared.item.item_key
         ));
     }
+    db_timing
 }
 
 fn raster_is_large_enough_for_canonical_proxy(
@@ -6734,6 +7190,9 @@ fn raster_is_large_enough_for_canonical_proxy(
             source_long_edge.min(crate::similar_image::JPEG_DCT_TARGET_EDGE)
         }
         SimilarImageFormat::Pdf => PDF_RENDER_LONG_EDGE,
+        // LibRaw's embedded raster is the intended index input for RAW. It can
+        // be smaller than the developed sensor dimensions.
+        SimilarImageFormat::Raw => 1,
         _ => source_long_edge,
     };
     decoded_long_edge >= required_long_edge
@@ -6743,6 +7202,20 @@ fn raster_is_large_enough_for_canonical_proxy(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn raw_preview_prefill_accepts_smaller_raster_than_developed_dimensions() {
+        assert!(raster_is_large_enough_for_canonical_proxy(
+            SimilarImageFormat::Raw,
+            (1024, 683),
+            (6000, 4000),
+        ));
+        assert!(!raster_is_large_enough_for_canonical_proxy(
+            SimilarImageFormat::Other,
+            (1024, 683),
+            (6000, 4000),
+        ));
+    }
 
     #[cfg(windows)]
     fn current_working_set_bytes() -> usize {
@@ -6783,12 +7256,17 @@ mod tests {
         assert_eq!(ReconcileJobKind::Purge.label(), "purge");
         assert_eq!(ReconcileJobKind::Purge.reason_label(), "root_removed");
         assert_eq!(FullReason::Initial.label(), "initial");
+        assert_eq!(FullReason::UserCheck.label(), "user_check");
         assert_eq!(FullReason::Reconfigure.label(), "reconfigure");
         assert_eq!(FullReason::Overflow.label(), "overflow");
         assert_eq!(FullReason::SummaryRepair.label(), "summary_repair");
         assert_eq!(FullReason::Manual.label(), "manual");
         assert_eq!(
             FullReason::Initial.container_preopen_policy(),
+            ContainerPreopenPolicy::InitialMetadataTrust
+        );
+        assert_eq!(
+            FullReason::UserCheck.container_preopen_policy(),
             ContainerPreopenPolicy::InitialMetadataTrust
         );
         for reason in [
@@ -6853,6 +7331,7 @@ mod tests {
             &Arc::new(Mutex::new(IndexProgress::Idle)),
             &notifier,
             Some(&full_safe),
+            "test fingerprint",
         )
         .unwrap();
         assert!(outcome.prune_safe);
@@ -6883,6 +7362,7 @@ mod tests {
             &Arc::new(Mutex::new(IndexProgress::Idle)),
             &notifier,
             Some(&full_incomplete),
+            "test fingerprint",
         )
         .unwrap();
         assert!(!outcome.prune_safe);
@@ -7486,6 +7966,7 @@ mod tests {
                         scheduler: Weak::new(),
                     },
                     None,
+                    "test fingerprint",
                 )
                 .unwrap()
             });
@@ -7518,6 +7999,7 @@ mod tests {
                     scheduler: Weak::new(),
                 },
                 None,
+                "test fingerprint",
             )
             .unwrap()
             .prune_safe,
@@ -7552,6 +8034,7 @@ mod tests {
                         scheduler: Weak::new(),
                     },
                     None,
+                    "test fingerprint",
                 )
                 .unwrap()
             });
@@ -7684,6 +8167,7 @@ mod tests {
                 scheduler: Weak::new(),
             },
             None,
+            "test fingerprint",
         )
         .unwrap()
         .report;
@@ -7766,6 +8250,15 @@ mod tests {
 
     #[test]
     fn initial_full_reuses_complete_zip_and_pdf_without_opening_them() {
+        assert_metadata_trust_full_reuses_containers(FullReason::Initial);
+    }
+
+    #[test]
+    fn user_check_full_reuses_complete_zip_and_pdf_without_opening_them() {
+        assert_metadata_trust_full_reuses_containers(FullReason::UserCheck);
+    }
+
+    fn assert_metadata_trust_full_reuses_containers(reason: FullReason) {
         let root = tempfile::tempdir().unwrap();
         let db = SimilarDb::open_in_memory().unwrap();
         populate_invalid_file_container_fixture(&db, root.path());
@@ -7775,7 +8268,7 @@ mod tests {
         let telemetry = telemetry_for_test(ReconcileJobKind::Full(FullIntent {
             config_epoch: 1,
             required_gap_epoch: 0,
-            reason: FullReason::Initial,
+            reason,
         }));
 
         let outcome = run_index_job(
@@ -7783,7 +8276,7 @@ mod tests {
             &[root.path().to_path_buf()],
             &[],
             &passwords,
-            ContainerPreopenPolicy::InitialMetadataTrust,
+            reason.container_preopen_policy(),
             None,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(IndexProgress::Idle)),
@@ -7791,6 +8284,7 @@ mod tests {
                 scheduler: Weak::new(),
             },
             Some(&telemetry),
+            "test fingerprint",
         )
         .unwrap();
 
@@ -7817,7 +8311,7 @@ mod tests {
     }
 
     #[test]
-    fn non_initial_full_and_delta_keep_opening_complete_containers() {
+    fn must_open_full_and_delta_keep_opening_complete_containers() {
         let root = tempfile::tempdir().unwrap();
         let full_db = SimilarDb::open_in_memory().unwrap();
         populate_invalid_file_container_fixture(&full_db, root.path());
@@ -7835,6 +8329,7 @@ mod tests {
                 scheduler: Weak::new(),
             },
             None,
+            "test fingerprint",
         )
         .unwrap();
         assert_eq!(full.report.unchanged, 0);
@@ -7875,6 +8370,7 @@ mod tests {
                 inventory: &inventory,
                 publication: &publication,
             },
+            raw_executor: None,
         };
         context.process_zip(&zip).unwrap();
         assert_eq!(context.report.unchanged, 0);
@@ -8849,6 +9345,7 @@ mod tests {
                 inventory: &inventory,
                 publication: &publication,
             },
+            raw_executor: None,
         };
         let unchanged = FileCandidate {
             path: PathBuf::from("this-file-does-not-exist.png"),
@@ -9858,6 +10355,728 @@ mod tests {
     }
 
     #[test]
+    fn startup_reused_initial_keeps_dirty_and_never_repairs_a_gap() {
+        let id = Uuid::new_v4();
+        let root = PathBuf::from("c:/root");
+        let mut state = coordinator_state_with_watch(id, &root, WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        state.next_event_seq = 1;
+        let scope = DirtyScope::DirectoryContents(root.clone());
+        state.dirty.insert(scope.clone(), 1);
+        let plan = state.take_next_job().unwrap();
+        assert!(state.can_reuse_initial(&plan));
+        // A channel fixes the watch/event transition between selection and completion.
+        std::thread::scope(|threads| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let state_ref = &mut state;
+            let plan_ref = &plan;
+            let worker = threads.spawn(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                state_ref.finish_completed_job(plan_ref, CompletedReconcileKind::ReusedInitial)
+            });
+            started_rx.recv().unwrap();
+            release_tx.send(()).unwrap();
+            assert_eq!(worker.join().unwrap(), SuccessfulJobDisposition::MoreWork);
+        });
+        assert_eq!(state.dirty.latest_by_scope.get(&scope), Some(&1));
+        assert_eq!(state.watch_by_root[&id].repaired_gap_epoch, 0);
+        state.phase = SchedulerPhase::Idle;
+        assert!(matches!(
+            state.take_next_job().unwrap().running.kind,
+            ReconcileJobKind::Delta
+        ));
+    }
+
+    #[test]
+    fn startup_reuse_requires_pure_initial_ready_and_no_gap() {
+        let id = Uuid::new_v4();
+        let root = PathBuf::from("c:/root");
+        let mut state = coordinator_state_with_watch(id, &root, WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        let mut plan = state.take_next_job().unwrap();
+        assert!(state.can_reuse_initial(&plan));
+        state.watch_by_root.get_mut(&id).unwrap().health = WatchHealth::Unavailable;
+        assert!(!state.can_reuse_initial(&plan));
+        state.watch_by_root.get_mut(&id).unwrap().health = WatchHealth::Ready;
+        state.watch_by_root.get_mut(&id).unwrap().gap_epoch = 1;
+        assert!(!state.can_reuse_initial(&plan));
+        state.watch_by_root.get_mut(&id).unwrap().repaired_gap_epoch = 1;
+        assert!(state.can_reuse_initial(&plan));
+        for reason in [
+            FullReason::UserCheck,
+            FullReason::Manual,
+            FullReason::Overflow,
+            FullReason::WatchRecovery,
+            FullReason::Reconfigure,
+            FullReason::SummaryRepair,
+        ] {
+            plan.running.kind = ReconcileJobKind::Full(FullIntent {
+                reason,
+                ..initial_full_intent()
+            });
+            assert!(!state.can_reuse_initial(&plan));
+        }
+    }
+
+    #[test]
+    fn startup_fingerprint_ignores_ephemeral_inputs_and_tracks_roots_exclusions() {
+        let id = Uuid::new_v4();
+        let state = coordinator_state_with_watch(id, Path::new("c:/root"), WatchHealth::Ready);
+        let config = state.desired_config.unwrap();
+        let expected = similar_scan_fingerprint(&config);
+        let mut changed = config.clone();
+        changed.password_revision = 999;
+        changed.roots[0].favorite_id = Uuid::new_v4();
+        changed.roots.push(changed.roots[0].clone());
+        assert_eq!(similar_scan_fingerprint(&changed), expected);
+        changed
+            .excluded_root_keys
+            .push("c:/root/excluded".to_owned());
+        assert_ne!(similar_scan_fingerprint(&changed), expected);
+        changed = config;
+        changed.roots[0].key = "c:/other".to_owned();
+        assert_ne!(similar_scan_fingerprint(&changed), expected);
+    }
+
+    fn startup_worker_fixture(
+        skip: bool,
+        marker: bool,
+    ) -> (tempfile::TempDir, SimilarIndexManager, Arc<SimilarDb>, Uuid) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let id = Uuid::new_v4();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let mut state = coordinator_state_with_watch(id, &root, WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        state.phase = SchedulerPhase::Starting;
+        let db = Arc::new(SimilarDb::open_at(&temp.path().join("similar.db")).unwrap());
+        if marker {
+            db.record_completed_index(current_hash_version(), 1, CompletedIndexStats::default())
+                .unwrap();
+            db.mark_scanned_once(&similar_scan_fingerprint(
+                state.desired_config.as_ref().unwrap(),
+            ))
+            .unwrap();
+        }
+        *manager.scheduler.prefill_db.lock().unwrap() = Some(Arc::clone(&db));
+        *manager.scheduler.state.lock().unwrap() = state;
+        manager.set_skip_offline_change_scan(skip);
+        (temp, manager, db, id)
+    }
+
+    #[test]
+    fn startup_worker_gated_unavailable_and_manual_merge_force_scanned_full() {
+        for change in ["unavailable", "user_check", "manual"] {
+            let (_temp, manager, db, id) = startup_worker_fixture(true, true);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            *manager.scheduler.startup_test_probe.lock().unwrap() = Some(Arc::new(move |phase| {
+                if phase == "before_initial_decision" {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }));
+            std::thread::scope(|threads| {
+                let scheduler = Arc::clone(&manager.scheduler);
+                let worker = threads.spawn(move || scheduler.worker_loop());
+                entered_rx.recv().unwrap();
+                if change == "user_check" {
+                    manager.request_full_all();
+                } else if change == "manual" {
+                    let mut state = manager.scheduler.state.lock().unwrap();
+                    let intent = FullIntent {
+                        reason: FullReason::Manual,
+                        ..initial_full_intent()
+                    };
+                    state.merge_full_intent(intent);
+                } else {
+                    manager
+                        .scheduler
+                        .state
+                        .lock()
+                        .unwrap()
+                        .watch_by_root
+                        .get_mut(&id)
+                        .unwrap()
+                        .health = WatchHealth::Unavailable;
+                }
+                // The second explicit Full needs no further gate.
+                *manager.scheduler.startup_test_probe.lock().unwrap() = None;
+                release_tx.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            assert!(db.full_inventory_load_count() >= 1);
+        }
+    }
+
+    #[test]
+    fn startup_user_check_request_coalesces_and_repairs_gap_as_scanned_full() {
+        let (_temp, manager, _db, id) = startup_worker_fixture(true, true);
+        let root = manager
+            .scheduler
+            .state
+            .lock()
+            .unwrap()
+            .desired_config
+            .as_ref()
+            .unwrap()
+            .roots[0]
+            .path
+            .clone();
+        let old_scope = DirtyScope::DirectoryContents(root.join("old"));
+        let new_scope = DirtyScope::DirectoryContents(root.join("new"));
+        {
+            let mut state = manager.scheduler.state.lock().unwrap();
+            state.next_gap_epoch = 2;
+            state.watch_by_root.get_mut(&id).unwrap().gap_epoch = 2;
+            state.next_event_seq = 1;
+            state.dirty.insert(old_scope.clone(), 1);
+        }
+        manager.request_full_all();
+        manager.request_full_all();
+        let mut state = manager.scheduler.state.lock().unwrap();
+        let plan = state.take_next_job().unwrap();
+        assert_eq!(
+            plan.running.kind,
+            ReconcileJobKind::Full(FullIntent {
+                reason: FullReason::UserCheck,
+                required_gap_epoch: 2,
+                ..initial_full_intent()
+            })
+        );
+        assert_eq!(plan.running.kind.reason_label(), "user_check");
+        assert_eq!(
+            FullReason::UserCheck.container_preopen_policy(),
+            ContainerPreopenPolicy::InitialMetadataTrust
+        );
+        assert!(!state.can_reuse_initial(&plan));
+        assert!(plan.running.repairs_watch_gap);
+        state.next_event_seq = 2;
+        state.dirty.insert(new_scope.clone(), 2);
+        assert_eq!(
+            state.finish_successful_job(&plan),
+            SuccessfulJobDisposition::MoreWork
+        );
+        assert!(!state.dirty.latest_by_scope.contains_key(&old_scope));
+        assert_eq!(state.dirty.latest_by_scope.get(&new_scope), Some(&2));
+        assert_eq!(state.watch_by_root[&id].repaired_gap_epoch, 2);
+        assert!(state.pending_full.is_none());
+    }
+
+    #[test]
+    fn startup_user_check_worker_does_not_reuse_matching_marker() {
+        let (_temp, manager, db, _id) = startup_worker_fixture(true, true);
+        manager.request_full_all();
+        Arc::clone(&manager.scheduler).worker_loop();
+        assert_eq!(db.full_inventory_load_count(), 1);
+        assert_eq!(manager.reconcile_job_counts_for_test(), (1, 0));
+        assert!(matches!(
+            manager.scheduler.state.lock().unwrap().phase,
+            SchedulerPhase::Idle
+        ));
+    }
+
+    #[test]
+    fn incremental_reconcile_user_check_merge_keeps_stronger_checks_and_latest_gap() {
+        for must_open in [
+            FullReason::Overflow,
+            FullReason::WatchRecovery,
+            FullReason::Reconfigure,
+            FullReason::SummaryRepair,
+            FullReason::Manual,
+        ] {
+            for reverse in [false, true] {
+                for user_gap in [0, 3, 9] {
+                    let mut state = SchedulerState::default();
+                    let user = FullIntent {
+                        config_epoch: 7,
+                        required_gap_epoch: user_gap,
+                        reason: FullReason::UserCheck,
+                    };
+                    let stronger = FullIntent {
+                        config_epoch: 7,
+                        required_gap_epoch: 3,
+                        reason: must_open,
+                    };
+                    for intent in if reverse {
+                        [stronger, user]
+                    } else {
+                        [user, stronger]
+                    } {
+                        state.merge_full_intent(intent);
+                    }
+                    let pending = state.pending_full.unwrap();
+                    assert_eq!(pending.reason, must_open);
+                    assert_eq!(pending.required_gap_epoch, user_gap.max(3));
+                    assert_eq!(
+                        pending.reason.container_preopen_policy(),
+                        ContainerPreopenPolicy::MustOpen
+                    );
+                    state.merge_full_intent(FullIntent {
+                        config_epoch: 6,
+                        required_gap_epoch: 99,
+                        reason: FullReason::UserCheck,
+                    });
+                    assert_eq!(state.pending_full, Some(pending));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reconcile_user_check_survives_initial_restore_and_later_gap() {
+        let id = Uuid::new_v4();
+        let mut state =
+            coordinator_state_with_watch(id, Path::new("c:/library"), WatchHealth::Ready);
+        state.pending_full = Some(initial_full_intent());
+        let initial = state.take_next_job().unwrap();
+        state.merge_full_intent(FullIntent {
+            reason: FullReason::UserCheck,
+            ..initial_full_intent()
+        });
+        state.restore_unfinished_job(&initial, false);
+        state.merge_full_intent(FullIntent {
+            required_gap_epoch: 9,
+            ..initial_full_intent()
+        });
+        assert_eq!(
+            state.pending_full,
+            Some(FullIntent {
+                reason: FullReason::UserCheck,
+                required_gap_epoch: 9,
+                ..initial_full_intent()
+            })
+        );
+    }
+
+    #[test]
+    fn startup_worker_reuses_then_acks_array_and_runs_kept_dirty_delta() {
+        let (_temp, manager, db, _id) = startup_worker_fixture(true, true);
+        {
+            let mut state = manager.scheduler.state.lock().unwrap();
+            let root = state.desired_config.as_ref().unwrap().roots[0].path.clone();
+            state.next_event_seq = 1;
+            state.dirty.insert(DirtyScope::DirectoryContents(root), 1);
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *manager.scheduler.startup_test_probe.lock().unwrap() = Some(Arc::new(move |phase| {
+            if phase == "before_array_request" {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        std::thread::scope(|threads| {
+            let scheduler = Arc::clone(&manager.scheduler);
+            let worker = threads.spawn(move || scheduler.worker_loop());
+            entered_rx.recv().unwrap();
+            assert!(matches!(
+                manager.progress(),
+                IndexProgress::AwaitingArray(_)
+            ));
+            assert_eq!(db.full_inventory_load_count(), 0);
+            assert_eq!(db.cleanup_incomplete_call_count(), 1);
+            assert_eq!(manager.scheduler.state.lock().unwrap().dirty.len(), 1);
+            *manager.scheduler.startup_test_probe.lock().unwrap() = None;
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(matches!(manager.progress(), IndexProgress::Complete(_)));
+        assert_eq!(manager.reconcile_job_counts_for_test(), (0, 1));
+        assert_eq!(db.full_inventory_load_count(), 0);
+    }
+
+    #[test]
+    fn startup_reuse_leaves_auxiliary_prefill_and_never_enumerates_scope_keys() {
+        let (temp, manager, db, id) = startup_worker_fixture(false, false);
+        let config = {
+            let mut state = manager.scheduler.state.lock().unwrap();
+            let config = state.desired_config.as_mut().unwrap();
+            config.excluded_roots = vec![config.roots[0].path.join("bookshelf")];
+            config.excluded_root_keys = config
+                .excluded_roots
+                .iter()
+                .map(|path| crate::search_index_db::normalize_path(path))
+                .collect();
+            config.clone()
+        };
+        let fingerprint = similar_scan_fingerprint(&config);
+        Arc::clone(&manager.scheduler).worker_loop();
+        assert!(matches!(manager.progress(), IndexProgress::Complete(_)));
+        assert_eq!(db.full_inventory_load_count(), 1);
+        assert!(db.scanned_once_matches(&fingerprint).unwrap());
+
+        // Browsing an excluded bookshelf can leave auxiliary prefill after a complete Full.
+        let prefill = row(
+            1,
+            &format!("{}/browsed.jpg", config.excluded_root_keys[0]),
+            [7; 32],
+            10,
+        )
+        .item;
+        db.put_prefill(&prefill).unwrap();
+        drop(manager);
+        drop(db);
+
+        // Reuse leaves auxiliary prefill alone; both starts must avoid any scope enumeration.
+        for _ in 0..2 {
+            let db = Arc::new(SimilarDb::open_at(&temp.path().join("similar.db")).unwrap());
+            assert!(db.scanned_once_matches(&fingerprint).unwrap());
+            let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+            let mut state =
+                coordinator_state_with_watch(id, &config.roots[0].path, WatchHealth::Ready);
+            state.desired_config = Some(config.clone());
+            state.pending_full = Some(initial_full_intent());
+            state.phase = SchedulerPhase::Starting;
+            *manager.scheduler.prefill_db.lock().unwrap() = Some(Arc::clone(&db));
+            *manager.scheduler.state.lock().unwrap() = state;
+            manager.set_skip_offline_change_scan(true);
+            let reused = Arc::new(AtomicBool::new(false));
+            let observed_reuse = Arc::clone(&reused);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            *manager.scheduler.startup_test_probe.lock().unwrap() = Some(Arc::new(move |phase| {
+                if phase == "reused_initial" {
+                    observed_reuse.store(true, Ordering::Release);
+                } else if phase == "before_array_request" {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }));
+            std::thread::scope(|threads| {
+                let scheduler = Arc::clone(&manager.scheduler);
+                let worker = threads.spawn(move || scheduler.worker_loop());
+                entered_rx.recv().unwrap();
+                let awaiting_ack = matches!(manager.progress(), IndexProgress::AwaitingArray(_));
+                let remaining_prefill = db.load_prefill(
+                    &prefill.item_key,
+                    prefill.mtime,
+                    prefill.file_size,
+                    prefill.hash_version,
+                );
+                let marker_kept = db.scanned_once_matches(&fingerprint);
+                // Release the worker before assertions so an invalidated marker fails, not hangs.
+                release_tx.send(()).unwrap();
+                worker.join().unwrap();
+                assert!(reused.load(Ordering::Acquire));
+                assert!(awaiting_ack);
+                assert!(remaining_prefill.unwrap().is_some());
+                assert!(marker_kept.unwrap());
+            });
+            assert!(matches!(manager.progress(), IndexProgress::Complete(_)));
+            assert_eq!(db.full_inventory_load_count(), 0);
+            assert_eq!(db.scope_purge_enumeration_count(), 0);
+            assert_eq!(db.cleanup_incomplete_call_count(), 1);
+            assert_eq!(manager.reconcile_job_counts_for_test(), (0, 0));
+            assert!(db.scanned_once_matches(&fingerprint).unwrap());
+        }
+    }
+
+    #[test]
+    fn startup_reused_initial_log_reports_each_step_in_normal_log() {
+        let telemetry = telemetry_for_test(ReconcileJobKind::Full(initial_full_intent()));
+        telemetry
+            .reused_cleanup_time
+            .observe(Duration::from_micros(1200));
+        assert_eq!(
+            telemetry.reused_initial_log(
+                Duration::from_micros(300),
+                137_000,
+                Duration::from_micros(5000),
+            ),
+            "similar reconcile reused initial: skipped=true cleanup_ms=1.2 page_order_ms=0.3 memory_ms=137.0 ack_ms=5.0"
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_and_page_order_cost_with_complete_containers() {
+        // A disposable on-disk store measures the remaining preparation work without real data.
+        // Timing is evidence only; correctness assertions never depend on elapsed thresholds.
+        for containers in [1_000, 100_000] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("similar.db");
+            let db = SimilarDb::open_at(&path).unwrap();
+            assert_eq!(
+                db.page_order_version().unwrap(),
+                crate::similar_db::PAGE_ORDER_VERSION
+            );
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute(
+                    "WITH RECURSIVE ids(value) AS (
+                       VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+                     )
+                     INSERT INTO container
+                       (container_key, source_parent_key, kind, page_count, scan_state,
+                        generation, mtime, file_size)
+                     SELECT printf('c:/library/books/%08d.zip', value), 'c:/library/books',
+                            ?2, 0, ?3, 1, 1, 1 FROM ids",
+                    rusqlite::params![
+                        containers,
+                        ContainerKind::Zip as i64,
+                        crate::similar_db::ScanState::Complete as i64,
+                    ],
+                )
+                .unwrap();
+            }
+            db.mark_scanned_once("same configuration").unwrap();
+            drop(db);
+
+            let db = SimilarDb::open_at(&path).unwrap();
+            let cleanup_started = std::time::Instant::now();
+            assert_eq!(
+                db.cleanup_incomplete_if(&Arc::new(AtomicBool::new(false)))
+                    .unwrap(),
+                Some(0)
+            );
+            let cleanup_elapsed = cleanup_started.elapsed();
+            let page_order_started = std::time::Instant::now();
+            repair_page_order_if_stale(&db);
+            let page_order_elapsed = page_order_started.elapsed();
+            println!(
+                "reused preparation: complete_containers={containers} db_bytes={} cleanup_ms={:.3} page_order_ms={:.3}",
+                std::fs::metadata(&path).unwrap().len(),
+                cleanup_elapsed.as_secs_f64() * 1000.0,
+                page_order_elapsed.as_secs_f64() * 1000.0,
+            );
+            assert_eq!(
+                db.load_complete_containers().unwrap().len(),
+                containers as usize
+            );
+            assert_eq!(db.full_inventory_load_count(), 0);
+            assert_eq!(db.scope_purge_enumeration_count(), 0);
+            assert!(db.scanned_once_matches("same configuration").unwrap());
+        }
+    }
+
+    #[test]
+    fn startup_marker_and_setting_control_full_and_success_sets_marker() {
+        for (skip, marker) in [(false, true), (true, false), (true, true)] {
+            let (_temp, manager, db, _id) = startup_worker_fixture(skip, marker);
+            if skip && marker {
+                db.mark_scanned_once("mismatched fingerprint").unwrap();
+            }
+            Arc::clone(&manager.scheduler).worker_loop();
+            assert_eq!(db.full_inventory_load_count(), 1);
+            let state = manager.scheduler.state.lock().unwrap();
+            assert!(
+                db.scanned_once_matches(&similar_scan_fingerprint(
+                    state.desired_config.as_ref().unwrap()
+                ))
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn startup_incomplete_or_cancelled_scan_never_marks_complete() {
+        for cancelled in [false, true] {
+            let (_temp, manager, db, id) = startup_worker_fixture(false, false);
+            let config = manager
+                .scheduler
+                .state
+                .lock()
+                .unwrap()
+                .desired_config
+                .clone()
+                .unwrap();
+            if !cancelled {
+                let root = &config.roots[0].path;
+                std::fs::remove_dir(root).unwrap();
+                std::fs::write(root, b"not a directory").unwrap();
+            }
+            let outcome = run_index_job(
+                &db,
+                &config.scan_roots(),
+                &config.excluded_root_keys,
+                &config.pdf_passwords,
+                ContainerPreopenPolicy::InitialMetadataTrust,
+                None,
+                &Arc::new(AtomicBool::new(cancelled)),
+                &manager.progress,
+                &ArrayRefreshNotifier {
+                    scheduler: Weak::new(),
+                },
+                None,
+                &similar_scan_fingerprint(&config),
+            )
+            .unwrap();
+            assert!(!outcome.prune_safe);
+            assert!(
+                !db.scanned_once_matches(&similar_scan_fingerprint(&config))
+                    .unwrap()
+            );
+            assert_eq!(
+                manager.scheduler.state.lock().unwrap().watch_by_root[&id].repaired_gap_epoch,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn startup_incomplete_worker_does_not_write_marker_or_erase_prior_complete() {
+        for prior_marker in [false, true] {
+            let (_temp, manager, db, _id) = startup_worker_fixture(false, prior_marker);
+            let config = manager
+                .scheduler
+                .state
+                .lock()
+                .unwrap()
+                .desired_config
+                .clone()
+                .unwrap();
+            std::fs::remove_dir(&config.roots[0].path).unwrap();
+            std::fs::write(&config.roots[0].path, b"not a directory").unwrap();
+            Arc::clone(&manager.scheduler).worker_loop();
+            assert!(matches!(
+                manager.progress(),
+                IndexProgress::Degraded {
+                    reason: IndexDegradedReason::FilesystemObservationIncomplete,
+                    ..
+                }
+            ));
+            assert_eq!(
+                db.scanned_once_matches(&similar_scan_fingerprint(&config))
+                    .unwrap(),
+                prior_marker
+            );
+        }
+    }
+
+    #[test]
+    fn startup_failed_full_publication_preserves_existing_marker() {
+        let (temp, manager, db, _id) = startup_worker_fixture(false, true);
+        let conn = rusqlite::Connection::open(temp.path().join("similar.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_full_publication BEFORE INSERT ON index_run
+            BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;",
+        )
+        .unwrap();
+        Arc::clone(&manager.scheduler).worker_loop();
+        assert!(matches!(manager.progress(), IndexProgress::Failed(_)));
+        let state = manager.scheduler.state.lock().unwrap();
+        assert!(
+            db.scanned_once_matches(&similar_scan_fingerprint(
+                state.desired_config.as_ref().unwrap()
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker() {
+        for off_purge in [false, true] {
+            let (temp, manager, db, id) = startup_worker_fixture(true, true);
+            let original = manager
+                .scheduler
+                .state
+                .lock()
+                .unwrap()
+                .desired_config
+                .clone()
+                .unwrap();
+            let fingerprint = similar_scan_fingerprint(&original);
+            let item_key = format!("{}/old.jpg", original.roots[0].key);
+            db.upsert_loose_item(&row(1, &item_key, [7; 32], 10).item)
+                .unwrap();
+            let gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+            gate.set_paused(true);
+            // OFF purge must still commit immediately while full scanning is paused.
+            manager.scheduler.configure(
+                if off_purge {
+                    Vec::new()
+                } else {
+                    original.roots.clone()
+                },
+                original.pdf_passwords.clone(),
+                if off_purge {
+                    Some(Arc::clone(&gate))
+                } else {
+                    None
+                },
+                if off_purge {
+                    Vec::new()
+                } else {
+                    vec![original.roots[0].path.join("excluded")]
+                },
+            );
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            *manager.scheduler.startup_test_probe.lock().unwrap() = Some(Arc::new(move |phase| {
+                let target = if off_purge {
+                    "configuration_purge_committed"
+                } else {
+                    "full_prepared"
+                };
+                if phase == target {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }));
+            std::thread::scope(|threads| {
+                let scheduler = Arc::clone(&manager.scheduler);
+                let worker = threads.spawn(move || scheduler.worker_loop());
+                entered_rx.recv().unwrap();
+                assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+                assert_eq!(
+                    db.load_search_rows(current_hash_version()).unwrap().len(),
+                    usize::from(!off_purge)
+                );
+                manager.scheduler.configure(
+                    original.roots.clone(),
+                    original.pdf_passwords.clone(),
+                    Some(Arc::clone(&gate)),
+                    original.excluded_roots.clone(),
+                );
+                // A normal shutdown cancels the current run with the replacement Full pending.
+                manager.scheduler.shutdown();
+                *manager.scheduler.startup_test_probe.lock().unwrap() = None;
+                release_tx.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            // The cancelled Full may enter the loader, which checks cancel before any reads.
+            let cancelled_loader_calls = usize::from(!off_purge);
+            assert_eq!(db.full_inventory_load_count(), cancelled_loader_calls);
+            assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+            drop(manager);
+            drop(db);
+
+            let db = Arc::new(SimilarDb::open_at(&temp.path().join("similar.db")).unwrap());
+            assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+            assert_eq!(db.full_inventory_load_count(), 0);
+            let restarted = SimilarIndexManager::new(temp.path().to_path_buf());
+            let mut state =
+                coordinator_state_with_watch(id, &original.roots[0].path, WatchHealth::Ready);
+            state.pending_full = Some(initial_full_intent());
+            state.phase = SchedulerPhase::Starting;
+            *restarted.scheduler.prefill_db.lock().unwrap() = Some(Arc::clone(&db));
+            *restarted.scheduler.state.lock().unwrap() = state;
+            restarted.set_skip_offline_change_scan(true);
+            let reused = Arc::new(AtomicBool::new(false));
+            let observed_reuse = Arc::clone(&reused);
+            *restarted.scheduler.startup_test_probe.lock().unwrap() =
+                Some(Arc::new(move |phase| {
+                    if phase == "reused_initial" {
+                        observed_reuse.store(true, Ordering::Release);
+                    }
+                }));
+            Arc::clone(&restarted.scheduler).worker_loop();
+            assert!(!reused.load(Ordering::Acquire));
+            assert_eq!(restarted.reconcile_job_counts_for_test(), (1, 0));
+            assert_eq!(db.full_inventory_load_count(), 1);
+            assert!(db.scanned_once_matches(&fingerprint).unwrap());
+        }
+    }
+
+    #[test]
     fn incremental_reconcile_full_watermark_absorbs_only_events_at_or_before_its_start() {
         let favorite_id = Uuid::new_v4();
         let root = PathBuf::from("c:/library");
@@ -10322,6 +11541,179 @@ mod tests {
                 .required_gap_epoch,
             2
         );
+    }
+
+    #[test]
+    fn revoked_watch_rejects_late_ready_and_events_but_replacement_repairs_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let favorite_id = Uuid::new_v4();
+        let root = temp.path().join("library");
+        let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+        state.next_watch_generation = 11;
+        state.phase = SchedulerPhase::Running(RunningReconcileJob {
+            kind: ReconcileJobKind::Delta,
+            config_epoch: 7,
+            start_event_seq: 0,
+            repairs_watch_gap: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        *manager.scheduler.state.lock().unwrap() = state;
+        let old = SimilarWatchRegistration {
+            favorite_id,
+            root_key: crate::search_index_db::normalize_path(&root),
+            registration_generation: 11,
+        };
+        manager.scheduler.revoke_watch(&old);
+        manager
+            .scheduler
+            .set_watch_health(&old, WatchHealth::Ready, None);
+        manager.scheduler.request_change_observed(
+            &old,
+            root.join("old.jpg"),
+            crate::search_watcher::ChangeKind::Upsert,
+            Some(ChangedPathObservation::File),
+        );
+        let revoked_gap = {
+            let state = manager.scheduler.state.lock().unwrap();
+            let watch = state.watch_by_root.get(&favorite_id).unwrap();
+            assert_eq!(watch.health, WatchHealth::Revoked);
+            assert_ne!(watch.registration_generation, old.registration_generation);
+            assert_eq!(state.next_event_seq, 0);
+            assert!(state.dirty.latest_by_scope.is_empty());
+            assert_eq!(
+                state.pending_full.unwrap().required_gap_epoch,
+                watch.gap_epoch
+            );
+            watch.gap_epoch
+        };
+        // Ordinary Unavailable recovery remains valid for the newly issued token.
+        let new = manager.scheduler.begin_watch(favorite_id, &root).unwrap();
+        manager.scheduler.set_watch_health(
+            &new,
+            WatchHealth::Unavailable,
+            Some("temporary gap".into()),
+        );
+        manager
+            .scheduler
+            .set_watch_health(&new, WatchHealth::Ready, None);
+        let state = manager.scheduler.state.lock().unwrap();
+        let watch = state.watch_by_root.get(&favorite_id).unwrap();
+        assert_eq!(watch.health, WatchHealth::Ready);
+        assert_eq!(watch.gap_epoch, revoked_gap);
+        assert!(watch.gap_epoch > watch.repaired_gap_epoch);
+        assert!(state.pending_full.unwrap().required_gap_epoch >= revoked_gap);
+    }
+
+    #[test]
+    fn stopped_watch_handoff_waits_at_registration_barrier_and_repairs_one_gap() {
+        // Exercise a long stopped/join interval from Idle, active reconciliation, and array ack.
+        // Phase Starting below is a deterministic reservation gate; no real worker is launched.
+        for phase in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+            let favorite_id = Uuid::new_v4();
+            let root = temp.path().join("library");
+            let mut state = coordinator_state_with_watch(favorite_id, &root, WatchHealth::Ready);
+            state.next_watch_generation = 11;
+            let interrupted = if phase == 0 {
+                None
+            } else {
+                state.pending_full = Some(initial_full_intent());
+                let plan = state.take_next_job().unwrap();
+                if phase == 2 {
+                    state.phase = SchedulerPhase::AwaitingArray(plan.running.clone());
+                }
+                Some(plan)
+            };
+            *manager.scheduler.state.lock().unwrap() = state;
+            *manager.scheduler.progress.lock().unwrap() = match phase {
+                0 => IndexProgress::Complete(IndexReport::default()),
+                1 => IndexProgress::Running(RunningProgress {
+                    stage: IndexStage::Scanning,
+                    current_path: None,
+                    report: IndexReport::default(),
+                }),
+                _ => IndexProgress::AwaitingArray(IndexReport::default()),
+            };
+            let old = SimilarWatchRegistration {
+                favorite_id,
+                root_key: crate::search_index_db::normalize_path(&root),
+                registration_generation: 11,
+            };
+            manager.scheduler.revoke_watch(&old);
+            if let Some(plan) = interrupted {
+                assert!(plan.running.cancel.load(Ordering::Acquire));
+                assert_eq!(
+                    manager
+                        .scheduler
+                        .settle_interrupted_plan(&plan, false, IndexReport::default()),
+                    InterruptedJobDisposition::AwaitingWatch
+                );
+            }
+            assert!(matches!(
+                manager.progress(),
+                IndexProgress::AwaitingWatch(_)
+            ));
+            {
+                let mut state = manager.scheduler.state.lock().unwrap();
+                assert!(matches!(state.phase, SchedulerPhase::Idle));
+                assert_eq!(
+                    state.watch_by_root[&favorite_id].health,
+                    WatchHealth::Revoked
+                );
+                assert_eq!(state.next_gap_epoch, 1);
+                assert!(!state.watches_are_terminal());
+                assert!(!state.reserve_worker_if_runnable());
+                assert!(state.take_next_job().is_none());
+                assert_eq!(state.pending_full.unwrap().required_gap_epoch, 1);
+            }
+            // Repeated stop and late Ready cannot reopen the terminal barrier.
+            manager.scheduler.revoke_watch(&old);
+            manager
+                .scheduler
+                .set_watch_health(&old, WatchHealth::Ready, None);
+            assert!(matches!(
+                manager.progress(),
+                IndexProgress::AwaitingWatch(_)
+            ));
+            let new = manager.scheduler.begin_watch(favorite_id, &root).unwrap();
+            {
+                let mut state = manager.scheduler.state.lock().unwrap();
+                assert_eq!(
+                    state.watch_by_root[&favorite_id].health,
+                    WatchHealth::Pending
+                );
+                assert_eq!(state.watch_by_root[&favorite_id].gap_epoch, 1);
+                assert_eq!(state.next_gap_epoch, 1);
+                assert!(state.take_next_job().is_none());
+                state.phase = SchedulerPhase::Starting;
+            }
+            manager
+                .scheduler
+                .set_watch_health(&new, WatchHealth::Ready, None);
+            let mut state = manager.scheduler.state.lock().unwrap();
+            state.phase = SchedulerPhase::Idle;
+            let repair = state
+                .take_next_job()
+                .expect("new Ready releases exactly one repair Full");
+            assert!(matches!(
+                repair.running.kind,
+                ReconcileJobKind::Full(FullIntent {
+                    required_gap_epoch: 1,
+                    ..
+                })
+            ));
+            assert!(repair.running.repairs_watch_gap);
+            assert_eq!(
+                state.finish_successful_job(&repair),
+                SuccessfulJobDisposition::Complete
+            );
+            assert_eq!(state.watch_by_root[&favorite_id].repaired_gap_epoch, 1);
+            state.phase = SchedulerPhase::Idle;
+            assert!(!state.has_runnable_work());
+            assert!(state.take_next_job().is_none());
+        }
     }
 
     #[test]

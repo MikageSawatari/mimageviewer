@@ -193,6 +193,7 @@ impl ClientError {
                 ThumbnailErrorCode::Unsupported => "miv_unsupported",
                 ThumbnailErrorCode::NotReady => "miv_not_ready",
                 ThumbnailErrorCode::GenerationFailed => "miv_generation_failed",
+                ThumbnailErrorCode::NoThumbnail => "miv_no_thumbnail",
                 ThumbnailErrorCode::Busy => "miv_busy",
                 ThumbnailErrorCode::PasswordRequired => "miv_password_required",
                 ThumbnailErrorCode::PageOutOfRange => "miv_page_out_of_range",
@@ -209,6 +210,8 @@ impl ClientError {
                 MediaErrorCode::PageOutOfRange => "miv_media_page_out_of_range",
                 MediaErrorCode::Cancelled => "miv_media_cancelled",
                 MediaErrorCode::Busy => "miv_media_busy",
+                MediaErrorCode::RawPrefetchSkipped => "miv_raw_prefetch_skipped",
+                MediaErrorCode::RawCapacity => "miv_raw_capacity",
                 MediaErrorCode::RenderFailed => "miv_media_render_failed",
                 MediaErrorCode::Internal => "miv_media_internal",
             }
@@ -965,6 +968,36 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "page request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn raw_prefetch_window(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: mimageviewer_ipc::RawPrefetchWindowRequest,
+    ) -> Result<IpcSuccess<mimageviewer_ipc::RawPrefetchWindowAck>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::RawPrefetchWindow {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::RawPrefetchWindow { response, .. } => Ok(IpcSuccess {
+                value: response,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "RAW window received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,

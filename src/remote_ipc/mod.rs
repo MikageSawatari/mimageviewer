@@ -8,6 +8,8 @@ mod long_job;
 mod page_jobs;
 mod path_guard;
 mod persistent_collections;
+mod raw_flights;
+mod raw_prefetch;
 mod service;
 mod thumbnail;
 mod video_jump;
@@ -802,15 +804,24 @@ impl RemoteIpcServer {
         persistent_collection_producer: Option<
             crate::collection_store::CollectionRemoteProducerControl,
         >,
+        raw_develop_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
     ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            return pipe::ServerGuard::start(settings, persistent_collection_producer)
-                .map(|guard| Self { _guard: guard });
+            return pipe::ServerGuard::start(
+                settings,
+                persistent_collection_producer,
+                raw_develop_executor,
+            )
+            .map(|guard| Self { _guard: guard });
         }
         #[cfg(not(windows))]
         {
-            let _ = (settings, persistent_collection_producer);
+            let _ = (
+                settings,
+                persistent_collection_producer,
+                raw_develop_executor,
+            );
             Err("リモート接続は Windows の名前付きパイプ専用です".to_owned())
         }
     }

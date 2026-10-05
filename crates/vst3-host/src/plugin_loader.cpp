@@ -1690,8 +1690,8 @@ bool PluginLoader::gui_surface_should_show() {
     HWND main = reinterpret_cast<HWND>(view_main_hwnd_);
     // Re-read OS state on the GUI thread, including after a long attached().
     // Missing main is suppressed during teardown rather than resurrected.
-    const bool minimized = main && (!IsWindow(main) || IsIconic(main));
-    gui_visibility_.suppress(GuiSuppression::Minimized, minimized);
+    if (main) gui_visibility_.reconcile_main(IsWindow(main) != FALSE, IsIconic(main) != FALSE,
+        gui_gate_ && gui_gate_->keep_visible_when_minimized());
     if (gui_gate_) gui_visibility_.suppress(GuiSuppression::RemoteSession, (gui_gate_->snapshot().remote & 1) != 0);
     return gui_visibility_.should_show(main != nullptr, gui_app_active_);
 }

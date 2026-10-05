@@ -26,11 +26,23 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+#[cfg(feature = "dev-tools")]
+pub mod raw;
+#[cfg(not(feature = "dev-tools"))]
+pub(crate) mod raw;
+pub mod raw_format;
 /// 一括書き出しの要求が必ず伴う借用。`app` module 自体は非公開なのでここで出す。
 pub use app::LocalAiActivityLease;
 pub use app::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
+pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
+pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
 pub mod audio_decode;
@@ -83,6 +95,9 @@ mod gpu_lanczos;
 pub mod metadata_transfer;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+mod startup_window_geometry;
+#[cfg(windows)]
+mod startup_windows_diag;
 mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
@@ -165,12 +180,15 @@ pub mod margin_fit;
 pub mod mask_db;
 pub mod materializer;
 pub mod metadata_cleanup;
+pub mod metadata_ownership;
+mod metadata_reconfiguration;
 pub mod modifier_ownership;
 mod modifier_probe;
 pub mod monitor;
 #[cfg(windows)]
 pub(crate) mod mouse_seek_debug;
 pub mod name_bulk_indexer;
+pub mod name_index_manager;
 pub mod name_index_supervisor;
 pub mod native_context_menu;
 mod native_name_dialog;
@@ -215,6 +233,10 @@ pub mod rename_key_migration;
 pub mod ring_shortcut;
 mod rotation_cache;
 pub mod rotation_db;
+#[cfg(any(not(feature = "portable"), test))]
+mod runtime_cleanup;
+#[cfg(any(not(feature = "portable"), test))]
+mod runtime_locks;
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;
@@ -226,6 +248,7 @@ mod seek_strip_menu;
 pub mod settings;
 pub mod settings_db;
 pub mod settings_restore;
+pub mod settings_transfer;
 pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
@@ -267,12 +290,19 @@ mod ui_adjustment_panel;
 mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
+mod ui_raw;
+#[doc(hidden)]
+pub use ui_raw::{
+    draw_raw_blocked_preview_snapshot_fixture, draw_raw_progress_snapshot_fixture,
+    draw_raw_settings_snapshot_fixture,
+};
 pub mod ui_dialogs;
 mod ui_sns_split;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_clipboard_capture_settings_pending_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_clipboard_capture_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_effetune_input_limit_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;
 #[doc(hidden)]
@@ -293,6 +323,9 @@ pub use ui_fullscreen::{
 mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
+pub mod ui_toolbar_layout;
+#[doc(hidden)]
+pub use ui_main::draw_color_presets_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 pub use ui_main::draw_details_icons_snapshot_fixture;
@@ -866,6 +899,7 @@ fn maybe_handle_version_or_help() -> bool {
              Options:\n  \
              -V, --version  Print version and exit\n  \
              -h, --help     Print this help and exit\n  \
+             --diag-startup-windows  Record startup HWND diagnostics (Windows)\n  \
              \n\
              PATH  Open the given image file or folder on startup.\n",
             ver = env!("CARGO_PKG_VERSION"),
@@ -917,6 +951,12 @@ fn write_to_parent_console(msg: &str) {
 }
 
 pub fn run() -> eframe::Result {
+    // Executable ownership is independent of --data-dir and includes workers.
+    #[cfg(all(windows, not(feature = "portable")))]
+    let _runtime_lease = runtime_cleanup::pin_running_version()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    #[cfg(windows)]
+    let _startup_windows_diagnostics = startup_windows_diag::start();
     // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
     // worker モード等の前に処理する (これらは内部フラグで --version と衝突しない)。
     if maybe_handle_version_or_help() {
@@ -1005,6 +1045,10 @@ pub fn run() -> eframe::Result {
     let t0 = Instant::now();
     data_dir::init();
     let data_dir_elapsed = t0.elapsed();
+    #[cfg(windows)]
+    if startup_windows_diag::enabled() {
+        startup_windows_diag::set_log_dir(data_dir::get().join("logs"));
+    }
 
     // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
     // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
@@ -1060,6 +1104,15 @@ pub fn run() -> eframe::Result {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     logger::init();
+
+    #[cfg(all(windows, not(feature = "portable")))]
+    {
+        // Resolve/pin before egui construction, never in update or App::new.
+        effetune::prepare_startup_bundle();
+        if let Err(error) = runtime_locks::signal_ready() {
+            logger::log(format!("runtime lease handoff: {error}"));
+        }
+    }
 
     // Keep the shared liveness lock alive until run() returns. A disabled gate is
     // retained as a typed outcome for the EPUB integration in the next stage.
@@ -1245,25 +1298,23 @@ pub fn run() -> eframe::Result {
 
     // 起動時の最大化。`--window-size` はスクリーンショット用に厳密なサイズを要求する
     // 経路なので、設定より優先して常に通常ウィンドウで起動する。
-    let start_maximized = parse_window_size_arg().is_none()
-        && crate::settings::resolve_startup_maximized(
-            saved.startup_window_state,
-            saved.window_maximized,
-        );
+    let startup_window_geometry = startup_window_geometry::StartupWindowGeometry::new(
+        size,
+        saved.startup_window_state,
+        saved.window_maximized,
+        parse_window_size_arg().is_some(),
+    );
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
         .with_window_level(crate::settings::viewer_window_level(saved.always_on_top))
         .with_inner_size(size)
         .with_min_inner_size(MIN_INNER_SIZE)
+        .with_maximized(false)
         .with_icon(icon);
 
-    // 最大化はウィンドウ生成の時点で指定する。初回フレームで
-    // `ViewportCommand::Maximized` を送る形にすると、通常サイズのウィンドウが一度
-    // 見えてから最大化するので、起動のたびにちらつく。
-    if start_maximized {
-        viewport = viewport.with_maximized(true);
-    }
+    // Hidden maximize in winit shows/hides the root before its first paint (1.327).
+    // Create normal; the app maximizes once after eframe's visible commit.
 
     // --window-size 指定時は位置を画面左上寄りに固定（保存済み位置は無視）
     if parse_window_size_arg().is_some() {
@@ -1311,6 +1362,16 @@ pub fn run() -> eframe::Result {
         wgpu_options,
         ..Default::default()
     };
+    #[cfg(windows)]
+    startup_windows_diag::mark("app.native_options.decided", 0, || {
+        serde_json::json!({
+            "inner_size": [size[0], size[1]], "position": options.viewport.position.map(|p| [p.x, p.y]),
+            "maximized": options.viewport.maximized.unwrap_or(false), "min_inner_size": MIN_INNER_SIZE,
+            "maximize_after_visible_commit": startup_window_geometry.maximized_to_save(false),
+            "requested_visible": options.viewport.visible,
+            "effective_eframe_create_visible": false, "ui_scale_factor": saved.ui_scale_factor,
+        })
+    });
 
     // Collection DBはproduction起動だけで開始する。actorのjoin権限はrun_native外のprocess
     // ownerに残し、Appへはclientとevent streamだけを渡す。
@@ -1330,17 +1391,24 @@ pub fn run() -> eframe::Result {
     // App 所有ハンドルを使うため、型付き queue と repaint wakeup 経由で UI thread に渡す。
     // guard は run_native が戻るまで保持し、Drop で listener と worker を閉じる。
     let remote_service_status = remote_ipc::RemoteServiceStatus::stopped();
-    let mut remote_ipc_server =
-        match remote_ipc::RemoteIpcServer::start(saved.clone(), collection_remote_producer.clone())
-        {
-            Ok(server) => Some(server),
-            Err(error) => {
-                eprintln!("remote IPC を開始できません: {error}");
-                logger::log(format!("remote_ipc: startup failed: {error}"));
-                remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
-                None
-            }
-        };
+    saved.raw_develop_parallelism = saved.raw_develop_parallelism.clamp(1, 10);
+    let raw_develop_executor = Arc::new(
+        raw::RawDevelopExecutor::new(saved.raw_develop_parallelism as usize)
+            .expect("RAW develop worker startup"),
+    );
+    let mut remote_ipc_server = match remote_ipc::RemoteIpcServer::start(
+        saved.clone(),
+        collection_remote_producer.clone(),
+        Arc::clone(&raw_develop_executor),
+    ) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!("remote IPC を開始できません: {error}");
+            logger::log(format!("remote_ipc: startup failed: {error}"));
+            remote_service_status.set_error("本体側のリモート接続を開始できませんでした");
+            None
+        }
+    };
     let remote_session_handle = remote_ipc_server
         .as_ref()
         .map(remote_ipc::RemoteIpcServer::session_handle);
@@ -1392,6 +1460,8 @@ pub fn run() -> eframe::Result {
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
             emit_startup("creator_enter", None);
             #[cfg(windows)]
+            startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
+            #[cfg(windows)]
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
@@ -1418,10 +1488,11 @@ pub fn run() -> eframe::Result {
             // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
             let repaint_ctx = cc.egui_ctx.clone();
-            let mut app = app::App::new_from_settings_with_load_meta_and_book_query_repaint(
+            let mut app = app::App::new_from_settings_with_load_meta_and_raw_executor(
                 saved.clone(),
                 settings_load_meta.clone(),
                 move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
+                Arc::clone(&raw_develop_executor),
             );
             match collection_install.clone() {
                 Ok((client, events)) => {
@@ -1507,13 +1578,10 @@ pub fn run() -> eframe::Result {
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
-            app.pending_initial_size = Some(size);
-            // 最大化起動では、この補正は最大化が解けるまで保留される
-            // (`App::apply_deferred_initial_size`)。
-            app.created_maximized = start_maximized;
-            // 追跡値の初期値は「こちらが要求した状態」。egui からの報告を待つ間に
-            // 終了しても、要求した状態がそのまま保存される。
-            app.last_window_maximized = start_maximized;
+            app.startup_window_geometry = startup_window_geometry;
+            // The actual initial window is normal. The startup owner separately preserves
+            // the desired maximized state for exit-save until the command has run.
+            app.last_window_maximized = false;
             #[cfg(all(feature = "test-script", windows))]
             if let Some(path) = test_script_path.clone() {
                 app.prepare_test_script_run();
@@ -1547,6 +1615,9 @@ pub fn run() -> eframe::Result {
     if let Ok(runtime) = collection_runtime {
         runtime.shutdown_and_join();
     }
+    // Rendering and normal shutdown are complete. Preserve the buffered tail for
+    // every perf category without adding another periodic log write on the UI.
+    perf::flush();
     #[cfg(all(feature = "test-script", windows))]
     if scripted_run && run_result.is_ok() {
         test_script::exit_after_run_native();

@@ -2084,7 +2084,9 @@ pub(crate) fn draw_native_audio_track_menu(
                             clip_rect: ui.clip_rect(),
                             layer_id: response.layer_id,
                             sense: response.sense,
-                            enabled: true,
+                            // Area's first sizing pass is invisible and disabled.
+                            // Its provisional rect must never become a click target.
+                            enabled: response.enabled(),
                         },
                     ));
                 }
@@ -13610,7 +13612,7 @@ impl NativeEguiOverlay {
                                     clip_rect: ui.clip_rect(),
                                     layer_id: response.layer_id,
                                     sense: response.sense,
-                                    enabled: true,
+                                    enabled: response.enabled(),
                                 },
                             ));
                             draw_overlay_button_bg(painter, rect, response.hovered(), audio_track_menu_open);
@@ -15535,6 +15537,62 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn audio_track_smoke_menu_waits_for_visible_sized_rows() {
+        let ctx = egui::Context::default();
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1140.0));
+        let button_rect =
+            egui::Rect::from_min_size(egui::pos2(800.0, 1070.0), egui::vec2(60.0, 28.0));
+        let rows = (1..=3)
+            .map(|ordinal| crate::video::audio_track_ui::AudioTrackRow {
+                label: format!("{ordinal}: tone - pcm_s16le 1ch"),
+                stream_index: ordinal,
+                ordinal,
+                is_current: ordinal == 2,
+                state:
+                    crate::video::audio_track_selection::AudioTrackSelectionDisplayState::Applied,
+            })
+            .collect::<Vec<_>>();
+        let mut menu_open = true;
+        let mut frames = Vec::new();
+        for frame in 0..3 {
+            let mut controls = Vec::new();
+            let mut menu_rect = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(full_rect),
+                    ..Default::default()
+                },
+                |_| {
+                    super::draw_native_audio_track_menu(
+                        &ctx,
+                        full_rect,
+                        button_rect,
+                        &rows,
+                        super::native_audio_track_menu_id(),
+                        &mut menu_open,
+                        &mut menu_rect,
+                        &mut Vec::new(),
+                        Some(&mut controls),
+                    );
+                },
+            );
+            assert!(menu_open);
+            assert_eq!(controls.len(), 3);
+            assert!(
+                controls
+                    .iter()
+                    .all(|(_, control)| control.enabled == (frame > 0))
+            );
+            frames.push(controls);
+        }
+        // Area constrains its initial estimated size, then the measured size.
+        // This is a real move, not a publish-generation change.
+        assert_ne!(frames[0][0].1.rect, frames[1][0].1.rect);
+        assert_eq!(frames[1], frames[2]);
+    }
+
     #[test]
     fn audio_track_popup_claims_its_drawn_hud_region() {
         let drawn = egui::Rect::from_min_size(egui::pos2(700.0, 500.0), egui::vec2(220.0, 80.0));

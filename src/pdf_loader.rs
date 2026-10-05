@@ -3626,6 +3626,7 @@ where
 
 impl PdfWorkerPool {
     fn start() -> Result<Self, PdfWorkerPoolStartupFailure> {
+        let _memory = crate::perf::memory::span("pdf_pool_spawn");
         let configured_pool_size = configured_pool_size();
         let exe_path =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));

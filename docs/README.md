@@ -8,7 +8,10 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
+| [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
+| [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |
@@ -17,7 +20,7 @@
 | [similar-index-incremental-reconcile-plan.md](similar-index-incremental-reconcile-plan.md) | 類似索引の全件反復を解消する独立ブランチの設計・実装計画。watch 差分、収束条件、scope prune、検索 snapshot 公開と synthetic 検証 |
 | [similar-index-startup-and-delta-optimization-plan.md](similar-index-startup-and-delta-optimization-plan.md) | 起動FS確認の分類別計測と、更新時DB整理のscope限定化・メモリ案比較。実装・性能検証記録 |
 | [similar-book-query-limit-plan.md](similar-book-query-limit-plan.md) | **完了 (2026-09-19、利用者が実機で確認)**。ページ数上限 3,000 / 候補の総ページ予算 10,000。旧 §1.254 「この本と重なる本」が大きな画像フォルダで終わらない件の正本。perf ログ・索引 DB・読み取り専用ベンチの実測 (所要時間は候補の本の総ページ数で決まる)、対称のページ数上限 + 仕事量の予算、「索引を更新中です」表示の削除、再測定手順 |
-| [section228-similar-container-preopen-plan.md](section228-similar-container-preopen-plan.md) | §1.228 起動時の変更がないZIP/PDFの再列挙を省略する条件。Initial限定の再利用、その他の再確認・差分更新の維持と検証記録 |
+| [section228-similar-container-preopen-plan.md](section228-similar-container-preopen-plan.md) | §1.228 起動時と「今すぐ確認」で変更がないZIP/PDFの再列挙を省略する条件。Initial / UserCheck の再利用、修復Full・差分更新の維持と検証記録 |
 | [section223-compare-wipe-guidance.md](section223-compare-wipe-guidance.md) | §1.223 比較ワイプ境界の常時表示とCtrl中の非表示。既存の比較セッションへの操作状態統合、準備中と終了時の契約 |
 | [section164-force-new-crop-frame.md](section164-force-new-crop-frame.md) | §1.164 修飾キーによる切り取り枠の新規作成。開始時の操作決定、Spaceパン優先、キー割り当てと入力所有の維持 |
 | [section221-context-menu-layout.md](section221-context-menu-layout.md) | §1.221 右クリック専用設定ページ、表示場面の確認と項目・区切り線の編集。静的項目と動的固定枠の分離、設定互換性、共通メニュー解決と検証記録 |
@@ -78,12 +81,14 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全 432 フィールドの分類 (130 対象 / 302 除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
+| [book-resume-meter-plan.md](book-resume-meter-plan.md) | 一覧の本サムネイルの読書位置メーター。記録時のHUD位置/総数、常に左→右、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |
 | [backlog-on-hold.md](backlog-on-hold.md) | **保留・着手待ちバックログ**。判断待ち / 再現・確認待ち / 見送り。動かせるようになったら節ごと上へ戻す |
 | [release-verification-records.md](release-verification-records.md) | **リリース前確認の記録**。版ごとに実際に取った perf smoke / idle health / bench / 依存確認の測定値。次に何かが遅くなったときの比較対象。手順の正本は CLAUDE.md と release-operations.md |
 | [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画別ウィンドウの設計・実装履歴。冒頭 §§1〜2 は初期 v1 案、§3.0 は現行モード、§11 以降は CUT 前 pin 案を含む履歴 |
@@ -93,6 +98,7 @@
 | [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。§9 が唯一の現況表。R2b は部分完了、R3 は実質完了、R4 は未完 |
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | 現行リワーク出荷前 smoke matrix (F/W/V/P/R 系)。独立静止画窓の Ctrl 物理フォルダ移動と configurable 右クリックを含む |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
+| [file-organize-destinations-plan.md](file-organize-destinations-plan.md) | **実装済み (レビュー前)**。固定整理先の登録、Shell によるコピー・移動と実機確認 |
 | [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md) | **一部実装済み**。Windows Shell の `IFileOperation` とネイティブ右クリックメニューへ寄せるファイル整理機能の実装計画。A/B クイックフォルダ、実/仮想項目の native 右クリックメニュー、rename、delete-to-recycle は実装済み。copy/move/drop の `IFileOperation` 化は後続 |
 | [context-menu-unification-plan.md](context-menu-unification-plan.md) | **Phase A/B 実装済み**。実項目・仮想項目で共通の native 右クリックメニュー、mIV 項目の単一定義、混在選択の拒否、Windows 項目の遅延サブメニューと併記設定の正本 |
 | [key-customization-impl-plan.md](key-customization-impl-plan.md) | **実装済みメモ**。簡易版 (旧テキスト ini / GUI なし / 競合は警告のみ) の手順書と実装判断。現在の正本は `Settings.keymap` で、旧 `keymap.ini` は初回起動時に settings.db へ移行して `keymap.ini.imported*.bak` へ退避する。`src/keymap.rs` の型・`keymap.ini.default` 生成・旧 ini 仕様 (`Action.1` 形式)・exact match ヘルパー・native 動画転送対応・エッジケース規則・`KeyAction` インベントリ (付録 A)・キー変換ホワイトリスト (付録 B) |
@@ -122,7 +128,7 @@
 | [filename-stack-plan.md](filename-stack-plan.md) | **実装済み (v2.0.0)**。ファイル名 prefix (末尾の区切り文字の前、既定 `_`) でフォルダ内画像を仮想スタックに畳む表示モード。pixiv/danbooru の「1 投稿=複数ファイル」を 1 サムネにまとめる。全グループを仮想スタック化 (単独=1 ページ) し、Ctrl+↑↓=スタック間 / ↑↓=スタック内のフルスクリーン二段ナビ。`ZipDir`/`SearchContainer` 仮想アイテム・Ctrl+G ドリル・`materialize` 見開きリセット・`start_loading_items` を流用、非破壊。②製本のピン本へスタック単位コピーと連携 |
 | [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) | **実装済み (2026-06-21)**。スタックの分類ルールをユーザー定義 Rhai スクリプトで書ける拡張。契約 = メンバー列→同長キー配列の純関数 `group(files)` (**画像のみ**を渡す。各要素は `name/stem/ext/mtime/size`。動画は常に単独なので渡さず `is_video` も非公開)。`regex_is_match`/`regex_capture`/`regex_replace`/`argsort_int` を公開、操作上限つきサンドボックス。既定は内蔵カスケード (mXD/末尾連番/先頭連番/連写、all-match + 汎用は distinct≥2)。`<data_dir>/stack_rules.rhai` で上書き可、失敗時は組み込み既定へフォールバック。設定 `stack_script_enabled`、UI = 環境設定「フォルダ・ファイル」、ヘルプ = manual/stack.html |
 | [rating-list-view-plan.md](rating-list-view-plan.md) | **Phase 1 実装済み (2026-06-23)、戻る導線追加済み (2026-07-05)**。場所▼ と ファイル メニューに ★1〜★5 を足し、選んだ★の付いたアイテム/コンテナを場所横断でフラット一覧する仮想ビュー。閲覧履歴/タグビューを雛形に `items_are_rating_view` を追加。**時刻ソートのため `rating.db` に `rated_at_ms` + `source_path` + `kind` + 仮想アイテム復元メタを後方互換追加** (リリース済み DB)。★設定時刻ソートはビュー固有 (表示中だけソートに追加、グローバル SortOrder は不変)。キー→GridItem 復元は新規行は kind/meta 直読み・旧行は parse+stat 推定。結果から開いたコンテナは `rating_view_nav_stack` でレーティング一覧へ戻る |
-| [color-search-plan.md](color-search-plan.md) | **Phase 1/2 + Phase 3 実装済み (2026-06-23 起案 → Codex/ClaudeCode レビュー → オンデマンド方式へ転換)**。Eagle 風のカラー検索 (画像色で絞り込み)。**永続化しない**: 画像色フィルタを使う瞬間に現在の表示の画像アイテムを Ctrl+F 風にスキャン (在メモリ・進捗+キャンセル) してパレット抽出。画素入手は cache_map(WebP)→catalog(WebP)→必要時デコード後に縮小/サンプリング (JPEG は DCT で縮小 decode 可、PNG/WebP/WIC はフル decode になり得る) のフォールバック。抽出は量子化+知覚マージ+再割当で 8 色、照合は CIELAB ΔE76 + ratio_floor。色/許容変更は必要時に自動で一時スキャンを開始し、スキャン後は在メモリ再フィルタのみ。スキーマ/マイグレーション/設定追加なし。今回リリースは通常フォルダ / ZIP / PDF 表示限定で、Ctrl+G/タグ/お気に入り検索など集約ビュー開放は後続。メタデータパネルのスウォッチ表示、クリック起動、perf 計装、大量時確認 UI、Eagle 風ピッカー (SV/Hue、プリセット、HEX/RGB/HSL)、マニュアル/製品ページ更新まで実装済み。画面スポイトは実機で UI 応答と入力透過のリスクが大きかったため削除済み |
+| [color-search-plan.md](color-search-plan.md) | **Phase 1/2 + Phase 3 実装済み (2026-06-23 起案 → Codex/ClaudeCode レビュー → オンデマンド方式へ転換)**。Eagle 風のカラー検索 (画像色で絞り込み)。**永続化しない**: 画像色フィルタを使う瞬間に現在の表示の画像アイテムを Ctrl+F 風にスキャン (在メモリ・進捗+キャンセル) してパレット抽出。画素入手は通常画像が cache_map(WebP)→必要時デコード後に縮小/サンプリング、ZIP/PDF 親代表だけが cache_map(WebP)→catalog(WebP、pin を含む代表キーの個別読取)→必要時生成 (JPEG は DCT で縮小 decode 可、PNG/WebP/WIC はフル decode になり得る) のフォールバック。抽出は量子化+知覚マージ+再割当で 8 色、照合は CIELAB ΔE76 + ratio_floor。色/許容変更は必要時に自動で一時スキャンを開始し、スキャン後は在メモリ再フィルタのみ。スキーマ/マイグレーション/設定追加なし。今回リリースは通常フォルダ / ZIP / PDF 表示限定で、Ctrl+G/タグ/お気に入り検索など集約ビュー開放は後続。メタデータパネルのスウォッチ表示、クリック起動、perf 計装、大量時確認 UI、Eagle 風ピッカー (SV/Hue、プリセット、HEX/RGB/HSL)、マニュアル/製品ページ更新まで実装済み。画面スポイトは実機で UI 応答と入力透過のリスクが大きかったため削除済み |
 | [nested-zip-tree-plan.md](nested-zip-tree-plan.md) | **実装済み**。`ZipTree` / `ZipDir` によるネスト ZIP のツリーナビ、階層 materialize、サムネイルとナビゲーションの設計契約 |
 | [rar-direct-read-plan.md](rar-direct-read-plan.md) | **実装済み (実 RAR の最終 smoke 対象)**。非ソリッド RAR/CBR の直読みと、ソリッド・入れ子・他形式を ZIP cache 変換へ委譲する routing 仕様 |
 | [external-tool-launch-plan.md](external-tool-launch-plan.md) | **P0/P1/P2a/P2b/P2c/P3 実装済み (2026-09-01、P3 は実機確認待ち)、P4 以降は未実装**。backlog §1.117 の正本。導線は登録した全ツールを平坦に出す右クリックと、既定キーなしの Grid 専用固定スロット / ピッカーの 2 つ。ツールバーとメニューバーの直接起動は一度実装後に撤去した。フォルダー背景・コンテナー項目から現在のフォルダー / 本 1 件を渡す入口を持ち、複数対象は既定 `Each`、ツール別の確認 5 件 / 上限 10 件で扱う。変換アーカイブは元パスを使い、1 コンテナーに定まらない集約ビュー背景と仮想ページは拒否する。外部ツール起動を引数テンプレート / 作業フォルダー / 複数選択 / **ZIP・PDF 内ページの一時実体化** / **動画の現在フレーム**まで広げる設計で、**仮想パスをそのまま渡す方針は採らない**。一時ファイルは NeeView 同型のプロセス単位ディレクトリ + 終了時削除 + 起動時の孤児回収 |

@@ -32,7 +32,7 @@
     "applicationSubCategory": "画像ビューア",
     "operatingSystem": "Windows 11 (64bit)",
     "softwareVersion": "4.3.0",
-    "dateModified": "2026-10-01",
+    "dateModified": "2026-10-04",
     "inLanguage": "ja",
     "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。AI 処理はすべて利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
@@ -54,7 +54,7 @@
       "サムネイルグリッド表示",
       "ZIP / CBZ / RAR / 7z / PDF の直接閲覧",
       "DRM のない EPUB を変換して閲覧",
-      "RAW・HEIC・AVIF・JPEG XL 対応",
+      "RAW 表示・現像を内蔵、HEIC・AVIF・JPEG XL 対応",
       "動画のインライン再生と一定間隔のサムネイル一覧（タイル表示）",
       "AI アップスケール（ローカル GPU 実行）",
       "非破壊の補正・注釈・消しゴム",
@@ -843,7 +843,7 @@
   <div class="usecase-card">
     <div class="uc-icon">🗂️</div>
     <div class="uc-title">種類の違うファイルを 1 つの画面で扱いたい</div>
-    <p class="uc-desc">画像・ZIP・PDF・動画・音声が同じ一覧に並び、同じ操作で開けます。種類ごとにソフトを使い分ける必要はありません。RAW・HEIC も追加インストール不要で、数十万枚のフォルダでも高速です。</p>
+    <p class="uc-desc">画像・ZIP・PDF・動画・音声が同じ一覧に並び、同じ操作で開けます。種類ごとにソフトを使い分ける必要はありません。RAW の表示・現像も内蔵し、数十万枚のフォルダでも高速です。</p>
   </div>
   <div class="usecase-card">
     <div class="uc-icon">📱</div>
@@ -1054,7 +1054,7 @@
       <div class="feature-card">
         <div class="icon">📷</div>
         <h3>RAW・HEIC・AVIF・レトロ形式対応</h3>
-        <p>各種 RAW・HEIC・AVIF・JPEG XL・TIFF を Windows の WIC で表示。Susie プラグイン（.spi）経由で PI / MAG / PIC など PC-98 / X68000 時代のレトロ画像形式も閲覧できます。</p>
+        <p>各社 RAW の表示・現像を内蔵。まず埋め込みプレビューを表示し、現像後に画像を切り替えます。HEIC・AVIF・JPEG XL・TIFF は Windows の表示機能を使います。Susie プラグイン（.spi）経由で PI / MAG / PIC など PC-98 / X68000 時代のレトロ画像形式も閲覧できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🎬</div>
@@ -1100,6 +1100,7 @@
         <div class="icon">🔍</div>
         <h3>横断検索・絞り込み</h3>
         <p>Ctrl+F で表示中の一覧をその場で絞り込み、Ctrl+G でお気に入り全体の画像・PDF・動画を全文索引で横断検索。ファイル名・EXIF・AI プロンプト・サイドカーなどを対象に、10 万件規模でも高速に探せます。</p>
+        <p>常駐して使う場合は、終了中の変更を起動時に確認しない設定で起動を速くできます。検索結果に変更が反映されていないときは、お気に入り編集の「今すぐ確認」でまとめて確認できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">📱</div>
@@ -1174,7 +1175,7 @@
 
   <section id="formats">
     <h2>対応フォーマット</h2>
-    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP（内蔵）／ HEIC・AVIF・JPEG XL・TIFF・各社 RAW（WIC 経由）</p>
+    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP、各社 RAW（内蔵）／ HEIC・AVIF・JPEG XL・TIFF（Windows の表示機能）。<a href="manual/formats.html#raw">RAW の対応形式と制限</a></p>
     <p><strong>アニメーション：</strong>アニメーション GIF、APNG、Animated WebP</p>
     <p><strong>動画：</strong>MP4、AVI、MOV、MKV、WMV、MPEG（サムネイル表示 + フルスクリーン再生）</p>
     <p><strong>ドキュメント：</strong>PDF（ページごとに表示、パスワード付き対応）</p>
@@ -1189,7 +1190,8 @@
       <li><span class="label">OS</span><span>Windows 11（64bit）</span></li>
       <li><span class="label">GPU</span><span>DirectX 12 対応グラフィックカード（最新のグラフィックドライバを推奨）</span></li>
       <li><span class="label">メモリ</span><span>4GB 以上（8GB 以上推奨）</span></li>
-      <li><span class="label">ランタイム</span><span>不要（単体 exe、インストール不要）</span></li>
+      <li><span class="label">CPU</span><span>x86-64（Intel / AMD）。音響調整 (EffeTune) には AVX2 と FMA の両方への対応が必要です。</span></li>
+      <li><span class="label">ランタイム</span><span>EPUB の変換と音響調整 (EffeTune) の画面表示には Microsoft Edge WebView2 Runtime が必要です（Windows 11 に標準で含まれます）。</span></li>
     </ul>
     <p style="margin-top:0.9rem; font-size:0.82rem; color:#888; line-height:1.7;">
       ※ 動作確認は主に NVIDIA GeForce 環境で行っています。Intel / AMD など他の GPU でも動作しますが、不具合がありましたらご連絡ください。
@@ -1233,10 +1235,13 @@
         <p>設定・動画や音声の再生位置・選んだ音声トラック・サムネイルキャッシュ（動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）・タグ・★評価・閲覧履歴・コレクションの名前と登録先・別バージョンを探すための索引は、PC に保存されます。リモート閲覧では端末から届いた動画の再生位置と音声トラックの選択も PC に記録されます。
           アンインストール時にまとめて削除できます。</p>
         <p style="margin-top:0.5rem;">EPUB を変換した PDF も通常は PC 内に保存されます。元の EPUB と同じ場所に PDF を書き出すのは、利用者が PDF ファイルへの保存・変換を選んだときだけです。</p>
+        <p style="margin-top:0.5rem;">環境設定のうち移行できる項目は、利用者が選んだファイルにも保存できます。ファイルに閲覧履歴・登録先・接続情報は含めず、アプリから外部へ送信しません。ネットワーク共有や同期フォルダを選ぶ場合は、その保存先や同期ソフトの動作に従います。</p>
         <p style="margin-top:0.5rem;">音響調整 (EffeTune) のプリセット・設定は、mImageViewer のデータフォルダーとは別に
           <code>%APPDATA%\effetune\</code> または <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。
           取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に保存され、mImageViewer のデータフォルダーを変更しても保存先は変わりません。
           EffeTune 自身の保存データは、mImageViewer のアンインストール時にも残ります。ポータブル版では音響調整を利用できません。
+          音響調整へ渡す前に大きな音のピークを抑える設定もあり、音の可視化だけでも使えます。
+          メイン画面を最小化しても音響調整の窓を表示したままにする設定で、ビジュアライザーを見続けることもできます。
           詳しくは<a href="manual/effetune.html">音響調整の説明</a>をご覧ください。</p>
         <p style="margin-top:0.5rem;">リモート閲覧用サービスの動作記録等は、通常版では <code>%APPDATA%\mimageviewer-remote\</code> に保存され、
           アンインストール後も残ります。ポータブル版は <code>data</code> と同じ場所の <code>data-remote</code> を使います。
@@ -1261,7 +1266,7 @@
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
         <div class="version">mImageViewer v4.3.0</div>
-        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-01</div>
+        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-04</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
         <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラ版</a>
@@ -1419,12 +1424,25 @@
       詳細はライセンス全文をご確認ください。
     </p>
 
+    <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（LibRaw / CDDL）</h3>
+    <p style="font-size:0.9rem;">
+      RAW の表示・現像には <a href="https://www.libraw.org/">LibRaw</a> を CDDL-1.0 で使用しています。対応するソースコードを以下から入手できます。
+    </p>
+    <ul style="font-size:0.9rem;">
+      <li>LibRaw バージョン: 0.22.2</li>
+      <li>対応ソース: <a href="https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz">libraw-0.22.2-source.tar.gz</a>（改変していない公式ソース。<a href="https://github.com/LibRaw/LibRaw/tree/0.22.2">配布元</a>）</li>
+      <li>ライセンス全文・著作権表記: アプリの「バージョン情報」から確認できます。インストーラ版・ポータブル版には LIBRAW-LICENSE.txt（CDDL-1.0 と BSD 表記を含む）も同梱しています</li>
+      <li>zlib 1.3.1（zlib ライセンス）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には ZLIB-LICENSE.txt も同梱しています</li>
+      <li>libjpeg-turbo（IJG / BSD-3-Clause / zlib）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には LIBJPEG-TURBO-LICENSE.txt も同梱しています。This software is based in part on the work of the Independent JPEG Group.</li>
+    </ul>
+
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（EffeTune / VST3 SDK）</h3>
     <p style="font-size:0.9rem;">
       単体exe版・インストーラ版の音響調整には EffeTune Mixwright（MIT License、
       Copyright (c) 2025-2026 Yoshiyuki Kobayashi）を同梱しています。
       VST3 対応には Steinberg VST3 SDK（MIT License、Steinberg Media Technologies GmbH）を使用しています。
-      EffeTune と同梱ライブラリの通知全文は、アプリの「バージョン情報」で確認できます。
+      EffeTune の同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate / setImmediate / pako (zlib)、CHOC、および通知に記載されたその他のライブラリ）には、それぞれのライセンスが適用されます。
+      通知全文は、アプリの「ソフトウェア情報」（バージョン情報）の EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。
       ポータブル版は EffeTune と VST3 ホストを同梱しません。
     </p>
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（FFmpeg / LGPL）</h3>

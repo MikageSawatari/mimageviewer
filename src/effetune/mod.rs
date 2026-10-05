@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 
-mod bundle_location;
+pub(crate) mod bundle_location;
 pub mod composition;
 pub(crate) mod gui_gate;
 mod window;
@@ -212,15 +212,35 @@ impl EffectiveState {
     }
 }
 
-/// All local players observe this one slot. A pump reads it once per block.
-#[derive(Default)]
+/// All local players and Remote workers observe this one slot per audio block.
 pub struct EffetuneAudioSlot {
     current: Mutex<Option<(u64, Arc<DspBridge>)>>,
     failure_tx: Mutex<Option<mpsc::Sender<EffetuneFailure>>>,
     failed_generation: AtomicU64,
+    pre_limiter_enabled: AtomicBool,
+}
+
+impl Default for EffetuneAudioSlot {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(None),
+            failure_tx: Mutex::new(None),
+            failed_generation: AtomicU64::new(0),
+            pre_limiter_enabled: AtomicBool::new(true),
+        }
+    }
 }
 
 impl EffetuneAudioSlot {
+    /// The App publishes only accepted preferences, independently of bridge life.
+    pub(crate) fn set_pre_limiter_enabled(&self, enabled: bool) {
+        self.pre_limiter_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn pre_limiter_enabled(&self) -> bool {
+        self.pre_limiter_enabled.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> Option<(u64, Arc<DspBridge>)> {
         self.current
             .lock()
@@ -711,7 +731,55 @@ fn resolve_bundle() -> Result<PathBuf, UnavailableReason> {
             }
             why
         })?;
-    check_bundle_cpu(bundle)
+    pin_process_bundle(check_bundle_cpu(bundle)?)
+}
+
+// One immutable successful resource owner survives App/host teardown until the
+// process exits. Initial failure is separately cached before egui construction;
+// the existing retry worker may install the first successful pin later.
+#[cfg(all(windows, not(feature = "portable"), not(test)))]
+static PROCESS_GENERATION: std::sync::OnceLock<crate::runtime_locks::PinnedGeneration> =
+    std::sync::OnceLock::new();
+#[cfg(all(windows, not(feature = "portable"), not(test)))]
+static STARTUP_BUNDLE: std::sync::OnceLock<Result<PathBuf, UnavailableReason>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(windows, not(feature = "portable")))]
+pub(crate) fn prepare_startup_bundle() {
+    #[cfg(not(test))]
+    STARTUP_BUNDLE.get_or_init(resolve_bundle);
+}
+
+fn pin_process_bundle(bundle: PathBuf) -> Result<PathBuf, UnavailableReason> {
+    #[cfg(all(windows, not(feature = "portable"), not(test)))]
+    return retain_process_generation(&PROCESS_GENERATION, bundle);
+    #[cfg(not(all(windows, not(feature = "portable"), not(test))))]
+    Ok(bundle)
+}
+
+#[cfg(any(not(feature = "portable"), test))]
+fn retain_process_generation(
+    owner: &std::sync::OnceLock<crate::runtime_locks::PinnedGeneration>,
+    bundle: PathBuf,
+) -> Result<PathBuf, UnavailableReason> {
+    if let Some(root) = bundle.parent().filter(|root| {
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(bundle_location::valid_generation)
+    }) {
+        let pin =
+            crate::runtime_locks::PinnedGeneration::new(root.to_path_buf()).map_err(|error| {
+                UnavailableReason::preparation_failed(format!("generation lease: {error}"))
+            })?;
+        if let Err(pin) = owner.set(pin) {
+            if owner.get().unwrap().path != pin.path {
+                return Err(UnavailableReason::preparation_failed(
+                    "core already pinned a different generation",
+                ));
+            }
+        }
+    }
+    Ok(bundle)
 }
 
 fn check_bundle_cpu(bundle: PathBuf) -> Result<PathBuf, UnavailableReason> {
@@ -727,7 +795,7 @@ fn resolve_bundle_for_retry(rejected: Option<&str>) -> Result<PathBuf, Unavailab
     let parent = exe
         .parent()
         .ok_or_else(|| UnavailableReason::preparation_failed("executable has no parent"))?;
-    check_bundle_cpu(resolve_retry_at(parent, rejected)?)
+    pin_process_bundle(check_bundle_cpu(resolve_retry_at(parent, rejected)?)?)
 }
 
 fn resolve_retry_at(parent: &Path, rejected: Option<&str>) -> Result<PathBuf, UnavailableReason> {
@@ -838,7 +906,21 @@ fn wake_ui(context: &Mutex<Option<egui::Context>>) {
 
 impl EffetuneController {
     pub fn new() -> Self {
-        let bundle = resolve_bundle();
+        let bundle = {
+            let _memory = crate::perf::memory::span("effetune_bundle_resolve");
+            #[cfg(all(windows, not(feature = "portable"), not(test)))]
+            {
+                STARTUP_BUNDLE.get().cloned().unwrap_or_else(|| {
+                    Err(UnavailableReason::preparation_failed(
+                        "startup bundle was not prepared",
+                    ))
+                })
+            }
+            #[cfg(not(all(windows, not(feature = "portable"), not(test))))]
+            {
+                resolve_bundle()
+            }
+        };
         if let Err(reason) = &bundle {
             crate::logger::log(format!("[EffeTune] unavailable: {reason:?}"));
         }
@@ -922,6 +1004,7 @@ impl EffetuneController {
                 current: Mutex::new(None),
                 failure_tx: Mutex::new(Some(failure_tx)),
                 failed_generation: AtomicU64::new(0),
+                pre_limiter_enabled: AtomicBool::new(true),
             }),
             bridge: None,
             bundle_path: bundle.ok(),
@@ -944,6 +1027,20 @@ impl EffetuneController {
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
         self.main_window.install(hwnd);
+    }
+
+    pub(crate) fn set_keep_visible_when_minimized(&self, keep_visible: bool) {
+        if let Ok(gate) = self.main_window.gate() {
+            gate.set_keep_visible_when_minimized(keep_visible);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keep_visible_when_minimized(&self) -> bool {
+        self.main_window
+            .gate()
+            .unwrap()
+            .keep_visible_when_minimized()
     }
 
     pub(crate) fn set_remote_session_source(
@@ -1053,7 +1150,9 @@ impl EffetuneController {
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
+                let _memory = crate::perf::memory::span("effetune_load");
                 let bundle = if let Some(original) = retry {
+                    let _memory = crate::perf::memory::span("effetune_bundle_resolve");
                     let UnavailableReason::BundlePreparationFailed {
                         ref rejected_generation,
                         ..
@@ -1449,6 +1548,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_generation_pin_survives_path_consumers_and_failed_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let version = temp.path().join("runtime/4.3.0");
+        let root = version.join("effetune").join("aaaaaaaaaaaa-Abc123");
+        let bundle = root.join(BUNDLE_NAME);
+        fs::create_dir_all(&bundle).unwrap();
+        let owner = std::sync::OnceLock::new();
+        let path = retain_process_generation(&owner, bundle.clone()).unwrap();
+        assert!(crate::runtime_locks::exclusive(&root, crate::runtime_locks::IN_USE).is_err());
+        let completion = complete_load(Ok(path), |_| {
+            Err(EffetuneFailure::LoadFailed("fixture".into()))
+        });
+        drop(completion);
+        // Controller completion/host lifetime cannot release the process pin.
+        assert!(crate::runtime_locks::exclusive(&root, crate::runtime_locks::IN_USE).is_err());
+        assert_eq!(
+            retain_process_generation(&owner, bundle.clone()).unwrap(),
+            bundle
+        );
+        #[cfg(windows)]
+        assert!(
+            retain_process_generation(
+                &owner,
+                version
+                    .join("effetune")
+                    .join("aaaaaaaaaaaa-aBC123")
+                    .join(BUNDLE_NAME)
+            )
+            .is_ok()
+        );
+        drop(owner);
+        assert!(crate::runtime_locks::exclusive(&root, crate::runtime_locks::IN_USE).is_ok());
+    }
+
+    #[test]
+    fn process_generation_pin_is_installed_by_retry_only_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let version = temp.path().join("runtime/4.3.0");
+        let container = version.join("effetune");
+        fs::create_dir_all(&container).unwrap();
+        let owner = std::sync::OnceLock::new();
+        // An unresolved startup leaves no successful owner; no retry load begins.
+        assert!(
+            retain_process_generation(
+                &owner,
+                container.join("aaaaaaaaaaaa-Abc123").join(BUNDLE_NAME)
+            )
+            .is_err()
+        );
+        assert!(owner.get().is_none());
+        let first = "aaaaaaaaaaaa-Abc123";
+        let second = "bbbbbbbbbbbb-Def456";
+        for name in [first, second] {
+            fs::create_dir_all(container.join(name).join(BUNDLE_NAME)).unwrap();
+        }
+        fs::write(
+            container.join("current"),
+            bundle_location::encode_pointer(first).unwrap(),
+        )
+        .unwrap();
+        let retry = resolve_retry_at(&version, None).unwrap();
+        assert!(retain_process_generation(&owner, retry).is_ok());
+        fs::write(
+            container.join("current"),
+            bundle_location::encode_pointer(second).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            retain_process_generation(&owner, resolve_retry_at(&version, None).unwrap()).is_err()
+        );
+        assert!(
+            crate::runtime_locks::exclusive(&container.join(first), crate::runtime_locks::IN_USE)
+                .is_err()
+        );
+        assert!(
+            crate::runtime_locks::exclusive(&container.join(second), crate::runtime_locks::IN_USE)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn gui_button_decides_hidden_front_and_behind() {
         assert_eq!(gui_button_action(false, false), GuiButtonAction::Show);
         assert_eq!(gui_button_action(false, true), GuiButtonAction::Show);
@@ -1583,11 +1763,12 @@ mod tests {
         controller.set_remote_session(false);
     }
 
-    // Fixture shape: Frieve-A/effetune-mixwright v0.11.1,
-    // src/bridge/state_codec.cpp, StateCodec::encode. Confirmed against bytes
-    // returned by the bundled v0.11.1 plug-in through the real host handler.
+    // Fixture shape: Frieve-A/effetune-mixwright v0.12.0,
+    // src/bridge/state_codec.cpp, StateCodec::encode. The formatVersion=1
+    // shape was observed with v0.11.1; appVersion is informational to mIV.
+    // No v0.12.0 product/plugin launch is claimed by this fixture.
     fn fixture(a: &str, b: &str, current: &str, bypass: bool) -> Vec<u8> {
-        format!(r#"{{"appVersion":"0.11.1","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
+        format!(r#"{{"appVersion":"0.12.0","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
     }
 
     #[test]

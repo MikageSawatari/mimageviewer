@@ -485,6 +485,9 @@ impl App {
     }
 
     pub(crate) fn poll_saved_group_open(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        use crate::collection_store::TestReadClock as Instant;
+
         let Some(mut request) = self.saved_group_open.take() else {
             return;
         };
@@ -868,17 +871,15 @@ mod tests {
             app.collection_grid_context_id().serial(),
             app.top_level_grid_view.generation(),
         );
+        let started = Instant::now();
+        let _clock = crate::collection_store::TestReadClock::long_elapsed_since(started);
         let request = app
             .saved_group_open
             .as_mut()
             .expect("collection open must wait for the shared catalog");
         let request_id = request.id;
-        request.lease = crate::collection_store::CollectionReadLease::new_aged_for_test(
-            scope,
-            Instant::now(),
-            "catalog",
-            Duration::from_secs(24 * 60 * 60),
-        );
+        request.lease =
+            crate::collection_store::CollectionReadLease::new(scope, started, "catalog");
         let lease_id = request.lease.request_id();
 
         app.poll_saved_group_open(&ctx);

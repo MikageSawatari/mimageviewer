@@ -3650,6 +3650,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libraw-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "turbojpeg-sys",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3974,9 +3982,11 @@ dependencies = [
  "ffmpeg-the-third",
  "flate2",
  "fontdb",
+ "fs4",
  "gilrs",
  "image",
  "kamadak-exif",
+ "libraw-sys",
  "local-adjust-core",
  "lopdf",
  "mimageviewer-ipc",
@@ -4023,6 +4033,7 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-dpapi",
  "windows-numerics 0.2.0",
+ "windows-sys 0.61.2",
  "winreg",
  "winresource",
  "zip",

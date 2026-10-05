@@ -9376,6 +9376,8 @@ pub(crate) enum FsNavNoOpReason {
     DetachedVideoUnsupported,
     DetachedEditUnavailable,
     PanoramaEditUnavailable,
+    RawDevelopmentPending,
+    RawDevelopmentUnavailable,
     ContinuousReadingUnavailable(FsContinuousReadingUnavailableFeature),
 }
 
@@ -9429,6 +9431,33 @@ pub(crate) fn slideshow_history_trigger() -> crate::app::HistoryTrigger {
 }
 
 impl App {
+    /// RAW folder locks and navigation sequences share the same display contract.
+    /// A decoded preview can settle with its faithful rendition; a developed page
+    /// with color processing waits for the complete final output.
+    pub(crate) fn raw_navigation_display_ready(
+        &self,
+        idx: usize,
+        original_preview_active: bool,
+    ) -> Option<bool> {
+        use crate::app::raw_page_store::RawPageLoadState;
+        let state = self.raw_page_load_state(idx)?;
+        if state.waiting_for_display() || state.terminal() {
+            return Some(false);
+        }
+        let bypass = self.fs_display_bypasses_final_pipeline(original_preview_active);
+        let ready = if bypass {
+            self.resolve_original_preview_tex(idx).is_some()
+        } else {
+            self.resolve_fs_display_tex(idx, true).is_some()
+        };
+        Some(
+            ready
+                && (state == RawPageLoadState::PreviewShown
+                    || bypass
+                    || !self.colorize_display_requires_final_effect(idx)
+                    || self.current_final_composite_is_complete(idx)),
+        )
+    }
     pub(crate) fn start_bucket_region_flash(
         &mut self,
         ctx: &egui::Context,
@@ -9589,6 +9618,9 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        if self.raw_development_blocked(idx) {
+            return self.resolve_original_preview_tex(idx);
+        }
         if self.fs_entry_is_animated(idx) {
             return self.current_animated_frame_texture(idx);
         }
@@ -9604,7 +9636,13 @@ impl App {
         // ここへ落ちると、ページ切替時に未適用画素が1フレームだけ露出する。
         // 通常ページ送りは別途、直前ページの holdover を使う。
         if self.colorize_display_requires_final_effect(idx) {
-            return None;
+            return if self.raw_page_load_state(idx)
+                == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown)
+            {
+                self.cached_passthrough_rendition(idx)
+            } else {
+                None
+            };
         }
         if let Some(tex) = self.current_edit_result_texture(idx) {
             return Some(tex);
@@ -9622,6 +9660,9 @@ impl App {
         }
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => return Some(tex.clone()),
+            Some(FsCacheEntry::RawPreview { preview, .. }) => {
+                return preview.as_ref().map(|p| p.tex.clone());
+            }
             Some(FsCacheEntry::Video { .. }) => {
                 // 動画は native presenter が独立 HWND に描画するため、
                 // ここから取り出せる egui TextureHandle はない。サムネイルへ
@@ -9629,7 +9670,7 @@ impl App {
             }
             _ => {}
         }
-        if include_thumb {
+        if include_thumb && self.raw_fullscreen_fallback_allowed(idx) {
             if let Some(crate::grid_item::ThumbnailState::Loaded { tex, .. }) =
                 self.thumbnails.get(idx)
             {
@@ -9700,7 +9741,13 @@ impl App {
         &self,
         resource: &crate::gpu_lanczos::FullscreenPaintResource,
     ) -> crate::adjustment::PostFilter {
-        if self.post_filter_bypassed {
+        if self.post_filter_bypassed
+            || resource.page_idx().is_some_and(|idx| {
+                matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::RawPreview {
+                            preview: Some(preview), ..
+                        }) if preview.tex.id() == resource.source_texture().id())
+            })
+        {
             crate::adjustment::PostFilter::None
         } else {
             resource
@@ -9815,6 +9862,7 @@ impl App {
     pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
         if self.post_filter_bypassed
             || self.fs_entry_is_animated(idx)
+            || self.raw_development_blocked(idx)
             || !matches!(
                 self.items.get(idx),
                 Some(GridItem::Image(_))
@@ -9899,6 +9947,9 @@ impl App {
             return "erase";
         }
         if self.fs_cache.get(&idx).is_some_and(|entry| match entry {
+            FsCacheEntry::RawPreview { preview, .. } => {
+                preview.as_ref().is_some_and(|p| p.tex.id() == texture_id)
+            }
             FsCacheEntry::Static { tex, .. } => tex.id() == texture_id,
             FsCacheEntry::Animated {
                 frames,
@@ -10557,7 +10608,7 @@ impl App {
 
         let target_unit_ready = target_pages.iter().all(|&idx| {
             self.resolve_fs_display_tex(idx, true).is_some()
-                || matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed))
+                || self.fs_page_load_state(idx) == crate::app::FsPageLoadState::LoadFailed
         });
         if target_unit_ready {
             self.clear_final_effect_source_reload_holdover();
@@ -10760,6 +10811,9 @@ impl App {
     fn resolve_original_preview_tex(&self, idx: usize) -> Option<egui::TextureHandle> {
         let texture = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+            Some(FsCacheEntry::RawPreview { preview, .. }) => {
+                preview.as_ref().map(|p| p.tex.clone())
+            }
             _ => self.current_animated_frame_texture(idx),
         }?;
         self.display_texture_matches_page(&texture, idx)
@@ -10823,6 +10877,9 @@ impl App {
         idx: usize,
         original_preview_active: bool,
     ) -> Option<egui::TextureHandle> {
+        if self.raw_development_blocked(idx) {
+            return self.resolve_original_preview_tex(idx);
+        }
         let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
         if is_video {
             return None;
@@ -10936,10 +10993,19 @@ impl App {
             return Some(texture);
         }
         if self.colorize_display_requires_final_effect(idx) {
-            // raw / edit / unprocessed-thumbnail gate は維持する。ページ単位表示は
-            // color-faithful rendition、source reload は display-unit holdover、
-            // 連結読みは従来どおりページ別 transition が完成までを橋渡しする。
-            return None;
+            // RAW previews share the existing small, faithful rendition path.
+            // Continuous reading calls this only for its admitted process page.
+            return if self.raw_page_load_state(idx)
+                == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown)
+            {
+                self.ensure_passthrough_rendition(ctx, idx)
+            } else {
+                None
+            };
+        }
+
+        if let Some(FsCacheEntry::RawPreview { preview, .. }) = self.fs_cache.get(&idx) {
+            return preview.as_ref().map(|preview| preview.tex.clone());
         }
         self.resolve_fs_pre_overlay_texture(idx)
     }
@@ -11310,7 +11376,7 @@ impl App {
         original_preview_active: bool,
         perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
     ) {
-        let Some(target) = self
+        let Some(mut target) = self
             .fs_holdover_tex
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
@@ -11322,11 +11388,39 @@ impl App {
         else {
             return;
         };
+        if matches!(
+            target.phase,
+            FsNavigationTargetPhase::Ready { .. } | FsNavigationTargetPhase::Presenting { .. }
+        ) && target
+            .pages()
+            .iter()
+            .any(|&idx| self.is_raw_page(idx) && self.fs_page_load_state(idx).waiting_for_display())
+        {
+            target.phase = FsNavigationTargetPhase::Awaiting {
+                demand: target.phase.demand().clone(),
+            };
+            if let Some(FsNavigationSequenceTarget::Display(current)) = self
+                .fs_holdover_tex
+                .as_mut()
+                .and_then(FsHoldover::navigation_sequence_mut)
+                .map(|sequence| &mut sequence.target)
+            {
+                current.phase = target.phase.clone();
+            }
+        }
         let accept_rendition = match &target.phase {
             FsNavigationTargetPhase::Awaiting { .. } => target.accept_rendition,
             FsNavigationTargetPhase::RenditionFailed { .. } => false,
             FsNavigationTargetPhase::Ready { .. } | FsNavigationTargetPhase::Presenting { .. } => {
-                return;
+                if !target.pages().iter().any(|&idx| {
+                    self.is_raw_page(idx)
+                        && (self.fs_page_load_state(idx).waiting_for_display()
+                            || self.fs_page_load_state(idx)
+                                == crate::app::FsPageLoadState::LoadFailed)
+                }) {
+                    return;
+                }
+                target.accept_rendition
             }
         };
         if target.items_generation != self.items_generation
@@ -11353,6 +11447,9 @@ impl App {
         let bypasses_final_pipeline =
             self.fs_display_bypasses_final_pipeline(original_preview_active);
         let materialized_ready = target_pages.iter().all(|idx| {
+            if let Some(ready) = self.raw_navigation_display_ready(*idx, original_preview_active) {
+                return ready;
+            }
             if bypasses_final_pipeline {
                 // この frame は描画側も raw source を明示的に選ぶ。通常表示では下の final
                 // pipeline gate を維持するため、白黒からカラーへの途中切替を見せない契約は
@@ -11383,7 +11480,7 @@ impl App {
         });
         let materialized_failed = target_pages
             .iter()
-            .any(|idx| matches!(self.fs_cache.get(idx), Some(FsCacheEntry::Failed)));
+            .any(|idx| self.fs_page_load_state(*idx) == crate::app::FsPageLoadState::LoadFailed);
         let rendition_ready = accept_rendition
             && target_pages.iter().all(|idx| {
                 let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
@@ -11399,9 +11496,10 @@ impl App {
                 ready
             });
         let rendition_failed = accept_rendition
-            && target_pages
-                .iter()
-                .any(|idx| matches!(self.thumbnails.get(*idx), Some(ThumbnailState::Failed)));
+            && target_pages.iter().any(|idx| {
+                !self.is_raw_page(*idx)
+                    && matches!(self.thumbnails.get(*idx), Some(ThumbnailState::Failed))
+            });
 
         let next_phase = navigation_target_next_phase(
             target.phase.demand(),
@@ -11659,7 +11757,8 @@ impl App {
             // ビュー単位の holdover overlay を止める。それまでは旧ビューを
             // 1 display unit として維持して黒を挟まず滑らかに繋ぐ。
             let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
-            let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
+            let new_content_failed =
+                self.fs_page_load_state(idx) == crate::app::FsPageLoadState::LoadFailed;
             if new_content_ready || new_content_failed {
                 return FsNavHoldoverDecision::TargetReady(FsNavigationPresentation::Materialized);
             }
@@ -12034,17 +12133,20 @@ impl App {
         );
         // 新 idx のデコードが失敗確定 (Failed) の場合も lock を解放する。さもないと
         // holdover (旧画像) が残り続け、以降の Ctrl+↑↓ が lock でブロックされる。
-        let has_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
+        let has_failed = self.fs_page_load_state(idx) == crate::app::FsPageLoadState::LoadFailed;
         let original_preview_active = self.original_preview_active_for_frame(ctx, idx);
         let requires_final_effect = !self
             .fs_display_bypasses_final_pipeline(original_preview_active)
             && self.colorize_display_requires_final_effect(idx);
-        let display_ready = if requires_final_effect {
-            self.resolve_fs_display_tex(idx, true).is_some()
-                && self.current_final_composite_is_complete(idx)
-        } else {
-            has_full || has_thumb
-        };
+        let display_ready =
+            if let Some(ready) = self.raw_navigation_display_ready(idx, original_preview_active) {
+                ready
+            } else if requires_final_effect {
+                self.resolve_fs_display_tex(idx, true).is_some()
+                    && self.current_final_composite_is_complete(idx)
+            } else {
+                has_full || has_thumb
+            };
         if display_ready || has_failed {
             self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
@@ -12344,7 +12446,11 @@ impl App {
                 page_idx: fs_idx,
                 viewport_rect: image_rect,
                 source_size,
-                texture_size: tex_size,
+                texture_size: if self.is_raw_page(fs_idx) {
+                    source_size
+                } else {
+                    tex_size
+                },
                 rotation,
                 free_rotation_rad: 0.0,
                 content_bbox: trim_bbox,
@@ -13979,24 +14085,13 @@ fn known_page_dims(
     page_dims_cache.get(items_generation, idx)
 }
 
-fn is_landscape(
-    idx: usize,
-    rotation: crate::rotation_db::Rotation,
-    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
-    thumbnails: &[ThumbnailState],
-    page_dims_cache: &crate::page_dims::PageDimsCache,
-    items_generation: u64,
-) -> bool {
-    known_page_dims(idx, fs_cache, thumbnails, page_dims_cache, items_generation)
-        .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
-}
-
 pub(crate) fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
     fn from_usize(dims: [usize; 2]) -> Option<(u32, u32)> {
         Some((u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?))
     }
 
     match entry {
+        FsCacheEntry::RawPreview { developed_dims, .. } => from_usize(*developed_dims),
         FsCacheEntry::Static {
             tex, source_dims, ..
         } => from_usize(source_dims.unwrap_or_else(|| tex.size())),
@@ -14610,38 +14705,6 @@ impl SpreadDisplayUnit {
             right: screen[1].idx,
         }
     }
-}
-
-fn build_spread_display_units(
-    nav: &[usize],
-    rotations: &[crate::rotation_db::Rotation],
-    items: &[GridItem],
-    spread_mode: SpreadMode,
-    shift_anchor_idx: Option<usize>,
-    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
-    thumbnails: &[ThumbnailState],
-    page_dims_cache: &crate::page_dims::PageDimsCache,
-    items_generation: u64,
-) -> Vec<SpreadDisplayUnit> {
-    build_spread_display_units_with_predicates(
-        nav,
-        spread_mode,
-        shift_anchor_idx,
-        |nav_pos, idx| {
-            is_landscape(
-                idx,
-                rotations
-                    .get(nav_pos)
-                    .copied()
-                    .unwrap_or(crate::rotation_db::Rotation::None),
-                fs_cache,
-                thumbnails,
-                page_dims_cache,
-                items_generation,
-            )
-        },
-        |idx| is_spread_pairable_item(items.get(idx)),
-    )
 }
 
 #[cfg(test)]
@@ -16052,7 +16115,7 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
     }
 }
 
-fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
+pub(crate) fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
     image_indices
         .iter()
         .position(|&image_idx| image_idx == idx)
@@ -16547,6 +16610,28 @@ impl App {
     }
 
     /// `fs_cache` へ静止画を挿入した直後に呼び、同じ frame 内で寸法確定を token へ反映する。
+    fn known_page_dims_for_idx(&self, idx: usize) -> Option<(u32, u32)> {
+        if self.is_raw_page(idx) {
+            return self
+                .raw_pages
+                .page(idx)?
+                .developed_dims
+                .map(|[w, h]| (w as u32, h as u32));
+        }
+        known_page_dims(
+            idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        )
+    }
+
+    fn page_is_landscape(&self, idx: usize, rotation: crate::rotation_db::Rotation) -> bool {
+        self.known_page_dims_for_idx(idx)
+            .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
+    }
+
     pub(crate) fn record_fs_cache_page_dims_for_spread(&mut self, idx: usize) {
         let dims = self.fs_cache.get(&idx).and_then(fs_cache_entry_page_dims);
         if let Some(dims) = dims {
@@ -16590,15 +16675,8 @@ impl App {
         idx: usize,
         rotation: crate::rotation_db::Rotation,
     ) {
-        let landscape = is_spread_pairable_item(self.items.get(idx))
-            && is_landscape(
-                idx,
-                rotation,
-                &self.fs_cache,
-                &self.thumbnails,
-                &self.page_dims_cache,
-                self.items_generation,
-            );
+        let landscape =
+            is_spread_pairable_item(self.items.get(idx)) && self.page_is_landscape(idx, rotation);
         self.spread_display_units_cache
             .reconcile_landscape(self.items_generation, idx, landscape);
     }
@@ -16666,16 +16744,12 @@ impl App {
             .enumerate()
             .map(|(nav_pos, &idx)| {
                 is_spread_pairable_item(self.items.get(idx))
-                    && is_landscape(
+                    && self.page_is_landscape(
                         idx,
                         rotations
                             .get(nav_pos)
                             .copied()
                             .unwrap_or(crate::rotation_db::Rotation::None),
-                        &self.fs_cache,
-                        &self.thumbnails,
-                        &self.page_dims_cache,
-                        self.items_generation,
                     )
             })
             .collect::<Vec<_>>();
@@ -16921,13 +16995,7 @@ impl App {
         if !is_spread_pairable_item(self.items.get(idx)) {
             return SplitDecision::NotAStillPage;
         }
-        let Some((w, h)) = known_page_dims(
-            idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        ) else {
+        let Some((w, h)) = self.known_page_dims_for_idx(idx) else {
             return SplitDecision::DimensionsUnknown;
         };
         if crate::rotation_db::landscape_after_rotation(w, h, rotation) {
@@ -17082,16 +17150,20 @@ impl App {
         nav: &[usize],
     ) -> Vec<Vec<usize>> {
         let rotations = self.get_rotations_for_indices(nav);
-        build_spread_display_units(
+        build_spread_display_units_with_predicates(
             nav,
-            &rotations,
-            &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
+            |nav_pos, idx| {
+                self.page_is_landscape(
+                    idx,
+                    rotations
+                        .get(nav_pos)
+                        .copied()
+                        .unwrap_or(crate::rotation_db::Rotation::None),
+                )
+            },
+            |idx| is_spread_pairable_item(self.items.get(idx)),
         )
         .into_iter()
         .map(|unit| unit.screen_pages(self.spread_mode))
@@ -22952,6 +23024,7 @@ impl App {
                 Some(FsCacheEntry::Static { .. }) => "static",
                 Some(FsCacheEntry::Animated { .. }) => "animated",
                 Some(FsCacheEntry::Video { .. }) => "video",
+                Some(FsCacheEntry::RawPreview { .. }) => "raw_preview",
                 Some(FsCacheEntry::Failed) => "failed",
                 None => "none",
             };
@@ -24287,6 +24360,8 @@ impl App {
                         // ── 高解像度読込中インジケーター ──
                         let has_any_tex = state.tex.is_some() || state.thumb_tex.is_some();
                         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
+                        let raw_label = self.raw_loading_label(fs_idx);
+                        if self.raw_current_developing(fs_idx) { ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
                         if similar_preview_presentation.is_none()
                             && fullscreen_processing_status_visible(
                                 self.settings.fullscreen_processing_status_visible,
@@ -24307,7 +24382,7 @@ impl App {
                         if similar_preview_presentation.is_none()
                             && fullscreen_processing_status_visible(
                                 self.settings.fullscreen_processing_status_visible,
-                                pdf_rerendering,
+                                pdf_rerendering || raw_label.is_some(),
                             )
                         {
                             let label =
@@ -24317,23 +24392,11 @@ impl App {
                                 } else {
                                     "読込中..."
                                 };
-                            let font = egui::FontId::proportional(13.0);
-                            let pos = egui::pos2(image_rect.min.x + 12.0, image_rect.max.y - 12.0);
-                            let galley = ui.painter().layout_no_wrap(
-                                label.to_string(),
-                                font.clone(),
-                                egui::Color32::WHITE,
+                            let bg = crate::ui_raw::paint_processing_status_overlay(
+                                ui.painter(),
+                                image_rect,
+                                raw_label.as_deref().unwrap_or(label),
                             );
-                            let text_rect =
-                                egui::Align2::LEFT_BOTTOM.anchor_size(pos, galley.size());
-                            let bg = text_rect.expand(4.0);
-                            ui.painter().rect_filled(
-                                bg,
-                                4.0,
-                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
-                            );
-                            ui.painter()
-                                .galley(text_rect.min, galley, egui::Color32::WHITE);
                             self.fs_loading_label_top = Some(bg.top());
                         }
 
@@ -25535,6 +25598,19 @@ impl App {
         if self.display_identity_error.borrow().is_some() {
             return "読み込みエラーです。アプリを再起動してください".to_owned();
         }
+        if self.is_raw_page(idx) {
+            return if matches!(
+                self.raw_page_load_state(idx),
+                Some(
+                    crate::app::raw_page_store::RawPageLoadState::PreviewShown
+                        | crate::app::raw_page_store::RawPageLoadState::Developed
+                )
+            ) {
+                String::new()
+            } else {
+                self.location_display_for(idx)
+            };
+        }
         let has_display_tex = matches!(
             self.fs_cache.get(&idx),
             Some(FsCacheEntry::Static { .. })
@@ -26686,7 +26762,8 @@ impl App {
             self.fs_painted_last = None;
         }
 
-        let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
+        let fs_load_failed =
+            self.fs_page_load_state(fs_idx) == crate::app::FsPageLoadState::LoadFailed;
 
         let waiting_for_colorize = !pass_through
             && !original_preview_active
@@ -26819,6 +26896,9 @@ impl App {
     /// scale. PDF `source_*` values have the same pixel contract as other sources;
     /// the independent page-box aspect lives in `layout_*`.
     pub(crate) fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
+        if self.is_raw_page(idx) {
+            return self.source_dims_for_idx(idx).map(|(w, h)| egui::vec2(w, h));
+        }
         self.source_dims_for_idx(idx)
             .map(|(w, h)| egui::vec2(w, h))
             .or_else(|| {
@@ -26869,6 +26949,13 @@ impl App {
     /// 描画中にファイル metadata やアーカイブを同期参照しない。
     fn cached_top_bar_page_info(&self, idx: usize) -> FsTopBarPageInfo {
         let (image_dims, image_downscaled) = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::RawPreview {
+                developed_dims: [w, h],
+                ..
+            }) => (
+                Some((*w as u32, *h as u32)),
+                *w > crate::app::MAX_TEXTURE_DIM || *h > crate::app::MAX_TEXTURE_DIM,
+            ),
             Some(FsCacheEntry::Static {
                 tex, source_dims, ..
             }) => {
@@ -27754,32 +27841,32 @@ impl App {
             self.get_nav_indices()
         };
         let rotations = self.get_rotations_for_indices(&nav);
-        let units = build_spread_display_units(
+        let units = build_spread_display_units_with_predicates(
             &nav,
-            &rotations,
-            &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
+            |nav_pos, idx| {
+                self.page_is_landscape(
+                    idx,
+                    rotations
+                        .get(nav_pos)
+                        .copied()
+                        .unwrap_or(crate::rotation_db::Rotation::None),
+                )
+            },
+            |idx| is_spread_pairable_item(self.items.get(idx)),
         );
         let landscape_flags = nav
             .iter()
             .enumerate()
             .map(|(nav_pos, &idx)| {
                 !is_spread_pairable_item(self.items.get(idx))
-                    || is_landscape(
+                    || self.page_is_landscape(
                         idx,
                         rotations
                             .get(nav_pos)
                             .copied()
                             .unwrap_or(crate::rotation_db::Rotation::None),
-                        &self.fs_cache,
-                        &self.thumbnails,
-                        &self.page_dims_cache,
-                        self.items_generation,
                     )
             })
             .collect::<Vec<_>>();
@@ -27971,7 +28058,18 @@ impl App {
         } else {
             FS_IMAGE_ACTIVE_SCOPES
         };
-        let Some(keys) = fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes) else {
+        let keys = fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes);
+        #[cfg(all(windows, feature = "test-script"))]
+        let keys = keys.or_else(|| {
+            // Semantic actions have no egui Key event. Preserve the ordinary
+            // keymap's text/focused-UI ownership gate at this probe boundary.
+            if _owner.blocks_legacy_keymap_shortcuts() {
+                return None;
+            }
+            crate::test_script::probe_targeted_action(ctx, active_scopes)
+                .map(|action| format!("semantic:{}", action.ini_name()))
+        });
+        let Some(keys) = keys else {
             return false;
         };
 
@@ -28282,6 +28380,7 @@ impl App {
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
             items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
             snapshot_frame: i64::try_from(ctx.cumulative_frame_nr()).unwrap_or(i64::MAX),
+            action_wait_diagnostic: String::new(),
             selected_index: self
                 .selected
                 .map_or(-1, |index| i64::try_from(index).unwrap_or(i64::MAX)),
@@ -32044,7 +32143,7 @@ impl App {
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
-        if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(fs_idx) {
+        if let Some(tex) = self.fs_thumbnail_texture_for_display(fs_idx) {
             canvas_painter.image(
                 tex.id(),
                 layout.content_rect,
@@ -32349,7 +32448,11 @@ impl App {
                 let texture = texture_sources
                     .texture_for_page(page.main.page_idx, None)
                     .or_else(|| match self.thumbnails.get(page.main.page_idx) {
-                        Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
+                        Some(ThumbnailState::Loaded { tex, .. })
+                            if self.raw_fullscreen_fallback_allowed(page.main.page_idx) =>
+                        {
+                            Some(tex)
+                        }
                         _ => None,
                     });
                 if let Some(tex) = texture {
@@ -34493,10 +34596,11 @@ impl App {
         if state.is_video {
             return true;
         }
-        let has_own_thumb = matches!(
-            self.thumbnails.get(fs_idx),
-            Some(ThumbnailState::Loaded { .. })
-        );
+        let has_own_thumb = self.raw_fullscreen_fallback_allowed(fs_idx)
+            && matches!(
+                self.thumbnails.get(fs_idx),
+                Some(ThumbnailState::Loaded { .. })
+            );
         state.tex.is_some() || has_own_thumb || state.fs_load_failed
     }
 
@@ -35309,7 +35413,7 @@ impl App {
         ));
     }
 
-    fn set_fullscreen_nav_noop(&mut self, reason: FsNavNoOpReason) {
+    pub(crate) fn set_fullscreen_nav_noop(&mut self, reason: FsNavNoOpReason) {
         self.fs_boundary_hint = Some(FsBoundaryHint::NavNoOp {
             reason,
             at: std::time::Instant::now(),
@@ -35364,6 +35468,8 @@ impl App {
             FsNavNoOpReason::PanoramaEditUnavailable => {
                 "360° ビュー中は画像編集モードを利用できません"
             }
+            FsNavNoOpReason::RawDevelopmentPending => "RAW の現像が終わると編集できます",
+            FsNavNoOpReason::RawDevelopmentUnavailable => crate::ui_raw::RAW_BLOCKED_PREVIEW_NOTICE,
             FsNavNoOpReason::ContinuousReadingUnavailable(feature) => feature.noop_title(),
         }
     }
@@ -35870,7 +35976,9 @@ impl App {
                 .fullscreen_idx
                 .is_some_and(|i| self.fs_page_load_state(i).waiting_for_display());
         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
-        if image_loading || pdf_rerendering {
+        if self.raw_current_developing(fs_idx) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else if image_loading || pdf_rerendering {
             ctx.request_repaint();
         }
 
@@ -35926,6 +36034,15 @@ impl App {
     /// (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の pixels から検出する。
     pub(crate) fn cached_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
         let (load_seq, pixels_ptr, pixels) = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::RawPreview {
+                preview: Some(preview),
+                load_seq,
+                ..
+            }) => (
+                *load_seq,
+                std::sync::Arc::as_ptr(&preview.pixels) as usize,
+                std::sync::Arc::clone(&preview.pixels),
+            ),
             Some(FsCacheEntry::Static {
                 pixels, load_seq, ..
             }) => (
@@ -36142,6 +36259,10 @@ impl App {
                 self.fs_page_content_bbox(page_idx, rotation, content_bbox)
             }
         };
+        if self.fullscreen_idx == Some(page_idx) && self.raw_current_developing(page_idx) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
         let using_full_texture = tex.is_some();
         let thumb_resource = thumb_tex
             .cloned()
@@ -36170,9 +36291,7 @@ impl App {
             let layout_source_size = match layout_source {
                 FsPageLayoutSource::Captured { layout_size, .. } => Some(layout_size),
                 FsPageLayoutSource::CurrentItem => {
-                    let preserve_texture_aspect = self.is_passthrough_rendition_texture(handle);
-                    let use_source_layout = preserve_texture_aspect
-                        || matches!(self.items.get(page_idx), Some(GridItem::PdfPage { .. }));
+                    let use_source_layout = self.fs_page_layout_uses_source_size(page_idx, handle);
                     use_source_layout
                         .then(|| self.fs_page_layout_source_size(page_idx))
                         .flatten()
@@ -36219,6 +36338,9 @@ impl App {
             let Some(transform) = transform else {
                 return None;
             };
+            if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
+                self.observe_raw_presentation(page_idx);
+            }
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;
             let needs_clip = zoom_pan.is_some()
@@ -36335,7 +36457,13 @@ impl App {
             } else {
                 "読込中..."
             };
-            paint_fullscreen_loading_placeholder(ui, full_rect, loading_label, location_display);
+            let raw_label = self.raw_loading_label(page_idx);
+            paint_fullscreen_loading_placeholder(
+                ui,
+                full_rect,
+                raw_label.as_deref().unwrap_or(loading_label),
+                location_display,
+            );
         }
         None
     }
@@ -37224,6 +37352,12 @@ impl App {
         prefer_processed: bool,
     ) -> egui::Vec2 {
         let rotation = self.get_rotation(idx);
+        if self.is_raw_page(idx) {
+            return self
+                .fs_page_coordinate_source_size(idx)
+                .map(|size| rotated_display_size(size, rotation))
+                .unwrap_or(fallback);
+        }
         let raster_fallback = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
                 tex, source_dims, ..
@@ -37871,6 +38005,22 @@ impl App {
         keep_positions_for_load.sort_unstable();
         keep_positions_for_load.dedup();
 
+        let raw_displayed = visible_positions
+            .iter()
+            .flat_map(|&pos| units[pos].source_indices())
+            .collect::<Vec<_>>();
+        let raw_current = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
+        keep_set.extend(self.reconcile_raw_demand(raw_current, &raw_displayed));
+        let raw_evicted = self
+            .raw_pages
+            .pages
+            .keys()
+            .copied()
+            .filter(|idx| !keep_set.contains(idx))
+            .collect::<Vec<_>>();
+        for idx in raw_evicted {
+            self.discard_fs_page(idx);
+        }
         self.fs_vertical_cache_keep_set = keep_set.clone();
         self.evict_final_pipeline_cache_for_keep_set(&keep_set);
         self.evict_adjustment_cache_for_keep_set(&keep_set);
@@ -37904,10 +38054,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         for idx in stale_promotions {
-            if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending.cancel();
-            }
-            self.fs_early_dims.remove(&idx);
+            self.cancel_fs_page_load(idx);
         }
         self.fs_upload_backlog.retain(|entry| {
             entry.purpose.promotion_started_at_for(entry.idx).is_none()
@@ -37923,15 +38070,13 @@ impl App {
                 if displayed_pages.contains(&k) {
                     return false;
                 }
-                current_loading || !keep_set.contains(&k)
+                (current_loading && !self.raw_pages.demand.contains_key(&k))
+                    || !keep_set.contains(&k)
             })
             .copied()
             .collect::<Vec<_>>();
         for idx in to_cancel {
-            if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending.cancel();
-            }
-            self.fs_early_dims.remove(&idx);
+            self.cancel_fs_page_load(idx);
         }
         if current_loading {
             for idx in displayed_pages {
@@ -37978,6 +38123,11 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        if self.raw_page_load_state(idx)
+            == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown)
+        {
+            return self.resolve_fs_display_tex(idx, false);
+        }
         if self.fs_entry_is_animated(idx) {
             self.current_animated_frame_texture(idx)
         } else if self.comic_pages.contains(&idx) {
@@ -38170,11 +38320,12 @@ impl App {
         }
         let has_deferred_processed = !original_preview_active
             && pages.iter().any(|page| {
-                !process_indices.contains(&page.idx())
+                !self.continuous_page_waits_for_raw_development(page.idx())
+                    && !process_indices.contains(&page.idx())
                     && !self.vertical_reading_processed_texture_cached(page.idx())
             });
 
-        let mut any_raw_work_pending = false;
+        let mut any_display_work_pending = false;
         let mut selected_processed_attempt = ContinuousProcessedAttempt::NotAttempted;
         let mut painted_sources = FsNavigatorTextureSources::default();
 
@@ -38208,7 +38359,9 @@ impl App {
             } else if let Some(tex) = self.vertical_reading_cached_processed_texture(page.idx()) {
                 self.observe_continuous_page_processed_texture(page.idx(), &tex);
                 Some(self.fullscreen_paint_resource_for_texture(page.idx(), tex))
-            } else if process_indices.contains(&page.idx()) {
+            } else if process_indices.contains(&page.idx())
+                && !self.continuous_page_waits_for_raw_development(page.idx())
+            {
                 // 連結読みでも単ページ/見開きと同じ final pipeline を使う。ただし
                 // 新規 GPU upload は未生成の可視ページだけを 1 フレームずつ進め、
                 // スクロール中の大量同期生成を避ける。
@@ -38270,7 +38423,7 @@ impl App {
         for (position, page) in pages.iter().enumerate() {
             let rotation = self.get_rotation(page.idx());
             let location = self.location_display_for_loading(page.idx());
-            if matches!(self.fs_cache.get(&page.idx()), Some(FsCacheEntry::Failed)) {
+            if self.fs_page_load_state(page.idx()) == crate::app::FsPageLoadState::LoadFailed {
                 painter.text(
                     page.rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -38280,14 +38433,16 @@ impl App {
                 );
                 continue;
             }
-            if !self.fs_cache.contains_key(&page.idx())
-                && (self.fs_pending.contains_key(&page.idx())
+            if self.fs_page_load_state(page.idx()).waiting_for_display()
+                && !self.continuous_page_waits_for_raw_development(page.idx())
+                && (self.is_raw_page(page.idx())
+                    || self.fs_pending.contains_key(&page.idx())
                     || self
                         .fs_upload_backlog
                         .iter()
                         .any(|entry| entry.idx == page.idx()))
             {
-                any_raw_work_pending = true;
+                any_display_work_pending = true;
             }
             let draw_tex = page_textures[position].take();
             let source_size = self
@@ -38391,13 +38546,36 @@ impl App {
             );
         }
         if continuous_reading_needs_repaint(
-            any_raw_work_pending,
+            any_display_work_pending,
             has_deferred_processed,
             selected_processed_attempt,
         ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if self.raw_current_developing(fs_idx) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         painted_sources
+    }
+
+    fn continuous_page_waits_for_raw_development(&self, idx: usize) -> bool {
+        if !self.raw_current_developing(idx) {
+            return false;
+        }
+        if self.fs_page_load_state(idx).waiting_for_display() {
+            return true;
+        }
+        // A validated preview may still need a faithful color/LUT rendition.
+        // Without both catalog inputs the resolver cannot progress next frame;
+        // thumbnail/development completion wakes the UI instead. Ready inputs
+        // retain the existing bounded processing admission.
+        self.raw_page_load_state(idx)
+            == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown)
+            && self.colorize_display_requires_final_effect(idx)
+            && self.cached_passthrough_rendition(idx).is_none()
+            && !(matches!(
+                self.thumbnails.get(idx),
+                Some(ThumbnailState::Loaded { .. })
+            ) && self.thumb_pixels.contains_key(&idx))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -38585,10 +38763,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<CapturePixelJobPreparation, String> {
+        if self.raw_development_unavailable(idx) {
+            return Err("RAW を現像できないため比較できません".into());
+        }
         // fs_cache の表示用 entry を残したまま、表示解像度更新などの replacement load が
         // 進む期間がある。capture 経路はその entry から complete な final composite を作れるが、
         // 比較用 source としてはまだ確定していないので worker へ渡さない。
-        if self.fs_pending.contains_key(&idx) {
+        if self.fs_pending.contains_key(&idx) || !self.raw_edit_target_gate(idx) {
             return Ok(CapturePixelJobPreparation::WaitingForSource);
         }
         let preparation =
@@ -40208,10 +40389,7 @@ impl App {
         {
             None
         } else {
-            match self.thumbnails.get(page_idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-                _ => None,
-            }
+            self.fs_thumbnail_texture_for_display(page_idx)
         };
         let Some(handle_owned) = page_tex.or(page_thumb) else {
             return;
@@ -40561,9 +40739,10 @@ impl App {
         } else {
             let both_in_fs_cache =
                 self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-            let pdf_layout_unit =
-                matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
-                    || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
+            let pdf_layout_unit = self.is_raw_page(left_idx)
+                || self.is_raw_page(right_idx)
+                || matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
+                || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
             if color_faithful_rendition_unit || pdf_layout_unit {
                 (
                     passthrough_layout_display_size(
@@ -41045,7 +41224,7 @@ impl App {
             FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
             FsPageLayoutSource::CurrentItem => {
                 let preserve_texture_aspect =
-                    self.is_passthrough_rendition_texture(handle.source_texture());
+                    self.fs_page_layout_uses_source_size(idx, handle.source_texture());
                 let use_layout = preserve_texture_aspect
                     || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
                 use_layout
@@ -41227,15 +41406,15 @@ impl App {
                 format!("{:?}", transform.placement),
             );
             paint_resource.retain_native_output_for_paint(painter);
+            if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
+                self.observe_raw_presentation(idx);
+            }
             return Some(transform);
         } else {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "読込中...",
-                egui::FontId::proportional(18.0),
-                egui::Color32::from_gray(150),
-            );
+            let label = self
+                .raw_loading_label(idx)
+                .unwrap_or_else(|| "読込中...".into());
+            crate::ui_raw::paint_loading_label(painter, rect, &label);
             crate::ui_helpers::draw_centered_elided_label(
                 painter,
                 rect,
@@ -43080,6 +43259,17 @@ fn draw_fs_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicato
     });
 }
 
+fn draw_raw_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicator) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("RAW 現像")
+                .monospace()
+                .color(crate::ui_helpers::PROGRESS_LABEL_COLOR),
+        );
+        draw_fs_prefetch_indicator(ui, indicator);
+    });
+}
+
 #[doc(hidden)]
 pub fn draw_fs_prefetch_indicator_snapshot_fixture(ui: &mut egui::Ui) {
     use FsPrefetchPageState::{Active, Missing, Ready};
@@ -43162,7 +43352,16 @@ impl App {
             .keys()
             .any(|key| key.edit_key.idx == fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
-        let any_busy = is_loading || has_ai_pending;
+        let raw_indicator = self
+            .settings
+            .fullscreen_prefetch_status_visible
+            .then(|| self.raw_prefetch_indicator(fs_idx))
+            .flatten();
+        let any_busy = is_loading
+            || has_ai_pending
+            || raw_indicator
+                .as_ref()
+                .is_some_and(|row| row.active_count > 0);
 
         let prefetch_indicator = self.final_ai_prefetch_indicator(fs_idx);
         let content = fs_ai_status_content(
@@ -43212,7 +43411,7 @@ impl App {
             None
         };
 
-        if lines.is_empty() && prefetch_indicator.is_none() {
+        if lines.is_empty() && prefetch_indicator.is_none() && raw_indicator.is_none() {
             self.ai_status_done_at = None;
             return;
         }
@@ -43274,6 +43473,9 @@ impl App {
                         }
                         if let Some(indicator) = &prefetch_indicator {
                             draw_fs_prefetch_status_row(ui, indicator);
+                        }
+                        if let Some(indicator) = &raw_indicator {
+                            draw_raw_prefetch_status_row(ui, indicator);
                         }
                     });
             });
@@ -43827,6 +44029,12 @@ impl App {
                 vec!["V キーで 360° ビューを終了してから編集してください"],
             ),
             FsBoundaryHint::NavNoOp {
+                reason:
+                    reason @ (FsNavNoOpReason::RawDevelopmentPending
+                    | FsNavNoOpReason::RawDevelopmentUnavailable),
+                ..
+            } => (Self::nav_noop_title(reason), Vec::new()),
+            FsBoundaryHint::NavNoOp {
                 reason: FsNavNoOpReason::ContinuousReadingUnavailable(feature),
                 ..
             } => (
@@ -44209,6 +44417,11 @@ impl App {
             self.show_feedback_toast("このアイテムは比較画像に設定できません".to_string());
             return;
         };
+
+        if self.raw_development_unavailable(idx) {
+            self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+            return;
+        }
 
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. }) => {
@@ -46675,6 +46888,10 @@ impl App {
             entries,
             include_metadata: effective_include_metadata,
             local_ai_activity: needs_ai_lease.then(|| self.local_ai_activity_lease()),
+            raw: Some(crate::raw::RawDecodeContext::new(
+                Arc::clone(&self.raw_develop_executor),
+                self.settings.raw_brightness,
+            )),
         };
         let pending = crate::export_dialog::spawn_export_worker(request)?;
         self.export_pending = Some(pending);
@@ -48231,6 +48448,983 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_review_cancelled_paged_preview_reenters_before_and_after_info() {
+        assert_cancelled_raw_preview_reenters(false);
+    }
+
+    #[test]
+    fn raw_review_cancelled_continuous_preview_reenters_before_and_after_info() {
+        assert_cancelled_raw_preview_reenters(true);
+    }
+
+    fn assert_cancelled_raw_preview_reenters(continuous: bool) {
+        use crate::app::raw_page_store::{
+            RawPageLoadState, RawPageRecord, RawResultStage, RawResultTag,
+        };
+        for info_received in [false, true] {
+            let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+            app.items = (0..6)
+                .map(|idx| GridItem::Image(format!("page-{idx}.jpg").into()))
+                .collect();
+            app.items[0] = GridItem::Image("current.dng".into());
+            app.items[4] = GridItem::Image("later.dng".into());
+            app.visible_indices = (0..6).collect();
+            app.details_order = (0..6).collect();
+            app.fullscreen_idx = Some(0);
+            app.settings.prefetch_forward = 5;
+            let RawPageRecord::Page(mut page) = app.raw_pages.pages.remove(&0).unwrap() else {
+                unreachable!()
+            };
+            page.source.item_key = app.page_path_key(4).unwrap();
+            page.source.path = "later.dng".into();
+            let source = page.source.clone();
+            if info_received {
+                app.raw_pages.pages.insert(4, RawPageRecord::Page(page));
+            }
+            let mut senders = Vec::new();
+            let mut old_id = 0;
+            for idx in [0, 4] {
+                let key = app.page_path_key(idx).unwrap();
+                let id = app.raw_pages.begin_preview(idx, key);
+                if idx == 4 {
+                    old_id = id;
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                senders.push(tx);
+                app.fs_pending.insert(
+                    idx,
+                    crate::app::FsPendingValue::new(
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        rx,
+                        id,
+                        crate::app::FsLoadPurpose::for_page(false),
+                    ),
+                );
+            }
+            let units = (0..6)
+                .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+                .collect::<Vec<_>>();
+            if continuous {
+                app.update_continuous_reading_prefetch_window(&units, &[0, 2], &[]);
+            } else {
+                app.update_prefetch_window(0);
+            }
+            assert!(!app.fs_pending.contains_key(&4));
+            assert_eq!(
+                app.raw_pages.classify(4),
+                RawPageLoadState::PreviewNotRequested,
+                "continuous={continuous}, info_received={info_received}"
+            );
+            let late = RawResultTag {
+                context: 11,
+                generation: app.items_generation,
+                idx: 4,
+                request_id: old_id,
+                source,
+                stage: RawResultStage::Info,
+            };
+            assert!(!app.raw_pages.resolve_source(&late, late.context));
+            app.fullscreen_idx = Some(4);
+            if continuous {
+                app.update_continuous_reading_prefetch_window(&units, &[4], &[]);
+            } else {
+                app.update_prefetch_window(4);
+            }
+            assert!(app.fs_pending.contains_key(&4));
+            assert!(!app.raw_pages.resolve_source(&late, late.context));
+            drop(senders);
+        }
+    }
+
+    #[test]
+    fn raw_review_supported_preview_is_unfiltered_but_rendition_keeps_filter() {
+        use crate::app::raw_page_store::{RawInstalledStage, RawPreviewPhase};
+        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+        let ctx = egui::Context::default();
+        let preview = ctx.load_texture(
+            "raw-review-preview",
+            egui::ColorImage::filled([3, 2], egui::Color32::GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        let rendition = ctx.load_texture(
+            "raw-review-rendition",
+            egui::ColorImage::filled([3, 2], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::RawPreview {
+                preview: Some(crate::fs_animation::RawPreviewTexture {
+                    tex: preview.clone(),
+                    pixels: std::sync::Arc::new(egui::ColorImage::filled(
+                        [3, 2],
+                        egui::Color32::GRAY,
+                    )),
+                }),
+                developed_dims: [12000, 8000],
+                load_seq: 1,
+            },
+        );
+        let page = app.raw_pages.page_mut(0).unwrap();
+        page.stage = RawInstalledStage::PreviewShown;
+        page.preview = RawPreviewPhase::Done;
+        app.settings.global_preset.post_filter = crate::adjustment::PostFilter::GameBoy;
+        for (tex, expected) in [
+            (preview, crate::adjustment::PostFilter::None),
+            (rendition, crate::adjustment::PostFilter::GameBoy),
+        ] {
+            let resource = app.fullscreen_paint_resource_for_texture(0, tex);
+            assert_eq!(app.fullscreen_paint_post_filter(&resource), expected);
+        }
+    }
+
+    #[test]
+    fn raw_review_continuous_development_wait_repaints_at_100ms() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPreviewPhase};
+        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+        app.items.truncate(1);
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Vertical;
+        let scheduler = crate::fs_page_load_scheduler::FsPageLoadScheduler::with_limits(1, 0);
+        let ticket = scheduler.request(
+            11,
+            0,
+            crate::fs_page_load_scheduler::FsPageLoadPriority::High,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let page = app.raw_pages.page_mut(0).unwrap();
+        page.stage = RawInstalledStage::PreviewAbsent;
+        page.preview = RawPreviewPhase::Absent;
+        *page.develop.lock().unwrap() = RawDevelopPhase::Preparing {
+            request_id: 10,
+            cancel: std::sync::Arc::new(std::sync::Mutex::new(ticket)),
+            highest_priority: crate::raw::RawPriority::High,
+            brightness: crate::raw::RawBrightness::MatchPreview,
+        };
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::RawPreview {
+                preview: None,
+                developed_dims: [12000, 8000],
+                load_seq: 1,
+            },
+        );
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut delay = std::time::Duration::ZERO;
+        for frame in 0..4 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(frame as f64),
+                    predicted_dt: 0.0,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.draw_fs_continuous_reading(
+                            ui,
+                            ctx,
+                            rect,
+                            0,
+                            false,
+                            FsPageTurnDecision::normal(),
+                        );
+                    });
+                },
+            );
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        assert_eq!(delay, std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn raw_rereview_continuous_preview_effect_wait_repaints_at_100ms() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPreviewPhase};
+        for effect in 0..2 {
+            // Missing texture, missing pixels, missing both, and ready catalog.
+            for catalog in 0..4 {
+                let ctx = egui::Context::default();
+                let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+                app.items.truncate(1);
+                app.visible_indices = vec![0];
+                app.fullscreen_idx = Some(0);
+                app.reading_flow = ReadingFlow::Vertical;
+                if effect == 0 {
+                    app.settings.global_preset.colorize.mode =
+                        crate::colorize::ColorizeMode::AllImages;
+                } else {
+                    let builtin = crate::creative_lut::BuiltinCreativeLut::WarmFilm;
+                    app.creative_lut_library =
+                        crate::creative_lut::CreativeLutLibrary::from_builtin_for_test(builtin);
+                    app.settings.global_preset.creative_lut =
+                        crate::creative_lut::CreativeLutSelection {
+                            id: Some(builtin.id()),
+                            strength: 1.0,
+                        };
+                }
+                let pixels =
+                    std::sync::Arc::new(egui::ColorImage::filled([3, 2], egui::Color32::GRAY));
+                let preview_tex = ctx.load_texture(
+                    "raw-preview-wait",
+                    pixels.as_ref().clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.thumbnails = vec![ThumbnailState::Pending];
+                if catalog == 1 || catalog == 3 {
+                    let tex = ctx.load_texture(
+                        "raw-catalog-wait",
+                        pixels.as_ref().clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    app.thumbnails[0] = ThumbnailState::Loaded {
+                        tex,
+                        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                            evaluated_display_px: 3,
+                        },
+                        from_edit_preview: false,
+                        rendered_at_px: 3,
+                        source_dims: Some((12000, 8000)),
+                        layout_dims: None,
+                    };
+                }
+                if catalog == 2 || catalog == 3 {
+                    app.thumb_pixels.insert(0, pixels.clone());
+                }
+                let scheduler =
+                    crate::fs_page_load_scheduler::FsPageLoadScheduler::with_limits(1, 0);
+                let ticket = scheduler.request(
+                    11,
+                    0,
+                    crate::fs_page_load_scheduler::FsPageLoadPriority::High,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    None,
+                    0,
+                );
+                let page = app.raw_pages.page_mut(0).unwrap();
+                page.stage = RawInstalledStage::PreviewShown;
+                page.preview = RawPreviewPhase::Done;
+                *page.develop.lock().unwrap() = RawDevelopPhase::Preparing {
+                    request_id: 10,
+                    cancel: std::sync::Arc::new(std::sync::Mutex::new(ticket)),
+                    highest_priority: crate::raw::RawPriority::High,
+                    brightness: crate::raw::RawBrightness::MatchPreview,
+                };
+                app.fs_cache.insert(
+                    0,
+                    FsCacheEntry::RawPreview {
+                        preview: Some(crate::fs_animation::RawPreviewTexture {
+                            tex: preview_tex.clone(),
+                            pixels,
+                        }),
+                        developed_dims: [12000, 8000],
+                        load_seq: 1,
+                    },
+                );
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+                let mut delay = std::time::Duration::ZERO;
+                for frame in 0..4 {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(rect),
+                            time: Some(frame as f64),
+                            predicted_dt: 0.0,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    rect,
+                                    0,
+                                    false,
+                                    FsPageTurnDecision::normal(),
+                                );
+                            });
+                        },
+                    );
+                    delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                }
+                assert_eq!(
+                    delay,
+                    std::time::Duration::from_millis(100),
+                    "effect={effect}, catalog={catalog}"
+                );
+                if catalog == 3 {
+                    let rendition = app
+                        .cached_passthrough_rendition(0)
+                        .expect("ready catalog must still be processed by actual drawing");
+                    assert_ne!(rendition.id(), preview_tex.id());
+                    assert!(app.vertical_reading_processed_texture_cached(0));
+                } else {
+                    assert!(app.cached_passthrough_rendition(0).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_review_actual_paint_keeps_canonical_layout_across_preview_clamped_full_and_final() {
+        use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPreviewPhase};
+        use std::sync::Arc;
+        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+        app.items.truncate(1);
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                max_texture_side: Some(8192),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let images = [[1200, 800], [8192, 5461], [300, 200]]
+            .map(|size| Arc::new(egui::ColorImage::filled(size, egui::Color32::GRAY)));
+        let textures = std::array::from_fn::<_, 3, _>(|idx| {
+            ctx.load_texture(
+                format!("raw-layout-stage-{idx}"),
+                images[idx].as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for fit in [
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+            FullscreenFitMode::Original,
+        ] {
+            for rotation in [
+                crate::rotation_db::Rotation::None,
+                crate::rotation_db::Rotation::Cw90,
+            ] {
+                for mode in 0..4 {
+                    // Each mode repeats a new preview -> Full cycle. Retire the prior
+                    // source through the real transaction before reusing this App.
+                    app.raw_brightness_changed();
+                    let mut first: Option<DisplayedImageTransform> = None;
+                    for stage in 0..3 {
+                        app.reading_flow = if mode == 3 {
+                            ReadingFlow::Vertical
+                        } else {
+                            ReadingFlow::Paged
+                        };
+                        app.settings.fullscreen_fit_mode = fit;
+                        app.rotation_cache.insert(0, rotation);
+                        app.fs_zoom = 1.3;
+                        app.fs_pan = egui::vec2(35.0, -20.0);
+                        app.fs_zoom_active = mode == 1;
+                        app.fs_zoom_factor = 2.0;
+                        app.final_composite_cache.clear();
+                        if stage == 0 {
+                            app.fs_cache.insert(
+                                0,
+                                FsCacheEntry::RawPreview {
+                                    preview: Some(crate::fs_animation::RawPreviewTexture {
+                                        tex: textures[0].clone(),
+                                        pixels: Arc::clone(&images[0]),
+                                    }),
+                                    developed_dims: [12000, 8000],
+                                    load_seq: 1,
+                                },
+                            );
+                            let page = app.raw_pages.page_mut(0).unwrap();
+                            page.stage = RawInstalledStage::PreviewShown;
+                            page.preview = RawPreviewPhase::Done;
+                        } else {
+                            app.fs_cache.insert(
+                                0,
+                                FsCacheEntry::Static {
+                                    tex: textures[1].clone(),
+                                    pixels: Arc::clone(&images[1]),
+                                    source_dims: Some([12000, 8000]),
+                                    load_seq: 2,
+                                    animation: crate::fs_animation::StaticAnimationState::Still,
+                                },
+                            );
+                            let page = app.raw_pages.page_mut(0).unwrap();
+                            page.stage = RawInstalledStage::Developed;
+                            *page.develop.lock().unwrap() = RawDevelopPhase::Done;
+                            if stage == 2 {
+                                crate::app::raw_page_store::tests::install_final_for_layout_test(
+                                    &mut app,
+                                    Arc::clone(&images[2]),
+                                    textures[2].clone(),
+                                );
+                            }
+                        }
+                        let mut drawn = None;
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(rect),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    let state = app.prepare_fullscreen_state(
+                                        ctx,
+                                        0,
+                                        FsPageTurnDecision::normal(),
+                                    );
+                                    if stage == 1 {
+                                        assert_eq!(
+                                            state.tex.as_ref().unwrap().size(),
+                                            [8192, 5461]
+                                        );
+                                    } else {
+                                        assert_eq!(
+                                            state.tex.as_ref().unwrap().id(),
+                                            textures[stage].id(),
+                                            "stage={stage}"
+                                        );
+                                    }
+                                    let resource = app.fullscreen_paint_resource_for_texture(
+                                        0,
+                                        state.tex.clone().unwrap(),
+                                    );
+                                    let source_size = app.fs_page_coordinate_source_size(0);
+                                    let bg = FsBgStyle::Solid(egui::Color32::BLACK);
+                                    drawn = if mode == 1 {
+                                        let seek = StillSeekGeometry::resolve(
+                                            rect,
+                                            false,
+                                            false,
+                                            0.0,
+                                            app.settings.still_seek_bar_with_strip,
+                                            app.settings.still_bottom_lock(),
+                                            0,
+                                        );
+                                        // Rotation is obtained by the real Z entry from the page owner.
+                                        app.draw_fs_zoom_mode(
+                                            ui,
+                                            ctx,
+                                            rect,
+                                            0,
+                                            SingletonSpreadPlacement::Center,
+                                            &state,
+                                            seek,
+                                        )
+                                    } else if mode == 2 {
+                                        app.draw_fs_spread_page(
+                                            ui.painter(),
+                                            rect,
+                                            rect,
+                                            0,
+                                            source_size,
+                                            FsPageLayoutSource::CurrentItem,
+                                            rotation,
+                                            &bg,
+                                            "",
+                                            Some(&resource),
+                                            false,
+                                            None,
+                                            1.0,
+                                            ResolvedDisplayPlacement::SingletonSpread {
+                                                side: SingletonSpreadPlacement::Left,
+                                                gap: 8.0,
+                                                zoom_pan: None,
+                                            },
+                                            egui::Vec2::ZERO,
+                                        )
+                                    } else if mode == 3 {
+                                        app.draw_fs_continuous_reading(
+                                            ui,
+                                            ctx,
+                                            rect,
+                                            0,
+                                            false,
+                                            FsPageTurnDecision::normal(),
+                                        );
+                                        app.fullscreen_page_layout
+                                            .page_by_idx(0)
+                                            .map(|page| page.transform)
+                                    } else {
+                                        app.draw_fs_image(
+                                            ui,
+                                            rect,
+                                            0,
+                                            source_size,
+                                            FsPageLayoutSource::CurrentItem,
+                                            None,
+                                            None,
+                                            SingletonSpreadPlacement::Center,
+                                            Some(&resource),
+                                            None,
+                                            false,
+                                            false,
+                                            false,
+                                            rotation,
+                                            Some((1.3, egui::vec2(35.0, -20.0))),
+                                            0.15,
+                                            &bg,
+                                            "",
+                                            false,
+                                            fit,
+                                            FullscreenFitScaleLimits::default(),
+                                            None,
+                                        )
+                                    };
+                                });
+                            },
+                        );
+                        let transform = drawn.unwrap();
+                        assert_eq!(transform.source_size, egui::vec2(12000.0, 8000.0));
+                        if let Some(preview) = first.as_ref() {
+                            assert!(
+                                (preview.paint_rect.center() - transform.paint_rect.center())
+                                    .length()
+                                    <= 1.5,
+                                "{fit:?} mode={mode} stage={stage}"
+                            );
+                            assert!(
+                                (preview.paint_rect.size() - transform.paint_rect.size()).length()
+                                    <= 3.0,
+                                "{fit:?} mode={mode} stage={stage}"
+                            );
+                            for point in [egui::pos2(6000.0, 4000.0), egui::pos2(3500.0, 2500.0)] {
+                                assert!(
+                                    (preview.source_to_screen(point)
+                                        - transform.source_to_screen(point))
+                                    .length()
+                                        <= 3.0
+                                );
+                                assert!(
+                                    (transform.screen_to_source(transform.source_to_screen(point))
+                                        - point)
+                                        .length()
+                                        < 0.05
+                                );
+                            }
+                        } else {
+                            first = Some(transform);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn raw_blocked_preview_settles_navigation_and_folder_lock_with_or_without_rendition() {
+        use crate::app::raw_page_store::{
+            RawDevelopBlocked, RawDevelopPhase, RawInstalledStage, RawPreviewPhase,
+        };
+        for failed in [false, true] {
+            for catalog_available in [false, true] {
+                // Exercise colorization, LUT alone, and unchanged disabled behavior in
+                // all three display modes through the shared texture/readiness paths.
+                for effect in 0..3 {
+                    for mode in 0..3 {
+                        let ctx = egui::Context::default();
+                        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg_after_generation_change();
+                        app.fullscreen_idx = Some(0);
+                        if mode == 1 {
+                            app.spread_mode = crate::settings::SpreadMode::Ltr;
+                        } else if mode == 2 {
+                            app.reading_flow = crate::settings::ReadingFlow::Vertical;
+                        }
+                        if effect == 0 {
+                            app.settings.global_preset.colorize.mode =
+                                crate::colorize::ColorizeMode::AllImages;
+                        } else if effect == 1 {
+                            let builtin = crate::creative_lut::BuiltinCreativeLut::WarmFilm;
+                            app.creative_lut_library =
+                                crate::creative_lut::CreativeLutLibrary::from_builtin_for_test(
+                                    builtin,
+                                );
+                            app.settings.global_preset.creative_lut =
+                                crate::creative_lut::CreativeLutSelection {
+                                    id: Some(builtin.id()),
+                                    strength: 1.0,
+                                };
+                        }
+                        let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+                            [3, 2],
+                            egui::Color32::GRAY,
+                        ));
+                        let tex = ctx.load_texture(
+                            "valid_raw_preview",
+                            pixels.as_ref().clone(),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        app.fs_cache.insert(
+                            0,
+                            FsCacheEntry::RawPreview {
+                                preview: Some(crate::fs_animation::RawPreviewTexture {
+                                    tex: tex.clone(),
+                                    pixels: pixels.clone(),
+                                }),
+                                developed_dims: [12000, 8000],
+                                load_seq: 1,
+                            },
+                        );
+                        let page = app.raw_pages.page_mut(0).unwrap();
+                        page.stage = RawInstalledStage::PreviewShown;
+                        page.preview = RawPreviewPhase::Done;
+                        if catalog_available {
+                            let catalog = ctx.load_texture(
+                                "catalog_raw_preview",
+                                pixels.as_ref().clone(),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            app.thumbnails = vec![
+                                ThumbnailState::Loaded {
+                                    tex: catalog,
+                                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                                        evaluated_display_px: 3,
+                                    },
+                                    from_edit_preview: false,
+                                    rendered_at_px: 3,
+                                    source_dims: Some((12000, 8000)),
+                                    layout_dims: None,
+                                },
+                                ThumbnailState::Pending,
+                            ];
+                            app.thumb_pixels.insert(0, pixels);
+                            let rendition = app.ensure_passthrough_rendition(&ctx, 0).unwrap();
+                            assert_ne!(rendition.id(), tex.id());
+                        } else {
+                            app.thumbnails = vec![ThumbnailState::Failed, ThumbnailState::Pending];
+                        }
+                        assert_eq!(app.colorize_display_requires_final_effect(0), effect != 2);
+                        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() =
+                            RawDevelopPhase::Blocked(if failed {
+                                RawDevelopBlocked::Failed {
+                                    error: crate::raw::RawError::Corrupt(
+                                        "development failed".into(),
+                                    ),
+                                    brightness: app.settings.raw_brightness,
+                                }
+                            } else {
+                                RawDevelopBlocked::Unsupported
+                            });
+                        assert!(app.raw_fullscreen_fallback_allowed(0));
+                        assert!(app.raw_development_unavailable(0));
+                        assert!(!app.colorize_display_requires_final_effect(0));
+                        assert_eq!(
+                            app.resolve_fs_processed_texture(&ctx, 0, false)
+                                .unwrap()
+                                .id(),
+                            tex.id()
+                        );
+                        assert_eq!(app.resolve_fs_display_tex(0, true).unwrap().id(), tex.id());
+                        assert_eq!(
+                            app.raw_loading_label(0).as_deref(),
+                            Some(crate::ui_raw::RAW_BLOCKED_PREVIEW_NOTICE)
+                        );
+                        assert_eq!(app.raw_navigation_display_ready(0, false), Some(true));
+                        assert!(!app.raw_edit_target_gate(0));
+                        assert!(!app.raw_edit_target_entry_allowed(0));
+                        assert!(matches!(
+                            app.fs_boundary_hint,
+                            Some(FsBoundaryHint::NavNoOp {
+                                reason: FsNavNoOpReason::RawDevelopmentUnavailable,
+                                ..
+                            })
+                        ));
+                        app.settings.global_preset.post_filter =
+                            crate::adjustment::PostFilter::GameBoy;
+                        let resource = app.fullscreen_paint_resource_for_texture(0, tex.clone());
+                        assert_eq!(
+                            app.fullscreen_paint_post_filter(&resource),
+                            crate::adjustment::PostFilter::None
+                        );
+                        let previous_jpeg = ctx.load_texture(
+                            "previous_jpeg_holdover",
+                            egui::ColorImage::filled([3, 2], egui::Color32::WHITE),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        let holdover = crate::gpu_lanczos::FullscreenPaintResource::resampleable(
+                            0,
+                            previous_jpeg,
+                            crate::gpu_lanczos::FullscreenPaintSourceGeneration {
+                                items: 0,
+                                input: 0,
+                            },
+                        );
+                        assert_eq!(
+                            app.fullscreen_paint_post_filter(&holdover),
+                            crate::adjustment::PostFilter::GameBoy,
+                            "an unrelated holdover sharing idx must retain its existing behavior"
+                        );
+                        app.settings.global_preset.post_filter =
+                            crate::adjustment::PostFilter::None;
+                        app.fs_nav_locked_gen = Some(0);
+                        app.poll_fs_nav_lock(&ctx);
+                        assert!(app.fs_nav_locked_gen.is_none());
+                        assert_eq!(
+                            app.ensure_passthrough_rendition(&ctx, 0).unwrap().id(),
+                            tex.id()
+                        );
+                        assert_eq!(app.cached_passthrough_rendition(0).unwrap().id(), tex.id());
+                        for accept_rendition in [false, true] {
+                            app.fs_holdover_tex = Some(page_wait_navigation_sequence(
+                                std::time::Instant::now(),
+                                app.items_generation,
+                                vec![0],
+                                navigation_awaiting(vec![0]),
+                            ));
+                            let FsNavigationSequenceTarget::Display(target) = &mut app
+                                .fs_holdover_tex
+                                .as_mut()
+                                .unwrap()
+                                .navigation_sequence_mut()
+                                .unwrap()
+                                .target
+                            else {
+                                unreachable!()
+                            };
+                            target.accept_rendition = accept_rendition;
+                            app.resolve_bound_fs_navigation_sequence_target_with_perf(
+                                &ctx, 0, false, &mut None,
+                            );
+                            if accept_rendition {
+                                assert_eq!(
+                                    app.fs_navigation_rendition_target_pages(0),
+                                    Some(vec![0])
+                                );
+                                assert_eq!(
+                                    app.ensure_passthrough_rendition(&ctx, 0).unwrap().id(),
+                                    tex.id()
+                                );
+                            }
+                            app.fs_nav_holdover_for_draw();
+                            // Both normal and held-paging presentation retire through the
+                            // existing live-page observation, without an unlock exception.
+                            assert!(app.fs_navigation_sequence_blocks_new_target());
+                            app.observe_fs_navigation_sequence_presented(&[navigation_trace_page(
+                                0,
+                                0,
+                                tex.id(),
+                                FsDisplayUnitPageProvenance::Live,
+                            )]);
+                            assert!(!app.fs_navigation_sequence_blocks_new_target());
+                            assert!(app.fs_holdover_tex.is_none());
+                        }
+                        if failed {
+                            app.settings.raw_brightness = crate::raw::RawBrightness::None;
+                            app.raw_brightness_changed();
+                            assert!(!app.raw_development_blocked(0));
+                            assert!(!app.raw_edit_target_entry_allowed(0));
+                            assert!(matches!(
+                                app.fs_boundary_hint,
+                                Some(FsBoundaryHint::NavNoOp {
+                                    reason: FsNavNoOpReason::RawDevelopmentPending,
+                                    ..
+                                })
+                            ));
+                            assert_eq!(app.colorize_display_requires_final_effect(0), effect != 2);
+                            if effect != 2 {
+                                if catalog_available {
+                                    assert_ne!(
+                                        app.resolve_fs_processed_texture(&ctx, 0, false)
+                                            .unwrap()
+                                            .id(),
+                                        tex.id()
+                                    );
+                                } else {
+                                    assert!(
+                                        app.resolve_fs_processed_texture(&ctx, 0, false).is_none()
+                                    );
+                                    assert_eq!(
+                                        app.raw_navigation_display_ready(0, false),
+                                        Some(false)
+                                    );
+                                }
+                            } else {
+                                assert_eq!(
+                                    app.resolve_fs_processed_texture(&ctx, 0, false)
+                                        .unwrap()
+                                        .id(),
+                                    tex.id()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_absent_preview_navigation_rechecks_ready_and_settles_only_developed_presentation() {
+        use crate::app::raw_page_store::{
+            RawDevelopBlocked, RawDevelopPhase, RawInstalledStage, RawPreviewPhase,
+        };
+        let ctx = egui::Context::default();
+        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+        app.fullscreen_idx = Some(0);
+        let pixels = egui::ColorImage::filled([6, 4], egui::Color32::GREEN);
+        let tex = ctx.load_texture(
+            "raw_navigation",
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = vec![ThumbnailState::Loaded {
+            tex: tex.clone(),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 6,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 6,
+            source_dims: Some((12000, 8000)),
+            layout_dims: None,
+        }];
+        app.thumb_pixels
+            .insert(0, std::sync::Arc::new(pixels.clone()));
+        let page = app.raw_pages.page_mut(0).unwrap();
+        page.stage = RawInstalledStage::PreviewAbsent;
+        page.preview = RawPreviewPhase::Absent;
+        for phase in [
+            navigation_ready(vec![0], FsNavigationPresentation::Rendition),
+            navigation_presenting(vec![0], FsNavigationPresentation::Rendition),
+        ] {
+            app.fs_holdover_tex = Some(page_wait_navigation_sequence(
+                std::time::Instant::now(),
+                app.items_generation,
+                vec![0],
+                phase,
+            ));
+            app.resolve_bound_fs_navigation_sequence_target_with_perf(&ctx, 0, false, &mut None);
+            assert!(app.fs_navigation_sequence_blocks_new_target());
+            assert!(matches!(
+                app.fs_holdover_tex
+                    .as_ref()
+                    .unwrap()
+                    .navigation_sequence()
+                    .unwrap()
+                    .target,
+                FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    phase: FsNavigationTargetPhase::Awaiting { .. },
+                    ..
+                })
+            ));
+            assert!(app.resolve_fs_processed_texture(&ctx, 0, false).is_none());
+        }
+        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() =
+            RawDevelopPhase::Blocked(RawDevelopBlocked::Unsupported);
+        app.resolve_bound_fs_navigation_sequence_target_with_perf(&ctx, 0, false, &mut None);
+        assert!(app.fs_nav_holdover_for_draw().is_none());
+        assert!(!app.fs_navigation_sequence_blocks_new_target());
+        let page = app.raw_pages.page_mut(0).unwrap();
+        page.stage = RawInstalledStage::Developed;
+        *page.develop.lock().unwrap() = RawDevelopPhase::Done;
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: tex.clone(),
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: Some([12000, 8000]),
+                load_seq: 2,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_holdover_tex = Some(page_wait_navigation_sequence(
+            std::time::Instant::now(),
+            app.items_generation,
+            vec![0],
+            navigation_awaiting(vec![0]),
+        ));
+        app.resolve_bound_fs_navigation_sequence_target_with_perf(&ctx, 0, false, &mut None);
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        assert!(app.fs_nav_holdover_for_draw().is_none());
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        let trace = navigation_trace_page(0, 0, tex.id(), FsDisplayUnitPageProvenance::Live);
+        app.observe_fs_navigation_sequence_presented(&[trace]);
+        assert!(!app.fs_navigation_sequence_blocks_new_target());
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    #[test]
+    fn raw_canonical_layout_survives_preview_clamped_develop_and_final_in_all_fit_modes() {
+        use super::*;
+        let source_size = egui::vec2(12000.0, 8000.0);
+        for fit_mode in [
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+            FullscreenFitMode::Original,
+        ] {
+            for rotation in [
+                crate::rotation_db::Rotation::None,
+                crate::rotation_db::Rotation::Cw90,
+            ] {
+                for placement in [
+                    ResolvedDisplayPlacement::Normal {
+                        zoom_pan: Some((1.3, egui::vec2(35.0, -20.0))),
+                    },
+                    ResolvedDisplayPlacement::SingletonSpread {
+                        side: SingletonSpreadPlacement::Left,
+                        gap: 8.0,
+                        zoom_pan: None,
+                    },
+                    ResolvedDisplayPlacement::Z {
+                        active: true,
+                        factor: 2.0,
+                        zoom_pan: Some((2.0, egui::vec2(13.0, -9.0))),
+                        singleton_side: SingletonSpreadPlacement::Center,
+                        singleton_gap: 0.0,
+                    },
+                ] {
+                    let transform = |texture_size| {
+                        resolve_fs_image_transform(
+                            DisplayedImageTransformInput {
+                                page_idx: 0,
+                                viewport_rect: egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(1200.0, 800.0),
+                                ),
+                                source_size,
+                                texture_size,
+                                rotation,
+                                free_rotation_rad: 0.15,
+                                content_bbox: None,
+                                fit_mode,
+                                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                                pixels_per_point: 1.0,
+                                placement,
+                                pixel_fit: RectPixelFit::Texels,
+                            },
+                            Some(source_size),
+                        )
+                        .unwrap()
+                    };
+                    let preview = transform(egui::vec2(1200.0, 800.0));
+                    for size in [
+                        egui::vec2(8192.0, 8192.0 * 2.0 / 3.0),
+                        egui::vec2(6000.0, 4000.0),
+                    ] {
+                        let next = transform(size);
+                        assert!(
+                            (preview.paint_rect.center() - next.paint_rect.center()).length()
+                                <= 1.5,
+                            "{fit_mode:?} {placement:?}"
+                        );
+                        assert!(
+                            (preview.paint_rect.size() - next.paint_rect.size()).length() <= 3.0,
+                            "{fit_mode:?} {placement:?}"
+                        );
+                        for point in [egui::pos2(6000.0, 4000.0), egui::pos2(3500.0, 2500.0)] {
+                            assert!(
+                                (preview.source_to_screen(point) - next.source_to_screen(point))
+                                    .length()
+                                    <= 3.0
+                            );
+                            let roundtrip = next.screen_to_source(next.source_to_screen(point));
+                            assert!((roundtrip - point).length() < 0.05);
+                        }
+                        assert_eq!(next.source_size, source_size);
+                    }
+                }
+            }
+        }
+    }
+
     mod still_seek_menu;
     mod still_seek_rotation;
     use super::*;

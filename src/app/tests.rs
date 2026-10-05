@@ -2,6 +2,173 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[cfg(test)]
+mod file_organize_tests {
+    use super::*;
+    use crate::shell_file_ops::{
+        ShellTransferOperation, ShellTransferOutcome, ShellTransferRequest,
+    };
+    use crate::ui_dialogs::file_organize::{
+        FileOrganizeRequest, FileOrganizeRunning, FileOrganizeSelection,
+    };
+
+    #[test]
+    fn file_organize_completion_requests_existing_external_rescan_only_for_current_real_folder() {
+        let mut env = phase_c_support::setup_app();
+        let root = env.tmp.path().to_owned();
+        let source = root.join("organize-source");
+        let destination = root.join("organize-destination");
+        let unrelated = root.join("unrelated");
+        for folder in [&source, &destination, &unrelated] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let ctx = egui::Context::default();
+        for (folder, physical, should_refresh) in [
+            (&source, true, true),
+            (&destination, true, true),
+            (&unrelated, true, false),
+            (&source, false, false),
+        ] {
+            for terminal in 0..4 {
+                env.current_folder = Some(folder.clone());
+                env.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+                    folder: folder.clone(),
+                    counts: Default::default(),
+                });
+                env.top_level_grid_view.replace_surface(if physical {
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                } else {
+                    top_level_grid_view::TopLevelGridSurface::Search(
+                        top_level_grid_view::TopLevelSearchView::Global,
+                    )
+                });
+                let (tx, rx) = mpsc::channel();
+                match terminal {
+                    0 => tx
+                        .send(Ok(ShellTransferOutcome { aborted: false }))
+                        .unwrap(),
+                    1 => tx.send(Ok(ShellTransferOutcome { aborted: true })).unwrap(),
+                    2 => tx.send(Err("fake failure".into())).unwrap(),
+                    _ => {}
+                }
+                drop(tx);
+                env.file_organize_request =
+                    FileOrganizeRequest::Running(Box::new(FileOrganizeRunning {
+                        request: ShellTransferRequest {
+                            sources: vec![source.join("item.png")],
+                            destination: destination.clone(),
+                            operation: ShellTransferOperation::Move,
+                        },
+                        rx,
+                    }));
+                env.poll_file_organize(&ctx);
+                assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                ));
+                assert_eq!(env.external_rescan_pending.is_some(), should_refresh);
+                if let Some(pending) = env.external_rescan_pending.take() {
+                    assert_eq!(pending.folder, *folder);
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_organize_production_submission_rejects_shutdown_and_root_close() {
+        let mut env = phase_c_support::setup_app();
+        env.main_hwnd = Some(1); // A refused boundary must never pass this fake HWND to Shell.
+        for closing_event in [false, true] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            if closing_event {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            ctx.begin_pass(input);
+            env.shutdown_requested
+                .store(!closing_event, Ordering::SeqCst);
+            env.file_organize_request =
+                FileOrganizeRequest::Selecting(Box::new(FileOrganizeSelection {
+                    sources: vec![r"C:\source\a.png".into()],
+                    destinations: vec![crate::settings::FileOrganizeDestination {
+                        name: "target".into(),
+                        path: r"D:\target".into(),
+                    }],
+                    focus: None,
+                }));
+            env.submit_file_organize(&ctx, 0, ShellTransferOperation::Copy);
+            assert!(matches!(
+                env.file_organize_request,
+                FileOrganizeRequest::Hidden
+            ));
+            assert!(env.fs_feedback_toast.as_ref().unwrap().0.contains("終了"));
+            let _ = ctx.end_pass();
+        }
+        env.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn file_organize_enter_needs_explicit_operation_after_row_navigation() {
+        let mut env = phase_c_support::setup_app();
+        env.file_organize_request =
+            FileOrganizeRequest::Selecting(Box::new(FileOrganizeSelection {
+                sources: vec![r"C:\source\a.png".into()],
+                destinations: vec![crate::settings::FileOrganizeDestination {
+                    name: "target".into(),
+                    path: r"D:\target".into(),
+                }],
+                focus: None,
+            }));
+        // The final Enter is refused before any Shell call, allowing this to use fake paths.
+        env.main_hwnd = Some(1);
+        env.shutdown_requested.store(true, Ordering::SeqCst);
+        let ctx = egui::Context::default();
+        for (step, key) in [
+            egui::Key::ArrowDown,
+            egui::Key::Enter,
+            egui::Key::ArrowRight,
+            egui::Key::Enter,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            env.show_file_organize_dialog(&ctx);
+            let _ = ctx.end_pass();
+            match step {
+                0 | 1 => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Selecting(ref selection) if selection.focus == Some((0, None))
+                )),
+                2 => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Selecting(ref selection) if selection.focus == Some((0, Some(ShellTransferOperation::Copy)))
+                )),
+                _ => assert!(matches!(
+                    env.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                )),
+            }
+        }
+        env.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+}
+
 fn music_source_for_test(app: &App, path: PathBuf) -> MusicAnalysisSource {
     MusicAnalysisSource {
         owner_context_id: app.projected_viewer_context_id(),
@@ -254,6 +421,172 @@ mod folder_mtime_rescan_tests {
             }
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn latest_seek_during_raw_development_supersedes_waiting_pages_and_promotes_raw() {
+    let mut app = setup_app_for_test();
+    app.items = (0..3)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.fullscreen_idx = Some(2);
+    let owner = app.fs_page_load_context_serial();
+    let scheduler = Arc::new(FsPageLoadScheduler::with_limits(1, 0));
+    app.fs_page_load_scheduler = Arc::clone(&scheduler);
+
+    let fs_ticket = scheduler.request(
+        owner,
+        2,
+        FsPageLoadPriority::Normal,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    drop(fs_ticket.waiter().acquire_cancellable().unwrap());
+    let blocker = scheduler.request(
+        owner + 1,
+        0,
+        FsPageLoadPriority::High,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    let blocker_permit = blocker.waiter().acquire_cancellable().unwrap();
+    let older = scheduler.request(
+        owner,
+        1,
+        FsPageLoadPriority::Normal,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    assert_eq!(scheduler.stats().waiting, 1);
+
+    let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let _raw_blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let (result_tx, _result_rx) = std::sync::mpsc::channel();
+    let raw_ticket = Arc::new(executor.submit_thumbnail_half(
+        crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+        crate::raw::RawPriority::Normal,
+        result_tx,
+    ));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let pending = FsPendingValue::scheduled(fs_ticket, rx, 0, FsLoadPurpose::Prefetch);
+    app.fs_pending.insert(2, pending);
+    let source = RawSourceIdentity {
+        item_key: app.page_path_key(2).unwrap(),
+        path: PathBuf::from("page-2.dng"),
+        size: 1,
+        mtime_ticks: 1,
+    };
+    app.raw_pages.pages.insert(
+        2,
+        RawPageRecord::Page(RawPageState {
+            source,
+            developed_dims: Some([10, 10]),
+            stage: RawInstalledStage::PreviewAbsent,
+            preview: RawPreviewPhase::Absent,
+            develop: Arc::new(Mutex::new(RawDevelopPhase::Submitted {
+                request_id: 1,
+                ticket: Arc::clone(&raw_ticket),
+                brightness: crate::raw::RawBrightness::None,
+            })),
+            preview_started_at: std::time::Instant::now(),
+            develop_started_at: std::time::Instant::now(),
+            presented: RawPresentation::Nothing,
+        }),
+    );
+
+    app.apply_fs_page_load_contract(2, FsPageLoadContract::LatestSeek);
+    assert!(
+        older.is_cancelled(),
+        "LatestSeek must supersede the older waiting page"
+    );
+    assert_eq!(scheduler.stats().waiting, 0);
+    assert_eq!(
+        executor.queued_priority_for_test(&raw_ticket),
+        Some(crate::raw::RawPriority::High)
+    );
+
+    app.discard_fs_page(2);
+    release_tx.send(()).unwrap();
+    drop(blocker_permit);
+}
+
+fn raw_half_followup_for_prune(idx: usize) -> crate::thumb_loader::LoadRequest {
+    crate::thumb_loader::LoadRequest {
+        idx,
+        input_seq: 42,
+        items_gen: 7,
+        raw_source: crate::thumb_loader::LoadRequestSource::RawHalfDeveloped {
+            image: image::DynamicImage::new_rgb8(2, 2),
+            developed_dims: [2, 2],
+            decode_ms: 0.0,
+            folder_selection_proof: None,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
+    let mut app = setup_app_for_test();
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.keep_set = [0, 1].into_iter().collect();
+    app.reload_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(0)]),
+        Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Condvar::new(),
+    )));
+    app.requested.insert(0, false);
+    app.requested.insert(1, false);
+
+    app.install_thumbnail_keep_projection(thumbnail_keep_projection(2, [], [], None, [], []), true);
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 2);
+    assert!(!app.requested.contains_key(&0) && !app.requested.contains_key(&1));
+    let mut canceled = [app.rx.try_recv().unwrap(), app.rx.try_recv().unwrap()].map(|msg| {
+        assert!(msg.canceled && !msg.finalized);
+        assert_eq!((msg.input_seq, msg.items_gen), (42, 7));
+        msg.idx
+    });
+    canceled.sort();
+    assert_eq!(canceled, [0, 1]);
+}
+
+#[test]
+fn grid_queue_prune_counts_queued_raw_followup() {
+    let mut app = setup_app_for_test();
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.image_metas = vec![None; 2];
+    app.visible_indices = vec![0];
+    app.reload_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+    app.requested.insert(1, false);
+
+    app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 1);
+    assert!(!app.requested.contains_key(&1));
+    let msg = app.rx.try_recv().unwrap();
+    assert_eq!((msg.idx, msg.input_seq, msg.items_gen), (1, 42, 7));
+    assert!(msg.canceled && !msg.finalized);
 }
 
 #[cfg(windows)]
@@ -1582,6 +1915,13 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     assert!(size_of::<PdfPasswordRequestOwner>() < 32);
     assert!(size_of::<PdfEnumeratePending>() < 1_200);
     assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
+    // Organize destinations also live in PreferencesState's Settings drafts. Keep
+    // a small explicit budget for that settings growth, and keep the rare request
+    // payload on the heap instead of storing it inline in every App.
+    assert!(
+        size_of::<crate::ui_dialogs::file_organize::FileOrganizeRequest>()
+            <= 2 * size_of::<usize>()
+    );
     assert!(size_of::<App>() < 110_000);
 }
 
@@ -8067,6 +8407,33 @@ fn update_perf_cycle_event_fields_pair_with_wall_clock_fields() {
 }
 
 #[test]
+fn idle_other_worker_polls_do_not_add_cycle_reads() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    app.details_meta_pending = None;
+    app.selected = None;
+    app.global_search.active = false;
+    app.global_search.done = true;
+    app.global_search.pending = None;
+    app.global_search.page_edit_prepare = None;
+    // A resident but empty tag worker must also skip instrumentation samples.
+    app.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+    let reads = crate::perf::stall::count_poll_reads(|| {
+        for n in 0..10 {
+            let at = std::time::Instant::now();
+            let scope = crate::perf::stall::OtherWorkerScope::start_at(n, at, 1_000);
+            app.poll_details_meta_load(&ctx);
+            app.poll_tag_prewarm_results();
+            app.poll_global_search_debounce(&ctx);
+            app.poll_global_search_events(&ctx);
+            scope.finish_at(at + std::time::Duration::from_millis(1), 1_100);
+        }
+    });
+    assert_eq!(reads, 0);
+}
+
+#[test]
 fn update_perf_stages_plus_unaccounted_equal_total() {
     let started_at = std::time::Instant::now();
     let started_cycles = 1_000;
@@ -9749,6 +10116,7 @@ impl App {
                 crate::settings::SettingsLoadMeta::default(),
                 || {},
                 config.similar_feature_capability,
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
             );
         // 起動時 purge-retry worker はテストハーネスでは既定オフにする。本番の既定は true
         // (app.rs:9667) だが、テストで有効だと `App::update` を回す並列テストがこの worker を
@@ -12510,6 +12878,7 @@ mod paused_similar_feature_tests {
         app.startup_init = Some(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
+            full_check_requested: false,
         });
         app.startup_done = false;
         app.poll_startup_init();
@@ -12564,6 +12933,7 @@ mod paused_similar_feature_tests {
         app.startup_init = Some(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
+            full_check_requested: false,
         });
         app.startup_done = false;
 
@@ -16593,7 +16963,7 @@ mod phase_c_key_tests {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &cache_map,
             &tx,
             Some(&drive_list_db),
@@ -16608,6 +16978,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             app.folder_thumb_pin_db.as_deref(),
+            None,
             None,
             None,
         );
@@ -16756,7 +17127,7 @@ mod phase_c_key_tests {
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &map,
             &tx,
             Some(&drive_catalog),
@@ -16771,6 +17142,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             Some(pins.as_ref()),
+            None,
             None,
             None,
         );
@@ -16822,7 +17194,7 @@ mod phase_c_key_tests {
         };
         let (writer_tx, writer_rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &writer_request,
+            &mut writer_request.clone(),
             &std::sync::RwLock::new(std::collections::HashMap::new()),
             &writer_tx,
             Some(&parent),
@@ -16837,6 +17209,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             app.folder_thumb_pin_db.as_deref(),
+            None,
             None,
             None,
         );
@@ -16867,7 +17240,7 @@ mod phase_c_key_tests {
         let load = || {
             let (tx, rx) = std::sync::mpsc::channel();
             crate::thumb_loader::process_load_request(
-                &req,
+                &mut req.clone(),
                 &std::sync::RwLock::new(std::collections::HashMap::new()),
                 &tx,
                 None,
@@ -16882,6 +17255,7 @@ mod phase_c_key_tests {
                 &std::sync::Arc::new(AtomicUsize::new(1)),
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );
@@ -17089,7 +17463,7 @@ mod phase_c_key_tests {
             req.items_gen = app.items_generation;
             let (tx, rx) = std::sync::mpsc::channel();
             crate::thumb_loader::process_load_request(
-                &req,
+                &mut req.clone(),
                 map,
                 &tx,
                 None,
@@ -17104,6 +17478,7 @@ mod phase_c_key_tests {
                 &std::sync::Arc::new(AtomicUsize::new(1)),
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );
@@ -17567,7 +17942,7 @@ mod phase_c_key_tests {
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &map,
             &tx,
             Some(&drive_list_db),
@@ -17582,6 +17957,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             Some(pins.as_ref()),
+            None,
             None,
             None,
         );
@@ -17634,7 +18010,7 @@ mod phase_c_key_tests {
         assert!(req.epub_pin_fallback.is_some());
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &std::sync::RwLock::new(std::collections::HashMap::new()),
             &tx,
             None,
@@ -17647,6 +18023,7 @@ mod phase_c_key_tests {
             None,
             &std::sync::Arc::new(AtomicUsize::new(0)),
             &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
             None,
             None,
             None,
@@ -17735,7 +18112,7 @@ mod phase_c_key_tests {
         .expect("drive-list folder pin should create a cache-only request");
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
-            &req,
+            &mut req.clone(),
             &cache_map,
             &tx,
             Some(&drive_list_db),
@@ -17750,6 +18127,7 @@ mod phase_c_key_tests {
             &std::sync::Arc::new(AtomicUsize::new(1)),
             None,
             app.folder_thumb_pin_db.as_deref(),
+            None,
             None,
             None,
         );
@@ -18014,6 +18392,158 @@ mod folder_pane_open_nav_tests {
         );
         assert!(pane_tx.send(Ok(empty_scan())).is_ok());
         app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+    }
+}
+
+#[cfg(test)]
+mod quick_folder_restart_tests {
+    use super::*;
+
+    #[test]
+    fn quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership() {
+        let mut env = phase_c_support::setup_app();
+        let pdf = env.tmp.path().join("cold-password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        for (idx, name) in ["slot-a", "slot-b"].into_iter().enumerate() {
+            let path = env.tmp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let key = drive_current_key_for_path(&path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path);
+        }
+        env.active_quick_folder_slot = None;
+        env.sync_quick_folder_settings();
+        env.settings.last_folder = Some(pdf.clone());
+        env.settings.save();
+        drop(env.app);
+        env.app = App::new_from_settings(crate::settings::Settings::load());
+        assert_eq!(env.active_quick_folder_slot, None);
+        let before = env.quick_folder_workspaces.clone();
+
+        env.open_default_startup_target();
+        assert!(matches!(
+            env.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+            Some(PdfOpenPhase::ColdCandidate { .. })
+        ));
+        // Inject the worker's typed password result; use the production startup,
+        // prompt cancellation, exit, and settings reload paths around that seam.
+        env.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        env.poll_pdf_enumerate();
+        assert!(matches!(
+            env.pdf_password_request
+                .as_ref()
+                .map(|request| &request.owner),
+            Some(PdfPasswordRequestOwner::Direct(_))
+        ));
+        assert!(env.cancel_pdf_password_dialog_request());
+        assert!(env.pdf_password_request.is_none());
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, None);
+        assert_eq!(saved.last_folder.as_ref(), Some(&pdf));
+        env.app = App::new_from_settings(saved);
+        assert_eq!(env.active_quick_folder_slot, None);
+
+        // A later successful open must still have no workspace owner.
+        let folder = env.tmp.path().join("after-cancel");
+        std::fs::create_dir(&folder).unwrap();
+        env.load_folder(folder);
+        assert_eq!(env.active_quick_folder_slot, None);
+        assert_eq!(env.quick_folder_workspaces, before);
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
+    fn exit_and_restart(
+        active: Option<QuickFolderSlotId>,
+        exiting_folder: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) {
+        let mut env = phase_c_support::setup_app();
+        let a = env.tmp.path().join("slot-a");
+        let b = env.tmp.path().join("slot-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let previous = if active == Some(QuickFolderSlotId::A) {
+            &a
+        } else {
+            &b
+        };
+        for (idx, path) in [&a, &b].into_iter().enumerate() {
+            env.quick_folder_workspaces[idx].target = Some(path.clone());
+            env.quick_folder_workspaces[idx].recent_folders = vec![path.clone()];
+            let key = drive_current_key_for_path(path).expect("Windows fixture drive");
+            env.quick_folder_workspaces[idx]
+                .drive_current_dirs
+                .insert(key, path.clone());
+        }
+        // Do not sync after setting active: exit must capture switches that did
+        // not load a folder (same-path / drive-list switches).
+        env.sync_quick_folder_settings();
+        env.active_quick_folder_slot = active;
+        env.settings.last_folder = Some(previous.clone());
+        env.current_folder = exiting_folder(previous);
+        let before = env.quick_folder_workspaces.clone();
+        env.on_exit_inner();
+        drop(env.app);
+        let saved = crate::settings::Settings::load();
+        assert_eq!(saved.active_quick_folder_slot, active);
+        assert_eq!(saved.last_folder.as_ref(), Some(previous));
+        env.app = App::new_from_settings(saved);
+        // Constructor must restore ownership before the first startup open.
+        assert_eq!(env.active_quick_folder_slot, active);
+        env.open_default_startup_target();
+        assert_eq!(env.current_folder.as_ref(), Some(previous));
+        assert_eq!(env.active_quick_folder_slot, active);
+        for (idx, workspace) in before.iter().enumerate() {
+            assert_eq!(env.quick_folder_workspaces[idx].target, workspace.target);
+            assert_eq!(
+                env.quick_folder_workspaces[idx].recent_folders,
+                workspace.recent_folders
+            );
+            assert_eq!(
+                env.quick_folder_workspaces[idx].drive_current_dirs,
+                workspace.drive_current_dirs
+            );
+        }
+        assert_eq!(env.settings.recent_folders, before[0].recent_folders);
+    }
+
+    #[test]
+    fn quick_folder_restart_after_b_exit_preserves_a_workspace() {
+        exit_and_restart(Some(QuickFolderSlotId::B), |path| Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_a_exit_preserves_b_workspace() {
+        exit_and_restart(Some(QuickFolderSlotId::A), |path| Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_exit_keeps_both_workspaces() {
+        exit_and_restart(None, |_| Some(search_results_synthetic_path()));
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_collection_exit_keeps_both_workspaces() {
+        // Collection roots have no physical current_folder.
+        exit_and_restart(None, |_| None);
+    }
+
+    #[test]
+    fn quick_folder_restart_after_none_smart_folder_exit_keeps_both_workspaces() {
+        exit_and_restart(None, |_| {
+            Some(smart_folder::smart_folder_synthetic_path(uuid::Uuid::nil()))
+        });
     }
 }
 
@@ -18450,7 +18980,7 @@ mod phase_c_folder_nav_history_tests {
             .expect("book resume DB")
             .set(&book, 12)
             .expect("seed book resume");
-        app.last_book_resume = Some((book.clone(), 12));
+        app.last_book_resume = Some((book.clone(), 12, None));
         app.settings
             .video_resume_positions
             .insert("/miv-test/movie.mp4".to_string(), 91.5);
@@ -18502,7 +19032,7 @@ mod phase_c_folder_nav_history_tests {
 
         // 場所の記憶以外はこの操作の対象外。
         assert_eq!(app.checked, HashSet::from([1, 3]));
-        assert_eq!(app.last_book_resume, Some((book.clone(), 12)));
+        assert_eq!(app.last_book_resume, Some((book.clone(), 12, None)));
         assert_eq!(
             app.book_resume_db
                 .as_ref()
@@ -31752,7 +32282,7 @@ mod favorite_adjustment_defaults_tests {
         let done = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &app.tx,
             None,
@@ -31765,6 +32295,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &app.keep_start_shared,
             &app.keep_end_shared,
+            None,
             None,
             None,
             None,
@@ -31815,7 +32346,7 @@ mod favorite_adjustment_defaults_tests {
         };
 
         crate::thumb_loader::process_load_request(
-            &next_request,
+            &mut next_request.clone(),
             &cache_map,
             &app.tx,
             None,
@@ -31828,6 +32359,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &app.keep_start_shared,
             &app.keep_end_shared,
+            None,
             None,
             None,
             None,
@@ -34131,14 +34663,16 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Folder(std::path::PathBuf::from(
             "c:/manga/series/sub",
         )));
+        app.rebuild_visible_indices();
 
         // 画像 (本ページ) idx 0 → 記録される
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 0)));
+        let meter = crate::book_resume_db::ReadingMeterValue::new(1, 1);
+        assert_eq!(app.last_book_resume, Some((folder.clone(), 0, meter)));
 
         // フォルダタイル idx 1 → 対象外。直近記録は据え置き
         app.record_book_resume(1);
-        assert_eq!(app.last_book_resume, Some((folder, 0)));
+        assert_eq!(app.last_book_resume, Some((folder, 0, meter)));
     }
 
     #[test]
@@ -37498,7 +38032,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -37511,6 +38045,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -37542,7 +38077,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -37555,6 +38090,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -38786,7 +39322,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -38799,6 +39335,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -39265,6 +39802,7 @@ mod favorite_adjustment_defaults_tests {
             zip_path: zip_path.clone(),
             entry_name: "bookA/p1.jpg".to_string(),
         });
+        app.rebuild_visible_indices();
 
         // 本の中 (深さ 2) → 記録されない
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
@@ -39280,7 +39818,14 @@ mod favorite_adjustment_defaults_tests {
         };
         app.zip_nav = Some(test_zip_nav(&["p1.jpg", "p2.jpg"]));
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, Some((zip_path, 0)));
+        assert_eq!(
+            app.last_book_resume,
+            Some((
+                zip_path,
+                0,
+                crate::book_resume_db::ReadingMeterValue::new(1, 1),
+            ))
+        );
     }
 
     /// ピンキーはルート表示では zip_path (= 外側 ZIP の代表、v1.2.x フラット UI 互換)、
@@ -40677,6 +41222,10 @@ mod favorite_adjustment_defaults_tests {
                 entries,
                 include_metadata: false,
                 local_ai_activity: None,
+                raw: Some(crate::raw::RawDecodeContext::new(
+                    Arc::clone(&app.raw_develop_executor),
+                    app.settings.raw_brightness,
+                )),
             })
             .expect("start export worker");
         let cancel = std::sync::Arc::clone(&pending.cancel);
@@ -42845,7 +43394,7 @@ mod favorite_adjustment_defaults_tests {
             let keep_start = Arc::new(AtomicUsize::new(0));
             let keep_end = Arc::new(AtomicUsize::new(1));
             crate::thumb_loader::process_load_request(
-                &request,
+                &mut request.clone(),
                 &cache_map,
                 &tx,
                 Some(&catalog),
@@ -42860,6 +43409,7 @@ mod favorite_adjustment_defaults_tests {
                 &keep_end,
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );
@@ -50008,6 +50558,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/scan.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -50062,6 +50613,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/old.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -50124,6 +50676,7 @@ mod pipeline_cache_refactor_tests {
             bg: 0,
         };
         let retained_key = RetainedFinalAiKey {
+            raw_source: None,
             item_key: "c:/books/scan.pdf::page_0".to_string(),
             edit_size: [2848, 4095],
             color_ai_hash: key.color_ai_hash,
@@ -94316,6 +94869,22 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     // 利用者が手で足す条件のバーなので、既定動作による非表示はこちらが定位置。
     assert!(app.settings.show_address_bar_omitted_entries);
     let ctx = egui::Context::default();
+    // The integrated bar also draws toolbar widgets using the app's named family.
+    crate::ui_fonts::configure_fonts(&ctx);
+    // TopBottomPanel learns the integrated toolbar height on its first frame.
+    // Inspect the settled frame, as the real event loop and Harness do.
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 240.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            app.render_toolbar(ctx);
+        },
+    );
     let output = ctx.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -94325,7 +94894,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_address_bar(ctx);
+            app.render_toolbar(ctx);
         },
     );
     let mut drawn = String::new();
@@ -94353,7 +94922,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_address_bar(ctx);
+            app.render_toolbar(ctx);
         },
     );
     let mut drawn_off = String::new();
@@ -94445,26 +95014,6 @@ fn the_overflow_button_closes_the_panel_it_opened() {
         FsOverflowPanelState::Closed,
         "a second press must close it"
     );
-}
-
-/// 起動時のウィンドウ状態 (§1.116)。最大化で起動したときに、初回フレームの
-/// mixed-DPI 補正が最大化を打ち消さないことを固定する。
-#[test]
-fn the_startup_size_correction_waits_while_the_window_is_maximized() {
-    use crate::app::deferred_initial_size_ready;
-
-    // 通常起動は従来どおり初回フレームで補正する。egui がまだ viewport を報告して
-    // いなくても待たない (待つと補正が永久に届かない環境がある)。
-    assert!(deferred_initial_size_ready(false, None));
-    assert!(deferred_initial_size_ready(false, Some(false)));
-
-    // 最大化起動では、報告が無い間は保留する。None を「最大化ではない」と読むと
-    // 初回フレームで InnerSize を送ってしまい、最大化が解けてしまう。
-    assert!(!deferred_initial_size_ready(true, None));
-    assert!(!deferred_initial_size_ready(true, Some(true)));
-
-    // 最大化が解けたと明示的に報告されたフレームで、はじめて補正を流す。
-    assert!(deferred_initial_size_ready(true, Some(false)));
 }
 
 /// 最小化中の maximized は当てにならないので、最後に見えていた状態を保つ。

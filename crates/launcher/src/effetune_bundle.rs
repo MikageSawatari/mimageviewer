@@ -2,6 +2,7 @@
 //! Published bundle trees are never moved or deleted during launcher startup.
 use crate::bundle_location;
 use crate::bundle_paths::{checked_metadata, exists_checked, inventory_metadata, relative_name};
+use crate::runtime_locks::{self, PinnedGeneration};
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +36,25 @@ pub fn ensure_bundle(
     ensure_bundle_with_wait(runtime, files, manifest, Duration::from_secs(60))
 }
 
+pub fn ensure_pinned_bundle(
+    runtime: &Path,
+    files: &[BundleFile],
+    manifest: &str,
+) -> Result<PinnedGeneration, PreparationError> {
+    let mut rejected_generation = None;
+    ensure_bundle_inner(
+        runtime,
+        files,
+        manifest,
+        Duration::from_secs(60),
+        &mut rejected_generation,
+    )
+    .map_err(|reason| PreparationError {
+        reason,
+        rejected_generation,
+    })
+}
+
 fn ensure_bundle_with_wait(
     runtime: &Path,
     files: &[BundleFile],
@@ -42,12 +62,12 @@ fn ensure_bundle_with_wait(
     wait: Duration,
 ) -> Result<PathBuf, PreparationError> {
     let mut rejected_generation = None;
-    ensure_bundle_inner(runtime, files, manifest, wait, &mut rejected_generation).map_err(
-        |reason| PreparationError {
+    ensure_bundle_inner(runtime, files, manifest, wait, &mut rejected_generation)
+        .map(|pin| pin.path.clone())
+        .map_err(|reason| PreparationError {
             reason,
             rejected_generation,
-        },
-    )
+        })
 }
 
 fn ensure_bundle_inner(
@@ -56,7 +76,7 @@ fn ensure_bundle_inner(
     manifest: &str,
     wait: Duration,
     rejected_generation: &mut Option<String>,
-) -> io::Result<PathBuf> {
+) -> io::Result<PinnedGeneration> {
     if !checked_metadata(runtime)?.is_dir() {
         return Err(io::Error::other("runtime directory required"));
     }
@@ -64,24 +84,27 @@ fn ensure_bundle_inner(
     if exists_checked(&container)? && !checked_metadata(&container)?.is_dir() {
         return Err(io::Error::other("EffeTune container must be a directory"));
     }
-    // A valid installation has no write/lock requirement, including read-only APPDATA.
+    // A valid cooperating installation needs only a shared read-only lease,
+    // without a publisher write lock or another asset hash pass.
     if let Ok(root) = ready_generation(&container, files, manifest, rejected_generation) {
         return Ok(root);
     }
     std::fs::create_dir_all(&container)?;
-    let lock_path = runtime.join(".effetune.lock");
-    if exists_checked(&lock_path)? && !checked_metadata(&lock_path)?.is_file() {
-        return Err(io::Error::other("bundle lock must be a regular file"));
-    }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
+    let started = std::time::Instant::now();
+    let lock = runtime_locks::open(runtime, runtime_locks::PUBLISHER)?;
     // Blocking OS locking runs on a worker, with a bounded launcher wait. A
     // timed-out worker only releases its lock: it never publishes anything.
     let _lock = match wait_for_publish_lock(lock, wait) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return ready_generation(&container, files, manifest, rejected_generation)
+                .or(Err(error));
+        }
+    };
+    // Released launchers only know the old in-tree publisher lock. Always take
+    // the permanent lock first, then this compatibility lock, within one budget.
+    let legacy = runtime_locks::open_legacy_publisher(runtime, false)?;
+    let _legacy = match wait_for_publish_lock(legacy, wait.saturating_sub(started.elapsed())) {
         Ok(lock) => lock,
         Err(error) => {
             return ready_generation(&container, files, manifest, rejected_generation)
@@ -94,21 +117,49 @@ fn ensure_bundle_inner(
     publish_generation(&container, files, manifest)
 }
 
-fn wait_for_publish_lock(lock: std::fs::File, wait: Duration) -> io::Result<std::fs::File> {
-    if lock.try_lock_exclusive()? {
+pub(crate) fn wait_for_publish_lock(
+    lock: std::fs::File,
+    wait: Duration,
+) -> io::Result<std::fs::File> {
+    wait_for_lock(lock, wait, LockMode::Exclusive)
+}
+
+pub(crate) fn wait_for_shared_lock(
+    lock: std::fs::File,
+    wait: Duration,
+) -> io::Result<std::fs::File> {
+    wait_for_lock(lock, wait, LockMode::Shared)
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+fn wait_for_lock(lock: std::fs::File, wait: Duration, mode: LockMode) -> io::Result<std::fs::File> {
+    let acquired = match mode {
+        LockMode::Shared => fs4::fs_std::FileExt::try_lock_shared(&lock)?,
+        LockMode::Exclusive => lock.try_lock_exclusive()?,
+    };
+    if acquired {
         return Ok(lock);
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
-        .name("effetune-publish-lock".into())
+        .name("runtime-owner-lock".into())
         .spawn(move || {
-            let result = lock.lock_exclusive().map(|()| lock);
+            let result = match mode {
+                LockMode::Shared => fs4::fs_std::FileExt::lock_shared(&lock),
+                LockMode::Exclusive => lock.lock_exclusive(),
+            }
+            .map(|()| lock);
             let _ = tx.send(result);
         })?;
     rx.recv_timeout(wait).map_err(|error| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("EffeTune publisher wait failed after {wait:?}: {error}; retry 音響調整"),
+            format!("runtime owner wait failed after {wait:?}: {error}"),
         )
     })?
 }
@@ -118,7 +169,7 @@ fn ready_generation(
     files: &[BundleFile],
     manifest: &str,
     rejected_generation: &mut Option<String>,
-) -> io::Result<PathBuf> {
+) -> io::Result<PinnedGeneration> {
     if !checked_metadata(container)?.is_dir() {
         return Err(io::Error::other("EffeTune directory required"));
     }
@@ -127,6 +178,7 @@ fn ready_generation(
     *rejected_generation = Some(generation.clone());
     let root = container.join(generation);
     bundle_location::checked_directory(&root)?;
+    let pin = PinnedGeneration::new(root.clone())?;
     let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
     if !root
         .file_name()
@@ -144,7 +196,7 @@ fn ready_generation(
     if !checked_metadata(&stamp)?.is_file() || std::fs::read_to_string(stamp)? != expected {
         return Err(io::Error::other("EffeTune extraction stamp mismatch"));
     }
-    Ok(root)
+    Ok(pin)
 }
 
 fn snapshot(root: &Path, files: &[BundleFile], manifest: &str) -> io::Result<String> {
@@ -163,11 +215,19 @@ fn snapshot(root: &Path, files: &[BundleFile], manifest: &str) -> io::Result<Str
     }
     let actual: BTreeSet<_> = entries
         .iter()
-        .filter(|(name, _, _)| name != ".manifest")
+        .filter(|(name, _, _)| name != ".manifest" && name != runtime_locks::IN_USE)
         .map(|(name, meta, _)| (name.clone(), meta.is_dir()))
         .collect();
     if actual != expected {
         return Err(io::Error::other("bundle inventory mismatch"));
+    }
+    if let Some((_, metadata, _)) = entries
+        .iter()
+        .find(|(name, _, _)| name == runtime_locks::IN_USE)
+    {
+        if !metadata.is_file() {
+            return Err(io::Error::other("generation lease must be a regular file"));
+        }
     }
     let metadata: BTreeMap<_, _> = entries
         .into_iter()
@@ -202,7 +262,7 @@ fn publish_generation(
     container: &Path,
     files: &[BundleFile],
     manifest: &str,
-) -> io::Result<PathBuf> {
+) -> io::Result<PinnedGeneration> {
     let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
     let stage = tempfile::Builder::new()
         .prefix(&format!(
@@ -211,6 +271,7 @@ fn publish_generation(
         ))
         .tempdir_in(container)?;
     check_publish_path_length(stage.path(), files)?;
+    let pin = PinnedGeneration::new(stage.path().to_path_buf())?;
     for file in files {
         relative_name(Path::new(file.name))?;
         let path = stage.path().join(file.name);
@@ -243,7 +304,8 @@ fn publish_generation(
         .persist(container.join(bundle_location::POINTER_FILE))
         .map_err(|e| e.error)?;
     // Cleanup is outside startup: absence of a lock cannot prove assets are unused.
-    Ok(stage.keep())
+    let _ = stage.keep();
+    Ok(pin)
 }
 
 fn check_publish_path_length(root: &Path, files: &[BundleFile]) -> io::Result<()> {
@@ -287,7 +349,9 @@ mod tests {
             bytes: b"bundle",
             hash: Box::leak(crate::hex_lower(&Sha256::digest(b"bundle")).into_boxed_str()),
         }];
-        test(temp.path(), &files);
+        let runtime = temp.path().join("runtime").join("4.3.0");
+        std::fs::create_dir_all(&runtime).unwrap();
+        test(&runtime, &files);
     }
     #[test]
     fn extracts_and_reuses_complete_verified_tree() {
@@ -438,6 +502,23 @@ mod tests {
             assert_eq!(error.reason.kind(), io::ErrorKind::TimedOut);
             lock.unlock().unwrap();
             assert!(ensure_bundle(dir, files, "current").is_ok());
+        });
+    }
+
+    #[test]
+    fn shared_owner_wait_keeps_multiple_readers_and_excludes_collector() {
+        with_fixture(|dir, _| {
+            let first = wait_for_shared_lock(
+                runtime_locks::open(dir, runtime_locks::IN_USE).unwrap(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            let second = runtime_locks::shared(dir).unwrap();
+            assert!(runtime_locks::exclusive(dir, runtime_locks::IN_USE).is_err());
+            drop(first);
+            assert!(runtime_locks::exclusive(dir, runtime_locks::IN_USE).is_err());
+            drop(second);
+            assert!(runtime_locks::exclusive(dir, runtime_locks::IN_USE).is_ok());
         });
     }
 

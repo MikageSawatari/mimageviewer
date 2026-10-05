@@ -3,17 +3,48 @@ use super::*;
 struct ColorScanWorkItem {
     key: crate::color_search::ColorPaletteKey,
     req: LoadRequest,
+    pin_source: Option<crate::folder_thumb_pins::FolderPinSource>,
 }
 
 const COLOR_SCAN_CONFIRM_MISSING_THRESHOLD: usize = 2_000;
 const MAX_COLOR_SCAN_MESSAGES_PER_FRAME: usize = 256;
 
 fn color_filter_item_supported(item: &crate::grid_item::GridItem) -> bool {
-    item.has_page_data() || matches!(item, crate::grid_item::GridItem::Stack { .. })
+    item.has_page_data()
+        || matches!(item, crate::grid_item::GridItem::Stack { .. })
+        || color_filter_representative_supported(item)
+}
+
+fn color_filter_representative_supported(item: &GridItem) -> bool {
+    match item {
+        GridItem::ZipFile(_) => true,
+        // PdfFile also represents converted EPUBs; do not expand the requested scope.
+        GridItem::PdfFile(path) => path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")),
+        _ => false,
+    }
+}
+
+fn color_representative_key(
+    item: &GridItem,
+    storage_key: &str,
+    pin: Option<&crate::folder_thumb_pins::FolderPinSource>,
+    pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
+    depth: u32,
+    revision: u64,
+) -> String {
+    // The root selection plus DB revision identifies cascade selections without UI-thread
+    // stat/DB lookups. The worker resolves the canonical #pin: storage suffix as usual.
+    format!(
+        "{}|representative:{storage_key:?}#pin:{pin:?}|cascade:{:?}:{depth}|thumb:{revision}",
+        item.perf_key(),
+        pin.and(pin_stamp)
+    )
 }
 
 fn color_scan_cache_decision(req: &LoadRequest, cache_decision: CacheDecision) -> CacheDecision {
-    if req.pdf_page.is_none() {
+    if req.pdf_page.is_none() || color_representative_request(req) {
         return cache_decision;
     }
     CacheDecision {
@@ -26,7 +57,71 @@ fn color_scan_cache_decision(req: &LoadRequest, cache_decision: CacheDecision) -
     }
 }
 
+fn color_representative_request(req: &LoadRequest) -> bool {
+    req.cache_key_override
+        .as_deref()
+        .is_some_and(|key| key.starts_with(CACHE_KEY_ZIP) || key.starts_with(CACHE_KEY_PDF))
+}
+
+/// Only parent ZIP/PDF representatives consult catalog on a fresh memory-cache miss.
+/// Use a private one-row map so a delayed DB read cannot overwrite a newer grid cache row.
+fn color_representative_catalog_cache(
+    req: &LoadRequest,
+    cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+) -> Option<Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>> {
+    if !color_representative_request(req) {
+        return None;
+    }
+    let key = crate::thumb_loader::cache_key_for_request(req)?;
+    let fresh = |entry: &crate::catalog::CacheEntry| {
+        entry.mtime == req.mtime && entry.file_size == req.file_size
+    };
+    if cache_map
+        .read()
+        .ok()
+        .is_some_and(|map| map.get(key.as_ref()).is_some_and(fresh))
+    {
+        return None;
+    }
+    let entry = match catalog?.load_one(key.as_ref()) {
+        Ok(entry) => entry.filter(fresh)?,
+        Err(error) => {
+            crate::logger::log(format!(
+                "color_scan: representative catalog read failed: {error}"
+            ));
+            return None;
+        }
+    };
+    Some(Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::from([(key.into_owned(), entry)]),
+    )))
+}
+
 impl App {
+    pub(crate) fn invalidate_color_representative(&mut self, idx: usize) {
+        // Color filtering belongs to the main grid, outside the swapped viewer payload.
+        // A thumbnail completion/reload in another owner must not mutate that grid's scan.
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        let Some(item) = self
+            .items
+            .get(idx)
+            .filter(|item| color_filter_representative_supported(item))
+        else {
+            return;
+        };
+        let revision = self
+            .color_filter
+            .palettes
+            .representative_revisions
+            .entry(item.perf_key())
+            .or_default();
+        *revision = revision.wrapping_add(1);
+        self.mark_color_filter_scope_dirty();
+    }
+
     pub(crate) fn color_filter_available_in_current_view(&self) -> bool {
         !self.items_are_drive_list
             && !self.items_are_reading_history_view
@@ -421,6 +516,7 @@ impl App {
         let cache_decision = CacheDecision::from_settings(&self.settings);
         let stats = Arc::clone(&self.stats);
         let pin_db = self.folder_thumb_pin_db.clone();
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
         // サムネ生成と同じ並列度設定に従う (Auto = cores/2)。デコードを並列化しつつ
         // I/O 競合を抑える。
         let threads = self.settings.parallelism.thread_count();
@@ -454,6 +550,7 @@ impl App {
                     cache_decision,
                     stats,
                     pin_db,
+                    raw_executor,
                     threads,
                     cancel,
                     tx,
@@ -521,7 +618,10 @@ impl App {
         let mut parts = Vec::with_capacity(indices.len());
         for idx in indices {
             let item = self.items.get(idx)?;
-            let key = item.perf_key();
+            let key = self
+                .color_identity_for_idx(idx)
+                .map(|identity| identity.0)
+                .unwrap_or_else(|| item.perf_key());
             let (mtime, file_size) = self
                 .image_metas
                 .get(idx)
@@ -588,7 +688,21 @@ impl App {
             {
                 continue;
             }
-            work.push(ColorScanWorkItem { key, req });
+            let pin_source = self
+                .items
+                .get(idx)
+                .filter(|item| color_filter_representative_supported(item))
+                .and_then(GridItem::container_path)
+                .and_then(|path| {
+                    self.folder_pin_map
+                        .get(&crate::path_key::normalize_keep_drive(path))
+                })
+                .cloned();
+            work.push(ColorScanWorkItem {
+                key,
+                req,
+                pin_source,
+            });
         }
         work
     }
@@ -602,7 +716,36 @@ impl App {
             return None;
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
-        Some((item.perf_key(), mtime, file_size))
+        let key = if color_filter_representative_supported(item) {
+            let storage_key = container_cache_base_key(
+                item,
+                self.use_full_path_cache_keys(),
+                Some(self.settings.folder_thumb_sort),
+                self.settings.folder_thumb_depth,
+            )?;
+            let pin = item.container_path().and_then(|path| {
+                self.folder_pin_map
+                    .get(&crate::path_key::normalize_keep_drive(path))
+            });
+            color_representative_key(
+                item,
+                &storage_key,
+                pin,
+                self.folder_thumb_pin_db
+                    .as_ref()
+                    .map(|db| db.mutation_stamp()),
+                self.settings.folder_thumb_depth,
+                self.color_filter
+                    .palettes
+                    .representative_revisions
+                    .get(&item.perf_key())
+                    .copied()
+                    .unwrap_or(0),
+            )
+        } else {
+            item.perf_key()
+        };
+        Some((key, mtime, file_size))
     }
 
     fn color_work_identity_for_idx(
@@ -614,6 +757,7 @@ impl App {
             return None;
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
+        let empty_pins = std::collections::HashMap::new();
         let mut req = make_load_request(
             item,
             idx,
@@ -623,7 +767,11 @@ impl App {
             self.pdf_current_password.as_deref(),
             Some(self.settings.folder_thumb_sort),
             self.settings.folder_thumb_depth,
-            &self.folder_pin_map,
+            if color_filter_representative_supported(item) {
+                &empty_pins
+            } else {
+                &self.folder_pin_map
+            },
             &self.converted_archive_cache_paths,
             self.archive_source_override.as_deref(),
             self.current_folder.as_deref(),
@@ -632,7 +780,9 @@ impl App {
             self.use_full_path_cache_keys(),
         )?;
         req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
-        Some((item.perf_key(), req))
+        req.context_epoch = crate::pdf_loader::current_render_context_epoch();
+        req.input_seq = self.input_seq;
+        Some((self.color_identity_for_idx(idx)?.0, req))
     }
 
     fn color_view_kind(&self) -> &'static str {
@@ -666,6 +816,7 @@ fn run_color_scan_worker(
     cache_decision: CacheDecision,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    raw_executor: Arc<crate::raw::RawDevelopExecutor>,
     threads: usize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<crate::color_search::ColorScanMessage>,
@@ -673,17 +824,48 @@ fn run_color_scan_worker(
     let done = Arc::new(AtomicUsize::new(0));
     let keep_start = Arc::new(AtomicUsize::new(0));
     let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
+    let raw_handoff = crate::thumb_loader::RawThumbHandoff::DedicatedWorker(raw_executor);
 
     // 1 件ぶんの処理。`cache_map` / `catalog` (Mutex<Connection>) / `stats` はいずれも
     // 内部同期されているので複数スレッドから安全に共有できる。`tx` は for_each_with の
     // per-thread clone で渡す (Sender は !Sync のため)。
     let process = |tx: &mut mpsc::Sender<crate::color_search::ColorScanMessage>,
-                   item: ColorScanWorkItem| {
+                   mut item: ColorScanWorkItem| {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
         let mtime = item.req.mtime;
         let file_size = item.req.file_size;
+        if let Some(source) = item.pin_source {
+            let container = item.req.path.clone();
+            let base_key = item
+                .req
+                .cache_key_override
+                .clone()
+                .expect("representative cache key");
+            let kind = if base_key.starts_with(CACHE_KEY_PDF) {
+                ContainerKindForPin::PdfFile
+            } else {
+                ContainerKindForPin::ZipFile
+            };
+            let pins = std::collections::HashMap::from([(
+                crate::path_key::normalize_keep_drive(&container),
+                source,
+            )]);
+            let password = item.req.pdf_password.clone();
+            item.req = apply_folder_thumb_pin(
+                item.req,
+                &container,
+                &base_key,
+                false,
+                kind,
+                &pins,
+                &std::collections::HashMap::new(),
+                pin_db.as_deref(),
+                None,
+                password.as_deref(),
+            );
+        }
         let palette = load_palette_for_request(
             item.req,
             &cache_map,
@@ -697,6 +879,7 @@ fn run_color_scan_worker(
             &keep_start,
             &keep_end,
             pin_db.as_deref(),
+            &raw_handoff,
         )
         .unwrap_or_default();
         if cancel.load(Ordering::Relaxed) {
@@ -770,16 +953,23 @@ fn load_palette_for_request(
     keep_start: &Arc<AtomicUsize>,
     keep_end: &Arc<AtomicUsize>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    raw_handoff: &crate::thumb_loader::RawThumbHandoff,
 ) -> Option<crate::color_search::Palette> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let (tx, rx) = mpsc::channel();
     req.priority = false;
     let cache_decision = color_scan_cache_decision(&req, cache_decision);
-    if req.pdf_page.is_some() {
+    if req.pdf_page.is_some() && cache_decision.policy == crate::settings::CachePolicy::Off {
         req.force_cache = false;
     }
+    // Pin resolution has already supplied the canonical #pin: key. This lookup stays on
+    // the color worker and leaves ordinary images' released cache_map -> decode path intact.
+    let catalog_cache = color_representative_catalog_cache(&req, cache_map, catalog);
     crate::thumb_loader::process_load_request(
-        &req,
-        cache_map,
+        &mut req,
+        catalog_cache.as_ref().unwrap_or(cache_map),
         &tx,
         catalog,
         thumb_px,
@@ -795,11 +985,14 @@ fn load_palette_for_request(
         pin_db,
         None,
         None,
+        Some(raw_handoff),
     );
 
     let mut image = None;
     while let Ok(msg) = rx.try_recv() {
         if msg.canceled {
+            // Transient unavailable pixels must not become an empty, final palette.
+            cancel.store(true, Ordering::Release);
             return None;
         }
         if image.is_none() {
@@ -827,8 +1020,752 @@ mod tests {
         }
     }
 
+    fn representative_app() -> AppTestEnvForTest {
+        let mut env = setup_app_for_test();
+        let root = env.tmp.path().to_path_buf();
+        env.items = vec![
+            GridItem::ZipFile(root.join("book.zip")),
+            GridItem::PdfFile(root.join("book.PDF")),
+        ];
+        env.image_metas = vec![Some((10, 20)); 2];
+        env
+    }
+
     #[test]
-    fn color_filter_targets_page_images_and_stacks_only() {
+    fn color_representatives_share_missing_confirmation_and_pending_visibility() {
+        let mut env = representative_app();
+        let root = env.tmp.path().to_path_buf();
+        env.items = (0..COLOR_SCAN_CONFIRM_MISSING_THRESHOLD)
+            .map(|i| {
+                if i % 2 == 0 {
+                    GridItem::ZipFile(root.join(format!("{i}.zip")))
+                } else {
+                    GridItem::PdfFile(root.join(format!("{i}.pdf")))
+                }
+            })
+            .collect();
+        env.image_metas = vec![Some((10, 20)); env.items.len()];
+        env.color_filter.enabled = true;
+        let ctx = egui::Context::default();
+        let scope = env.color_current_scope_signature();
+        assert_eq!(
+            env.color_missing_work_items().len(),
+            COLOR_SCAN_CONFIRM_MISSING_THRESHOLD
+        );
+        env.ensure_color_scan_for_current_scope(&ctx);
+        assert_eq!(
+            env.color_filter.confirmation.as_ref().unwrap().missing,
+            COLOR_SCAN_CONFIRM_MISSING_THRESHOLD
+        );
+        assert!(env.color_filter.pending.is_none());
+        assert!(env.passes_color_filter_for_scope(0, scope));
+        assert!(env.passes_color_filter_for_scope(1, scope));
+        env.cancel_large_color_scan_confirmation();
+        assert!(!env.color_filter.enabled);
+    }
+
+    #[test]
+    fn color_representative_pin_reload_and_file_changes_reject_old_results() {
+        let mut env = representative_app();
+        let original_scope = env.color_current_scope_signature().unwrap();
+        for idx in 0..2 {
+            let (key, mtime, file_size) = env.color_identity_for_idx(idx).unwrap();
+            env.color_filter.palettes.insert(
+                key,
+                crate::color_search::PaletteEntry {
+                    mtime,
+                    file_size,
+                    palette: Default::default(),
+                },
+            );
+        }
+        assert!(env.color_missing_work_items().is_empty());
+        env.invalidate_color_representative(0);
+        assert_eq!(env.color_missing_work_items().len(), 1);
+        let changed_scope = env.color_current_scope_signature().unwrap();
+        assert_eq!(
+            crate::color_search::scan_result_disposition(
+                false,
+                true,
+                1,
+                1,
+                original_scope,
+                Some(changed_scope)
+            ),
+            crate::color_search::ScanDisposition::Restart
+        );
+        let pdf_path = env.items[1].container_path().unwrap().to_path_buf();
+        env.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&pdf_path),
+            crate::folder_thumb_pins::FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 3,
+            },
+        );
+        assert_eq!(env.color_missing_work_items().len(), 2);
+        // UI construction must not stat/open this nonexistent PDF, even when pinned.
+        assert_eq!(
+            env.color_work_identity_for_idx(1).unwrap().1.pdf_page,
+            Some(0)
+        );
+        let pin_key = env.color_identity_for_idx(1).unwrap().0;
+        assert!(pin_key.contains("#pin:"));
+        env.folder_pin_map.clear();
+        assert_ne!(env.color_identity_for_idx(1).unwrap().0, pin_key);
+        assert_eq!(env.color_missing_work_items().len(), 1);
+        env.image_metas[1] = Some((11, 20));
+        assert_eq!(env.color_missing_work_items().len(), 2);
+        env.image_metas[1] = Some((10, 21));
+        assert_eq!(env.color_missing_work_items().len(), 2);
+        env.clear_color_filter_for_new_items();
+        assert!(
+            env.color_filter
+                .palettes
+                .representative_revisions
+                .is_empty()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_representative_invalidation_stays_with_main_grid_owner() {
+        let mut env = representative_app();
+        let items = env.items.clone();
+        let sibling = env.build_window_context_for_test(29_010, |owner| {
+            owner.items = items;
+            owner.image_metas = vec![Some((10, 20)); 2];
+        });
+        env.color_filter.enabled = true;
+        env.color_filter_scope_refresh_pending = false;
+        let scope = env.color_current_scope_signature();
+        env.with_viewer_context(sibling, |owner| {
+            owner.invalidate_color_representative(0);
+            assert!(
+                owner
+                    .color_filter
+                    .palettes
+                    .representative_revisions
+                    .is_empty()
+            );
+            assert!(!owner.color_filter_scope_refresh_pending);
+        })
+        .unwrap();
+        assert_eq!(env.color_current_scope_signature(), scope);
+        env.invalidate_color_representative(0);
+        assert_eq!(env.color_filter.palettes.representative_revisions.len(), 1);
+        assert!(env.color_filter_scope_refresh_pending);
+    }
+
+    #[test]
+    fn color_representative_cascade_pin_stamp_changes_identity_without_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        let item = GridItem::ZipFile(tmp.path().join("book.zip"));
+        let source = crate::folder_thumb_pins::FolderPinSource::ZipDir {
+            zip_rel: String::new(),
+            dir_prefix: "chapter/".into(),
+        };
+        let key = |pin, stamp| {
+            color_representative_key(&item, "zipthumb:book.zip", pin, Some(stamp), 3, 0)
+        };
+        let before = db.mutation_stamp();
+        let pinned = key(Some(&source), before);
+        db.set(
+            &tmp.path().join("book.zip/chapter"),
+            &crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "chapter/b.png".into(),
+            },
+        )
+        .unwrap();
+        assert_ne!(pinned, key(Some(&source), db.mutation_stamp()));
+        assert_eq!(key(None, before), key(None, db.mutation_stamp()));
+    }
+
+    fn scan_one(
+        req: LoadRequest,
+        pin_source: Option<crate::folder_thumb_pins::FolderPinSource>,
+        entries: std::collections::HashMap<String, crate::catalog::CacheEntry>,
+        catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    ) -> crate::color_search::Palette {
+        let (tx, rx) = mpsc::channel();
+        run_test_scan(
+            req,
+            pin_source,
+            Arc::new(std::sync::RwLock::new(entries)),
+            catalog,
+            always_cache_decision(),
+            Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let crate::color_search::ColorScanMessage::Item(result) = rx.recv().unwrap() else {
+            panic!("item before done")
+        };
+        assert!(matches!(
+            rx.recv().unwrap(),
+            crate::color_search::ColorScanMessage::Done {
+                cancelled: false,
+                ..
+            }
+        ));
+        result.palette
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_test_scan(
+        req: LoadRequest,
+        pin_source: Option<crate::folder_thumb_pins::FolderPinSource>,
+        cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        catalog: Option<Arc<crate::catalog::CatalogDb>>,
+        decision: CacheDecision,
+        executor: Arc<crate::raw::RawDevelopExecutor>,
+        cancel: Arc<AtomicBool>,
+        tx: mpsc::Sender<crate::color_search::ColorScanMessage>,
+    ) {
+        run_color_scan_worker(
+            1,
+            2,
+            vec![ColorScanWorkItem {
+                key: "test".into(),
+                req,
+                pin_source,
+            }],
+            cache_map,
+            catalog,
+            128,
+            75,
+            decision,
+            Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
+            None,
+            executor,
+            1,
+            cancel,
+            tx,
+        );
+    }
+
+    #[cfg(windows)]
+    fn raw_without_preview() -> PathBuf {
+        let path = PathBuf::from("vendor/raw-samples/3196.mos");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        assert!(matches!(
+            crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(&path)),
+            Err(crate::raw::RawError::NoUsablePreview(_))
+        ));
+        path
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_raw_zip_representatives_without_preview_develop_with_cache_on_and_off() {
+        use std::io::Write;
+        let source = raw_without_preview();
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("raw.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zip.start_file("cover.mos", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&std::fs::read(&source).unwrap()).unwrap();
+        zip.finish().unwrap();
+
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let raster = crate::thumb_loader::decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(source.clone()),
+            128,
+            &executor,
+        )
+        .unwrap();
+        let expected = crate::color_search::extract_palette_from_color_image(
+            &crate::thumb_loader::resize_to_display_color_image(
+                &raster.image,
+                128,
+                Some(raster.developed_dims),
+            ),
+        );
+        assert!(!expected.colors.is_empty());
+
+        let request = |path: &Path, zip_entry, cache_key_override| {
+            let meta = std::fs::metadata(path).unwrap();
+            LoadRequest {
+                path: path.to_owned(),
+                zip_entry,
+                cache_key_override,
+                mtime: crate::ui_helpers::mtime_secs(&meta),
+                file_size: meta.len() as i64,
+                ..Default::default()
+            }
+        };
+        let ordinary = request(&source, None, None);
+        let leaf = request(&zip_path, Some("cover.mos".into()), None);
+        let parent = request(&zip_path, None, Some("zipthumb:raw.zip".into()));
+        let pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "cover.mos".into(),
+        };
+        for policy in [
+            crate::settings::CachePolicy::Always,
+            crate::settings::CachePolicy::Off,
+        ] {
+            for (req, pin_source) in [
+                (ordinary.clone(), None),
+                (leaf.clone(), None),
+                (parent.clone(), None),
+                (parent.clone(), Some(pin.clone())),
+            ] {
+                let cache_dir = tempfile::tempdir().unwrap();
+                let db = Arc::new(
+                    crate::catalog::CatalogDb::open(cache_dir.path(), tmp.path()).unwrap(),
+                );
+                let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+                    String,
+                    crate::catalog::CacheEntry,
+                >::new()));
+                // A stale parent cache must not supply substitute colors.
+                if req.cache_key_override.is_some() && pin_source.is_none() {
+                    let stale = cache_entry([0, 255, 0], req.mtime - 1, req.file_size);
+                    cache_map
+                        .write()
+                        .unwrap()
+                        .insert("zipthumb:raw.zip".into(), stale.clone());
+                    db.save_thumb_bytes(
+                        "zipthumb:raw.zip",
+                        stale.mtime,
+                        stale.file_size,
+                        stale.source_dims,
+                        &stale.jpeg_data,
+                    )
+                    .unwrap();
+                }
+                let mut decision = always_cache_decision();
+                decision.policy = policy;
+                decision.zip_always = false;
+                let (tx, rx) = mpsc::channel();
+                run_test_scan(
+                    req,
+                    pin_source,
+                    Arc::clone(&cache_map),
+                    Some(Arc::clone(&db)),
+                    decision,
+                    Arc::clone(&executor),
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                );
+                let crate::color_search::ColorScanMessage::Item(result) = rx.recv().unwrap() else {
+                    panic!("developed palette before Done")
+                };
+                assert_eq!(result.palette.colors.len(), expected.colors.len());
+                for (actual, expected) in result.palette.colors.iter().zip(&expected.colors) {
+                    assert_eq!(actual.rgb, expected.rgb);
+                    assert_eq!(actual.ratio, expected.ratio);
+                }
+                assert!(matches!(
+                    rx.recv().unwrap(),
+                    crate::color_search::ColorScanMessage::Done {
+                        cancelled: false,
+                        ..
+                    }
+                ));
+                if policy == crate::settings::CachePolicy::Off {
+                    assert!(
+                        cache_map
+                            .read()
+                            .unwrap()
+                            .values()
+                            .all(|entry| entry.mtime != result.mtime)
+                    );
+                    assert!(
+                        db.load_all()
+                            .unwrap()
+                            .values()
+                            .all(|entry| entry.mtime != result.mtime)
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_raw_cancel_retires_queued_develop_without_waiting_for_other_owner() {
+        let source = raw_without_preview();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (_other_ticket, other_result) =
+            executor.block_one_slot_with_result_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker_executor = Arc::clone(&executor);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            run_test_scan(
+                LoadRequest {
+                    path: source,
+                    ..Default::default()
+                },
+                None,
+                Arc::new(std::sync::RwLock::new(Default::default())),
+                None,
+                always_cache_decision(),
+                worker_executor,
+                worker_cancel,
+                tx,
+            );
+        });
+        executor.wait_for_queued_job_for_test();
+        cancel.store(true, Ordering::Release);
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let running = executor.running_jobs_for_test();
+        let waiting = executor.waiting_jobs_for_test();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            matches!(
+                done.unwrap(),
+                crate::color_search::ColorScanMessage::Done {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "cancellation must send no empty Item, and finish before the unrelated job"
+        );
+        assert_eq!(
+            running, 1,
+            "scan cancellation must leave the other owner running"
+        );
+        assert_eq!(waiting, 0, "canceled scan must retire its queued job");
+        assert!(
+            other_result
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_raw_executor_rejection_never_publishes_empty_final_palette() {
+        let source = raw_without_preview();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        executor.shutdown();
+        let (tx, rx) = mpsc::channel();
+        run_test_scan(
+            LoadRequest {
+                path: source,
+                ..Default::default()
+            },
+            None,
+            Arc::new(std::sync::RwLock::new(Default::default())),
+            None,
+            always_cache_decision(),
+            executor,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        assert!(matches!(
+            rx.recv().unwrap(),
+            crate::color_search::ColorScanMessage::Done {
+                cancelled: true,
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn cache_entry(rgb: [u8; 3], mtime: i64, file_size: i64) -> crate::catalog::CacheEntry {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([rgb[0], rgb[1], rgb[2], 255]),
+        ));
+        let (jpeg_data, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 100.0).unwrap();
+        crate::catalog::CacheEntry {
+            mtime,
+            file_size,
+            jpeg_data,
+            source_dims: Some((8, 8)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        }
+    }
+
+    #[test]
+    fn color_catalog_fallback_does_not_change_normal_image_pixels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("image.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255u8, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let req = LoadRequest {
+            path,
+            mtime: crate::ui_helpers::mtime_secs(&metadata),
+            file_size: metadata.len() as i64,
+            ..Default::default()
+        };
+        let db = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let green = cache_entry([0, 255, 0], req.mtime, req.file_size);
+        db.save_thumb_bytes(
+            "image.png",
+            req.mtime,
+            req.file_size,
+            green.source_dims,
+            &green.jpeg_data,
+        )
+        .unwrap();
+        let palette = scan_one(req, None, Default::default(), Some(db));
+        assert!(crate::color_search::palette_matches(
+            &palette,
+            crate::color_search::srgb_to_lab([255, 0, 0]),
+            6.0
+        ));
+        assert!(!crate::color_search::palette_matches(
+            &palette,
+            crate::color_search::srgb_to_lab([0, 255, 0]),
+            6.0
+        ));
+    }
+
+    #[test]
+    fn color_pdf_pinned_representative_reuses_exact_catalog_key_and_memory_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("book.pdf");
+        // Source contents must never be read: only the pinned page's cached thumbnail exists.
+        std::fs::write(&path, b"not a PDF").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let req = LoadRequest {
+            path: path.clone(),
+            pdf_page: Some(0),
+            cache_key_override: Some("pdfthumb:book.pdf".into()),
+            mtime: crate::ui_helpers::mtime_secs(&metadata),
+            file_size: metadata.len() as i64,
+            ..Default::default()
+        };
+        let source = crate::folder_thumb_pins::FolderPinSource::PdfPage {
+            pdf_rel: String::new(),
+            page: 3,
+        };
+        let pins = std::collections::HashMap::from([(
+            crate::path_key::normalize_keep_drive(&path),
+            source.clone(),
+        )]);
+        let pinned = apply_folder_thumb_pin(
+            req.clone(),
+            &path,
+            "pdfthumb:book.pdf",
+            false,
+            ContainerKindForPin::PdfFile,
+            &pins,
+            &Default::default(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(pinned.pdf_page, Some(3));
+        let key = crate::thumb_loader::cache_key_for_request(&pinned)
+            .unwrap()
+            .into_owned();
+        assert!(key.contains("#pin:"));
+        let db = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        db.set_pdf_meta("book.pdf", req.mtime, req.file_size, 4, false)
+            .unwrap();
+        let blue = cache_entry([0, 0, 255], pinned.mtime, pinned.file_size);
+        db.save_thumb_bytes(
+            &key,
+            pinned.mtime,
+            pinned.file_size,
+            blue.source_dims,
+            &blue.jpeg_data,
+        )
+        .unwrap();
+        let palette = scan_one(
+            req.clone(),
+            Some(source.clone()),
+            Default::default(),
+            Some(Arc::clone(&db)),
+        );
+        assert!(crate::color_search::palette_matches(
+            &palette,
+            crate::color_search::srgb_to_lab([0, 0, 255]),
+            6.0
+        ));
+        let red = cache_entry([255, 0, 0], pinned.mtime, pinned.file_size);
+        let memory = scan_one(
+            req,
+            Some(source),
+            std::collections::HashMap::from([(key, red)]),
+            Some(db),
+        );
+        assert!(crate::color_search::palette_matches(
+            &memory,
+            crate::color_search::srgb_to_lab([255, 0, 0]),
+            6.0
+        ));
+        assert!(!crate::color_search::palette_matches(
+            &memory,
+            crate::color_search::srgb_to_lab([0, 0, 255]),
+            6.0
+        ));
+    }
+
+    #[test]
+    fn color_pdf_representative_reads_memory_and_catalog_cache_and_preserves_failure_behavior() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonexistent.pdf");
+        let req = LoadRequest {
+            path,
+            pdf_page: Some(0),
+            cache_key_override: Some("pdfthumb:nonexistent.pdf".into()),
+            mtime: 10,
+            file_size: 20,
+            ..Default::default()
+        };
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([128, 24, 40, 255]),
+        ));
+        let (bytes, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 100.0).unwrap();
+        let entry = crate::catalog::CacheEntry {
+            mtime: 10,
+            file_size: 20,
+            jpeg_data: bytes.clone(),
+            source_dims: Some((8, 8)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        let memory = scan_one(
+            req.clone(),
+            None,
+            std::collections::HashMap::from([("pdfthumb:nonexistent.pdf".into(), entry)]),
+            None,
+        );
+        assert!(crate::color_search::palette_matches(
+            &memory,
+            crate::color_search::srgb_to_lab([128, 24, 40]),
+            6.0
+        ));
+        let db = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        // Keep this headless cache test out of the PDF metadata catch-up queue.
+        db.set_pdf_meta("nonexistent.pdf", 10, 20, 1, false)
+            .unwrap();
+        assert!(
+            db.save_thumb_bytes("pdfthumb:nonexistent.pdf", 10, 20, Some((8, 8)), &bytes)
+                .unwrap()
+        );
+        let catalog = scan_one(req, None, Default::default(), Some(db));
+        assert!(crate::color_search::palette_matches(
+            &catalog,
+            crate::color_search::srgb_to_lab([128, 24, 40]),
+            6.0
+        ));
+        let failed = scan_one(
+            LoadRequest {
+                path: tmp.path().join("missing.zip"),
+                cache_key_override: Some("zipthumb:missing.zip".into()),
+                ..Default::default()
+            },
+            None,
+            Default::default(),
+            None,
+        );
+        assert!(failed.colors.is_empty());
+        assert!(!crate::color_search::palette_matches(
+            &failed, [0.0; 3], 60.0
+        ));
+    }
+
+    #[test]
+    fn color_zip_representative_decodes_only_selected_cover_and_rejects_stale_cache() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for (name, rgb) in [("a.png", [255, 0, 0]), ("b.png", [0, 0, 255])] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([rgb[0], rgb[1], rgb[2], 255]),
+            ));
+            let mut png = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+            zip.write_all(png.get_ref()).unwrap();
+        }
+        zip.finish().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let req = LoadRequest {
+            path,
+            cache_key_override: Some("zipthumb:book.zip".into()),
+            mtime: crate::ui_helpers::mtime_secs(&meta),
+            file_size: meta.len() as i64,
+            ..Default::default()
+        };
+        let green = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([0, 255, 0, 255]),
+        ));
+        let (bytes, _, _) = crate::catalog::encode_thumb_webp(&green, 8, 100.0).unwrap();
+        let entry = crate::catalog::CacheEntry {
+            mtime: req.mtime - 1,
+            file_size: req.file_size,
+            jpeg_data: bytes,
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        let db = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        db.save_thumb_bytes(
+            "zipthumb:book.zip",
+            entry.mtime,
+            entry.file_size,
+            entry.source_dims,
+            &entry.jpeg_data,
+        )
+        .unwrap();
+        let cover = scan_one(
+            req.clone(),
+            None,
+            std::collections::HashMap::from([("zipthumb:book.zip".into(), entry)]),
+            Some(db),
+        );
+        let matches = |palette: &crate::color_search::Palette, rgb| {
+            crate::color_search::palette_matches(
+                palette,
+                crate::color_search::srgb_to_lab(rgb),
+                6.0,
+            )
+        };
+        assert!(matches(&cover, [255, 0, 0]));
+        assert!(!matches(&cover, [0, 0, 255]));
+        let pinned = scan_one(
+            req,
+            Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "b.png".into(),
+            }),
+            Default::default(),
+            None,
+        );
+        assert!(matches(&pinned, [0, 0, 255]));
+        assert!(!matches(&pinned, [255, 0, 0]));
+    }
+
+    #[test]
+    fn color_filter_targets_images_stacks_and_zip_pdf_representatives() {
         assert!(color_filter_item_supported(
             &crate::grid_item::GridItem::Image(PathBuf::from("a.jpg"))
         ));
@@ -859,12 +1796,22 @@ mod tests {
         assert!(!color_filter_item_supported(
             &crate::grid_item::GridItem::Video(PathBuf::from("clip.mp4"))
         ));
-        assert!(!color_filter_item_supported(
+        assert!(color_filter_item_supported(
             &crate::grid_item::GridItem::ZipFile(PathBuf::from("book.zip"))
         ));
-        assert!(!color_filter_item_supported(
+        assert!(color_filter_item_supported(
             &crate::grid_item::GridItem::PdfFile(PathBuf::from("book.pdf"))
         ));
+        for item in [
+            GridItem::PdfFile(PathBuf::from("book.epub")),
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from("book.rar"),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::Audio(PathBuf::from("song.mp3")),
+        ] {
+            assert!(!color_filter_item_supported(&item));
+        }
     }
 
     #[test]
@@ -875,6 +1822,18 @@ mod tests {
             ..Default::default()
         };
         let image_req = LoadRequest::default();
+        let representative = LoadRequest {
+            cache_key_override: Some("pdfthumb:book.pdf#pin:page3".into()),
+            ..pdf_req.clone()
+        };
+        assert!(
+            color_scan_cache_decision(&representative, decision).should_cache(
+                Path::new("book.pdf"),
+                1,
+                0.0,
+                0.0
+            )
+        );
 
         assert!(decision.should_cache(Path::new("book.pdf"), 1, 0.0, 0.0));
         assert!(!color_scan_cache_decision(&pdf_req, decision).should_cache(

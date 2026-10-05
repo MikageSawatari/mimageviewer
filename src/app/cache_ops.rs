@@ -1,5 +1,57 @@
 use super::*;
 
+/// Decode on the quality-dialog worker. A RAW failure stays typed here and
+/// cannot be retried through `image`'s TIFF reader.
+fn decode_thumb_quality_sample(
+    source: ThumbSampleSource,
+    sample_px: u32,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+) -> Result<Option<(image::DynamicImage, u64)>, crate::raw::RawError> {
+    match source {
+        ThumbSampleSource::File(path) => {
+            let image = if crate::raw_format::is_raw_path(&path) {
+                Some(
+                    crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                        crate::raw::RawOwnedSource::Path(path.clone()),
+                        sample_px,
+                        raw_executor,
+                    )?
+                    .image,
+                )
+            } else {
+                image::open(&path).ok()
+            };
+            Ok(image.map(|image| {
+                let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                (image, size)
+            }))
+        }
+        ThumbSampleSource::ZipEntry {
+            zip_path,
+            entry_name,
+        } => {
+            let bytes = match crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(None),
+            };
+            let size = bytes.len() as u64;
+            let image = if crate::raw_format::is_raw_path(Path::new(&entry_name)) {
+                Some(
+                    crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                        crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)),
+                        sample_px,
+                        raw_executor,
+                    )?
+                    .image,
+                )
+            } else {
+                image::load_from_memory(&bytes).ok()
+            };
+            Ok(image.map(|image| (image, size)))
+        }
+    }
+}
+
 #[inline]
 fn batch_pdf_parent_present(
     cache_map: &std::collections::HashMap<String, crate::catalog::CacheEntry>,
@@ -85,23 +137,17 @@ impl App {
         // 数百ms〜秒単位止めるため同期実行しない。ダイアログは即座に「読み込み中」で開く。
         let (tx, rx) = mpsc::channel();
         let display_name = source.display_name();
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
+        let sample_px = self.settings.thumb_px;
         std::thread::Builder::new()
             .name("thumb-quality-sample-decode".into())
             .spawn(move || {
-                let result = match source {
-                    ThumbSampleSource::File(path) => image::open(&path).ok().map(|img| {
-                        let orig = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        (img, orig)
-                    }),
-                    ThumbSampleSource::ZipEntry {
-                        zip_path,
-                        entry_name,
-                    } => crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                        .ok()
-                        .and_then(|bytes| {
-                            let orig = bytes.len() as u64;
-                            image::load_from_memory(&bytes).ok().map(|img| (img, orig))
-                        }),
+                let result = match decode_thumb_quality_sample(source, sample_px, &raw_executor) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        crate::logger::log(format!("RAW quality sample decode failed: {error}"));
+                        None
+                    }
                 };
                 let _ = tx.send(result);
             })
@@ -328,6 +374,7 @@ impl App {
         let current = Arc::clone(&self.cc.current);
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
         let threads = self.settings.parallelism.thread_count();
         let batch_zip = self.settings.batch_cache_zip_contents;
         let batch_pdf = self.settings.batch_cache_pdf_contents;
@@ -462,6 +509,7 @@ impl App {
                                 *file_size,
                                 thumb_px,
                                 thumb_quality,
+                                &raw_executor,
                             ) {
                                 size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                             }
@@ -528,6 +576,27 @@ impl App {
                                     Ok(b) => b,
                                     Err(_) => return,
                                 };
+                                if crate::raw_format::is_raw_path(Path::new(&entry.entry_name)) {
+                                    let Ok(raster) = crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                                        crate::raw::RawOwnedSource::Bytes(Arc::from(raw)),
+                                        thumb_px,
+                                        &raw_executor,
+                                    ) else { return };
+                                    let source_dims = Some(raster.developed_dims);
+                                    if i == 0 {
+                                        *first_webp.lock().unwrap() = Some((
+                                            raster.image.clone(), source_dims, entry.entry_name.clone(),
+                                        ));
+                                    }
+                                    if let Some(bytes) = encode_and_save_with_source_dims(
+                                        &raster.image, source_dims, &entry.entry_name,
+                                        &zip_catalog, entry.mtime, entry.uncompressed_size as i64,
+                                        thumb_px, thumb_quality,
+                                    ) {
+                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                    }
+                                    return;
+                                }
                                 let orientation = read_exif_orientation_from_bytes(&raw);
                                 // JPEG なら TurboJPEG DCT scale を試す
                                 let (img, dct_stats): (
@@ -608,6 +677,29 @@ impl App {
                             if let Ok(raw) =
                                 crate::zip_loader::read_entry_bytes(zip_path, &first_entry)
                             {
+                                if crate::raw_format::is_raw_path(Path::new(&first_entry)) {
+                                    if let Ok(raster) =
+                                        crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                                            crate::raw::RawOwnedSource::Bytes(Arc::from(raw)),
+                                            thumb_px,
+                                            &raw_executor,
+                                        )
+                                    {
+                                        if let Some(bytes) = encode_and_save_with_source_dims(
+                                            &raster.image,
+                                            Some(raster.developed_dims),
+                                            &folder_key,
+                                            &catalog,
+                                            *zip_mtime,
+                                            *zip_file_size,
+                                            thumb_px,
+                                            thumb_quality,
+                                        ) {
+                                            size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let orientation = read_exif_orientation_from_bytes(&raw);
                                 // JPEG なら DCT scale → source_dims override で保存
                                 let (img, source_dims): (
@@ -944,5 +1036,60 @@ impl App {
 
             finished.store(true, Ordering::Relaxed);
         });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod raw_quality_sample_tests {
+    use super::*;
+    use image::GenericImageView;
+    use std::io::Write;
+
+    #[test]
+    fn raw_quality_samples_use_libraw_for_file_and_zip_without_fallback() {
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(
+            cr2.is_file() && dng.is_file(),
+            "Run .\\scripts\\setup-raw-samples.ps1"
+        );
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (half, size) =
+            decode_thumb_quality_sample(ThumbSampleSource::File(cr2), 2048, &executor)
+                .unwrap()
+                .unwrap();
+        assert_eq!(half.dimensions(), (1761, 1174));
+        assert!(size > 0);
+
+        let bytes = std::fs::read(dng).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("pages.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.dng", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let (preview, size) = decode_thumb_quality_sample(
+            ThumbSampleSource::ZipEntry {
+                zip_path,
+                entry_name: "page.dng".to_owned(),
+            },
+            512,
+            &executor,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(preview.dimensions(), (5796, 3870));
+        assert_eq!(size, bytes.len() as u64);
+
+        let misleading = temp.path().join("misleading.dng");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .save_with_format(&misleading, image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            decode_thumb_quality_sample(ThumbSampleSource::File(misleading), 512, &executor,)
+                .is_err()
+        );
     }
 }

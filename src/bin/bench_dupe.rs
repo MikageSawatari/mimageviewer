@@ -13,9 +13,7 @@ use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage, Rgba, Rg
 use mimageviewer::dupe::{self, Algo, LumaMetrics, Proxy, Sig, Signature};
 use mimageviewer::folder_tree::{SUPPORTED_EXTENSIONS, is_apple_double};
 use mimageviewer::pdf_loader::{self, CancelWaitPolicy, JobPriority};
-use mimageviewer::similar_image::{
-    PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat, proxy_from_source,
-};
+use mimageviewer::similar_image::{PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat};
 use mimageviewer::thumb_loader::{
     DctDecodeError, apply_exif_orientation, apply_exif_orientation_from_bytes,
     decode_jpeg_turbo_scaled_from_bytes,
@@ -35,6 +33,30 @@ const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LARGE_DIFF_THRESHOLD_BIN: u8 = 0;
 
 type Result<T> = std::result::Result<T, String>;
+
+fn bench_raw_executor() -> &'static std::sync::Arc<mimageviewer::raw::RawDevelopExecutor> {
+    static EXECUTOR: std::sync::OnceLock<std::sync::Arc<mimageviewer::raw::RawDevelopExecutor>> =
+        std::sync::OnceLock::new();
+    EXECUTOR.get_or_init(|| {
+        std::sync::Arc::new(
+            mimageviewer::raw::RawDevelopExecutor::new(3).expect("RAW bench executor"),
+        )
+    })
+}
+
+fn proxy_from_source(
+    source: ProxySource<'_>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> std::result::Result<
+    mimageviewer::similar_image::CanonicalProxy,
+    mimageviewer::similar_image::ProxyError,
+> {
+    mimageviewer::similar_image::proxy_from_source_with_raw(
+        source,
+        cancel,
+        Some(bench_raw_executor()),
+    )
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ScanRecord {
@@ -1983,6 +2005,26 @@ fn pdf_password_required(error: &std::io::Error) -> bool {
 }
 
 fn decode_full(path: &Path, bytes: &[u8]) -> Result<(DynamicImage, String, String)> {
+    if mimageviewer::raw_format::is_raw_path(path) {
+        let executor = bench_raw_executor();
+        let (send, receive) = std::sync::mpsc::channel();
+        let _ticket = executor.submit(
+            mimageviewer::raw::RawOwnedSource::Bytes(bytes.to_vec().into()),
+            mimageviewer::raw::RawDevelopScale::Full,
+            mimageviewer::raw::RawBrightness::MatchPreview,
+            mimageviewer::raw::RawPriority::High,
+            send,
+        );
+        let output = receive
+            .recv()
+            .map_err(|error| format!("RAW bench executor: {error}"))?
+            .map_err(|error| format!("RAW bench development: {error}"))?;
+        return Ok((
+            output.image,
+            "libraw_full".to_owned(),
+            "LibRaw Full development".to_owned(),
+        ));
+    }
     match image::load_from_memory(bytes) {
         Ok(image) => Ok((image, "image_full".to_owned(), "direct decode".to_owned())),
         Err(image_error) => match mimageviewer::wic_decoder::decode_to_dynamic_image(path) {
@@ -2625,7 +2667,11 @@ fn decode_full_oriented_for_synthesis(path: &Path, bytes: &[u8]) -> Result<RgbaI
         }
     } else {
         let (image, _, _) = decode_full(path, bytes)?;
-        apply_exif_orientation(image, path)
+        if mimageviewer::raw_format::is_raw_path(path) {
+            image
+        } else {
+            apply_exif_orientation(image, path)
+        }
     };
     Ok(image.to_rgba8())
 }
@@ -3294,6 +3340,23 @@ fn io_error(error: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn tiff_structured_raw_full_decode_uses_libraw() {
+        for name in ["885.dng", "1018.cr2"] {
+            let path = Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(&path).unwrap();
+            let (image, source, _) = decode_full(&path, &bytes).unwrap();
+            let dims =
+                mimageviewer::raw::raw_decoder::info(mimageviewer::raw::RawSource::Bytes(&bytes))
+                    .unwrap()
+                    .developed_dims;
+            assert_eq!(source, "libraw_full");
+            assert_eq!(image.dimensions(), (dims[0], dims[1]));
+        }
+    }
 
     fn scan_record(path: &str, marker: u8, quality: u8) -> ScanRecord {
         let bits = vec![marker; 32];

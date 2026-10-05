@@ -4,7 +4,10 @@
 
 fn detached_video(s) {
     for window in s.windows {
-        if window.role == "detached" && window.host_ready && window.media_kind == "video" {
+        // host_ready only means the HWND is registered. F12 creates a hidden
+        // Opening host before committing the presentation and rendering its session.
+        if window.role == "detached" && window.host_ready
+            && window.presentation == "active_immediate" && window.media_kind == "video" {
             return window;
         }
     }

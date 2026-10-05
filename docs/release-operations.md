@@ -228,7 +228,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   EffeTune は `vendor/effetune-mixwright/` を target staging にコピーしてから全 PE を署名する
   (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、
   `build-release.ps1` の launcher build と dependency gate が同じ署名済み実体を使う。
-  署名前にtracked manifestの全408ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
+  署名前にtracked manifestの全425ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
   PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
   `third_party/effetune-mixwright/<version>/` と about の include_str! を一体で更新する。
 - **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
@@ -307,7 +307,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   Chrome での実ダウンロード確認を通してから行う。単体exe / インストーラ版は埋め込みなので
   VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
   [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
-  launcher が VERSION を記録した全 bundle (v0.11.1 は407ファイル、VERSION込み入力408ファイル) を
+  launcher が VERSION を記録した全 bundle (v0.12.0 は424ファイル、VERSION込み入力425ファイル) を
   `runtime/<version>/effetune/<hash12>-<generation>/` へ全hash検証して公開し、
   atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。
   hash12はcontent SHA256先頭12桁でstampにはfull hashを使う。最深fileのUTF-16長260以上は理由付きで拒否する。

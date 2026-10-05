@@ -1,5 +1,10 @@
 models/*.onnx filter=lfs diff=lfs merge=lfs -text
 
+# Full upstream notices: preserve the verbatim source bytes on checkout.
+LIBRAW-LICENSE.txt -text
+ZLIB-LICENSE.txt -text
+LIBJPEG-TURBO-LICENSE.txt -text
+
 # FFmpeg LGPL source mirror — keep byte-exact (no EOL conversion); the .asc GPG
 # armored signature must stay LF or signature verification breaks on checkout.
 htdocs/mimageviewer/ffmpeg-*-source.tar.xz binary
@@ -24,3 +29,7 @@ htdocs/mimageviewer/manual/effetune/**/*.html text eol=lf
 # Verbatim EffeTune notices and VERSION must match vendor bytes even when
 # core.autocrlf=true. Their committed blobs are LF; never convert on checkout.
 third_party/effetune-mixwright/** -text
+# mIV supplemental notices are also verbatim license copies, outside the bundle.
+third_party/effetune-mixwright/supplemental/NOTICES.txt -text
+# Japanese upstream documentation and referenced images are verbatim snapshots.
+third_party/effetune-docs/** -text

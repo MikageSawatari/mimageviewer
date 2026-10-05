@@ -27,11 +27,13 @@ impl ContainerRemoteAiExecutor {
 impl RemoteAiExecutor for ContainerRemoteAiExecutor {
     fn execute(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
     ) -> RemoteAiExecutionOutcome {
-        self.engine.execute_remote_ai(request, progress, cancel)
+        self.engine
+            .execute_remote_ai(owner, request, progress, cancel)
     }
 }
 
@@ -45,6 +47,7 @@ pub(crate) trait RemoteAiProgressSink: Send + Sync {
 pub(crate) trait RemoteAiExecutor: Send + Sync {
     fn execute(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
@@ -293,7 +296,7 @@ impl RemoteAiJobRegistry {
         state.jobs.insert(
             job_id.clone(),
             JobEntry {
-                owner,
+                owner: owner.clone(),
                 request: request.clone(),
                 snapshot: snapshot.clone(),
                 cancel,
@@ -304,13 +307,14 @@ impl RemoteAiJobRegistry {
         );
         drop(state);
 
-        self.spawn_job(job_id, request, RemoteAiJobLease::new(operation));
+        self.spawn_job(job_id, owner, request, RemoteAiJobLease::new(operation));
         RemoteAiStartResponse::Accepted(snapshot)
     }
 
     fn spawn_job(
         self: &Arc<Self>,
         job_id: String,
+        owner: String,
         request: RemoteAiStartRequest,
         lease: RemoteAiJobLease,
     ) {
@@ -352,7 +356,7 @@ impl RemoteAiJobRegistry {
                 );
                 let cancel = registry.cancel_for(&thread_job_id);
                 let outcome = match cancel {
-                    Some(cancel) => executor.execute(&request, &reporter, &cancel),
+                    Some(cancel) => executor.execute(&owner, &request, &reporter, &cancel),
                     None => {
                         RemoteAiExecutionOutcome::Failed("AI 処理を開始できませんでした".to_owned())
                     }
@@ -863,6 +867,7 @@ mod tests {
     use std::sync::mpsc;
 
     struct FakeCall {
+        owner: String,
         request_id: String,
         cancel: Arc<AtomicBool>,
         complete: mpsc::Sender<FakeCompletion>,
@@ -883,6 +888,7 @@ mod tests {
     impl RemoteAiExecutor for ControlledExecutor {
         fn execute(
             &self,
+            owner: &str,
             request: &RemoteAiStartRequest,
             _progress: &dyn RemoteAiProgressSink,
             cancel: &Arc<AtomicBool>,
@@ -890,6 +896,7 @@ mod tests {
             let (complete, wait) = mpsc::channel();
             self.calls
                 .send(FakeCall {
+                    owner: owner.to_owned(),
                     request_id: request.request_id.clone(),
                     cancel: Arc::clone(cancel),
                     complete,
@@ -1074,6 +1081,7 @@ mod tests {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "ready");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(call.owner, "client");
         assert_eq!(call.request_id, "ready");
         call.complete.send(FakeCompletion::Ready).unwrap();
         wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);

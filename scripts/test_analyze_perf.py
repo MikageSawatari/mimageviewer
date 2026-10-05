@@ -24,7 +24,9 @@ from analyze_perf import (
     cmd_colorize,
     cmd_collection,
     cmd_idle_health,
+    cmd_hitches,
     cmd_metadata_search,
+    cmd_memory,
     cmd_page_turn,
     cmd_pre_grid,
     cmd_remote_page,
@@ -1548,6 +1550,331 @@ class ColorizeReportTests(unittest.TestCase):
         self.assertNotIn("colorize total", report)
 
 
+class HitchReportTests(unittest.TestCase):
+    def report(self, events: list[dict], threshold_ms: float = 100.0) -> str:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_hitches(events, threshold_ms)
+        return output.getvalue()
+
+    def test_new_schema_jsonl_preserves_deferred_interval_evidence(self) -> None:
+        rows = [
+            frame(1.0, 1843),
+            {"t": 1.84, "cat": "ui", "kind": "update_breakdown", "n": 1843,
+             "total_ms": 840.0, "total_cycles": 14000000,
+             "other_worker_polls_ms": 810.0, "other_worker_polls_cycles": 1000000},
+            frame(1.86, 1844),
+            {"t": 2.0, "cat": "thumb", "kind": "load_phases", "tid": 22, "idx": 7,
+             "key": "テスト.png", "start_t": 1.02, "end_t": 1.83,
+             "total_ms": 810.0, "normal_log_ms": 790.0, "normal_log_cycles": 1000},
+            # These rows are appended later, but describe earlier measured spans.
+            {"t": 1.82, "cat": "log", "kind": "slow_io", "logger": "normal", "tid": 11,
+             "start_t": 1.03, "acquired_t": 1.81, "end_t": 1.82,
+             "operation": "log", "call_site": "global_search_ui.rs:456",
+             "wait_ms": 780.0, "hold_ms": 10.0, "write_ms": 8.0, "flush_ms": 2.0,
+             "holder_tid": 22, "holder_site": "thumb_loader.rs:123",
+             "holder_snapshot": "at_wait_start_best_effort"},
+            {"t": 1.83, "cat": "ui", "kind": "other_worker_polls_breakdown", "n": 1843,
+             "start_t": 1.02, "end_t": 1.83, "total_ms": 810.0, "total_cycles": 1000000,
+             "prepared_adoption_ms": 790.0, "prepared_adoption_cycles": 1000},
+        ]
+        contents = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
+        with mock.patch.object(Path, "open", return_value=io.StringIO(contents)) as opened:
+            events = load_events(Path("new-schema-deferred.jsonl"))
+        opened.assert_called_once_with("r", encoding="utf-8")
+        self.assertEqual([e["_line"] for e in events], list(range(1, 7)))
+        self.assertEqual(events[4]["acquired_t"], 1.81)
+        report = self.report(events)
+        for expected in [
+            "n=1843 [1.000, 1.840]s",
+            "other_worker_polls [1.020, 1.830]s",
+            "prepared_adoption=790.0ms cycles=1000",
+            "[1.030, 1.820]s logger=normal tid=11",
+            "wait=780.0ms", "holder(snapshot)=22/thumb_loader.rs:123",
+            "[1.020, 1.830]s tid=22 idx=7 key=テスト.png",
+            "normal_log=790.0ms cycles=1000",
+        ]:
+            self.assertIn(expected, report)
+
+    def test_simultaneous_stall_shows_wait_holder_ui_and_thumb_evidence(self) -> None:
+        events = [
+            frame(1.0, 1843), frame(1.86, 1844),
+            {"t": 1.844, "cat": "ui", "kind": "update_breakdown", "n": 1843,
+             "total_ms": 844.0, "total_cycles": 14000000,
+             "other_worker_polls_ms": 817.6, "other_worker_polls_cycles": 12000000},
+            {"t": 1.83, "start_t": 1.01, "end_t": 1.8276, "cat": "ui",
+             "kind": "other_worker_polls_breakdown", "n": 1843,
+             "total_ms": 817.6, "total_cycles": 12000000,
+             "details_meta_ms": 1.0, "details_meta_cycles": 1000000,
+             "global_search_events_ms": 2.0, "global_search_events_cycles": 1000000,
+             "prepared_adoption_ms": 800.0, "prepared_adoption_cycles": 1000000,
+             "tag_prewarm_ms": 10.0, "tag_prewarm_cycles": 1000000,
+             "video_pin_fetch_ms": 1.0, "video_pin_fetch_cycles": 1000000,
+             "search_debounce_ms": 0.1, "other_ms": 3.5},
+            {"t": 1.85, "cat": "thumb", "kind": "load_phases", "idx": 7, "tid": 22,
+             "key": "test.png", "total_ms": 840.0, "total_cycles": 30000000,
+             "decode_ms": 30.0, "decode_cycles": 28000000,
+             "offer_raster_ms": 2.0, "offer_raster_cycles": 1000,
+             "prefill_db_ms": 1.0, "prefill_db_cycles": 500,
+             "stats_ms": 1.0, "stats_cycles": 1000,
+             "normal_log_ms": 801.0, "normal_log_cycles": 2000,
+             "perf_log_ms": 1.0, "perf_log_cycles": 500,
+             "unaccounted_ms": 6.0},
+            # Serialized last, but its actual end lies before several earlier rows.
+            {"t": 1.82, "observed_t": 2.4, "cat": "log", "kind": "slow_io",
+             "logger": "normal", "tid": 11, "start_t": 1.02, "end_t": 1.82,
+             "wait_ms": 790.0, "hold_ms": 10.0, "write_ms": 8.0, "flush_ms": 2.0,
+             "auxiliary_ms": 0.5, "acquired_t": 1.81, "operation": "log",
+             "holder_tid": 22, "holder_site": "src/thumb_loader.rs:123",
+             "call_site": "src/global_search_ui.rs:456"},
+        ]
+        report = self.report(events)
+        for expected in [
+            "n=1843 [1.000, 1.844]s", "other_worker_polls=817.6ms cycles=12000000",
+            "other_worker_polls [1.010, 1.828]s", "prepared_adoption=800.0ms",
+            "tag_prewarm=10.0ms", "video_pin_fetch=1.0ms", "UI 段は排他的計測",
+            "logger=normal tid=11", "holder(snapshot)=22/src/thumb_loader.rs:123",
+            "site=src/global_search_ui.rs:456", "wait=790.0ms", "write=8.0ms",
+            "flush=2.0ms", "thumb.load_phases 重複区間: 1 件", "idx=7 key=test.png",
+            "auxiliary=0.5ms", "acquired_t=1.81", "operation=log", "perf_log=1.0ms cycles=500",
+            "normal_log=801.0ms cycles=2000", "offer_raster=2.0ms", "stats=1.0ms",
+            "prefill_db=1.0ms", "prefill_db は offer_raster の内訳",
+            "全カテゴリイベント時刻の空白", "OS paging・プロセス停止・logger 待ちを断定できない",
+        ]:
+            self.assertIn(expected, report)
+        self.assertEqual(report, self.report(list(reversed(events))))
+
+    def test_overlap_uses_intervals_including_completion_after_hitch(self) -> None:
+        events = [frame(1.0, 1), frame(1.8, 2)]
+        for site, start, end in [
+            ("overlapping", 1.4, 2.1), ("before", 0.1, 1.0), ("after", 1.8, 2.2),
+        ]:
+            events.append({"t": end, "cat": "log", "kind": "slow_io", "logger": "perf",
+                           "start_t": start, "end_t": end, "call_site": site,
+                           "wait_ms": 500.0, "hold_ms": 200.0,
+                           "holder_tid": None, "holder_site": None})
+        events += [
+            {"t": 2.2, "cat": "thumb", "kind": "load_phases", "total_ms": 900.0,
+             "key": "overlapping-thumb"},
+            {"t": 3.0, "cat": "thumb", "kind": "load_phases", "total_ms": 100.0,
+             "key": "after-thumb"},
+        ]
+        report = self.report(events)
+        self.assertIn("logger 重複区間: 1 件", report)
+        self.assertIn("logger=perf", report)
+        self.assertIn("site=overlapping", report)
+        self.assertIn("holder(snapshot)=None/None", report)
+        self.assertNotIn("site=before", report)
+        self.assertNotIn("site=after", report)
+        self.assertIn("thumb.load_phases 重複区間: 1 件", report)
+        self.assertIn("key=overlapping-thumb", report)
+        self.assertNotIn("key=after-thumb", report)
+
+    def test_old_log_reports_previous_update_number_and_outside_time(self) -> None:
+        events = [frame(2.0, 9), {**frame(3.0, 10), "prev_update_ms": 200.0,
+                                "prev_update_cycles": 1000, "prev_outside_ms": 800.0},
+                  {"t": 2.9, "cat": "nav", "kind": "apply_end", "ms": 3.0}]
+        report = self.report(events)
+        self.assertIn("n=9 [2.000, 2.200]s", report)
+        self.assertIn("outside=800.0ms", report)
+        self.assertIn("other_worker_polls 内訳なし", report)
+        self.assertIn("apply_end=3.0ms", report)
+        self.assertIn("cycles=1000", report)
+        self.assertIn("区間と logger/thumb 重複判定は概算 (frame.begin 起点)", report)
+        self.assertNotIn("n=10 [", report)
+
+    def test_outer_endpoints_capture_leading_logger_stall_and_exclude_next_frame(self) -> None:
+        events = [
+            frame(1.4, 41),
+            {"t": 1.43, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 20.0, "grid_ms": 19.0},
+            {**frame(2.0, 42), "prev_update_ms": 820.0,
+             "prev_update_start_t": 1.0, "prev_update_end_t": 1.82},
+            {"t": 1.39, "cat": "log", "kind": "slow_io", "logger": "perf",
+             "start_t": 1.0, "end_t": 1.39, "call_site": "leading-stall",
+             "wait_ms": 390.0},
+            {"t": 2.1, "cat": "log", "kind": "slow_io", "logger": "perf",
+             "start_t": 2.0, "end_t": 2.1, "call_site": "next-frame",
+             "wait_ms": 100.0},
+        ]
+        report = self.report(events, 500.0)
+        updates = report.split("\nupdate >= 500.0ms:", 1)[1].split("\n全カテゴリ", 1)[0]
+        self.assertIn("n=41 [1.000, 1.820]s total=820.0ms", updates)
+        self.assertIn("inner update_frame [1.410, 1.430]s total=20.0ms", updates)
+        self.assertIn("logger 重複区間: 1 件", updates)
+        self.assertIn("site=leading-stall", updates)
+        self.assertNotIn("site=next-frame", updates)
+        self.assertNotIn("概算", updates)
+        self.assertNotIn("n=42 [", updates)
+        self.assertEqual(report, self.report(list(reversed(events)), 500.0))
+
+    def test_missing_or_malformed_outer_endpoints_keep_approximate_legacy_span(self) -> None:
+        for start, end in [(None, 1.82), (1.0, None), ("invalid", 1.82),
+                           (1.82, 1.0), (float("nan"), 1.82)]:
+            with self.subTest(start=start, end=end):
+                report = self.report([
+                    frame(1.4, 41),
+                    {**frame(2.3, 42), "prev_update_ms": 820.0,
+                     "prev_update_start_t": start, "prev_update_end_t": end},
+                ], 500.0)
+                self.assertIn("n=41 [1.400, 2.220]s total=820.0ms", report)
+                self.assertIn("区間と logger/thumb 重複判定は概算 (frame.begin 起点)", report)
+                self.assertNotIn("n=42 [", report)
+
+    def test_outer_and_inner_measurements_coexist_by_previous_frame_number(self) -> None:
+        events = [
+            frame(1.0, 41),
+            {"t": 1.6, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 600.0, "total_cycles": 6000, "grid_ms": 590.0},
+            {**frame(1.9, 42), "prev_update_ms": 820.0,
+             "prev_update_cycles": 8200, "prev_outside_ms": 80.0},
+            {"t": 2.5, "cat": "ui", "kind": "update_breakdown", "n": 42,
+             "total_ms": 600.0, "total_cycles": 4200, "grid_ms": 599.0},
+        ]
+        report = self.report(events, 500.0)
+        self.assertIn("update >= 500.0ms: 2 件", report)
+        self.assertIn("n=41 [1.000, 1.820]s total=820.0ms cycles=8200", report)
+        self.assertIn("inner update_frame [1.000, 1.600]s total=600.0ms cycles=6000", report)
+        self.assertIn("grid=590.0ms", report)
+        self.assertIn("outside=80.0ms", report)
+        self.assertIn("n=42 [1.900, 2.500]s total=600.0ms cycles=4200", report)
+        self.assertNotIn("n=42 [1.000, 1.820]s", report)
+        self.assertEqual(report, self.report(list(reversed(events)), 500.0))
+
+    def test_short_inner_breakdown_keeps_outer_hitch_and_end_of_frame_logger_stall(self) -> None:
+        events = [
+            frame(1.0, 41),
+            {"t": 1.02, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 20.0, "grid_ms": 19.0},
+            {**frame(1.9, 42), "prev_update_ms": 820.0, "prev_update_cycles": 8200},
+            {"t": 1.91, "cat": "ui", "kind": "update_breakdown", "n": 42,
+             "total_ms": 10.0, "grid_ms": 9.0},
+            # Deferred logger record describes work after the inner breakdown.
+            {"t": 1.82, "cat": "log", "kind": "slow_io", "logger": "perf",
+             "start_t": 1.02, "end_t": 1.82, "call_site": "end-of-frame",
+             "wait_ms": 800.0},
+        ]
+        report = self.report(events, 500.0)
+        updates = report.split("\nupdate >= 500.0ms:", 1)[1].split("\n全カテゴリ", 1)[0]
+        self.assertIn("1 件", updates)
+        self.assertIn("n=41 [1.000, 1.820]s total=820.0ms", updates)
+        self.assertIn("inner update_frame [1.000, 1.020]s total=20.0ms", updates)
+        self.assertIn("grid=19.0ms", updates)
+        self.assertIn("logger 重複区間: 1 件", updates)
+        self.assertIn("site=end-of-frame", updates)
+        self.assertNotIn("n=42", updates)
+        self.assertEqual(report, self.report(list(reversed(events)), 500.0))
+
+    def test_inner_only_last_frame_remains_partial_without_outer_measurement(self) -> None:
+        events = [
+            frame(1.0, 41),
+            {"t": 1.6, "cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 600.0, "grid_ms": 590.0},
+        ]
+        report = self.report(events, 500.0)
+        self.assertIn("update >= 500.0ms: 1 件", report)
+        self.assertIn("n=41 [1.000, 1.600]s total=600.0ms", report)
+        self.assertIn("inner update_frame のみ (部分計測; outer 未計測)", report)
+        self.assertIn("grid=590.0ms", report)
+
+    def test_missing_begin_or_inner_endpoint_does_not_invent_outer_interval(self) -> None:
+        # A current begin cannot identify the absent previous frame's start or n.
+        events = [
+            {**frame(1.9, 42), "prev_update_ms": 820.0},
+            {"cat": "ui", "kind": "update_breakdown", "n": 41,
+             "total_ms": 600.0, "grid_ms": 590.0},
+        ]
+        report = self.report(events, 500.0)
+        self.assertIn("update >= 500.0ms: 1 件", report)
+        self.assertIn("n=41 [区間不明] total=600.0ms", report)
+        self.assertIn("inner update_frame のみ (部分計測; outer 未計測)", report)
+        self.assertNotIn("total=820.0ms", report)
+        self.assertNotIn("n=42 [", report)
+        events[1]["total_ms"] = 20.0
+        self.assertIn("update >= 500.0ms: 0 件", self.report(events, 500.0))
+
+    def test_update_number_wins_over_adjacent_timestamp(self) -> None:
+        events = [
+            {"t": 5.0, "cat": "ui", "kind": "update_breakdown", "n": 10, "total_ms": 800.0},
+            {"t": 5.0, "cat": "ui", "kind": "other_worker_polls_breakdown", "n": 11,
+             "total_ms": 700.0, "prepared_adoption_ms": 699.0},
+            {"t": 10.0, "cat": "ui", "kind": "other_worker_polls_breakdown", "n": 10,
+             "start_t": 4.2, "end_t": 4.9, "total_ms": 700.0, "details_meta_ms": 699.0},
+        ]
+        report = self.report(events)
+        self.assertIn("frame.begin が 2 件未満", report)
+        self.assertIn("n=10 [4.200, 5.000]s", report)
+        self.assertIn("details_meta=699.0ms", report)
+        self.assertNotIn("prepared_adoption=699.0ms", report)
+
+    def test_log_gaps_use_all_categories_sorted_not_only_frames(self) -> None:
+        events = [frame(1.8, 2), {"t": 1.05, "cat": "thumb", "kind": "decode"},
+                  frame(1.0, 1), {"t": 1.85, "cat": "search", "kind": "done"}]
+        report = self.report(events)
+        self.assertIn("全カテゴリイベント時刻の空白 >= 100.0ms: 1 件", report)
+        self.assertIn("[1.050, 1.800]s gap=750.0ms", report)
+        self.assertIn("update 計測なし", report)
+        self.assertNotIn("gap=-", report)
+
+    def test_empty_and_missing_optional_diagnostics_are_supported(self) -> None:
+        self.assertIn("フレーム数: 0", self.report([]))
+        report = self.report([
+            {"t": 1.0, "cat": "ui", "kind": "update_breakdown", "n": 1, "total_ms": 150.0},
+            {"t": 0.99, "cat": "thumb", "kind": "load_phases", "total_ms": 140.0,
+             "decode_ms": 20.0, "decode_parts": {"orientation_ms": 5.0}},
+        ])
+        self.assertIn("total=150.0ms cycles=n/a", report)
+        self.assertIn("decode=20.0ms cycles=n/a", report)
+        self.assertIn("other_worker_polls 内訳なし", report)
+
+    def test_dropped_diagnostics_are_reported_as_incomplete_evidence(self) -> None:
+        report = self.report([
+            {"t": 1.0, "cat": "log", "kind": "diagnostic_dropped", "count": 2},
+            {"t": 2.0, "cat": "log", "kind": "diagnostic_dropped", "count": 3},
+        ])
+        self.assertIn("logger 診断欠落: 5 件", report)
+        self.assertIn("queue 競合/飽和等", report)
+        self.assertIn("待ち先の証拠は不完全", report)
+
+    def test_thumb_total_cycles_do_not_fabricate_candidate_cycles(self) -> None:
+        report = self.report([
+            frame(1.0, 41), frame(1.9, 42),
+            {"t": 1.85, "cat": "thumb", "kind": "load_phases",
+             "start_t": 1.01, "end_t": 1.85, "total_ms": 840.0,
+             "total_cycles": 30000000, "offer_raster_ms": 2.0, "stats_ms": 1.0,
+             "normal_log_ms": 801.0, "perf_log_ms": 1.0, "prefill_db_ms": 0.5},
+        ])
+        self.assertIn("total=840.0ms cycles=30000000", report)
+        for candidate, ms in [
+            ("offer_raster", 2.0), ("stats", 1.0), ("normal_log", 801.0),
+            ("perf_log", 1.0), ("prefill_db", 0.5),
+        ]:
+            self.assertIn(f"{candidate}={ms:.1f}ms cycles=n/a", report)
+        self.assertNotIn("cycles=0", report)
+
+    def test_raw_async_decode_is_reported_outside_continuation_span(self) -> None:
+        event = {
+            "t": 1.85, "cat": "thumb", "kind": "load_phases", "key": "raw.cr2",
+            "start_t": 1.80, "end_t": 1.81, "total_ms": 10.0,
+            "total_cycles": 30000, "decode_ms": 1.0, "display_ms": 5.0,
+            "unaccounted_ms": 4.0, "raw_async_decode_ms": 500.0,
+        }
+        report = self.report([frame(1.79, 41), frame(1.92, 42), event])
+        self.assertIn("[1.800, 1.810]s", report)
+        self.assertIn("total=10.0ms cycles=30000", report)
+        self.assertIn("decode=1.0ms cycles=n/a", report)
+        self.assertIn("unaccounted=4.0ms", report)
+        self.assertIn("区間外: raw_async_decode=500.0ms", report)
+        self.assertIn("上記の区間・total・cycles に含まない", report)
+        worker_line = next(line for line in report.splitlines() if "key=raw.cr2" in line)
+        self.assertNotIn("500.0ms", worker_line)
+        # Neither the prior executor duration nor deferred emission expands the
+        # worker span to overlap an earlier hitch.
+        earlier = self.report([frame(1.20, 41), frame(1.40, 42), event])
+        self.assertIn("thumb.load_phases 重複区間: 0 件", earlier)
+        self.assertNotIn("raw_async_decode", earlier)
+
+
 class PreGridReportTests(unittest.TestCase):
     def test_sample_jsonl_is_grouped_and_ranked_by_component(self) -> None:
         sample_events = [
@@ -1601,6 +1928,68 @@ class PreGridReportTests(unittest.TestCase):
         with contextlib.redirect_stdout(filtered_output):
             cmd_pre_grid(events, min_ms=15.0)
         self.assertIn("frames=1 / 2", filtered_output.getvalue())
+
+
+class MemoryTimelineTests(unittest.TestCase):
+    def test_session_anchor_maps_samples_before_and_after_late_perf_init_to_utc(self):
+        events = [
+            {"t": 7.0, "cat": "session", "kind": "start", "pid": 42,
+             "wall_unix_ms": 1_700_000_000_123, "wall_t": 5.25,
+             "process_start_unix_ms": 1_699_999_990_000},
+            {"t": 5.5, "cat": "process_memory", "kind": "sample", "stage": "later", "pid": 42},
+            {"t": 1.0, "cat": "process_memory", "kind": "milestone", "stage": "earlier", "pid": 42},
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory(events)
+        report = output.getvalue()
+        self.assertIn("session pid=42 wall=2023-11-14T22:13:20.123Z at t=5.250000s", report)
+        self.assertIn("core process creation (UTC): 2023-11-14T22:13:10.000Z", report)
+        self.assertRegex(report, r"2023-11-14T22:13:15\.873Z\s+1\.000.*milestone / earlier")
+        self.assertRegex(report, r"2023-11-14T22:13:20\.373Z\s+5\.500.*sample / later")
+
+    def test_legacy_session_header_still_prints_relative_samples(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory([
+                {"t": 5.0, "cat": "session", "kind": "start", "pid": 42},
+                {"t": 6.0, "cat": "process_memory", "kind": "sample", "stage": "legacy", "pid": 42},
+            ])
+        report = output.getvalue()
+        self.assertIn("UTC 対応情報なし", report)
+        self.assertRegex(report, r"6\.000\s+42.*sample / legacy")
+
+    def test_timeline_sorts_samples_converts_bytes_and_keeps_stages_and_pid(self):
+        samples = [
+            {"t": 2.0, "cat": "process_memory", "kind": "end", "stage": "ai_runtime_init", "pid": 42,
+             "private_bytes": 5 * 1024 * 1024, "working_set_bytes": 3 * 1024 * 1024,
+             "peak_working_set_bytes": 4 * 1024 * 1024, "pagefile_bytes": 6 * 1024 * 1024},
+            {"t": 1.0, "cat": "process_memory", "kind": "sample", "stage": "startup_sampler", "pid": 42},
+            {"t": 0.0, "cat": "startup", "kind": "settings_load"},
+            {"t": 3.0, "cat": "process_memory", "kind": "query_failed", "stage": "pdf_pool_spawn", "error": 5},
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory(samples)
+        report = output.getvalue()
+        self.assertLess(report.index("startup_sampler"), report.index("ai_runtime_init"))
+        self.assertIn("42", report)
+        self.assertRegex(report, r"5\.00\s+3\.00\s+4\.00\s+6\.00\s+end / ai_runtime_init")
+        self.assertIn("Win32 error=5", report)
+        self.assertNotIn("settings_load", report)
+
+    def test_old_logs_and_memory_cli(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_memory([{"cat": "startup", "kind": "first_frame"}])
+        self.assertIn("process_memory イベントなし", output.getvalue())
+        with mock.patch.object(sys, "argv", ["analyze_perf.py", "unused.jsonl", "memory"]), \
+                mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch("analyze_perf.load_events", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch("analyze_perf.cmd_memory") as command:
+            main()
+        command.assert_called_once_with([])
 
 
 if __name__ == "__main__":
