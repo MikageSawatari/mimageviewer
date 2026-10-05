@@ -1988,8 +1988,14 @@ impl App {
             self.raw_brightness_changed();
         }
         #[cfg(windows)]
-        self.effetune
-            .set_keep_visible_when_minimized(self.settings.effetune_keep_visible_when_minimized);
+        {
+            self.effetune.set_keep_visible_when_minimized(
+                self.settings.effetune_keep_visible_when_minimized,
+            );
+            self.effetune
+                .slot
+                .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
+        }
         if media_duration_changed {
             self.invalidate_details_meta_requirements();
         }
@@ -5226,6 +5232,12 @@ mod tests {
     fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
         use egui_kittest::{Harness, kittest::Queryable};
         let mut app = crate::app::setup_app_for_test();
+        // Retain consumers BEFORE opening preferences: an existing player/pump
+        // and existing Remote admission/generation must see OK without reopening.
+        let chain = app.local_audio_dsp_chain();
+        let sibling_chain = app.local_audio_dsp_chain();
+        let remote = app.remote_clockless_audio_processing(1.0);
+        let generation = remote.for_remote_generation(13, 1);
         app.open_preferences_request(PreferencesOpenRequest::anchored(
             PreferencesPage::Video,
             "video/effetune-input-limit",
@@ -5252,6 +5264,8 @@ mod tests {
                 .effetune_pre_limiter_enabled
         );
         assert!(harness.state().settings.effetune_pre_limiter_enabled);
+        assert!(chain.effetune.pre_limiter_enabled());
+        assert!(remote.effetune_pre_limiter_enabled());
         harness.get_by_label("  OK  ").click();
         harness.run();
         assert!(!harness.state().show_preferences);
@@ -5259,18 +5273,44 @@ mod tests {
         let reloaded = Settings::load();
         assert!(!reloaded.effetune_pre_limiter_enabled);
         harness.state_mut().settings = reloaded;
-        let chain = harness.state().local_audio_dsp_chain();
-        assert!(!chain.effetune_pre_limiter_enabled);
-        // Exercise the actual limiter consumer with the saved local snapshot.
-        let input = [1.28, -1.27];
+        assert!(!chain.effetune.pre_limiter_enabled());
+        assert!(!sibling_chain.effetune.pre_limiter_enabled());
+        assert!(!remote.effetune_pre_limiter_enabled());
+        assert!(!generation.effetune_pre_limiter_enabled());
+        // Exercise the existing local consumer's shared live value.
+        let input = [1.28, -1.27].repeat(12);
         let mut limiter = crate::video::audio::EffetuneInputLimiter::new(1_000);
-        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune_pre_limiter_enabled);
-        assert_eq!(samples, input);
-        assert_eq!(latency, 0.0);
+        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune.pre_limiter_enabled());
+        assert_eq!(&samples[10..], &input[..input.len() - 10]);
+        assert_eq!(latency, 0.005);
         assert!(
             !harness
                 .state()
                 .remote_clockless_audio_processing(1.0)
+                .effetune_pre_limiter_enabled()
+        );
+        let mut enabled = harness.state().settings.clone();
+        enabled.effetune_pre_limiter_enabled = true;
+        harness.state_mut().install_preferences_settings(enabled);
+        assert!(chain.effetune.pre_limiter_enabled());
+        assert!(sibling_chain.effetune.pre_limiter_enabled());
+        assert!(remote.effetune_pre_limiter_enabled());
+        assert!(generation.effetune_pre_limiter_enabled());
+        let (samples, latency) = limiter.prepare(&input, 1, chain.effetune.pre_limiter_enabled());
+        assert!(samples[12..].iter().all(|sample| sample.abs() <= 1.0));
+        assert_eq!(latency, 0.005);
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_pre_limiter_loaded_preferences_initialize_shared_owner() {
+        let app = crate::app::setup_app_for_test();
+        let mut settings = app.settings.clone();
+        settings.effetune_pre_limiter_enabled = false;
+        let app = crate::app::App::new_from_settings(settings);
+        assert!(!app.local_audio_dsp_chain().effetune.pre_limiter_enabled());
+        assert!(
+            !app.remote_clockless_audio_processing(1.0)
                 .effetune_pre_limiter_enabled()
         );
     }

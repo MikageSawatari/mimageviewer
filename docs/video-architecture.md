@@ -1784,8 +1784,13 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - EffeTune 適用時の DSP 順序は normalize → ユーザー VST3 → 任意の EffeTune 前段
   SafetyLimiter → EffeTune → 手動 boost → 常時有効の最終 SafetyLimiter → 出力音量。
   前段は別 instance の ceiling 0 dBFS / lookahead 5 ms / release 100 ms で、
-  `effetune_pre_limiter_enabled`（既定 ON）を再生開始時に取得する。音楽も同じ pump、
-  Remote 動画・音楽は `ClocklessAudioProcessor` が同じ順序で処理する。
+  `effetune_pre_limiter_enabled`（既定 ON）は App の `EffetuneAudioSlot` の atomic に公開し、
+  local pump / Remote `ClocklessAudioProcessor` が通常処理・EOS の各ブロックで読む。
+  環境設定の OK 後に反映し、画面・配信の再開は不要。動画・音楽・動画の音声表示モード、
+  メイン・全画面・別窓で同じ slot を共有する。Remote は生成済み音声には遡及しない。
+  OFF でも前段 delay / PDC / EOS 保持量は同じ約5msを維持し、同じ delay-line の制限済み音と
+  raw 音を約5msでクロスフェードする（ON 完了までの ramp 中は 0dB 超を含み得る）。
+  codec / resampler / timeline / DSP graph は設定切替で reset しない。
   原音を保持した scratch だけを制限するため、EffeTune 失敗時はユーザー VST3 後へ戻り、
   前段・EffeTune の遅延をともに除外する。成功時だけ前段の実サンプル数による遅延を PDC に加算。
   2 秒 admission は従来どおり plugin のみ（両 limiter と stretch は上限外）。

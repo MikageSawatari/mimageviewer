@@ -5615,7 +5615,7 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
-    /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。再生開始時に取得する。
+    /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。設定の確定時に音声処理へ公開する。
     #[serde(default = "default_true")]
     pub effetune_pre_limiter_enabled: bool,
     /// メイン最小化中も、表示していた音響調整の窓を残す。

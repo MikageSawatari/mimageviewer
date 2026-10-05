@@ -436,7 +436,7 @@ struct ClocklessVstChain {
 #[derive(Clone)]
 pub(crate) struct ClocklessAudioProcessing {
     pub(crate) normalize_gain: f64,
-    effetune_pre_limiter_enabled: bool,
+    effetune_slot: Arc<crate::effetune::EffetuneAudioSlot>,
     vst3: Option<ClocklessVstChain>,
     effetune: Option<ClocklessVstChain>,
     vst3_status: ClocklessVstStatus,
@@ -447,14 +447,21 @@ pub(crate) struct ClocklessAudioProcessing {
 impl ClocklessAudioProcessing {
     #[cfg(test)]
     pub(crate) fn effetune_pre_limiter_enabled(&self) -> bool {
-        self.effetune_pre_limiter_enabled
+        self.effetune_slot.pre_limiter_enabled()
     }
 
-    pub(crate) fn with_effetune_preferences(
+    pub(crate) fn with_effetune_slot(
         mut self,
-        settings: &crate::settings::Settings,
+        slot: Arc<crate::effetune::EffetuneAudioSlot>,
     ) -> Self {
-        self.effetune_pre_limiter_enabled = settings.effetune_pre_limiter_enabled;
+        self.effetune_slot = slot;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_effetune_preferences(self, settings: &crate::settings::Settings) -> Self {
+        self.effetune_slot
+            .set_pre_limiter_enabled(settings.effetune_pre_limiter_enabled);
         self
     }
 
@@ -467,7 +474,7 @@ impl ClocklessAudioProcessing {
         });
         Self {
             normalize_gain,
-            effetune_pre_limiter_enabled: true,
+            effetune_slot: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
             vst3: None,
             effetune: None,
             vst3_status,
@@ -491,7 +498,7 @@ impl ClocklessAudioProcessing {
         });
         Self {
             normalize_gain,
-            effetune_pre_limiter_enabled: true,
+            effetune_slot: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
             vst3: Some(ClocklessVstChain {
                 processor,
                 failed: Arc::new(AtomicBool::new(false)),
@@ -1332,7 +1339,7 @@ impl AudioPath {
 
 struct ClocklessAudioProcessor {
     normalize_gain: f32,
-    effetune_pre_limiter_enabled: bool,
+    effetune_slot: Arc<crate::effetune::EffetuneAudioSlot>,
     effetune_input_limiter: EffetuneInputLimiter,
     vst3: Option<ClocklessVstChain>,
     vst3_output: Vec<f32>,
@@ -1603,7 +1610,7 @@ impl ClocklessAudioProcessor {
         }
         Ok(Self {
             normalize_gain: config.normalize_gain as f32,
-            effetune_pre_limiter_enabled: config.effetune_pre_limiter_enabled,
+            effetune_slot: config.effetune_slot,
             effetune_input_limiter: EffetuneInputLimiter::new(sample_rate),
             vst3,
             vst3_output: Vec::new(),
@@ -1735,7 +1742,7 @@ impl ClocklessAudioProcessor {
                         let (input, input_latency_secs) = self.effetune_input_limiter.prepare(
                             &chunk.samples,
                             0,
-                            self.effetune_pre_limiter_enabled,
+                            self.effetune_slot.pre_limiter_enabled(),
                         );
                         match chain
                             .processor
@@ -1784,25 +1791,15 @@ impl ClocklessAudioProcessor {
         chunk.pdc_latency_secs_at_process = latency_secs;
         chunk.effetune_generation = composition.effetune_generation;
         let final_frames = (self.limiter.latency_secs() * self.sample_rate as f64).round() as usize;
-        let pre_frames = if effetune_applied && self.effetune_pre_limiter_enabled {
-            final_frames
-        } else {
-            0
-        };
+        let pre_frames = if effetune_applied { final_frames } else { 0 };
         let effect_frames = if effetune_applied {
             ((effetune_latency_secs * self.sample_rate as f64).round() as usize)
                 .saturating_sub(pre_frames)
         } else {
             0
         };
-        self.tail.capture(
-            &chunk,
-            effect_frames,
-            pre_frames,
-            final_frames,
-            self.effetune_pre_limiter_enabled,
-            1.0,
-        );
+        self.tail
+            .capture(&chunk, effect_frames, pre_frames, final_frames, 1.0);
 
         let total_latency_samples = (chunk.pdc_latency_secs_at_process
             * f64::from(self.latency_reconciler.sample_rate))
@@ -1828,6 +1825,7 @@ impl ClocklessAudioProcessor {
             self.sample_rate,
             &mut self.effetune_input_limiter,
             &mut self.limiter,
+            self.effetune_slot.pre_limiter_enabled(),
             |_, latency_frames, input, output| {
                 let Some(chain) = effect.filter(|chain| {
                     !chain.failed.load(Ordering::Acquire)
@@ -2896,8 +2894,7 @@ mod tests {
                     }
                 }
                 let lookahead = (0.005 * rate as f64).round() as usize;
-                let leading =
-                    (effect_frames as usize + lookahead * if enabled { 2 } else { 1 }) * 2;
+                let leading = (effect_frames as usize + lookahead * 2) * 2;
                 assert_eq!(&output[..leading], vec![0.0; leading]);
                 assert_eq!(&output[leading..], input);
                 assert!(
@@ -3639,7 +3636,7 @@ mod tests {
             warning: None,
         });
         // Legacy routing tests explicitly exercise the unaltered input mode.
-        config.effetune_pre_limiter_enabled = false;
+        config.effetune_slot.set_pre_limiter_enabled(false);
         config.vst3_status = ClocklessVstStatus::combined(config.vst3_status, status.clone());
         config.effetune = Some(ClocklessVstChain {
             processor: effect,
@@ -3668,11 +3665,65 @@ mod tests {
             let inputs = effect.inputs.lock().unwrap();
             if enabled {
                 assert!(inputs[0].iter().all(|sample| sample.abs() <= 1.0));
-                assert_eq!(result.pdc_latency_secs_at_process, 0.010);
             } else {
-                assert_eq!(inputs[0], input);
-                assert_eq!(result.pdc_latency_secs_at_process, 0.005);
+                assert_eq!(&inputs[0][..10], &[0.0; 10]);
+                assert_eq!(&inputs[0][10..], &input[..input.len() - 10]);
             }
+            assert_eq!(result.pdc_latency_secs_at_process, 0.010);
+        }
+    }
+
+    #[test]
+    fn effetune_pre_limiter_remote_live_toggle_keeps_timeline_and_host_state() {
+        for rate in [1_000, 44_100, 48_000] {
+            let effect = Arc::new(FakeVstProcessor::new(rate, false));
+            let slot = Arc::new(crate::effetune::EffetuneAudioSlot::default());
+            let config = with_unlimited_fake_effetune(
+                ClocklessAudioProcessing::without_vst3(1.0),
+                effect.clone(),
+            )
+            .with_effetune_slot(slot.clone());
+            let mut processor = ClocklessAudioProcessor::new(config.clone(), rate).unwrap();
+            let resets = effect.reset_count.load(Ordering::Acquire);
+            let n = (processor.limiter.latency_secs() * rate as f64).round() as usize;
+            let mut end_pts: Option<f64> = None;
+            for (i, enabled) in [true, false, true].into_iter().enumerate() {
+                slot.set_pre_limiter_enabled(enabled);
+                assert_eq!(config.effetune_pre_limiter_enabled(), enabled);
+                let mut raw = audio_chunk(vec![2.0, -2.0].repeat(n * 4));
+                raw.audible_pts_secs = 10.0 + i as f64 * (n * 4) as f64 / rate as f64;
+                raw.duration_secs = (n * 4) as f64 / rate as f64;
+                let chunk = processor
+                    .process(raw)
+                    .expect("toggle must not trim/drop a block");
+                assert_eq!(chunk.samples.len(), n * 8);
+                assert_eq!(
+                    chunk.pdc_latency_secs_at_process,
+                    2.0 * n as f64 / rate as f64
+                );
+                assert_eq!(chunk.seek_serial, SEEK_SERIAL);
+                if let Some(end) = end_pts {
+                    assert!((chunk.audible_pts_secs - end).abs() < 1e-9);
+                }
+                end_pts = Some(chunk.audible_pts_secs + chunk.duration_secs);
+                let inputs = effect.inputs.lock().unwrap();
+                let last = inputs.last().unwrap();
+                assert!((last[last.len() - 2] - if enabled { 1.0 } else { 2.0 }).abs() < 1e-5);
+                assert_eq!(effect.reset_count.load(Ordering::Acquire), resets);
+            }
+            // EOS uses the same live owner, not the last block's preference.
+            slot.set_pre_limiter_enabled(false);
+            processor.start_tail();
+            processor.process_tail().unwrap();
+            let inputs = effect.inputs.lock().unwrap();
+            assert!(
+                inputs
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample.abs() > 1.0)
+            );
+            assert_eq!(effect.reset_count.load(Ordering::Acquire), resets);
         }
     }
 
@@ -3853,9 +3904,18 @@ mod tests {
         );
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let failed_chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
-        assert_eq!(user.inputs.lock().unwrap().as_slice(), &[vec![0.2, -0.1]]);
-        assert_eq!(effect.inputs.lock().unwrap().as_slice(), &[vec![0.4, -0.2]]);
+        let frames = AUDIO_OUTPUT_RATE as usize / 200 + 1;
+        let failed_chunk = processor
+            .process(audio_chunk(vec![0.4, -0.2].repeat(frames)))
+            .unwrap();
+        assert_eq!(
+            user.inputs.lock().unwrap().as_slice(),
+            &[vec![0.2, -0.1].repeat(frames)]
+        );
+        let inputs = effect.inputs.lock().unwrap();
+        assert_eq!(&inputs[0][..(frames - 1) * 2], vec![0.0; (frames - 1) * 2]);
+        assert_eq!(&inputs[0][(frames - 1) * 2..], &[0.4, -0.2]);
+        drop(inputs);
         assert_eq!(
             failed_chunk.pdc_latency_secs_at_process,
             processor.limiter.latency_secs()
@@ -3884,8 +3944,12 @@ mod tests {
         );
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let _ = processor.process(audio_chunk(vec![0.4, -0.2]));
-        assert_eq!(effect.inputs.lock().unwrap().as_slice(), &[vec![0.2, -0.1]]);
+        let frames = AUDIO_OUTPUT_RATE as usize / 200 + 1;
+        let _ = processor.process(audio_chunk(vec![0.4, -0.2].repeat(frames)));
+        let inputs = effect.inputs.lock().unwrap();
+        assert_eq!(&inputs[0][..(frames - 1) * 2], vec![0.0; (frames - 1) * 2]);
+        assert_eq!(&inputs[0][(frames - 1) * 2..], &[0.2, -0.1]);
+        drop(inputs);
         let snapshot = status.snapshot();
         assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 2);
@@ -3907,8 +3971,11 @@ mod tests {
         );
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let _ = processor.process(audio_chunk(vec![0.2, -0.1]));
-        assert_eq!(effect.inputs.lock().unwrap().as_slice(), &[vec![0.2, -0.1]]);
+        let frames = AUDIO_OUTPUT_RATE as usize / 200 + 1;
+        let _ = processor.process(audio_chunk(vec![0.2, -0.1].repeat(frames)));
+        let inputs = effect.inputs.lock().unwrap();
+        assert_eq!(&inputs[0][..(frames - 1) * 2], vec![0.0; (frames - 1) * 2]);
+        assert_eq!(&inputs[0][(frames - 1) * 2..], &[0.2, -0.1]);
         let snapshot = status.snapshot();
         assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 1);

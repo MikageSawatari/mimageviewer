@@ -18954,6 +18954,9 @@ impl App {
                 }));
             app.effetune
                 .set_keep_visible_when_minimized(app.settings.effetune_keep_visible_when_minimized);
+            app.effetune
+                .slot
+                .set_pre_limiter_enabled(app.settings.effetune_pre_limiter_enabled);
         }
 
         if app
@@ -26451,7 +26454,6 @@ impl App {
         crate::video::audio::AudioDspChain {
             user: Some(self.dsp_bridge.clone()),
             effetune: Arc::clone(&self.effetune.slot),
-            effetune_pre_limiter_enabled: self.settings.effetune_pre_limiter_enabled,
             coordinator: Arc::clone(&self.dsp_processing),
         }
     }
