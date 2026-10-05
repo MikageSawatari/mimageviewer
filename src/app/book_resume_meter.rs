@@ -1,4 +1,4 @@
-//! 一覧の読書位置。全行読込は既存writer、通常paintはpath memoとmap参照だけ。
+//! 一覧の前回位置。本の全行読込は既存writer、媒体はlive設定表と取得済み長さを参照する。
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -44,7 +44,26 @@ pub(crate) struct BookResumeMeters {
     pending: Option<PendingRead>,
     clear: Option<mpsc::Receiver<Result<usize, String>>>,
     // path自身をmemo keyにする。items/idxの差替えやviewer切替で別セルを指さない。
-    keys: HashMap<PathBuf, String>,
+    keys: HashMap<PathBuf, ResumeMeterPathKeys>,
+}
+
+struct ResumeMeterPathKeys {
+    book: String,
+    media: String,
+}
+
+/// Unknown or inconsistent media positions never become guessed endpoints.
+pub(crate) fn media_resume_fraction(position: f64, duration: f64) -> Option<f32> {
+    if !position.is_finite()
+        || !duration.is_finite()
+        || position <= 0.0
+        || duration <= 0.0
+        || position > duration
+    {
+        return None;
+    }
+    let fraction = (position / duration) as f32;
+    (fraction > 0.0).then_some(fraction)
 }
 
 impl BookResumeMeters {
@@ -79,13 +98,30 @@ impl BookResumeMeters {
     }
 
     pub(crate) fn get(&mut self, path: &Path) -> Option<ReadingMeterValue> {
-        let rows = self.rows.as_ref()?;
+        self.rows.as_ref()?;
+        self.ensure_keys(path);
+        self.rows
+            .as_ref()?
+            .get(&self.keys.get(path)?.book)
+            .copied()
+            .flatten()
+    }
+
+    fn ensure_keys(&mut self, path: &Path) {
         if !self.keys.contains_key(path) {
-            self.keys
-                .insert(path.to_path_buf(), crate::path_key::normalize(path));
+            self.keys.insert(
+                path.to_path_buf(),
+                ResumeMeterPathKeys {
+                    book: crate::path_key::normalize(path),
+                    media: crate::adjustment_db::normalize_path(path),
+                },
+            );
         }
-        let key = self.keys.get(path)?;
-        rows.get(key).copied().flatten()
+    }
+
+    pub(crate) fn media_key(&mut self, path: &Path) -> &str {
+        self.ensure_keys(path);
+        &self.keys.get(path).expect("memo inserted").media
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -109,6 +145,30 @@ impl BookResumeMeters {
 }
 
 impl App {
+    pub(crate) fn thumbnail_resume_meter(&mut self, idx: usize) -> Option<f32> {
+        if !self.settings.thumb_show_resume_meter {
+            return None;
+        }
+        if let Some(
+            crate::grid_item::GridItem::Video(path) | crate::grid_item::GridItem::Audio(path),
+        ) = self.items.get(idx)
+        {
+            let key = self.book_resume_meters.media_key(path);
+            if self.settings.video_watched_to_end.contains(key) {
+                return Some(1.0);
+            }
+            let position = *self.settings.video_resume_positions.get(key)?;
+            // Same source-stamp validation as details_lazy_meta_for_idx, using the memoized key.
+            let meta = self
+                .details_lazy_meta
+                .get(key)
+                .filter(|meta| meta.matches_source(self.image_metas.get(idx).copied().flatten()))?;
+            return media_resume_fraction(position, meta.media.read()?.duration_secs?);
+        }
+        self.thumbnail_book_resume_meter(idx)
+            .map(ReadingMeterValue::fraction)
+    }
+
     pub(crate) fn persist_book_resume(
         &mut self,
         path: PathBuf,
@@ -166,7 +226,7 @@ impl App {
                 }),
             _ => false,
         };
-        if !self.settings.thumb_show_book_resume_meter
+        if !self.settings.thumb_show_resume_meter
             || !physical_folder
             || self.book_bookmark_view_is_synthetic()
             || self.grid_is_zip_entries()

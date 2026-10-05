@@ -1492,7 +1492,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 
     ui.add_space(8.0);
-    anchored(ui, state, "thumbnail/book-resume-meter", |ui, state| {
+    anchored(ui, state, "thumbnail/resume-meter", |ui, state| {
         draw_book_resume_meter_settings(ui, &mut state.settings);
     });
 
@@ -1610,11 +1610,11 @@ pub(super) fn draw_book_resume_meter_settings(
     settings: &mut settings::Settings,
 ) {
     ui.checkbox(
-        &mut settings.thumb_show_book_resume_meter,
-        "本のサムネイルに前回の読書位置を表示",
+        &mut settings.thumb_show_resume_meter,
+        "本・動画・音声のサムネイルに前回の位置を表示",
     );
     ui.small(
-        "メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません",
+        "記録された読書位置・再生位置を、常に左から右へ伸びるメーターで表示します。最後まで視聴した動画・音声は、長さの取得を待たず満タンで表示します。途中位置はページ数・長さを確認できたものに表示します。以前に見終えたもので記録が残っていないものには表示しません。長さの表示とは独立して切り替えられます。",
     );
 }
 
@@ -10174,13 +10174,14 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     // 動画・音声の再生位置と音声トラック選択。クリアは OK 適用時に反映。
     anchored(ui, state, "resume/video-audio", |ui, state| {
         let video_count = state.settings.video_resume_positions.len();
+        let watched_count = state.settings.video_watched_to_end.len();
         let track_count = state.settings.video_audio_track_choices.len();
         ui.label(format!(
-            "動画・音声の再生位置: {video_count} 件、音声トラックの選択: {track_count} 件を記憶。"
+            "動画・音声の再生位置: {video_count} 件、最後まで視聴: {watched_count} 件、音声トラックの選択: {track_count} 件を記憶。"
         ));
-        if (video_count > 0 || track_count > 0)
+        if (video_count > 0 || watched_count > 0 || track_count > 0)
             && ui
-                .button("再生位置と音声トラックの選択をすべてクリア")
+                .button("再生位置・視聴済み記録と音声トラックの選択をすべてクリア")
                 .clicked()
         {
             state.clear_video_media_memory();

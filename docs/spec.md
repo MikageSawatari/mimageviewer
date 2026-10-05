@@ -2042,7 +2042,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_show_media_duration` | bool | true | 動画・音声のサムネイル右下に長さを表示する。1 時間未満は `m:ss`、1 時間以上は `h:mm:ss`。フィルタ一致数と既存バッジを優先し、衝突時は上へ移し、空きがなければ非表示。可視 + 先読みだけ既存遅延メタ worker で取得する。設定項目がない既存 JSON / settings.db も true になる |
-| `thumb_show_book_resume_meter` | bool | true | 通常の一覧のフォルダ・ZIP・PDF サムネイル下端に保存済み読書位置の比率を常に左から右へ表示する。本の読み方向や `fullscreen_seek_direction` には連動しない。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続き、ON に戻すと追加読み取りなしに表示できる。欠落した JSON / settings.db 設定と既定設定も true |
+| `thumb_show_resume_meter` | bool | true | フォルダ・ZIP・PDF の読書位置と、動画・音声の再生位置をサムネイル下端に常に左から右へ表示する。動画・音声は最後まで視聴した記録があれば長さ未取得でも満タンとし、途中位置は既存の保存済み位置/取得済み長さから比率を求め、長さバッジOFFでも既存の可視+近傍取得を行う。watchedも途中位置もないものには表示しない。途中位置は長さ未確定/不正・位置超過・source不一致では表示しない。EOF/末尾5秒以内で新たに保存した媒体はwatchedに記録し、再開位置は従来どおり消す。以前に消えた記録は補完しない。本の読み方向や `fullscreen_seek_direction` には連動しない。全体共通の環境設定 → 表示 → サムネイルで変更する。OFF でも位置の記録とメモリ更新は続く。本はONに戻すと追加読み取りなしに表示でき、動画・音声は取得済みの長さがあれば表示し、未取得なら既存workerで取得する。欠落した JSON / settings.db 設定と既定設定も true |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
 | `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
 | `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |

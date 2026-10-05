@@ -335,15 +335,15 @@ pub(crate) fn layout_cell_overlays(
     )
 }
 
-/// Paint into the strip owned by the pure layout, using already-resolved saved direction.
-pub(crate) fn paint_book_resume_meter(
+/// Paint a valid saved-position fraction into the shared thumbnail strip, always left to right.
+pub(crate) fn paint_thumbnail_resume_meter(
     ui: &egui::Ui,
     cell: egui::Rect,
     layout: &ThumbnailOverlayLayout,
-    value: Option<crate::book_resume_db::ReadingMeterValue>,
+    fraction: Option<f32>,
     is_cut: bool,
 ) {
-    let (Some(rect), Some(value)) = (layout.book_resume_meter, value) else {
+    let (Some(rect), Some(fraction)) = (layout.book_resume_meter, fraction) else {
         return;
     };
     if !ui.is_rect_visible(cell) {
@@ -355,7 +355,7 @@ pub(crate) fn paint_book_resume_meter(
     }
     let palette = crate::os_theme::book_resume_meter_palette(ui.visuals().dark_mode);
     painter.rect_filled(rect, 0.0, palette.track);
-    let width = rect.width() * value.fraction();
+    let width = rect.width() * fraction;
     let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + width, rect.max.y));
     painter.rect_filled(fill, 0.0, palette.fill);
     // One physical pixel, inside the owned strip at every DPI.
@@ -1005,8 +1005,9 @@ mod book_resume_meter_tests {
     use crate::book_resume_db::ReadingMeterValue;
 
     #[test]
-    fn book_resume_meter_paint_always_fills_left_to_right_with_saved_fraction_and_cut_opacity() {
-        for ordinal in [1, 4, 10] {
+    fn thumbnail_resume_meter_paint_always_fills_left_to_right_with_saved_fraction_and_cut_opacity()
+    {
+        for fraction in [0.1, 0.4, 1.0] {
             for cut in [false, true] {
                 let ctx = egui::Context::default();
                 let cell =
@@ -1024,14 +1025,14 @@ mod book_resume_meter_tests {
                     |ctx| {
                         crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            paint_book_resume_meter(
+                            paint_thumbnail_resume_meter(
                                 ui,
                                 cell,
                                 &ThumbnailOverlayLayout {
                                     book_resume_meter: Some(meter),
                                     ..Default::default()
                                 },
-                                Some(ReadingMeterValue { ordinal, total: 10 }),
+                                Some(fraction),
                                 cut,
                             );
                         });
@@ -1051,7 +1052,7 @@ mod book_resume_meter_tests {
                         _ => None,
                     })
                     .expect("meter fill rectangle");
-                assert!((fill.rect.width() - meter.width() * ordinal as f32 / 10.0).abs() < 0.001);
+                assert!((fill.rect.width() - meter.width() * fraction).abs() < 0.001);
                 assert_eq!(fill.rect.min.y, meter.min.y);
                 assert_eq!(fill.rect.max.y, meter.max.y);
                 assert_eq!(fill.rect.min.x, meter.min.x);
@@ -1060,7 +1061,7 @@ mod book_resume_meter_tests {
     }
 
     #[test]
-    fn book_resume_meter_paint_has_no_track_without_value_or_layout() {
+    fn thumbnail_resume_meter_paint_has_no_track_without_value_or_layout() {
         for has_value in [false, true] {
             let ctx = egui::Context::default();
             let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1068,17 +1069,14 @@ mod book_resume_meter_tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let rect =
                         egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 80.0));
-                    paint_book_resume_meter(
+                    paint_thumbnail_resume_meter(
                         ui,
                         rect,
                         &ThumbnailOverlayLayout {
                             book_resume_meter: (!has_value).then_some(rect),
                             ..Default::default()
                         },
-                        has_value.then_some(ReadingMeterValue {
-                            ordinal: 1,
-                            total: 1,
-                        }),
+                        has_value.then_some(1.0),
                         false,
                     );
                 });
@@ -1097,6 +1095,29 @@ mod book_resume_meter_tests {
         value: Option<ReadingMeterValue>,
         dense: bool,
         cut: bool,
+    ) {
+        paint_fixture_cell(
+            ui,
+            size,
+            item,
+            color,
+            value.map(ReadingMeterValue::fraction),
+            dense,
+            cut,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_fixture_cell(
+        ui: &mut egui::Ui,
+        size: egui::Vec2,
+        item: &GridItem,
+        color: egui::Color32,
+        fraction: Option<f32>,
+        dense: bool,
+        cut: bool,
+        duration: Option<&str>,
     ) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let thumb = ThumbnailState::Loaded {
@@ -1133,8 +1154,8 @@ mod book_resume_meter_tests {
             VideoThumbnailIndicator::default(),
             dense,
             dense.then_some(42),
-            None,
-            value.is_some(),
+            duration,
+            fraction.is_some(),
         );
         draw_cell(
             ui,
@@ -1151,7 +1172,7 @@ mod book_resume_meter_tests {
             VideoThumbnailIndicator::default(),
             cut,
         );
-        paint_book_resume_meter(ui, rect, &layout, value, cut);
+        paint_thumbnail_resume_meter(ui, rect, &layout, fraction, cut);
     }
 
     fn fixture(ui: &mut egui::Ui) {
@@ -1231,7 +1252,77 @@ mod book_resume_meter_tests {
         });
     }
 
-    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, dpi: f32) {
+    fn media_fixture(ui: &mut egui::Ui, duration_badge: bool) {
+        use std::path::PathBuf;
+        let video = GridItem::Video(PathBuf::from("scene.mp4"));
+        let audio = GridItem::Audio(PathBuf::from("song.flac"));
+        let duration = duration_badge.then_some("1:02:03");
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
+        ui.label(if duration_badge {
+            "再生位置メーター / 長さバッジ ON"
+        } else {
+            "再生位置メーター / 長さバッジ OFF"
+        });
+        ui.horizontal(|ui| {
+            for (item, fraction, color) in [
+                (&video, Some(0.35), egui::Color32::WHITE),
+                (&audio, Some(0.75), egui::Color32::from_rgb(245, 30, 110)),
+                (&video, None, egui::Color32::BLACK),
+            ] {
+                paint_fixture_cell(
+                    ui,
+                    egui::vec2(140.0, 94.0),
+                    item,
+                    color,
+                    fraction,
+                    false,
+                    false,
+                    duration,
+                );
+            }
+        });
+        ui.label("選択・チェック・編集・タグ・評価 / 切り取り / 最後");
+        ui.horizontal(|ui| {
+            for (item, fraction, dense, cut) in [
+                (&video, 0.4, true, false),
+                (&audio, 0.6, false, true),
+                (&audio, 1.0, false, false),
+            ] {
+                paint_fixture_cell(
+                    ui,
+                    egui::vec2(140.0, 108.0),
+                    item,
+                    egui::Color32::from_rgb(38, 65, 112),
+                    Some(fraction),
+                    dense,
+                    cut,
+                    duration,
+                );
+            }
+        });
+        ui.label("狭いセル / 極小セルは既存バッジ優先");
+        ui.horizontal(|ui| {
+            for width in [100.0, 48.0, 32.0] {
+                paint_fixture_cell(
+                    ui,
+                    egui::vec2(width, width),
+                    &video,
+                    egui::Color32::WHITE,
+                    Some(0.3),
+                    true,
+                    false,
+                    duration,
+                );
+            }
+        });
+    }
+
+    fn snapshot_with_fixture(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        dpi: f32,
+        mut build_ui: impl FnMut(&mut egui::Ui),
+    ) {
         let mut fonts_ready = false;
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(480.0, 400.0))
@@ -1244,7 +1335,7 @@ mod book_resume_meter_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, fixture);
+                egui::CentralPanel::default().show(ctx, |ui| build_ui(ui));
             });
         harness.run();
         harness.snapshot(name);
@@ -1252,28 +1343,71 @@ mod book_resume_meter_tests {
 
     #[test]
     fn book_resume_meter_snapshot_light() {
-        snapshot(
+        snapshot_with_fixture(
             "book_resume_meter_light",
             crate::os_theme::ResolvedTheme::Light,
             1.0,
+            fixture,
         );
     }
 
     #[test]
     fn book_resume_meter_snapshot_dark() {
-        snapshot(
+        snapshot_with_fixture(
             "book_resume_meter_dark",
             crate::os_theme::ResolvedTheme::Dark,
             1.0,
+            fixture,
         );
     }
 
     #[test]
     fn book_resume_meter_snapshot_dark_high_dpi() {
-        snapshot(
+        snapshot_with_fixture(
             "book_resume_meter_dark_high_dpi",
             crate::os_theme::ResolvedTheme::Dark,
             1.5,
+            fixture,
+        );
+    }
+
+    #[test]
+    fn media_resume_meter_snapshot_light() {
+        snapshot_with_fixture(
+            "media_resume_meter_light",
+            crate::os_theme::ResolvedTheme::Light,
+            1.0,
+            |ui| media_fixture(ui, true),
+        );
+    }
+
+    #[test]
+    fn media_resume_meter_snapshot_dark() {
+        snapshot_with_fixture(
+            "media_resume_meter_dark",
+            crate::os_theme::ResolvedTheme::Dark,
+            1.0,
+            |ui| media_fixture(ui, true),
+        );
+    }
+
+    #[test]
+    fn media_resume_meter_snapshot_badge_off_light() {
+        snapshot_with_fixture(
+            "media_resume_meter_badge_off_light",
+            crate::os_theme::ResolvedTheme::Light,
+            1.0,
+            |ui| media_fixture(ui, false),
+        );
+    }
+
+    #[test]
+    fn media_resume_meter_snapshot_badge_off_dark() {
+        snapshot_with_fixture(
+            "media_resume_meter_badge_off_dark",
+            crate::os_theme::ResolvedTheme::Dark,
+            1.0,
+            |ui| media_fixture(ui, false),
         );
     }
 }

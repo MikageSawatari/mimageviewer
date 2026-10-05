@@ -416,9 +416,9 @@ fn book_resume_meter_scope_removal_respects_boundaries_and_tile_kind() {
             if idx < 3 { value } else { None }
         );
     }
-    app.settings.thumb_show_book_resume_meter = false;
+    app.settings.thumb_show_resume_meter = false;
     assert_eq!(app.thumbnail_book_resume_meter(0), None);
-    app.settings.thumb_show_book_resume_meter = true;
+    app.settings.thumb_show_resume_meter = true;
     assert_eq!(app.thumbnail_book_resume_meter(0), value);
 
     // idxが同じでもitemsを入れ替えたらpath自身のmemoで照合する。
