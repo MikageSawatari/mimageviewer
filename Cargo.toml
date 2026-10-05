@@ -440,6 +440,8 @@ tray-icon = "0.20"
 # rustls-tls 指定で OpenSSL に依存しない (CRT 静的リンク方針との両立)。
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 semver = "1"
+# Same nonblocking publisher lock as the launcher runtime collector.
+fs4 = "0.13"
 # 動画インライン再生 (フルスクリーンで MP4/MKV/MOV/AVI/WMV/MPG/MPEG を再生)。
 # BtbN の FFmpeg LGPL shared build を vendor/ffmpeg/ に置き、FFMPEG_DIR で参照する
 # (.cargo/config.toml に env で指定済み)。本体 (`mimageviewer-core.exe`) は通常リンク

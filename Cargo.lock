@@ -3982,6 +3982,7 @@ dependencies = [
  "ffmpeg-the-third",
  "flate2",
  "fontdb",
+ "fs4",
  "gilrs",
  "image",
  "kamadak-exif",

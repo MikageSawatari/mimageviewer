@@ -554,8 +554,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   PEはchecksum／証明書以外が原本と一致し、指定発行元の有効署名があることを要求する。
 - 起動時は `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/`
   へ新しい世代を構築する。全ファイルのhashと一覧を検証してから、小さな `effetune/current`
-  pointerだけをatomicに更新する。公開済みtreeは使用中の読手から見えるため一切移動・削除しない。
-  旧世代のcleanupは起動経路では行わない。修復は別世代の公開でありin-placeの置換ではない。
+  pointerだけをatomicに更新する。公開処理は公開済みtreeを移動・削除しない。
+  旧世代のcleanupは起動後のcore背景workerで行う（下記2026-10-05追補）。修復は別世代の公開でありin-placeの置換ではない。
   正常stampの一覧・サイズ・更新時刻・作成時刻が一致するときは全量再hashもwrite lockも不要。
   metadataを保持したままの内容改変は通常起動での検出対象外。書込不能／publisher busyなどで
   repairできなくてもcoreは起動する。失敗理由と拒否世代を専用envからUnavailable UI／ログへ伝え、古いtreeを
@@ -585,7 +585,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   UTF-16長が260以上なら公開せず、UIにパスが長すぎる理由を示す。SDK directory checkのNotFound以外のerrorも
   単体DLL pathへfallbackせず報告し、Win32にはnative backslash wide pathを渡す。
   hostはCMakeで現trackedソースhash markerを埋め、署名前／core埋込前／bare cargo releaseのgateで照合する。
-  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは[バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)へ延期する。
+  APPDATAから旧hostをコピーするbuild fallbackは削除。旧世代cleanupは下記追補および
+  [バックログ§1.316](next-release-backlog.md#1316-effetune-公開済み旧世代の-best-effort-cleanup--2026-10-02)を参照。
 - 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
@@ -596,6 +597,77 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。
 - EffeTune の共有プリセット／設定、host 名の WebView 保存領域、Remote sibling の保存領域は
   アンインストール後も残す。削除は利用者の判断で手動とし、アンインストーラの挙動は変えない。
+
+#### 起動後の旧世代清掃（§1.331 / §1.316、2026-10-05）
+
+- 利用者決定は「今の版だけ残して削除」。core の起動完了・初回描画後、`runtime-cleanup` worker
+  が `<data_dir>/runtime` 直下の SemVer として読める他版を削除する。ダウングレードでも新しい版を
+  削除し、再度その版を起動すれば launcher が再展開する。portable は完全な no-op。
+- **P1/P2対応の利用者決定（2026-10-05）**: 各coreはexeの属する `runtime/<version>` と、
+  固定したEffeTune世代の外側lockをsharedでプロセス寿命中保持する。`--data-dir` が異なる
+  coreも同じ実体のlockを使う。成功した世代解決はpathとleaseを持つ単一ownerとして固定し、
+  初回はegui構築前、準備失敗後の再解決は既存load worker内で取得する。UI updateにI/Oを追加しない。
+  版の使用権はWindowsのcase aliasも認識してcanonical実体で取得する。APPDATAのredirect自体は
+  起動を妨げず、清掃の祖先reparse拒否だけを適用する。
+- **P1/P3再レビュー対応（2026-10-05）**: cooperative lockは削除tree外の `runtime/.locks/` に
+  固定する。版は `<version>.in-use`／`<version>.extract`、publisherは `<version>.effetune`、
+  世代は `<version>.gen-<hash12>-<generation>`。`.locks` はSemVerではなく、列挙でも明示skip。
+  lockは微小な永久fileとして残し、古いlockも削除・rotateしない。tree内のlockを消すと別fileへ
+  排他が分裂するため、削除処理の工夫で対応せず、削除範囲から除外する単純な所有配置を採用する。
+  外側lockは `FILE_SHARE_READ | FILE_SHARE_WRITE` のみでopenし、delete sharingを許可しない。
+  runtime親のcanonical identityとversion／generation名から算出し、削除済みtreeの存在を要求しない。
+  `.locks` directoryと各lock fileもreparse拒否・canonical confinement／regular file検査を行う。
+- launcherはruntime親を作成・canonical化し、外側版shared leaseを取得してから版directoryを
+  作成・展開する。清掃が先に取得した場合の起動を維持するため、launcher側の版shared取得だけは
+  従来publisherと同じOS workerによる最大60秒待機を使う（清掃側は一度だけ非blocking）。
+  exe/DLL抽出は外側exclusive extract lockで直列化する。
+  正常世代を使う経路でも外側世代shared leaseを取得してから検査し、新規世代も公開前に取得する。
+  新しい世代tree内にlease fileは置かない。旧 `.in-use.lock` があるtreeのstamp互換のため、
+  この旧管理fileだけは引き続きasset inventoryから除外し、regular fileかは検査する。
+- **released publisher互換**: `runtime/<version>/.effetune.lock` は既存launcherが使うため、
+  新publisherは外側lock→旧lockの順に両方exclusive取得し、1回分の従来最大60秒budget内で待つ。
+  清掃は外側publisherを非blocking取得後、旧fileがあればそのlockも非blocking取得して保持する。
+  世代だけの削除なら旧fileは削除範囲外でありdelete sharingを禁止できる。版全体の削除時に限り
+  内側旧fileはdelete sharingを許可してtreeと削除する（外側lockは永久保持したまま）。
+  旧file名の消失による未対応旧launcherの新規同時起動は、末尾の既存受容raceの範囲。
+  新対応launcherは外側版／publisher lockで同一性を維持するため、この旧fileへ依存しない。
+- spawn直後にlauncherがleaseを放す隙間を作らない。coreが自身の版leaseと初回の世代pin／Unavailableを
+  確定してnamed eventで通知するまで、launcherはshared leaseを保持してOS waitする。
+  coreはこの通知に対して待機しない。coreが先に終了した場合もlauncherは終了できる。
+  生存中coreのpinをtimeoutで放すことはしない。通常はこの引き渡し直後にlauncherが終了する。
+- 現在版の `effetune` はcurrentと当該coreの固定世代を残す。canonical化した世代名を比較し、
+  nonceの大文字・小文字違いも同じ実体として扱う。清掃は各候補の外側使用中lockをexclusiveで
+  非blocking取得し、版全体なら外側extract／publisher lockも取得する。
+  現在版の世代清掃も外側publisherと存在する旧publisherを取得し、**tree削除完了まで保持**する。
+  busy/errorなら資産の削除を始めず今回は見送る。初回世代未確定、未知配置、current異常も見送る。
+- 各targetはcanonical化してruntime内の直下child関係を確認する。root／祖先／全subtreeの
+  symlink・junction・reparse pointは明示的に拒否し、そのtreeを残す。削除失敗はlogのみ。
+  部分削除は許容し、次回起動で再度試す。timer、retry loop、UI通知、終了時joinは持たない。
+- **P1 #2は受容（利用者決定2026-10-05）**: 事前検査後に親directoryをjunctionへ差し替える
+  TOCTOUは対処しない。成立には利用者と同じ権限で動く別processが必要で、そのprocessは同じfileを
+  直接削除できるため、新たな権限を与えない。既存のcanonical／reparse事前検査は維持するが、
+  親directoryをhandleで固定した競合耐性を保証するものとは説明しない。
+- 同梱bundleだけが対象。EffeTune設定／プリセット／IR／測定データ、WebView保存領域は削除しない。
+- **旧版互換（利用者／ClaudeCode決定2026-10-05、方針1）**: workerが起動ごとに一度だけ
+  `K32EnumProcesses` と `QueryFullProcessImageNameW`（query limited rights）でprocess画像を列挙し、
+  候補tree内で実行中の画像があれば削除しない。世代内にexeが無い旧coreもあるため、現在版内の
+  別 `mimageviewer-core.exe` が動く間は全旧世代を保守的に残す（自coreとremote等のhelperは除外）。
+  この事前検査はlock対応版にも適用し、既存のshared／exclusive lock保護も維持する。
+  missing leaseは事前検査後に清掃側で外側へ新規作成してexclusive取得するので、未使用の既存旧版も
+  清掃できる。作成不能／権限不足は通常の削除失敗と同じくlogして次回起動へ回す。
+  process画像はcanonical化して比較し、列挙失敗／固定bufferの不足は全清掃を見送る。
+  終了済み／query拒否のprocessは画像を取得できないため検査対象外。全画像の一度の列挙だけで、
+  module列挙・VM read・待機・再試行は行わず、UI／起動／初期化の経路には置かない。
+  API仕様: [EnumProcesses](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-enumprocesses)、
+  [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)。
+  開発機のheadless test実測は525画像の列挙＋canonical化で約123ms（性能保証ではない）。
+- **旧launcher同時開始raceも受容（同決定）**: snapshot後に新規起動する未対応旧launcherは
+  lockを取得しないため、清掃との競合を完全には防げない。新旧版を利用者が同時に起動する必要が
+  あり、旧launcherは次回起動で再展開する。上記親junction TOCTOUと併記する受容範囲であり、
+  lock対応版同士は版lease／抽出／公開lockで保護する。
+- 回帰testは製品の `cleanup_effetune` を呼び、注入した削除操作内で実tree削除後も別handleの
+  publisher exclusive／世代shared取得が失敗することを確認する。版全体も削除・再作成の途中で
+  同じ外側lockへの取得が失敗し、guard解放後だけ成功する。sleepやtest自身による代理guardは無い。
 
 ### 10.3 同梱版更新 (2026-10-04、v4.3.0 公開前)
 

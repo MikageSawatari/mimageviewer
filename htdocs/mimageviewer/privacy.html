@@ -146,6 +146,7 @@
       <li>リモート閲覧の暗証番号（そのままではなく、元に戻せない形に変換して保存）</li>
       <li>リモート閲覧の動作記録（表示にかかった時間などの数値と、開いたページの名前）</li>
       <li>外部ツールへ渡すために一時的に書き出した画像（本アプリの終了時に削除します）</li>
+      <li>単体exe版・インストーラ版の起動用ファイル（<code>runtime</code> フォルダー）。起動後に古い版や音響調整の旧ファイルのバックグラウンド清掃を試みます。現在の版のファイルは残し、使用中と判断したものや保存先を確認できないものは見送ります。削除できなかったものは次回起動時に再び試します。清掃の競合を防ぐ小さな管理ファイルは削除せず残します</li>
     </ul>
     <div class="info-box">
       mImageViewer 自身のデータの保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
@@ -306,6 +307,7 @@
       <li>The remote-viewing PIN (stored in a form that cannot be turned back into the PIN)</li>
       <li>Remote-viewing operation records (timings and similar numbers, plus the names of the pages you opened)</li>
       <li>Images temporarily exported for external tools (removed when the App exits)</li>
+      <li>Startup files for the installer and single-exe editions (the <code>runtime</code> folder). After startup, the App attempts background cleanup of older versions and old audio-adjustment files. It keeps the current version and skips files identified as in use or whose storage location cannot be verified. Failed deletions are tried again at a later startup. Tiny management files used to coordinate cleanup are kept</li>
     </ul>
     <div class="info-box">
       mImageViewer's own data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),

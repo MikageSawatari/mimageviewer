@@ -17008,6 +17008,9 @@ pub struct App {
     /// `indexer_manager.is_none()` だけだと「init 失敗で永続 None」と
     /// 「未起動」を区別できないので別フラグで持つ。
     pub(crate) startup_done: bool,
+    /// One best-effort runtime sweep after startup and the first painted frame.
+    #[cfg(all(windows, not(feature = "portable"), not(test)))]
+    runtime_cleanup_armed: bool,
     /// CLI soak test (`--play-test`) の進行状態。通常起動では None。
     pub(crate) play_test: Option<PlayTestState>,
     /// `fts_meta` の housekeeping (VACUUM) を起動完了後に走らせるための armed フラグ。
@@ -18896,6 +18899,8 @@ impl App {
             startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
             startup_init: None,
             startup_done: false,
+            #[cfg(all(windows, not(feature = "portable"), not(test)))]
+            runtime_cleanup_armed: true,
             play_test: None,
             housekeeping_armed: false,
             initial_scan_settled_pending: true,
@@ -87280,6 +87285,14 @@ impl eframe::App for App {
             self.authorize_external_tool_launch_boundaries_after_ui();
         }
         self.maximize_startup_window_after_visible_commit(ctx, frame);
+        #[cfg(all(windows, not(feature = "portable"), not(test)))]
+        if self.runtime_cleanup_armed && self.startup_done && ctx.cumulative_frame_nr() > 0 {
+            self.runtime_cleanup_armed = false;
+            crate::runtime_cleanup::spawn(
+                crate::data_dir::get(),
+                self.effetune.bundle_path().map(Path::to_path_buf),
+            );
+        }
         if let Some(t0) = update_t0 {
             let end = std::time::Instant::now();
             self.perf_prev_update_ms =
