@@ -96,15 +96,20 @@ impl ClipboardFormats {
 }
 
 /// Decide whether automatic capture needs to open the clipboard using format
-/// presence only. History values and unknown PowerPoint-prefixed format names
+/// presence and snapshot eligibility (enabled kind and its baseline sequence).
+/// History values and unknown PowerPoint-prefixed format names
 /// require an open clipboard and remain part of post-read classification.
-pub(super) fn should_open_automatic(formats: &ClipboardFormats) -> bool {
+pub(super) fn should_open_automatic(
+    formats: &ClipboardFormats,
+    images_allowed: bool,
+    html_allowed: bool,
+) -> bool {
     !formats.has("ExcludeClipboardContentFromMonitorProcessing")
         && !formats.has("Clipboard Viewer Ignore")
         && !formats.has(ORIGIN_FORMAT_NAME)
         && !formats.has_files()
         && !formats.has_known_office()
-        && (formats.has_image() || formats.has("HTML Format"))
+        && ((images_allowed && formats.has_image()) || (html_allowed && formats.has("HTML Format")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -803,7 +808,11 @@ mod tests {
                     names: spelling,
                     ..Default::default()
                 };
-                assert_eq!(should_open_automatic(&formats), *should_open, "{label}");
+                assert_eq!(
+                    should_open_automatic(&formats, true, true),
+                    *should_open,
+                    "{label}"
+                );
                 assert_eq!(classify_automatic(&formats, *source), *automatic, "{label}");
                 assert_eq!(classify_manual(&formats), *manual, "{label}");
             }
@@ -835,13 +844,17 @@ mod tests {
                 for content in ["PNG", "CF_DIBV5", "CF_DIB", "HTML Format"] {
                     let formats = formats(&[&spelling, content]);
                     assert!(!formats.own_marker);
-                    assert!(!should_open_automatic(&formats), "{spelling}: {content}");
+                    assert!(
+                        !should_open_automatic(&formats, true, true),
+                        "{spelling}: {content}"
+                    );
                 }
                 // An unrelated name containing the same text is not excluded.
-                assert!(should_open_automatic(&formats(&[
-                    &format!("{spelling} extra"),
-                    "PNG",
-                ])));
+                assert!(should_open_automatic(
+                    &formats(&[&format!("{spelling} extra"), "PNG",]),
+                    true,
+                    true
+                ));
             }
         }
     }
@@ -855,7 +868,10 @@ mod tests {
             &["CF_BITMAP"][..],
             &["CanIncludeInClipboardHistory"][..],
         ] {
-            assert!(!should_open_automatic(&formats(names)), "{names:?}");
+            assert!(
+                !should_open_automatic(&formats(names), true, true),
+                "{names:?}"
+            );
         }
         for candidate in ["PNG", "CF_DIBV5", "CF_DIB", "HTML Format"] {
             assert!(PREFLIGHT_FORMAT_NAMES.contains(&candidate), "{candidate}");
@@ -864,11 +880,32 @@ mod tests {
                 candidate.to_ascii_lowercase(),
                 mixed_case(candidate),
             ] {
-                assert!(should_open_automatic(&formats(&[&spelling])));
-                assert!(should_open_automatic(&formats(&[
-                    &spelling,
-                    "CF_UNICODETEXT",
-                ])));
+                assert!(should_open_automatic(&formats(&[&spelling]), true, true));
+                assert!(should_open_automatic(
+                    &formats(&[&spelling, "CF_UNICODETEXT",]),
+                    true,
+                    true
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_requires_an_enabled_content_kind() {
+        for (names, image, html) in [
+            (vec!["PNG", "CF_UNICODETEXT"], true, false),
+            (vec!["CF_UNICODETEXT", "HTML Format"], false, true),
+            (vec!["CF_DIB", "HTML Format"], true, true),
+        ] {
+            let formats = formats(&names);
+            for images_allowed in [false, true] {
+                for html_allowed in [false, true] {
+                    assert_eq!(
+                        should_open_automatic(&formats, images_allowed, html_allowed),
+                        (image && images_allowed) || (html && html_allowed),
+                        "{names:?}: images={images_allowed}, html={html_allowed}"
+                    );
+                }
             }
         }
     }
@@ -876,12 +913,12 @@ mod tests {
     #[test]
     fn miv_image_fixture_preflight_excludes_marker_without_reading_nonce() {
         let original = formats(&["CF_DIB", "CF_DIBV5", "CF_BITMAP"]);
-        assert!(should_open_automatic(&original));
+        assert!(should_open_automatic(&original, true, true));
         assert_eq!(classify_automatic(&original, None), ClipboardKind::Image);
 
         let mut marked = formats(&["CF_DIB", "CF_DIBV5", "CF_BITMAP", ORIGIN_FORMAT_NAME]);
         assert!(!marked.own_marker);
-        assert!(!should_open_automatic(&marked));
+        assert!(!should_open_automatic(&marked, true, true));
         // The raw classifier still requires the validated nonce, whereas
         // automatic preflight never needs to obtain the marker bytes.
         assert_eq!(classify_automatic(&marked, None), ClipboardKind::Image);
@@ -895,7 +932,7 @@ mod tests {
         for history_allowed in [None, Some(false), Some(true)] {
             let mut formats = formats(&["PNG", "CanIncludeInClipboardHistory"]);
             formats.history_allowed = history_allowed;
-            assert!(should_open_automatic(&formats));
+            assert!(should_open_automatic(&formats, true, true));
             assert_eq!(
                 classify_automatic(&formats, None),
                 if history_allowed == Some(false) {
@@ -909,7 +946,7 @@ mod tests {
         // preflight presence snapshot. Only the named marker may preexclude.
         let mut marker_value_only = formats(&["PNG"]);
         marker_value_only.own_marker = true;
-        assert!(should_open_automatic(&marker_value_only));
+        assert!(should_open_automatic(&marker_value_only, true, true));
         assert_eq!(
             classify_automatic(&marker_value_only, None),
             ClipboardKind::Ignored
@@ -921,7 +958,7 @@ mod tests {
             mixed_case("PowerPoint 12.0 Internal Shapes"),
         ] {
             let formats = formats(&[&spelling, "PNG", "HTML Format"]);
-            assert!(should_open_automatic(&formats));
+            assert!(should_open_automatic(&formats, true, true));
             assert_eq!(
                 classify_automatic(&formats, Some("https://example.com")),
                 ClipboardKind::Ignored
@@ -930,7 +967,7 @@ mod tests {
         // Preserve the raw classifier's HTML fallback: the new preflight is
         // the boundary which excludes known Office HTML-only copies.
         let word_html = formats(&["Object Descriptor", "HTML Format"]);
-        assert!(!should_open_automatic(&word_html));
+        assert!(!should_open_automatic(&word_html, true, true));
         assert_eq!(
             classify_automatic(&word_html, Some("https://example.com")),
             ClipboardKind::Html

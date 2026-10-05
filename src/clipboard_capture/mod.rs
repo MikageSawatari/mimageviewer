@@ -212,6 +212,15 @@ pub(crate) struct ReadRequest {
     pub reread: bool,
 }
 
+impl ReadRequest {
+    fn reread_at(mut self, sequence: u32, observed_at: Instant) -> Self {
+        self.sequence = sequence;
+        self.notified_at = observed_at;
+        self.reread = true;
+        self
+    }
+}
+
 // Waiting belongs to the reader. The listener only replaces its latest slot
 // and wakes the channel; neither notification delivery nor the UI waits here.
 fn await_quiet_request(
@@ -766,23 +775,63 @@ mod tests {
     #[test]
     fn publisher_wait_does_not_add_another_delay_for_an_already_quiet_sequence_reread() {
         let start = Instant::now();
-        let r = ReadRequest {
-            notified_at: start,
-            reread: true,
-            ..request(12)
-        };
+        let r = request(11).reread_at(12, start);
         let quiet = await_quiet_request(
             r.clone(),
             &ReaderState::default(),
             |_| true,
             || None,
             || start + Duration::from_millis(400),
-            |_| panic!("reread retains the original notification deadline"),
+            |_| panic!("the observed sequence has already been quiet for 300 ms"),
         )
         .unwrap();
         assert!(quiet.reread);
         assert!(Arc::ptr_eq(&quiet.snapshot, &r.snapshot));
         assert_eq!(quiet.notified_at, r.notified_at);
+    }
+
+    #[test]
+    fn publisher_wait_replaces_an_unnotified_reread_with_the_latest_notification() {
+        let original = request(11);
+        let observed_at = original.notified_at + Duration::from_secs(1);
+        let retry = original.clone().reread_at(12, observed_at);
+        let notification = ReadRequest {
+            serial: 2,
+            notified_at: observed_at + Duration::from_millis(25),
+            snapshot: snapshot(true, true, 10),
+            ..request(13)
+        };
+        let latest = std::cell::RefCell::new(None);
+        let clock = std::cell::Cell::new(observed_at);
+        let mut waits = Vec::new();
+        let quiet = await_quiet_request(
+            retry,
+            &ReaderState::default(),
+            |_| true,
+            || latest.borrow_mut().take(),
+            || clock.get(),
+            |remaining| {
+                waits.push(remaining);
+                if waits.len() == 1 {
+                    clock.set(notification.notified_at);
+                    *latest.borrow_mut() = Some(notification.clone());
+                } else {
+                    clock.set(clock.get() + remaining);
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, vec![PUBLISHER_QUIET_PERIOD; 2]);
+        assert_eq!(quiet.sequence, 13);
+        assert_eq!(quiet.serial, 2);
+        assert!(!quiet.reread);
+        assert!(Arc::ptr_eq(&quiet.snapshot, &notification.snapshot));
+        assert!(!Arc::ptr_eq(&quiet.snapshot, &original.snapshot));
+        assert_eq!(
+            clock.get(),
+            notification.notified_at + PUBLISHER_QUIET_PERIOD
+        );
     }
 
     #[test]
@@ -864,12 +913,11 @@ mod tests {
         let ReadDecision::Reread(sequence) = state.decide(&r, 12, 12, 1, false) else {
             panic!("one reread required");
         };
-        let retry = ReadRequest {
-            reread: true,
-            sequence,
-            ..r.clone()
-        };
+        let observed_at = r.notified_at + Duration::from_secs(1);
+        let retry = r.clone().reread_at(sequence, observed_at);
         assert!(Arc::ptr_eq(&retry.snapshot, &r.snapshot));
+        assert_eq!(retry.serial, r.serial);
+        assert_eq!(retry.notified_at, observed_at);
         assert_eq!(
             state.decide(&retry, 12, 13, 1, false),
             ReadDecision::Abandon

@@ -236,6 +236,7 @@ fn copy_named_format(
 struct Observation {
     before: u32,
     after: u32,
+    observed_at: Instant,
     data: Result<ObservedContent, String>,
 }
 enum ObservedContent {
@@ -270,19 +271,33 @@ fn preflight_format_ids() -> Result<Vec<(u32, &'static str)>, String> {
 
 // The rejected observation uses the same sequence fence as an opened read.
 // It becomes Other only after acceptance, never after an unstable availability
-// query or an obsolete generation. OpenClipboard is reachable only via read().
+// query or an obsolete generation. Candidates must pass the request/before/after
+// fence too: a stale availability result must never reach OpenClipboard.
 fn read_with_preflight(
+    request: &ReadRequest,
     sequence: impl Fn() -> u32,
+    now: impl Fn() -> Instant,
     available: impl FnOnce() -> data::ClipboardFormats,
     read: impl FnOnce() -> Result<Observation, String>,
 ) -> Result<Observation, String> {
     let before = sequence();
-    if data::should_open_automatic(&available()) {
+    let formats = available();
+    let after = sequence();
+    let observed_at = now();
+    if request.sequence == before
+        && before == after
+        && data::should_open_automatic(
+            &formats,
+            request.snapshot.allows_images(request.sequence),
+            request.snapshot.allows_html(request.sequence),
+        )
+    {
         read()
     } else {
         Ok(Observation {
             before,
-            after: sequence(),
+            after,
+            observed_at,
             data: Ok(ObservedContent::Skipped),
         })
     }
@@ -290,7 +305,9 @@ fn read_with_preflight(
 
 fn read(request: &ReadRequest, formats: &[(u32, &'static str)]) -> Result<Observation, String> {
     read_with_preflight(
+        request,
         || unsafe { GetClipboardSequenceNumber() },
+        Instant::now,
         || data::ClipboardFormats {
             names: formats
                 .iter()
@@ -377,12 +394,14 @@ fn read_opened(request: &ReadRequest) -> Result<Observation, String> {
     })();
     drop(guard);
     let after = unsafe { GetClipboardSequenceNumber() };
+    let observed_at = Instant::now();
     for error in origin_warnings {
         crate::logger::log(format!("clipboard_capture: origin omitted: {error}"));
     }
     Ok(Observation {
         before,
         after,
+        observed_at,
         data: result,
     })
 }
@@ -502,9 +521,7 @@ fn reader(
                     active = newer;
                 }
                 ReadDecision::Reread(sequence) => {
-                    request.sequence = sequence;
-                    request.reread = true;
-                    active = Some(request);
+                    active = Some(request.reread_at(sequence, observation.observed_at));
                 }
                 ReadDecision::Abandon => {
                     crate::logger::log("clipboard_capture: sequence changed twice; copy skipped");
@@ -885,6 +902,7 @@ mod tests {
 
     #[test]
     fn preflight_exclusions_do_not_call_the_opened_reader() {
+        let request = read_request(11);
         for excluded in [
             "ExcludeClipboardContentFromMonitorProcessing",
             "Clipboard Viewer Ignore",
@@ -904,7 +922,9 @@ mod tests {
                 vec![excluded.to_owned(), "PNG".to_owned()]
             };
             let observation = read_with_preflight(
+                &request,
                 || 11,
+                Instant::now,
                 || data::ClipboardFormats {
                     names,
                     ..Default::default()
@@ -920,8 +940,12 @@ mod tests {
     #[test]
     fn preflight_candidates_use_the_opened_observation_and_keep_post_open_exclusions() {
         for name in ["PNG", "CF_DIBV5", "CF_DIB", "HTML Format"] {
+            let mut request = read_request(11);
+            Arc::make_mut(&mut request.snapshot).config.html = true;
             let observation = read_with_preflight(
+                &request,
                 || 11,
+                Instant::now,
                 || data::ClipboardFormats {
                     names: vec![name.into()],
                     ..Default::default()
@@ -930,6 +954,7 @@ mod tests {
                     Ok(Observation {
                         before: 12,
                         after: 13,
+                        observed_at: Instant::now(),
                         data: Ok(ObservedContent::Read(
                             data::ClipboardFormats {
                                 names: vec![name.into()],
@@ -954,6 +979,175 @@ mod tests {
     }
 
     #[test]
+    fn preflight_sequence_mismatches_never_call_the_opened_reader() {
+        let state = ReaderState::default();
+        let request = read_request(11);
+        for sequences in [[12, 12], [11, 12], [12, 11]] {
+            let observed_at = request.notified_at + Duration::from_secs(1);
+            let samples = std::cell::RefCell::new(sequences.into_iter());
+            let observation = read_with_preflight(
+                &request,
+                || samples.borrow_mut().next().unwrap(),
+                || observed_at,
+                || data::ClipboardFormats {
+                    names: vec!["PNG".into()],
+                    ..Default::default()
+                },
+                || panic!("unstable image candidate must not open the clipboard"),
+            )
+            .unwrap();
+            assert!(matches!(observation.data, Ok(ObservedContent::Skipped)));
+            assert_eq!(observation.observed_at, observed_at);
+            assert_eq!(
+                state.decide(&request, observation.before, observation.after, 1, true),
+                ReadDecision::PreferLatest
+            );
+            assert_eq!(
+                state.decide(&request, observation.before, observation.after, 1, false),
+                ReadDecision::Reread(sequences[1])
+            );
+            let retry = request
+                .clone()
+                .reread_at(sequences[1], observation.observed_at);
+            assert!(Arc::ptr_eq(&retry.snapshot, &request.snapshot));
+            assert_eq!(
+                state.decide(&retry, sequences[1], sequences[1] + 1, 1, false),
+                ReadDecision::Abandon
+            );
+        }
+    }
+
+    #[test]
+    fn unnotified_sequence_reread_waits_from_observation_before_opening() {
+        let request = read_request(11);
+        let observed_at = request.notified_at + Duration::from_secs(1);
+        let samples = std::cell::RefCell::new([11, 12].into_iter());
+        let state = ReaderState::default();
+        let observation = read_with_preflight(
+            &request,
+            || samples.borrow_mut().next().unwrap(),
+            || observed_at,
+            || data::ClipboardFormats {
+                names: vec!["PNG".into()],
+                ..Default::default()
+            },
+            || panic!("changed sequence must not open"),
+        )
+        .unwrap();
+        let ReadDecision::Reread(sequence) =
+            state.decide(&request, observation.before, observation.after, 1, false)
+        else {
+            panic!("must reread the newly observed sequence");
+        };
+        let retry = request.clone().reread_at(sequence, observation.observed_at);
+        let clock = std::cell::Cell::new(observed_at);
+        let mut waits = Vec::new();
+        let quiet = await_quiet_request(
+            retry,
+            &state,
+            |_| true,
+            || None,
+            || clock.get(),
+            |remaining| {
+                waits.push(remaining);
+                clock.set(clock.get() + remaining);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, vec![super::super::PUBLISHER_QUIET_PERIOD]);
+        assert_eq!(quiet.notified_at, observed_at);
+        assert!(Arc::ptr_eq(&quiet.snapshot, &request.snapshot));
+        let result = read_with_preflight(
+            &quiet,
+            || 12,
+            || clock.get(),
+            || data::ClipboardFormats {
+                names: vec!["PNG".into()],
+                ..Default::default()
+            },
+            || {
+                assert_eq!(
+                    clock.get(),
+                    observed_at + super::super::PUBLISHER_QUIET_PERIOD
+                );
+                Ok(Observation {
+                    before: 12,
+                    after: 12,
+                    observed_at: clock.get(),
+                    data: Ok(ObservedContent::Read(
+                        data::ClipboardFormats::default(),
+                        data::RawClipboardData::default(),
+                    )),
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(result.data, Ok(ObservedContent::Read(..))));
+        assert_eq!(
+            state.decide(&quiet, result.before, result.after, 1, false),
+            ReadDecision::Accept
+        );
+    }
+
+    #[test]
+    fn preflight_uses_each_content_kinds_setting_and_enable_baseline() {
+        for (names, images, html, image_baseline, html_baseline, opens) in [
+            (
+                vec!["CF_UNICODETEXT", "HTML Format"],
+                true,
+                false,
+                10,
+                10,
+                false,
+            ),
+            (vec!["HTML Format"], false, true, 10, 10, true),
+            (vec!["HTML Format"], true, true, 10, 11, false),
+            (vec!["PNG"], true, true, 11, 10, false),
+            (vec!["PNG"], false, true, 10, 10, false),
+            (vec!["PNG", "HTML Format"], true, true, 11, 10, true),
+            (vec!["PNG", "HTML Format"], true, true, 10, 11, true),
+            (vec!["PNG", "HTML Format"], true, true, 11, 11, false),
+        ] {
+            let mut request = read_request(11);
+            let snapshot = Arc::make_mut(&mut request.snapshot);
+            snapshot.config.images = images;
+            snapshot.config.html = html;
+            snapshot.image_baseline = image_baseline;
+            snapshot.html_baseline = html_baseline;
+            let opened = std::cell::Cell::new(false);
+            let observation = read_with_preflight(
+                &request,
+                || 11,
+                Instant::now,
+                || data::ClipboardFormats {
+                    names: names.iter().map(|name| (*name).into()).collect(),
+                    ..Default::default()
+                },
+                || {
+                    assert!(opens, "disabled kind must not open: {names:?}");
+                    opened.set(true);
+                    Ok(Observation {
+                        before: 11,
+                        after: 11,
+                        observed_at: Instant::now(),
+                        data: Ok(ObservedContent::Read(
+                            data::ClipboardFormats::default(),
+                            data::RawClipboardData::default(),
+                        )),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(opened.get(), opens, "{names:?}");
+            assert_eq!(
+                matches!(observation.data, Ok(ObservedContent::Read(..))),
+                opens
+            );
+        }
+    }
+
+    #[test]
     fn skipped_observation_keeps_sequence_and_hash_until_the_same_acceptance_fence_passes() {
         let mut state = ReaderState::default();
         let first = read_request(11);
@@ -962,7 +1156,9 @@ mod tests {
         let request = read_request(12);
         let sequences = std::cell::RefCell::new([12, 13].into_iter());
         let unstable = read_with_preflight(
+            &request,
             || sequences.borrow_mut().next().unwrap(),
+            Instant::now,
             data::ClipboardFormats::default,
             || panic!("text must not open the clipboard"),
         )
@@ -980,7 +1176,9 @@ mod tests {
         assert_eq!(state.accepted_sequence, Some(11));
         assert_eq!(state.image_hash, Some([1; 32]));
         let stable = read_with_preflight(
+            &request,
             || 12,
+            Instant::now,
             data::ClipboardFormats::default,
             || panic!("text must not open the clipboard"),
         )
