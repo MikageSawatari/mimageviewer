@@ -67,13 +67,6 @@
   足りるかもしれない (mIV との組み合わせは未確認) こと、件数上限 10 とコマンドライン長の制限も伝えた。
 - 規模 / 優先度: Small〜Medium / P3。
 
-### 1.324 「EffeTune に渡す前に 0dB を超える音を抑える」の再生中反映 — 実装済み・全体ゲート／実機確認待ち (2026-10-05)
-
-- 済み (次版、master 2b8a6d5c4、v4.3.0 には未収録): 最終安全リミッターを常に通す (利用者決定)、通常の EOS で前段・最終リミッターと resampler の保持分を出し切る、シーク / ループで codec・resampler・timeline を初期化 (44.1 kHz 出力で前周の末尾が次周の頭に再生されていた不具合)。`testdata/audio-tail/` の素材で、ループ 1 周 1 クリック・通常設定での開始ノイズ解消を利用者が実機で確認 (2026-10-04、再生デバイス 24bit / 44.1 kHz)。設計の正本は [EffeTune 計画](effetune-integration-plan.md)。
-- 利用者決定 (2026-10-05): 再生中に反映する。共有 slot の atomic を local / Remote の各 block で参照し、ON/OFF とも前段約5msの遅延を維持して短いクロスフェードを行う実装。再open・配信再開・codec / resampler / timeline reset は不要。Remote の生成済み音声の後から反映する。対象テスト・通常／portable check・fmt・差分検査・glyph・snapshot は成功、独立コードレビューの修正指摘なし。確認用 build 済み、起動・commit なし。全体ゲートは未変更の索引テスト1件がアクセス拒否で失敗（孤立実行は成功）し未完了。利用者実機確認待ち。設計・検証の正本は [EffeTune 計画 §15](effetune-integration-plan.md#15-1324-前段ピーク保護の再生中反映-2026-10-05)。
-- 対象外のまま: ユーザー VST3 チェーン内部の先読み分は EOS で出し切らない。
-- 規模 / 優先度: Small / P3。
-
 ### 1.322 初回起動直後に Windows のメモリ使用量の報告 (RADAR_PRE_LEAK_64) が出る — Sandbox 記録 (2026-10-03)
 
 - 観測 (サブPCの Windows Sandbox、利用者が確認): v4.3.0 の単体exe版を日本語を含む APPDATA で初回起動した約 26 秒後に WER 1001 `RADAR_PRE_LEAK_64` (P1 mimageviewer-core.exe 4.3.0.0、ダンプなし)。クラッシュ・ハングではなく、mIV は応答を続けて正常終了。インストール版の初回起動では出ていない。
