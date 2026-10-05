@@ -6,6 +6,24 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ORIGIN_FORMAT_NAME: &str = "mImageViewer Clipboard Origin v1";
+/// Names whose presence can be checked before OpenClipboard. Native code maps
+/// standard names to their fixed IDs and registers the remaining names once.
+pub(super) const PREFLIGHT_FORMAT_NAMES: &[&str] = &[
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "Clipboard Viewer Ignore",
+    ORIGIN_FORMAT_NAME,
+    "CF_HDROP",
+    "FileGroupDescriptorW",
+    "Shell IDList Array",
+    "Embed Source",
+    "Object Descriptor",
+    "XML Spreadsheet",
+    "Art::GVML ClipFormat",
+    "PNG",
+    "CF_DIBV5",
+    "CF_DIB",
+    "HTML Format",
+];
 pub(crate) const MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const MAX_HTML_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RGBA_BYTES: u64 = 1024 * 1024 * 1024;
@@ -57,7 +75,7 @@ impl ClipboardFormats {
             .any(|name| self.has(name))
     }
 
-    fn has_office(&self) -> bool {
+    fn has_known_office(&self) -> bool {
         [
             "Embed Source",
             "Object Descriptor",
@@ -66,11 +84,27 @@ impl ClipboardFormats {
         ]
         .iter()
         .any(|name| self.has(name))
+    }
+
+    fn has_office(&self) -> bool {
+        self.has_known_office()
             || self
                 .names
                 .iter()
                 .any(|name| format_name_starts_with(name, "PowerPoint "))
     }
+}
+
+/// Decide whether automatic capture needs to open the clipboard using format
+/// presence only. History values and unknown PowerPoint-prefixed format names
+/// require an open clipboard and remain part of post-read classification.
+pub(super) fn should_open_automatic(formats: &ClipboardFormats) -> bool {
+    !formats.has("ExcludeClipboardContentFromMonitorProcessing")
+        && !formats.has("Clipboard Viewer Ignore")
+        && !formats.has(ORIGIN_FORMAT_NAME)
+        && !formats.has_files()
+        && !formats.has_known_office()
+        && (formats.has_image() || formats.has("HTML Format"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -609,8 +643,15 @@ mod tests {
     }
 
     #[test]
-    fn s0_format_fixtures_obey_automatic_and_manual_routes() {
-        let fixtures: &[(&str, &[&str], Option<&str>, ClipboardKind, ClipboardKind)] = &[
+    fn s0_format_fixtures_obey_preflight_automatic_and_manual_routes() {
+        let fixtures: &[(
+            &str,
+            &[&str],
+            Option<&str>,
+            ClipboardKind,
+            ClipboardKind,
+            bool,
+        )] = &[
             (
                 "Chrome image 173723",
                 &[
@@ -624,6 +665,7 @@ mod tests {
                 None,
                 ClipboardKind::Image,
                 ClipboardKind::Image,
+                true,
             ),
             (
                 "Chrome page 173736",
@@ -631,6 +673,7 @@ mod tests {
                 Some("https://example.com/artworks/1#1"),
                 ClipboardKind::Html,
                 ClipboardKind::Html,
+                true,
             ),
             (
                 "Excel 173803",
@@ -648,6 +691,7 @@ mod tests {
                 Some("file:///sheet"),
                 ClipboardKind::Ignored,
                 ClipboardKind::Image,
+                false,
             ),
             (
                 "Word 173826",
@@ -662,6 +706,7 @@ mod tests {
                 None,
                 ClipboardKind::Other,
                 ClipboardKind::Html,
+                false,
             ),
             (
                 "PowerPoint 173844",
@@ -677,6 +722,7 @@ mod tests {
                 None,
                 ClipboardKind::Ignored,
                 ClipboardKind::Image,
+                true,
             ),
             (
                 "Explorer 173857",
@@ -684,6 +730,7 @@ mod tests {
                 None,
                 ClipboardKind::Files,
                 ClipboardKind::Files,
+                false,
             ),
             (
                 "mIV files 173911",
@@ -691,6 +738,7 @@ mod tests {
                 None,
                 ClipboardKind::Files,
                 ClipboardKind::Files,
+                false,
             ),
             (
                 "mIV image 173922 before marker",
@@ -698,6 +746,7 @@ mod tests {
                 None,
                 ClipboardKind::Image,
                 ClipboardKind::Image,
+                true,
             ),
             (
                 "Snipping Tool 180739",
@@ -711,6 +760,7 @@ mod tests {
                 None,
                 ClipboardKind::Image,
                 ClipboardKind::Image,
+                true,
             ),
             (
                 "Edge image 180801",
@@ -725,6 +775,7 @@ mod tests {
                 None,
                 ClipboardKind::Image,
                 ClipboardKind::Image,
+                true,
             ),
             (
                 "Firefox image 180822",
@@ -739,9 +790,10 @@ mod tests {
                 None,
                 ClipboardKind::Image,
                 ClipboardKind::Image,
+                true,
             ),
         ];
-        for (label, names, source, automatic, manual) in fixtures {
+        for (label, names, source, automatic, manual, should_open) in fixtures {
             for spelling in [
                 names.iter().map(|name| (*name).to_owned()).collect(),
                 names.iter().map(|name| name.to_ascii_lowercase()).collect(),
@@ -751,10 +803,138 @@ mod tests {
                     names: spelling,
                     ..Default::default()
                 };
+                assert_eq!(should_open_automatic(&formats), *should_open, "{label}");
                 assert_eq!(classify_automatic(&formats, *source), *automatic, "{label}");
                 assert_eq!(classify_manual(&formats), *manual, "{label}");
             }
         }
+    }
+
+    #[test]
+    fn preflight_excludes_known_formats_by_presence_before_opening() {
+        for excluded in [
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "Clipboard Viewer Ignore",
+            ORIGIN_FORMAT_NAME,
+            "CF_HDROP",
+            "FileGroupDescriptorW",
+            "Shell IDList Array",
+            "Embed Source",
+            "Object Descriptor",
+            "XML Spreadsheet",
+            "Art::GVML ClipFormat",
+        ] {
+            assert!(PREFLIGHT_FORMAT_NAMES.contains(&excluded), "{excluded}");
+            for spelling in [
+                excluded.to_owned(),
+                excluded.to_ascii_lowercase(),
+                mixed_case(excluded),
+            ] {
+                // HTML-only Office copies are excluded too. A private marker
+                // requires no nonce read: its registered presence is enough.
+                for content in ["PNG", "CF_DIBV5", "CF_DIB", "HTML Format"] {
+                    let formats = formats(&[&spelling, content]);
+                    assert!(!formats.own_marker);
+                    assert!(!should_open_automatic(&formats), "{spelling}: {content}");
+                }
+                // An unrelated name containing the same text is not excluded.
+                assert!(should_open_automatic(&formats(&[
+                    &format!("{spelling} extra"),
+                    "PNG",
+                ])));
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_reads_only_image_or_html_candidates_and_preserves_text_images() {
+        for names in [
+            &[][..],
+            &["CF_UNICODETEXT"][..],
+            &["CF_TEXT", "Rich Text Format"][..],
+            &["CF_BITMAP"][..],
+            &["CanIncludeInClipboardHistory"][..],
+        ] {
+            assert!(!should_open_automatic(&formats(names)), "{names:?}");
+        }
+        for candidate in ["PNG", "CF_DIBV5", "CF_DIB", "HTML Format"] {
+            assert!(PREFLIGHT_FORMAT_NAMES.contains(&candidate), "{candidate}");
+            for spelling in [
+                candidate.to_owned(),
+                candidate.to_ascii_lowercase(),
+                mixed_case(candidate),
+            ] {
+                assert!(should_open_automatic(&formats(&[&spelling])));
+                assert!(should_open_automatic(&formats(&[
+                    &spelling,
+                    "CF_UNICODETEXT",
+                ])));
+            }
+        }
+    }
+
+    #[test]
+    fn miv_image_fixture_preflight_excludes_marker_without_reading_nonce() {
+        let original = formats(&["CF_DIB", "CF_DIBV5", "CF_BITMAP"]);
+        assert!(should_open_automatic(&original));
+        assert_eq!(classify_automatic(&original, None), ClipboardKind::Image);
+
+        let mut marked = formats(&["CF_DIB", "CF_DIBV5", "CF_BITMAP", ORIGIN_FORMAT_NAME]);
+        assert!(!marked.own_marker);
+        assert!(!should_open_automatic(&marked));
+        // The raw classifier still requires the validated nonce, whereas
+        // automatic preflight never needs to obtain the marker bytes.
+        assert_eq!(classify_automatic(&marked, None), ClipboardKind::Image);
+        marked.own_marker = true;
+        assert_eq!(classify_automatic(&marked, None), ClipboardKind::Ignored);
+        assert_eq!(classify_manual(&marked), ClipboardKind::Image);
+    }
+
+    #[test]
+    fn preflight_leaves_value_and_powerpoint_prefix_checks_to_post_read() {
+        for history_allowed in [None, Some(false), Some(true)] {
+            let mut formats = formats(&["PNG", "CanIncludeInClipboardHistory"]);
+            formats.history_allowed = history_allowed;
+            assert!(should_open_automatic(&formats));
+            assert_eq!(
+                classify_automatic(&formats, None),
+                if history_allowed == Some(false) {
+                    ClipboardKind::Ignored
+                } else {
+                    ClipboardKind::Image
+                }
+            );
+        }
+        // This field is populated from bytes after opening, never from the
+        // preflight presence snapshot. Only the named marker may preexclude.
+        let mut marker_value_only = formats(&["PNG"]);
+        marker_value_only.own_marker = true;
+        assert!(should_open_automatic(&marker_value_only));
+        assert_eq!(
+            classify_automatic(&marker_value_only, None),
+            ClipboardKind::Ignored
+        );
+
+        for spelling in [
+            "PowerPoint 12.0 Internal Shapes".to_owned(),
+            "powerpoint 12.0 internal shapes".to_owned(),
+            mixed_case("PowerPoint 12.0 Internal Shapes"),
+        ] {
+            let formats = formats(&[&spelling, "PNG", "HTML Format"]);
+            assert!(should_open_automatic(&formats));
+            assert_eq!(
+                classify_automatic(&formats, Some("https://example.com")),
+                ClipboardKind::Ignored
+            );
+        }
+        // Preserve the raw classifier's HTML fallback: the new preflight is
+        // the boundary which excludes known Office HTML-only copies.
+        let word_html = formats(&["Object Descriptor", "HTML Format"]);
+        assert!(!should_open_automatic(&word_html));
+        assert_eq!(
+            classify_automatic(&word_html, Some("https://example.com")),
+            ClipboardKind::Html
+        );
     }
 
     #[test]

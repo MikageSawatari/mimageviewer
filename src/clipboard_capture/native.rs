@@ -1,6 +1,6 @@
 use super::{
-    AcceptedContent, CaptureEvent, CaptureSnapshot, ReadDecision, ReadRequest, ReaderState, data,
-    popup,
+    AcceptedContent, CaptureEvent, CaptureSnapshot, ReadDecision, ReadRequest, ReaderState,
+    await_quiet_request, data, popup,
 };
 use std::{
     cell::RefCell,
@@ -10,7 +10,7 @@ use std::{
         mpsc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -23,7 +23,7 @@ use windows::{
         },
         UI::WindowsAndMessaging::*,
     },
-    core::w,
+    core::{PCWSTR, w},
 };
 
 const SHUTDOWN: u32 = WM_APP + 0x32b;
@@ -79,6 +79,7 @@ impl Shared {
             serial: self.serial.fetch_add(1, Ordering::AcqRel) + 1,
             sequence,
             snapshot,
+            notified_at: Instant::now(),
             reread: false,
         };
         *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(request);
@@ -90,6 +91,11 @@ impl Shared {
     }
     fn still_latest(&self, request: &ReadRequest) -> bool {
         self.current(request) && self.serial.load(Ordering::Acquire) == request.serial
+    }
+    fn update_snapshot(&self, snapshot: Arc<CaptureSnapshot>) {
+        *self.snapshot.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
+        super::wake_save_destination_waiters();
+        let _ = self.wake.try_send(());
     }
 }
 thread_local! { static LISTENER: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) }; }
@@ -230,9 +236,74 @@ fn copy_named_format(
 struct Observation {
     before: u32,
     after: u32,
-    data: Result<(data::ClipboardFormats, data::RawClipboardData), String>,
+    data: Result<ObservedContent, String>,
 }
-fn read(request: &ReadRequest) -> Result<Observation, String> {
+enum ObservedContent {
+    Skipped,
+    Read(data::ClipboardFormats, data::RawClipboardData),
+}
+
+fn preflight_format_ids() -> Result<Vec<(u32, &'static str)>, String> {
+    data::PREFLIGHT_FORMAT_NAMES
+        .iter()
+        .map(|&name| {
+            let id = match name {
+                "CF_DIB" => 8,
+                "CF_DIBV5" => 17,
+                "CF_HDROP" => 15,
+                _ => {
+                    let wide: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
+                    unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) }
+                }
+            };
+            if id == 0 {
+                Err(format!(
+                    "RegisterClipboardFormatW({name}): {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                Ok((id, name))
+            }
+        })
+        .collect()
+}
+
+// The rejected observation uses the same sequence fence as an opened read.
+// It becomes Other only after acceptance, never after an unstable availability
+// query or an obsolete generation. OpenClipboard is reachable only via read().
+fn read_with_preflight(
+    sequence: impl Fn() -> u32,
+    available: impl FnOnce() -> data::ClipboardFormats,
+    read: impl FnOnce() -> Result<Observation, String>,
+) -> Result<Observation, String> {
+    let before = sequence();
+    if data::should_open_automatic(&available()) {
+        read()
+    } else {
+        Ok(Observation {
+            before,
+            after: sequence(),
+            data: Ok(ObservedContent::Skipped),
+        })
+    }
+}
+
+fn read(request: &ReadRequest, formats: &[(u32, &'static str)]) -> Result<Observation, String> {
+    read_with_preflight(
+        || unsafe { GetClipboardSequenceNumber() },
+        || data::ClipboardFormats {
+            names: formats
+                .iter()
+                .filter(|(id, _)| unsafe { IsClipboardFormatAvailable(*id) }.is_ok())
+                .map(|(_, name)| (*name).to_owned())
+                .collect(),
+            ..Default::default()
+        },
+        || read_opened(request),
+    )
+}
+
+fn read_opened(request: &ReadRequest) -> Result<Observation, String> {
     unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard: {e}"))?;
     let guard = ClipboardGuard;
     let before = unsafe { GetClipboardSequenceNumber() };
@@ -302,7 +373,7 @@ fn read(request: &ReadRequest) -> Result<Observation, String> {
                 }
             }
         }
-        Ok((formats, raw))
+        Ok(ObservedContent::Read(formats, raw))
     })();
     drop(guard);
     let after = unsafe { GetClipboardSequenceNumber() };
@@ -333,6 +404,13 @@ fn reader(
             return;
         }
     };
+    let formats = match preflight_format_ids() {
+        Ok(formats) => formats,
+        Err(error) => {
+            state.fail(format!("reader: {error}"));
+            return;
+        }
+    };
     let mut accepted = ReaderState::default();
     while !state.stop.load(Ordering::Acquire) {
         if wake.recv().is_err() {
@@ -350,6 +428,20 @@ fn reader(
             {
                 continue;
             }
+            let Some(quiet) = await_quiet_request(
+                request,
+                &accepted,
+                |request| state.current(request),
+                || state.take_latest(),
+                Instant::now,
+                |remaining| match wake.recv_timeout(remaining) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => true,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => false,
+                },
+            ) else {
+                continue;
+            };
+            request = quiet;
             let mut observation = None;
             let mut superseded = None;
             for attempt in 0..=4 {
@@ -360,7 +452,7 @@ fn reader(
                 if !state.current(&request) {
                     break;
                 }
-                match read(&request) {
+                match read(&request, &formats) {
                     Ok(value) => {
                         observation = Some(value);
                         break;
@@ -433,7 +525,7 @@ fn reader(
                         continue;
                     }
                     match observation.data {
-                        Ok((formats, raw)) => {
+                        Ok(ObservedContent::Read(formats, raw)) => {
                             if data::classify_automatic(&formats, None)
                                 == data::ClipboardKind::Image
                             {
@@ -478,6 +570,13 @@ fn reader(
                                     AcceptedContent::Other,
                                 );
                             }
+                        }
+                        Ok(ObservedContent::Skipped) => {
+                            accepted.accept_content(
+                                &request,
+                                state.generation.load(Ordering::Acquire),
+                                AcceptedContent::Other,
+                            );
                         }
                         Err(error) => {
                             accepted.accept_content(
@@ -629,12 +728,7 @@ impl CaptureRuntime {
         // The service has already advanced generation. Hide before exposing
         // new requests, so this invalidation cannot erase a new worker's Show.
         self.popup.hide();
-        *self
-            .state
-            .snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = snapshot;
-        super::wake_save_destination_waiters();
+        self.state.update_snapshot(snapshot);
     }
 
     pub(super) fn resolve_reveal(
@@ -702,6 +796,209 @@ impl Drop for CaptureRuntime {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn read_request(sequence: u32) -> ReadRequest {
+        ReadRequest {
+            serial: 1,
+            sequence,
+            snapshot: Arc::new(CaptureSnapshot::updated(
+                None,
+                super::super::CaptureConfig {
+                    images: true,
+                    html: false,
+                    destination: None,
+                },
+                10,
+                false,
+            )),
+            notified_at: Instant::now(),
+            reread: false,
+        }
+    }
+
+    fn assert_publication_wait_is_cancelled(invalidate: impl FnOnce(&Shared, &ReadRequest)) {
+        let request = read_request(11);
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let (events, _) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            snapshot: Mutex::new(request.snapshot.clone()),
+            generation: Arc::new(AtomicU64::new(1)),
+            latest: Mutex::new(None),
+            serial: AtomicU64::new(1),
+            stop: AtomicBool::new(false),
+            hwnd: AtomicIsize::new(0),
+            wake: wake_tx,
+            events,
+            repaint: Arc::new(|| {}),
+        });
+        let waiting = shared.clone();
+        let active = request.clone();
+        let (entered, entry) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let clock = active.notified_at;
+            let result = await_quiet_request(
+                active,
+                &ReaderState::default(),
+                |request| waiting.current(request),
+                || waiting.take_latest(),
+                || clock,
+                |remaining| {
+                    assert_eq!(remaining, super::super::PUBLISHER_QUIET_PERIOD);
+                    entered.send(()).unwrap();
+                    // Freeze time and wait on the production wake channel:
+                    // cancellation must wake us, not expire the quiet period.
+                    wake_rx.recv().is_ok()
+                },
+            );
+            finished.send(result).unwrap();
+        });
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        invalidate(&shared, &request);
+        let cancelled = completion.recv_timeout(Duration::from_secs(5));
+        // Release a broken wait before reporting the failed assertion.
+        let _ = shared.wake.try_send(());
+        worker.join().unwrap();
+        assert!(cancelled.unwrap().is_none());
+    }
+
+    #[test]
+    fn publisher_wait_is_released_by_stop_without_advancing_the_clock() {
+        assert_publication_wait_is_cancelled(|shared, _| shared.stop());
+    }
+
+    #[test]
+    fn publisher_wait_is_released_by_settings_generation_without_advancing_the_clock() {
+        assert_publication_wait_is_cancelled(|shared, request| {
+            let snapshot = Arc::new(CaptureSnapshot::updated(
+                Some(&request.snapshot),
+                request.snapshot.config.clone(),
+                11,
+                false,
+            ));
+            shared
+                .generation
+                .store(snapshot.generation, Ordering::Release);
+            shared.update_snapshot(snapshot);
+        });
+    }
+
+    #[test]
+    fn preflight_exclusions_do_not_call_the_opened_reader() {
+        for excluded in [
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "Clipboard Viewer Ignore",
+            data::ORIGIN_FORMAT_NAME,
+            "CF_HDROP",
+            "FileGroupDescriptorW",
+            "Shell IDList Array",
+            "Embed Source",
+            "Object Descriptor",
+            "XML Spreadsheet",
+            "Art::GVML ClipFormat",
+            "CF_UNICODETEXT",
+        ] {
+            let names = if excluded == "CF_UNICODETEXT" {
+                vec![excluded.to_owned()]
+            } else {
+                vec![excluded.to_owned(), "PNG".to_owned()]
+            };
+            let observation = read_with_preflight(
+                || 11,
+                || data::ClipboardFormats {
+                    names,
+                    ..Default::default()
+                },
+                || panic!("excluded clipboard must not be opened: {excluded}"),
+            )
+            .unwrap();
+            assert_eq!((observation.before, observation.after), (11, 11));
+            assert!(matches!(observation.data, Ok(ObservedContent::Skipped)));
+        }
+    }
+
+    #[test]
+    fn preflight_candidates_use_the_opened_observation_and_keep_post_open_exclusions() {
+        for name in ["PNG", "CF_DIBV5", "CF_DIB", "HTML Format"] {
+            let observation = read_with_preflight(
+                || 11,
+                || data::ClipboardFormats {
+                    names: vec![name.into()],
+                    ..Default::default()
+                },
+                || {
+                    Ok(Observation {
+                        before: 12,
+                        after: 13,
+                        data: Ok(ObservedContent::Read(
+                            data::ClipboardFormats {
+                                names: vec![name.into()],
+                                history_allowed: Some(false),
+                                own_marker: false,
+                            },
+                            data::RawClipboardData::default(),
+                        )),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!((observation.before, observation.after), (12, 13));
+            let Ok(ObservedContent::Read(formats, _)) = observation.data else {
+                panic!("must read the candidate");
+            };
+            assert_eq!(
+                data::classify_automatic(&formats, None),
+                data::ClipboardKind::Ignored
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_observation_keeps_sequence_and_hash_until_the_same_acceptance_fence_passes() {
+        let mut state = ReaderState::default();
+        let first = read_request(11);
+        assert!(state.accept(&first, 1));
+        assert!(state.accept_content(&first, 1, AcceptedContent::Image([1; 32])));
+        let request = read_request(12);
+        let sequences = std::cell::RefCell::new([12, 13].into_iter());
+        let unstable = read_with_preflight(
+            || sequences.borrow_mut().next().unwrap(),
+            data::ClipboardFormats::default,
+            || panic!("text must not open the clipboard"),
+        )
+        .unwrap();
+        assert_eq!(
+            state.decide(&request, unstable.before, unstable.after, 1, false),
+            ReadDecision::Reread(13)
+        );
+        assert_eq!(
+            state.decide(&request, 12, 12, 2, false),
+            ReadDecision::Discard
+        );
+        assert!(!state.accept(&request, 2));
+        assert!(!state.accept_content(&request, 2, AcceptedContent::Other));
+        assert_eq!(state.accepted_sequence, Some(11));
+        assert_eq!(state.image_hash, Some([1; 32]));
+        let stable = read_with_preflight(
+            || 12,
+            data::ClipboardFormats::default,
+            || panic!("text must not open the clipboard"),
+        )
+        .unwrap();
+        assert!(matches!(stable.data, Ok(ObservedContent::Skipped)));
+        assert_eq!(
+            state.decide(&request, stable.before, stable.after, 1, false),
+            ReadDecision::Accept
+        );
+        assert!(state.accept(&request, 1));
+        assert!(!state.accept_content(&request, 1, AcceptedContent::Other));
+        assert_eq!(state.accepted_sequence, Some(12));
+        assert_eq!(state.image_hash, None);
+        assert!(!state.should_read(&request, 1));
+        let again = read_request(13);
+        assert!(state.accept(&again, 1));
+        assert!(state.accept_content(&again, 1, AcceptedContent::Image([1; 32])));
+    }
 
     #[test]
     fn registered_payload_lookup_ignores_case_for_history_marker_and_preferred_image() {

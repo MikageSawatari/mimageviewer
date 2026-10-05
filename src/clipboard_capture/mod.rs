@@ -12,6 +12,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
+use std::time::{Duration, Instant};
+
+const PUBLISHER_QUIET_PERIOD: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 enum DestinationState {
@@ -205,7 +208,36 @@ pub(crate) struct ReadRequest {
     pub serial: u64,
     pub sequence: u32,
     pub snapshot: Arc<CaptureSnapshot>,
+    pub notified_at: Instant,
     pub reread: bool,
+}
+
+// Waiting belongs to the reader. The listener only replaces its latest slot
+// and wakes the channel; neither notification delivery nor the UI waits here.
+fn await_quiet_request(
+    mut request: ReadRequest,
+    accepted: &ReaderState,
+    current: impl Fn(&ReadRequest) -> bool,
+    mut take_latest: impl FnMut() -> Option<ReadRequest>,
+    now: impl Fn() -> Instant,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> Option<ReadRequest> {
+    loop {
+        if let Some(newer) = take_latest() {
+            request = newer;
+        }
+        if !current(&request) || !accepted.should_read(&request, request.snapshot.generation) {
+            return None;
+        }
+        let remaining = PUBLISHER_QUIET_PERIOD
+            .saturating_sub(now().saturating_duration_since(request.notified_at));
+        if remaining.is_zero() {
+            return Some(request);
+        }
+        if !wait(remaining) {
+            return None;
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -637,8 +669,188 @@ mod tests {
             serial: 1,
             sequence,
             snapshot: snapshot(true, false, 10),
+            notified_at: Instant::now(),
             reread: false,
         }
+    }
+
+    #[test]
+    fn publisher_wait_merges_notifications_and_waits_from_the_latest_notification() {
+        use std::cell::{Cell, RefCell};
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let latest = RefCell::new(None);
+        let mut waits = Vec::new();
+        let first = ReadRequest {
+            notified_at: start,
+            ..request(11)
+        };
+        let mut final_request = None;
+        let quiet = await_quiet_request(
+            first,
+            &ReaderState::default(),
+            |_| true,
+            || latest.borrow_mut().take(),
+            || clock.get(),
+            |remaining| {
+                waits.push(remaining);
+                if waits.len() == 1 {
+                    // The reader wakes after multiple publications. Their
+                    // individual snapshots/timestamps belong to the slot.
+                    *latest.borrow_mut() = Some(ReadRequest {
+                        serial: 2,
+                        notified_at: start + Duration::from_millis(25),
+                        ..request(12)
+                    });
+                    let last = ReadRequest {
+                        serial: 3,
+                        notified_at: start + Duration::from_millis(156),
+                        ..request(13)
+                    };
+                    final_request = Some(last.clone());
+                    *latest.borrow_mut() = Some(last);
+                    clock.set(start + Duration::from_millis(156));
+                } else {
+                    clock.set(clock.get() + remaining);
+                }
+                true
+            },
+        )
+        .unwrap();
+        let last = final_request.unwrap();
+        assert_eq!(quiet.sequence, 13);
+        assert_eq!(quiet.serial, 3);
+        assert!(Arc::ptr_eq(&quiet.snapshot, &last.snapshot));
+        assert_eq!(quiet.notified_at, last.notified_at);
+        assert_eq!(clock.get(), start + Duration::from_millis(456));
+        assert_eq!(waits, vec![PUBLISHER_QUIET_PERIOD; 2]);
+    }
+
+    #[test]
+    fn publisher_wait_without_a_new_notification_does_not_restart_the_deadline() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut waits = Vec::new();
+        let quiet = await_quiet_request(
+            ReadRequest {
+                notified_at: start,
+                ..request(11)
+            },
+            &ReaderState::default(),
+            |_| true,
+            || None,
+            || clock.get(),
+            |remaining| {
+                waits.push(remaining);
+                clock.set(
+                    clock.get()
+                        + if waits.len() == 1 {
+                            Duration::from_millis(100)
+                        } else {
+                            remaining
+                        },
+                );
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(quiet.sequence, 11);
+        assert_eq!(
+            waits,
+            vec![Duration::from_millis(300), Duration::from_millis(200)]
+        );
+        assert_eq!(clock.get(), start + PUBLISHER_QUIET_PERIOD);
+    }
+
+    #[test]
+    fn publisher_wait_does_not_add_another_delay_for_an_already_quiet_sequence_reread() {
+        let start = Instant::now();
+        let r = ReadRequest {
+            notified_at: start,
+            reread: true,
+            ..request(12)
+        };
+        let quiet = await_quiet_request(
+            r.clone(),
+            &ReaderState::default(),
+            |_| true,
+            || None,
+            || start + Duration::from_millis(400),
+            |_| panic!("reread retains the original notification deadline"),
+        )
+        .unwrap();
+        assert!(quiet.reread);
+        assert!(Arc::ptr_eq(&quiet.snapshot, &r.snapshot));
+        assert_eq!(quiet.notified_at, r.notified_at);
+    }
+
+    #[test]
+    fn publisher_wait_discards_disabled_baseline_duplicate_and_obsolete_requests_before_waiting() {
+        let mut accepted = ReaderState::default();
+        assert!(accepted.accept(&request(11), 1));
+        let requests = [
+            request(11),
+            request(10),
+            ReadRequest {
+                snapshot: snapshot(false, false, 10),
+                ..request(12)
+            },
+        ];
+        for r in requests {
+            assert!(
+                await_quiet_request(
+                    r,
+                    &accepted,
+                    |_| true,
+                    || None,
+                    Instant::now,
+                    |_| panic!("discarded request must not wait")
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            await_quiet_request(
+                request(12),
+                &accepted,
+                |_| false,
+                || None,
+                Instant::now,
+                |_| panic!("obsolete request must not wait")
+            )
+            .is_none()
+        );
+        assert_eq!(accepted.accepted_sequence, Some(11));
+    }
+
+    #[test]
+    fn publisher_wait_rechecks_the_merged_requests_settings_before_reading() {
+        let start = Instant::now();
+        let latest = std::cell::RefCell::new(None);
+        let mut waits = 0;
+        assert!(
+            await_quiet_request(
+                ReadRequest {
+                    notified_at: start,
+                    ..request(11)
+                },
+                &ReaderState::default(),
+                |_| true,
+                || latest.borrow_mut().take(),
+                || start,
+                |_| {
+                    waits += 1;
+                    *latest.borrow_mut() = Some(ReadRequest {
+                        snapshot: snapshot(false, false, 10),
+                        ..request(12)
+                    });
+                    true
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(waits, 1);
     }
     #[test]
     fn mismatches_prefer_latest_then_allow_only_one_snapshot_preserving_retry() {
