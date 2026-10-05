@@ -60,7 +60,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 出す | `ui_theme`, `text_contrast`, `ai_feature_mode` | 全体設定のテーマ・文字と AI 利用範囲 (pages.rs:33 / 57 / 91)。性能の手動 tuning とは分ける。 | `src/settings.rs:5047` |
 | 出す | `detached_viewer_open_images_in_window`, `auto_fullscreen_zip_pdf`, `auto_fullscreen_image_folders`, `fullfeature_media_window` | 全体設定の閲覧モード (pages.rs:128)。実効値ではなく保存された選択値を出す。 | `src/settings.rs:5625` |
 | 出す | `restore_last_cursor`, `startup_window_state` | 起動時の振舞いだけ (pages.rs:409 / 476)。実際の場所・座標は出さない。 | `src/settings.rs:4288` |
-| 出す | `grid_click_selection_mode`, `grid_open_selected_item_on_click`, `grid_cursor_wrap`, `remember_favorite_view_state`, `grid_display_order`, `video_thumbnail_indicator`, `thumb_show_media_duration`, `thumb_show_book_resume_meter`, `selection_info_display_mode` | 表示→サムネイルの操作・情報表示 (pages.rs:1362–1641)。カテゴリの行構成は環境設定内、名前等のソートは対象外。 | `src/settings.rs:4121` |
+| 出す | `grid_click_selection_mode`, `grid_open_selected_item_on_click`, `grid_cursor_wrap`, `remember_favorite_view_state`, `grid_display_order`, `video_thumbnail_indicator`, `thumb_show_media_duration`, `thumb_show_resume_meter`, `selection_info_display_mode` | 表示→サムネイルの操作・情報表示 (pages.rs:1362–1641)。カテゴリの行構成は環境設定内、名前等のソートは対象外。 | `src/settings.rs:4121` |
 | 出す | `thumb_tooltip_show_filename`, `thumb_tooltip_show_image_dimensions`, `thumb_tooltip_show_video_duration`, `thumb_tooltip_show_kind`, `thumb_tooltip_show_page_count`, `thumb_tooltip_show_file_size`, `thumb_tooltip_show_modified`, `thumb_tooltip_show_created`, `thumb_tooltip_show_video_dimensions`, `thumb_tooltip_show_video_codec`, `thumb_tooltip_show_location`, `thumb_tooltip_show_full_location` | 表示項目の bool のみ (pages.rs:1581)。名前・場所・履歴の実データを含めない。 | `src/settings.rs:4500` |
 | 出す | `thumb_tooltip_show_reading_history_last_read`, `thumb_tooltip_show_reading_history_progress` | 同上。閲覧履歴の内容ではなく表示するかどうか。 | `src/settings.rs:4536` |
 | 出す | `show_windows_context_menu_inline`, `skip_recycle_bin_delete_confirmation` | エクスプローラ連携の表示・削除確認方針 (pages.rs:1194 / 1329)。Shell 登録そのものは移さない。 | `src/settings.rs:4660` |
@@ -88,7 +88,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `stack_script_enabled` | 移行先の `stack_rules.rhai` に依存する有効化設定。本体を転送しないため一組で除外する。 | `src/settings.rs` |
 | 除く | `keymap`, `ring_shortcuts`, `menu_layout`, `context_menu_layout`, `gamepad_enabled` | 既存の操作カスタマイズ共有が正本。環境設定にも編集入口があっても重複転送しない。 | `src/settings.rs:5198` |
 | 除く | `favorites`, `smart_folders`, `tags`, `recent_folders`, `quick_folder_recent_folders`, `quick_folder_slots`, `quick_folder_drive_current_dirs`, `last_folder`, `last_cursor_name`, `last_cursor_rows_above`, `search_index_checks`, `active_book_name` | 利用データ・登録先・履歴・検索対象。名前や ID も含めない。 | `src/settings.rs:4262` |
-| 除く | `pinned_books`, `pinned_collections`, `toolbar_collection_target_id`, `video_resume_positions`, `video_audio_track_choices` | 同上。本棚・コレクション参照・再生位置・音声トラック選択。 | `src/settings.rs:4752` |
+| 除く | `pinned_books`, `pinned_collections`, `toolbar_collection_target_id`, `video_resume_positions`, `video_watched_to_end`, `video_audio_track_choices` | 同上。本棚・コレクション参照・再生位置・音声トラック選択。 | `src/settings.rs:4752` |
 | 除く | `favorite_view_overlay`, `window_pos`, `window_size`, `window_maximized`, `detached_viewer_window_placement`, `effetune_gui_pos`, `effetune_gui_size`, `vst3_panel_pos` | runtime overlay / PC のウィンドウ配置。serde(skip) も明示分類。 | `src/settings.rs:4273` |
 | 除く | `first_setup_completed`, `touch_still_chrome_learned`, `touch_video_chrome_learned`, `last_seen_version`, `update_check_dismissed_version`, `network_data_dir_notice_dismissed_for`, `perf_log_enabled` | 初回/学習/通知/保存版の内部記録。診断ログは移行先で明示有効化。 | `src/settings.rs:5063` |
 | 除く | `archive_convert_without_dialog`, `video_loop` | 現行 enum の互換 mirror。転送せず既存の OK/保存で enum から導出。独立した設定ではない。 | `src/settings.rs:4450` |
@@ -115,7 +115,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `video_seek_strip_span`, `video_autoplay`, `video_autoplay_mode`, `video_continuous_mode`, `video_muted`, `video_adjustments`, `video_scale_filter`, `video_downscale_smoothing_percent`, `video_anime4k_budget` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5467` |
 | 除く | `video_anime4k_measurement`, `video_preset_slots`, `video_tile_columns`, `video_in_window_mode`, `detached_viewer_enabled`, `vst3_gui_visible`, `vst3_video_compact`, `audio_normalize_enabled`, `audio_normalize_target_lufs_milli` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5544` |
 
-承認済みの内訳: 出す 130 フィールド / 除く 302 フィールド / 合計 432 フィールド。
+現在の内訳: 出す130 / 除く303 / 合計433フィールド。§1.333追加watched集合は個人の視聴履歴・pathとして除外する。調査時点の432という記録は履歴として保持する。
 
 ### 2.2 実装時の唯一の policy と強制テスト
 

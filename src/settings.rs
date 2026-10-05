@@ -4489,9 +4489,9 @@ pub struct Settings {
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
-    /// 本のサムネイル下端に、記録済みの読書位置を表示する。
+    /// 本・動画・音声のサムネイル下端に、記録済みの読書・再生位置を表示する。
     #[serde(default = "default_true")]
-    pub thumb_show_book_resume_meter: bool,
+    pub thumb_show_resume_meter: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -5551,6 +5551,9 @@ pub struct Settings {
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
+    /// 最後まで視聴した動画・音声の正規化済み絶対パス。再生位置の復元とは独立。
+    #[serde(default)]
+    pub video_watched_to_end: std::collections::HashSet<String>,
     /// 明示的に選んだ音声トラック。再生位置とは独立してファイルごとに保持する。
     #[serde(default)]
     pub video_audio_track_choices:
@@ -7270,7 +7273,7 @@ impl Default for Settings {
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
-            thumb_show_book_resume_meter: true,
+            thumb_show_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -7531,6 +7534,7 @@ impl Default for Settings {
             video_anime4k_measurement: None,
             video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
+            video_watched_to_end: std::collections::HashSet::new(),
             video_audio_track_choices: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
             video_nav_resume: ResumeMode::Resume,
@@ -10090,36 +10094,32 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn thumb_show_book_resume_meter_defaults_on_and_preserves_disabled_setting() {
-        assert!(Settings::default().thumb_show_book_resume_meter);
+    fn thumb_show_resume_meter_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_resume_meter);
         let missing: Settings = serde_json::from_str("{}").unwrap();
-        assert!(missing.thumb_show_book_resume_meter);
+        assert!(missing.thumb_show_resume_meter);
         let disabled: Settings =
-            serde_json::from_str(r#"{"thumb_show_book_resume_meter":false}"#).unwrap();
+            serde_json::from_str(r#"{"thumb_show_resume_meter":false}"#).unwrap();
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
-        assert!(!restored.thumb_show_book_resume_meter);
+        assert!(!restored.thumb_show_resume_meter);
     }
 
     #[test]
-    fn thumb_show_book_resume_meter_missing_db_key_defaults_on() {
+    fn thumb_show_resume_meter_missing_db_key_defaults_on() {
         let temp = tempfile::tempdir().unwrap();
         let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
         db.save_full(&Settings::default()).unwrap();
         drop(db);
         let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
         conn.execute(
-            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_resume_meter'",
             [],
         )
         .unwrap();
         drop(conn);
         let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
-        assert!(
-            db.load_into_settings()
-                .unwrap()
-                .thumb_show_book_resume_meter
-        );
+        assert!(db.load_into_settings().unwrap().thumb_show_resume_meter);
     }
 
     #[test]

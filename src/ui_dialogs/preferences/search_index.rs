@@ -193,10 +193,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再生アイコン", "左下バッジ", "非表示"]
     ),
     entry!(
-        "thumbnail/book-resume-meter",
+        "thumbnail/resume-meter",
         Thumbnail,
-        "本のサムネイルに前回の読書位置を表示",
-        ["読書", "ページ", "進捗", "メーター", "ZIP", "PDF"]
+        "本・動画・音声のサムネイルに前回の位置を表示",
+        [
+            "読書",
+            "再生位置",
+            "動画",
+            "音声",
+            "進捗",
+            "メーター",
+            "ZIP",
+            "PDF"
+        ]
     ),
     entry!(
         "thumbnail/idle-upgrade",

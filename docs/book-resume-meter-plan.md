@@ -1,5 +1,7 @@
 # §1.256 一覧の本サムネイルの読書位置メーター — 記録値を表示する設計
 
+追加のwatched対応 (§11) は実装完了・全体ゲートと確認用ビルド済み。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を反映済み。前段§10の検証記録はそのまま保持する。
+
 作成・改訂: 2026-10-04。コード調査基準: `next-file-ops` / `e804db069`。
 状態: **実装完了・関連自動検証済み。全体ゲートはlauncher入力用release binaryの準備待ち。** 独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。常に左→右への変更とその確認用ビルドも完了。commit・アプリ起動は行っていない。
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
@@ -171,7 +173,7 @@ map更新はAppの単一受付へ集約し、起動読込中・再読込中のSe
 
 `layout_cell_overlays` は `rect.shrink(4)` のinnerと実測badgeを純layoutへ渡し、`draw_cell` は同じlayoutをcell内へclipする (`src/app/grid_paint.rs:254`, `src/app/grid_paint.rs:383`)。現行 `ThumbnailOverlayLayout` はcheck/stack/top-left/bottom-left/filter count/media durationを所有する (`src/thumb_overlay_layout.rs:184`, `src/thumb_overlay_layout.rs:426`)。ここにmeter rectを追加し、下端帯の所有を1箇所にする。backlog §2.2の古い未着手記録を理由に四隅を再実装しない。
 
-inner下端の高さ3 logical pt、左右はinner端、上に2pt gapを初期値とする。meterがある時だけ `badges_inner.max.y = meter.top - 2pt` として既存layoutへ予約を渡す。**独立レビューP2の決定:** 右下filter件数は `cell.max.y - 3` を基準にする (`src/thumb_overlay_layout.rs:712`, `:758`) ため、innerの縮小だけで済ませず、右下配置の基準にもmeter帯 + gapの予約を純layout内で反映する。形式/フォルダ名/filename/評価、右下filter countはその上に置く。左上編集/pin/tag/time/UP、右上check/stackは既存優先規則を維持。動画/音声cellは非対象で、長さ表示と共存しないが共有duration layoutの回帰も確認する。極小cellでは既存badgeを優先し、meterを省略する。
+inner下端の高さ3 logical pt、左右はinner端、上に2pt gapを初期値とする。meterがある時だけ `badges_inner.max.y = meter.top - 2pt` として既存layoutへ予約を渡す。**独立レビューP2の決定:** 右下filter件数は `cell.max.y - 3` を基準にする (`src/thumb_overlay_layout.rs:712`, `:758`) ため、innerの縮小だけで済ませず、右下配置の基準にもmeter帯 + gapの予約を純layout内で反映する。形式/フォルダ名/filename/評価、右下filter countはその上に置く。左上編集/pin/tag/time/UP、右上check/stackは既存優先規則を維持。§1.333では動画/音声cellにも同じ帯を使い、右下の長さ表示にもmeter帯とgapを予約して非交差を保つ。長さバッジOFFでも帯を表示する。極小cellでは既存badgeを優先し、meterを省略する。
 
 cell_h・cell rect・並び順・image fit・scroll content・hit-testは不変。回転/補正済bitmapやcatalog thumbnailに焼き込まない。選択borderは上層、cutは既存content painterのopacity、タグhit-testは同じBadgePlacementを使う。狭いcellでもmeterとbadgeは重ねない。
 
@@ -185,7 +187,7 @@ cell_h・cell rect・並び順・image fit・scroll content・hit-testは不変�
 
 色は `os_theme::book_resume_meter_palette(effective_dark)` 相当のsemantic helperで所有し、paint側へLight/DarkのRGB分岐を分散させない (`src/os_theme.rs:291`, `src/os_theme.rs:343`)。trackは不透明の暗灰/明灰、fillはテーマ別青緑、1px境界を候補にsnapshotで確定する。白/黒/鮮やかな表紙上でもfillと未塗りを区別する。テーマは当該UIのresolved visualsを使い、OSテーマ固定値をcacheしない。テーマ変更はpalette再取得だけ。
 
-設定は **`thumb_show_book_resume_meter`、既定ON**、全体共通。環境設定 **表示 → サムネイル** に **「本のサムネイルに前回の読書位置を表示」**。説明は「メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません」。favorite/本別設定・方向独立設定は増やさない。閲覧表示の「ページシークバーの方向」には連動せず、以前追加したmeterへの適用説明を削除する。
+設定は **`thumb_show_resume_meter`、既定ON**、全体共通。環境設定 **表示 → サムネイル** に **「本・動画・音声のサムネイルに前回の位置を表示」**。説明は「メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません」。favorite/本別設定・方向独立設定は増やさない。閲覧表示の「ページシークバーの方向」には連動せず、以前追加したmeterへの適用説明を削除する。
 
 既存draft編集→OK→prepare/merge→ `install_preferences_settings` → `settings.save()` を使う (`src/ui_dialogs/preferences.rs:1924`, `src/ui_dialogs/preferences.rs:1957`, `src/ui_dialogs/preferences.rs:2448`, `src/ui_dialogs/preferences.rs:2592`)。OFFはpaintを止めるだけでmap/記録は保持、ONは保持mapから表示する。Cancelはruntimeへ適用しない。serde欠落既定値・settings.db roundtrip・default/reset・Preferences管理フィールドとしてのmergeを揃え、既存設定確定のrepaint経路へ接続する。
 
@@ -324,3 +326,156 @@ DB書込失敗・稀な再読込失敗については次を設計責任者/利�
 `UPDATE_SNAPSHOTS=1` は `--lib book_resume_meter_snapshot` (exit 0、3 passed) と `--test ui_snapshot preferences_book_resume_meter` (exit 0、2 passed) にだけ指定。変更した5 PNGは目視で左→右の伸び・最後までの塗り・cut opacity・帯/badge非交差、Light/Dark/高DPIと設定の説明/折り返しを確認した。他機能だけの既存変更ファイルは作業開始時のhashと一致し、`tests/ui_snapshot.rs` も変更していない。既存差分がある `manual/grid.html` も本件ではメーター段落だけを変更し、ファイル整理先の段落は保持した。
 
 確認用ビルドも `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 1` がexit 0。core / Remote service / EPUB PDF workerを再作成し、現在の承認済みEffeTune v0.11.1、FFmpegとVC runtimeを配置した。VC runtime PE検証も成功。ログは `target/book-resume-ltr-build-dev.log`。通常profileの利用者向け起動コマンド・注意は上記と同じ。今回はFolder/ZIP/PDFを読んで一覧へ戻り、右綴じ/左綴じとシークバー方向にかかわらずメーターが左→右へ伸びることを確認する。製品binaryはagentが起動していない。
+
+## 10. §1.333 動画・音声の前回再生位置 (2026-10-05)
+
+状態: 実装・自動検証完了、独立レビューP1/P2指摘なし。HEAD `c56632af7` の既存§1.256を拡張する。利用者の決定は、表示設定の共有・既定ON、長さバッジOFFでもバー表示、見終わった動画は位置なしのままバーなし、Audioを含める、すべて常に左→右。
+
+### 10.1 既存のコード事実と変えない正本
+
+- `src/settings.rs:5553` の `video_resume_positions: HashMap<String,f64>` は起動時から読込済み。Video/Audioの位置は `src/app.rs:88350` の保存規則により、再生直後・末尾数秒・EOFで行を除去する。出荷済みの形式・保存条件は変更しない。
+- キーは `src/adjustment_db.rs:550` のnormalize (ドライブ保持・小文字・slash統一)。本のresume keyはDriveStrippedなので同じ正規化を流用できない。`src/app.rs:59635` の媒体のmetadata keyは同じドライブ保持normalize。
+- 長さバッジは `src/app.rs:60572` が `DetailsLazyMeta.media.read().duration_secs` を読む。`src/app.rs:61138` は取得済みsource stampとの一致だけをメモリで検査し、UIでstat/DB/probeを行わない。既存のdetails-meta workerが親catalogのvideo_meta cacheを読んでmissだけprobeし、取消/世代/mtime-size照合を行う。
+- HEAD `c56632af7` では `thumbnail_media_duration_enabled` とvisible-stage/selection-only/target要求は長さバッジだけで決まっていた。§1.333の `thumbnail_media_metadata_enabled` (`src/app.rs:59820`) はこの取得要件を共通表示設定とのORへ変更し、長さバッジの描画条件は分離して保持する。
+
+### 10.2 状態を増やさない取得・描画
+
+別の再生位置map、worker、監視、generation、保存列を作らない。比率の分子は毎回既存のlive `Settings.video_resume_positions` を読む。したがって再生中の位置更新・EOF/clear/delete/renameの既存表更新が、一覧へ戻った描画にもそのまま反映される。
+
+既存 `BookResumeMeters` のPathBuf key memoを1箇所のまま本/媒体それぞれの正規化済み文字列へ拡張する。pathそのものをキーにし、idx・viewer・同名別ドライブへの取り違えを避ける。毎frameのpath正規化は不要。既存のscope除去に伴うmemo失効も維持する。
+
+可視+近傍の長さ取得は§1.308のstaged details-meta scanに乗せる。Thumbnail表示で `thumb_show_media_duration || thumb_show_resume_meter` のとき、既存の要求・cached result・generation・scroll idle gate・取消ownerを使う。どちらもOFFなら従来の専用選択情報/AI等の要求だけに戻す。設定変更は既存のmetadata要件失効へ接続する。新しい待機状態は不要で、取得のmodal化はスクロールを妨げるため採用しない。
+
+Video/Audioの可視cellは位置と、現在source stampに一致したメモリ上の長さを使う。位置なし・長さ未取得/不明/0/負数/失敗・source不一致、非有限値、位置<=0、位置>長さでは帯自体を描かない。比率はposition/durationでありclamp・0%/100%への代用・長さの推測をしない。等しい有効値なら1.0だが、通常の見終わりは既存保存規則が行を消すので表示しない。本は従来のordinal/totalであり、見開きanchorと対象判定を維持する。
+
+描画helperは本・Video・Audio共通の有効fractionを受け、常に左端から塗る。`ThumbnailOverlayLayout` の既存3pt帯+2pt gapを使い、右下duration/countにも予約を反映する。極小cellは既存badge優先で帯を省略する。セル高・順序・fit・hit-testは変更しない。色は同じos_theme helper、cut opacityも維持する。Remoteのwire/IPC版は変更しない。
+
+### 10.3 共有設定・未リリースの改名
+
+`thumb_show_resume_meter`、既定/欠落ON、環境設定「表示 → サムネイル」。表示名は「本・動画・音声のサムネイルに前回の位置を表示」。読み/再生位置を常に左→右へ表示し、位置や長さが不明なら非表示、見終わった媒体も非表示、長さバッジとは独立であることを説明する。旧 `thumb_show_book_resume_meter` は未出荷の§1.256で追加した項目のため移行/aliasを作らず改名する。出荷済みの再生位置表やvideo_meta形式は変更しない。
+
+### 10.4 検証・文書更新
+
+比率の境界/非有限/未取得/失敗/source不一致、動画/音声、位置表の即時更新・除去、異なるdrive/idx差替え、長さバッジOFFでも可視/近傍worker要求が出ること、OFF/OFF時の要件失効、既存worker世代/取消を検証する。純layoutは長さバッジあり/なし・件数・dense・極小cellの非交差。本/媒体のLight/Dark snapshot、実Preferences編集→本番OK→save→DB再読込→開き直し/Cancel/欠落ONを確認する。
+
+spec/display-pipeline/architecture/async、設定共有のexport表と検索項目、manualのgrid/settings/読書チュートリアルを更新する。利用者向け説明に内部用語・バージョンを載せない。backlog §1.333は指定どおり「実装済み (レビュー前)」とする。fmt/core check/関連lib/UI snapshot/glyph/full gate/PreserveRuntime確認用buildの結果を後記する。commit・製品binary起動は行わない。
+### 10.5 実装・検証記録 (2026-10-05)
+
+実装箇所は `src/app/book_resume_meter.rs` (媒体のキーmemoと比率/参照)、`src/app.rs` (既存長さ取得要件のOR)、`src/ui_main.rs` / `src/app/grid_paint.rs` (共通描画)、`src/thumb_overlay_layout.rs` (媒体非交差テスト)、settings/preferences/search/export (共有設定)、関連libテストとsnapshot。`book_resume.db`、再生位置の保存規則・形式、Remote wireは変更していない。
+
+独立レビュー (`gpt-6.1-sol` / `xhigh`) はP1/P2指摘なし。媒体を本のDB読込/物理一覧判定から独立して参照し、キーのドライブ保持、source stamp検証、既存workerの世代/取消、長さバッジ独立、共通LTR描画を確認した。
+
+| コマンド | exit code / 件数 |
+|---|---|
+| `cargo fmt` / `cargo fmt --check` | 0 / 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 |
+| `cargo test -p mimageviewer --lib resume_meter` | 0 / 41 passed |
+| 同 `--lib media_duration` | 0 / 18 passed |
+| 同 `--lib thumbnail_selection_info_keeps_single_target_fast_path` | 0 / 1 passed |
+| 同 `--lib thumb_overlay_layout` | 0 / 22 passed |
+| 同 `--lib settings_transfer` | 0 / 15 passed |
+| 同 `--lib preferences::search_index` | 0 / 11 passed |
+| `cargo test --test ui_snapshot` | 0 / 76 passed |
+| `python scripts/check_ui_glyphs.py` | 0 / dangerous glyph 0 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0 / 11,377 passed、58 ignored |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0 / core・remote・EPUB worker配置済み、runtime=4 / PE=3検査通過 |
+
+full gateはworkspaceとvendor/egui・egui-wgpu・eframeの全段通過。件数はfiltered-out=0の57集計の合計で、子process内の限定再実行2件は重複計上しない。本体libは10,282 passed / 52 ignored。
+
+関連libは`CARGO_BUILD_JOBS=1` / `RUST_TEST_THREADS=4`、full gateにも同じprocess-local設定を使用。初回の媒体テストは新snapshot未生成4件とfixtureの対象key期待値1件で失敗した。worker起動時は取得対象の媒体keyだけを保持する既存処理 (`src/app.rs:61000`) にfixtureを合わせ、再実行は全件通過。UI snapshot初回は共有設定の文字変更2件のみ差分となり、対象を限定して更新した。意図しないsnapshot差分はない。
+
+新規媒体Light/Dark×長さバッジON/OFFの4枚と、共有設定の2枚を目視確認した。バーは左→右、長さバッジと非交差、極小セルは既存表示優先、cut時は既存opacityを維持。PNGとテストを同時更新し、製品binaryは起動していない。snapshot更新コマンドは `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib media_resume_meter_snapshot` (exit 0 / 4 passed) と `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot preferences_book_resume_meter` (exit 0 / 2 passed)。確認用coreは9m03s、companionは各0.3sでbuild完了。未解決の自動検証/レビュー指摘はない。ログは `target/media-resume-*.log`。
+
+利用者の実機確認: 1分以上の動画と音声を中ほどまで再生して一覧へ戻る→現在位置のバー、長さバッジOFFでもバー、共通設定OFFで本/動画/音声のすべて非表示、見終わった媒体はバーなし、Light/Dark・小さいセルで既存バッジと重ならないことを確認する。
+
+### 10.6 変更ファイル一覧
+
+- 取得・描画・回帰テスト: `src/app.rs`, `src/app/book_resume_meter.rs`, `src/app/book_resume_meter_tests.rs`, `src/app/media_resume_meter_tests.rs`, `src/app/grid_paint.rs`, `src/app/tests.rs`, `src/thumb_overlay_layout.rs`, `src/ui_main.rs`。
+- 共有設定: `src/settings.rs`, `src/settings_transfer.rs`, `src/ui_dialogs/preferences.rs`, `src/ui_dialogs/preferences/pages.rs`, `src/ui_dialogs/preferences/search_index.rs`。
+- 設計/仕様: `docs/README.md`, `docs/architecture-overview.md`, `docs/async-architecture.md`, `docs/book-resume-meter-plan.md`, `docs/display-pipeline.md`, `docs/next-release-backlog.md`, `docs/settings-export-import-plan.md`, `docs/spec.md`。
+- 利用者向け説明: `htdocs/mimageviewer/manual/grid.html`, `htdocs/mimageviewer/manual/settings.html`, `htdocs/mimageviewer/manual/tut-reading.html`。
+- snapshot (6枚): `tests/snapshots/media_resume_meter_light.png`, `tests/snapshots/media_resume_meter_dark.png`, `tests/snapshots/media_resume_meter_badge_off_light.png`, `tests/snapshots/media_resume_meter_badge_off_dark.png`, `tests/snapshots/preferences_book_resume_meter_light.png`, `tests/snapshots/preferences_book_resume_meter_dark.png`。
+
+## 11. §1.333「最後まで視聴」の記録 (2026-10-05追加決定)
+
+状態: 実装完了・全体ゲートと確認用ビルド済み、利用者の実機確認待ち。通常コピー/移動は対象外、3秒未満はwatched保持という設計担当の決定を反映済み。前段のコミット未実施差分に追加し、製品起動はしない。
+
+### 11.1 前提差と合意した対象範囲
+
+`video_resume_positions` は共通 `rename_key_migration::STORES` に登録されていない。Appがrename成功/回復時にlive mapを移行し、Settingsの既存full保存でDBへ反映する。通常Shell整理のcopy/moveは `src/ui_dialogs/file_organize.rs:504` で明示的にメタデータ転記を行わず、外部変更検知へ戻す。内容identityの対象はImage/Zip/Pdf等でVideo/Audioを含まない。このため「通常copy/moveも既存resumeと同じ場所へ足すだけ」はコードと一致しない。
+
+設計担当決定 (2026-10-05): 既存のrename/deleteに揃え、通常コピー/移動 (ファイル整理先・クリップボード貼り付け等) は対象外。整理先への移動は利用者が「エクスプローラー移動相当」と決定済みであり、コピー/移動したファイルでは再生位置と同じく最後まで見た記録も引き継がれない。watchedだけ異なる扱いにしない。この経路は変更せず、Shellのprogress sinkや新しい転記状態は追加しない。generic storeのcopy capability自体はwatchedにも登録し、pure DB APIのcopyはテストするが、実媒体のUI copy対応完了とは扱わない。
+
+### 11.2 状態と保存規則
+
+追加の保持状態は `Settings.video_watched_to_end: HashSet<String>` 一つだけ。キーは出荷済みresumeと同じドライブ保持normalize。`settings.db` に `video_watched_to_end(path_normalized TEXT PRIMARY KEY, updated_at INTEGER NOT NULL)` をCREATE IF NOT EXISTSで足し、既存複合値と同じtransactionでsave/loadする。settings_kvへ集合を二重保存せず、設定export/importからもpath履歴として除外する。新表は未リリース追加、出荷済みresume表・HashMapの形と意味は保持する。旧DBはinit_schemaで空表を作り、既存の消えた記録の補完はしない。旧版は新表を読まず、再開動作は変わらない。
+
+保存の唯一の判定は既存 `save_video_resume_position` に集合を渡す。EOF→resume削除/watched追加、EOF以外で3秒未満→resume削除/watched不変、末尾5秒以内→resume削除/watched追加、その他途中→resume保存/watched解除。開始直後や再開playerの初期化で既視聴記録を消さないため3秒未満は保持する。短い動画もEOFなら記録し、EOF前は従来の<3判定順を保つ。値は既存の検証済みRemote/ローカルplayerから渡す。
+
+通常tick/手動保存/save_allは既存apply_media_resume_updatesを、detached終了はread-only teardown planから既存apply_viewer_context_media_resume_updatesを通り、両方とも同じ保存helperへ渡す。Remoteも既存RecordVideoProgress→apply_remote_media_resume_update→共有helperを使う。wire/IPC版・再開helper・previewの復元は変更しない。watched-onlyには再開位置が無いので先頭から開く。
+
+### 11.3 引継ぎ・消去・鮮度
+
+renameはresumeとwatchedを一つのmedia entryとして既存の移行先優先へ揃える。新keyにいずれかがあればその状態を保持し旧keyを捨てる。新keyが空なら旧位置/既視聴を移す。DB generic watched move/copyも同transaction内で新keyのresume行を確認し、resumeが既存ならwatchを追加しない。prefixは既存exact helper経由、旧schemaで新表/resume表が無いfixtureは欠落を許容する。
+
+通常deleteは既存path scope matcherでlive watchedも除去する。明示メタデータ整理はcommit済みreport.deleted_keysで集合を除去し、次のSettings full保存で削除行が復活することを防ぐ。既存purge retryの結果にはworkerで不在を確認したremoved_pathsを一過性payloadとして載せ、受信時に集合だけを同じscopeで除去する。新worker・再読込・pending・状態機械は作らない。このpayloadは永続/制御状態ではなく既存処理の完了データである。
+
+Preferences OKは既存live media memory mergeへ集合を加え、draft生成後の視聴/再視聴/rename/delete結果を落とさない。明示clearの意図があればresume/trackとともに空にする。Cancelはlive値を保持する。
+
+### 11.4 描画・簡素化
+
+Video/Audioのwatched集合参照を最初に行い、あればSome(1.0)を共通LTR painterへ渡す。長さ取得を待たず満タンとする。本の最終anchorの保存済み比率も内容を後から数え直さないため、この扱いは本と一貫する。無ければ従来の途中比率、位置も無ければ帯なし。共通設定OFFは両方非表示。帯・色・バッジ予約・極小セル優先は変更しない。
+
+本のような別map/DB worker、content監視、watch状態enumやDB読み直しは採用しない。判定と所有者を既存保存helperとSettingsへ揃え、まれな失敗への独自retry/回復は増やさない。旧版で再視聴した後の古いwatchedが残ることは、新版で途中を再記録するまで満タンが残る制限として扱う。再開位置は旧版と同じであり、triggerは作らない。
+
+### 11.5 検証・文書更新
+
+保存の途中→末尾→短時間再視聴→途中、EOF/短い媒体、Video/Audio、watched満タンの長さ未取得/失敗、watched-only先頭再開、live mapの即時更新、旧DB空表追加/位置保持、DB往復/clear/KV除外、exact/slash/:: rename/copy/purge・新key合成優先、Remote本番受付/遅いsequence除外、save_all/detached exit、明示cleanup/purge retry、実Preferences OK/save/reopen/Cancel/clearをテストする。
+
+spec/display-pipeline/architecture、設定転送の分類、manual grid/settings、backlogを更新する。共有設定のLight/Dark snapshotは文言変更に合わせ限定更新・目視確認する。前段の検証記録を新watched変更の検証と混同せず、今回のfmt/core check/lib/UI snapshot/glyph/full gate/build結果は以下へ別記する。通常コピー/移動は§11.1の決定に従い対象外。
+
+### 11.6 追加実装の検証記録 (2026-10-05、中断時点)
+
+通常Shellコピー/移動の範囲に関する§11.1の前提差を利用者へ照会し、その判断に依存しない保存・DB・描画・既存rename/delete経路を実装、検証した。独立レビュー (`gpt-6.1-sol` / `xhigh`) の明示cleanup後の集合復活とrename先の合成状態優先のP2は修正済み。修正後の再レビューは残存P1/P2なし。通常Shellコピー/移動を実装済みとするものではない。
+
+| コマンド | exit code | 結果 |
+|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` | 0 / 0 | 整形済み |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最新のUI文言を含む最終check |
+| `cargo test -p mimageviewer --lib video_watched_to_end` | 0 | 8 passed |
+| `cargo test -p mimageviewer --lib resume_meter` | 0 | 50 passed |
+| `cargo test -p mimageviewer --lib rename_key_migration` | 0 | 48 passed / 1 ignored |
+| `cargo test -p mimageviewer --lib metadata_cleanup` | 0 | 10 passed |
+| `cargo test -p mimageviewer --lib settings_transfer` | 0 | 15 passed |
+| `cargo test -p mimageviewer --lib completed_video_keeps_history` | 0 | 1 passed |
+| `cargo test -p mimageviewer --lib parked_media_teardown_resume_seam` | 0 | 1 passed |
+| `cargo test -p mimageviewer --lib save_all_video_resume_removes_eof` | 0 | 1 passed |
+| `cargo test -p mimageviewer --lib audio_mode_resume_uses_clock` | 0 | 1 passed |
+| `cargo test -p mimageviewer --lib teardown_plan_bakes_eof` | 0 | 1 passed |
+| `cargo test -p mimageviewer --lib detached_teardown_plan_carries_confirmed_choice` | 0 | 1 passed |
+| `cargo test --test ui_snapshot` | 0 | 最終比較 76 passed |
+| `python scripts/check_ui_glyphs.py` | 0 | dangerous glyphs なし |
+
+snapshot初回は75 passed / 1 failed (exit 101)。お気に入り設定fixtureが同じサムネイルページ全体を描くため、メーター説明文の増加でスクロールバーのつまみだけが4ピクセル変わった。限定再実行でも同じ差を確認し、本文と配置は変わらないことを目視して期待画像を更新した。メーター設定Light/Darkの説明文更新も限定更新・目視済み。更新後の全76件比較が成功した。
+
+中断時点では、今回の追加実装に対する `test-full.ps1 -SuppressCrashDialogs` と `build-dev.ps1 -PreserveRuntime` は未実行だった。範囲確定後の成功結果は§11.7に記録する。§10の前段成功結果を今回の成功証拠に流用せず、追加watched対応の確認用dev-runtimeを改めて作成した。commit・製品バイナリ起動は行っていない。
+
+実機確認予定: 動画と音声で途中再生→一覧の部分バー→末尾/EOF→満タン→再度開くと先頭→3秒以上の途中で閉じると部分バーへ戻る。再度開いて3秒未満で閉じた場合は満タンを維持する。以前に見終えて位置行がない媒体は帯なし。長さバッジOFF/未取得でもwatchedは満タン。共有設定OFF/ON、rename/delete、記録clearのOK/Cancelも確認する。通常コピー/移動では移動先に記録を引き継がないことを確認する (移動先に既存の記録がないファイルを使う)。
+
+### 11.7 範囲確定後の全体検証 (2026-10-05)
+
+設計担当は§11.1の推奨案を採用し、通常コピー/移動は対象外と決定した。3秒未満のwatched保持も採用済み。設計書・backlog・利用者向けgridマニュアルへ反映し、保存規則や通常Shell経路には追加変更をしない。
+
+初回の `.\scripts\test-full.ps1 -SuppressCrashDialogs` はexit 101。本体libは10,296 passed / 3 failed / 52 ignored、他のworkspaceターゲットは成功した。失敗は共有STORESへsettings.dbのwatchedを登録したことに伴うテストfixtureの追従漏れ: `create_production_store_schemas` がsettings.dbの本番初期化を呼ばず、prefix index検査2件で空DBを検査していた。接続数検査1件もstore数の期待値が24のままだった。
+
+`src/content_identity/restore.rs` のテストだけを修正し、fixtureで `SettingsDb::create_new` / `open` と初回 `save_full` を使う。BINARY leading indexとSEARCH planの検査は維持し、接続数の期待値は25 store + 1 ledger + 8 runtime = 34とする。候補1件/100件で一定という検査も維持する。製品実装・スキーマの修正は不要だった。`cargo fmt` はexit 0、`cargo test -p mimageviewer --lib content_identity::restore::tests` はexit 0 / 17 passed (失敗3件を含む)。ログは `target/watched-full.log`, `target/watched-restore-tests.log`。
+
+2回目の全体ゲートはexit 101。本体libは10,298 passed / 1 failed / 52 ignored。上記3件は成功したが、既存 `old_two_connection_deferred_schema_open_can_fail_despite_busy_timeout` が `[Ok(()), Ok(())]` となった。このテストはschema読込だけをbarrierで揃え、DDL成功側のrollbackを保持しないため、他方のDDL前にロックが解放されると競合を再現できなかった。`src/content_identity.rs` の当該テストだけに、両接続のDDL試行が終わるまでrollbackを待つbarrierを追加する。SQLITE_BUSYの期待値・本番DB処理は変更しない。ログは `target/watched-full-final.log`。
+
+`cargo test -p mimageviewer --features pack-build-tools --lib old_two_connection_deferred_schema_open_can_fail_despite_busy_timeout` はexit 0 / 1 passed。最終の `.\scripts\test-full.ps1 -SuppressCrashDialogs` はexit 0 / 11,394 passed / 58 ignored / 0 failed。本体libは10,299 passed / 52 ignored。workspace・vendor/egui・egui-wgpu・eframeの全段が成功した。filtered-out=0の57集計の合計で、子process内の限定再実行2件は重複計上しない。`CARGO_BUILD_JOBS=1` / `RUST_TEST_THREADS=4` をprocess-localで設定した。ログは `target/watched-schema-race-test.log`, `target/watched-full-verified.log`。
+
+その後の `cargo fmt --check`、`cargo check -p mimageviewer --bin mimageviewer-core`、`python scripts/check_ui_glyphs.py` もすべてexit 0。core checkログは `target/watched-check-verified.log`。追加のテスト修正は `src/content_identity.rs` / `src/content_identity/restore.rs` のcfg(test)内だけで、製品の内容identity処理には変更がない。
+
+`.\scripts\build-dev.ps1 -PreserveRuntime` はexit 0。normal feature set / dev-runtime profileでcore (11m50s)、Remote service (0.53s)、EPUB PDF worker (0.76s) をビルドし、`target/dev-runtime/`へ配置済み。runtime=4 / PE=3の検査も成功した。ログは `target/watched-build.log`。製品バイナリ起動・commitは行っていない。自動検証の未解決点はなく、実機確認は利用者が行う。
+
+範囲確定後の変更ファイルは `docs/book-resume-meter-plan.md`, `docs/next-release-backlog.md`, `htdocs/mimageviewer/manual/grid.html` と、全体ゲートで見つかったテスト不備を直す `src/content_identity/restore.rs`, `src/content_identity.rs`。後二者はcfg(test)内だけの修正である。

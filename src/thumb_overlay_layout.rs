@@ -184,6 +184,7 @@ impl BottomLeftOverlayLayout {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThumbnailOverlayLayout {
+    /// Shared saved-position strip for books, video, and audio (historical field name).
     pub book_resume_meter: Option<egui::Rect>,
     pub check: Option<egui::Rect>,
     pub stack_count: Option<BadgePlacement>,
@@ -241,6 +242,7 @@ pub struct BottomContainerInput<'a> {
 pub struct ThumbnailOverlayLayoutInput<'a> {
     pub cell: egui::Rect,
     pub inner: egui::Rect,
+    /// Reserve the shared saved-position strip only when this cell has a valid fraction.
     pub book_resume_meter: bool,
     pub checked: bool,
     pub stack_count: Option<usize>,
@@ -876,6 +878,98 @@ fn fit_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_resume_meter_reserves_right_bottom_with_duration_badge_on_or_off() {
+        let (cell, inner) = square_cell(100.0);
+        for duration in [None, Some("0:07"), Some("1:02:03")] {
+            let mut input = duration_input(cell, inner);
+            input.media_duration = duration;
+            input.book_resume_meter = true;
+            let layout = layout_thumbnail_overlays(input, measure);
+            let meter = layout.book_resume_meter.expect("room for media meter");
+            assert_eq!(layout.media_duration.is_some(), duration.is_some());
+            if let Some(badge) = layout.media_duration {
+                assert_eq!(badge.rect.max.y, meter.min.y - BOOK_RESUME_METER_GAP);
+                assert!(!badge.rect.intersects(meter));
+            }
+        }
+    }
+
+    #[test]
+    fn media_resume_meter_preserves_duration_count_and_dense_badges_in_small_cells() {
+        let tags = tags(&["#tag", "動画"]);
+        for width in [32.0, 48.0, 64.0, 100.0, 180.0, 240.0] {
+            let (cell, inner) = square_cell(width);
+            for duration in [None, Some("0:07"), Some("1:02:03")] {
+                for count in [None, Some(42)] {
+                    for dense in [false, true] {
+                        let mut input = ThumbnailOverlayLayoutInput {
+                            tags: if dense { &tags } else { &[] },
+                            ..duration_input(cell, inner)
+                        };
+                        input.media_duration = duration;
+                        input.filter_match_count = count;
+                        input.filename = Some("scene.mp4");
+                        input.checked = dense;
+                        input.upscaled_video = dense;
+                        input.rating_text = dense.then_some("★★★★★");
+                        input.edit_badges = EditBadgeFlags {
+                            crop: dense,
+                            pin: dense,
+                            ..Default::default()
+                        };
+                        input.bottom_container = dense.then_some(BottomContainerInput {
+                            kind: BottomContainerKind::Format(FormatBadgeKind::Video),
+                            label: "動画",
+                        });
+                        let baseline = layout_thumbnail_overlays(input.clone(), measure);
+                        input.book_resume_meter = true;
+                        let layout = layout_thumbnail_overlays(input, measure);
+                        for badge in baseline.badge_placements() {
+                            assert!(
+                                layout.badge_placements().any(|candidate| {
+                                    candidate.kind == badge.kind && candidate.text == badge.text
+                                }),
+                                "{width}pt / {duration:?} / {count:?} / dense={dense}: lost {:?}",
+                                badge.kind
+                            );
+                        }
+                        if layout.book_resume_meter.is_none() {
+                            assert_eq!(layout, baseline);
+                        }
+                        if width == 32.0 && dense {
+                            assert!(layout.book_resume_meter.is_none());
+                        }
+                        if width >= 180.0 {
+                            assert!(layout.book_resume_meter.is_some());
+                        }
+                        let occupied: Vec<_> = layout
+                            .check
+                            .iter()
+                            .copied()
+                            .chain(layout.book_resume_meter.iter().copied())
+                            .chain(layout.badge_placements().map(|badge| badge.rect))
+                            .collect();
+                        for (index, rect) in occupied.iter().enumerate() {
+                            assert!(cell.contains_rect(*rect));
+                            for other in occupied.iter().skip(index + 1) {
+                                assert!(
+                                    !rect.intersects(*other),
+                                    "{width}pt / {duration:?} / {count:?} / dense={dense}: {rect:?} overlaps {other:?}"
+                                );
+                            }
+                        }
+                        if let Some(meter) = layout.book_resume_meter {
+                            assert!(layout.badge_placements().all(|badge| {
+                                badge.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn book_resume_meter_owns_bottom_strip_including_right_filter_count() {

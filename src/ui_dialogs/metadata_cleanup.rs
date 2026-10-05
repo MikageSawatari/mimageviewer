@@ -70,6 +70,9 @@ impl App {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
+        self.settings
+            .video_watched_to_end
+            .retain(|key| !deleted.contains(key.as_str()));
         self.rating_cache.clear();
         self.current_folder_rating_cache = None;
         self.invalidate_rating_counts_cache();
@@ -272,5 +275,34 @@ impl App {
             }
             self.show_metadata_cleanup = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod watched_tests {
+    #[test]
+    fn video_watched_to_end_cleanup_removes_only_committed_keys_and_does_not_resurrect_on_save() {
+        let mut app = crate::app::setup_app_for_test();
+        let deleted = crate::adjustment_db::normalize_path(&app.tmp.path().join("gone.mp4"));
+        let kept = crate::adjustment_db::normalize_path(&app.tmp.path().join("gone.mp4-copy.flac"));
+        app.settings.video_watched_to_end =
+            std::collections::HashSet::from([deleted.clone(), kept.clone()]);
+        app.apply_metadata_cleanup_result(&crate::metadata_cleanup::DeleteReport {
+            deleted_keys: vec![deleted.clone()],
+            ..Default::default()
+        });
+        assert_eq!(
+            app.settings.video_watched_to_end,
+            std::collections::HashSet::from([kept.clone()])
+        );
+        app.settings.save();
+        let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(
+            loaded.video_watched_to_end,
+            std::collections::HashSet::from([kept])
+        );
     }
 }

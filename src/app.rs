@@ -154,6 +154,8 @@ pub(crate) mod content_identity_restore;
 mod detached_window_manager;
 mod facet_name_filter;
 pub(crate) mod folder_scan;
+#[cfg(test)]
+mod media_resume_meter_tests;
 pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
 pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
@@ -244,7 +246,8 @@ pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     draw_cell, draw_cut_badge, draw_spread_pair_cursor, grid_tag_badge_hit_rect,
-    layout_cell_overlays, paint_book_resume_meter, primary_grid_tag_for_badge, tq_draw_preview,
+    layout_cell_overlays, paint_thumbnail_resume_meter, primary_grid_tag_for_badge,
+    tq_draw_preview,
 };
 use metadata_ops::{
     DetailsSortPrimary, DetailsSortRow, cmp_option_last, ctrl_f_progress_total,
@@ -12457,6 +12460,37 @@ fn migrate_key_map_for_rename<V>(
     }
 }
 
+/// Resume and watched describe the same media entry; an existing destination wins.
+fn migrate_media_memory_for_rename(
+    positions: &mut HashMap<String, f64>,
+    watched: &mut HashSet<String>,
+    old_k: &str,
+    new_k: &str,
+) {
+    let affected: HashSet<String> = positions
+        .keys()
+        .chain(watched.iter())
+        .filter(|key| renamed_key_for(key, old_k, new_k).is_some())
+        .cloned()
+        .collect();
+    for key in affected {
+        let destination = renamed_key_for(&key, old_k, new_k).expect("affected key");
+        let destination_exists =
+            positions.contains_key(&destination) || watched.contains(&destination);
+        let position = positions.remove(&key);
+        let completed = watched.remove(&key);
+        if destination_exists {
+            continue;
+        }
+        if let Some(position) = position {
+            positions.insert(destination.clone(), position);
+        }
+        if completed {
+            watched.insert(destination);
+        }
+    }
+}
+
 /// bundle が削除 / リネーム対象 path を「表示中 / 再生中」か。判定対象は現在表示
 /// アイテム (fullscreen_idx)・bundle の current_folder (フォルダ / コンテナ自体の削除)・
 /// fs_cache 内の VideoPlayer (再生中 handle)。含まれるだけのアイテムは対象外。
@@ -12700,6 +12734,7 @@ fn pause_viewer_context_bundle_media_for_remote_session(context: ContextRef<'_>)
 #[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
     map: &mut std::collections::HashMap<String, f64>,
+    watched: &mut HashSet<String>,
     choices: &mut std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
     updates: &[MediaResumeUpdate],
 ) -> Vec<String> {
@@ -12710,6 +12745,7 @@ fn apply_viewer_context_media_resume_updates(
         }
         if !save_video_resume_position(
             map,
+            watched,
             update.key.clone(),
             update.position,
             update.duration,
@@ -38728,6 +38764,9 @@ impl App {
             .video_resume_positions
             .retain(|key, _| !matches_key(key));
         self.settings
+            .video_watched_to_end
+            .retain(|key| !matches_key(key));
+        self.settings
             .video_audio_track_choices
             .retain(|key, _| !matches_key(key));
         #[cfg(windows)]
@@ -40996,7 +41035,12 @@ impl App {
         if old_k == new_k {
             return;
         }
-        migrate_key_map_for_rename(&mut self.settings.video_resume_positions, &old_k, &new_k);
+        migrate_media_memory_for_rename(
+            &mut self.settings.video_resume_positions,
+            &mut self.settings.video_watched_to_end,
+            &old_k,
+            &new_k,
+        );
         migrate_key_map_for_rename(&mut self.settings.video_audio_track_choices, &old_k, &new_k);
         #[cfg(windows)]
         migrate_key_map_for_rename(&mut self.video_resume_thumb_last_request, &old_k, &new_k);
@@ -41010,6 +41054,10 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(report) => {
                     self.delete_purge_retry_pending = None;
+                    let removed_key = removed_path_key_matcher(&report.removed_paths);
+                    self.settings
+                        .video_watched_to_end
+                        .retain(|key| !removed_key(key));
                     self.reload_book_resume_meters();
                     self.apply_content_identity_store_mutations(report.store_mutations);
                     crate::logger::log(format!(
@@ -53402,6 +53450,7 @@ impl App {
             .collect();
         let removed = apply_viewer_context_media_resume_updates(
             &mut self.settings.video_resume_positions,
+            &mut self.settings.video_watched_to_end,
             &mut self.settings.video_audio_track_choices,
             &updates,
         );
@@ -59814,13 +59863,13 @@ impl App {
         }
     }
 
-    fn thumbnail_media_duration_enabled(&self) -> bool {
+    fn thumbnail_media_metadata_enabled(&self) -> bool {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
-            && self.settings.thumb_show_media_duration
+            && (self.settings.thumb_show_media_duration || self.settings.thumb_show_resume_meter)
     }
 
     fn details_lazy_uses_visible_stages(&self) -> bool {
-        self.thumbnail_media_duration_enabled()
+        self.thumbnail_media_metadata_enabled()
             || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                 && self.settings.details_show_page_count
                 && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
@@ -59841,7 +59890,7 @@ impl App {
         if self.selection_info_needs_lazy_meta_request() {
             return true;
         }
-        if self.thumbnail_media_duration_enabled() {
+        if self.thumbnail_media_metadata_enabled() {
             return self.details_tag_prewarm_indices.iter().copied().any(|idx| {
                 self.details_item_requires_lazy_meta(idx)
                     && self
@@ -59910,7 +59959,7 @@ impl App {
         if self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail {
             return;
         }
-        if !self.thumbnail_media_duration_enabled() && self.ai_model_facet_should_load() {
+        if !self.thumbnail_media_metadata_enabled() && self.ai_model_facet_should_load() {
             return;
         }
         let selected = self.selection_info_lazy_target_idx();
@@ -59919,7 +59968,7 @@ impl App {
             || self.selection_info_needs_lazy_meta_request(),
             |pending| pending.selection_target_key != selection_key,
         );
-        let mut near = if self.thumbnail_media_duration_enabled() {
+        let mut near = if self.thumbnail_media_metadata_enabled() {
             self.keep_set_sorted()
         } else {
             Vec::new()
@@ -60238,7 +60287,7 @@ impl App {
                     || self.selection_info_lazy_target_idx().is_some()
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_show_media_duration
+                self.thumbnail_media_metadata_enabled()
                     || self.ai_model_facet_should_load()
                     || self.selection_info_lazy_target_idx().is_some()
             }
@@ -60287,7 +60336,7 @@ impl App {
         !self.ai_model_facet_should_load()
             && match self.settings.grid_view_mode {
                 crate::settings::GridViewMode::Thumbnail => {
-                    !self.settings.thumb_show_media_duration
+                    !self.thumbnail_media_metadata_enabled()
                 }
                 crate::settings::GridViewMode::Details => !self.details_any_lazy_columns_enabled(),
             }
@@ -60411,7 +60460,7 @@ impl App {
                         && self.selection_info_lazy_column_requested(DetailsColumn::VideoCodec)),
             ),
             crate::settings::GridViewMode::Thumbnail => (
-                self.settings.thumb_show_media_duration
+                self.thumbnail_media_metadata_enabled()
                     || (selection_or_ai
                         && self.selection_info_lazy_column_requested(DetailsColumn::VideoDuration)),
                 selection_or_ai
@@ -60732,7 +60781,7 @@ impl App {
             )
         } else if visible_page_count_stage_only
             || scan_scope == DetailsMetaScanScope::VisibleStage
-            || (self.thumbnail_media_duration_enabled()
+            || (self.thumbnail_media_metadata_enabled()
                 && (!ai_facet_load || scan_scope == DetailsMetaScanScope::VisibleStage))
         {
             let order = self.details_meta_visible_order();
@@ -81660,6 +81709,7 @@ impl App {
             );
             let kept = save_video_resume_position(
                 &mut self.settings.video_resume_positions,
+                &mut self.settings.video_watched_to_end,
                 update.key.clone(),
                 update.position,
                 update.duration,
@@ -88346,6 +88396,7 @@ pub(crate) const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
 /// - それ以外 → position を保存
 fn save_video_resume_position(
     map: &mut std::collections::HashMap<String, f64>,
+    watched: &mut HashSet<String>,
     key: String,
     position: f64,
     duration: f64,
@@ -88353,6 +88404,7 @@ fn save_video_resume_position(
 ) -> bool {
     if at_eof {
         map.remove(&key);
+        watched.insert(key);
         return false;
     }
     if position < VIDEO_RESUME_MIN_POSITION_SECS {
@@ -88361,8 +88413,10 @@ fn save_video_resume_position(
     }
     if duration > 0.0 && position >= duration - VIDEO_RESUME_END_GUARD_SECS {
         map.remove(&key);
+        watched.insert(key);
         return false;
     }
+    watched.remove(&key);
     map.insert(key, position);
     true
 }

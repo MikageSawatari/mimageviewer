@@ -233,14 +233,18 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 重なる場合は左下の低優先要素を表示しない。右下の絞り込み件数は左上・左下と重ならない位置まで上げ、余地がなければ省略する。色・角丸・フォントなど各要素の見た目は
 `ui_helpers.rs` の個別描画関数が持つ。
 スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
-通常一覧のFolder/ZipFile/PdfFileには、保存済み読書位置が有効な場合だけ下端へ3ptの
+本のFolder/ZipFile/PdfFileと動画/音声セルには、保存済み位置の有効な比率がある場合だけ下端へ3ptの
 メーターを重ねる。`ThumbnailOverlayLayout` が帯と2pt gapを予約し、左下だけでなく
 cell基準の右下件数もその上へ配置する。極小セルで既存バッジが失われる場合は帯を省略する。
 セル高・画像fit・並び順・hit-testは変更せず、内容bitmapへ焼き込まない。色は
 `os_theme::book_resume_meter_palette`。メーターは常に左から右へ伸び、`fullscreen_seek_direction` と本の読み方向には連動しない。
-比率はHUDの読み順で記録したanchor ordinal/totalで、見開きの相手ページは加算しない。
-起動時writer全行readと稀なDB変更後read以外はAppのpath memo/mapだけを参照する。
-未読・NULL・不正値はtrackも出さず、設定OFFではpaintだけを止める。
+本の比率はHUDの読み順で記録したanchor ordinal/totalで、見開きの相手ページは加算しない。
+動画/音声はliveのwatched集合にあれば長さ不要で満タンとする。それ以外はliveの再生位置表と現在source stampに一致した取得済み長さから求める。
+右下の長さバッジも帯+gapの上へ予約する。watchedなし・位置なしなら帯を出さない。途中位置は長さ不明・失敗/不正比率では帯を出さない。
+長さバッジOFFでも共通の前回位置設定がONなら既存の可視+近傍workerで長さを取得する。
+本は起動時writer全行readと稀なDB変更後read以外はAppのpath memo/mapだけを参照する。
+動画/音声用の位置mapは複製せず、描画からDB/ファイル/FFmpegへは到達しない。
+未読・NULL・不正値はtrackも出さず、設定OFFでも位置の記録は続く。動画/音声の長さ取得は、長さバッジまたは共通の前回位置設定がONのときに要求する。
 詳細は [book-resume-meter-plan.md](book-resume-meter-plan.md)。
 補正済みサムネイルの生成は `thumb.adjustment_build` perf event で色調処理と
 `ctx.load_texture` を分けて計測できる。`origin=visible` は一覧描画中、

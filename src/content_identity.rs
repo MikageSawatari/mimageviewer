@@ -2607,10 +2607,12 @@ mod tests {
         drop(conn);
 
         let both_read_schema = Arc::new(std::sync::Barrier::new(2));
+        let both_attempted_create = Arc::new(std::sync::Barrier::new(2));
         let attempts: Vec<_> = (0..2)
             .map(|_| {
                 let db_path = db_path.clone();
                 let both_read_schema = Arc::clone(&both_read_schema);
+                let both_attempted_create = Arc::clone(&both_attempted_create);
                 std::thread::spawn(move || {
                     let mut conn = rusqlite::Connection::open(db_path).unwrap();
                     conn.busy_timeout(Duration::from_secs(5)).unwrap();
@@ -2619,6 +2621,9 @@ mod tests {
                     both_read_schema.wait();
                     let result =
                         tx.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)");
+                    // Keep the successful writer's lock until the other read transaction
+                    // attempts its upgrade. Rolling back earlier can let both DDLs succeed.
+                    both_attempted_create.wait();
                     tx.rollback().unwrap();
                     result.map_err(|error| error.to_string())
                 })
