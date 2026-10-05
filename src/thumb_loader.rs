@@ -514,6 +514,19 @@ pub(crate) fn decode_raw_thumbnail_on_worker(
     display_px: u32,
     executor: &crate::raw::RawDevelopExecutor,
 ) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    decode_raw_thumbnail_on_cancellable_worker(source, display_px, executor, None)
+}
+
+fn decode_raw_thumbnail_on_cancellable_worker(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
+    if cancelled() {
+        return Err(crate::raw::RawError::Cancelled);
+    }
     let info = crate::raw::raw_decoder::info(source.as_source())?;
     let dims = (info.developed_dims[0], info.developed_dims[1]);
     let threshold = display_px.min(dims.0.max(dims.1));
@@ -531,8 +544,35 @@ pub(crate) fn decode_raw_thumbnail_on_worker(
         return Err(crate::raw::RawError::Unsupported(reason));
     }
     let (tx, rx) = mpsc::channel();
-    let _ticket = executor.submit_thumbnail_half(source, crate::raw::RawPriority::Background, tx);
-    let output = rx.recv().map_err(|_| crate::raw::RawError::Cancelled)??;
+    let ticket = executor.submit_thumbnail_half_with_cancel_flag(
+        source,
+        crate::raw::RawPriority::Background,
+        tx,
+        cancel.cloned(),
+    );
+    let output = if cancel.is_some() {
+        // A flag alone does not remove a queued executor job. Retire our ticket
+        // without waiting for Background admission, or joining running native work.
+        loop {
+            if cancelled() {
+                ticket.cancel();
+                return Err(crate::raw::RawError::Cancelled);
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(output) => break output?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(crate::raw::RawError::Cancelled);
+                }
+            }
+        }
+    } else {
+        rx.recv().map_err(|_| crate::raw::RawError::Cancelled)??
+    };
+    if cancelled() {
+        ticket.cancel();
+        return Err(crate::raw::RawError::Cancelled);
+    }
     Ok(RawThumbnailRaster {
         image: output.image,
         developed_dims: dims,
@@ -570,6 +610,9 @@ pub enum RawThumbUnavailable {
 #[derive(Clone)]
 pub enum RawThumbHandoff {
     Local(RawThumbLocalHandoff),
+    /// Only dedicated workers may wait here, with no thumbnail/I/O/PDF permit.
+    /// Uses the same App-owned executor and Background admission as cache creation.
+    DedicatedWorker(Arc<crate::raw::RawDevelopExecutor>),
     RemotePreviewOnly(mpsc::Sender<RawThumbUnavailable>),
 }
 
@@ -4047,6 +4090,14 @@ pub fn load_one_cached(
                 Ok(crate::raw::RawOwnedSource::Path(path.to_owned()))
             };
         source_result.and_then(|source| {
+            if let Some(RawThumbHandoff::DedicatedWorker(executor)) = raw_handoff {
+                let raster = decode_raw_thumbnail_on_cancellable_worker(
+                    source, display_px, executor, cancel,
+                )
+                .map_err(raw_image_error)?;
+                raw_developed_dims = Some(raster.developed_dims);
+                return Ok(raster.image);
+            }
             let info =
                 crate::raw::raw_decoder::info(source.as_source()).map_err(raw_image_error)?;
             let developed_dims = info.developed_dims;
@@ -4073,7 +4124,10 @@ pub fn load_one_cached(
                     }
                     let handoff = match raw_handoff {
                         Some(RawThumbHandoff::Local(handoff)) => handoff,
-                        Some(RawThumbHandoff::RemotePreviewOnly(_)) => unreachable!(),
+                        Some(
+                            RawThumbHandoff::RemotePreviewOnly(_)
+                            | RawThumbHandoff::DedicatedWorker(_),
+                        ) => unreachable!(),
                         None => return Err(raw_image_error(crate::raw::RawError::Internal(-1))),
                     };
                     let Some(mut next_req) = deferred_req else {
@@ -4420,7 +4474,15 @@ pub fn load_one_cached(
                     &e,
                     image::ImageError::IoError(io) if io.kind() == std::io::ErrorKind::Interrupted
                 );
-            let cancelled = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            let raw_cancelled = is_raw
+                && matches!(
+                    &e,
+                    image::ImageError::IoError(io)
+                        if io.get_ref().and_then(|error| error.downcast_ref::<crate::raw::RawError>())
+                            == Some(&crate::raw::RawError::Cancelled)
+                );
+            let cancelled =
+                raw_cancelled || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
             // **Codex P2 対応 (2026-05)**:
             // `pdf_interrupted` は cancel_token を flip せず epoch だけ進めた経路

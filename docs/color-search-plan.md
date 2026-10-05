@@ -173,7 +173,14 @@ Codex がレビューで挙げた問題が、オンデマンド化でどうな�
    数百 MB を一時的に重複させてしまう。必要キーだけ個別 SELECT する。取得した行はworkerの1行だけの私有mapで既存サムネイル処理へ渡し、遅いDB読取で共有mapの新しい行を上書きしない。
 3. **再利用できるキャッシュが無い**: 元画像を**デコードし、縮小/サンプリング**する。ZIP/PDF 親代表は既存の先頭画像デコード / ページ0レンダ、または手動pin代表の生成へ進む。
    - **JPEG**: turbojpeg の DCT スケール（1/8 等）で**入口から縮小デコード**でき軽い。
-   - **PNG / WebP / WIC（HEIC/AVIF/JXL/TIFF/RAW）**: ほとんどの経路は**いったんフル解像度
+   - **RAW**: 通常画像・ZIP 内画像・ZIP 自動/pin 代表とも、既存のサムネイル処理に
+     `RawThumbHandoff::DedicatedWorker` を渡す。画質サンプル/キャッシュ作成と同じ
+     `decode_raw_thumbnail_on_worker` の判定を再利用し、十分な埋め込みプレビューが無ければ
+     App 共通 `RawDevelopExecutor` の Background admission で half 現像する。
+     待機は専有色 worker 上だけで行い、サムネイル/I/O/PDF の permit は保持しない。
+     scan の cancel flag を共有し、待機中は 50 ms ごとの channel wait で取消を観測して
+     自分の ticket を cancel する。実行中の現像は native 終了まで executor 枠を保持する。
+   - **PNG / WebP / WIC（HEIC/AVIF/JXL/TIFF）**: ほとんどの経路は**いったんフル解像度
      デコードしてから縮小**する（Codex P2）。つまり「低解像度指定」でも decode コスト自体は
      フル decode のことが多い。→ §3.2 の上限/進捗/キャンセル/大量時の確認が重要。
    - ZIP/PDF の親一覧項目は既存の代表サムネ（先頭画像 / ページ0、または手動 pin）を画素源にする。動画は対象外。
@@ -229,12 +236,18 @@ raw `rayon` でフォルダ全件を一気にデコードすると、**サムネ
 - 対象に `ZipFile` (ZIP/CBZ) と PDF の `PdfFile` を追加する。通常画像・ZIP画像・PDFページ・Stack は維持する。`PdfFile` に共用される EPUB、変換書庫、実フォルダ、動画、音声、ZipDir は追加しない。
 - 先頭画像 / ページ0、または手動 pin の代表だけを既存の一覧サムネイルで判定し、全ページを走査しない。要求は `make_load_request`、画素取得は色 worker 内の `process_load_request` を再利用する。pin の stat / cascade DB lookup も色 worker で行う。
 - PDF 代表の `pdfthumb:` / `pdfthumb:...#pin:` 要求は一覧と同じキャッシュ設定で読み書きする。直接 `PdfPage` の色スキャンは従来どおり保存 Off。Off は既存サムネイルの読取まで禁止するものではない。PDF は UI enqueue 時の context epoch と Normal 優先度を使い、epoch を worker で読み直さない。
-- スキャン中は ZIP/PDF を先に除外せず、従来の完了時一括反映・進捗・取消・2,000件以上の missing 確認を共有する。**取得失敗は通常画像と同じく空パレットで、不一致として扱う**。新しい失敗状態や自動再試行は作らない。
+- スキャン中は ZIP/PDF を先に除外せず、従来の完了時一括反映・進捗・取消・2,000件以上の missing 確認を共有する。**実際のデコード失敗は通常画像と同じく空パレットで、不一致として扱う**。RAW の現像待ちは完了まで worker が待ち、取消・executor 終了・PDF epoch 失効の `canceled` 通知は scan の取消へ伝えて Item を公開しない。一時的な画素未取得を空パレットで確定しない。新しい失敗状態や自動再試行は作らない。
 - 色キーと scope signature には item の `perf_key` に加え、代表 storage base、`#pin:` 相当の root pin 指定、pin DB の変更 stamp (cascade の子 pin 変更を含む)、探索深度、per-item サムネイル更新世代を含める。canonical `#pin:` storage suffix の解決は既存 worker 経路へ委譲する。pin stamp はメモリ上の atomic 読取だけで、UI に stat / DB lookup を追加しない。
 - `fresh_entry` は従来どおり親ファイルの mtime・size も照合する。pin変更・解除 / cascade変更 / 更新世代変更でキーとscopeが変わるため、旧workerの遅着結果は現在項目には採用されない。pin DB の stamp は pinned 代表だけに含め、無関係なpin変更で未固定代表のキーを変更しない。
 - 一覧サムネイルの source decode 完了通知 (cache保存 / skip 完了) と明示 reload eviction で、そのZIP/PDF項目だけ更新世代を進め、色scopeをdirtyにする。cache hit・通常のGPU evictionは世代を進めない。フォルダ再ロード / items交換で色状態と世代を破棄する。色worker自身のcache保存はUIサムネイル通知を出さないため自己失効ループを作らない。
 - 色状態は main grid の所有物で、viewer payload の交換対象ではない。更新世代を進めるのは既存の projected context ID が main と一致するときだけとし、別ウィンドウの代表更新で main の色スキャンを失効させない。
 - 簡素化: pin変更は既存の一覧reload経路を使い、専用のlive rebuildや失敗復旧状態を作らない。色スキャンは既存の取消・scope照合を再利用できるため、新しいモーダルは追加しない。
+- RAW 統合修正 (2026-10-05): 通常 RAW も従来は handoff 無しで half 現像不可だったため、
+  通常/代表を同じ既存 worker 用デコードへ揃えた。サムネイル完了後の再スキャンだけで待つ案は、
+  cache Off で共有画素が残らず、通常 RAW に代表更新トリガも無いので採用しない。
+  独立設計レビューで共有 executor/Background と ticket 取消の構造を合意した。
+  PDF 代表の pin は内部 PdfPage のみで RAW へ解決されない。EPUB/変換書庫/実フォルダ等の
+  親代表は従来どおり対象外。ZIP 内画像と Stack の RAW は同じ修正経路を使う。
 
 ### 3.5 候補色 (§1.291、実装済み・未レビュー)
 

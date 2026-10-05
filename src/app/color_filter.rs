@@ -516,6 +516,7 @@ impl App {
         let cache_decision = CacheDecision::from_settings(&self.settings);
         let stats = Arc::clone(&self.stats);
         let pin_db = self.folder_thumb_pin_db.clone();
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
         // サムネ生成と同じ並列度設定に従う (Auto = cores/2)。デコードを並列化しつつ
         // I/O 競合を抑える。
         let threads = self.settings.parallelism.thread_count();
@@ -549,6 +550,7 @@ impl App {
                     cache_decision,
                     stats,
                     pin_db,
+                    raw_executor,
                     threads,
                     cancel,
                     tx,
@@ -814,6 +816,7 @@ fn run_color_scan_worker(
     cache_decision: CacheDecision,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    raw_executor: Arc<crate::raw::RawDevelopExecutor>,
     threads: usize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<crate::color_search::ColorScanMessage>,
@@ -821,6 +824,7 @@ fn run_color_scan_worker(
     let done = Arc::new(AtomicUsize::new(0));
     let keep_start = Arc::new(AtomicUsize::new(0));
     let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
+    let raw_handoff = crate::thumb_loader::RawThumbHandoff::DedicatedWorker(raw_executor);
 
     // 1 件ぶんの処理。`cache_map` / `catalog` (Mutex<Connection>) / `stats` はいずれも
     // 内部同期されているので複数スレッドから安全に共有できる。`tx` は for_each_with の
@@ -875,6 +879,7 @@ fn run_color_scan_worker(
             &keep_start,
             &keep_end,
             pin_db.as_deref(),
+            &raw_handoff,
         )
         .unwrap_or_default();
         if cancel.load(Ordering::Relaxed) {
@@ -948,6 +953,7 @@ fn load_palette_for_request(
     keep_start: &Arc<AtomicUsize>,
     keep_end: &Arc<AtomicUsize>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    raw_handoff: &crate::thumb_loader::RawThumbHandoff,
 ) -> Option<crate::color_search::Palette> {
     if cancel.load(Ordering::Relaxed) {
         return None;
@@ -979,12 +985,14 @@ fn load_palette_for_request(
         pin_db,
         None,
         None,
-        None,
+        Some(raw_handoff),
     );
 
     let mut image = None;
     while let Ok(msg) = rx.try_recv() {
         if msg.canceled {
+            // Transient unavailable pixels must not become an empty, final palette.
+            cancel.store(true, Ordering::Release);
             return None;
         }
         if image.is_none() {
@@ -1182,22 +1190,13 @@ mod tests {
         catalog: Option<Arc<crate::catalog::CatalogDb>>,
     ) -> crate::color_search::Palette {
         let (tx, rx) = mpsc::channel();
-        run_color_scan_worker(
-            1,
-            2,
-            vec![ColorScanWorkItem {
-                key: "test".into(),
-                req,
-                pin_source,
-            }],
+        run_test_scan(
+            req,
+            pin_source,
             Arc::new(std::sync::RwLock::new(entries)),
             catalog,
-            128,
-            75,
             always_cache_decision(),
-            Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
-            None,
-            1,
+            Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -1212,6 +1211,273 @@ mod tests {
             }
         ));
         result.palette
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_test_scan(
+        req: LoadRequest,
+        pin_source: Option<crate::folder_thumb_pins::FolderPinSource>,
+        cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        catalog: Option<Arc<crate::catalog::CatalogDb>>,
+        decision: CacheDecision,
+        executor: Arc<crate::raw::RawDevelopExecutor>,
+        cancel: Arc<AtomicBool>,
+        tx: mpsc::Sender<crate::color_search::ColorScanMessage>,
+    ) {
+        run_color_scan_worker(
+            1,
+            2,
+            vec![ColorScanWorkItem {
+                key: "test".into(),
+                req,
+                pin_source,
+            }],
+            cache_map,
+            catalog,
+            128,
+            75,
+            decision,
+            Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
+            None,
+            executor,
+            1,
+            cancel,
+            tx,
+        );
+    }
+
+    #[cfg(windows)]
+    fn raw_without_preview() -> PathBuf {
+        let path = PathBuf::from("vendor/raw-samples/3196.mos");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        assert!(matches!(
+            crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(&path)),
+            Err(crate::raw::RawError::NoUsablePreview(_))
+        ));
+        path
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_raw_zip_representatives_without_preview_develop_with_cache_on_and_off() {
+        use std::io::Write;
+        let source = raw_without_preview();
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("raw.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zip.start_file("cover.mos", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&std::fs::read(&source).unwrap()).unwrap();
+        zip.finish().unwrap();
+
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let raster = crate::thumb_loader::decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(source.clone()),
+            128,
+            &executor,
+        )
+        .unwrap();
+        let expected = crate::color_search::extract_palette_from_color_image(
+            &crate::thumb_loader::resize_to_display_color_image(
+                &raster.image,
+                128,
+                Some(raster.developed_dims),
+            ),
+        );
+        assert!(!expected.colors.is_empty());
+
+        let request = |path: &Path, zip_entry, cache_key_override| {
+            let meta = std::fs::metadata(path).unwrap();
+            LoadRequest {
+                path: path.to_owned(),
+                zip_entry,
+                cache_key_override,
+                mtime: crate::ui_helpers::mtime_secs(&meta),
+                file_size: meta.len() as i64,
+                ..Default::default()
+            }
+        };
+        let ordinary = request(&source, None, None);
+        let leaf = request(&zip_path, Some("cover.mos".into()), None);
+        let parent = request(&zip_path, None, Some("zipthumb:raw.zip".into()));
+        let pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "cover.mos".into(),
+        };
+        for policy in [
+            crate::settings::CachePolicy::Always,
+            crate::settings::CachePolicy::Off,
+        ] {
+            for (req, pin_source) in [
+                (ordinary.clone(), None),
+                (leaf.clone(), None),
+                (parent.clone(), None),
+                (parent.clone(), Some(pin.clone())),
+            ] {
+                let cache_dir = tempfile::tempdir().unwrap();
+                let db = Arc::new(
+                    crate::catalog::CatalogDb::open(cache_dir.path(), tmp.path()).unwrap(),
+                );
+                let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+                    String,
+                    crate::catalog::CacheEntry,
+                >::new()));
+                // A stale parent cache must not supply substitute colors.
+                if req.cache_key_override.is_some() && pin_source.is_none() {
+                    let stale = cache_entry([0, 255, 0], req.mtime - 1, req.file_size);
+                    cache_map
+                        .write()
+                        .unwrap()
+                        .insert("zipthumb:raw.zip".into(), stale.clone());
+                    db.save_thumb_bytes(
+                        "zipthumb:raw.zip",
+                        stale.mtime,
+                        stale.file_size,
+                        stale.source_dims,
+                        &stale.jpeg_data,
+                    )
+                    .unwrap();
+                }
+                let mut decision = always_cache_decision();
+                decision.policy = policy;
+                decision.zip_always = false;
+                let (tx, rx) = mpsc::channel();
+                run_test_scan(
+                    req,
+                    pin_source,
+                    Arc::clone(&cache_map),
+                    Some(Arc::clone(&db)),
+                    decision,
+                    Arc::clone(&executor),
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                );
+                let crate::color_search::ColorScanMessage::Item(result) = rx.recv().unwrap() else {
+                    panic!("developed palette before Done")
+                };
+                assert_eq!(result.palette.colors.len(), expected.colors.len());
+                for (actual, expected) in result.palette.colors.iter().zip(&expected.colors) {
+                    assert_eq!(actual.rgb, expected.rgb);
+                    assert_eq!(actual.ratio, expected.ratio);
+                }
+                assert!(matches!(
+                    rx.recv().unwrap(),
+                    crate::color_search::ColorScanMessage::Done {
+                        cancelled: false,
+                        ..
+                    }
+                ));
+                if policy == crate::settings::CachePolicy::Off {
+                    assert!(
+                        cache_map
+                            .read()
+                            .unwrap()
+                            .values()
+                            .all(|entry| entry.mtime != result.mtime)
+                    );
+                    assert!(
+                        db.load_all()
+                            .unwrap()
+                            .values()
+                            .all(|entry| entry.mtime != result.mtime)
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_raw_cancel_retires_queued_develop_without_waiting_for_other_owner() {
+        let source = raw_without_preview();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (_other_ticket, other_result) =
+            executor.block_one_slot_with_result_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker_executor = Arc::clone(&executor);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            run_test_scan(
+                LoadRequest {
+                    path: source,
+                    ..Default::default()
+                },
+                None,
+                Arc::new(std::sync::RwLock::new(Default::default())),
+                None,
+                always_cache_decision(),
+                worker_executor,
+                worker_cancel,
+                tx,
+            );
+        });
+        executor.wait_for_queued_job_for_test();
+        cancel.store(true, Ordering::Release);
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let running = executor.running_jobs_for_test();
+        let waiting = executor.waiting_jobs_for_test();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            matches!(
+                done.unwrap(),
+                crate::color_search::ColorScanMessage::Done {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "cancellation must send no empty Item, and finish before the unrelated job"
+        );
+        assert_eq!(
+            running, 1,
+            "scan cancellation must leave the other owner running"
+        );
+        assert_eq!(waiting, 0, "canceled scan must retire its queued job");
+        assert!(
+            other_result
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_raw_executor_rejection_never_publishes_empty_final_palette() {
+        let source = raw_without_preview();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        executor.shutdown();
+        let (tx, rx) = mpsc::channel();
+        run_test_scan(
+            LoadRequest {
+                path: source,
+                ..Default::default()
+            },
+            None,
+            Arc::new(std::sync::RwLock::new(Default::default())),
+            None,
+            always_cache_decision(),
+            executor,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        assert!(matches!(
+            rx.recv().unwrap(),
+            crate::color_search::ColorScanMessage::Done {
+                cancelled: true,
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     fn cache_entry(rgb: [u8; 3], mtime: i64, file_size: i64) -> crate::catalog::CacheEntry {

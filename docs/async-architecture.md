@@ -168,6 +168,18 @@ stream 不在・非対応 codec / container だけを `Unreadable` とする。�
 UI は既存 `DetailsLazyMeta` を読むだけ。古い source identity の読取結果は公開前に破棄する。
 catalog の詳細・aggregate lookup・簡素化判断は [catalog-design.md](catalog-design.md) を参照。
 
+### 色スキャンの RAW half 現像
+
+色スキャンは既存の専有 worker と scan cancel flag を所有し、通常 RAW・ZIP 内 RAW・
+ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedWorker` へ渡す。
+プレビューの判定と half 現像はキャッシュ作成/画質サンプルと同じ worker 用 decoder、
+実行枠は App 共通 `RawDevelopExecutor` の Background を使う。色 worker は他の permit を
+保持せずに channel で待ち、executor の枠が返った後に縮小・保存・パレット抽出を行う。
+50 ms の channel wait ごとに取消を観測し、自分の ticket を cancel して worker を終了する。
+待機中の job は列から除去し、実行中の native call は join せず実終了まで枠を保持する。
+`canceled` な thumbnail 結果は scan を取消し、空パレットを Item として公開しない。
+既存 scan_id / scope signature / 代表 identity による適用境界と grid の RAW 所有状態は変更しない。
+
 ## 2. スレッド間通信
 
 ### 2.1 共有アトミック

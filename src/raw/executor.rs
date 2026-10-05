@@ -410,10 +410,22 @@ impl RawDevelopExecutor {
 
     #[cfg(test)]
     pub(crate) fn wait_for_queued_job_for_test(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut state = self.shared.state.lock().unwrap();
         while state.waiting() == 0 {
-            state = self.shared.wake.wait(state).unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Do not poison the executor mutex: Drop also acquires it.
+                drop(state);
+                panic!("RAW job was not queued within 30 seconds");
+            }
+            state = self.shared.wake.wait_timeout(state, remaining).unwrap().0;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_jobs_for_test(&self) -> usize {
+        self.shared.state.lock().unwrap().waiting()
     }
 
     #[cfg(test)]
