@@ -914,6 +914,12 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
   ([計装の読み方](ui-responsiveness.md#恒久的に使える計装))。
 - キャッシュ一括作成 (D4)・画質サンプル (D9) は現状 RAW を扱えていない。同じ振り分けを入れて
   サムネイルと同じ結果にする (half 現像が要る RAW は executor の Background で)
+- 色スキャン (2026-10-05 統合修正) は通常 RAW / ZIP 内 RAW / ZIP 自動・pin 代表を
+  既存の専有 worker 用サムネイルデコードへ揃える (`RawThumbHandoff::DedicatedWorker`)。
+  App 共通 executor の Background half を使い、縮小・保存・パレット抽出は色 worker に戻す。
+  scan cancel flag を現像と共有し、channel 待機中の取消では保持 ticket を cancel して
+  待機列から退役する。取消された画素取得を空の最終パレットとして公開しない。
+  grid の Local handoff の可視範囲/Normal admission、Remote の preview-only 方針は維持する。
 - 類似索引への prefill (`src/thumb_loader.rs:3512-3520`) は、`Other` 形式では「decode 長辺 ≥ source_dims
   長辺」でないと拒否される (`src/similar_index.rs:6722-6737`)。RAW 用の形式区分を足し、プレビューからの
   prefill を受け入れる (§9 D6)
