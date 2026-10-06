@@ -423,8 +423,7 @@ fn run_root_app_update(
 
 #[cfg(windows)]
 fn settle_root_app_update_fixture(app: &mut App, ctx: &egui::Context, frame: &mut eframe::Frame) {
-    app.startup_done = true;
-    app.startup_init = None;
+    app.indexer_init.mark_unavailable_if_not_ready();
     crate::ui_fonts::configure_fonts(ctx);
     let _ = run_root_app_update(app, ctx, frame, root_update_input(Vec::new(), 0.0));
 }
@@ -442,8 +441,7 @@ fn plain_key_press(key: egui::Key) -> egui::Event {
 
 #[cfg(windows)]
 fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[PathBuf]) {
-    app.startup_done = true;
-    app.startup_init = None;
+    app.indexer_init.mark_unavailable_if_not_ready();
     crate::ui_fonts::configure_fonts(ctx);
     seed_images(app, pages);
     let pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::DARK_BLUE));

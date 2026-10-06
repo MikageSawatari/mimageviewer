@@ -5,6 +5,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 #[cfg(test)]
 use crate::final_composite::FinalCompositeTiming;
@@ -4311,6 +4314,7 @@ pub(crate) struct StartupOpenPathResolvePending {
     /// A snapshot-gated Activation temporarily owns the resolver it displaced. If the
     /// Activation is refused, this exact request (receiver and cancel token included) resumes.
     held_resolve_for_activation_admission: Option<Box<StartupOpenPathResolvePending>>,
+    diagnostic: Option<startup_ops::InitialNavigationTrace>,
 }
 
 impl StartupOpenPathResolvePending {
@@ -4326,12 +4330,141 @@ impl Drop for StartupOpenPathResolvePending {
 }
 
 /// バックグラウンドで走らせる `IndexerManager::new` の状態。
-/// 起動フェーズ判定は `App::startup_init.is_some()` で行う (Loading の間だけ Some)。
+/// One owner for the worker, its late result and the installed manager.
+#[derive(Debug, PartialEq, Eq)]
+enum PresentWatchOperation {
+    Begin,
+    Suspend,
+    Resume,
+}
+fn apply_startup_present_watch(
+    visible: bool,
+    minimized: bool,
+    begin: bool,
+    mut apply: impl FnMut(PresentWatchOperation),
+) {
+    if begin {
+        apply(PresentWatchOperation::Begin);
+    }
+    apply(if !visible || minimized {
+        PresentWatchOperation::Suspend
+    } else {
+        PresentWatchOperation::Resume
+    });
+}
+
+fn startup_stage_name(stage: miv_startup::Stage) -> &'static str {
+    use miv_startup::Stage;
+    match stage {
+        Stage::IndexerMetaOpen | Stage::IndexerRebuildRead => "検索の記録を読み込んでいます",
+        Stage::IndexerOldIndexWipe | Stage::FtsSchemaRecreate | Stage::IndexerInventoryReset => {
+            "検索の記録を整理しています"
+        }
+        Stage::FtsOpen | Stage::FtsReader | Stage::FtsWriter => "検索の準備をしています",
+        Stage::IndexerMetadataSpawn | Stage::IndexerDispatcher => "検索の更新を準備しています",
+        Stage::IndexerAdopt => "検索の準備ができました",
+        _ => "検索の準備中",
+    }
+}
+
+pub(crate) enum IndexerInit {
+    NotStarted,
+    Pending(StartupInitPending),
+    Ready(crate::indexer_manager::IndexerManager),
+    Unavailable,
+}
+
+impl IndexerInit {
+    pub(crate) fn as_ref(&self) -> Option<&crate::indexer_manager::IndexerManager> {
+        if let Self::Ready(manager) = self {
+            Some(manager)
+        } else {
+            None
+        }
+    }
+    fn as_mut(&mut self) -> Option<&mut crate::indexer_manager::IndexerManager> {
+        if let Self::Ready(manager) = self {
+            Some(manager)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn is_some(&self) -> bool {
+        self.as_ref().is_some()
+    }
+    pub(crate) fn is_none(&self) -> bool {
+        self.as_ref().is_none()
+    }
+    pub(crate) fn pending(&self) -> Option<&StartupInitPending> {
+        if let Self::Pending(pending) = self {
+            Some(pending)
+        } else {
+            None
+        }
+    }
+    fn pending_mut(&mut self) -> Option<&mut StartupInitPending> {
+        if let Self::Pending(pending) = self {
+            Some(pending)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Unavailable)
+    }
+    pub(crate) fn mark_unavailable_if_not_ready(&mut self) {
+        if !matches!(self, Self::Ready(_)) {
+            *self = Self::Unavailable;
+        }
+    }
+    pub(crate) fn overlay_active(&self) -> bool {
+        match self {
+            Self::NotStarted => true,
+            Self::Pending(pending) => pending.started_at.elapsed() < Duration::from_secs(5),
+            Self::Ready(_) | Self::Unavailable => false,
+        }
+    }
+}
+
 pub(crate) struct StartupInitPending {
     rx: mpsc::Receiver<crate::indexer_manager::StartupInitOutcome>,
     started_at: std::time::Instant,
     /// 名前索引は即時に要求済み。残る metadata / similar の要求だけを集約する。
     full_check_requested: bool,
+    #[cfg(test)]
+    disposal_witness: Option<mpsc::Sender<std::thread::ThreadId>>,
+}
+
+/// Spawn with an empty channel first: a failed spawn must never destroy a queued
+/// Ready manager on the UI thread. This derived index is retained until process
+/// exit if disposal itself cannot start; there is no synchronous recovery.
+fn retire_pending_startup_result(pending: StartupInitPending) {
+    let (tx, rx) = mpsc::channel::<StartupInitPending>();
+    match std::thread::Builder::new()
+        .name("startup-result-drop".into())
+        .spawn(move || {
+            if let Ok(pending) = rx.recv() {
+                #[cfg(test)]
+                let mut pending = pending;
+                #[cfg(test)]
+                let witness = pending.disposal_witness.take();
+                drop(pending);
+                #[cfg(test)]
+                if let Some(witness) = witness {
+                    let _ = witness.send(std::thread::current().id());
+                }
+            }
+        }) {
+        Ok(_) => {
+            if let Err(error) = tx.send(pending) {
+                std::mem::forget(error.0);
+            }
+        }
+        Err(error) => {
+            miv_startup::record_detail("indexer.disposal.unavailable", &error.to_string());
+            std::mem::forget(pending);
+        }
+    }
 }
 
 impl StartupInitPending {
@@ -5564,12 +5697,25 @@ impl ComparePreparationState {
 
 /// 起動オーバーレイ用の `StartupProgressHook` を作る共通ヘルパー。
 /// `IndexerManager::new` が各 sub-step の前に呼び、Mutex 内の文字列を更新する。
-fn make_progress_hook(progress: Arc<Mutex<String>>) -> crate::indexer_manager::StartupProgressHook {
-    Arc::new(move |s: &str| {
-        if let Ok(mut p) = progress.lock() {
-            *p = s.to_string();
-        }
-    })
+#[cfg(test)]
+thread_local! {
+    static FORCE_INDEXER_INIT_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn spawn_startup_init_worker(
+    work: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if FORCE_INDEXER_INIT_SPAWN_FAILURE.with(|slot| slot.get()) {
+        return Err(std::io::Error::other("injected startup spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name("startup-init".into())
+        .spawn(work)
+}
+
+fn make_progress_hook() -> crate::indexer_manager::StartupProgressHook {
+    Arc::new(|text| miv_startup::record_detail("indexer.progress", text))
 }
 
 #[cfg(windows)]
@@ -14557,7 +14703,7 @@ pub struct App {
     // + fts_meta 管理メタを Tantivy First 順序 (commit + reload 成功後に SQLite
     // を同期更新) で運用する。
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
-    pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
+    pub(crate) indexer_init: IndexerInit,
 
     // ── 別バージョン索引 ─────────────────────────────────────────
     // 別バージョン索引 service の runtime owner。`None` は UI と全 producer に共通の
@@ -17426,24 +17572,13 @@ pub struct App {
     /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
     pub(crate) last_main_focused: bool,
 
-    // ── 起動オーバーレイ ─────────────────────────────────────────
-    /// オーバーレイに表示する短いステータス文字列。バックグラウンド init スレッドが
-    /// 各 sub-step の前に書き換える。
-    pub(crate) startup_progress: Arc<Mutex<String>>,
-    /// 走行中の起動 init スレッドの状態。`update` 内で try_recv して
-    /// 完了次第 `indexer_manager` に注入する。
-    pub(crate) startup_init: Option<StartupInitPending>,
-    /// 起動 init が一度走り切ったか (成功・失敗問わず)。
-    /// `indexer_manager.is_none()` だけだと「init 失敗で永続 None」と
-    /// 「未起動」を区別できないので別フラグで持つ。
-    pub(crate) startup_done: bool,
     /// One best-effort runtime sweep after startup and the first painted frame.
     #[cfg(all(windows, not(feature = "portable"), not(test)))]
     runtime_cleanup_armed: bool,
     /// CLI soak test (`--play-test`) の進行状態。通常起動では None。
     pub(crate) play_test: Option<PlayTestState>,
     /// `fts_meta` の housekeeping (VACUUM) を起動完了後に走らせるための armed フラグ。
-    /// `startup_done` で true になり、全 supervisor が idle に達したフレームで
+    /// Indexerの単一adoptionで準備され、全 supervisor が idle に達したフレームで
     /// `spawn_housekeeping` を 1 回呼んで false に倒す (Codex 指摘: VACUUM が
     /// supervisor の初回 scan と writer mutex を取り合うのを避ける)。
     pub(crate) housekeeping_armed: bool,
@@ -17519,6 +17654,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.retire_pending_startup_result();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         // LibRaw may be inside an uncancellable native interval. Cancel work and
         // let its worker thread finish; never join it on the UI thread.
@@ -17853,20 +17989,26 @@ impl App {
         // 全文検索インデクサ (Tantivy) は起動の最大ボトルネック (実測 1 秒級) なので、
         // `App::update` の最初のフレームで `kick_off_startup_init` がバックグラウンド
         // スレッドに spawn する。それまでは None で、検索系 UI は無効として描画される。
-        let indexer_manager: Option<crate::indexer_manager::IndexerManager> = None;
+        let indexer_init = IndexerInit::NotStarted;
 
         // === 各 SQLite DB の open を計測 ===
         // 起動 UI スレッドで同期実行されるので、cold open が支配的なら
         // ここで個別の所要時間が判明する。--perf-log 無効時は no-op。
         let t = std::time::Instant::now();
-        let archive_cache_db = crate::archive_cache::ArchiveCacheDb::open()
+        let archive_cache_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "archive_cache", || {
+                crate::archive_cache::ArchiveCacheDb::open()
+            })
             .map_err(|e| crate::logger::log(format!("archive_cache_db open failed: {e}")))
             .ok()
             .map(Arc::new);
         crate::perf::emit_ms("startup", "db_open_archive_cache", 0, t);
 
         let t = std::time::Instant::now();
-        let edit_preview_cache = crate::edit_preview_cache::EditPreviewCacheService::open()
+        let edit_preview_cache =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "edit_preview_cache", || {
+                crate::edit_preview_cache::EditPreviewCacheService::open()
+            })
             .map_err(|e| crate::logger::log(format!("edit_preview_cache open failed: {e}")))
             .ok();
         if let Some(service) = &edit_preview_cache {
@@ -17879,41 +18021,70 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_edit_preview_cache", 0, t);
 
         let t = std::time::Instant::now();
-        let search_index_db = crate::search_index_db::SearchIndexDb::open()
+        let search_index_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "search_index_db", || {
+                crate::search_index_db::SearchIndexDb::open()
+            })
             .map_err(|e| crate::logger::log(format!("search_index_db open failed: {e}")))
             .ok()
             .map(Arc::new);
         crate::perf::emit_ms("startup", "db_open_search_index", 0, t);
 
         let t = std::time::Instant::now();
-        let rotation_db = crate::rotation_db::RotationDb::open().ok();
+        let rotation_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "rotation_db", || {
+                crate::rotation_db::RotationDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_rotation_keys");
         let rotation_page_keys = rotation_db
             .as_ref()
             .map(crate::rotation_db::RotationDb::load_rotated_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_rotation_keys", 0, t);
 
         let t = std::time::Instant::now();
-        let audio_normalize_db = crate::audio_normalize_db::AudioNormalizeDb::open().ok();
+        let audio_normalize_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "audio_normalize_db", || {
+                crate::audio_normalize_db::AudioNormalizeDb::open()
+            })
+            .ok();
         let (normalize_lookup_tx, normalize_lookup_rx) = std::sync::mpsc::channel();
         crate::perf::emit_ms("startup", "db_open_audio_normalize", 0, t);
 
         let t = std::time::Instant::now();
-        let video_pin_db = crate::video_pins::VideoPinDb::open().ok();
+        let video_pin_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "video_pins", || {
+                crate::video_pins::VideoPinDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
 
         let t = std::time::Instant::now();
         let opened_folder_thumb_pins =
-            crate::folder_thumb_pins::FolderThumbPinDb::open_with_migration_info()
-                .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
-                .ok();
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "folder_thumb_pins", || {
+                crate::folder_thumb_pins::FolderThumbPinDb::open_with_migration_info()
+            })
+            .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
+            .ok();
         let migration_ran = opened_folder_thumb_pins
             .as_ref()
             .map(|(_, migrated)| *migrated);
         let folder_thumb_pin_db = opened_folder_thumb_pins.map(|(db, _)| std::sync::Arc::new(db));
+        miv_startup::record_detail(
+            "app.db_migration.folder_thumb",
+            if migration_ran == Some(true) {
+                "migration completed"
+            } else {
+                "migration not required or unavailable"
+            },
+        );
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "startup",
@@ -17931,29 +18102,50 @@ impl App {
         }
 
         let t = std::time::Instant::now();
-        let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
+        let video_bookmark_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "video_bookmarks", || {
+                crate::video_bookmarks::VideoBookmarkDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
         // SQLite の open / schema 初期化を含めて専用 worker で行う。
         let book_bookmark_service = crate::book_bookmarks::BookBookmarkService::spawn();
 
         let t = std::time::Instant::now();
-        let video_chapter_thumb_db = crate::video_chapter_thumbs::VideoChapterThumbDb::open().ok();
+        let video_chapter_thumb_db = crate::startup_result(
+            miv_startup::Stage::AppDbOpen,
+            "video_chapter_thumbs",
+            || crate::video_chapter_thumbs::VideoChapterThumbDb::open(),
+        )
+        .ok();
         crate::perf::emit_ms("startup", "db_open_video_chapter_thumbs", 0, t);
 
         let t = std::time::Instant::now();
-        let video_tile_cache = crate::video::tile_thumb_cache::TileThumbCache::open()
+        let video_tile_cache =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "video", || {
+                crate::video::tile_thumb_cache::TileThumbCache::open()
+            })
             .ok()
             .map(std::sync::Arc::new);
         crate::perf::emit_ms("startup", "db_open_video_tile_cache", 0, t);
 
         let t = std::time::Instant::now();
-        let rating_db = crate::rating_db::RatingDb::open().ok();
-        let tags_db = crate::tags_db::TagsDb::open().ok();
+        let rating_db = crate::startup_result(miv_startup::Stage::AppDbOpen, "rating_db", || {
+            crate::rating_db::RatingDb::open()
+        })
+        .ok();
+        let tags_db = crate::startup_result(miv_startup::Stage::AppDbOpen, "tags_db", || {
+            crate::tags_db::TagsDb::open()
+        })
+        .ok();
         crate::perf::emit_ms("startup", "db_open_rating", 0, t);
 
         let t = std::time::Instant::now();
-        let spread_db = crate::spread_db::SpreadDb::open_for_app().map_err(|error| {
+        let spread_db = crate::startup_result(miv_startup::Stage::AppDbOpen, "spread_db", || {
+            crate::spread_db::SpreadDb::open_for_app()
+        })
+        .map_err(|error| {
             let message = format!("spread.db open failed: {error}");
             crate::logger::log(message.clone());
             message
@@ -17961,7 +18153,11 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_spread", 0, t);
 
         let t = std::time::Instant::now();
-        let view_trim_db = crate::view_trim_db::ViewTrimDb::open().ok();
+        let view_trim_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "view_trim_db", || {
+                crate::view_trim_db::ViewTrimDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
         let content_identity_fallback_io_sem =
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
@@ -17997,7 +18193,11 @@ impl App {
                 )
             };
         let t = std::time::Instant::now();
-        let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
+        let book_resume_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "book_resume_db", || {
+                crate::book_resume_db::BookResumeDb::open()
+            })
+            .ok();
         let book_resume_writer = if book_resume_db.is_some() {
             crate::book_resume_db::BookResumeWriter::spawn()
         } else {
@@ -18010,7 +18210,11 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_book_resume", 0, t);
 
         let t = std::time::Instant::now();
-        let reading_history_db = crate::reading_history_db::ReadingHistoryDb::open().ok();
+        let reading_history_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "reading_history_db", || {
+                crate::reading_history_db::ReadingHistoryDb::open()
+            })
+            .ok();
         let reading_history_writer = if reading_history_db.is_some() {
             crate::reading_history_db::ReadingHistoryWriter::spawn()
         } else {
@@ -18019,7 +18223,10 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_reading_history", 0, t);
 
         let t = std::time::Instant::now();
-        let auto_aspect_cache_db = crate::auto_aspect_cache::AutoAspectCacheDb::open()
+        let auto_aspect_cache_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "auto_aspect_cache", || {
+                crate::auto_aspect_cache::AutoAspectCacheDb::open()
+            })
             .map_err(|e| crate::logger::log(format!("auto_aspect_cache_db open failed: {e}")))
             .ok();
         let collection_auto_aspect_cache =
@@ -18033,29 +18240,49 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_auto_aspect_cache", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("pdf_passwords_load");
         let pdf_passwords = crate::pdf_passwords::PdfPasswordStore::load();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "pdf_passwords_load", 0, t);
 
         let t = std::time::Instant::now();
-        let adjustment_db = crate::adjustment_db::AdjustmentDb::open().ok();
+        let adjustment_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "adjustment_db", || {
+                crate::adjustment_db::AdjustmentDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_adjustment", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_adjusted_page_keys");
         let adjusted_page_keys = adjustment_db
             .as_ref()
             .map(crate::adjustment_db::AdjustmentDb::load_page_param_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_adjusted_page_keys", 0, t);
 
         let t = std::time::Instant::now();
-        let local_adjust_db = crate::local_adjust_db::LocalAdjustDb::open().ok();
+        let local_adjust_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "local_adjust_db", || {
+                crate::local_adjust_db::LocalAdjustDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_local_adjust", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_local_adjust_keys");
         let local_adjust_page_keys = local_adjust_db
             .as_ref()
             .map(crate::local_adjust_db::LocalAdjustDb::load_all_layer_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_local_adjust_keys", 0, t);
 
         // リリース済みの旧マスク形式を詰め直す。実測 954 MB の DB が数十 MB になり、
@@ -18085,51 +18312,84 @@ impl App {
         }
 
         let t = std::time::Instant::now();
-        let export_crop_db = crate::export_crop::CropDb::open().ok();
+        let export_crop_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "export_crop", || {
+                crate::export_crop::CropDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_export_crop", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_export_crop_keys");
         let export_crop_page_keys = export_crop_db
             .as_ref()
             .map(crate::export_crop::CropDb::load_all_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_export_crop_keys", 0, t);
 
         let t = std::time::Instant::now();
-        let mask_db = crate::mask_db::MaskDb::open().ok();
+        let mask_db = crate::startup_result(miv_startup::Stage::AppDbOpen, "mask_db", || {
+            crate::mask_db::MaskDb::open()
+        })
+        .ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_mask_keys");
         let mask_page_keys = mask_db
             .as_ref()
             .map(crate::mask_db::MaskDb::load_all_mask_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_mask_keys", 0, t);
 
         let t = std::time::Instant::now();
-        let conceal_db = crate::conceal_db::ConcealDb::open().ok();
+        let conceal_db = crate::startup_result(miv_startup::Stage::AppDbOpen, "conceal_db", || {
+            crate::conceal_db::ConcealDb::open()
+        })
+        .ok();
         crate::perf::emit_ms("startup", "db_open_conceal", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_conceal_keys");
         let conceal_page_keys = conceal_db
             .as_ref()
             .map(crate::conceal_db::ConcealDb::load_all_conceal_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_conceal_keys", 0, t);
 
         let t = std::time::Instant::now();
-        let comic_db = crate::comic_db::ComicDb::open().ok();
+        let comic_db = crate::startup_result(miv_startup::Stage::AppDbOpen, "comic_db", || {
+            crate::comic_db::ComicDb::open()
+        })
+        .ok();
         crate::perf::emit_ms("startup", "db_open_comic", 0, t);
 
         let t = std::time::Instant::now();
+        let db_read_trace =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::AppDbRead)
+                .detail("db_load_comic_keys");
         let comic_page_keys = comic_db
             .as_ref()
             .map(crate::comic_db::ComicDb::load_all_comic_keys)
             .unwrap_or_default();
+        db_read_trace.finish(miv_startup::Outcome::Ok);
         crate::perf::emit_ms("startup", "db_load_comic_keys", 0, t);
 
         let t = std::time::Instant::now();
-        let comic_user_stamp_db = crate::comic_user_stamps::ComicUserStampDb::open().ok();
+        let comic_user_stamp_db =
+            crate::startup_result(miv_startup::Stage::AppDbOpen, "comic_user_stamps", || {
+                crate::comic_user_stamps::ComicUserStampDb::open()
+            })
+            .ok();
         crate::perf::emit_ms("startup", "db_open_comic_user_stamps", 0, t);
 
         let video_upscale_data_dir = crate::data_dir::get();
@@ -18440,7 +18700,7 @@ impl App {
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
             fav_add_auto_index_similar: false,
-            indexer_manager,
+            indexer_init,
             similar_index,
             name_index_manager: None,
             activity_gate,
@@ -19473,9 +19733,6 @@ impl App {
             current_folder_signature: None,
             last_main_focused: true,
 
-            startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
-            startup_init: None,
-            startup_done: false,
             #[cfg(all(windows, not(feature = "portable"), not(test)))]
             runtime_cleanup_armed: true,
             play_test: None,
@@ -26743,9 +27000,9 @@ impl App {
     }
 
     fn request_index_full_check_shared(&mut self) {
-        if let Some(manager) = self.indexer_manager.as_ref() {
+        if let Some(manager) = self.indexer_init.as_ref() {
             manager.request_shared_full_check();
-        } else if let Some(pending) = self.startup_init.as_mut() {
+        } else if let Some(pending) = self.indexer_init.pending_mut() {
             pending.full_check_requested = true;
         } else {
             let name_status = if self.name_index_manager.is_some() {
@@ -26796,13 +27053,13 @@ impl App {
 
     fn refresh_similar_index_password_config(&mut self) {
         let excluded = vec![self.settings.books_root_path()];
-        if let Some(manager) = self.indexer_manager.as_mut() {
+        if let Some(manager) = self.indexer_init.as_mut() {
             manager.sync_with_configuration_and_passwords(
                 &self.settings.favorites,
                 excluded,
                 self.pdf_passwords.clone(),
             );
-        } else if self.startup_done {
+        } else if self.indexer_init.is_terminal() {
             // With no shared watcher manager, close the bootstrap barrier explicitly.
             if let Some(similar_index) = self.similar_index.as_ref() {
                 let notifier = similar_index.notifier();
@@ -26886,7 +27143,7 @@ impl App {
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
     /// 1 度しか走らせない。
     pub(crate) fn kick_off_startup_init(&mut self) {
-        if self.startup_init.is_some() || self.startup_done {
+        if !matches!(self.indexer_init, IndexerInit::NotStarted) {
             return;
         }
         #[cfg(windows)]
@@ -26907,84 +27164,72 @@ impl App {
         let speed = self.settings.indexer_speed_profile;
         let skip_offline_change_scan = self.settings.skip_offline_change_scan;
         let activity_gate = Arc::clone(&self.activity_gate);
-        let progress = Arc::clone(&self.startup_progress);
         let (tx, rx) = mpsc::channel();
         let started_at = std::time::Instant::now();
-        let hook = make_progress_hook(Arc::clone(&progress));
-        let spawn_result = std::thread::Builder::new()
-            .name("startup-init".to_string())
-            .spawn({
-                let hook = Arc::clone(&hook);
-                move || {
-                    let t = std::time::Instant::now();
-                    let outcome = crate::indexer_manager::IndexerManager::new(
-                        &favorites,
-                        speed,
-                        Arc::clone(&activity_gate),
-                        excluded_roots.clone(),
-                        similar_notifier.clone(),
-                        Some(similar_passwords.clone()),
-                        Some(hook),
-                        skip_offline_change_scan,
-                    );
-                    if !matches!(
+        let hook = make_progress_hook();
+        let wake = self.edit_preview_repaint_ctx.clone();
+        if let Some(watch) = miv_startup::watch_handle(miv_startup::WatchSlot::IndexerInit) {
+            watch.begin();
+        }
+        let spawn_result = spawn_startup_init_worker({
+            let hook = Arc::clone(&hook);
+            move || {
+                let trace =
+                    miv_startup::span(miv_startup::Lane::Indexer, miv_startup::Stage::IndexerInit);
+                let t = std::time::Instant::now();
+                let outcome = crate::indexer_manager::IndexerManager::new(
+                    &favorites,
+                    speed,
+                    Arc::clone(&activity_gate),
+                    excluded_roots.clone(),
+                    similar_notifier.clone(),
+                    Some(similar_passwords.clone()),
+                    Some(hook),
+                    skip_offline_change_scan,
+                );
+                crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
+                trace.finish(
+                    if matches!(
                         &outcome,
                         crate::indexer_manager::StartupInitOutcome::Ready(_)
                     ) {
-                        if let Some(similar_notifier) = similar_notifier.as_ref() {
-                            similar_notifier.configure(
-                                &favorites,
-                                similar_passwords,
-                                Some(activity_gate),
-                                excluded_roots,
-                            );
-                            similar_notifier.finish_watch_bootstrap();
-                        }
-                    }
-                    crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
-                    let _ = tx.send(outcome);
-                }
-            });
-        if let Err(e) = spawn_result {
-            // フォールバック: スレッド起動に失敗したら同期で実行する
-            // (スレッド数制限の極端な環境向け保険)。
-            crate::logger::log(format!(
-                "startup-init spawn failed: {e} — running synchronously"
-            ));
-            let outcome = crate::indexer_manager::IndexerManager::new(
-                &self.settings.favorites,
-                self.settings.indexer_speed_profile,
-                Arc::clone(&self.activity_gate),
-                vec![self.settings.books_root_path()],
-                self.similar_index
-                    .as_ref()
-                    .map(crate::similar_index::SimilarIndexManager::notifier),
-                Some(self.pdf_passwords.clone()),
-                Some(hook),
-                self.settings.skip_offline_change_scan,
-            );
-            self.indexer_manager = match outcome {
-                crate::indexer_manager::StartupInitOutcome::Ready(manager) => Some(manager),
-                crate::indexer_manager::StartupInitOutcome::Unavailable => None,
-                crate::indexer_manager::StartupInitOutcome::Failed { user_message } => {
-                    self.show_feedback_toast(user_message);
-                    None
-                }
-            };
-            if self.indexer_manager.is_none() {
-                if let Some(similar_index) = self.similar_index.as_ref() {
-                    similar_index.notifier().finish_watch_bootstrap();
+                        miv_startup::Outcome::Ok
+                    } else {
+                        miv_startup::Outcome::Error
+                    },
+                );
+                let sent = miv_startup::span(
+                    miv_startup::Lane::Indexer,
+                    miv_startup::Stage::IndexerResultSend,
+                );
+                let accepted = tx.send(outcome).is_ok();
+                sent.finish(if accepted {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Cancelled
+                });
+                if let Some(ctx) = wake {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             }
-            self.startup_done = true;
-            self.housekeeping_armed = true;
-            self.sync_shared_favorite_indexers();
+        });
+        if let Err(error) = spawn_result {
+            crate::logger::log(format!("startup-init spawn failed: {error}"));
+            self.adopt_startup_init(
+                crate::indexer_manager::StartupInitOutcome::Failed {
+                    user_message: "検索の準備を開始できませんでした。次回起動時に再試行します"
+                        .to_string(),
+                },
+                false,
+            );
             return;
         }
-        self.startup_init = Some(StartupInitPending {
+        self.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at,
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
     }
 
@@ -27335,7 +27580,7 @@ impl App {
         if self.play_test.as_ref().is_none_or(|s| s.close_sent) {
             return;
         }
-        if !self.startup_done {
+        if !self.indexer_init.is_terminal() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
             return;
         }
@@ -27573,7 +27818,7 @@ impl App {
         }
 
         let fts_all_idle = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::all_supervisors_idle);
         let name_all_done = self
@@ -27583,7 +27828,7 @@ impl App {
 
         if Self::take_initial_scan_settled_event(
             &mut self.initial_scan_settled_pending,
-            self.startup_done,
+            self.indexer_init.is_terminal(),
             fts_all_idle.unwrap_or(true),
             name_all_done,
         ) {
@@ -27591,62 +27836,169 @@ impl App {
         }
 
         if Self::take_housekeeping_spawn(&mut self.housekeeping_armed, fts_all_idle)
-            && let Some(mgr) = self.indexer_manager.as_ref()
+            && let Some(mgr) = self.indexer_init.as_ref()
         {
             mgr.spawn_housekeeping(&crate::data_dir::get());
         }
     }
 
+    fn sync_startup_present_watch(&self, ctx: &egui::Context, begin_normal: bool) {
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        for slot in [
+            miv_startup::WatchSlot::CoreStartup,
+            miv_startup::WatchSlot::NormalPresent,
+        ] {
+            if let Some(watch) = miv_startup::watch_handle(slot) {
+                apply_startup_present_watch(
+                    self.window_visible,
+                    minimized,
+                    begin_normal && slot == miv_startup::WatchSlot::NormalPresent,
+                    |operation| match operation {
+                        PresentWatchOperation::Begin => watch.begin(),
+                        PresentWatchOperation::Suspend => watch.suspend(),
+                        PresentWatchOperation::Resume => watch.resume(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn reconcile_startup_visibility(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !frame.native_window_visible_commit_completed() {
+            return;
+        }
+        if self.settings.minimize_to_tray_on_close || self.tray_controller.is_some() {
+            // 実際の Win32 可視状態と App の `window_visible` を毎フレーム同期する。
+            // トレイスレッドや 2 重起動アクティベーションリスナーが `ShowWindow` を直接呼ぶ
+            // 経路があるので、こちらは flag を追従させる責務を持つ。
+            #[cfg(windows)]
+            if let Some(hwnd_raw) = self.main_hwnd {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+                let is_visible_now = unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
+                if is_visible_now && !self.window_visible {
+                    crate::logger::log(
+                        "tray: detected external ShowWindow — running sync_after_restore",
+                    );
+                    self.sync_after_restore(ctx);
+                } else if !is_visible_now && self.window_visible {
+                    self.window_visible = false;
+                    let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
+                    crate::set_ui_heartbeat_suspended(
+                        !keep_heartbeat_alive,
+                        if keep_heartbeat_alive {
+                            "App::update heartbeat kept alive for active viewer session after external window hide"
+                        } else {
+                            "App::update heartbeat suspended after external window hide"
+                        }
+                        .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn retire_pending_startup_result(&mut self) {
+        if matches!(self.indexer_init, IndexerInit::Pending(_)) {
+            if let IndexerInit::Pending(pending) =
+                std::mem::replace(&mut self.indexer_init, IndexerInit::Unavailable)
+            {
+                retire_pending_startup_result(pending);
+            }
+        }
+    }
+
+    fn poll_startup_diagnostics_notice(
+        &mut self,
+        minimized: bool,
+        take_notice: impl FnOnce() -> bool,
+    ) {
+        // Keep the one-shot notice in its diagnostics owner until a visible normal
+        // UI can draw it. Starting a toast clock under the overlay loses the notice.
+        if !self.indexer_init.overlay_active() && self.window_visible && !minimized && take_notice()
+        {
+            self.show_feedback_toast("起動記録を保存できませんでした".to_string());
+        }
+    }
+
+    fn poll_startup_owner(&mut self, ctx: &egui::Context) {
+        self.kick_off_startup_init();
+        self.poll_startup_init();
+        let overlay_now = self.indexer_init.overlay_active();
+        let overlay_was_visible = ctx.data_mut(|data| {
+            let id = egui::Id::new("startup.overlay.previous-root-pass");
+            let previous = data.get_temp::<bool>(id).unwrap_or(true);
+            data.insert_temp(id, overlay_now);
+            previous
+        });
+        if overlay_was_visible && !overlay_now {
+            self.consume_input_during_startup(ctx);
+        }
+        if self.indexer_init.pending().is_some() {
+            ctx.request_repaint_after_for(Duration::from_millis(100), egui::ViewportId::ROOT);
+        }
+    }
+
     pub(crate) fn poll_startup_init(&mut self) {
-        let Some(pending) = &self.startup_init else {
+        let Some(pending) = self.indexer_init.pending() else {
             return;
         };
-        match pending.try_recv() {
-            Ok(outcome) => {
-                let full_check_requested = pending.full_check_requested;
-                crate::logger::log(format!(
-                    "startup: IndexerManager init completed in {:.0} ms",
-                    pending.elapsed_ms()
-                ));
-                self.indexer_manager = match outcome {
-                    crate::indexer_manager::StartupInitOutcome::Ready(manager) => Some(manager),
-                    crate::indexer_manager::StartupInitOutcome::Unavailable => None,
-                    crate::indexer_manager::StartupInitOutcome::Failed { user_message } => {
-                        self.show_feedback_toast(user_message);
-                        None
-                    }
-                };
-                self.startup_init = None;
-                self.startup_done = true;
-                self.housekeeping_armed = true;
-                self.sync_shared_favorite_indexers();
-                if full_check_requested {
-                    self.request_index_full_check_shared();
-                }
-                if let Ok(mut p) = self.startup_progress.lock() {
-                    *p = "起動完了".to_string();
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
+        let full_check_requested = pending.full_check_requested;
+        let outcome = match pending.try_recv() {
+            Ok(outcome) => outcome,
+            Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                let full_check_requested = pending.full_check_requested;
-                // bg スレッドが panic 等で落ちた: 検索機能なしで継続させる。
                 crate::logger::log("startup: init thread disconnected unexpectedly");
-                self.indexer_manager = None;
-                self.startup_init = None;
-                self.startup_done = true;
-                self.refresh_similar_index_password_config();
-                if let Some(similar_index) = self.similar_index.as_ref() {
-                    // The worker normally closes the watch-registration barrier when
-                    // `IndexerManager::new` returns `None`. A panic can disconnect the channel
-                    // before that owner runs, so close the same barrier here instead of leaving
-                    // the optional Similar service permanently AwaitingWatch.
-                    similar_index.notifier().finish_watch_bootstrap();
-                }
-                if full_check_requested {
-                    self.request_index_full_check_shared();
+                crate::indexer_manager::StartupInitOutcome::Failed {
+                    user_message: "検索の準備が中断されました。次回起動時に再試行します"
+                        .to_string(),
                 }
             }
+        };
+        self.adopt_startup_init(outcome, full_check_requested);
+    }
+
+    /// The only result installation point, including spawn/disconnect failure.
+    fn adopt_startup_init(
+        &mut self,
+        outcome: crate::indexer_manager::StartupInitOutcome,
+        full_check_requested: bool,
+    ) {
+        let stage = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::IndexerAdopt);
+        self.indexer_init = match outcome {
+            crate::indexer_manager::StartupInitOutcome::Ready(manager) => {
+                // Current SW_HIDE state, not a snapshot taken when the worker began.
+                manager.set_io_throttled(!self.window_visible);
+                IndexerInit::Ready(manager)
+            }
+            crate::indexer_manager::StartupInitOutcome::Unavailable => {
+                self.show_feedback_toast("全文検索を準備できませんでした".to_string());
+                IndexerInit::Unavailable
+            }
+            crate::indexer_manager::StartupInitOutcome::Failed { user_message } => {
+                self.show_feedback_toast(user_message);
+                IndexerInit::Unavailable
+            }
+        };
+        self.housekeeping_armed = self.indexer_init.is_some();
+        self.sync_shared_favorite_indexers();
+        if full_check_requested {
+            self.request_index_full_check_shared();
+        }
+        if self.global_search.active && !self.global_search.query.trim().is_empty() {
+            self.global_search.last_executed.clear();
+        }
+        stage.finish(if self.indexer_init.is_some() {
+            miv_startup::Outcome::Ok
+        } else {
+            miv_startup::Outcome::Error
+        });
+        if let Some(watch) = miv_startup::watch_handle(miv_startup::WatchSlot::IndexerInit) {
+            watch.retire(if self.indexer_init.is_some() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            });
         }
     }
 
@@ -27687,7 +28039,7 @@ impl App {
         if !self.settings.update_check_enabled {
             return;
         }
-        if !self.startup_done {
+        if self.indexer_init.overlay_active() {
             return; // 起動中はネットワークを走らせない
         }
         const PERIODIC: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
@@ -27780,11 +28132,11 @@ impl App {
     }
 
     pub(crate) fn render_startup_overlay(&self, ctx: &egui::Context) {
-        let progress_text = self
-            .startup_progress
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| "起動中…".to_string());
+        let snapshot = miv_startup::lane_snapshot(miv_startup::Lane::Indexer);
+        let progress_text = snapshot
+            .stage
+            .map(startup_stage_name)
+            .unwrap_or("検索の準備中");
         // 背景全面に半透明の幕を引いてから中央に文字を出す。
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(ctx.style().visuals.panel_fill))
@@ -27800,18 +28152,12 @@ impl App {
                         egui::Layout::centered_and_justified(egui::Direction::TopDown),
                     ),
                     |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(rect.height() * 0.3);
-                            ui.spinner();
-                            ui.add_space(12.0);
-                            ui.label(egui::RichText::new("起動中…").size(20.0).strong());
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(progress_text)
-                                    .size(14.0)
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                        });
+                        crate::ui_startup::draw_status(
+                            ui,
+                            progress_text,
+                            snapshot.elapsed,
+                            snapshot.total,
+                        );
                     },
                 );
             });
@@ -27855,7 +28201,7 @@ impl App {
             return true;
         }
         // メタ索引
-        if let Some(mgr) = self.indexer_manager.as_ref() {
+        if let Some(mgr) = self.indexer_init.as_ref() {
             if mgr.is_reconciling() {
                 return true;
             }
@@ -27885,7 +28231,7 @@ impl App {
     /// worker で確定した再起動案内を既存の全画面トーストへ届ける。
     fn poll_indexer_notifications(&mut self) {
         let notifications = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.take_notifications())
             .unwrap_or_default();
@@ -62845,7 +63191,7 @@ impl App {
         }
         let cache_dir = crate::catalog::default_cache_dir();
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|mgr| mgr.io_sem())
             .unwrap_or_else(|| {
@@ -65117,10 +65463,8 @@ impl App {
         // 表示中アイテムを on-demand 経路 (PNG / EXIF / XMP / 動画メタ) で
         // 判定する。`run_metadata_search` は引数として fts_meta を受け取るが現在は
         // 未使用 (将来 Tantivy STORED への切替路の余地として残してある)。
-        let fts_meta_clone: Option<std::sync::Arc<crate::fts_meta::FtsMetaDb>> = self
-            .indexer_manager
-            .as_ref()
-            .map(|mgr| mgr.clone_fts_meta());
+        let fts_meta_clone: Option<std::sync::Arc<crate::fts_meta::FtsMetaDb>> =
+            self.indexer_init.as_ref().map(|mgr| mgr.clone_fts_meta());
         // §4.1.2: ZIP 表示中は検索対象をファイル名に固定する。ユーザーが選んだ
         // self.search_target (メタ系) はそのまま保持し、ここでの override は
         // ZIP グリッドに限る (通常フォルダに戻れば元の target で検索される)。
@@ -85848,34 +86192,6 @@ impl App {
         // 走らせないで済むようここで一括 gate する。
         let tray_active = self.settings.minimize_to_tray_on_close || self.tray_controller.is_some();
         if tray_active {
-            // 実際の Win32 可視状態と App の `window_visible` を毎フレーム同期する。
-            // トレイスレッドや 2 重起動アクティベーションリスナーが `ShowWindow` を直接呼ぶ
-            // 経路があるので、こちらは flag を追従させる責務を持つ。
-            #[cfg(windows)]
-            if let Some(hwnd_raw) = self.main_hwnd {
-                use windows::Win32::Foundation::HWND;
-                use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
-                let is_visible_now = unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
-                if is_visible_now && !self.window_visible {
-                    crate::logger::log(
-                        "tray: detected external ShowWindow — running sync_after_restore",
-                    );
-                    self.sync_after_restore(ctx);
-                } else if !is_visible_now && self.window_visible {
-                    self.window_visible = false;
-                    let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
-                    crate::set_ui_heartbeat_suspended(
-                        !keep_heartbeat_alive,
-                        if keep_heartbeat_alive {
-                            "App::update heartbeat kept alive for active viewer session after external window hide"
-                        } else {
-                            "App::update heartbeat suspended after external window hide"
-                        }
-                        .to_string(),
-                    );
-                }
-            }
-
             // 設定変更反映 + メニューイベントをポーリング + 閉じるボタンの乗っ取り。
             self.sync_tray_with_settings(ctx);
             self.poll_tray_events(ctx);
@@ -86156,30 +86472,21 @@ impl App {
                 self.vst3_was_fullscreen = is_fs;
             }
         }
-        if !self.startup_done {
-            self.kick_off_startup_init();
-            self.poll_startup_init();
-            #[cfg(windows)]
-            self.poll_vst3_startup_load(ctx);
-            #[cfg(windows)]
-            self.poll_effetune(ctx);
-            if self.startup_init.is_some() {
-                self.render_startup_overlay(ctx);
-                self.consume_input_during_startup(ctx);
-                ctx.request_repaint();
-                finish_update_perf(&mut update_perf, self.frame_counter);
-                return;
-            }
-            // Ready に遷移したフレーム: Loading 中に積もった入力イベントが
-            // 誤発火しないよう一掃してから通常 update に進む。
+        if self.indexer_init.overlay_active() {
+            self.render_startup_overlay(ctx);
             self.consume_input_during_startup(ctx);
+            finish_update_perf(&mut update_perf, self.frame_counter);
+            return;
+        }
+        if self.indexer_init.pending().is_some() {
+            egui::TopBottomPanel::top("startup-search-preparing").show(ctx, |ui| {
+                crate::ui_startup::draw_preparing(ui);
+            });
         }
         #[cfg(windows)]
         self.poll_vst3_startup_load(ctx);
         #[cfg(windows)]
-        if self.startup_done {
-            self.poll_effetune(ctx);
-        }
+        self.poll_effetune(ctx);
         self.poll_play_test(ctx);
 
         // バージョン更新通知: 起動完了後の初回 + 24h 周期で auto kick。
@@ -87632,6 +87939,8 @@ impl App {
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
+        self.sync_startup_present_watch(ctx, true);
+        egui_wgpu::set_root_startup_frame_tag(ctx, true);
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::Grid);
@@ -88574,6 +88883,23 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        static FIRST_UPDATE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let first_update = !FIRST_UPDATE.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let first_update_trace = first_update
+            .then(|| miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::FirstUpdate));
+        self.edit_preview_repaint_ctx = Some(ctx.clone());
+        self.reconcile_startup_visibility(ctx, frame);
+        self.sync_startup_present_watch(ctx, false);
+        self.poll_startup_owner(ctx);
+        egui_wgpu::set_root_startup_frame_tag(ctx, false);
+        if first_update {
+            miv_startup::milestone("core.first_update");
+        }
+        self.poll_startup_diagnostics_notice(
+            ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+            miv_startup::take_unavailable_notice,
+        );
         self.startup_window_geometry
             .begin_frame(ctx.cumulative_frame_nr());
         self.apply_deferred_initial_size(ctx);
@@ -88667,8 +88993,16 @@ impl eframe::App for App {
             self.authorize_external_tool_launch_boundaries_after_ui();
         }
         self.maximize_startup_window_after_visible_commit(ctx, frame);
+        if !self.indexer_init.overlay_active() && self.fullscreen_idx.is_some() {
+            if let Some(watch) = miv_startup::watch_handle(miv_startup::WatchSlot::NormalPresent) {
+                watch.retire(miv_startup::Outcome::Skipped);
+            }
+        }
         #[cfg(all(windows, not(feature = "portable"), not(test)))]
-        if self.runtime_cleanup_armed && self.startup_done && ctx.cumulative_frame_nr() > 0 {
+        if self.runtime_cleanup_armed
+            && !self.indexer_init.overlay_active()
+            && ctx.cumulative_frame_nr() > 0
+        {
             self.runtime_cleanup_armed = false;
             crate::runtime_cleanup::spawn(
                 crate::data_dir::get(),
@@ -88683,9 +89017,13 @@ impl eframe::App for App {
             self.perf_prev_update_cycles =
                 update_cycles_t0.map(|start| Self::thread_cycles_now().saturating_sub(start));
         }
+        if let Some(trace) = first_update_trace {
+            trace.finish(miv_startup::Outcome::Ok);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.retire_pending_startup_result();
         self.epub_convert = None;
         // A process exit that bypassed the ordinary close-event frame must still fence the exact
         // settings-family mutation before any settings save/flush in `on_exit_inner`.
@@ -90739,20 +91077,273 @@ mod index_full_check_tests {
     use super::*;
 
     #[test]
+    fn diagnostics_save_failure_waits_for_normal_ui_with_slow_indexer() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let (_tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now(),
+            full_check_requested: false,
+            disposal_witness: None,
+        });
+        app.window_visible = true;
+        // Inject the diagnostics owner's one-shot save-failure source, without
+        // poisoning process-global diagnostics or writing the real profile.
+        let pending_notice = std::cell::Cell::new(true);
+        let take_notice = || pending_notice.replace(false);
+        for elapsed in [0, 2, 4] {
+            app.indexer_init.pending_mut().unwrap().started_at =
+                Instant::now() - Duration::from_secs(elapsed);
+            app.poll_startup_init();
+            app.poll_startup_diagnostics_notice(false, take_notice);
+            assert!(pending_notice.get(), "overlay must not consume the notice");
+            assert!(app.fs_feedback_toast.is_none());
+        }
+        app.indexer_init.pending_mut().unwrap().started_at =
+            Instant::now() - Duration::from_secs(6);
+        app.window_visible = false;
+        app.poll_startup_diagnostics_notice(false, take_notice);
+        assert!(pending_notice.get(), "tray-hidden UI cannot show a toast");
+        app.window_visible = true;
+        app.poll_startup_diagnostics_notice(true, take_notice);
+        assert!(pending_notice.get(), "minimized UI cannot show a toast");
+        assert!(app.fs_feedback_toast.is_none());
+        app.poll_startup_init();
+        assert!(
+            app.indexer_init.pending().is_some(),
+            "the same worker continues"
+        );
+        let before_show = Instant::now();
+        app.poll_startup_diagnostics_notice(false, take_notice);
+        assert!(!pending_notice.get());
+        let toast = app.fs_feedback_toast.as_ref().unwrap();
+        assert_eq!(toast.0, "起動記録を保存できませんでした");
+        assert!(
+            toast.1 >= before_show,
+            "toast lifetime starts on normal UI admission"
+        );
+        let shown_at = toast.1;
+        app.poll_startup_diagnostics_notice(false, take_notice);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+    }
+
+    #[test]
+    fn hidden_requested_grid_pass_never_resumes_startup_presentation_watch() {
+        for (visible, minimized) in [(false, false), (true, true), (false, true)] {
+            for begin in [false, true] {
+                let mut operations = Vec::new();
+                apply_startup_present_watch(visible, minimized, begin, |operation| {
+                    operations.push(operation)
+                });
+                assert_eq!(operations.last(), Some(&PresentWatchOperation::Suspend));
+                assert!(!operations.contains(&PresentWatchOperation::Resume));
+            }
+        }
+        let mut operations = Vec::new();
+        apply_startup_present_watch(true, false, true, |operation| operations.push(operation));
+        assert_eq!(
+            operations,
+            [PresentWatchOperation::Begin, PresentWatchOperation::Resume]
+        );
+    }
+
+    #[test]
+    fn startup_spawn_failure_is_terminal_and_never_creates_index_on_ui() {
+        let mut env = setup_app_for_test();
+        FORCE_INDEXER_INIT_SPAWN_FAILURE.with(|slot| slot.set(true));
+        env.app.kick_off_startup_init();
+        FORCE_INDEXER_INIT_SPAWN_FAILURE.with(|slot| slot.set(false));
+        assert!(matches!(env.app.indexer_init, IndexerInit::Unavailable));
+        assert!(!env.app.indexer_init.overlay_active());
+        assert!(!env.tmp.path().join("fts_index").exists());
+        let notified_at = env.app.fs_feedback_toast.as_ref().unwrap().1;
+        env.app.kick_off_startup_init();
+        env.app.poll_startup_init();
+        assert_eq!(env.app.fs_feedback_toast.as_ref().unwrap().1, notified_at);
+    }
+
+    #[test]
+    fn overlay_deadline_and_terminal_admission_consume_boundary_input_once() {
+        for terminal in [false, true] {
+            let mut env = setup_app_for_test();
+            let app = &mut env.app;
+            let (tx, rx) = mpsc::channel();
+            app.indexer_init = IndexerInit::Pending(StartupInitPending {
+                rx,
+                started_at: Instant::now(),
+                full_check_requested: false,
+                disposal_witness: None,
+            });
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.poll_startup_owner(ctx));
+            if terminal {
+                tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
+                    .unwrap_or_else(|_| panic!("live receiver"));
+            } else {
+                app.indexer_init.pending_mut().unwrap().started_at =
+                    Instant::now() - Duration::from_secs(6);
+            }
+            let input = || egui::RawInput {
+                events: vec![egui::Event::Text("queued input".into())],
+                ..Default::default()
+            };
+            let _ = ctx.run(input(), |ctx| {
+                app.poll_startup_owner(ctx);
+                assert!(ctx.input(|i| i.events.is_empty()));
+            });
+            let _ = ctx.run(input(), |ctx| {
+                app.poll_startup_owner(ctx);
+                assert!(ctx.input(|i| !i.events.is_empty()));
+            });
+        }
+    }
+
+    #[test]
+    fn startup_worker_wakes_root_without_input_then_adopts_once() {
+        let mut env = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let ui_thread = std::thread::current().id();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            if std::thread::current().id() != ui_thread && info.delay.is_zero() {
+                let _ = wake_tx.send(info.viewport_id);
+            }
+        });
+        env.app.edit_preview_repaint_ctx = Some(ctx);
+        env.app.kick_off_startup_init();
+        assert_eq!(
+            wake_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("worker-owned wake"),
+            egui::ViewportId::ROOT
+        );
+        // No input or other UI polling is needed to get the completed worker's wake.
+        env.app.poll_startup_init();
+        assert!(env.app.indexer_init.is_terminal());
+        let ready = env.app.indexer_init.is_some();
+        env.app.poll_startup_init();
+        assert_eq!(env.app.indexer_init.is_some(), ready);
+    }
+
+    #[test]
+    fn startup_deadline_keeps_receiver_then_adopts_hidden_manager_once() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let (tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now() - Duration::from_secs(6),
+            full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
+        });
+        assert!(!app.indexer_init.overlay_active());
+        assert!(!app.indexer_init.is_terminal());
+        app.poll_startup_init();
+        assert!(app.indexer_init.pending().is_some());
+        app.window_visible = false;
+        app.activity_gate.set_paused(true);
+        app.global_search.active = true;
+        app.global_search.query = "latest query".into();
+        app.global_search.last_executed = "older query".into();
+        let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
+            &env.tmp.path().join("late-init"),
+            Arc::clone(&app.activity_gate),
+            app.similar_index.as_ref().unwrap().notifier(),
+            app.pdf_passwords.clone(),
+        );
+        assert!(
+            tx.send(crate::indexer_manager::StartupInitOutcome::Ready(manager))
+                .is_ok()
+        );
+        app.poll_startup_init();
+        assert!(app.indexer_init.is_terminal());
+        let semaphore = app.indexer_init.as_ref().unwrap().io_sem();
+        assert!(semaphore.is_throttled());
+        assert_eq!(app.global_search.query, "latest query");
+        assert!(app.global_search.last_executed.is_empty());
+        app.global_search.last_executed = "adopted only once".into();
+        app.poll_startup_init();
+        assert_eq!(app.global_search.last_executed, "adopted only once");
+        app.sync_after_restore(&egui::Context::default());
+        assert!(!semaphore.is_throttled());
+    }
+
+    #[test]
+    fn pending_global_search_retains_input_without_consuming_query_or_spawning_prepare() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let (_tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now() - Duration::from_secs(6),
+            full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
+        });
+        app.global_search.active = true;
+        app.global_search.query = "current text".into();
+        app.global_search.filters.favorite = Some(uuid::Uuid::new_v4());
+        app.spawn_global_search(&egui::Context::default());
+        assert_eq!(app.global_search.query, "current text");
+        assert!(app.global_search.filters.favorite.is_none());
+        assert!(app.global_search.last_executed.is_empty());
+        assert!(app.global_search.page_edit_prepare.is_none());
+        assert!(app.global_search.pending.is_none());
+        assert_eq!(
+            app.global_search.reject_message.as_deref(),
+            Some("検索の準備中")
+        );
+    }
+
+    #[test]
+    fn quitting_pending_hidden_startup_disposes_queued_ready_on_worker() {
+        let mut env = setup_app_for_test();
+        let (tx, rx) = mpsc::channel();
+        let (witness_tx, witness_rx) = mpsc::channel();
+        let manager = crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
+            &env.tmp.path().join("queued-quit"),
+            Arc::clone(&env.app.activity_gate),
+            env.app.similar_index.as_ref().unwrap().notifier(),
+            env.app.pdf_passwords.clone(),
+        );
+        tx.send(crate::indexer_manager::StartupInitOutcome::Ready(manager))
+            .unwrap_or_else(|_| panic!("receiver live"));
+        env.app.window_visible = false;
+        env.app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now() - Duration::from_secs(6),
+            full_check_requested: false,
+            disposal_witness: Some(witness_tx),
+        });
+        env.app.retire_pending_startup_result();
+        let disposal_thread = witness_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("queued manager disposed");
+        assert_ne!(disposal_thread, std::thread::current().id());
+        assert!(
+            tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn index_full_check_initializing_reserves_shared_once_and_runs_name_immediately() {
         let mut env = setup_app_for_test();
         let app = &mut env.app;
         app.sync_name_index_supervisors();
         let (tx, rx) = mpsc::channel();
-        app.startup_init = Some(StartupInitPending {
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
-        app.startup_done = false;
         app.request_index_full_check();
         app.request_index_full_check();
-        assert!(app.startup_init.as_ref().unwrap().full_check_requested);
+        assert!(app.indexer_init.pending().unwrap().full_check_requested);
         assert_eq!(
             app.name_index_manager
                 .as_ref()
@@ -90778,14 +91369,14 @@ mod index_full_check_tests {
                 .is_ok()
         );
         app.poll_startup_init();
-        assert!(app.startup_init.is_none());
+        assert!(app.indexer_init.pending().is_none());
         assert!(
-            app.indexer_manager
+            app.indexer_init
                 .as_ref()
                 .unwrap()
                 .full_check_requested_for_test()
         );
-        app.indexer_manager
+        app.indexer_init
             .as_ref()
             .unwrap()
             .wait_full_check_dispatched_for_test();
@@ -90809,7 +91400,7 @@ mod index_full_check_tests {
     fn index_full_check_unavailable_keeps_name_and_explains_shared_failure() {
         let mut env = setup_app_for_test();
         let app = &mut env.app;
-        app.startup_done = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.request_index_full_check();
         assert_eq!(
             app.name_index_manager
@@ -90833,20 +91424,21 @@ mod index_full_check_tests {
                 .contains("初期化できなかった")
         );
         let (tx, rx) = mpsc::channel();
-        app.startup_init = Some(StartupInitPending {
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
-        app.startup_done = false;
         app.request_index_full_check();
         assert!(
             tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
                 .is_ok()
         );
         app.poll_startup_init();
-        assert!(app.startup_init.is_none());
-        assert!(app.indexer_manager.is_none());
+        assert!(app.indexer_init.pending().is_none());
+        assert!(app.indexer_init.is_none());
         assert_eq!(
             app.name_index_manager
                 .as_ref()
@@ -90876,7 +91468,7 @@ mod index_full_check_tests {
         let data = env.tmp.path().join("full-check");
         let app = &mut env.app;
         app.activity_gate.set_paused(true);
-        app.indexer_manager = Some(
+        app.indexer_init = IndexerInit::Ready(
             crate::indexer_manager::IndexerManager::new_at_with_similar_for_test(
                 &data,
                 Arc::clone(&app.activity_gate),
@@ -90884,15 +91476,15 @@ mod index_full_check_tests {
                 app.pdf_passwords.clone(),
             ),
         );
-        app.startup_done = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.request_index_full_check();
         assert!(
-            app.indexer_manager
+            app.indexer_init
                 .as_ref()
                 .unwrap()
                 .full_check_requested_for_test()
         );
-        app.indexer_manager
+        app.indexer_init
             .as_ref()
             .unwrap()
             .wait_full_check_dispatched_for_test();

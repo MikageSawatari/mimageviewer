@@ -2123,7 +2123,7 @@ impl App {
             request_id = 1;
         }
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.io_sem())
             .unwrap_or_else(|| {
@@ -3649,7 +3649,7 @@ impl App {
         refresh: bool,
     ) -> Result<SmartFolderPending, String> {
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.io_sem())
             .unwrap_or_else(|| {

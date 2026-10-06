@@ -59,7 +59,7 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 
 [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) 参照。現行の mIV タグ正本は
 `tags.db` で、Ctrl+G/Ctrl+F の全文検索ソースには混ぜない。`SourceKind::Tags` と
-Tantivy `tags` STORED フィールドは旧 XMP `dc:subject` からの移行用として残すが、
+Tantivy `tags` STORED フィールドは旧schema互換用として残すが、旧タグ移行も撤去済みであり、
 `SourceKind::ALL` / `SearchTarget::includes(Tags)` / ingest / Ctrl+F fallback からは外す。
 
 「検索結果をタグで絞る」用途は、検索結果グリッドに対して facet タグフィルタを AND 合成する。
@@ -99,7 +99,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + 3-way diff (FS / `fts_meta.db` の突き合わせ) |
 | [search_watcher.rs](../src/search_watcher.rs) | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce |
 | [ingest_worker.rs](../src/ingest_worker.rs) | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 |
-| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) ビルダー |
+| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags はschema互換用) ビルダー |
 | [external_metadata.rs](../src/external_metadata.rs) | 外部メタデータサイドカー (画像と同名 .json/.txt) の検出・値抽出・差分署名・逆引き (§4.10) |
 | [name_index_supervisor.rs](../src/name_index_supervisor.rs) | Ctrl+S 用 **名前索引 supervisor** (初期バルク + notify-rs 追従) |
 | [name_bulk_indexer.rs](../src/name_bulk_indexer.rs) | Ctrl+S 用 初期バルクスキャンの本体 |
@@ -132,9 +132,9 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
-| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。semantic version 移行は `fts_meta.db` の durable marker に従い、旧 directory を消してから開く。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
+| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。semantic version 移行は `fts_meta.db` の durable marker に従い、旧 directory を消してから開く。`tags` フィールドはschema互換用で検索/移行対象外 |
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` + `index_state` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | v9→v10 では files 再作成・version bump・`tantivy_rebuild_pending=1` を同じ transaction で確定。新 Tantivy index の open 成功後だけ marker を消す |
-| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。Tantivy一回移行フラグ、既存の歴史的XMP移行状態、任意のタグsidecar backup import同期状態もここに置く |
+| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。Tantivy/XMP移行の既存marker/source行は歴史値として保持。任意のタグsidecar backup import同期状態もここに置く |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で `normalize_path`
@@ -190,7 +190,6 @@ EPUB 内のタイトル・著者も索引しない。取込失敗として記録
 App 起動
   └─ IndexerManager::new
        ├─ FtsMetaDb を open
-       ├─ 旧 Tantivy STORED tags を tags.db へ一度だけ移行 (fts_index wipe より前)
        ├─ durable rebuild pending なら旧 fts_index を wipe (失敗時は旧 index を開かない)
        ├─ FtsIndex を openし、成功後だけ rebuild pending を clear
        ├─ manager worker で起動時 reconciliation (§4.3) と所有範囲外 cleanup
@@ -488,7 +487,7 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 - 動画ファイル本体: ファイル名 + FFmpeg が読めるコンテナメタデータ (title /
   artist / URL / description / comment / chapter title 等) を `video_meta_text` へ。
 - 動画タグ: 現行の mIV タグは `tags.db` 正本。旧 `<video.ext>.xmp` の
-  `dc:subject` は移行元としてのみ扱い、Ctrl+F / Ctrl+G の検索ソースにはしない。
+  旧 `dc:subject` タグの取込経路は撤去済みで、Ctrl+F / Ctrl+G の検索ソースにも含めない。
 - フレーム内容 / 音声文字起こし / チャプター以外の本文抽出は対象外。動画再生や
   サムネイル抽出とは独立した低頻度のメタ読み取りだけを行う。
 
@@ -509,10 +508,11 @@ Clear 要求を serial に処理し、`tags.db` だけを更新する。通常�
 Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待ちや stale snapshot
 競合は発生しない。
 
-旧 `dc:subject` 由来の Tantivy STORED `tags` は、起動時に一度だけ
-`tags.db` へコピーする。挿入点は `IndexerManager::new` の `FtsMetaDb` open 後、
-`fts_index` wipe / `FtsIndex::open_at` より前。移行済みフラグは
-`tags.db.tag_meta.legacy_tantivy_imported` に置く。
+旧 `dc:subject` 由来の Tantivy STORED `tags` を起動時に `tags.db` へ一括コピーする
+処理は、2026-10-06の利用者決定で専用readerとともに撤去済み。v1.4.0以降で取り込み済みの
+catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込まない。ファイルXMPも変更しない。
+既存の `tag_meta.legacy_tantivy_imported` / `tag_item_state.source='tantivy_migration'` は
+歴史値として保持し、markerの読取・書換・削除は行わない。
 
 フォルダ表示時に未索引ファイルのXMP `dc:subject`を読む自動seedは、v1.0救済終了について
 2026-09-12に利用者了承を得て撤去した。手動の「旧XMPタグを取り込む／取り込んで削除」も
@@ -841,7 +841,7 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 | **`dc:subject` に `#xxx` (採用)** | 業界標準プロパティで他ソフトからも見える。`#` で mIV 管理タグを識別し他ソフト由来を保護 |
 
 現行仕様では通常タグは `tags.db` 正本で、`dc:subject` への書き込みや Ctrl+G
-検索投影は行わない。この節は v1.0 互換タグを移行元として読むための背景メモ。
+検索投影は行わない。旧タグの取込経路もすべて撤去済みで、この節はv1.0当時の背景メモ。
 
 詳細は [archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) 参照。
 

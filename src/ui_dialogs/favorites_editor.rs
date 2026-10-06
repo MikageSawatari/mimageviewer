@@ -375,7 +375,7 @@ impl App {
         let old_pause_minimized = self.settings.pause_indexer_while_minimized;
 
         // 事前にインデクサ情報を取り出し (borrow 競合回避)
-        let startup_diag = self.indexer_manager.as_ref().map(|m| m.startup_diag());
+        let startup_diag = self.indexer_init.as_ref().map(|m| m.startup_diag());
         // インデックスサイズ + 件数キャッシュ。
         //
         // Codex 指摘 (2026-04): UI スレッドで `COUNT(*)` を N 回叩くと、毎回
@@ -408,7 +408,7 @@ impl App {
             .unwrap_or(true);
         if counts_stale && self.favorites_index_refresh_rx.is_none() {
             let name_db = self.search_index_db.as_ref().cloned();
-            let meta_db = self.indexer_manager.as_ref().map(|m| m.clone_fts_meta());
+            let meta_db = self.indexer_init.as_ref().map(|m| m.clone_fts_meta());
             let favorites = self.settings.favorites.clone();
             let common_excluded = vec![self.settings.books_root_path()];
             let (tx, rx) = std::sync::mpsc::channel();
@@ -453,11 +453,11 @@ impl App {
                 .collect()
         };
         let reconciling = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .is_some_and(|m| m.is_reconciling());
         let stats_by_id: std::collections::HashMap<uuid::Uuid, SupervisorStats> = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|m| m.all_stats())
             .unwrap_or_default()

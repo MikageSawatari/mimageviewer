@@ -1,4 +1,51 @@
 use super::*;
+use miv_startup::{Lane, Outcome, Stage, WatchHandle, WatchSlot, event_span};
+
+/// Diagnostics for this existing resolver request, through UI acceptance/refusal.
+/// This is not the lifetime of downstream async enumeration or conversion.
+pub(super) struct InitialNavigationTrace {
+    dispatch: Option<miv_startup::Span>,
+    watch: Option<WatchHandle>,
+}
+
+impl InitialNavigationTrace {
+    fn begin(boundary: &str) -> Self {
+        let watch = miv_startup::first_dispatch_watch();
+        if let Some(watch) = watch {
+            watch.begin();
+        }
+        Self {
+            dispatch: Some(
+                event_span(Lane::Navigation, Stage::InitialTargetResolve, 0)
+                    .watched_optional(watch)
+                    .detail(boundary),
+            ),
+            watch,
+        }
+    }
+    fn correlation(&self) -> u64 {
+        self.dispatch.as_ref().map_or(0, miv_startup::Span::id)
+    }
+    fn finish(mut self, outcome: Outcome) {
+        if let Some(dispatch) = self.dispatch.take() {
+            dispatch.finish(outcome);
+        }
+        if let Some(watch) = self.watch.take() {
+            watch.retire(outcome);
+        }
+    }
+}
+
+impl Drop for InitialNavigationTrace {
+    fn drop(&mut self) {
+        if let Some(dispatch) = self.dispatch.take() {
+            dispatch.finish(Outcome::Cancelled);
+        }
+        if let Some(watch) = self.watch.take() {
+            watch.retire(Outcome::Cancelled);
+        }
+    }
+}
 
 const STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY: std::time::Duration =
     std::time::Duration::from_millis(400);
@@ -229,6 +276,9 @@ impl App {
                         pending.owner.perf_tag(),
                         pending.requested.display()
                     ));
+                    if let Some(watch) = pending.diagnostic.as_ref().and_then(|trace| trace.watch) {
+                        watch.suspend();
+                    }
                     held_resolve_for_activation_admission = Some(Box::new(pending));
                 }
             } else {
@@ -241,6 +291,10 @@ impl App {
             }
         }
 
+        let diagnostic = matches!(source, StartupOpenPathSource::InitialStartup)
+            .then(|| InitialNavigationTrace::begin("initial-resolver-dispatch-to-ui-admission"));
+        let trace_correlation = diagnostic.as_ref().map(InitialNavigationTrace::correlation);
+        let trace_watch = diagnostic.as_ref().and_then(|trace| trace.watch);
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -259,8 +313,21 @@ impl App {
             if cancel_w.load(Ordering::Relaxed) {
                 return;
             }
+            let resolve_span = trace_correlation.map(|id| {
+                event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
+                    .watched_optional(trace_watch)
+            });
             let result =
                 resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
+            if let Some(resolve_span) = resolve_span {
+                resolve_span.finish(if cancel_w.load(Ordering::Relaxed) {
+                    Outcome::Cancelled
+                } else if result.resolved.is_some() {
+                    Outcome::Ok
+                } else {
+                    Outcome::Error
+                });
+            }
             if cancel_w.load(Ordering::Relaxed) {
                 return;
             }
@@ -292,6 +359,7 @@ impl App {
                     started_at: std::time::Instant::now(),
                     toast_shown: false,
                     held_resolve_for_activation_admission,
+                    diagnostic,
                 });
             }
             Err(e) => {
@@ -299,7 +367,18 @@ impl App {
                     "startup open: resolve worker spawn failed: {e}; running synchronously"
                 ));
                 let resolve_started_at = std::time::Instant::now();
+                let resolve_span = trace_correlation.map(|id| {
+                    event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
+                        .watched_optional(trace_watch)
+                });
                 let result = resolve_startup_open_path(requested, source, bookmark.as_ref());
+                if let Some(resolve_span) = resolve_span {
+                    resolve_span.finish(if result.resolved.is_some() {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Error
+                    });
+                }
                 let held_duration = resolve_started_at.elapsed();
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
@@ -307,6 +386,7 @@ impl App {
                     held_resolve_for_activation_admission,
                     held_duration,
                     Some(requested_owner),
+                    diagnostic,
                     ctx,
                 );
             }
@@ -322,7 +402,23 @@ impl App {
         // owner intact so the ordinary completion tail runs exactly once after restore terminal;
         // taking it here would let `load_folder` replace the restore target mid-transaction.
         if self.sidecar_restore_active() || self.document_open_modal_admission_blocked() {
+            if let Some(watch) = self
+                .startup_open_path_resolve_pending
+                .as_ref()
+                .and_then(|pending| pending.diagnostic.as_ref())
+                .and_then(|trace| trace.watch)
+            {
+                watch.suspend();
+            }
             return;
+        }
+        if let Some(watch) = self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .and_then(|pending| pending.diagnostic.as_ref())
+            .and_then(|trace| trace.watch)
+        {
+            watch.resume();
         }
         let recv = match self.startup_open_path_resolve_pending.as_ref() {
             Some(pending) => pending.rx.try_recv(),
@@ -336,6 +432,7 @@ impl App {
                 let held = pending.held_resolve_for_activation_admission.take();
                 let held_duration = pending.elapsed();
                 let requested_owner = pending.requested.clone();
+                let diagnostic = pending.diagnostic.take();
                 drop(pending);
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
@@ -343,6 +440,7 @@ impl App {
                     held,
                     held_duration,
                     Some(requested_owner),
+                    diagnostic,
                     ctx,
                 );
                 ctx.request_repaint();
@@ -370,6 +468,9 @@ impl App {
                 let owner = pending.owner.clone();
                 let held = pending.held_resolve_for_activation_admission.take();
                 let held_duration = pending.elapsed();
+                if let Some(diagnostic) = pending.diagnostic.take() {
+                    diagnostic.finish(Outcome::Error);
+                }
                 crate::logger::log(format!(
                     "startup open: resolve worker disconnected source={} requested={}",
                     owner.perf_tag(),
@@ -405,6 +506,7 @@ impl App {
             None,
             std::time::Duration::ZERO,
             None,
+            None,
             ctx,
         );
     }
@@ -416,6 +518,7 @@ impl App {
         held: Option<Box<StartupOpenPathResolvePending>>,
         held_duration: std::time::Duration,
         requested_owner: Option<crate::pdf_loader::LeasedEpubPath>,
+        diagnostic: Option<InitialNavigationTrace>,
         ctx: &egui::Context,
     ) {
         if !self.startup_open_path_owner_is_current(&owner) {
@@ -444,6 +547,7 @@ impl App {
                     held,
                     held_duration,
                     requested_owner,
+                    diagnostic,
                     ctx,
                 );
             });
@@ -493,7 +597,27 @@ impl App {
             return;
         }
         let requested_display = result.requested.display().to_string();
-        match self.apply_startup_open_path_resolve_result(&owner, result, ctx) {
+        let correlation = diagnostic.as_ref().map(InitialNavigationTrace::correlation);
+        let watch = diagnostic.as_ref().and_then(|trace| trace.watch);
+        let adoption = correlation.map(|id| {
+            event_span(Lane::Navigation, Stage::InitialTargetAdopt, id)
+                .watched_optional(watch)
+                .detail("resolver-result-ui-admission")
+        });
+        let outcome =
+            self.apply_startup_open_path_resolve_result(&owner, result, ctx, correlation, watch);
+        let trace_outcome = if matches!(outcome, StartupOpenApplyOutcome::Opened) {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        };
+        if let Some(adoption) = adoption {
+            adoption.finish(trace_outcome);
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(trace_outcome);
+        }
+        match outcome {
             StartupOpenApplyOutcome::Opened => return,
             StartupOpenApplyOutcome::Refused(reason) => {
                 if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
@@ -550,6 +674,9 @@ impl App {
         let Some(held) = held else {
             return;
         };
+        if let Some(watch) = held.diagnostic.as_ref().and_then(|trace| trace.watch) {
+            watch.resume();
+        }
         crate::logger::log(format!(
             "startup open: resume held resolve after activation refusal source={} requested={}",
             held.owner.perf_tag(),
@@ -681,6 +808,13 @@ impl App {
     ) {
         let held = pending.held_resolve_for_activation_admission.take();
         let owner = pending.owner.clone();
+        if let Some(diagnostic) = pending.diagnostic.take() {
+            diagnostic.finish(if reason == "remote_session_acquired" {
+                Outcome::SuspendedNotWatched
+            } else {
+                Outcome::Cancelled
+            });
+        }
         drop(pending);
         self.finish_replaced_startup_open_owner(owner, reason);
         if let Some(held) = held {
@@ -696,6 +830,9 @@ impl App {
     }
 
     pub(crate) fn cancel_unresolved_open_for_remote_session(&mut self) {
+        if let Some(watch) = miv_startup::watch_handle(WatchSlot::InitialDispatch) {
+            watch.retire(Outcome::SuspendedNotWatched);
+        }
         // The worker result is stale after Remote acquires, but the explicit command line
         // target must remain pending until Local owns the viewer again.
         let mut held = self.startup_open_path_resolve_pending.as_ref();
@@ -875,6 +1012,8 @@ impl App {
         owner: &StartupOpenPathOwner,
         result: StartupOpenPathResolveResult,
         ctx: &egui::Context,
+        trace_correlation: Option<u64>,
+        trace_watch: Option<WatchHandle>,
     ) -> StartupOpenApplyOutcome {
         let source = owner.source();
         let Some(resolution) = result.resolved else {
@@ -1012,6 +1151,11 @@ impl App {
         }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
+        let scan = trace_correlation.map(|id| {
+            event_span(Lane::Navigation, Stage::InitialTargetScan, id)
+                .watched_optional(trace_watch)
+                .detail("existing-loader-call-return")
+        });
         let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
             openable,
             auto_fullscreen,
@@ -1022,6 +1166,18 @@ impl App {
                 super::StartupListIntent::container_open(auto_fullscreen)
             },
         );
+        if let Some(scan) = scan {
+            scan.finish(
+                if matches!(
+                    outcome,
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+                ) {
+                    Outcome::Error
+                } else {
+                    Outcome::Ok
+                },
+            );
+        }
         match outcome {
             FolderOpenOutcome::Ignored => return StartupOpenApplyOutcome::NotOpenable,
             FolderOpenOutcome::Refused(reason) => {
@@ -1316,19 +1472,59 @@ impl App {
     }
 
     pub(crate) fn open_default_startup_target(&mut self) {
+        let diagnostic = InitialNavigationTrace::begin("default-target-existing-loader-return");
+        let correlation = diagnostic.correlation();
+        let watch = diagnostic.watch;
+        let adoption = event_span(Lane::Navigation, Stage::InitialTargetAdopt, correlation)
+            .watched_optional(watch)
+            .detail("default-target-call-return");
+        let outcome = self.open_default_startup_target_observed(correlation, watch);
+        adoption.finish(outcome);
+        diagnostic.finish(outcome);
+    }
+
+    fn open_default_startup_target_observed(
+        &mut self,
+        correlation: u64,
+        watch: Option<WatchHandle>,
+    ) -> Outcome {
         if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Previous {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("previous-list-call-return");
             self.open_previous_startup_list();
-            return;
+            load.finish(Outcome::Ok);
+            return Outcome::Ok;
         }
         if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::ReadingHistory {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("reading-history-call-return");
             self.enter_reading_history();
+            load.finish(Outcome::Ok);
         } else if should_start_in_drive_list(&self.settings) {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("drive-list-call-return");
             self.enter_drive_list(None);
-        } else if let Some(folder) = crate::known_folders::startup_folder(
-            self.settings.startup_folder_mode,
-            self.settings.last_folder.as_deref(),
-            self.settings.startup_folder_path.as_deref(),
-        ) {
+            load.finish(Outcome::Ok);
+        } else {
+            let resolve = event_span(Lane::Navigation, Stage::InitialTargetResolve, correlation)
+                .watched_optional(watch)
+                .detail("default-known-folder-resolution");
+            let folder = crate::known_folders::startup_folder(
+                self.settings.startup_folder_mode,
+                self.settings.last_folder.as_deref(),
+                self.settings.startup_folder_path.as_deref(),
+            );
+            resolve.finish(if folder.is_some() {
+                Outcome::Ok
+            } else {
+                Outcome::Skipped
+            });
+            let Some(folder) = folder else {
+                return Outcome::Skipped;
+            };
             // last_folder には変換アーカイブ (RAR/CBR/7z/LZH) の元パスが入りうるので、
             // load_folder ではなく load_folder_or_convert_archive を通す。キャッシュが
             // あれば open_archive_via_cache が元アーカイブを開き直し (current_folder は
@@ -1345,14 +1541,22 @@ impl App {
             let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
             self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
             self.scroll_selected_to_rows_above = hint.and_then(|(_, rows)| rows);
-            if matches!(
-                self.load_folder_or_convert_archive(folder),
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("default-existing-loader-call-return");
+            let outcome = self.load_folder_or_convert_archive(folder);
+            let refused = matches!(
+                outcome,
                 FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
-            ) {
+            );
+            load.finish(if refused { Outcome::Error } else { Outcome::Ok });
+            if refused {
                 self.select_after_load = previous_selection;
                 self.scroll_selected_to_rows_above = previous_scroll;
+                return Outcome::Error;
             }
         }
+        Outcome::Ok
     }
 
     fn open_startup_file_if_visible(&mut self, requested: &Path) {

@@ -34,15 +34,6 @@ pub struct RetagReport {
     pub removed_conflicts: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LegacyImportReport {
-    pub skipped_already_imported: bool,
-    pub scanned_docs: usize,
-    pub imported_items: usize,
-    pub inserted_tags: usize,
-    pub skipped_decided_items: usize,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedSidecarTagItem {
     pub(crate) item_key: String,
@@ -67,12 +58,9 @@ pub(crate) enum SidecarTagBatchOutcome {
     Cancelled,
 }
 
-pub const LEGACY_TANTIVY_IMPORTED_META: &str = "legacy_tantivy_imported";
-
 /// `tag_item_state.source` に入れる値。
 pub mod source {
     pub const EDIT: &str = "edit";
-    pub const TANTIVY_MIGRATION: &str = "tantivy_migration";
     pub const XMP_LEGACY: &str = "xmp_legacy";
     pub const SIDECAR: &str = "sidecar";
     pub const METADATA_IMPORT: &str = "metadata_import";
@@ -629,14 +617,6 @@ impl TagsDb {
         tx.commit()
     }
 
-    pub fn meta(&self, key: &str) -> Option<String> {
-        self.conn
-            .query_row("SELECT value FROM tag_meta WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .ok()
-    }
-
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
         self.rotate_backups_once();
         let _tag_write = TAG_WRITES.begin();
@@ -678,76 +658,6 @@ impl TagsDb {
                 [folder_key],
             )
             .map(|_| ())
-    }
-
-    pub fn import_legacy_tantivy_tags<I, K, T>(
-        &mut self,
-        docs: I,
-    ) -> Result<LegacyImportReport, rusqlite::Error>
-    where
-        I: IntoIterator<Item = (K, T)>,
-        K: AsRef<str>,
-        T: AsRef<str>,
-    {
-        if self.meta(LEGACY_TANTIVY_IMPORTED_META).as_deref() == Some("1") {
-            return Ok(LegacyImportReport {
-                skipped_already_imported: true,
-                ..LegacyImportReport::default()
-            });
-        }
-
-        self.rotate_backups_once();
-        let _tag_write = TAG_WRITES.begin();
-        let now = now_unix_secs();
-        let tx = self.conn.transaction()?;
-        let mut report = LegacyImportReport::default();
-        for (item_key, tags_column) in docs {
-            report.scanned_docs += 1;
-            let item_key = item_key.as_ref().trim();
-            if item_key.is_empty() {
-                continue;
-            }
-            let already_decided = tx
-                .query_row(
-                    "SELECT 1 FROM tag_item_state WHERE item_key = ?1 LIMIT 1",
-                    [item_key],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if already_decided {
-                report.skipped_decided_items += 1;
-                continue;
-            }
-
-            let legacy_tags = crate::ingest_text::parse_tags_column(tags_column.as_ref())
-                .into_iter()
-                .filter(|tag| tag.trim_start().starts_with('#'));
-            let normalized = collapse_tags(legacy_tags, now);
-            if normalized.is_empty() {
-                continue;
-            }
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO item_tags (item_key, tag, tag_key, applied_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?;
-                for tag in &normalized {
-                    let inserted =
-                        stmt.execute(params![item_key, tag.tag, tag.tag_key, tag.applied_at])?;
-                    report.inserted_tags += inserted;
-                }
-            }
-            upsert_item_state_tx(&tx, item_key, source::TANTIVY_MIGRATION, now)?;
-            report.imported_items += 1;
-        }
-        tx.execute(
-            "INSERT INTO tag_meta (key, value) VALUES (?1, '1')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [LEGACY_TANTIVY_IMPORTED_META],
-        )?;
-        tx.commit()?;
-        Ok(report)
     }
 
     pub fn tag_summaries(&self) -> Vec<TagSummary> {
@@ -1446,48 +1356,5 @@ mod tests {
         assert_eq!(db.display_tags_for_item("c:/a.jpg"), vec!["#dog"]);
         assert_eq!(db.display_tags_for_item("c:/b.jpg"), vec!["#dog"]);
         assert!(db.item_keys_by_tag_exact("cat", 10).is_empty());
-    }
-
-    #[test]
-    fn legacy_tantivy_import_copies_only_hash_tags_once() {
-        let mut db = memory_db();
-        let report = db
-            .import_legacy_tantivy_tags([
-                ("c:/a.jpg", "#原神 external #風景"),
-                ("c:/b.jpg", "external"),
-            ])
-            .unwrap();
-        assert_eq!(report.scanned_docs, 2);
-        assert_eq!(report.imported_items, 1);
-        assert_eq!(report.inserted_tags, 2);
-        assert_eq!(report.skipped_decided_items, 0);
-        assert_eq!(db.meta(LEGACY_TANTIVY_IMPORTED_META).as_deref(), Some("1"));
-
-        let tags = db.display_tags_for_item("c:/a.jpg");
-        assert!(tags.contains(&"#原神".to_string()));
-        assert!(tags.contains(&"#風景".to_string()));
-        assert!(db.display_tags_for_item("c:/b.jpg").is_empty());
-        assert!(db.has_item_state("c:/a.jpg"));
-
-        let skipped = db
-            .import_legacy_tantivy_tags([("c:/c.jpg", "#未実行")])
-            .unwrap();
-        assert!(skipped.skipped_already_imported);
-        assert!(db.display_tags_for_item("c:/c.jpg").is_empty());
-    }
-
-    #[test]
-    fn legacy_tantivy_import_skips_decided_items() {
-        let mut db = memory_db();
-        db.set_item_tags("c:/a.jpg", ["既存"], source::EDIT)
-            .unwrap();
-        let report = db
-            .import_legacy_tantivy_tags([("c:/a.jpg", "#旧タグ")])
-            .unwrap();
-        assert_eq!(report.scanned_docs, 1);
-        assert_eq!(report.imported_items, 0);
-        assert_eq!(report.inserted_tags, 0);
-        assert_eq!(report.skipped_decided_items, 1);
-        assert_eq!(db.display_tags_for_item("c:/a.jpg"), vec!["#既存"]);
     }
 }

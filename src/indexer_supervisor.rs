@@ -41,6 +41,7 @@ use uuid::Uuid;
 use crate::fts_index::FtsIndex;
 use crate::fts_meta::FtsMetaDb;
 use crate::indexer_progress::ProgressReporter;
+use miv_startup::{Lane, Outcome, Stage, event_span};
 /// Filesystem observation and committed writes for the last Full; startup markers are separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FullScanOutcome {
@@ -287,6 +288,12 @@ pub fn spawn(
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
 
+    let spawn_span = event_span(
+        Lane::Metadata,
+        Stage::MetadataSupervisorSpawn,
+        fav_id.as_u128() as u64,
+    )
+    .detail(&fav_id.to_string());
     let thread = std::thread::Builder::new()
         .name(format!("indexer-{}", fav_id.as_simple()))
         .spawn(move || {
@@ -317,8 +324,12 @@ pub fn spawn(
             let _ = finished_tx.send(());
         });
     let thread = match thread {
-        Ok(thread) => thread,
+        Ok(thread) => {
+            spawn_span.finish(Outcome::Ok);
+            thread
+        }
         Err(error) => {
+            spawn_span.finish(Outcome::Error);
             if let (Some(notifier), Some(registration)) = (
                 params.similar_notifier.as_ref(),
                 registration_on_spawn_failure.as_ref(),
@@ -374,6 +385,12 @@ fn supervisor_loop(
     // 1. Watcher registration is a barrier for the similar index.  Publish its terminal
     // immediately after recursive registration, before the metadata scan can hold this thread.
     let mut watch_retry_attempt = 0usize;
+    let registration_span = event_span(
+        Lane::Metadata,
+        Stage::MetadataWatchRegistration,
+        favorite_id.as_u128() as u64,
+    )
+    .detail(&favorite_id.to_string());
     let mut watcher = match FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()) {
         Ok(watcher) => {
             if let (Some(notifier), Some(registration)) =
@@ -383,6 +400,11 @@ fn supervisor_loop(
                     notifier.watch_ready(registration);
                 }
             }
+            registration_span.finish(if cancel.load(Ordering::SeqCst) {
+                Outcome::Cancelled
+            } else {
+                Outcome::Ok
+            });
             Some(watcher)
         }
         Err(error) => {
@@ -394,6 +416,7 @@ fn supervisor_loop(
             {
                 notifier.watch_unavailable(registration, error.to_string());
             }
+            registration_span.finish(Outcome::Error);
             None
         }
     };
@@ -468,6 +491,12 @@ fn supervisor_loop(
         }
         if watcher.is_none() && next_watch_retry.is_some_and(|deadline| Instant::now() >= deadline)
         {
+            let registration_span = event_span(
+                Lane::Metadata,
+                Stage::MetadataWatchRegistration,
+                favorite_id.as_u128() as u64,
+            )
+            .detail(&favorite_id.to_string());
             match FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()) {
                 Ok(next) => {
                     watcher = Some(next);
@@ -498,6 +527,11 @@ fn supervisor_loop(
                             notifier.watch_ready(registration);
                         }
                     }
+                    registration_span.finish(if cancel.load(Ordering::SeqCst) {
+                        Outcome::Cancelled
+                    } else {
+                        Outcome::Ok
+                    });
                     crate::logger::log(format!(
                         "indexer[{favorite_id}]: FsWatcher registration recovered"
                     ));
@@ -509,6 +543,7 @@ fn supervisor_loop(
                     {
                         notifier.watch_unavailable(registration, error.to_string());
                     }
+                    registration_span.finish(Outcome::Error);
                     next_watch_retry = WATCH_RETRY_DELAYS
                         .get(watch_retry_attempt)
                         .map(|delay| Instant::now() + *delay);

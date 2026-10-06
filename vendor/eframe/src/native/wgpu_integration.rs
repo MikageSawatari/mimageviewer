@@ -803,6 +803,8 @@ impl WgpuWinitRunning<'_> {
             drop(callback_window);
             integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input)
         };
+        let startup_tag = (viewport_id == ViewportId::ROOT)
+            .then(|| egui_wgpu::take_root_startup_frame_tag(&integration.egui_ctx));
 
         // ------------------------------------------------------------
 
@@ -874,13 +876,14 @@ impl WgpuWinitRunning<'_> {
         }
         #[cfg(all(test, target_os = "windows"))]
         render_phase_test_gate::before_surface_acquire();
-        let vsync_secs = painter.paint_and_update_textures(
+        let vsync_secs = painter.paint_and_update_textures_with_startup_tag(
             viewport_id,
             pixels_per_point,
             app.clear_color(&egui_ctx.style().visuals),
             &clipped_primitives,
             &textures_delta,
             screenshot_commands,
+            startup_tag,
         );
         #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
         if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
@@ -1168,7 +1171,19 @@ fn create_window(
     )
     .with_visible(false); // Start hidden until we render the first frame to fix white flash on startup (https://github.com/emilk/egui/pull/3631)
 
-    let window = egui_winit::create_window(egui_ctx, event_loop, &viewport_builder)?;
+    if let Some(callback) = &native_options.wgpu_options.startup_diagnostics {
+        callback(egui_wgpu::StartupDiagnosticEvent::Begin(
+            egui_wgpu::StartupGpuStage::WindowCreate,
+        ));
+    }
+    let result = egui_winit::create_window(egui_ctx, event_loop, &viewport_builder);
+    if let Some(callback) = &native_options.wgpu_options.startup_diagnostics {
+        callback(egui_wgpu::StartupDiagnosticEvent::End {
+            stage: egui_wgpu::StartupGpuStage::WindowCreate,
+            success: result.is_ok(),
+        });
+    }
+    let window = result?;
     epi_integration::apply_window_settings(&window, window_settings);
     Ok((window, viewport_builder))
 }
