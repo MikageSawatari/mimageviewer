@@ -387,6 +387,28 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 再現手段が無い、利用者の確認を待っている、実機計測を待っている、原因が未確定のもの。
 
+### 1.338 EffeTune のビジュアライザーに曲情報を表示する / 起動時に Visualizer を表示する — 作者の対応待ち (2026-10-06)
+
+- 要望 (利用者): 音響調整の窓を開くたびに Effect Pipeline から Visualizer へ切り替えている。また Visualizer の
+  Title / Album / Artist / Artwork が mIV からは表示されない。
+- 原因 (同梱 Mixwright v0.12.0 のソースで確認):
+  - 起動時の表示: デスクトップ版には「起動時の表示」設定があるが、プラグイン版は `vst-bootstrap.js` の `loadConfig` で
+    `startupView` を常に `'effects'` に上書きする。
+  - 曲情報: `js/visualizer/visualizer-view.js` の `metadata()` は EffeTune 内蔵プレーヤーで再生中の曲だけを読む。
+    プラグイン版では常に空。プラグイン版の通信口 (`__effetuneHostCall`) にも VST3 の規格にも、ホストから曲情報を渡す口は無い。
+- mIV 側だけでは進められない: EffeTune の画面はプラグインが所有しており、ホストから操作する正規の手段は無い。
+  同梱ファイルの書き換えは無改変同梱の検証 (manifest) と署名の方針に反する。クリックやキーの模擬はしない。
+- **2026-10-06 利用者が作者 (Frieve-A) へ要望メールを送信済み**: ①プラグイン版でも起動時の表示に Visualizer を選べるように
+  ②ホストから曲情報を渡せるように (例として `IConnectionPoint::notify` + 独自 `IMessage` ID `"EffeTune.NowPlaying"`、
+  項目 title / album / artist と artwork (画像バイト列 + MIME)、曲の切替ごとに送り空で消去。方式は作者に委ねた)。
+- 作者が対応したら:
+  - ①は同梱版の更新だけで済む見込み (mIV 側の改修なし)。§1.337 の自動で開く設定と合わせると、再生だけで Visualizer が出る。
+  - ②は作者の決めた方式に合わせ、vst3-host から送る処理を足す (host は `IMessage` を作る仕組みを既に持つ、`crates/vst3-host/src/host_app.cpp`)。
+    材料: 音声タグ (`src/audio_decode.rs`)、動画の埋め込みタイトル、動画サムネイル (ジャケット代わり)。
+    mIV は音声のジャケット画像を表示・取得していない (一覧は固定の音楽アイコン) ので、音声ファイルは当面画像なしで送る。
+    埋め込みジャケット (FFmpeg の添付画像) や同名画像の取得は、そのとき別途検討する。
+  - リモート配信中の扱い (共有 bridge に配信側の曲情報を送るか) も決める。
+
 ### 1.111 フルスクリーンで動画へ入る瞬間に前面を失い、押しっぱなしのキーが他アプリへ流れる — 利用者報告
 
 - 出典: 利用者報告 (2026-08-21、v3.1.2 で確認)。
