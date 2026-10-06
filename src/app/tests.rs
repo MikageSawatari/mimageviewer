@@ -21545,6 +21545,333 @@ mod phase_c_folder_nav_history_tests {
         panic!("Rating navigation worker did not settle");
     }
 
+    fn write_1328_zip(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for page in 0..4 {
+            zip.start_file(
+                format!("page-{page}.jpg"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn install_1328_parent(app: &mut App, parent: &std::path::Path, items: Vec<GridItem>) {
+        let metas = vec![None; items.len()];
+        app.start_loading_items(
+            parent.to_path_buf(),
+            items,
+            metas,
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
+    }
+
+    #[test]
+    fn section1328_normal_zip_history_back_restores_parent_selection_and_scroll() {
+        for slot in [None, Some(QuickFolderSlotId::A), Some(QuickFolderSlotId::B)] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = slot;
+            let parent = app.tmp.path().join("parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let zip = parent.join("20.zip");
+            write_1328_zip(&zip);
+            let items: Vec<_> = (0..24)
+                .map(|i| GridItem::ZipFile(parent.join(format!("{i:02}.zip"))))
+                .collect();
+            install_1328_parent(&mut app, &parent, items.clone());
+            app.selected = Some(20);
+            app.scroll_offset_y = 640.0;
+            app.record_folder_nav_transition(&zip);
+            app.load_zip_as_folder_prepared(
+                zip.clone(),
+                crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+                crate::app::StartupListIntent::ExplicitList,
+            );
+            app.selected = Some(3);
+            app.scroll_offset_y = 96.0;
+            let mut rollback = None;
+            let target = app
+                .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut rollback)
+                .unwrap();
+            assert_eq!(target, parent);
+            install_1328_parent(&mut app, &target, items);
+            assert_eq!(app.selected, Some(20), "workspace {slot:?}");
+            assert_eq!(app.scroll_offset_y, 640.0);
+            assert!(app.scroll_to_selected);
+        }
+    }
+
+    #[test]
+    fn section1328_normal_zip_backspace_control_selects_opened_zip() {
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip = parent.join("20.zip");
+        write_1328_zip(&zip);
+        let items: Vec<_> = (0..24)
+            .map(|i| GridItem::ZipFile(parent.join(format!("{i:02}.zip"))))
+            .collect();
+        install_1328_parent(&mut app, &parent, items.clone());
+        app.selected = Some(20);
+        app.scroll_offset_y = 640.0;
+        app.load_zip_as_folder_prepared(
+            zip.clone(),
+            crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        app.selected = Some(3);
+        let Some(crate::ui_main::AddressBarNav::Direct(target, restore_intent)) =
+            app.resolve_grid_parent_nav()
+        else {
+            panic!("Backspace must return to the parent folder");
+        };
+        install_1328_parent(&mut app, &target, items);
+        assert_eq!(restore_intent, crate::app::StartupListIntent::ExplicitList);
+        assert_eq!(app.selected, Some(20));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1328_converted_archive_history_back_restores_parent_position() {
+        for format in [
+            ArchiveFormat::Rar,
+            ArchiveFormat::SevenZ,
+            ArchiveFormat::Lzh,
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let parent = app.tmp.path().join("parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let source = parent.join("book.7z");
+            let backing = app.tmp.path().join("cache.zip");
+            write_1328_zip(&backing);
+            let items = vec![
+                GridItem::Folder(parent.join("first")),
+                GridItem::ConvertibleArchive {
+                    path: source.clone(),
+                    format,
+                },
+            ];
+            install_1328_parent(&mut app, &parent, items.clone());
+            app.selected = Some(1);
+            app.scroll_offset_y = 320.0;
+            app.record_folder_nav_transition(&source);
+            app.load_zip_as_folder_prepared_with_logical_source(
+                backing.clone(),
+                crate::zip_loader::enumerate_image_entries_detailed(&backing).unwrap(),
+                Some(&source),
+                crate::app::StartupListIntent::InternalHydration(Box::new(
+                    crate::app::StartupListIntent::ExplicitList,
+                )),
+            );
+            app.adopt_staged_archive_source_alias(&source, &backing);
+            app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
+            app.selected = Some(3);
+            let target = app
+                .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None)
+                .unwrap();
+            install_1328_parent(&mut app, &target, items);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(app.scroll_offset_y, 320.0);
+            assert!(app.scroll_to_selected);
+        }
+    }
+
+    #[test]
+    fn section1328_pdf_history_back_control_preserves_parent_position() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let pdf = parent.join("book.pdf");
+        let items = vec![
+            GridItem::Folder(parent.join("first")),
+            GridItem::PdfFile(pdf.clone()),
+        ];
+        install_1328_parent(&mut app, &parent, items.clone());
+        app.selected = Some(1);
+        app.scroll_offset_y = 320.0;
+        app.record_folder_nav_transition(&pdf);
+        let pages = (0..4)
+            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                page_num,
+                mtime: 1,
+                file_size: 1,
+            })
+            .collect();
+        assert!(matches!(
+            app.load_pdf_as_folder_prepared(
+                pdf,
+                pages,
+                super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        ));
+        app.selected = Some(3);
+        let target = app
+            .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None)
+            .unwrap();
+        install_1328_parent(&mut app, &target, items);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_offset_y, 320.0);
+        assert!(app.scroll_to_selected);
+    }
+
+    fn rating_1328_zip_return(backspace: bool, direction: FolderHistoryDirection) {
+        let mut app = setup_app();
+        app.settings.rating_view_sort =
+            crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("rated");
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut opened = PathBuf::new();
+        for i in 0..6 {
+            let path = parent.join(format!("{i:02}.zip"));
+            write_1328_zip(&path);
+            let key = crate::adjustment_db::normalize_path(&path);
+            let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+                .with_source_path(&path);
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 3, Some(&meta))
+                .unwrap();
+            if i == 4 {
+                opened = path;
+            }
+        }
+        app.current_folder = Some(parent);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.select_rating_view_row_for_opened_path(&opened);
+        let owner = app.rating_view_physical_load_owner(&opened).unwrap();
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(!app.items_are_rating_view);
+        app.selected = Some(3); // The fourth page is unrelated to the list's fourth row.
+        if backspace {
+            app.rating_view_back();
+        } else {
+            if matches!(direction, FolderHistoryDirection::Forward) {
+                let rating = app.folder_nav_back_stack.pop().unwrap();
+                app.folder_nav_forward_stack.push(rating);
+            }
+            app.dispatch_main_folder_history_input(direction, &mut None);
+        }
+        finish_rating_navigation_for_test(&mut app);
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1328_rating_zip_history_back_selects_opened_zip_after_fourth_page() {
+        rating_1328_zip_return(false, FolderHistoryDirection::Back);
+    }
+
+    #[test]
+    fn section1328_rating_zip_history_forward_selects_opened_zip_after_fourth_page() {
+        rating_1328_zip_return(false, FolderHistoryDirection::Forward);
+    }
+
+    #[test]
+    fn section1328_rating_zip_backspace_control_selects_opened_zip() {
+        rating_1328_zip_return(true, FolderHistoryDirection::Back);
+    }
+
+    fn rating_1328_install_rows(app: &mut App) -> Vec<crate::rating_view::RatingViewRow> {
+        let GridItem::Image(previous) = &app.items[0] else {
+            panic!("expected an image fixture");
+        };
+        let root = previous.parent().unwrap().to_path_buf();
+        (0..6)
+            .map(|i| {
+                let path = root.join(format!("new-{i}.jpg"));
+                std::fs::write(&path, b"image").unwrap();
+                let key = crate::adjustment_db::normalize_path(&path);
+                let meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                        .with_source_path(&path);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+                crate::rating_view::RatingViewRow {
+                    key,
+                    item: GridItem::Image(path),
+                    image_meta: None,
+                    rated_at_ms: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn section1328_rating_install_does_not_inherit_index_from_another_surface() {
+        for previous_stars in [None, Some(1)] {
+            let mut app = setup_app();
+            if let Some(stars) = previous_stars {
+                app.items_are_rating_view = true;
+                app.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::Rating { stars },
+                );
+            }
+            app.items = (0..4)
+                .map(|i| GridItem::Image(app.tmp.path().join(format!("old-{i}.jpg"))))
+                .collect();
+            app.selected = Some(3);
+            app.rating_view_stars = 3;
+            app.rating_view_rows = rating_1328_install_rows(&mut app);
+            app.install_rating_view_rows();
+            assert_eq!(app.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn section1328_rating_same_list_rebuild_keeps_index_fallback() {
+        let mut app = setup_app();
+        app.items_are_rating_view = true;
+        app.rating_view_stars = 3;
+        app.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 });
+        app.items = vec![GridItem::Image(app.tmp.path().join("removed.jpg")); 4];
+        app.selected = Some(3);
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.install_rating_view_rows();
+        assert_eq!(app.selected, Some(3));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1328_zip_page_continuation_saves_history_without_adopting_startup_list() {
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip = parent.join("book.zip");
+        write_1328_zip(&zip);
+        install_1328_parent(&mut app, &parent, vec![GridItem::ZipFile(zip.clone())]);
+        app.selected = Some(0);
+        app.scroll_offset_y = 320.0;
+        app.capture_main_list_restore_cursor();
+        let startup_before = app.settings.startup_list_restore.clone();
+        app.load_zip_as_folder_prepared(
+            zip.clone(),
+            crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+            crate::app::StartupListIntent::PageContinuation,
+        );
+        assert_eq!(app.settings.startup_list_restore, startup_before);
+        assert_eq!(app.folder_history.get(&parent), Some(&(320.0, Some(0))));
+    }
+
     #[test]
     fn location_menu_rating_view_records_previous_folder_for_back() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();

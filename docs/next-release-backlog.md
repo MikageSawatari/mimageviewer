@@ -2235,7 +2235,7 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
-### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 利用者報告、原因特定済み (2026-10-05)
+### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 主要2経路修正・自動検証完了、残件あり (2026-10-07)
 
 - 出典: 利用者メール (§1.280 / §1.307 と同じ報告者、v4.3.0)。報告者の観測:
   - 通常フォルダ: ZIP を開く → ← → 一番左上の項目が選択され、一覧の先頭までスクロールする (時々違う挙動もする)。
@@ -2246,29 +2246,60 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
     レーティング一覧の件はコード調査のみ。
   - 報告者へ「今後の版で修正する。ほかの画面から開いた場合も確認する」と返信済み (2026-10-05)。
 - 望ましい動き: ← で戻ったとき、開いていた ZIP を選択し、画面内に収める (BS で戻ったときと同じ)。
-- 原因 (コード調査):
+- 原因 (コード調査、行番号は §1.335 統合後の修正前 `f18de061e` で再照合):
   - **通常フォルダ**: フォルダを離れるときの位置 (`folder_history` の scroll / selected) は `start_loading_items_inner`
-    (`src/app.rs` 34213 付近) で保存し、戻ったときに 35048 付近で復元する。ところが ZIP を開く
-    `load_zip_as_folder_with_prepared_enumeration` (30986 付近) は、その保存より前に `selected = None` /
+    (`src/app.rs` 35345、保存自体は 35616) で保存し、戻ったときに 36452 付近で復元する。ところが ZIP を開く
+    `load_zip_as_folder_with_prepared_enumeration` (32143) は、その保存より前に `selected = None` /
     `scroll_offset_y = 0` にし、`current_folder` を ZIP に書き換える。このため元フォルダの位置が保存されず、
     ← で戻ると履歴が無い扱い (先頭選択・先頭スクロール) になる。以前の保存が残っていればそれに戻るので
     「時々違う挙動」になる (推測)。BS は `select_after_load` に ZIP 名を渡すので正しく選ばれる。
-    PDF の open (`load_pdf_as_folder_with_prepared_pages`) は `start_loading_items` の保存を通るので同じ問題は無いはず。
-    変換済み書庫 (RAR / 7z / LZH) は同じ ZIP の経路なので同じ症状のはず (未確認)。
-  - **レーティング一覧**: BS (`rating_view_back`、30116 付近) は `select_opened_path` に開いていた ZIP を渡すが、
-    ← の replay (`start_rating_navigation`、30504 付近) は `None`。一覧の install (`finish_rating_view_install`、
-    30753 付近) は直前の `selected` を key → 同じ index の順で引き継ぐため、ZIP 内の 4 番目の画像の index が
+      PDF の open (`load_pdf_as_folder_with_prepared_pages`) は `start_loading_items` の保存を通るので同じ問題は無い
+      (prepared open の対照回帰で確認)。変換済み書庫 (RAR / 7z / LZH) は同じ ZIP の経路を通り、
+      元パス採用後の履歴復帰の回帰でも同じ保存欠落を確認した。外部変換ツールの実行は今回の自動テスト対象外。
+  - **レーティング一覧**: BS (`rating_view_back`、31339) は `select_opened_path` に開いていた ZIP を渡すが、
+    ← の replay (`start_rating_navigation`、31723) は `None`。一覧の install (`finish_rating_view_install`、
+    31972) は直前の `selected` を key → 同じ index の順で引き継ぐため、ZIP 内の 4 番目の画像の index が
     一覧の 4 番目の行として使われる。index での引き継ぎは同じ一覧の並べ直し用で、別の画面から戻るときに使うのが誤り。
   - **コレクション**: 戻り先に開いていた entry の anchor を持つ (§1.282) ので正しく動く。
-- 方針候補:
-  - 通常フォルダ: ZIP を開く経路でも、`current_folder` を書き換える前に元フォルダの位置を `folder_history` へ保存する
-    (保存の所有者を 1 か所にまとめられるか検討する)。
-  - レーティング一覧: ← / → の replay でも、離れる場所 (開いていた ZIP など) を `select_opened_path` に渡す。
-    `finish_rating_view_install` の index での引き継ぎは、同じ一覧の再構築に限る。
-  - 同型の確認: スマートフォルダ・検索結果・ブックマーク・閲覧履歴・サブフォルダ展開・ドライブ一覧から ZIP / PDF /
-    変換書庫 / フォルダを開いて ← で戻る場合を列挙し、選択と画面内表示を揃える。
-- 回帰確認: 通常フォルダ (一覧の下の方の ZIP、ZIP 内でページを選んだ後、変換済み書庫、PDF)、レーティング一覧、
-  コレクション、A/B クイックフォルダ、BS で戻る動きが変わらないこと。
+- 実装 (2026-10-07、Codex の source inspection / 自動テスト。実アプリ起動は未実施):
+  - 通常フォルダ: `save_leaving_folder_grid_position` に既存の位置保存を集約。
+    ZIP が旧一覧を消す直前と通常 install が同じ owner を呼ぶ。列挙完了時の空一覧は保存しない。
+    ZIP / 直接閲覧 RAR / RAR・7z・LZH の変換済み ZIP で共通。PDF の既存 install 保存は維持。
+  - レーティング一覧: ← / → replay の `select_opened_path` に発行時の `effective_folder()` を渡し、
+    成功採用後に開いていたコンテナを選択して ensure-visible。変換書庫は元 source を照合。
+    index fallback は同じ ★一覧の rebuild だけ。key による追従は維持。
+  - Backspace / Collection / detached の経路は変更しない。新規の入力操作・manual 更新は不要。
+  - 簡素化: 新しい保存 state / rollback / modal は足さず、既存 owner と採用境界へ揃えた。
+    §1.335 の `StartupListIntent` の運搬・採用は維持し、session 内履歴の保存から起動復元先を採用しない。
+- 同型調査 (コードからの判定、実アプリの観測ではない。今回と異なる原因の修正は範囲外):
+
+  | 一覧 | ZIP / PDF / 変換書庫 / フォルダを開いた後の ← | 根拠・残件 |
+  | --- | --- | --- |
+  | 通常フォルダ | ZIP・直読み RAR・変換 ZIP は今回修正。PDF・実フォルダは既存保存経路 | `start_loading_items_inner` と ZIP 即応表示の保存時点差を解消 |
+  | レーティング | 対象 container の元パスを今回 replay に追加 | prepared / 通常 install の index fallback を同じ ★一覧に限定 |
+  | スマートフォルダ | root entry の選択と退避 scroll を復元する既存経路 | `restore_smart_folder_prepared_grid` の returned-root-entry と resident session。物理子の通常 ZIP 一覧位置は共通保存の修正対象 |
+  | 検索結果 (Ctrl+S/G/T、ローカル検索、★固定) | 検索・snapshot 所有中の ← / → は既存仕様で拒否 | `history_input_nav_allowed`。検索の Backspace 帰路は今回変更しない |
+  | ブックマーク | 元の bookmark row の stable key / scroll を復元する既存経路 | `BookmarkViewReturnGridState` / `restore_bookmark_view_grid`。本のページを開く一覧で、実フォルダ行は対象外 |
+  | 閲覧履歴 | 開いた本の選択は保証しない (残件) | replay は `enter_reading_history` へ再入場し、一覧 install が先頭を選ぶ。返り先に opened-row anchor を持たない。ZIP 専用の保存欠落 / rating index 継承とは別原因。実フォルダ本も同じ |
+  | サブフォルダ展開 | 開いた項目の選択は保証しない (残件) | restore state は root / snapshot / tombstone を保持するが selection anchor / scroll を持たず、prepare 完了時に先頭を選ぶ。ZIP/PDF/変換書庫/本フォルダに共通する別の owner 設計課題 |
+  | ドライブ一覧 | ← dispatch が離れるドライブルートを origin として選ぶ既存経路 | `enter_drive_list(effective_folder())`。一覧行はドライブルートのみで、ZIP/PDF/変換書庫は直接開けない |
+  | コレクション | §1.282 の entry anchor を保持する既存経路 | 今回変更なし |
+  | A/B クイックフォルダ | 通常フォルダと同じ保存処理、各 slot の履歴 dispatch | A/B 両方を通常 ZIP 回帰に含める。slot 所有・切替仕様は変更しない |
+
+  - 検証 (2026-10-07):
+    - 修正前 `f18de061e`、fixture / §1.335 intent 引数を揃えた追加 10 件は 6 件失敗 / 4 件成功、exit 1。
+      失敗は通常 ZIP、変換 ZIP、rating ← / →、異なる一覧の index 継承、PageContinuation の位置保存。
+      Backspace 2 件・PDF・同じ ★一覧 rebuild の対照は成功。証跡: `target/1328-red.txt`。
+    - 修正後: 追加 10/10、履歴群 106/106、起動復元群 73/73 が成功。
+      `cargo test -p mimageviewer --lib` (pipe なし) は 10900 成功 / 0 失敗 / 52 ignored、exit 0。
+    - `cargo fmt --all -- --check`、normal / portable の `cargo check -p mimageviewer --bin mimageviewer-core`
+      (`portable` は `--features portable`) は exit 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0 / exit 0。
+    - `.\scripts\build-dev.ps1 -PreserveRuntime` は exit 0。normal 機能構成の core / remote service / EPUB PDF worker と
+      FFmpeg / VCRT DLL / EffeTune bundle を配置、VCRT PE 検査は runtime=4 / pe=3 で成功。
+      初回 native 構築の並列競合を避け、`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` で実行。
+      製品バイナリは起動していない。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で全ファイル EOL 差分が無いことを確認。
+- 残る検収: 独立レビューと、利用者による実アプリの ZIP / レーティング / 変換書庫 / PDF / BS 確認。
+  閲覧履歴・サブ展開の anchor を含む構造変更はこの bounded fix では実装しない。
 - 規模 / 優先度: Small〜Medium / P2 (利用者報告あり)。
 
 ### 1.318 起動時の索引走査を HDD ごとに 1 本ずつ順に回す (D2) — 実測から保留 (2026-10-03)

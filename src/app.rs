@@ -31732,6 +31732,9 @@ impl App {
         }
         self.cancel_replaced_staged_archive_conversion();
         self.replace_history_navigation_transition(None);
+        let select_opened_path = matches!(&intent, RatingNavigationIntent::Replay { .. })
+            .then(|| self.effective_folder())
+            .flatten();
         let transition = RatingNavigationTransition {
             intent,
             history_before: self.folder_nav_history_snapshot(),
@@ -31744,7 +31747,7 @@ impl App {
             target_sort: self.settings.rating_view_sort.normalized_for_rating_view(),
             saved_folder,
             subfolder_restore,
-            select_opened_path: None,
+            select_opened_path,
         };
         self.start_rating_build(
             transition.target_stars,
@@ -31866,12 +31869,26 @@ impl App {
         }
     }
 
+    /// Numeric selection belongs only to rebuilding the same rating list. Keys can follow
+    /// the same item across lists, but a page index must never become a list-row index.
+    fn rating_view_rebuild_selected_index(&self) -> Option<usize> {
+        if self.items_are_rating_view
+            && matches!(self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Rating { stars }
+                    if *stars == self.rating_view_stars)
+        {
+            self.selected
+        } else {
+            None
+        }
+    }
+
     fn install_prepared_rating_view_rows(
         &mut self,
         prepared: crate::rating_view::RatingViewPreparedItems,
     ) {
-        let previous_selected = self.selected;
-        let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected_key = self.selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected = self.rating_view_rebuild_selected_index();
         let retained_details_rated_at_sort = (self.items_are_rating_view
             && self.settings.details_sort_key == crate::settings::DetailsSortKey::RatedAt)
             .then_some(self.settings.details_sort_ascending);
@@ -31890,8 +31907,8 @@ impl App {
     }
 
     fn install_rating_view_rows(&mut self) {
-        let previous_selected = self.selected;
-        let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected_key = self.selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected = self.rating_view_rebuild_selected_index();
         let retained_details_rated_at_sort = (self.items_are_rating_view
             && self.settings.details_sort_key == crate::settings::DetailsSortKey::RatedAt)
             .then_some(self.settings.details_sort_ascending);
@@ -32260,6 +32277,7 @@ impl App {
         // address / current_folder を zip_path にして breadcrumb と BS (parent) を正しく動かす。
         // catalog / sidecar / worker spawn などの重い設定は poll_zip_enumerate の
         // start_loading_items で行う (二重にやらない)。
+        self.save_leaving_folder_grid_position();
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
@@ -35342,6 +35360,27 @@ impl App {
         );
     }
 
+    /// Save before the visible source rows or path are replaced (including ZIP pending UI).
+    /// This session history is separate from StartupListIntent adoption.
+    fn save_leaving_folder_grid_position(&mut self) {
+        if !self.navigation_scope.is_detached_physical()
+            && let Some(cur) = self.current_folder.clone()
+        {
+            let leaving_search_view = self.items_are_global_search_view
+                || self.items_are_tag_view
+                || self.items_are_reading_history_view
+                || self.items_are_bookmark_view
+                || self.items_are_rating_view
+                || is_synthetic_view_path(&cur);
+            let has_grid_state_to_save =
+                !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
+            if !leaving_search_view && has_grid_state_to_save {
+                self.folder_history
+                    .insert(cur, (self.scroll_offset_y, self.selected));
+            }
+        }
+    }
+
     fn start_loading_items_inner(
         &mut self,
         source_path: PathBuf,
@@ -35613,20 +35652,7 @@ impl App {
         // folder_history (スクロール位置復元用) へ保存しない。Ctrl+G は current_folder を
         // 検索前フォルダのまま保つため、検索ビューの scroll_offset_y をそのフォルダの
         // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
-        if !detached_physical && let Some(cur) = self.current_folder.clone() {
-            let leaving_search_view = self.items_are_global_search_view
-                || self.items_are_tag_view
-                || self.items_are_reading_history_view
-                || self.items_are_bookmark_view
-                || self.items_are_rating_view
-                || is_synthetic_view_path(&cur);
-            let has_grid_state_to_save =
-                !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
-            if !leaving_search_view && has_grid_state_to_save {
-                self.folder_history
-                    .insert(cur, (self.scroll_offset_y, self.selected));
-            }
-        }
+        self.save_leaving_folder_grid_position();
         self.change_main_context_for_visible_grid(false);
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
