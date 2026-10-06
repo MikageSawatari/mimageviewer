@@ -508,7 +508,7 @@ mIV の「画像をコピー」は、次のすべてが [context_menu.rs:2503](.
     - それも無ければ、検証済みの context 全体を fragment とみなす。
     - context も壊れていたら解析しない。
 - **HTML パーサの crate を追加する**。今の依存には無く、`quick-xml` は実際の HTML に耐えない。
-  - `scraper` (内部で html5ever を使う) を採用する。堅牢で保守も活発。ライセンスは `scraper` が ISC、html5ever が MIT / Apache-2.0 (2026-10-06 実装担当の確認で訂正。初版は scraper も MIT / Apache-2.0 と誤記)。ISC は既存依存 (rustls、ring、libloading など) にも含まれる許容的なライセンスで、mIV (MIT) の配布に支障はない。
+  - `scraper` (内部で html5ever を使う) を採用する。堅牢で保守も活発。ライセンスは `scraper` が ISC、html5ever が MIT / Apache-2.0 (2026-10-06 実装担当の確認で訂正。初版は scraper も MIT / Apache-2.0 と誤記)。ISC は既存依存 (rustls、ring、libloading など) にも含まれる許容的なライセンスで、mIV (MIT) の配布に支障はない。 scraper が使う `cssparser` / `selectors` (インライン style の解析にも `cssparser` を使う) は MPL-2.0。MPL-2.0 も既存依存 (symphonia、smartstring など) に含まれ、改変せずに使う。
 - 集める候補:
   - `<img src>`
   - `<img srcset>` (最大の w / x 記述子のもの)
