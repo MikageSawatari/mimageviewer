@@ -13,6 +13,32 @@ mod file_organize_tests {
     };
 
     #[test]
+    fn file_organize_destinations_direct_handler_adopts_folder_and_history() {
+        let mut app = phase_c_support::setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("origin");
+        let destination = app.tmp.path().join("destination");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        app.load_folder(origin.clone());
+        let history = app.folder_nav_history_snapshot();
+        assert!(
+            app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+                destination.clone()
+            ),)
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        let after = app.folder_nav_history_snapshot();
+        assert_eq!(after.back_stack.len(), history.back_stack.len() + 1);
+        assert_eq!(
+            after.back_stack.last(),
+            Some(&FolderNavHistoryTarget::Path(origin))
+        );
+        assert!(after.forward_stack.is_empty());
+    }
+
+    #[test]
     fn file_organize_completion_requests_existing_external_rescan_only_for_current_real_folder() {
         let mut env = phase_c_support::setup_app();
         let root = env.tmp.path().to_owned();
@@ -1915,9 +1941,9 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     assert!(size_of::<PdfPasswordRequestOwner>() < 32);
     assert!(size_of::<PdfEnumeratePending>() < 1_200);
     assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
-    // Organize destinations also live in PreferencesState's Settings drafts. Keep
-    // a small explicit budget for that settings growth, and keep the rare request
-    // payload on the heap instead of storing it inline in every App.
+    // Keep the rare organize request payload on the heap instead of storing it
+    // inline in every App. Grow App by moving state to the heap (as pref_state
+    // does), not by raising the limit below.
     assert!(
         size_of::<crate::ui_dialogs::file_organize::FileOrganizeRequest>()
             <= 2 * size_of::<usize>()
@@ -26098,14 +26124,17 @@ mod phase_c_drill_nav_tests {
         let path = std::path::PathBuf::from("c:/media/completed.mp4");
         let key = crate::adjustment_db::normalize_path(&path);
         let mut resume = std::collections::HashMap::from([(key.clone(), 90.0)]);
+        let mut watched = std::collections::HashSet::new();
         assert!(!crate::app::save_video_resume_position(
             &mut resume,
+            &mut watched,
             key.clone(),
             100.0,
             100.0,
             true,
         ));
         assert!(!resume.contains_key(&key));
+        assert!(watched.contains(&key));
 
         let mut history = ReadingHistoryEntry::new(
             path.clone(),
@@ -70176,15 +70205,19 @@ mod still_window_mode_key_tests {
             },
         ];
         let mut resume = std::collections::HashMap::from([(finished.clone(), 10.0)]);
+        let mut watched = std::collections::HashSet::from([kept.clone()]);
 
         let removed = apply_viewer_context_media_resume_updates(
             &mut resume,
+            &mut watched,
             &mut Default::default(),
             &updates,
         );
 
         assert_eq!(resume.get(&kept), Some(&37.5));
         assert!(!resume.contains_key(&finished));
+        assert!(!watched.contains(&kept));
+        assert!(watched.contains(&finished));
         assert_eq!(removed, vec![finished]);
         assert!(viewer_context_teardown_paths_contain(
             &[PathBuf::from(r"C:\Music\BGM.FLAC")],
@@ -70365,10 +70398,13 @@ mod still_window_mode_key_tests {
         app.settings
             .video_resume_positions
             .insert(eof_key.clone(), 13.046);
+        app.settings.video_watched_to_end.insert(mid_key.clone());
 
         app.save_all_video_resume_positions();
 
         assert!(!app.settings.video_resume_positions.contains_key(&eof_key));
+        assert!(app.settings.video_watched_to_end.contains(&eof_key));
+        assert!(!app.settings.video_watched_to_end.contains(&mid_key));
         assert_eq!(
             app.settings.video_resume_positions.get(&mid_key),
             Some(&40.0),
@@ -70395,9 +70431,11 @@ mod still_window_mode_key_tests {
         );
         app.video_audio_mode = Some(idx);
         let key = crate::adjustment_db::normalize_path(&path);
+        app.settings.video_watched_to_end.insert(key.clone());
 
         app.save_all_video_resume_positions();
         assert_eq!(app.settings.video_resume_positions.get(&key), Some(&40.0));
+        assert!(!app.settings.video_watched_to_end.contains(&key));
 
         let items = app.items.clone();
         let player = crate::video::VideoPlayer::disconnected_for_test(path, 55.0);
@@ -70521,14 +70559,17 @@ mod still_window_mode_key_tests {
         assert!(plan.resume_updates[0].at_eof);
         assert_eq!(plan.resume_updates[0].duration, 0.0);
         let mut resume = std::collections::HashMap::from([(key.clone(), 13.046)]);
+        let mut watched = std::collections::HashSet::new();
 
         let removed = apply_viewer_context_media_resume_updates(
             &mut resume,
+            &mut watched,
             &mut Default::default(),
             &plan.resume_updates,
         );
 
         assert!(!resume.contains_key(&key));
+        assert!(watched.contains(&key));
         assert_eq!(removed, vec![key]);
     }
 
@@ -70567,9 +70608,11 @@ mod still_window_mode_key_tests {
             })
             .unwrap();
         let mut positions = Default::default();
+        let mut watched = Default::default();
         let mut choices = Default::default();
         apply_viewer_context_media_resume_updates(
             &mut positions,
+            &mut watched,
             &mut choices,
             &plan.resume_updates,
         );
@@ -92568,6 +92611,7 @@ fn replacing_items_discards_incomplete_details_target_plan() {
 fn thumbnail_selection_info_keeps_single_target_fast_path() {
     let mut app = phase_c_support::setup_app();
     app.settings.thumb_show_media_duration = false;
+    app.settings.thumb_show_resume_meter = false;
     app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
     app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
     app.settings.thumb_tooltip_show_created = false;
@@ -96689,6 +96733,7 @@ fn media_duration_thumbnail_targets_only_near_video_and_audio() {
         }
     }
     app.settings.thumb_show_media_duration = false;
+    app.settings.thumb_show_resume_meter = false;
     assert!(!app.details_lazy_columns_visible());
     for idx in 0..5 {
         assert!(app.details_meta_target_for_idx(idx, &near, true).is_none());
@@ -96890,6 +96935,7 @@ fn media_duration_preference_off_cancels_ai_pending_and_preserves_other_requirem
     let cancel = install_fake_media_duration_pending(&mut app);
     let mut edited = app.settings.clone();
     edited.thumb_show_media_duration = false;
+    edited.thumb_show_resume_meter = false;
     app.install_preferences_settings(edited);
     assert!(cancel.load(Ordering::Relaxed));
     assert!(app.details_meta_pending.is_none());

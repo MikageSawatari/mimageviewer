@@ -36,6 +36,8 @@ struct DeletePurgeJournalEntry {
 pub(crate) struct DeletePurgeRetryReport {
     pub(crate) attempted: usize,
     pub(crate) purged: usize,
+    /// Worker-confirmed absent paths; reconcile live media memory without rereading SQLite.
+    pub(crate) removed_paths: Vec<PathBuf>,
     pub(crate) remaining: usize,
     pub(crate) rows: usize,
     pub(crate) errors: Vec<String>,
@@ -253,6 +255,7 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
             ));
             continue;
         }
+        report.removed_paths.push(entry.path.clone());
         let purge = crate::rename_key_migration::purge_removed_paths_guarded_at(
             data_dir,
             std::slice::from_ref(&entry.path),
@@ -1346,6 +1349,7 @@ mod tests {
         let report = retry_delete_purge_journal_at(&data_dir);
         assert_eq!(report.attempted, 1);
         assert_eq!(report.purged, 1);
+        assert_eq!(report.removed_paths, vec![removed.clone()]);
         assert_eq!(report.remaining, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(rating.get(&key), 0);

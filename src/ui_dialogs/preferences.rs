@@ -60,7 +60,7 @@ pub fn draw_preferences_transfer_explanation_snapshot_fixture(ui: &mut egui::Ui,
 
 #[doc(hidden)]
 pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::Ui) {
-    let mut destinations = vec![
+    let destinations = vec![
         crate::settings::FileOrganizeDestination {
             name: "保管".into(),
             path: PathBuf::from(r"D:\写真\保管"),
@@ -70,7 +70,9 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
             path: PathBuf::from(r"\\server\写真\非常に長いフォルダ名\要確認"),
         },
     ];
-    pages::draw_file_organize_destinations_settings(ui, &mut destinations);
+    let mut settings = Settings::default();
+    settings.file_organize_destinations = destinations;
+    pages::draw_file_organize_destinations_settings(ui, &mut settings);
 }
 
 #[doc(hidden)]
@@ -1093,6 +1095,7 @@ impl PreferencesState {
     fn clear_video_media_memory(&mut self) {
         self.video_media_memory_clear_requested = true;
         self.settings.video_resume_positions.clear();
+        self.settings.video_watched_to_end.clear();
         self.settings.video_audio_track_choices.clear();
     }
     pub(super) fn select_external_tool(
@@ -2129,11 +2132,13 @@ fn merge_video_media_memory_for_preferences(
 ) {
     if clear_requested {
         edited.video_resume_positions.clear();
+        edited.video_watched_to_end.clear();
         edited.video_audio_track_choices.clear();
     } else {
-        // 再生位置の保存と選択の確定・削除・リネームはダイアログ表示中も live を更新する。
-        // 環境設定側の編集意図はクリアだけなので、OK 時には両方の最新 map を移す。
+        // 再生位置・視聴済みの保存と選択の確定・削除・リネームは表示中も live を更新する。
+        // 環境設定側の編集意図はクリアだけなので、OK 時には最新の利用記録を移す。
         edited.video_resume_positions = std::mem::take(&mut live.video_resume_positions);
+        edited.video_watched_to_end = std::mem::take(&mut live.video_watched_to_end);
         edited.video_audio_track_choices = std::mem::take(&mut live.video_audio_track_choices);
     }
 }
@@ -2155,8 +2160,9 @@ impl App {
                 settings.raw_develop_parallelism = requested_raw_parallelism;
             }
         }
-        let media_duration_changed =
-            self.settings.thumb_show_media_duration != settings.thumb_show_media_duration;
+        let thumbnail_media_requirements_changed = self.settings.thumb_show_media_duration
+            != settings.thumb_show_media_duration
+            || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
         if old_raw_brightness != self.settings.raw_brightness {
@@ -2171,7 +2177,7 @@ impl App {
                 .slot
                 .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
         }
-        if media_duration_changed {
+        if thumbnail_media_requirements_changed {
             self.invalidate_details_meta_requirements();
         }
         if books_root_changed {
@@ -4156,6 +4162,7 @@ mod tests {
                 .is_empty()
         );
         let mut state = preferences_state_for_test(&app.settings);
+        state.settings.show_location_file_organize_destinations = false;
         state
             .settings
             .file_organize_destinations
@@ -4191,14 +4198,23 @@ mod tests {
         prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
         app.install_preferences_settings(state.settings);
         assert_eq!(app.settings.file_organize_destinations, expected);
+        assert!(!app.settings.show_location_file_organize_destinations);
         assert_eq!(app.settings.favorites[0].id, favorite_id);
         assert_eq!(app.settings.toolbar_section_order, toolbar);
         assert!(app.settings.save_checked());
         let persisted = db.load_into_settings().unwrap();
         let mut reopened = preferences_state_for_test(&persisted);
+        assert!(!reopened.settings.show_location_file_organize_destinations);
+        reopened.settings.show_location_file_organize_destinations = true;
         assert_eq!(reopened.settings.file_organize_destinations, expected);
         reopened.settings.file_organize_destinations.clear();
         drop(reopened); // 本番 Cancel と同じく draft を捨てるだけ。
+        assert!(!app.settings.show_location_file_organize_destinations);
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .show_location_file_organize_destinations
+        );
         assert_eq!(app.settings.file_organize_destinations, expected);
         assert_eq!(
             db.load_into_settings().unwrap().file_organize_destinations,
@@ -4309,18 +4325,173 @@ mod tests {
     }
 
     #[test]
-    fn book_resume_meter_preferences_ok_save_db_reread_reopen_and_cancel() {
+    fn resume_meter_preferences_watched_live_ok_save_reopen_cancel_and_clear() {
+        let mut app = crate::app::setup_app_for_test();
+        let key = |name| crate::adjustment_db::normalize_path(&app.tmp.path().join(name));
+        let old_key = key("old-watched.mkv");
+        let video_key = key("watched.mkv");
+        let audio_key = key("watched.mp3");
+        let resume_key = key("in-progress.mkv");
+        let later_key = key("later-watched.mkv");
+        let after_clear_key = key("after-clear-watched.mp3");
+        app.settings.video_watched_to_end.insert(old_key.clone());
+        app.settings
+            .video_resume_positions
+            .insert(resume_key.clone(), 18.0);
+        app.settings.video_audio_track_choices.insert(
+            video_key.clone(),
+            saved_audio_choice_for_preferences_test(2),
+        );
+
+        let mut state = preferences_state_for_test(&app.settings);
+        state.settings.thumb_show_resume_meter = false;
+        // Viewing continues while the draft contains an old watched set.
+        app.settings.video_watched_to_end.remove(&old_key);
+        app.settings.video_watched_to_end.insert(video_key.clone());
+        app.settings.video_watched_to_end.insert(audio_key.clone());
+        assert!(state.settings.video_watched_to_end.contains(&old_key));
+        assert!(!state.settings.video_watched_to_end.contains(&video_key));
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        app.settings.save();
+
+        let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        let expected = std::collections::HashSet::from([video_key.clone(), audio_key.clone()]);
+        assert_eq!(persisted.video_watched_to_end, expected);
+        let mut reopened = preferences_state_for_test(&persisted);
+        assert_eq!(reopened.settings.video_watched_to_end, expected);
+        assert!(!reopened.settings.thumb_show_resume_meter);
+
+        reopened.clear_video_media_memory();
+        assert!(reopened.settings.video_watched_to_end.is_empty());
+        app.settings.video_watched_to_end.insert(later_key.clone());
+        app.pref_state = Some(Box::new(reopened));
+        app.discard_preferences_dialog();
+        assert!(app.settings.video_watched_to_end.contains(&later_key));
+        assert!(app.settings.video_watched_to_end.contains(&video_key));
+        assert!(app.settings.video_watched_to_end.contains(&audio_key));
+        assert!(
+            app.settings
+                .video_resume_positions
+                .contains_key(&resume_key)
+        );
+        assert!(
+            app.settings
+                .video_audio_track_choices
+                .contains_key(&video_key)
+        );
+        app.settings.save();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(
+            persisted.video_watched_to_end,
+            app.settings.video_watched_to_end
+        );
+        let mut state = preferences_state_for_test(&persisted);
+
+        state.clear_video_media_memory();
+        // An explicit clear wins over records added after the user requested it.
+        app.settings.video_watched_to_end.insert(after_clear_key);
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        app.settings.save();
+        let persisted = db.load_into_settings().unwrap();
+        let reopened = preferences_state_for_test(&persisted);
+        assert!(reopened.settings.video_watched_to_end.is_empty());
+        assert!(reopened.settings.video_resume_positions.is_empty());
+        assert!(reopened.settings.video_audio_track_choices.is_empty());
+    }
+
+    #[test]
+    fn resume_meter_preferences_toggle_requeues_media_metadata_with_duration_badge_off() {
+        use crate::app::LazyColumnState;
+        use crate::grid_item::GridItem;
+
+        for item in [
+            GridItem::Video(std::path::PathBuf::from("resume-meter-video.mkv")),
+            GridItem::Audio(std::path::PathBuf::from("resume-meter-audio.mp3")),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            app.install_new_items(vec![item], vec![Some((1, 10))]);
+            app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+            app.settings.thumb_show_media_duration = false;
+            app.settings.thumb_show_resume_meter = false;
+            app.selected = None;
+            app.items_are_drive_list = false;
+            app.ai_model_facet_requested = false;
+            app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+
+            let mut state = preferences_state_for_test(&app.settings);
+            state.settings.thumb_show_resume_meter = true;
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.install_preferences_settings(state.settings);
+            assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+            assert!(!app.settings.thumb_show_media_duration);
+
+            // An unchanged OK must preserve the completed scan state.
+            app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+            let unchanged = app.settings.clone();
+            app.install_preferences_settings(unchanged);
+            assert_eq!(
+                app.details_image_dims_state,
+                LazyColumnState::Ready { failed: 0 }
+            );
+
+            let mut state = preferences_state_for_test(&app.settings);
+            state.settings.thumb_show_resume_meter = false;
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.install_preferences_settings(state.settings);
+            assert_eq!(app.details_image_dims_state, LazyColumnState::Disabled);
+        }
+    }
+
+    #[test]
+    fn resume_meter_preferences_ok_save_db_reread_reopen_and_cancel() {
         use crate::settings::FullscreenSeekDirection;
 
         let mut app = crate::app::setup_app_for_test();
-        assert!(app.settings.thumb_show_book_resume_meter);
+        assert!(app.settings.thumb_show_resume_meter);
+        let video_path = app.tmp.path().join("resume-meter-video.mkv");
+        let audio_path = app.tmp.path().join("resume-meter-audio.mp3");
+        let video_key = crate::adjustment_db::normalize_path(&video_path);
+        let audio_key = crate::adjustment_db::normalize_path(&audio_path);
         for (enabled, direction) in [
             (false, FullscreenSeekDirection::LeftToRight),
             (true, FullscreenSeekDirection::FollowReading),
         ] {
+            app.settings
+                .video_resume_positions
+                .insert(video_key.clone(), 7.0);
+            app.settings
+                .video_resume_positions
+                .insert(audio_key.clone(), 9.0);
             let mut state = preferences_state_for_test(&app.settings);
-            state.settings.thumb_show_book_resume_meter = enabled;
+            state.settings.thumb_show_resume_meter = enabled;
             state.settings.fullscreen_seek_direction = direction;
+
+            // Both video and audio advance while the draft still contains their old positions.
+            for (idx, path, position) in
+                [(0, video_path.clone(), 18.0), (1, audio_path.clone(), 28.0)]
+            {
+                app.fs_cache.insert(
+                    idx,
+                    crate::fs_animation::FsCacheEntry::Video {
+                        player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                            path, position,
+                        )),
+                        load_seq: 0,
+                    },
+                );
+            }
+            app.save_all_video_resume_positions();
+            assert_eq!(
+                state.settings.video_resume_positions.get(&video_key),
+                Some(&7.0)
+            );
+            assert_eq!(
+                state.settings.video_resume_positions.get(&audio_key),
+                Some(&9.0)
+            );
 
             // Runtime and other-dialog changes made after opening Preferences must survive OK.
             let width = app.settings.details_name_width + 17.0;
@@ -4333,55 +4504,88 @@ mod tests {
             app.settings.favorites = vec![favorite];
             prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
             app.install_preferences_settings(state.settings);
-            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(app.settings.thumb_show_resume_meter, enabled);
             assert_eq!(app.settings.fullscreen_seek_direction, direction);
             assert_eq!(app.settings.details_name_width, width);
             assert_eq!(app.settings.favorites[0].id, favorite_id);
+            assert_eq!(
+                app.settings.video_resume_positions.get(&video_key),
+                Some(&18.0)
+            );
+            assert_eq!(
+                app.settings.video_resume_positions.get(&audio_key),
+                Some(&28.0)
+            );
             app.settings.save();
 
             // Read the actual persisted DB, then construct a new real Preferences draft.
             let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
             let persisted = db.load_into_settings().unwrap();
-            assert_eq!(persisted.thumb_show_book_resume_meter, enabled);
+            assert_eq!(persisted.thumb_show_resume_meter, enabled);
             assert_eq!(persisted.fullscreen_seek_direction, direction);
+            assert_eq!(
+                persisted.video_resume_positions.get(&video_key),
+                Some(&18.0)
+            );
+            assert_eq!(
+                persisted.video_resume_positions.get(&audio_key),
+                Some(&28.0)
+            );
             let mut reopened = preferences_state_for_test(&persisted);
-            assert_eq!(reopened.settings.thumb_show_book_resume_meter, enabled);
+            assert_eq!(reopened.settings.thumb_show_resume_meter, enabled);
             assert_eq!(reopened.settings.fullscreen_seek_direction, direction);
 
-            reopened.settings.thumb_show_book_resume_meter = !enabled;
+            reopened.settings.thumb_show_resume_meter = !enabled;
             reopened.settings.fullscreen_seek_direction =
                 if direction == FullscreenSeekDirection::LeftToRight {
                     FullscreenSeekDirection::FollowReading
                 } else {
                     FullscreenSeekDirection::LeftToRight
                 };
-            drop(reopened); // Cancel closes the draft without applying/saving it.
-            assert_eq!(app.settings.thumb_show_book_resume_meter, enabled);
+            app.pref_state = Some(Box::new(reopened));
+            app.discard_preferences_dialog();
+            assert_eq!(app.settings.thumb_show_resume_meter, enabled);
             assert_eq!(app.settings.fullscreen_seek_direction, direction);
+            assert_eq!(
+                app.settings.video_resume_positions.get(&video_key),
+                Some(&18.0)
+            );
+            assert_eq!(
+                app.settings.video_resume_positions.get(&audio_key),
+                Some(&28.0)
+            );
             let after_cancel = db.load_into_settings().unwrap();
-            assert_eq!(after_cancel.thumb_show_book_resume_meter, enabled);
+            assert_eq!(after_cancel.thumb_show_resume_meter, enabled);
             assert_eq!(after_cancel.fullscreen_seek_direction, direction);
+            assert_eq!(
+                after_cancel.video_resume_positions.get(&video_key),
+                Some(&18.0)
+            );
+            assert_eq!(
+                after_cancel.video_resume_positions.get(&audio_key),
+                Some(&28.0)
+            );
             assert_eq!(
                 preferences_state_for_test(&after_cancel)
                     .settings
-                    .thumb_show_book_resume_meter,
+                    .thumb_show_resume_meter,
                 enabled
             );
         }
     }
 
     #[test]
-    fn book_resume_meter_preferences_missing_setting_and_default_draft_are_on() {
+    fn resume_meter_preferences_missing_setting_and_default_draft_are_on() {
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert!(
             preferences_state_for_test(&missing)
                 .settings
-                .thumb_show_book_resume_meter
+                .thumb_show_resume_meter
         );
         assert!(
             preferences_state_for_test(&Settings::default())
                 .settings
-                .thumb_show_book_resume_meter
+                .thumb_show_resume_meter
         );
 
         let temp = tempfile::tempdir().unwrap();
@@ -4390,7 +4594,7 @@ mod tests {
         drop(db);
         let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
         conn.execute(
-            "DELETE FROM settings_kv WHERE key = 'thumb_show_book_resume_meter'",
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_resume_meter'",
             [],
         )
         .unwrap();
@@ -4399,7 +4603,7 @@ mod tests {
         assert!(
             preferences_state_for_test(&db.load_into_settings().unwrap())
                 .settings
-                .thumb_show_book_resume_meter
+                .thumb_show_resume_meter
         );
     }
 

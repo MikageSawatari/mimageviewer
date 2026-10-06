@@ -14,24 +14,70 @@ impl App {
         }
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let mut close = false;
         let mut open_release_page = false;
         let mut dismiss_this_version = false;
         let info = self.update_info.clone();
         let error = self.update_check_error.clone();
-        egui::Window::new("バージョン情報")
-            .open(&mut open)
+        let response = draw_update_notice_dialog(ctx, &mut open, info.as_ref(), error.as_deref());
+        close |= response.close;
+        open_release_page |= response.open_release_page;
+        dismiss_this_version |= response.dismiss_this_version;
+
+        if open_release_page {
+            let url: &str = match info.as_ref() {
+                Some(i) => i.release_url.as_str(),
+                None => crate::update_check::releases_page_url(),
+            };
+            crate::ui_helpers::open_url(url);
+        }
+        if dismiss_this_version {
+            if let Some(ref info) = self.update_info {
+                self.settings.update_check_dismissed_version = Some(info.latest_tag.clone());
+                self.settings.save();
+            }
+            close = true;
+        }
+        if close || !open || escape_pressed {
+            self.show_update_dialog = false;
+            // 一度見せたエラーは消す (次回の manual で再評価)。
+            self.update_check_error = None;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct UpdateNoticeResponse {
+    close: bool,
+    open_release_page: bool,
+    dismiss_this_version: bool,
+}
+
+pub(super) fn draw_update_notice_dialog(
+    ctx: &egui::Context,
+    open: &mut bool,
+    info: Option<&crate::update_check::UpdateInfo>,
+    error: Option<&str>,
+) -> UpdateNoticeResponse {
+    let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+    let mut response = UpdateNoticeResponse::default();
+    egui::Window::new("バージョン情報")
+            .open(open)
             .collapsible(false)
             .resizable(true)
             .default_pos(dialog_pos)
             .min_width(420.0)
-            .default_height(360.0)
+            .default_height((ctx.content_rect().height() - 80.0).max(1.0))
             .show(ctx, |ui| {
+                let mut labels = vec!["リリースページを開く"];
+                if info.is_some_and(|info| info.is_newer) { labels.push("このバージョンの通知をオフ"); }
+                labels.push("閉じる");
+                let footer = super::startup_dialog_footer_height(ui, &labels, 18.0);
+                super::startup_dialog_scroll_body(ui, "update_notice_body", footer, |ui| {
                 ui.add_space(4.0);
                 // 直近 manual チェックがエラーなら最上部にバナーで表示。
                 // (既知の update_info は維持されるので、その下に通常表示が続く)
-                if let Some(ref e) = error {
+                if let Some(e) = error {
                     ui.label(
                         egui::RichText::new(format!("⚠ 更新確認に失敗しました: {e}"))
                             .color(ui.visuals().error_fg_color),
@@ -45,7 +91,7 @@ impl App {
                     ui.separator();
                     ui.add_space(4.0);
                 }
-                if let Some(ref info) = info {
+                if let Some(info) = info {
                     ui.heading(if info.is_newer {
                         "新しいバージョンがあります"
                     } else {
@@ -78,40 +124,9 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("更新内容").strong());
                         ui.add_space(2.0);
-                        ui.scope(|ui| {
-                            ui.spacing_mut().scroll =
-                                super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
-                            egui::ScrollArea::vertical()
-                                .id_salt("update_body_scroll")
-                                .max_height(240.0)
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    crate::changelog_markdown::render(ui, &info.body);
-                                });
-                        });
+                        crate::changelog_markdown::render(ui, &info.body);
+
                     }
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("リリースページを開く").clicked() {
-                            open_release_page = true;
-                        }
-                        if info.is_newer
-                            && ui
-                                .button("このバージョンの通知をオフ")
-                                .on_hover_text(
-                                    "このバージョンに対する通知バッジを表示しません。\n\
-                                     さらに新しいバージョンが出れば再度通知します。",
-                                )
-                                .clicked()
-                        {
-                            dismiss_this_version = true;
-                        }
-                        if ui.button("閉じる").clicked() {
-                            close = true;
-                        }
-                    });
                 } else {
                     // 既知の update_info も無く、初回 manual チェックも失敗したケース。
                     ui.add_space(2.0);
@@ -122,35 +137,26 @@ impl App {
                         ))
                         .size(12.0),
                     );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("リリースページを開く").clicked() {
-                            open_release_page = true;
-                        }
-                        if ui.button("閉じる").clicked() {
-                            close = true;
-                        }
-                    });
                 }
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("リリースページを開く").clicked() {
+                        response.open_release_page = true;
+                    }
+                    if info.is_some_and(|info| info.is_newer)
+                        && ui.button("このバージョンの通知をオフ")
+                            .on_hover_text("このバージョンに対する通知バッジを表示しません。\nさらに新しいバージョンが出れば再度通知します。")
+                            .clicked()
+                    {
+                        response.dismiss_this_version = true;
+                    }
+                    if ui.button("閉じる").clicked() {
+                        response.close = true;
+                    }
+                });
             });
-        if open_release_page {
-            let url: &str = match info.as_ref() {
-                Some(i) => i.release_url.as_str(),
-                None => crate::update_check::releases_page_url(),
-            };
-            crate::ui_helpers::open_url(url);
-        }
-        if dismiss_this_version {
-            if let Some(ref info) = self.update_info {
-                self.settings.update_check_dismissed_version = Some(info.latest_tag.clone());
-                self.settings.save();
-            }
-            close = true;
-        }
-        if close || !open || escape_pressed {
-            self.show_update_dialog = false;
-            // 一度見せたエラーは消す (次回の manual で再評価)。
-            self.update_check_error = None;
-        }
-    }
+    response
 }

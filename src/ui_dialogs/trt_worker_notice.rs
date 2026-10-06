@@ -36,34 +36,15 @@ impl App {
 
         let (title, body, can_retry) = notice_text(&notice);
 
-        // 右上に小さく出す (`anchor` だとドラッグできなくなるので default_pos)。
-        let content = ctx.content_rect();
-        let default_pos = egui::pos2(content.max.x - 380.0 - 16.0, content.min.y + 56.0);
-
-        let mut close_clicked = false;
-        let mut retry_clicked = false;
-
-        egui::Window::new(title)
-            .id(egui::Id::new("trt_worker_notice"))
-            .default_pos(default_pos)
-            .default_width(360.0)
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(body);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if can_retry {
-                        if ui.button("ワーカーを再起動").clicked() {
-                            retry_clicked = true;
-                        }
-                    }
-                    if ui.button("閉じる").clicked() {
-                        close_clicked = true;
-                    }
-                });
-            });
+        let (retry_clicked, close_clicked) = super::draw_startup_worker_notice(
+            ctx,
+            title,
+            "trt_worker_notice",
+            360.0,
+            &body,
+            can_retry.then_some("ワーカーを再起動"),
+            false,
+        );
 
         if retry_clicked {
             if self

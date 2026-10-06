@@ -937,6 +937,14 @@ const fn optional_legacy_store(
 /// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
 /// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
 pub(crate) const STORES: &[StoreDescriptor] = &[
+    // Added after the original settings schema; an unopened legacy DB has no watched table yet.
+    optional_legacy_store(
+        "settings.db",
+        "video_watched_to_end",
+        "path_normalized",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
     store(
         "rating.db",
         "ratings",
@@ -1983,6 +1991,12 @@ fn move_exact(
     old_key: &str,
     new_key: &str,
 ) -> Result<usize, rusqlite::Error> {
+    // Resume and watched together own the destination's saved viewing state. A resume-only
+    // destination must not acquire the source's watched marker while keys are migrated.
+    if watched_destination_has_resume(tx, table, col, new_key)? {
+        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
+        return Ok(0);
+    }
     let changed = if unique {
         let n = tx.execute(
             &format!("UPDATE OR IGNORE {table} SET {col} = ?1 WHERE {col} = ?2"),
@@ -1997,6 +2011,32 @@ fn move_exact(
         )?
     };
     Ok(changed)
+}
+
+/// Only the watched descriptor consults its sibling table. The same transaction sees the
+/// destination ownership before changing keys; legacy databases may not have a resume table.
+fn watched_destination_has_resume(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    new_key: &str,
+) -> Result<bool, rusqlite::Error> {
+    if table != "video_watched_to_end" || col != "path_normalized" {
+        return Ok(false);
+    }
+    let has_resume_table: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'video_resume_positions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_resume_table {
+        return Ok(false);
+    }
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM video_resume_positions WHERE path_normalized = ?1)",
+        [new_key],
+        |row| row.get(0),
+    )
 }
 
 /// prefix キーの移動。BINARY key index の範囲で列挙してから 1 行ずつ付け替える。
@@ -2241,6 +2281,9 @@ fn copy_exact(
     if old_key == new_key {
         return Ok(0);
     }
+    if watched_destination_has_resume(tx, table, col, new_key)? {
+        return Ok(0);
+    }
     let insert_columns = columns.join(", ");
     let select_columns = columns
         .iter()
@@ -2433,6 +2476,7 @@ fn migrate_reading_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
@@ -2524,6 +2568,225 @@ mod tests {
 
     fn open(dir: &Path, file: &str) -> rusqlite::Connection {
         rusqlite::Connection::open(dir.join(file)).unwrap()
+    }
+
+    #[test]
+    fn video_watched_to_end_generic_rename_copy_and_purge_use_full_key_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"C:\Media\Old%_");
+        let renamed = PathBuf::from(r"D:\Media\Renamed");
+        let copied = PathBuf::from(r"E:\Media\Copied");
+        let descriptor = STORES
+            .iter()
+            .find(|store| store.table == "video_watched_to_end")
+            .unwrap();
+        assert_eq!(descriptor.normalization, StoreKeyNormalization::KeepDrive);
+        assert!(descriptor.unique && descriptor.rename_generic);
+        let old_key = descriptor.normalize_path(&old);
+        let new_key = descriptor.normalize_path(&renamed);
+        let copy_key = descriptor.normalize_path(&copied);
+        let adjacent = format!("{old_key}-adjacent.mp4");
+        let other_drive = descriptor.normalize_path(Path::new(r"Z:\Media\Old%_"));
+        let conn = open(dir.path(), "settings.db");
+        conn.execute_batch("CREATE TABLE video_watched_to_end (path_normalized TEXT PRIMARY KEY, updated_at INTEGER NOT NULL)").unwrap();
+        for (key, timestamp) in [
+            (old_key.clone(), 11),
+            (format!("{old_key}/clip.mp4"), 22),
+            (format!("{old_key}::track.flac"), 33),
+            (adjacent.clone(), 44),
+            (other_drive.clone(), 55),
+            (new_key.clone(), 99),
+            (copy_key.clone(), 777),
+        ] {
+            conn.execute(
+                "INSERT INTO video_watched_to_end VALUES (?1, ?2)",
+                rusqlite::params![key, timestamp],
+            )
+            .unwrap();
+        }
+        let timestamp = |key: &str| {
+            conn.query_row(
+                "SELECT updated_at FROM video_watched_to_end WHERE path_normalized = ?1",
+                [key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let report = run_at(dir.path(), &old, &renamed);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(timestamp(&old_key), None);
+        assert_eq!(timestamp(&format!("{old_key}/clip.mp4")), None);
+        assert_eq!(timestamp(&format!("{old_key}::track.flac")), None);
+        assert_eq!(timestamp(&new_key), Some(99), "destination wins");
+        assert_eq!(timestamp(&format!("{new_key}/clip.mp4")), Some(22));
+        assert_eq!(timestamp(&format!("{new_key}::track.flac")), Some(33));
+
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(&renamed, &copied),
+                StoreCopyPathMapping::virtual_prefix(&renamed, &copied),
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        assert_eq!(
+            timestamp(&copy_key),
+            Some(777),
+            "copy retains existing destination"
+        );
+        assert_eq!(timestamp(&format!("{copy_key}::track.flac")), Some(33));
+        assert_eq!(timestamp(&new_key), Some(99), "copy preserves source");
+
+        let copied_purge = purge_removed_paths_at(dir.path(), &[copied], &[]);
+        assert!(copied_purge.errors.is_empty(), "{:?}", copied_purge.errors);
+        assert_eq!(copied_purge.rows, 2);
+        let renamed_purge = purge_removed_paths_at(dir.path(), &[renamed], &[]);
+        assert!(
+            renamed_purge.errors.is_empty(),
+            "{:?}",
+            renamed_purge.errors
+        );
+        assert_eq!(renamed_purge.rows, 3);
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM video_watched_to_end", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(timestamp(&adjacent), Some(44));
+        assert_eq!(timestamp(&other_drive), Some(55));
+    }
+
+    #[test]
+    fn video_watched_to_end_generic_operations_allow_missing_legacy_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path(), "settings.db");
+        conn.execute_batch("CREATE TABLE settings_kv (key TEXT PRIMARY KEY, value TEXT); INSERT INTO settings_kv VALUES ('preserved', 'true')").unwrap();
+        let old = PathBuf::from(r"C:\Media\Old.mp4");
+        let new = PathBuf::from(r"D:\Media\New.mp4");
+        assert!(run_at(dir.path(), &old, &new).errors.is_empty());
+        assert!(
+            copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(&old, &new)])
+                .errors
+                .is_empty()
+        );
+        assert!(
+            purge_removed_paths_at(dir.path(), &[old], &[])
+                .errors
+                .is_empty()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = 'preserved'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "true"
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'video_watched_to_end'", [], |row| row.get::<_, usize>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn video_watched_to_end_migration_keeps_composite_destination_state_for_exact_and_prefixes() {
+        for copy in [false, true] {
+            for (destination_resume, destination_watched, destination_position) in [
+                (false, false, 0.0),
+                (true, false, 0.0),
+                (true, false, 34.5),
+                (false, true, 0.0),
+                (true, true, 34.5),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let old = PathBuf::from(r"C:\Media\Old");
+                let new = PathBuf::from(r"D:\Media\New");
+                let old_key = crate::path_key::normalize_keep_drive(&old);
+                let new_key = crate::path_key::normalize_keep_drive(&new);
+                let conn = open(dir.path(), "settings.db");
+                conn.execute_batch(
+                    "CREATE TABLE video_watched_to_end (path_normalized TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);
+                     CREATE TABLE video_resume_positions (path_normalized TEXT PRIMARY KEY, position_secs REAL NOT NULL, updated_at INTEGER NOT NULL)"
+                ).unwrap();
+                let faces = [("", 11), ("/clip.mp4", 22), ("::track.flac", 33)];
+                for (suffix, timestamp) in faces {
+                    let source = format!("{old_key}{suffix}");
+                    let destination = format!("{new_key}{suffix}");
+                    conn.execute(
+                        "INSERT INTO video_watched_to_end VALUES (?1, ?2)",
+                        rusqlite::params![source, timestamp],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO video_resume_positions VALUES (?1, 12.5, 111)",
+                        [&source],
+                    )
+                    .unwrap();
+                    if destination_resume {
+                        conn.execute(
+                            "INSERT INTO video_resume_positions VALUES (?1, ?2, 222)",
+                            rusqlite::params![destination, destination_position],
+                        )
+                        .unwrap();
+                    }
+                    if destination_watched {
+                        conn.execute(
+                            "INSERT INTO video_watched_to_end VALUES (?1, 999)",
+                            [&destination],
+                        )
+                        .unwrap();
+                    }
+                }
+                if copy {
+                    let report = copy_stores_at(
+                        dir.path(),
+                        &[
+                            StoreCopyPathMapping::exact(&old, &new),
+                            StoreCopyPathMapping::exact(old.join("clip.mp4"), new.join("clip.mp4")),
+                            StoreCopyPathMapping::virtual_prefix(&old, &new),
+                        ],
+                    );
+                    assert!(report.errors.is_empty(), "{:?}", report.errors);
+                } else {
+                    let report = run_at(dir.path(), &old, &new);
+                    assert!(report.errors.is_empty(), "{:?}", report.errors);
+                }
+                for (suffix, timestamp) in faces {
+                    let source = format!("{old_key}{suffix}");
+                    let destination = format!("{new_key}{suffix}");
+                    let watched = |key: &str| {
+                        conn.query_row("SELECT updated_at FROM video_watched_to_end WHERE path_normalized = ?1", [key], |row| row.get::<_, i64>(0)).optional().unwrap()
+                    };
+                    let resume = |key: &str| {
+                        conn.query_row("SELECT position_secs, updated_at FROM video_resume_positions WHERE path_normalized = ?1", [key], |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?))).optional().unwrap()
+                    };
+                    let expected = if destination_watched {
+                        Some(999)
+                    } else if destination_resume {
+                        None
+                    } else {
+                        Some(timestamp)
+                    };
+                    assert_eq!(
+                        watched(&destination),
+                        expected,
+                        "copy={copy} resume={destination_resume} watched={destination_watched} suffix={suffix}"
+                    );
+                    assert_eq!(watched(&source), copy.then_some(timestamp));
+                    assert_eq!(
+                        resume(&source),
+                        Some((12.5, 111)),
+                        "source resume remains untouched"
+                    );
+                    assert_eq!(
+                        resume(&destination),
+                        destination_resume.then_some((destination_position, 222)),
+                        "destination resume remains untouched"
+                    );
+                }
+            }
+        }
     }
 
     fn sorted_keys(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
@@ -2690,10 +2953,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            26,
-            "endpoint と page-alone preference を含む現行 descriptor 数"
+            27,
+            "watched と endpoint / page-alone preference を含む現行 descriptor 数"
         );
-        assert_eq!(covered, 25);
+        assert_eq!(covered, 26);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
 

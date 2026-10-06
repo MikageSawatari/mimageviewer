@@ -1341,6 +1341,16 @@ mod tests {
     /// Exercise the schema creation and additive migrations used by the application, rather
     /// than test-local CREATE TABLE statements. Every STORES file is opened at least once.
     fn create_production_store_schemas(data_dir: &Path) {
+        // watched is the first settings.db entry in STORES. Exercise its real schema
+        // initializer too; merely opening this file with rusqlite leaves an empty DB.
+        if data_dir.join("settings.db").exists() {
+            drop(crate::settings_db::SettingsDb::open(data_dir).unwrap());
+        } else {
+            let settings = crate::settings_db::SettingsDb::create_new(data_dir).unwrap();
+            settings
+                .save_full(&crate::settings::Settings::default())
+                .unwrap();
+        }
         drop(crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap());
         drop(ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap());
         drop(crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db")).unwrap());
@@ -1826,8 +1836,8 @@ mod tests {
         let hundred = measure_batch_database_opens(100);
 
         assert_eq!(
-            one, 33,
-            "24 store copy + 1 origin batch + 8 runtime reads, including endpoint and page-alone placement"
+            one, 34,
+            "25 store copy + 1 origin batch + 8 runtime reads, including endpoint and page-alone placement"
         );
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }

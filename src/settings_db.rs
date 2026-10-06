@@ -78,10 +78,12 @@ const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv 
 /// `external_tools` は v3.5.0 から専用テーブルが正本。旧 `settings_kv` にこのキーを
 /// 書いた版は無く、それ以前の登録は専用の `custom_open_with_apps` →
 /// `external_tools` migration で保護する。
+/// `video_watched_to_end` も導入時から専用テーブルで、旧 JSON の kv 行は存在しない。
 const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
     "video_resume_positions",
+    "video_watched_to_end",
     "video_audio_track_choices",
     "vst3_plugins",
     "vst3_chain_slots",
@@ -961,6 +963,7 @@ impl SettingsDb {
         write_favorites(&tx, &settings.favorites)?;
         write_tags(&tx, &settings.tags)?;
         write_video_resume_positions(&tx, &settings.video_resume_positions)?;
+        write_video_watched_to_end(&tx, &settings.video_watched_to_end)?;
         write_video_audio_track_choices(&tx, &settings.video_audio_track_choices)?;
         // `custom_open_with_apps` は移行元の照合用にテーブルと既存行を残すが、
         // 外部ツール UI への載せ替え後は更新しない。
@@ -1633,6 +1636,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS video_resume_positions (
             path_normalized TEXT PRIMARY KEY,
             position_secs   REAL NOT NULL,
+            updated_at      INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS video_watched_to_end (
+            path_normalized TEXT PRIMARY KEY,
             updated_at      INTEGER NOT NULL
          );
 
@@ -2325,6 +2333,32 @@ fn read_video_resume_positions(
     Ok(out)
 }
 
+fn write_video_watched_to_end(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &std::collections::HashSet<String>,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM video_watched_to_end", [])?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut stmt = tx.prepare(
+        "INSERT INTO video_watched_to_end (path_normalized, updated_at) VALUES (?1, ?2)",
+    )?;
+    for path in paths {
+        stmt.execute(params![path, now])?;
+    }
+    Ok(())
+}
+
+fn read_video_watched_to_end(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<String>, SettingsDbError> {
+    let mut stmt = conn.prepare("SELECT path_normalized FROM video_watched_to_end")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
 fn write_video_audio_track_choices(
     tx: &rusqlite::Transaction<'_>,
     map: &std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
@@ -2945,6 +2979,7 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     let favorites = read_favorites(conn)?;
     let tags = read_tags(conn)?;
     let video_resume_positions = read_video_resume_positions(conn)?;
+    let video_watched_to_end = read_video_watched_to_end(conn)?;
     let video_audio_track_choices = read_video_audio_track_choices(conn)?;
     let vst3_plugins = read_vst3_plugins(conn)?;
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
@@ -2956,6 +2991,10 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     map.insert(
         "video_resume_positions".into(),
         serde_json::to_value(video_resume_positions)?,
+    );
+    map.insert(
+        "video_watched_to_end".into(),
+        serde_json::to_value(video_watched_to_end)?,
     );
     map.insert(
         "video_audio_track_choices".into(),
@@ -4998,6 +5037,100 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn video_watched_to_end_upgrades_old_db_without_changing_resume_positions() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings
+            .video_resume_positions
+            .insert("c:/media/unfinished.mp4".into(), 123.5);
+        db.save_full(&settings).unwrap();
+        drop(db);
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute("DROP TABLE video_watched_to_end", []).unwrap();
+        drop(conn);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.video_watched_to_end.is_empty());
+        assert_eq!(
+            loaded.video_resume_positions,
+            settings.video_resume_positions
+        );
+        // Opening repeatedly keeps the old resume data and the additive table intact.
+        drop(db);
+        let reopened = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .load_into_settings()
+                .unwrap()
+                .video_resume_positions,
+            settings.video_resume_positions
+        );
+    }
+
+    #[test]
+    fn video_watched_to_end_roundtrips_clears_and_stays_out_of_settings_kv() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.video_watched_to_end.extend([
+            "c:/media/finished.mp4".into(),
+            "d:/music/finished.flac".into(),
+        ]);
+        settings
+            .video_resume_positions
+            .insert("c:/media/unfinished.mp4".into(), 12.5);
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.video_watched_to_end, settings.video_watched_to_end);
+        assert_eq!(
+            loaded.video_resume_positions,
+            settings.video_resume_positions
+        );
+        {
+            let inner = db.inner.lock().unwrap();
+            assert_eq!(
+                inner
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM video_watched_to_end", [], |row| row
+                        .get::<_, usize>(
+                        0
+                    ))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                inner
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM settings_kv WHERE key = 'video_watched_to_end'",
+                        [],
+                        |row| row.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        settings.video_watched_to_end.clear();
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.video_watched_to_end.is_empty());
+        assert_eq!(
+            loaded.video_resume_positions,
+            settings.video_resume_positions
+        );
+    }
+
+    #[test]
+    fn video_watched_to_end_serde_missing_defaults_to_empty() {
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        json.as_object_mut().unwrap().remove("video_watched_to_end");
+        let loaded: Settings = serde_json::from_value(json).unwrap();
+        assert!(loaded.video_watched_to_end.is_empty());
+        assert!(Settings::default().video_watched_to_end.is_empty());
     }
 
     #[test]

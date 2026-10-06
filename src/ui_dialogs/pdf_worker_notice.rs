@@ -19,24 +19,15 @@ impl App {
             return;
         };
         let body = notice_text(notice);
-        let content = ctx.content_rect();
-        let default_pos = egui::pos2(content.max.x - 440.0 - 16.0, content.min.y + 56.0);
-        let mut close_clicked = false;
-
-        egui::Window::new("PDF の準備を開始できませんでした")
-            .id(egui::Id::new("pdf_worker_notice"))
-            .default_pos(default_pos)
-            .default_width(420.0)
-            .resizable(true)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(body);
-                ui.separator();
-                if ui.button("閉じる").clicked() {
-                    close_clicked = true;
-                }
-            });
+        let (_, close_clicked) = super::draw_startup_worker_notice(
+            ctx,
+            "PDF の準備を開始できませんでした",
+            "pdf_worker_notice",
+            420.0,
+            &body,
+            None,
+            true,
+        );
 
         if close_clicked {
             self.pdf_worker_notice = None;

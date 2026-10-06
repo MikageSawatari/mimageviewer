@@ -4639,6 +4639,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 false,
                 VideoThumbnailIndicator::PlayIcon,
                 is_cut,
+                None,
             );
         });
     }
@@ -11079,6 +11080,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_location_reading_history = true;
         s.show_location_rating = true;
         s.show_location_bookshelf = true;
+        s.show_location_file_organize_destinations = true;
         s.show_location_desktop = true;
         s.show_location_pictures = true;
         s.show_location_downloads = true;
@@ -11473,6 +11475,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .changed();
         changed |= ui
             .checkbox(&mut self.settings.show_location_bookshelf, "本棚フォルダ")
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_location_file_organize_destinations,
+                "整理先",
+            )
             .changed();
         changed |= ui
             .checkbox(
@@ -14305,7 +14313,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             let location_entries =
                                 crate::known_folders::location_menu_entries(&self.settings);
                             // Main-window only (not part of the shared list used by mIV Remote):
-                            // shown right after the bookshelf group, before the quick locations.
+                            // shown right below 本棚フォルダ (before 整理先 and the quick locations).
                             let mut clipboard_capture_location =
                                 crate::known_folders::main_clipboard_capture_location(
                                     &self.settings,
@@ -14313,7 +14321,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             for entry in location_entries {
                                 if matches!(
                                     entry,
-                                    crate::known_folders::LocationMenuEntry::Separator
+                                    crate::known_folders::LocationMenuEntry::FileOrganizeDestinations { .. }
+                                        | crate::known_folders::LocationMenuEntry::Separator
                                         | crate::known_folders::LocationMenuEntry::QuickLocation(_)
                                         | crate::known_folders::LocationMenuEntry::DriveRoot(_)
                                 ) && let Some(destination) = clipboard_capture_location.take()
@@ -14366,6 +14375,38 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         {
                                             result = Some(AddressBarNav::BooksRoot);
                                             ui.close();
+                                        }
+                                    }
+                                    crate::known_folders::LocationMenuEntry::FileOrganizeDestinations {
+                                        destinations,
+                                    } => {
+                                        let response = ui.menu_button("整理先", |ui| {
+                                            // Reserve a separate gutter so the last names remain readable.
+                                            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("organize_destinations_menu")
+                                                .max_height((ui.ctx().content_rect().height() - 48.0).clamp(48.0, 400.0))
+                                                .show(ui, |ui| {
+                                                    for destination in destinations {
+                                                        if ui
+                                                            .add(egui::Button::new(&destination.name).wrap_mode(egui::TextWrapMode::Extend))
+                                                            .hover_tip(destination.path.to_string_lossy())
+                                                            .clicked()
+                                                        {
+                                                            if let Some(resolved) =
+                                                                resolve_folder_bar_nav_path(&destination.path)
+                                                            {
+                                                                result = Some(AddressBarNav::Direct(resolved));
+                                                            }
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                });
+                                        });
+                                        // Submenus use a stack-owned popup id, unlike root menus.
+                                        // Contents ran iff this submenu is open; consume after its scroll area.
+                                        if response.inner.is_some() {
+                                            consume_wheel_input(ui.ctx());
                                         }
                                     }
                                     crate::known_folders::LocationMenuEntry::Separator => {
@@ -18770,7 +18811,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                 });
                                 let media_duration = self.thumbnail_media_duration_text(idx);
-                                let mut book_resume_meter = self.thumbnail_book_resume_meter(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -18801,7 +18841,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
-                                    book_resume_meter.is_some(),
+                                    self.settings.thumb_show_resume_meter,
                                 );
 
                                 primary_click_hit_cell |=
@@ -18831,9 +18871,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
                                 // A click may toggle the check state during interaction. Re-layout only
                                 // that changed cell so the new check and its reserved area agree in this frame.
-                                let current_meter = self.thumbnail_book_resume_meter(idx);
-                                if self.checked.contains(&idx) != is_checked || current_meter != book_resume_meter {
-                                    book_resume_meter = current_meter;
+                                if self.checked.contains(&idx) != is_checked {
                                     overlay_layout = crate::app::layout_cell_overlays(
                                         ui.painter(),
                                         cell_rect,
@@ -18848,10 +18886,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
-                                        book_resume_meter.is_some(),
+                                        self.settings.thumb_show_resume_meter,
                                     );
                                 }
 
+                                let book_resume_meter = self.thumbnail_resume_meter(idx);
                                 let rot = self.get_rotation(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
@@ -18893,8 +18932,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
                                     is_cut,
+                                    book_resume_meter,
                                 );
-                                crate::app::paint_book_resume_meter(ui, cell_rect, &overlay_layout, book_resume_meter, is_cut);
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {
@@ -26778,6 +26817,204 @@ mod section207_tests {
         }
         app.settings.show_toolbar_folder = true;
         app.settings.show_toolbar_folder_tree_button = true;
+    }
+
+    #[test]
+    fn file_organize_destinations_location_menu_navigation_and_snapshot() {
+        use crate::settings::FileOrganizeDestination;
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        env.address = r"C:\Photos".into();
+        env.settings.show_location_desktop = false;
+        env.settings.show_location_pictures = false;
+        env.settings.show_location_downloads = false;
+        env.settings.show_location_drive_roots = false;
+        env.settings.file_organize_destinations = vec![
+            FileOrganizeDestination {
+                name: "要確認".into(),
+                path: env.tmp.path().join("review"),
+            },
+            FileOrganizeDestination {
+                name: "保管".into(),
+                path: env.tmp.path().join("archive"),
+            },
+        ];
+        let target = env.settings.file_organize_destinations[1].path.clone();
+        std::fs::create_dir_all(&target).unwrap();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 480.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                if let Some(value) = render.borrow_mut().render_toolbar(ctx).1 {
+                    nav_render.borrow_mut().push(value);
+                }
+            });
+        harness.run();
+        click_location_menu(&mut harness, "場所▼");
+        harness.run();
+        click_location_menu(&mut harness, "整理先 ⏵");
+        harness.run();
+        harness.snapshot("folder_bar_organize_destinations");
+        click_location_menu(&mut harness, "保管");
+        harness.run();
+        assert!(
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+        );
+        assert!(
+            harness.query_by_label("保管").is_none(),
+            "choosing a destination closes the menu"
+        );
+        nav.borrow_mut().clear();
+        app.borrow_mut()
+            .settings
+            .show_location_file_organize_destinations = false;
+        click_location_menu(&mut harness, "場所▼");
+        harness.run();
+        assert!(harness.query_by_label("整理先 ⏵").is_none());
+    }
+
+    fn click_location_menu(harness: &mut Harness<'_, ()>, label: &str) {
+        let pos = harness.get_by_label(label).rect().center();
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+    }
+
+    #[test]
+    fn file_organize_destinations_many_location_entries_scroll_and_select_last() {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        env.address = r"C:\Photos".into();
+        env.settings.show_location_desktop = false;
+        env.settings.show_location_pictures = false;
+        env.settings.show_location_downloads = false;
+        env.settings.show_location_drive_roots = false;
+        env.settings.file_organize_destinations = (0..100)
+            .map(|index| crate::settings::FileOrganizeDestination {
+                name: format!("整理先 {index:03}"),
+                path: env.tmp.path().join(format!("destination-{index}")),
+            })
+            .collect();
+        let target = env
+            .settings
+            .file_organize_destinations
+            .last()
+            .unwrap()
+            .path
+            .clone();
+        std::fs::create_dir_all(&target).unwrap();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let wheel_after = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&wheel_after);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 480.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                if let Some(value) = render.borrow_mut().render_toolbar(ctx).1 {
+                    nav_render.borrow_mut().push(value);
+                }
+                observed.set(ctx.input(|i| {
+                    i.raw_scroll_delta != egui::Vec2::ZERO
+                        || i.smooth_scroll_delta != egui::Vec2::ZERO
+                        || i.events
+                            .iter()
+                            .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
+                }));
+            });
+        harness.run();
+        click_location_menu(&mut harness, "場所▼");
+        harness.run();
+        click_location_menu(&mut harness, "整理先 ⏵");
+        harness.run();
+        let first = harness.get_by_label("整理先 000").rect();
+        assert!(
+            harness
+                .query_by_label("整理先 099")
+                .is_none_or(|last| last.rect().bottom() > 480.0)
+        );
+        harness.hover_at(first.center());
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10000.0),
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(!wheel_after.get(), "popup wheel must not reach the grid");
+        harness.run();
+        let last = harness.get_by_label("整理先 099").rect();
+        assert!(last.top() >= 0.0 && last.bottom() <= 480.0);
+        harness.snapshot("folder_bar_organize_destinations_scrolled");
+        click_location_menu(&mut harness, "整理先 099");
+        harness.run();
+        assert!(
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+        );
+        assert!(harness.query_by_label("整理先 099").is_none());
+    }
+
+    #[test]
+    fn file_organize_destinations_location_toggle_snapshot() {
+        let env = crate::app::setup_app_for_test();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 700.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render.borrow_mut().draw_folder_bar_settings_menu(ui);
+                });
+            });
+        harness.run();
+        harness.snapshot("folder_bar_organize_destinations_toggle");
+        harness.get_by_label("整理先").click();
+        harness.run();
+        assert!(
+            !app.borrow()
+                .settings
+                .show_location_file_organize_destinations
+        );
+        let persisted: crate::settings::Settings =
+            serde_json::from_str(&serde_json::to_string(&app.borrow().settings).unwrap()).unwrap();
+        assert!(!persisted.show_location_file_organize_destinations);
+        app.borrow_mut().reset_toolbar_customization();
+        assert!(
+            app.borrow()
+                .settings
+                .show_location_file_organize_destinations
+        );
     }
 
     #[test]

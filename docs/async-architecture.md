@@ -977,6 +977,9 @@ DB変更完了後の再読込はrename/copy復元・明示整理・purge retry�
 内容identityのcopy復元にも開始前の延期機構はなく、確認済みの未開始要求を保持する新状態は
 追加しない。直前の未処理Recordとの競合ではコピー先の位置・比率が古いままになることを
 合意済みの割り切りとし、復元完了後のmap再読込は維持する。
+§1.333の動画/音声も同じ下端帯を使う。位置はlive設定表、長さはsource照合済みのdetails-metaキャッシュを読む。
+長さバッジまたは共通メーター設定がONなら既存の可視+近傍stageを起動し、設定変更も既存要件失効へ接続する。
+別のworker/位置map/世代を作らず、描画はI/Oを行わない。
 詳細は [book-resume-meter-plan.md](book-resume-meter-plan.md)。
 
 `App::update` 内で CPU 重めの処理をすると fps が落ちる。

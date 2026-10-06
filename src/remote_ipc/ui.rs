@@ -5036,6 +5036,55 @@ mod tests {
     }
 
     #[test]
+    fn video_watched_to_end_remote_progress_uses_shared_rules_and_rejects_stale_writes() {
+        let (handle, owner, _) = active_session();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        for name in ["watched.mp4", "watched.flac"] {
+            let path = app.tmp.path().join(name);
+            std::fs::write(&path, b"fixture").unwrap();
+            let key = crate::adjustment_db::normalize_path(&path);
+            for (sequence, position, ended, expected_position, watched) in [
+                (1, 30.0, false, Some(30.0), false),
+                (2, 95.0, false, None, true),
+                (3, 0.0, false, None, true),
+                (4, 40.0, false, Some(40.0), false),
+                (5, 100.0, true, None, true),
+                (4, 20.0, false, None, true),
+                (6, 10.0, false, Some(10.0), false),
+            ] {
+                let operation = handle
+                    .begin_operation(&owner, "video progress".to_owned())
+                    .unwrap();
+                let (pending, response) = ClaimedRemoteWrite::for_test(
+                    operation,
+                    RemoteWriteRequest::RecordVideoProgress {
+                        address: mimageviewer_ipc::RemoteAddress::file(
+                            path.to_string_lossy().into_owned(),
+                        ),
+                        sequence,
+                        position_secs: position,
+                        duration_secs: 100.0,
+                        ended,
+                    },
+                );
+                app.apply_pending_remote_write(pending, &ctx);
+                assert!(matches!(
+                    response
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .unwrap(),
+                    UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                ));
+                assert_eq!(
+                    app.settings.video_resume_positions.get(&key).copied(),
+                    expected_position
+                );
+                assert_eq!(app.settings.video_watched_to_end.contains(&key), watched);
+            }
+        }
+    }
+
+    #[test]
     fn video_progress_sequence_is_scoped_to_owner_generation_and_path() {
         let mut order = RemoteVideoProgressOrder::default();
         let a = std::path::Path::new("C:/media/a.mp4");

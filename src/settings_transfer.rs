@@ -268,7 +268,7 @@ preferences_policy! {
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
-        thumb_show_book_resume_meter: bool => ("サムネイルの読書進捗表示", |_, _| true, plain, plain);
+        thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
         thumb_tooltip_show_image_dimensions: bool => ("サムネイルツールチップ：画像サイズ", |_, _| true, plain, plain);
@@ -532,6 +532,7 @@ preferences_policy! {
         show_location_reading_history => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_bookshelf => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_location_file_organize_destinations => "場所▼の表示状態。他の show_location_* と同じく転送対象外";
         show_location_desktop => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_pictures => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_downloads => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -673,6 +674,7 @@ preferences_policy! {
         video_anime4k_measurement => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         video_preset_slots => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         video_resume_positions => "同上";
+        video_watched_to_end => "同上";
         video_audio_track_choices => "同上";
         reading_history_limit => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
         video_hw_decode => "同上";
@@ -917,7 +919,7 @@ mod tests {
             ],
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
-        settings.thumb_show_book_resume_meter = !settings.thumb_show_book_resume_meter;
+        settings.thumb_show_resume_meter = !settings.thumb_show_resume_meter;
         settings.selection_info_display_mode = different_enum(
             &settings.selection_info_display_mode,
             &[
@@ -1536,7 +1538,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 443);
+        assert_eq!(entries.len(), 445);
         assert_eq!(
             entries
                 .iter()
@@ -1627,6 +1629,7 @@ mod tests {
         settings
             .video_resume_positions
             .insert(sentinel.into(), 88.5);
+        settings.video_watched_to_end.insert(sentinel.into());
         settings.reading_history_limit = 17;
         settings.remote_service_enabled = true;
         settings.remote_video_streaming_enabled = true;
