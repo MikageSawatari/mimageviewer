@@ -737,9 +737,19 @@ fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, 
         let mut process = 0;
         let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
         let foreground = unsafe { GetForegroundWindow() };
+        // Before Ctrl/V Down the exact root must own the foreground. Once the keys are
+        // delivered, the existing Shell paste may legitimately raise its own copy progress
+        // window (OperationStatusWindow) in this process, so any window of ours is accepted.
+        let mut foreground_process = 0;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_process)) };
+        let foreground_ok = if phase == "before-down" {
+            foreground == hwnd
+        } else {
+            foreground == hwnd || foreground_process == unsafe { GetCurrentProcessId() }
+        };
         if process != unsafe { GetCurrentProcessId() }
             || !unsafe { IsWindowVisible(hwnd).as_bool() }
-            || foreground != hwnd
+            || !foreground_ok
         {
             return Err(format!(
                 "clipboard paste exact root is not the visible foreground owner (phase={phase}, visible={}, foreground={})",
