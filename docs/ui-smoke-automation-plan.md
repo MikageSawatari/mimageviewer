@@ -30,7 +30,12 @@
 今回の実装作業では実行せず、シナリオの登録・コンパイルと非対話の fixture／書き手テストを検証する。
 所要時間は既存診断ビルドの再利用時に約 2〜3 分、初回ビルドは別途 5〜15 分を見込む。
 
-了承後の実行コマンド:
+実行前に、通常版・確認用ビルド・portable を含むすべての mIV を終了する（トレイ常駐も）。
+ClipboardCapture は場所を問わず `mimageviewer.exe` / `mimageviewer-core.exe` を検査し、
+別インスタンスが動作中ならビルド・アプリ起動・証跡ディレクトリ作成前に中止する。
+既存インスタンスを自動終了しない。他シナリオの受付条件は変更しない。
+
+上記の終了確認と了承後の実行コマンド:
 
 ```powershell
 .\scripts\ui-smoke.ps1 -Scenario ClipboardCapture -InteractiveApproved
@@ -41,8 +46,10 @@ runner の了承 guard はビルド・ディレクトリ作成・アプリ起動
 `target/portable-smoke/mimageviewer.exe` と sibling `data`、既存の marker・manifest・入力 desktop
 事前検査を維持する。fixture generator は隔離 data の `clipboard-capture/manual/seed.png` を起動前に
 用意し、今のフォルダを空にしない。Shell コピー元は sibling `source`、監視保存先は sibling `captures`。
-通常設定や既存クリップボードの内容を fixture にコピーしない。終了時のクリップボードは disposable PNG
-になり、以前の内容は復元しないため、了承時にこの上書きを明示する。
+通常設定や既存クリップボードの内容を fixture にコピーしない。成功時のクリップボードは disposable PNG
+になる。失敗時は模擬 Office データや停止済み fixture server を参照する HTML が残り得るため、
+通常の貼り付けを再開する前に、無害なテキストを一度コピーする。runner の失敗表示もこの手順を案内する。
+以前の内容は復元しないため、了承時にこの上書きを明示する。
 
 追加 API の `clipboard_fixture` は Rhai worker で CF_HTML（SourceURL 付き）、PNG と CF_DIB、CF_DIB
 単体、CF_HDROP、Office 形式の組（Embed Source／Object Descriptor／XML Spreadsheet + DIB + HTML）、
@@ -82,6 +89,7 @@ Set 失敗時も開いた Clipboard を閉じることを検査する。最後�
 除外確認は固定 sleep 後の見た目だけで成功にしない。
 
 非対話の追加検証は `scripts/test-ui-smoke-approval.ps1`（未了承 guard）、
+`scripts/test-ui-smoke-clipboard-guard.ps1`（別 mIV の起動前拒否・失敗時の案内、プロセス列挙は fake）、
 `scripts/test-ui-smoke-button-runner.ps1`（helper 登録・終了順・環境復元）、
 `scripts/test-ui-smoke-button-helper.ps1 -ClipboardOnly`（fake key owner 7 件、OS 入力なし）、
 `python -B scripts/ui-smoke/test_clipboard_capture_fixture.py`（PNG 構成・同一内容・非空先拒否）を使う。

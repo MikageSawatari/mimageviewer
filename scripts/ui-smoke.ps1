@@ -40,6 +40,23 @@ if (-not $InteractiveApproved) {
         '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
     exit 2
 }
+if ($Scenario -eq 'ClipboardCapture') {
+    # Check every installation before preparation can launch anything. Another
+    # instance's image monitor could save our fixtures into its real destination.
+    try {
+        $otherMivProcesses = @(Get-Process -ErrorAction Stop | Where-Object {
+            $_.ProcessName -in @('mimageviewer', 'mimageviewer-core')
+        })
+    }
+    catch {
+        [Console]::Error.WriteLine('[ui-smoke] ClipboardCapture cannot inspect running processes. Close mIV first, including tray-resident instances, then retry. No application was started.')
+        exit 2
+    }
+    if ($otherMivProcesses.Count -gt 0) {
+        [Console]::Error.WriteLine('[ui-smoke] ClipboardCapture requires all other mIV instances to be closed first, including tray-resident instances (mimageviewer.exe / mimageviewer-core.exe, from any location). No application was started; existing instances were not stopped.')
+        exit 2
+    }
+}
 if ($Scenario -eq 'AudioTracks' -and -not $PSBoundParameters.ContainsKey('TimeoutSeconds')) {
     $TimeoutSeconds = 240
 }
@@ -1917,6 +1934,10 @@ catch {
 }
 finally {
     Complete-UiSmokeRun
+}
+
+if ($Scenario -eq 'ClipboardCapture' -and $script:runExitCode -ne 0) {
+    [Console]::Error.WriteLine('[ui-smoke] ClipboardCapture failed. The clipboard may contain simulated Office data or HTML referencing the stopped fixture server. Before resuming normal paste, copy harmless text once. Previous clipboard contents are not restored.')
 }
 
 if ($script:runDir) {
