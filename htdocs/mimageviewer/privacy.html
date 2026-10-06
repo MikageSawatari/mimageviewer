@@ -119,7 +119,7 @@
       本アプリは利用者の PC 上でローカルに動作するデスクトップアプリケーションであり、
       <strong>開発者が利用者の個人情報を収集・送信・販売することは一切ありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月6日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月7日</p>
   </section>
 
   <section>
@@ -198,6 +198,13 @@
       不具合を調べるための<strong>動作記録を利用者が有効にした場合</strong>は、
       開いたファイルの場所を含む記録が PC 内の <code>logs</code> フォルダに残ります。
       これも外部へ送信されることはなく、不要になれば削除できます。
+    </div>
+    <div class="info-box">
+      起動の不具合を調べられるように、<strong>起動のたびに起動時の記録</strong>を PC 内に保存します
+      （インストーラ版・単体exe版は <code>%LOCALAPPDATA%\mimageviewer\startup-logs</code>、
+      ポータブル版はデータフォルダ内の <code>logs\startup</code>）。起動時に開いた場所や、
+      データの保存場所を含みます。外部へ送信されることはなく、直近 10 回分だけを残して
+      古いものは自動で削除します。
     </div>
   </section>
 
@@ -286,7 +293,7 @@
       runs locally on your PC. <strong>The developer does not collect, transmit, or sell any of
       your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: October 6, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: October 7, 2026</p>
   </section>
 
   <section>
@@ -359,6 +366,13 @@
       kept in the <code>logs</code> folder on your PC include the locations of the files you
       opened. These are not sent anywhere either, and you can delete them once you no longer
       need them.
+    </div>
+    <div class="info-box">
+      So that startup problems can be investigated, the App saves a <strong>startup record on your PC
+      every time it starts</strong> (<code>%LOCALAPPDATA%\mimageviewer\startup-logs</code> for the installer
+      and single-exe editions; <code>logs\startup</code> inside the data folder for the portable edition).
+      It includes the locations opened at startup and where the App stores its data. It is not sent
+      anywhere, and only the 10 most recent records are kept; older ones are deleted automatically.
     </div>
   </section>
 

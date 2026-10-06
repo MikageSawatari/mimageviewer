@@ -1252,6 +1252,8 @@
         <p style="margin-top:0.5rem;">リモート閲覧用サービスの動作記録等は、通常版では <code>%APPDATA%\mimageviewer-remote\</code> に保存され、
           アンインストール後も残ります。ポータブル版は <code>data</code> と同じ場所の <code>data-remote</code> を使います。
           不要になった場合は、アプリを終了してから手動で削除できます。</p>
+        <p style="margin-top:0.5rem;">起動の不具合を調べるための起動時の記録を、起動のたびに PC 内へ保存します（通常版は <code>%LOCALAPPDATA%\mimageviewer\startup-logs\</code>、ポータブル版は <code>data\logs\startup</code>）。
+          起動時に開いた場所やデータの保存場所を含みます。直近 10 回分だけを残し、古いものは自動で削除します。</p>
         <p style="margin-top:0.5rem;">外部ツールへ渡すために書き出した画像は、Windows の一時フォルダー内の
           本アプリ専用の場所に置き、<strong>終了時に削除します</strong>。</p>
         <p style="margin-top:0.5rem;">クリップボードから取り込んだ画像は、取り込みフォルダまたは Ctrl+V を押したときのフォルダに保存します。出どころの URL がわかる場合は、Windows の Mark of the Web として記録します。ページの画像を選ぶ間の一時ファイルは、取得・保存が終わった後に削除し、異常終了などで残った分は次回起動時に片付けます。</p>
