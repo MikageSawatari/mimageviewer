@@ -365,7 +365,14 @@ impl ClipboardWriter for NativeWriter<'_> {
                 windows::Win32::Foundation::HWND(self.hwnd as usize as *mut _),
             ))
         }
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            // Name the holder: mIV's own readers and third-party clipboard tools differ.
+            let holder = unsafe { windows::Win32::System::DataExchange::GetOpenClipboardWindow() };
+            format!(
+                "{e} (clipboard held by {})",
+                holder.map_or_else(|e| format!("unknown ({e})"), describe_window)
+            )
+        })
     }
     fn replace(&mut self, content: &[Payload]) -> Result<(), String> {
         use windows::{
@@ -521,9 +528,11 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                     bridge: &excel_bridge,
                     hwnd: owner.hwnd(),
                 };
-                for _ in 0..repetitions {
+                for round in 1..=repetitions {
+                    // A busy second open is the regression under test: report it as a
+                    // script failure, not as an environment problem.
                     two_phase_write(&mut writer, &content)
-                        .map_err(|e| native_mouse_environment_error(&excel_bridge, e))?;
+                        .map_err(|e| rhai_error(format!("round {round}/{repetitions}: {e}")))?;
                     writer
                         .delay(Duration::from_millis(100))
                         .map_err(rhai_error)?;
@@ -659,9 +668,9 @@ impl KeyPipeClient {
     }
 }
 
-/// Names the window that took the foreground (process image and class only; no title).
+/// Names a window by process image and class only (no title), for smoke diagnostics.
 #[cfg(windows)]
-fn describe_foreground(foreground: windows::Win32::Foundation::HWND) -> String {
+fn describe_window(foreground: windows::Win32::Foundation::HWND) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
@@ -761,7 +770,7 @@ fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, 
             return Err(format!(
                 "clipboard paste exact root is not the visible foreground owner (phase={phase}, visible={}, foreground={})",
                 unsafe { IsWindowVisible(hwnd).as_bool() },
-                describe_foreground(foreground)
+                describe_window(foreground)
             ));
         }
         let input = unsafe { OpenInputDesktop(0, 0, 1) };
