@@ -14404,7 +14404,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                             if let Some(resolved) =
                                                                 resolve_folder_bar_nav_path(&destination.path)
                                                             {
-                                                                result = Some(AddressBarNav::Direct(resolved));
+                                                                result = Some(AddressBarNav::Direct(
+    resolved,
+    crate::app::StartupListIntent::ExplicitList,
+));
                                                             }
                                                             ui.close();
                                                         }
@@ -26906,7 +26909,7 @@ mod section207_tests {
         click_location_menu(&mut harness, "保管");
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &target)
         );
         assert!(
             harness.query_by_label("保管").is_none(),
@@ -27011,7 +27014,7 @@ mod section207_tests {
         click_location_menu(&mut harness, "整理先 099");
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &target)
         );
         assert!(harness.query_by_label("整理先 099").is_none());
     }

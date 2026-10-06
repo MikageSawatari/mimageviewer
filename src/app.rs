@@ -94,7 +94,8 @@ mod clipboard_capture_admission_tests {
             app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                 candidate,
                 false,
-                OpenRequestOwner::Navigation
+                OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::container_open(false),
             ),
             FolderOpenOutcome::Classifying
         );

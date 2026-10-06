@@ -24,8 +24,9 @@ mod file_organize_tests {
         let history = app.folder_nav_history_snapshot();
         assert!(
             app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
-                destination.clone()
-            ),)
+                destination.clone(),
+                crate::app::StartupListIntent::ExplicitList,
+            ))
         );
         assert_eq!(app.current_folder.as_ref(), Some(&destination));
         assert!(app.top_level_grid_view.open_path_classification().is_none());
