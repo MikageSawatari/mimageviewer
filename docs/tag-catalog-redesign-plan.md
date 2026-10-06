@@ -10,8 +10,8 @@
   全文検索索引のいずれにも書かない (非破壊・投影ゼロ)**
 - タグの発見は Ctrl+G / Ctrl+S とは **完全に分離**し、**専用のタグビュー (Ctrl+T) + facet フィルタ**で行う
 
-archive/search-metadata/tag-feature.md から **生かす部分**: §3.3 タグ名のルール (使用可能文字・長さ・大小文字無視)、
-XMP `dc:subject` の **読み取り**ロジック ([src/xmp_reader.rs](../src/xmp_reader.rs)、移行専用)。
+archive/search-metadata/tag-feature.md から **生かす部分**: §3.3 タグ名のルール (使用可能文字・長さ・大小文字無視)。
+旧XMPタグの読み取りは移行当時の歴史として§7に残すが、現役の取込経路ではない。
 
 archive/search-metadata/tag-feature.md から **置き換える部分**: §1/§3.1/§5 (XMP・動画 `.xmp` への**書き込み**を正本とする
 モデル全体)、`#` プレフィックスをファイルに刻む規約、ZIP内画像/PDFページ/フォルダを非対象とする
@@ -38,8 +38,8 @@ archive/search-metadata/tag-feature.md から **置き換える部分**: §1/§3
 | D11 | **`tags.db` = 正規化テーブル** `item_tags(item_key, tag, tag_key, applied_at)` + `tag_key` index | 大小無視/前方一致/最近使用/DISTINCT を高カーディナリティで効率化。§8.1 |
 | D12 | **`tags.db` ↔ `mimageviewer.dat` 二層**。タグ用サイドカーバックアップは新トグルで **既定 OFF** | 既存編集データと同じ二層パターン。§4 |
 | D13 | **書き込み投影ゼロ**: タグ書き込みは `tags.db` のみ。Tantivy/search_index には書かない | D4 の帰結。stale化しない |
-| D14 | **移行 = 既存 Tantivy `tags` の `#` 付き値を `tags.db` へ一括コピー (`#` 剥がし)** | ファイル I/O・再スキャン・リバイバルなし。§7 |
-| D15 | **既存 FTS のタグ経路を能動的に閉じる**: `SourceKind::Tags` を検索/ingest から外し、STORED tags は移行専用に | 「分離」を原則でなく実挙動にする。§5.4 |
+| D14 | **旧Tantivyタグ一括移行は2026-10-06利用者決定で撤去済み** | v1.4.0以降で取込済みのcatalogを保持。v1.0〜v1.3から直接更新する旧タグは取り込まない。§7.1 |
+| D15 | **既存 FTS のタグ経路を能動的に閉じる**: `SourceKind::Tags` を検索/ingest から外し、STORED tags はschema互換だけに保持 | 旧タグreaderも撤去し、検索/移行には使わない。§5.4 |
 | D16 | **タグビューの stale パスは worker で存在確認 → 結果から非表示。missing だけでは DB を変更しない** | 外付け/NAS offline と恒久削除を安全に区別できないため。§5.5 |
 | D17 | **体験層では D4 の分離を見せない (UX レビュー)**: Ctrl+G の素キーワード→タグ件数ヒント / チップ・バッジのクリック=タグ検索 / メニューに「タグビュー (Ctrl+T)」 | 分離が体験の断絶として出ると「タグが壊れた」と誤解される。§13 |
 | D18 | **複数選択トグルは all-or-nothing** (全付与済み→全削除、それ以外→全付与) | 結果が予測しやすい。出荷マニュアルの「各ファイル独立」記述を改める。§6.1 |
@@ -84,7 +84,7 @@ ZipImage/PdfPage/ZipDir 用合成キーは不要 (それらは付与対象外)�
 - 正本は `tags.db`。**内部表現は `#` なしの素のタグ名** (`原神`、`鈴木作』` 等)。
 - **画面表示時のみ `#` を冠して「タグ」であることを示す** (`#原神`)。`#` は表示上の飾りで、保存・
   照合・キー化はすべて `#` なしで行う。
-- v1.0 互換: v1.0 はファイル XMP に `#原神` と刻んでいた。移行 (§7) で `#` を剥がして `tags.db` に取り込む。
+- v1.0の歴史: ファイル XMP に `#原神` と刻んでいた。旧取込経路はすべて撤去済み (§7)。ファイルXMPと取込済み `tags.db` は保持する。
 - タグ名ルールは archive/search-metadata/tag-feature.md §3.3 を踏襲 (1〜64 文字、大小無視、`#` は入力させず表示時に付与)。
 
 ### 3.2 他アプリ由来 dc:subject は「タグ」として扱わない (D10)
@@ -258,8 +258,8 @@ AND `facet_filter` を合成して `visible_indices` を作る ([docs/details-vi
   ([src/global_search_ui.rs:2127](../src/global_search_ui.rs) / [src/ui_main.rs:2785](../src/ui_main.rs)) は
   クエリへ `#tag` を挿入する導線。`Tags` 検索を外した後に残すと**壊れた導線**になるので、**撤去**するか
   **「タグビューを開く」ボタンに置換**する。
-- **既存 STORED `tags` は移行専用**: 索引に残る旧値は §7.1 の一括コピー元としてのみ使い、検索には
-  出さない。再 ingest で順次空になる。**移行は再 ingest より先に走らせる**。
+- **既存 STORED `tags` はschema互換だけに保持**: 旧値は検索/移行に使わない。再 ingest で順次空になる。
+  旧タグ撤去だけを理由にschema変更・INDEX_VERSION変更・索引再構築は行わない。
 - `SourceKind::Sidecar` (外部 JSON/TXT サイドカーの別系統メタ, [src/fts_index.rs:81](../src/fts_index.rs)) は
   mIV タグと無関係なので**そのまま**。
 - **2026-09-12 更新**: 検索ソースとしての XMP/`dc:subject` 読みに加え、§7.2 の
@@ -372,9 +372,15 @@ Shell 成功 path だけを、共通 delete worker が全 path-keyed store と�
 ## 7. 移行 (リリース済み機能の後方互換)
 
 v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時に Tantivy `tags` フィールドにも upsert
-していた。新モデルでは `tags.db` が正本かつ唯一の発見源になるため、以下で取りこぼしと事故を防ぐ。
+していた。現仕様では `tags.db` が正本であり、以下の旧版救済経路はすべて撤去済み。以下は導入時の歴史を残す。
 
-### 7.1 一括移行 — Tantivy `tags` → `tags.db` (主経路)
+### 7.1 一括移行 — Tantivy `tags` → `tags.db` — 2026-10-06 撤去済み
+
+2026-10-06の利用者決定で起動時の一括移行、専用reader、progress/perf/log、専用testsを撤去した。
+v1.4.0以降で取り込み済みの `item_tags` / `tag_item_state`（`source='tantivy_migration'`を含む）と
+`tag_meta.legacy_tantivy_imported` の既存行は保持し、掃除・読み直し・再移行はしない。
+v1.0〜v1.3から直接更新する場合、旧TantivyタグとファイルXMPに残る旧タグは取り込まれない。
+ファイルのXMP自体は変更しない。以下はv1.4.0導入時の設計記録で、現役の起動仕様ではない。
 
 - 既存の mIV タグは **既に Tantivy `tags` フィールドに入っている** ([src/fts_index.rs:773](../src/fts_index.rs))。
   アップグレード時に **Tantivy 索引を走査し、各文書の `tags` のうち `#` 始まりの要素を `#` 剥がしで
@@ -393,7 +399,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 - **取り込んだ各 `item_key` に `tag_item_state` (source='tantivy_migration') を記録**する。
   旧XMP自動seedの撤去後も、Tantivy移行の完了記録とタグ決定状態としてこの台帳を維持する。
 
-### 7.2 遅延取り込み + リバイバル防止 (保険経路) — 2026-09-12 廃止
+### 7.2 遅延取り込み + リバイバル防止 (保険経路) — 2026-09-12 撤去済み (v3.9.1)
 
 以下は2026-06-12に導入した当時の設計記録である。日常利用済みデータは移行済みとしてv1.0救済を
 終了する利用者了承を得て、自動seedの3入口、context owner、待機、worker、専用bounded readerを
@@ -418,7 +424,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 - **ファイル mtime が変わっても再 seed しない** (他アプリの後付け編集で旧タグが復活するのを防ぐ)。
   再取り込みは §7.3 の明示コマンド経由のみ。
 
-### 7.3 ファイルからの除去 (明示・任意) — 2026-08-30 廃止
+### 7.3 ファイルからの除去 (明示・任意) — 2026-08-30 撤去済み (v3.4.0)
 
 以下は実装当時の設計記録である。利用者向け手動取り込み／取り込み後削除と専用workerは
 2026-08-30に撤去済みで、2026-09-12の自動seed撤去時に復活させないと決定した。
@@ -460,14 +466,14 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
     decided_at INTEGER NOT NULL,
     source     TEXT    NOT NULL                     -- 'edit'/'tantivy_migration'/'xmp_legacy'/'sidecar'
   );
-  tag_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- legacy_tantivy_imported 等の全体フラグ (§7.1)
+  tag_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- 旧legacy_tantivy_imported行も歴史値として保持 (§7.1)
   ```
   - **`tag_key` 正規化は単一関数 `normalize_tag_key()` = trim → NFKC → lowercase に固定** (D11, Codex P3)。
     NFKC で全半角/互換文字を統一し `ＦＡＴＥ` / `FATE` 重複を防ぐ。tags.db は FTS 非依存なので採用は容易。
     **統合規則**: 移行/付与時に同一 `tag_key` へ正規化される表示違いが出たら、表示形 1 つ (最新
     `applied_at`) に寄せ、適用 (item_tags 行) を union する。
   - **`tag_item_state` の立て方 (Codex P2)**: 「この item_key のタグは tags.db が決定済み」を表す行。
-    通常編集 (付与/削除/全クリア)・§7.1 一括移行・§4.1 sidecar import の各経路で、その item_key を
+    通常編集 (付与/削除/全クリア)・§4.1 sidecar import の各経路で、その item_key を
     処理した時点でupsertする。sidecar importはこの行が在ればskipし、タグを全削除して空になったitemも
     復活させない。廃止したlegacy XMP seedが作った `source='xmp_legacy'` の既存行も歴史値として保持する。
   - **前方一致検索のワイルドカード対策 (Codex P3)**: タグ名は `%` / `_` を含み得るので、入力を同じく
@@ -518,11 +524,8 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
     ([src/settings_db.rs:1942](../src/settings_db.rs) / [src/settings_db.rs:1966](../src/settings_db.rs)) は
     JSON 読込後に load-time migration を適用する。`TagDef` の新フィールドは **serde default** で旧 JSON を
     吸収する (`tag_key` は空 → 後で `normalize_tag_key(name)` 補完、`show_shortcut` は既定 true)。
-- **旧 Tantivy 一括移行の挿入点 (Codex P2)**: [src/indexer_manager.rs:139](../src/indexer_manager.rs) で
-  `FtsMetaDb` を開いた後、`rebuilt_on_open()` だと [src/indexer_manager.rs:148](../src/indexer_manager.rs) で
-  `fts_index` を wipe する。**この wipe より前に**、`tag_meta.legacy_tantivy_imported` が未設定なら旧
-  `fts_index` を read-only で開いて `#` タグを `tags.db` へ import + フラグ設定する (§7.1)。wipe 後だと旧
-  STORED tags が消えて移行できない。
+- **旧 Tantivy 一括移行は撤去済み** (§7.1): `FtsMetaDb` open → durable rebuild marker確認 →
+  必要なら `fts_index` wipe → `FtsIndex::open_at` の通常順序を保持。タグ移行の挿入点・marker確認はない。
 - **`FacetFilter.tags` の移行 (§5.2)**: 永続値 `#原神` → `tag_key` (strip `#` + NFKC 正規化)。
   settings.json / settings.db 両経路。リリース済み設定フィールドなので移行必須。
 - **検索バーのタグピッカー撤去/置換** (§5.4): [src/global_search_ui.rs:2127](../src/global_search_ui.rs) /
@@ -535,7 +538,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 - `src/tag_legacy_xmp_worker.rs`: §7.3 の明示取り込み／取り込み後削除として2026-06-12に実装したが、
   2026-08-30に製品とsourceを撤去済み。フォルダ／ライブラリ再帰版も実装しない。
 - [src/ui_metadata_panel.rs](../src/ui_metadata_panel.rs): タグセクション mIV のみ、外部タグ区別表示を削除。
-- 移行: Tantivy `tags` 走査 → `#` 剥がし → `tags.db` 一括コピー (§7.1)。
+- 旧Tantivyタグ一括コピーは2026-10-06撤去済み (§7.1)。通常タグ・sidecar復元・設定値migrationは維持する。
 
 ### 8.3 留意 (実装時に確認)
 
@@ -549,6 +552,8 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
 
 ## 9. 関連クリーンアップ
 
+- **旧Tantivyタグ移行の撤去 (2026-10-06)**: 起動時移行API/readerと専用testsを撤去済み。
+  通常タグ、sidecar復元、閉じたFTSタグ検索の回帰は維持し、歴史的catalog/source/marker行を保持する。
 - **`GridItem::ZipSeparator` 撤去**: v1.3.0 のネスト ZIP ツリー化で生成されなくなったレガシー
   variant を v2.5.0 で撤去済み。本設計の付与対象表からも除外した。
 
@@ -597,7 +602,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
   のまま、context で曖昧性解消、[src/keymap.rs:1887](../src/keymap.rs))。二義性を嫌うユーザーは keymap で
   `Ctrl+Shift+T` 等へ再割当可能。**欠落セルは画面非表示だが DB 行は保持**する
   (§5.5、2026-07-11 統一設計)。
-- 移行(§7.1) の Tantivy 走査コスト (大規模ライブラリでの一括コピー時間) と進捗 UX。
+- 旧Tantivy移行の性能計測・進捗UXは撤去により対象外 (§7.1)。
 - 大量一括付与時の進捗 UX / キャンセル。
 - タグビュー結果の並び順 (パス順 / 付与日時順) の既定と切替 (UX レビュー【中6】)。
 - facet でフォルダ/コンテナ中身を素通りさせる挙動と ★ フィルタの一時解除の差を、マニュアルで一言説明。

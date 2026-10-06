@@ -2880,9 +2880,10 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 
 現在のタグ実装は [docs/tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) の
 `tags.db` 正本モデルへ移行済み。通常のタグ付与/削除はファイル本体や XMP を書き換えず、
-Ctrl+F / Ctrl+G の全文検索にも投影しない。旧 XMP `dc:subject` の `#` タグは、起動時の
-旧Tantivy STORED tags一回移行に含まれる既存値だけを取り込む。ファイルXMPからの自動seedは
-2026-09-12に、手動取り込み／削除は2026-08-30に廃止済みである。
+Ctrl+F / Ctrl+G の全文検索にも投影しない。旧Tantivy STORED tagsの起動時一回移行は
+2026-10-06の利用者判断で撤去した。v1.0〜v1.3からv1.4.0以降を一度も起動せずに
+次版へ更新した場合、旧タグはファイルXMPに残るがmIVには取り込まない。
+ファイルXMPからの自動seedは2026-09-12に、手動取り込み／削除は2026-08-30に廃止済みである。
 
 **現行 (`tags.db` 正本):**
 
@@ -2894,8 +2895,8 @@ Ctrl+F / Ctrl+G の全文検索にも投影しない。旧 XMP `dc:subject` の 
 - [x] タグの発見はタグビュー (Ctrl+T) + facet タグフィルタに一本化。Ctrl+F / Ctrl+G には投影しない (`SourceKind::Tags` は検索対象から除外済み)
 - [x] 書き込み worker + 進捗インジケーター (左下ステータスライン)
 - [x] `Settings.tags: Vec<TagDef>` (UUID + name) で永続化、`tag_write_warning_acknowledged` で初回警告抑制
-- [x] 旧Tantivy STORED tagsの一回移行を維持。旧XMPタグの自動seed／手動取り込みは廃止し、
-      既存 `tags.db` 行と一般XMP metadata／ratingはそのまま保持する
+- [x] 旧Tantivy STORED tagsの一回移行、旧XMPタグの自動seed／手動取り込みは廃止。
+      既存 `tags.db` 行（移行済みタグを含む）、ファイルXMPと一般XMP metadata／ratingはそのまま保持する
 
 **v1.0 当時の実装 (現在は上のモデルへ置き換え済み。履歴として残す):**
 

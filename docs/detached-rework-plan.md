@@ -1455,6 +1455,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-06 §1.241 plan A Phase A 起動診断・Indexer単一採用**
+
+設計 `docs/startup-diagnostics-plan.md` は f2fcef6b2 の独立レビューで ready（指摘なし）となり、
+ClaudeCode 設計ownerと独立Codexは detachedへ到達する部分を構造変更として合意した。
+Phase A は共通 wgpu painter / eframe root paint の観測callback、accepted final pass の
+Overlay/NormalShell識別、ROOTだけの実present milestone、Indexer Pending ownerのROOT wake、
+既存tray可視状態同期とlate adoption時の現throttle適用に限定する。
+detached paintでroot readyを立てず、surface skip、texture delta、viewport配置・mount・host・
+native presentation reducer、OS最小化とtray hideの区別は維持する。
+診断は既存ownerのbegin/endを観測し、第二の機能state writerや症状repaintを作らない。
+初期フォルダのDeferred/resolver/scan、held activation/bookmark、Remote返却再dispatchの変更は
+§1.335統合後のPhase Bへ保留する。first_setup.rsは対象外。
+
 **2026-10-06 §1.335 main の起動復元先と明示一覧復帰の受理境界**
 
 起動復元先を読書用 load や表示先切替から分離し、既存 typed navigation request が

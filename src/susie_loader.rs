@@ -51,6 +51,13 @@ static SUSIE_WORKER_BYTES: &[u8] =
 
 static WORKER_EXE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(not(feature = "portable"))]
+fn extraction_span(stage: miv_startup::Stage) -> miv_startup::Span {
+    miv_startup::span(miv_startup::Lane::Core, stage).watched_optional(miv_startup::watch_handle(
+        miv_startup::WatchSlot::CoreStartup,
+    ))
+}
+
 /// 埋め込みバイト列を APPDATA に展開する。サイズ一致でスキップ。
 /// 起動時に一度だけ呼ぶ (main.rs の data_dir 初期化直後)。
 pub fn ensure_worker_extracted() {
@@ -75,8 +82,19 @@ fn worker_exe_cached_path() -> PathBuf {
             }
             #[cfg(not(feature = "portable"))]
             {
+                let extraction = extraction_span(miv_startup::Stage::SusieWorker)
+                    .detail("cached-susie-worker-extraction");
                 let dir = crate::data_dir::get();
-                if let Err(e) = std::fs::create_dir_all(&dir) {
+                let mkdir = extraction_span(miv_startup::Stage::AssetWrite)
+                    .detail(&format!("susie-directory path={}", dir.display()));
+                let result = std::fs::create_dir_all(&dir);
+                mkdir.finish(if result.is_ok() {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Error
+                });
+                if let Err(e) = result {
+                    extraction.finish(miv_startup::Outcome::Error);
                     crate::logger::log(format!(
                         "susie: data_dir create failed: {e} (path: {})",
                         dir.display()
@@ -88,20 +106,48 @@ fn worker_exe_cached_path() -> PathBuf {
                 // 埋め込みが空 (開発時 vendor/susie-worker 未設置) の場合は展開しない。
                 // 既存の実ファイルを 0 バイトで上書きして壊すのを避ける。
                 if SUSIE_WORKER_BYTES.is_empty() {
+                    extraction.finish(miv_startup::Outcome::Skipped);
                     return exe_path;
                 }
                 // サイズ比較だけではアップデート時に同サイズ・別内容のバイナリを
                 // 取り違える可能性があるため、既存ファイル全体を読んで中身比較する。
                 // 169KB 程度なので起動時の 1 回読みは許容範囲。
-                let needs_extract = match std::fs::read(&exe_path) {
+                let compare = extraction_span(miv_startup::Stage::AssetVerify).detail(&format!(
+                    "susie-content-compare bytes={} path={}",
+                    SUSIE_WORKER_BYTES.len(),
+                    exe_path.display()
+                ));
+                let existing = std::fs::read(&exe_path);
+                let needs_extract = match &existing {
                     Ok(existing) => existing.as_slice() != SUSIE_WORKER_BYTES,
                     Err(_) => true,
                 };
+                compare.finish(match &existing {
+                    Ok(_) => miv_startup::Outcome::Ok,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        miv_startup::Outcome::Skipped
+                    }
+                    Err(_) => miv_startup::Outcome::Error,
+                });
+                drop(existing);
+                let mut outcome = miv_startup::Outcome::Skipped;
                 if needs_extract {
                     // 他プロセス (旧 mImageViewer インスタンス) がワーカーを起動中で
                     // ファイルをロックしている場合 write は失敗する。その場合は
                     // 古いバイナリのまま続行 (次回起動で書き換わる)。
-                    match std::fs::write(&exe_path, SUSIE_WORKER_BYTES) {
+                    let write = extraction_span(miv_startup::Stage::AssetWrite).detail(&format!(
+                        "susie-worker bytes={} path={}",
+                        SUSIE_WORKER_BYTES.len(),
+                        exe_path.display()
+                    ));
+                    let result = std::fs::write(&exe_path, SUSIE_WORKER_BYTES);
+                    outcome = if result.is_ok() {
+                        miv_startup::Outcome::Ok
+                    } else {
+                        miv_startup::Outcome::Error
+                    };
+                    write.finish(outcome);
+                    match result {
                         Ok(()) => {
                             crate::logger::log(format!(
                                 "susie: worker extracted to {} ({} bytes)",
@@ -117,6 +163,13 @@ fn worker_exe_cached_path() -> PathBuf {
                         }
                     }
                 }
+                extraction
+                    .detail(if needs_extract {
+                        "extraction-attempted"
+                    } else {
+                        "reused-content-match"
+                    })
+                    .finish(outcome);
                 exe_path
             }
         })

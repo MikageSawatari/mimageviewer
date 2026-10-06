@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::{Receiver, Sender};
+use miv_startup::{Lane, Outcome, Stage, span};
 use uuid::Uuid;
 
 use crate::activity_gate::ActivityGate;
@@ -100,8 +101,8 @@ pub struct StartupDiag {
 /// fts_meta が INDEX_VERSION bump / 旧スキーマを検出して `files` テーブルを drop した場合、
 /// Tantivy 側も一緒に wipe しないと旧 key 形式 (例: `!` separator) で書かれた orphan doc が
 /// 残り続ける (post-filter で弾かれるが容量を食う、かつ将来リカバリ経路が増えたら顕在化し得る)。
-/// このため fts_meta open → 旧 STORED tags を tags.db へ移行 → durable rebuild pending
-/// チェック → 必要なら `fts_index` 削除 → fts open → pending clear の順で実行する。
+/// このため fts_meta open → durable rebuild pending チェック → 必要なら `fts_index`
+/// 削除 → fts open → pending clear の順で実行する。
 ///
 /// 本番 `new()` とテスト用 `new_at()` の両方から呼ぶ (Codex P3 指摘: 旧コードでは
 /// `new_at` が wipe を再現していなかったため、version bump の挙動を統合テストで検証できず
@@ -113,7 +114,7 @@ pub struct StartupDiag {
 pub type StartupProgressHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 /// App の既存 startup completion channel に載せる typed outcome。状態を App field に
-/// 重複保持せず、migration failure の user message を poll owner が 1 回だけ通知する。
+/// 重複保持せず、store initialization failure の user message を poll owner が 1 回だけ通知する。
 pub enum StartupInitOutcome {
     Ready(IndexerManager),
     Unavailable,
@@ -124,66 +125,6 @@ pub enum StartupInitOutcome {
 enum StoreOpenFailure {
     Unavailable,
     RebuildDeferred,
-}
-
-fn run_legacy_tantivy_tag_import(
-    data_dir: &std::path::Path,
-    fts_dir: &std::path::Path,
-    log_tag: &str,
-    progress: Option<&StartupProgressHook>,
-) {
-    let mut tags_db = match crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")) {
-        Ok(db) => db,
-        Err(e) => {
-            crate::logger::log(format!(
-                "{log_tag}: tags.db open for legacy import failed: {e}"
-            ));
-            return;
-        }
-    };
-    if tags_db
-        .meta(crate::tags_db::LEGACY_TANTIVY_IMPORTED_META)
-        .as_deref()
-        == Some("1")
-    {
-        return;
-    }
-    if let Some(p) = progress {
-        p("旧タグをタグカタログへ移行しています…");
-    }
-    let t_import = std::time::Instant::now();
-    let legacy_docs = match crate::fts_index::collect_legacy_tag_docs_at(fts_dir) {
-        Ok(docs) => docs,
-        Err(e) => {
-            crate::logger::log(format!(
-                "{log_tag}: collect legacy Tantivy tags failed: {e} (continuing)"
-            ));
-            return;
-        }
-    };
-    let report = match tags_db.import_legacy_tantivy_tags(
-        legacy_docs
-            .into_iter()
-            .map(|doc| (doc.item_key, doc.tags_column)),
-    ) {
-        Ok(report) => report,
-        Err(e) => {
-            crate::logger::log(format!(
-                "{log_tag}: import legacy Tantivy tags failed: {e} (continuing)"
-            ));
-            return;
-        }
-    };
-    crate::perf::emit_ms("startup", "legacy_tantivy_tag_import", 0, t_import);
-    crate::logger::log(format!(
-        "{log_tag}: legacy Tantivy tag import: scanned_docs={}, imported_items={}, \
-         inserted_tags={}, skipped_decided_items={}, skipped_already_imported={}",
-        report.scanned_docs,
-        report.imported_items,
-        report.inserted_tags,
-        report.skipped_decided_items,
-        report.skipped_already_imported
-    ));
 }
 
 fn open_stores_with_rebuild_sync(
@@ -209,6 +150,7 @@ fn open_stores_with_rebuild_sync_using(
     let fts_dir = data_dir.join("fts_index");
     // meta DB を失ったのに Tantivy だけ残った場合、files inventory が無いので旧 docs を
     // 公開できない。marker は DB 初期化 transaction 内で立て、crash gap を作らない。
+    let meta_open = span(Lane::Indexer, Stage::IndexerMetaOpen);
     let force_tantivy_rebuild = !meta_path.exists() && fts_dir.exists();
     let t_meta = std::time::Instant::now();
     let meta_db = match FtsMetaDb::open_at_with_tantivy_rebuild_requirement(
@@ -217,21 +159,25 @@ fn open_stores_with_rebuild_sync_using(
     ) {
         Ok(db) => db,
         Err(e) => {
+            meta_open.finish(Outcome::Error);
             crate::logger::log(format!("{log_tag}: FtsMetaDb open failed: {e}"));
             return Err(StoreOpenFailure::Unavailable);
         }
     };
+    meta_open.finish(Outcome::Ok);
     crate::perf::emit_ms("startup", "fts_meta_open", 0, t_meta);
-    run_legacy_tantivy_tag_import(data_dir, &fts_dir, log_tag, progress);
+    let rebuild_read = span(Lane::Indexer, Stage::IndexerRebuildRead);
     let rebuild_pending = match meta_db.tantivy_rebuild_pending() {
         Ok(pending) => pending,
         Err(e) => {
+            rebuild_read.finish(Outcome::Error);
             crate::logger::log(format!(
                 "{log_tag}: read Tantivy rebuild marker failed: {e}"
             ));
             return Err(StoreOpenFailure::Unavailable);
         }
     };
+    rebuild_read.finish(Outcome::Ok);
     if rebuild_pending {
         if let Some(p) = progress {
             p("古いインデックスを削除しています…");
@@ -241,8 +187,10 @@ fn open_stores_with_rebuild_sync_using(
             fts_dir.display()
         ));
         let t_wipe = std::time::Instant::now();
+        let wipe = span(Lane::Indexer, Stage::IndexerOldIndexWipe);
         if let Err(e) = remove_fts_dir(&fts_dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
+                wipe.finish(Outcome::Error);
                 crate::logger::log(format!(
                     "{log_tag}: wipe fts_index failed for {}: {e}; old index will not be opened, rebuild remains pending",
                     fts_dir.display()
@@ -250,6 +198,7 @@ fn open_stores_with_rebuild_sync_using(
                 return Err(StoreOpenFailure::RebuildDeferred);
             }
         }
+        wipe.finish(Outcome::Ok);
         crate::perf::emit_ms("startup", "fts_index_wipe", 0, t_wipe);
     }
     let meta_db = Arc::new(meta_db);
@@ -270,25 +219,35 @@ fn open_stores_with_rebuild_sync_using(
     };
     crate::perf::emit_ms("startup", "fts_index_open", 0, t_fts);
     if fts.recreated_on_open() {
-        meta_db
-            .reset_inventory_for_recreated_tantivy()
-            .map_err(|error| {
+        let reset = span(Lane::Indexer, Stage::IndexerInventoryReset);
+        let reset_result = meta_db.reset_inventory_for_recreated_tantivy();
+        reset.finish(if reset_result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        reset_result.map_err(|error| {
+            crate::logger::log(format!(
+                "{log_tag}: clear scan markers after store recreation failed: {error}"
+            ));
+            if let Err(pending_error) = meta_db.request_item_index_rebuild() {
                 crate::logger::log(format!(
-                    "{log_tag}: clear scan markers after store recreation failed: {error}"
+                    "{log_tag}: request rebuild failed: {pending_error}"
                 ));
-                if let Err(pending_error) = meta_db.request_item_index_rebuild() {
-                    crate::logger::log(format!(
-                        "{log_tag}: request rebuild failed: {pending_error}"
-                    ));
-                }
-                StoreOpenFailure::RebuildDeferred
-            })?;
+            }
+            StoreOpenFailure::RebuildDeferred
+        })?;
     }
-    if rebuild_pending && let Err(e) = meta_db.complete_tantivy_rebuild() {
-        crate::logger::log(format!(
-            "{log_tag}: clear Tantivy rebuild marker failed: {e}; rebuild remains pending"
-        ));
-        return Err(StoreOpenFailure::RebuildDeferred);
+    if rebuild_pending {
+        let complete = span(Lane::Indexer, Stage::IndexerRebuildComplete);
+        if let Err(e) = meta_db.complete_tantivy_rebuild() {
+            complete.finish(Outcome::Error);
+            crate::logger::log(format!(
+                "{log_tag}: clear Tantivy rebuild marker failed: {e}; rebuild remains pending"
+            ));
+            return Err(StoreOpenFailure::RebuildDeferred);
+        }
+        complete.finish(Outcome::Ok);
     }
     Ok((meta_db, fts))
 }
@@ -434,8 +393,10 @@ impl IndexerManager {
         ));
         let io_sem = Arc::new(GlobalIoSemaphore::new(permits));
 
+        let dispatcher = span(Lane::Indexer, Stage::IndexerDispatcher);
         let writer =
             crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
+        dispatcher.finish(Outcome::Ok);
 
         // === 起動時 reconciliation → supervisor spawn を同じ worker に渡す ===
         // supervisor が走る前に status != ok の残留行を整理する。dispatcher 経由で
@@ -443,7 +404,8 @@ impl IndexerManager {
         if let Some(p) = progress.as_ref() {
             p("アイテム索引を整理中…");
         }
-        let runtime = crate::metadata_reconfiguration::Runtime::start(
+        let runtime_spawn = span(Lane::Indexer, Stage::IndexerMetadataSpawn);
+        let runtime_result = crate::metadata_reconfiguration::Runtime::start(
             crate::metadata_reconfiguration::Stores {
                 meta: Arc::clone(&meta_db),
                 fts: Arc::clone(&fts),
@@ -461,8 +423,13 @@ impl IndexerManager {
                 config.skip_offline_change_scan = skip_offline_change_scan;
                 config
             },
-        )
-        .ok()?;
+        );
+        runtime_spawn.finish(if runtime_result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        let runtime = runtime_result.ok()?;
         let mgr = IndexerManager {
             meta_db,
             fts,
@@ -824,6 +791,61 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    #[test]
+    fn opening_search_stores_does_not_import_or_touch_legacy_tags() {
+        for marker in [None, Some(false), Some(true)] {
+            let tmp = TempDir::new().unwrap();
+            let tags_path = tmp.path().join("tags.db");
+            let before = marker.map(|marked| {
+                let mut tags = crate::tags_db::TagsDb::open_at(&tags_path).unwrap();
+                tags.set_item_tags("c:/kept.jpg", ["kept"], "tantivy_migration")
+                    .unwrap();
+                if marked {
+                    tags.set_meta("legacy_tantivy_imported", "1").unwrap();
+                }
+                drop(tags);
+                std::fs::read(&tags_path).unwrap()
+            });
+            // A current metadata store prevents an unrelated orphan-index rebuild.
+            drop(FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap());
+            let fts = FtsIndex::open_at(&tmp.path().join("fts_index")).unwrap();
+            let mut writer = fts.writer().unwrap();
+            upsert_doc(
+                &writer,
+                fts.fields(),
+                &IndexDoc {
+                    path: "c:/old.jpg".into(),
+                    container: Container::Fs,
+                    zip_entry: String::new(),
+                    favorite_id: Uuid::new_v4(),
+                    kind: IndexKind::Image,
+                    mtime: 1,
+                    file_size: 1,
+                    norms: crate::ingest_text::PerSourceText {
+                        tags: "#old".into(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+            writer.commit().unwrap();
+            drop(writer);
+            drop(fts);
+            let (_, reopened) =
+                open_stores_with_rebuild_sync(tmp.path(), "legacy-removal-test", None).unwrap();
+            assert_eq!(reopened.searcher().num_docs(), 1);
+            if let Some(bytes) = before {
+                assert_eq!(std::fs::read(&tags_path).unwrap(), bytes);
+                let tags = crate::tags_db::TagsDb::open_at(&tags_path).unwrap();
+                assert_eq!(tags.display_tags_for_item("c:/kept.jpg"), vec!["#kept"]);
+                assert!(tags.has_item_state("c:/kept.jpg"));
+                assert!(tags.display_tags_for_item("c:/old.jpg").is_empty());
+            } else {
+                assert!(!tags_path.exists());
+            }
+        }
+    }
 
     fn test_manager(
         meta: Arc<FtsMetaDb>,

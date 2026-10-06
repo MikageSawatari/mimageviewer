@@ -4,6 +4,7 @@ use crate::bundle_location;
 use crate::bundle_paths::{checked_metadata, exists_checked, inventory_metadata, relative_name};
 use crate::runtime_locks::{self, PinnedGeneration};
 use fs4::fs_std::FileExt;
+use miv_startup::Stage;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -91,10 +92,18 @@ fn ensure_bundle_inner(
     }
     std::fs::create_dir_all(&container)?;
     let started = std::time::Instant::now();
-    let lock = runtime_locks::open(runtime, runtime_locks::PUBLISHER)?;
+    let lock = crate::trace(
+        Stage::EffeTunePublishLock,
+        "open permanent publisher lock",
+        || runtime_locks::open(runtime, runtime_locks::PUBLISHER),
+    )?;
     // Blocking OS locking runs on a worker, with a bounded launcher wait. A
     // timed-out worker only releases its lock: it never publishes anything.
-    let _lock = match wait_for_publish_lock(lock, wait) {
+    let _lock = match crate::trace(
+        Stage::EffeTunePublishLock,
+        "permanent publisher lock",
+        || wait_for_publish_lock(lock, wait),
+    ) {
         Ok(lock) => lock,
         Err(error) => {
             return ready_generation(&container, files, manifest, rejected_generation)
@@ -103,8 +112,14 @@ fn ensure_bundle_inner(
     };
     // Released launchers only know the old in-tree publisher lock. Always take
     // the permanent lock first, then this compatibility lock, within one budget.
-    let legacy = runtime_locks::open_legacy_publisher(runtime, false)?;
-    let _legacy = match wait_for_publish_lock(legacy, wait.saturating_sub(started.elapsed())) {
+    let legacy = crate::trace(
+        Stage::EffeTunePublishLock,
+        "open legacy publisher lock",
+        || runtime_locks::open_legacy_publisher(runtime, false),
+    )?;
+    let _legacy = match crate::trace(Stage::EffeTunePublishLock, "legacy publisher lock", || {
+        wait_for_publish_lock(legacy, wait.saturating_sub(started.elapsed()))
+    }) {
         Ok(lock) => lock,
         Err(error) => {
             return ready_generation(&container, files, manifest, rejected_generation)
@@ -170,92 +185,96 @@ fn ready_generation(
     manifest: &str,
     rejected_generation: &mut Option<String>,
 ) -> io::Result<PinnedGeneration> {
-    if !checked_metadata(container)?.is_dir() {
-        return Err(io::Error::other("EffeTune directory required"));
-    }
-    *rejected_generation = None;
-    let generation = bundle_location::read_pointer(container)?;
-    *rejected_generation = Some(generation.clone());
-    let root = container.join(generation);
-    bundle_location::checked_directory(&root)?;
-    let pin = PinnedGeneration::new(root.clone())?;
-    let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
-    if !root
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .starts_with(&format!(
-            "{}-",
-            &fingerprint[..bundle_location::FINGERPRINT_LENGTH]
-        ))
-    {
-        return Err(io::Error::other("EffeTune generation fingerprint mismatch"));
-    }
-    let expected = snapshot(&root, files, manifest)?;
-    let stamp = root.join(".manifest");
-    if !checked_metadata(&stamp)?.is_file() || std::fs::read_to_string(stamp)? != expected {
-        return Err(io::Error::other("EffeTune extraction stamp mismatch"));
-    }
-    Ok(pin)
+    crate::trace(Stage::EffeTuneReuse, &container.to_string_lossy(), || {
+        if !checked_metadata(container)?.is_dir() {
+            return Err(io::Error::other("EffeTune directory required"));
+        }
+        *rejected_generation = None;
+        let generation = bundle_location::read_pointer(container)?;
+        *rejected_generation = Some(generation.clone());
+        let root = container.join(generation);
+        bundle_location::checked_directory(&root)?;
+        let pin = PinnedGeneration::new(root.clone())?;
+        let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
+        if !root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!(
+                "{}-",
+                &fingerprint[..bundle_location::FINGERPRINT_LENGTH]
+            ))
+        {
+            return Err(io::Error::other("EffeTune generation fingerprint mismatch"));
+        }
+        let expected = snapshot(&root, files, manifest)?;
+        let stamp = root.join(".manifest");
+        if !checked_metadata(&stamp)?.is_file() || std::fs::read_to_string(stamp)? != expected {
+            return Err(io::Error::other("EffeTune extraction stamp mismatch"));
+        }
+        Ok(pin)
+    })
 }
 
 fn snapshot(root: &Path, files: &[BundleFile], manifest: &str) -> io::Result<String> {
-    let entries = inventory_metadata(root)?;
-    let mut expected = BTreeSet::new();
-    for file in files {
-        relative_name(Path::new(file.name))?;
-        if !expected.insert((file.name.to_string(), false)) {
-            return Err(io::Error::other("duplicate bundle file"));
+    crate::trace(Stage::EffeTuneInventory, &root.to_string_lossy(), || {
+        let entries = inventory_metadata(root)?;
+        let mut expected = BTreeSet::new();
+        for file in files {
+            relative_name(Path::new(file.name))?;
+            if !expected.insert((file.name.to_string(), false)) {
+                return Err(io::Error::other("duplicate bundle file"));
+            }
+            let mut parent = Path::new(file.name).parent();
+            while let Some(dir) = parent.filter(|p| !p.as_os_str().is_empty()) {
+                expected.insert((relative_name(dir)?, true));
+                parent = dir.parent();
+            }
         }
-        let mut parent = Path::new(file.name).parent();
-        while let Some(dir) = parent.filter(|p| !p.as_os_str().is_empty()) {
-            expected.insert((relative_name(dir)?, true));
-            parent = dir.parent();
+        let actual: BTreeSet<_> = entries
+            .iter()
+            .filter(|(name, _, _)| name != ".manifest" && name != runtime_locks::IN_USE)
+            .map(|(name, meta, _)| (name.clone(), meta.is_dir()))
+            .collect();
+        if actual != expected {
+            return Err(io::Error::other("bundle inventory mismatch"));
         }
-    }
-    let actual: BTreeSet<_> = entries
-        .iter()
-        .filter(|(name, _, _)| name != ".manifest" && name != runtime_locks::IN_USE)
-        .map(|(name, meta, _)| (name.clone(), meta.is_dir()))
-        .collect();
-    if actual != expected {
-        return Err(io::Error::other("bundle inventory mismatch"));
-    }
-    if let Some((_, metadata, _)) = entries
-        .iter()
-        .find(|(name, _, _)| name == runtime_locks::IN_USE)
-    {
-        if !metadata.is_file() {
-            return Err(io::Error::other("generation lease must be a regular file"));
+        if let Some((_, metadata, _)) = entries
+            .iter()
+            .find(|(name, _, _)| name == runtime_locks::IN_USE)
+        {
+            if !metadata.is_file() {
+                return Err(io::Error::other("generation lease must be a regular file"));
+            }
         }
-    }
-    let metadata: BTreeMap<_, _> = entries
-        .into_iter()
-        .map(|(name, meta, _)| (name, meta))
-        .collect();
-    let mut stamp = format!("effetune-v2\n{manifest}\n");
-    for file in files {
-        let meta = &metadata[file.name];
-        if !meta.is_file() || meta.len() != file.bytes.len() as u64 {
-            return Err(io::Error::other("bundle size mismatch"));
+        let metadata: BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|(name, meta, _)| (name, meta))
+            .collect();
+        let mut stamp = format!("effetune-v2\n{manifest}\n");
+        for file in files {
+            let meta = &metadata[file.name];
+            if !meta.is_file() || meta.len() != file.bytes.len() as u64 {
+                return Err(io::Error::other("bundle size mismatch"));
+            }
+            let modified = meta
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            let created = meta
+                .created()?
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            stamp.push_str(&format!(
+                "{}\t{}\t{modified}\t{created}\n",
+                file.name,
+                meta.len()
+            ));
         }
-        let modified = meta
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        let created = meta
-            .created()?
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        stamp.push_str(&format!(
-            "{}\t{}\t{modified}\t{created}\n",
-            file.name,
-            meta.len()
-        ));
-    }
-    Ok(stamp)
+        Ok(stamp)
+    })
 }
 
 fn publish_generation(
@@ -263,49 +282,68 @@ fn publish_generation(
     files: &[BundleFile],
     manifest: &str,
 ) -> io::Result<PinnedGeneration> {
-    let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
-    let stage = tempfile::Builder::new()
-        .prefix(&format!(
-            "{}-",
-            &fingerprint[..bundle_location::FINGERPRINT_LENGTH]
-        ))
-        .tempdir_in(container)?;
-    check_publish_path_length(stage.path(), files)?;
-    let pin = PinnedGeneration::new(stage.path().to_path_buf())?;
-    for file in files {
-        relative_name(Path::new(file.name))?;
-        let path = stage.path().join(file.name);
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut output = std::fs::File::create(&path)?;
-        output.write_all(file.bytes)?;
-        output.sync_all()?;
-        drop(output);
-        if crate::sha256_file_hex(&path)? != file.hash {
-            return Err(io::Error::other(format!(
-                "bundle hash mismatch: {}",
-                file.name
-            )));
+    crate::trace(Stage::EffeTuneExtract, "publish new generation", || {
+        let fingerprint = crate::hex_lower(&Sha256::digest(manifest.as_bytes()));
+        let stage = tempfile::Builder::new()
+            .prefix(&format!(
+                "{}-",
+                &fingerprint[..bundle_location::FINGERPRINT_LENGTH]
+            ))
+            .tempdir_in(container)?;
+        check_publish_path_length(stage.path(), files)?;
+        let pin = PinnedGeneration::new(stage.path().to_path_buf())?;
+        for file in files {
+            relative_name(Path::new(file.name))?;
+            let path = stage.path().join(file.name);
+            crate::trace(
+                Stage::AssetWrite,
+                &format!("asset={} bytes={}", file.name, file.bytes.len()),
+                || {
+                    std::fs::create_dir_all(path.parent().unwrap())?;
+                    let mut output = std::fs::File::create(&path)?;
+                    output.write_all(file.bytes)?;
+                    output.sync_all()?;
+                    Ok::<_, io::Error>(())
+                },
+            )?;
+            let actual_hash = crate::trace(Stage::EffeTuneHash, file.name, || {
+                crate::sha256_file_hex(&path)
+            })?;
+            if actual_hash != file.hash {
+                return Err(io::Error::other(format!(
+                    "bundle hash mismatch: {}",
+                    file.name
+                )));
+            }
         }
-    }
-    let stamp = snapshot(stage.path(), files, manifest)?;
-    let mut output = std::fs::File::create(stage.path().join(".manifest"))?;
-    output.write_all(stamp.as_bytes())?;
-    output.sync_all()?;
-    drop(output);
-    // Only the private, unpublished stage is cleaned up on error. There is no
-    // fallible operation after pointer commit; published generations are kept.
-    let root = stage.path().to_path_buf();
-    let mut pointer = tempfile::NamedTempFile::new_in(container)?;
-    pointer.write_all(
-        bundle_location::encode_pointer(root.file_name().unwrap().to_str().unwrap())?.as_bytes(),
-    )?;
-    pointer.as_file().sync_all()?;
-    pointer
-        .persist(container.join(bundle_location::POINTER_FILE))
-        .map_err(|e| e.error)?;
-    // Cleanup is outside startup: absence of a lock cannot prove assets are unused.
-    let _ = stage.keep();
-    Ok(pin)
+        let stamp = snapshot(stage.path(), files, manifest)?;
+        crate::trace(Stage::AssetWrite, "EffeTune manifest", || {
+            let mut output = std::fs::File::create(stage.path().join(".manifest"))?;
+            output.write_all(stamp.as_bytes())?;
+            output.sync_all()?;
+            Ok::<_, io::Error>(())
+        })?;
+        // Only the private, unpublished stage is cleaned up on error. There is no
+        // fallible operation after pointer commit; published generations are kept.
+        let root = stage.path().to_path_buf();
+        let pointer = crate::trace(Stage::AssetWrite, "EffeTune current pointer", || {
+            let mut pointer = tempfile::NamedTempFile::new_in(container)?;
+            pointer.write_all(
+                bundle_location::encode_pointer(root.file_name().unwrap().to_str().unwrap())?
+                    .as_bytes(),
+            )?;
+            pointer.as_file().sync_all()?;
+            Ok::<_, io::Error>(pointer)
+        })?;
+        crate::trace(Stage::AssetRename, "EffeTune pointer publish", || {
+            pointer
+                .persist(container.join(bundle_location::POINTER_FILE))
+                .map_err(|e| e.error)
+        })?;
+        // Cleanup is outside startup: absence of a lock cannot prove assets are unused.
+        let _ = stage.keep();
+        Ok(pin)
+    })
 }
 
 fn check_publish_path_length(root: &Path, files: &[BundleFile]) -> io::Result<()> {

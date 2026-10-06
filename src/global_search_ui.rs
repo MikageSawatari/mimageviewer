@@ -2250,6 +2250,21 @@ impl App {
 
     /// 現在のクエリで検索を spawn する。
     pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
+        // Indexerのreadinessとは独立した、保存設定だけのフィルター健全化。
+        // 準備中も削除済み/対象外のfavoriteを解除し、表示と検索scopeを一致させる。
+        let ownership = crate::metadata_ownership::metadata_ownership(
+            &self.settings.favorites,
+            &[self.settings.books_root_path()],
+        );
+        let favs = resolve_favorite_filter(
+            &mut self.global_search.filters.favorite,
+            &self.settings.favorites,
+            &ownership,
+        );
+        if !self.indexer_init.is_terminal() {
+            self.global_search.reject_message = Some("検索の準備中".to_string());
+            return;
+        }
         self.global_search.reset_for_new_query();
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
@@ -2263,21 +2278,7 @@ impl App {
             );
         }
 
-        // Codex P2 #3: indexer_manager の有無とは独立に filter の健全化を先に行う。
-        // 選択中の favorite が削除された / auto_index_metadata を外された場合、UI ラベルと
-        // 検索スコープが食い違う (ラベル = 名前表示、スコープ = 全対象) のを避けるため
-        // フィルタ側を None に倒して UI も「すべて」に戻す。
-        let ownership = crate::metadata_ownership::metadata_ownership(
-            &self.settings.favorites,
-            &[self.settings.books_root_path()],
-        );
-        let favs = resolve_favorite_filter(
-            &mut self.global_search.filters.favorite,
-            &self.settings.favorites,
-            &ownership,
-        );
-
-        let Some(mgr) = self.indexer_manager.as_ref() else {
+        let Some(mgr) = self.indexer_init.as_ref() else {
             self.global_search.reject_message =
                 Some("全文検索インデクサが利用できません".to_string());
             self.global_search.done = true;

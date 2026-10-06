@@ -29,6 +29,7 @@ name = "mimageviewer"
 path = "src/main.rs"
 
 [dependencies]
+miv-startup = { path = "../startup-diagnostics" }
 sha2 = "0.10"
 fs4 = "0.13"
 tempfile = "3"
