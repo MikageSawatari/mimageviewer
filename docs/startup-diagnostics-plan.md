@@ -114,7 +114,8 @@ env だけの案は core entry 前の停止に記録が残らないため不採�
   launcher exit に writer drain の待機を追加しない。末尾の未出力はあり得るが、core に渡った pre-spawn snapshot で補う。
   core も終了時に writer の無期限 join / flush をしない。diagnostics の shutdown は best effort。
 - writer / watchdog の spawn error、disk-full / permission error は diagnostic-unavailable をメモリへ公開して終わる。
-  通常 logger へ再入して報告しない。起動後に通常 UI が通知可能なら一度だけ「起動診断を保存できませんでした」と表示する。
+  通常 logger へ再入して報告しない。起動後に通常 UI が通知可能なら一度だけ「起動記録を保存できませんでした」と表示する。
+  一度限りの通知はoverlay中・トレイ非表示中・OS最小化中には消費せず、通常UIが表示可能になった時点でtoastの期限を開始する。
   自動 retry、別 disk への多段 fallback、設定ファイルの削除は作らない。
 
 通常版の保存先候補は `%LOCALAPPDATA%\mimageviewer\startup-logs\<run>-<role>-<pid>.jsonl`。
@@ -140,6 +141,10 @@ drive type、known-folder の通常位置との差、reparse / resolved location
 header / 補足には `network = yes/no/unknown`、`unc = yes/no`、
 `redirected = yes/no/unknown` と根拠（env 指定先、Shell 通常位置との差、reparse target 等）を残す。
 APPDATA の文字列差だけで folder redirection が無いと断定せず、未照会・照会停止は unknown。
+祖先のreparse pointもenvironment workerで確認する。local driveでも祖先にlink/reparseがある、
+または祖先情報が読めない場合、到達先のlocal確認をしていないためnetworkはunknown。
+`C:\link\data`の`C:\link`がUNCを指す場合もnoとしない。literal UNC/remote driveはyesを維持する。
+診断のためのlink target解決・再試行は加えず、ログにtarget未照会を明示する。
 data_dir の canonicalize / ネットワーク接続の確認を診断目的で起動 thread に追加しない。
 GPU 情報は既存 adapter 情報から backend / name / vendor / device / driver 情報を記録し、
 診断のために別 GPU device を作らない。driver 欄が API から得られない場合は unknown。
@@ -228,6 +233,10 @@ Reservedはresumeで開始せず、実dispatch/paintのbeginだけがActiveに�
 pause時はnow − effective_start、resume時はnow − saved_elapsedを使う。
 watchdogは元identityごとの3bit通知maskを自分だけで所有する。childへの出入り/親復帰で
 親時計や通知済みmaskをresetせず、parent beginを再発行しない。snapshot再読ループは作らない。
+子identityの通知maskは各slot最大128件。129件目を観測した時点で
+`watch.children.capacity_exceeded`（capacity=128 per slot、watch=parent-only）を一度記録し、
+そのrunの以後は全slotで親spanのみ監視する。128件目までは監視し、既知childへの復帰も
+超過後は再監視しない。table再利用・回復・再試行は加えない。親の5/15/30秒と終端条件は維持する。
 
 初回dispatch前のslotはReservedで予約し、present完了→次updateのdispatch間で
 全slotが一瞬退役してwatchdogが先に終了することを防ぐ。不要/取消/Remote取得はこの予約も退役する。
@@ -795,3 +804,16 @@ Susie統合試験には不足していた実体fixtureを補い、skipではな�
 検証用アプリは起動していない。証拠と環境条件は`target/planA-msg-A.txt`、最終全体gateは
 `target/planA-full-final-{stdout,stderr}.txt`、buildは`target/planA-build-dev-final-{stdout,stderr}.txt`。
 Phase Bの初期フォルダoff-UI化・resolver fallback撤去・Deferred wakeは未実装で、§1.335統合後に続ける。
+
+### 10.2 Phase A再レビュー対応（2026-10-06、bb32bc6e0後）
+
+`target/rplanAimpl-review.txt`のP2×3・P3×1に対応した。通知はdiagnostics ownerに保持し、
+overlay解除後かつroot可視・OS非最小化の時だけ消費する。遅いIndexerの同じreceiverを維持したまま、
+overlay→5秒解除→tray非表示→最小化→復帰→新しいtoast期限→一回表示をhandler-level testで確認する。
+child watchの128件目・129件目、超過ログ一回、既知child/別slotの監視停止、親期限と終端維持を
+fake clockで検証する。保存先はancestor probeを注入して`C:\link\data`のUNC向けjunctionと
+照会失敗を検証し、実ネットワーク・実link・通常profileは使わない。
+`docs/spec.md`も旧移行廃止・直接upgrade時の非取込・既存catalog/XMP保持へ更新した。
+独立Sol/xhighの再レビューはready、追加指摘なし。新しいdetached predicate/viewport経路は変更していない。
+Phase Bの保留とmerge順は§10のまま。最終command・件数・exit code・build証拠は
+`target/planA-msg-A2.txt`へ記録する。

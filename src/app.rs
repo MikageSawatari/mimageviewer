@@ -27234,6 +27234,19 @@ impl App {
         }
     }
 
+    fn poll_startup_diagnostics_notice(
+        &mut self,
+        minimized: bool,
+        take_notice: impl FnOnce() -> bool,
+    ) {
+        // Keep the one-shot notice in its diagnostics owner until a visible normal
+        // UI can draw it. Starting a toast clock under the overlay loses the notice.
+        if !self.indexer_init.overlay_active() && self.window_visible && !minimized && take_notice()
+        {
+            self.show_feedback_toast("起動記録を保存できませんでした".to_string());
+        }
+    }
+
     fn poll_startup_owner(&mut self, ctx: &egui::Context) {
         self.kick_off_startup_init();
         self.poll_startup_init();
@@ -87603,9 +87616,10 @@ impl eframe::App for App {
         if first_update {
             miv_startup::milestone("core.first_update");
         }
-        if miv_startup::take_unavailable_notice() {
-            self.show_feedback_toast("起動記録を保存できませんでした".to_string());
-        }
+        self.poll_startup_diagnostics_notice(
+            ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+            miv_startup::take_unavailable_notice,
+        );
         self.startup_window_geometry
             .begin_frame(ctx.cumulative_frame_nr());
         self.apply_deferred_initial_size(ctx);
@@ -89773,6 +89787,58 @@ pub(crate) use tests::phase_c_support::{
 #[cfg(test)]
 mod index_full_check_tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_save_failure_waits_for_normal_ui_with_slow_indexer() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let (_tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now(),
+            full_check_requested: false,
+            disposal_witness: None,
+        });
+        app.window_visible = true;
+        // Inject the diagnostics owner's one-shot save-failure source, without
+        // poisoning process-global diagnostics or writing the real profile.
+        let pending_notice = std::cell::Cell::new(true);
+        let take_notice = || pending_notice.replace(false);
+        for elapsed in [0, 2, 4] {
+            app.indexer_init.pending_mut().unwrap().started_at =
+                Instant::now() - Duration::from_secs(elapsed);
+            app.poll_startup_init();
+            app.poll_startup_diagnostics_notice(false, take_notice);
+            assert!(pending_notice.get(), "overlay must not consume the notice");
+            assert!(app.fs_feedback_toast.is_none());
+        }
+        app.indexer_init.pending_mut().unwrap().started_at =
+            Instant::now() - Duration::from_secs(6);
+        app.window_visible = false;
+        app.poll_startup_diagnostics_notice(false, take_notice);
+        assert!(pending_notice.get(), "tray-hidden UI cannot show a toast");
+        app.window_visible = true;
+        app.poll_startup_diagnostics_notice(true, take_notice);
+        assert!(pending_notice.get(), "minimized UI cannot show a toast");
+        assert!(app.fs_feedback_toast.is_none());
+        app.poll_startup_init();
+        assert!(
+            app.indexer_init.pending().is_some(),
+            "the same worker continues"
+        );
+        let before_show = Instant::now();
+        app.poll_startup_diagnostics_notice(false, take_notice);
+        assert!(!pending_notice.get());
+        let toast = app.fs_feedback_toast.as_ref().unwrap();
+        assert_eq!(toast.0, "起動記録を保存できませんでした");
+        assert!(
+            toast.1 >= before_show,
+            "toast lifetime starts on normal UI admission"
+        );
+        let shown_at = toast.1;
+        app.poll_startup_diagnostics_notice(false, take_notice);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+    }
 
     #[test]
     fn hidden_requested_grid_pass_never_resumes_startup_presentation_watch() {

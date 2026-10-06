@@ -282,11 +282,13 @@ struct ChildMask {
 struct Poller {
     parent_masks: [u8; 5],
     children: [[ChildMask; 128]; 5],
+    parent_only: bool,
 }
 impl Poller {
     fn new() -> Self {
         Self {
             parent_masks: [0; 5],
+            parent_only: false,
             children: std::array::from_fn(|_| {
                 std::array::from_fn(|_| ChildMask {
                     identity: 0,
@@ -313,6 +315,9 @@ impl Poller {
                 &mut self.parent_masks[slot as usize],
                 true,
             );
+            if self.parent_only {
+                continue;
+            }
             let child = s.child.load(Ordering::Acquire);
             if let Some((stage, start)) = unpack(child) {
                 let table = &mut self.children[slot as usize];
@@ -331,6 +336,15 @@ impl Poller {
                         now,
                         &mut table[index].mask,
                         false,
+                    );
+                } else {
+                    // Diagnostic fidelity has a fixed budget. Do not recycle identities
+                    // (which would re-notify returning parents) or add recovery machinery.
+                    self.parent_only = true;
+                    o.publish(
+                        Event::new(4, lane(slot), stage, slot as u64, now)
+                            .named("watch.children.capacity_exceeded")
+                            .text("capacity=128 per slot;watch=parent-only for remainder of run"),
                     );
                 }
             }
@@ -369,6 +383,73 @@ fn emit_due(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_capacity_boundary_reports_once_then_watches_only_parents() {
+        let o = crate::tests::test_owner(Role::Core);
+        initialize(&o, 0);
+        let s = &o.watches[WatchSlot::CoreStartup as usize];
+        let mut p = Poller::new();
+        // Fill all 128 identities, including the exact last supported entry.
+        for index in 0..128 {
+            s.child
+                .store(crate::pack(Stage::SettingsOpen, index), Ordering::Release);
+            assert!(p.poll(&o, index));
+        }
+        assert!(!p.parent_only);
+        let last = crate::pack(Stage::SettingsOpen, 127);
+        p.poll(&o, 5_000_127);
+        assert!(
+            o.journal
+                .lock()
+                .unwrap()
+                .history
+                .iter()
+                .any(|e| { e.message() == "stage.overdue" && e.id == last })
+        );
+        s.child
+            .store(crate::pack(Stage::SettingsOpen, 128), Ordering::Release);
+        p.poll(&o, 5_000_128);
+        assert!(p.parent_only);
+        // Even already-known children and a different slot stop child monitoring.
+        s.child.store(last, Ordering::Release);
+        let other = &o.watches[WatchSlot::IndexerInit as usize];
+        other.begin(0);
+        other
+            .child
+            .store(crate::pack(Stage::IndexerInit, 0), Ordering::Release);
+        for now in [15_000_128, 30_000_128, 40_000_128] {
+            assert!(p.poll(&o, now));
+        }
+        let j = o.journal.lock().unwrap();
+        let capacity = j
+            .history
+            .iter()
+            .filter(|e| e.name() == "watch.children.capacity_exceeded")
+            .collect::<Vec<_>>();
+        assert_eq!(capacity.len(), 1);
+        assert!(capacity[0].message().contains("watch=parent-only"));
+        assert_eq!(
+            j.history
+                .iter()
+                .filter(|e| e.message() == "stage.overdue")
+                .count(),
+            1
+        );
+        for slot in [WatchSlot::CoreStartup, WatchSlot::IndexerInit] {
+            let warnings = j
+                .history
+                .iter()
+                .filter(|e| e.message() == "parent.overdue" && e.parent == slot as u64)
+                .map(|e| e.correlation)
+                .collect::<Vec<_>>();
+            assert_eq!(warnings, [5_000_000, 15_000_000, 30_000_000]);
+        }
+        drop(j);
+        for slot in WatchSlot::ALL {
+            o.watches[slot as usize].retire();
+        }
+        assert!(!p.poll(&o, 50_000_000));
+    }
     #[test]
     fn suspended_clock_retains_effective_elapsed_and_retirement_is_terminal() {
         let s = WatchState::new();

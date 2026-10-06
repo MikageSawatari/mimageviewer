@@ -253,8 +253,11 @@ pub(crate) fn environment(path: PathBuf, selection: String, runtime: Option<Path
         let query=event_span(Lane::Metadata,Stage::EnvironmentQuery,0);
         record_path("data_dir",&path);record_detail("data_dir.selection",&selection);
         if let Some(runtime)=runtime {record_path("runtime.path",&runtime);}
-        let unc=is_unc(&path.to_string_lossy());let network=if unc {"yes"} else {drive_network(&path)};
-        record_detail("data_dir.environment",&format!("unc={unc};network={network};redirected={};evidence=drive-type/reparse;unqueried-shell-location=unknown",reparse_status(&path)));
+        let unc=is_unc(&path.to_string_lossy());
+        let reparse=ancestor_reparse(&path, path_is_reparse);
+        let network=network_with_reparse(unc,drive_network(&path),reparse.as_ref().ok().copied());
+        let redirected=if matches!(reparse,Ok(true)) {"yes"} else {"unknown"};
+        record_detail("data_dir.environment",&format!("unc={unc};network={network};redirected={redirected};evidence=drive-type/ancestor-reparse;reparse-target=unqueried;unqueried-shell-location=unknown"));
         query.finish(Outcome::Ok);
     }).is_err() {if let Some(o)=owner() {o.fail();}}
 }
@@ -312,32 +315,77 @@ fn network_for_drive_type(drive_type: u32) -> &'static str {
 fn drive_network(_path: &Path) -> &'static str {
     "unknown"
 }
-fn reparse_status(path: &Path) -> &'static str {
+fn network_with_reparse(unc: bool, drive: &'static str, reparse: Option<bool>) -> &'static str {
+    if unc || drive == "yes" {
+        "yes"
+    } else if drive == "no" && reparse == Some(false) {
+        "no"
+    } else {
+        // A local drive letter does not prove a link's destination is local.
+        // We deliberately do not resolve targets; failed ancestry probes are unknown too.
+        "unknown"
+    }
+}
+fn ancestor_reparse(
+    path: &Path,
+    mut probe: impl FnMut(&Path) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    for ancestor in path.ancestors() {
+        if probe(ancestor)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn path_is_reparse(path: &Path) -> std::io::Result<bool> {
+    let metadata = std::fs::symlink_metadata(path)?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        for ancestor in path.ancestors() {
-            match std::fs::symlink_metadata(ancestor) {
-                Ok(m) if m.file_attributes() & 0x400 != 0 => return "yes",
-                Ok(_) => {}
-                Err(_) => return "unknown",
-            }
-        }
+        Ok(metadata.file_attributes() & 0x400 != 0)
     }
     #[cfg(not(windows))]
     {
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return "yes";
-        }
+        Ok(metadata.file_type().is_symlink())
     }
-    // Absence of a reparse point does not prove Shell folder redirection absent.
-    "unknown"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn local_drive_requires_confirmed_non_reparse_ancestry() {
+        assert_eq!(network_with_reparse(false, "no", Some(false)), "no");
+        assert_eq!(network_with_reparse(false, "no", Some(true)), "unknown");
+        assert_eq!(network_with_reparse(false, "no", None), "unknown");
+        assert_eq!(
+            network_with_reparse(false, "unknown", Some(false)),
+            "unknown"
+        );
+        assert_eq!(network_with_reparse(false, "yes", Some(true)), "yes");
+        assert_eq!(network_with_reparse(true, "unknown", None), "yes");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn local_link_data_with_unc_target_is_unknown_without_target_confirmation() {
+        let path = Path::new(r"C:\link\data");
+        let mut visited = Vec::new();
+        // Synthetic junction C:\link -> \\server\share. No privilege, real link
+        // creation, or network access is needed; targets are intentionally unqueried.
+        let reparse = ancestor_reparse(path, |ancestor| {
+            visited.push(ancestor.to_path_buf());
+            Ok(ancestor == Path::new(r"C:\link"))
+        })
+        .unwrap();
+        assert_eq!(visited, [path.to_path_buf(), PathBuf::from(r"C:\link")]);
+        assert_eq!(
+            network_with_reparse(false, network_for_drive_type(3), Some(reparse)),
+            "unknown"
+        );
+        let failed = ancestor_reparse(path, |_| Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert_eq!(network_with_reparse(false, "no", failed.ok()), "unknown");
+    }
     #[test]
     fn unc_forms_and_explicit_sink_do_not_probe_filesystem() {
         assert!(is_unc("\\\\server\\share"));
