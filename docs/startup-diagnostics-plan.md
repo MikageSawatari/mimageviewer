@@ -1,6 +1,9 @@
 # 起動診断と起動オーバーレイの有界化 — plan A
 
-2026-10-06 / Phase 1 **設計のみ・未実装・独立設計レビュー前**。
+2026-10-06 / Phase 1 **設計のみ・未実装**。`c9b2d0aa8` への独立レビュー
+`target/rplanA-review.txt`（revise: P1×2 / P2×3）を反映した改訂案。
+P1-1 は **2026-10-06 利用者決定: 旧Tantivyタグ一括移行を撤去**（§5.3）。
+他のレビュー修正は維持する。本改訂を全体の独立レビュー承認済み・実装許可済みとは扱わない。
 利用者指定: 次回 Microsoft Store 再申請に向けた plan A。
 作業枝 `next-startup-diagnostics`、基準は master **`8a314a25f6df4c612b381f67a47cf39a8f8db74c`**。
 本文の `file:line` は、この固定 master の行番号である。調査メモの v4.3.0 行番号を転記したものではない。
@@ -22,6 +25,7 @@ Indexer 無期限待ちが仮説である。本設計は原因を断定せず、
 3. オーバーレイ解除は検索準備の取消・失敗・完了を意味しない。同じ worker、同じ receiver、同じ writer を保ち、結果を一度だけ採用する。
 4. 初期フォルダの解決・stat・走査は通常 UI の root present 後に worker で行う。起動場所・カーソル・明示ファイル open の意味を変えない。
 5. 検索準備中の普通の閲覧・設定変更を許す。未準備サービスへの操作を「使えません」へ誤分類せず、遅い結果で新しい設定・navigation を上書きしない。
+   旧タグ移行は利用者決定で撤去し、タグ操作に起動専用の制限・queue・移行準備状態を追加しない（§5.3）。
 
 **保証の限界:** 「never stuck on startup overlay」は、本変更が扱う Indexer 待ちと初期フォルダ境界についての保証。
 UI thread 自体が native call / 既存同期 I/O / 共通 logger 内で停止した場合、期限判定の実行も描画もできない。
@@ -86,6 +90,8 @@ env だけの案は core entry 前の停止に記録が残らないため不採�
 - lane は固定の少数（launcher main、core main/render、Indexer init、initial navigation、metadata bootstrap）。
   実行 owner が begin/end を発行し、その lane の現在 stage と stage 開始単調時刻を atomic に公開する。
   子 span へ入る前後は owner-local な固定深さ stack で親を復帰し、親 total と子 duration を二重加算しない。
+- この current-child と local stack だけでは親 await を監視できない。§3.5 の固定 parent-watch slot を
+  別に公開する。子 stage の開始・終了・親への復帰は、その slot の時計や通知済み threshold を変更しない。
 - current stage の ID と開始時刻は一つの `AtomicU64` に pack し、watchdog/UI が異なる世代の ID と時刻を組み合わせない。
   例: 16bit ID + run-relative 48bit microseconds。長い寿命を前提にせず startup 用とし、同じ stage 再入にも開始時刻で identity を付ける。
   diagnostics snapshot のための spin loop、seqlock 再読ループ、`try_lock` + sleep を作らない。
@@ -137,6 +143,9 @@ HWND の geometry 推測や全 detached window 列挙を常時 timeline に持�
 
 ### 3.4 必須 stage の配置（begin/end 両方）
 
+表の参照位置は固定masterの現行経路。§5.3で撤去する旧タグ移行には新しいtimeline stageを実装しない。
+現役のApp tags.db open、通常タグwriterと他のIndexer段階は維持する。
+
 | stage 群 | master の境界 | publisher（単一 owner） |
 | --- | --- | --- |
 | launcher entry、引数、既存 instance / IPC、runtime path | `crates/launcher/src/main.rs:112`, `:119`, `:133`, `:137`, `:492` | launcher main |
@@ -179,7 +188,6 @@ Indexer 内部も「整理中」の一段へ丸めない。
 | Indexer 子 stage | master の入口 | owner |
 | --- | --- | --- |
 | fts_meta presence / open / schema | `src/indexer_manager.rs:212`, `:214` | startup-init worker |
-| legacy tags DB / collection / import | `src/indexer_manager.rs:129`, `:135`, `:155`, `:164` | 同じ worker。利用者 tags を timeout で消さない |
 | rebuild marker read / old index wipe | `src/indexer_manager.rs:226`, `:244` | 同じ worker |
 | Tantivy open / schema recreation / reader | `src/indexer_manager.rs:260` → `src/fts_index.rs:350` | 同じ worker。meta lock と writer lock を混同しない |
 | inventory reset / marker complete | `src/indexer_manager.rs:274`, `:287` | 同じ worker |
@@ -191,19 +199,50 @@ timeline の観測を入れるために DB の recovery / 索引再構築仕様�
 背景 AI / WASAPI / Susie / VST / EffeTune / tray の開始と結果は補足として区別し、
 それらが通常 UI の待ち条件であるような単一「起動中 stage」を上書きしない。
 
-### 3.5 UI heartbeat と独立した watchdog
+### 3.5 UI heartbeat と独立した watchdog（P2-5）
 
-launcher entry / core entry に専用 watchdog を開始。250 ms 程度の timed wait で atomic lane snapshot を読み、
-**同じ stage 開始時刻から 5 / 15 / 30 秒**を超えた各 threshold を一度だけ記録する。
-UI heartbeat の増減で期限を reset しない。writer の disk write や普通の logger も呼ばず非待機 enqueue のみ。
-親の await-indexer span も lane に保持するため、短い子段階を繰り返しても総待ち時間を見失わない。
-並行する lane はそれぞれ記録し、例えば `normal_ui.ready` 後でも Indexer init の滞留は記録する。
-5秒の warning と §5 の overlay limit は別の意味で、watchdog が App 状態を変更してはならない。
+launcher entry / core entry に専用 watchdog を開始。250 ms 程度の timed wait で公開メモリを読み、
+**監視対象の同じ span の 5 / 15 / 30 秒**を各一回だけ非待機 enqueue する。
+UI heartbeat、spinner、短い child の完了で期限を reset しない。writer の I/O や普通の logger を呼ばない。
+5秒の warning と §5 の overlay limit は別の意味で、watchdog は App の機能状態を変更しない。
 
-root が描けない driver 停止でも、最後の `adapter.enumerate.begin` / `device.request.begin` /
-`d3d11.create.begin` / `present.begin` と overdue が残れば停止境界を特定できる。
-UI heartbeat は添付情報であり、spinner 継続も証拠にできる。30 秒以降に同じ warning を連打しない。
-startup target と Indexer init が terminal になるか process 終了まで監視。通常閲覧の毎フレーム記録には拡大しない。
+**公開方法と単一 owner:** current-child lane に加え、起動時に固定 parent-watch slot を確保する。
+launcher handoff、core first-update、normal-root-present、Indexer init、初期 target の実作業
+（明示要求と一回の default fallback は別 slot）、metadata watch-bootstrap の有限集合とする。
+各 slot は run/slot ID と元の begin 時刻を持ち、実行 owner だけが watch clock を一つの AtomicU64 に publish する。
+clock は Active（有効開始時刻）/ Suspended（それまでの有効経過）/ Retired の tagged 値。
+pause 時は now − effective_start、resume 時は now − saved_elapsed を新しい effective_start とする。
+意図的待機の時間を除きつつ、親の identity と通知済み threshold を維持できる。観測用時計であり業務状態は増やさない。
+slot は run 内で再利用しない。watchdog は元の親 identity ごとの 3bit 通知 mask を自分だけで所有する。
+予定済みだが未 dispatch の slot は Suspended(0) として予約し、NotApplicable/取消/不要になった
+fallback は owner が Retired にする。present完了→次のupdateでdispatchの間に全slotが一瞬Retiredとなり、
+watchdogが先に終了することを防ぐ。予約は警告対象ではなく、業務requestの新状態を追加するものではない。
+child の ID/時刻を読む必要がある場合も一回の snapshot とし、再読ループで起動 owner を待たない。
+local stack はログの親子 duration 用にだけ残す。parent の Active clock は子へ入っても上書きしない。
+stage を親へ復帰する際にも parent begin を再発行せず、5/15/30秒を再通知しない。
+
+| parent / 発行 owner | 開始・終了と意図的待機 |
+| --- | --- |
+| launcher handoff / launcher main | entry → lease handoff 成功または起動失敗/終了。展開の child が切り替わっても総待ちを監視。core の画面を監督する役割は持たない |
+| first-update / core main → root update への所有権受渡し | core entry → 最初の root update が戻る、fatal または終了。run_native の begin/end は timeline に残すが、run_native 自体を生涯監視しない |
+| normal-root-present / Deferred owner | overlay 解除後の描画要求 → NormalShell の present-return、取消または終了。利用者の hide / OS minimize 中は Suspended。eframe が白フラッシュ対策で最初だけ非表示にする bootstrap は利用者 hide と区別し、初回描画の総待ちを監視する |
+| await-Indexer-init / App-global 初期化 owner | worker dispatch → 単一採用点の Ready / Unavailable（spawn失敗・disconnectを含む）または終了。通常 UI ready では退役しない。トレイ hide でも実初期化は継続するため監視を続ける |
+| initial-target-work / 同じ navigation request owner | resolver/scan dispatch → 採用/失敗/取消。Deferred の modal・Remote admission 待ちはこの実作業 span を開始しない。hold した結果の採用待ちは Suspended。普通の navigation に slot を転用しない |
+| metadata watch-bootstrap / 既存 metadata worker | bootstrap 開始 → 実 bootstrap 完了/Unavailable/shutdown。ActivityGate で意図的に待つ区間だけ Suspended。日常の全フォルダ reconciliation や常駐 supervisor の寿命は監視対象にしない |
+
+hide/restore と modal admission の事実は、その既存 owner が診断 slot に公開する。watchdog が
+heartbeat の停止や HWND geometry から推測して gate を変えない。normal-root-present は実際の restore/
+unminimize イベントで resume し、modal 待ちは理由を timeline に残す。Indexer の native I/O が
+止まっている時は、画面を隠してもその clock を止めない。Active な child の native 呼出しも独立して監視する。
+root が描けない driver 停止では adapter/device/D3D11/present の最後の begin と overdue が境界を指す。
+GPU 停止の解除は保証しない。各ログには wall elapsed、有効 elapsed、現在 child、heartbeat を添える。
+childの監視も固定stage表の実startup呼出しだけを対象とし、run_native/通常フレーム/
+admissionを表す親へlaneが戻っても、それを新しいstuck stageとして監視しない。
+
+normal UI ready 後は画面到達の監視を終え、少なくとも Indexer の監視をその終端まで継続する。
+dispatch 済み初期 target と metadata bootstrap の有限実作業が残っていればそれぞれの span だけを継続し、
+ユーザー操作待ちを起動停止扱いしない。全対象の退役か process shutdown で watchdog を終了する。
+終了時も UI は watchdog/writer の無期限 join をしない。30秒以降の連打、親復帰時の再通知はしない。
 
 ### 3.6 first PRESENT と通常 UI ready の正本
 
@@ -214,7 +253,8 @@ startup target と Indexer init が terminal になるか process 終了まで�
 surface absent / timeout / lost / zero-size / paint skip / submit のみでは first-present を確定しない。
 
 vendored `WgpuConfiguration` に任意の軽量 diagnostics callback を渡し、初期化 span と
-root paint outcome を固定 event として core の timeline へ発行する。callback は publisher だけを呼ぶ。
+root paint outcome を固定 event として core の timeline へ発行する。callback は軽量 publish と、
+§6.1 の生きた Deferred 要求に登録された root wake だけを呼ぶ。I/O・App の採用・resolver 実行はしない。
 App は root の該当 frame の draw が Overlay / NormalShell のどちらかを小さい frame tag に公開する。
 eframe が root update の full output を paint へ渡す時にその tag を捕捉し、同じ paint attempt に対応させる。
 egui の複数 pass / discard の場合は採用された最終 pass の tag を使い、前 pass の Normal tag を流用しない。
@@ -223,6 +263,8 @@ root と frame identity を一緒に渡し、deferred / immediate detached paint
 最初に Overlay を present すれば `first_present.returned` のみ。
 NormalShell tag の root present が戻った時に `normal_ui.ready` を一度 publish する。
 App は次の root update でその atomic milestone を読む。**この後にだけ初期 target request を dispatch**する。
+その「次の update」を偶然の入力や Indexer poll に任せない。Deferred owner の一回の present-completion
+wake と、normal paint 未成功中の所有タイマー（§6.1）が進行を保証する。
 通常 UI ready は「shell が描けた」であって、検索利用可 / 初期一覧の読込完了ではない。
 初期 target の一覧採用、対象ファイル/本の表示、通常 UI の first present は別の相関イベントを持つ。
 初回設定・更新通知など既存 modal が NormalShell 上にある場合は modal を隠さず、navigation admission を待つ。
@@ -236,7 +278,6 @@ stage → Japanese は固定対応表で、UI 側の renderer が時計を読み
 | 内部段階 | 表示例 |
 | --- | --- |
 | meta DB / schema | 検索用データを開いています |
-| legacy tags | 保存済みのタグを確認しています |
 | wipe / recreation | 検索用データを作り直しています |
 | Tantivy index / reader | 検索の準備をしています |
 | writer / runtime spawn | 検索の準備を仕上げています |
@@ -287,15 +328,19 @@ Ready manager への accessor で既存 consumer を移行。`full_check_request
 
 root の外側 `App::update` (`src/app.rs:87296`) で、`update_frame` より前に一度
 `start_if_not_started` / `poll_indexer_init` を実行する。overlay、動画、fullscreen の early return でも poll が消えない。
-worker result、spawn failure、channel disconnect は同じ `adopt_indexer_init_outcome` に入る。
+終端 worker result、spawn failure、channel disconnect は同じ `adopt_indexer_init_outcome` に入る。
 この関数だけが Pending → Ready / Unavailable を遷移させ、manager を install する。
-初期化中だけ 100–200ms の `request_repaint_after` と残り overlay deadline の短い方を毎 pass 要求する。
+初期化中だけ ROOT を明示した 100–200ms の request_repaint_after_for と残り overlay deadline の短い方を
+毎 pass 要求する。hidden/minimized も既存 scheduler の requested work として poll を進める
+（vendor/eframe/src/native/run.rs:558、idle hidden を常時起こす変更はしない）。
 通知のための第2 poll、writer 起動、timeout thread からの App 書換えは作らない。
 
 採用時の順序:
 
 1. Pending を `take` 相当で退役し、同じ outcome を二度採用できなくする。待ち時間と result を timeline に publish。
-2. Ready manager を enum に移し、**採用時点の最新** favorites / excluded roots / PDF passwords /
+2. Ready manager を露出/設定提出する前に、**採用時点の現在の tray/visibility** に
+   set_io_throttled(!window_visible)（src/indexer_manager.rs:664）で合わせる。
+   Ready manager を enum に移し、**採用時点の最新** favorites / excluded roots / PDF passwords /
    similar configuration を既存 `sync_with_configuration_and_passwords` などへ提出する。
    init の古い snapshot で UI 設定を巻き戻さない。speed は現在も次回起動反映
    (`src/ui_dialogs/preferences/pages.rs:7438` 前後) なので、この起動の初期 snapshot を維持する。
@@ -319,6 +364,105 @@ disconnect / panic でも同じ terminal tail が similar watch bootstrap を閉
 終了時は receiver を落とし、停止した初期化 thread を UI から join しない。
 未採用 Ready manager は worker 側で既存 shutdown 所有規約に従って処分し、UI や sibling context へ移さない。
 Ready 後の shutdown は既存 manager-wide bounded stop / writer finalizer の契約を維持する。
+
+**表示状態の owner（P2-4）:** hide_to_tray（src/tray_integration.rs:278、throttle :321）と
+sync_after_restore（:355、throttle :366）が正本。既存 update_frame の外部 ShowWindow 同期
+（src/app.rs:84615 付近）を、当該 root pass の採用前に同じ helper 経由で反映する。
+HWND capture/既存 tray-active gate を保ち、同じ可視状態の第2 bool や新しい OS polling owner を作らない。
+閉じる要求を tray が受理しても既存 viewport 登録を省略する early return は加えない。
+Pending 中の hide は manager が無いため現 :321 の throttle が空振りするが、上の採用点が補う。
+ActivityGate は init に渡した共有 gate で、pause_indexer_while_minimized による既存 pause と
+I/O semaphore の throttle は別。採用時に gate を resume/reset せず、最新の既存 gate 状態を使う。
+
+OS minimize は SW_HIDE/tray退避と同じではない。window_visible=true の単なる最小化を
+検索の新しい throttle/pause 条件にしない（名称だけから設定の意味を広げない）。
+起動途中の tray hide はこの一回の late adoption、常駐インスタンスへの activation は既存
+restore/activation routing であり、新しい startup worker/default folder/overlay を開始しない。
+hide 後も Pending poll の所有要求は継続し、hidden scheduler 経由で結果を採用してから throttled に保つ。
+restore は同じ manager を通常速度へ戻す。hidden quit は Pending receiver/request を退役し、
+未採用結果を復活させず init worker を UI join しない。Ready は既存 bounded shutdown に従う。
+
+### 5.3 旧Tantivyタグ一括移行 — 撤去決定（P1-1）
+
+**2026-10-06 利用者決定: 起動時の一度きりの旧タグ移行を撤去する。**
+本Phase 1は設計のみで、コード上の撤去は後続実装に含める。
+移行と編集を順序付ける案、overlay延長、タグ操作の制限案は採用しない。
+前改訂のタグ操作制限案、タグadmission/準備中notice/proof通知、専用の三状態、sidecar保留、
+Remote tagの移行理由Busy、移行失敗のための旧索引保持/Blocked処理は設計から削除する。
+同じ受信channelには終端StartupInitOutcomeだけを運び、新しいmigration eventを追加しない。
+
+**理由と受け入れる損失:** この移行が必要になるのは主に、v1.0〜v1.3でタグを利用し、
+v1.4.0以降を一度も起動せず、次のreleaseへ直接更新する利用者。
+v1.4.0（2026-06-13）から約4か月・約20releaseを経たため、このまれな直更新の救済より
+単純な仕様を優先する、という利用者判断である。人数/規模の計測結果に基づく推定ではない。
+直接更新時、旧Tantivy STORED tagsの値は新たにtags.dbへ取り込まれず、
+旧タグをmIVのタグ一覧・タグ検索で利用できるようになるという従来の救済を失う。
+元ファイル/動画sidecarのXMPに残っている旧タグはそのまま残し、移行目的の読み取り・削除・書き換えをしない。
+Tantivy索引自体は従来のrebuild/ingestで更新され得るが、タグ移行用に保存し続ける新機構は作らない。
+手動legacy XMP取込はv3.4.0、自動seedはv3.9.1で撤去済みであり、復活させない。
+「XMPにあるのでmIVが後で自動救済する」と説明しない。
+
+既に移行済みのtags.db、通常のタグ付与/削除/改名/Undo/Redo、mIV sidecarのバックアップ/復元、
+metadata import、タグ保存を伴うcopy/move/delete、smart folder、Remoteの独立タグserviceは維持する。
+Indexer Pending/Unavailableを理由にタグ操作を止めない。タグDB/writer自身の既存Unavailableは別に扱う。
+既存item_tags/tag_item_state、歴史的source='tantivy_migration'の行、既存tag_meta内の完了markerは
+掃除しない。markerを読むコード/定数を消すことと、永続データ/schemaの破壊は別である。
+他のsettings/タグ設定移行や一般XMP metadata/ratingの現役経路を削除対象へ広げない。
+
+#### 後続実装の削除範囲・単一owner
+
+chunk Cの実装担当が以下を一つの coherent removal として所有する。新しいtag writerは作らない。
+
+| masterの削除対象 | 範囲・保持する境界 |
+| --- | --- |
+| src/indexer_manager.rs:129 / :225 | run_legacy_tantivy_tag_importとその唯一の呼出しを削除。専用perf/log報告も削除。現FtsMetaDb open → rebuild marker → wipe/FtsIndex openの順序は保ち、tags移行/proofを別位置へ移す処理は作らない |
+| src/indexer_manager.rs:152 | progress文字列「旧タグをタグカタログへ移行しています…」を削除。§3.4/§4にもそのstage/日本語表示を新設しない |
+| src/tags_db.rs:683 / :38 / :70 | TagsDb::import_legacy_tantivy_tags、LegacyImportReport、LEGACY_TANTIVY_IMPORTED_METAを削除。通常タグDB/write API、既存データは維持 |
+| src/tags_db.rs:75 / :632 | source::TANTIVY_MIGRATION定数とTagsDb::metaは、削除後のcall-site監査で他用途が無ければ削除。現在の参照は移行本体と専用testsだけ。既存source文字列/marker行はそのまま保持 |
+| src/fts_index.rs:668 / :682 / :240 / :832 | collect_legacy_tag_docs_at、private collect_legacy_tag_docs_from_index、LegacyTagDoc、stored_text_fieldを、他用途が無ければ削除。下記監査では移行専用なので撤去対象。通常reader/search/stored metadata読取は維持 |
+| src/tags_db.rs:1452 / :1480、src/fts_index.rs:1004 | legacy_tantivy_import_copies_only_hash_tags_once、legacy_tantivy_import_skips_decided_items、collect_legacy_tag_docs_reads_stored_tags_onlyを削除。通常タグ/閉じたFTSタグ検索の回帰は削除しない |
+
+**reader参照監査（2026-10-06）:** git grepとrepository検索で確認した。
+collect_legacy_tag_docs_atの本番callerはindexer_manager.rs:155の移行だけ。
+他のcallerはfts_index.rs:1023の専用testのみ。private helper、LegacyTagDoc、stored_text_fieldもこのreaderに専用。
+移行と専用testを撤去すると他の利用は無いので、reader一式も撤去範囲に含める。
+実装時はmerge後の全tracked source（tests/benches/vendor含む）で再確認し、新callerがあれば共用部分は残す。
+sample_doc_with_tags（fts_index.rs:965）は別のFTSタグ閉鎖test（:1824）にも使うので維持する。
+Tantivyのtags field/共通schemaをこのために削除・version bump・再構築しない。
+
+#### 後続実装のdocsとrelease説明
+
+| 文書 / 実装担当の更新範囲 | 更新内容 |
+| --- | --- |
+| docs/tag-catalog-redesign-plan.md D14/§7.1 | D14を2026-10-06決定で撤去した仕様へ更新。§7.1は導入時の歴史として残し、実装完了時に撤去済みと明示。旧版直接更新の非取込と既存catalog/XMPの保持を記載 |
+| 同 D15/§2/§5.4/§8/§9/未解決事項 | 「STORED tagsは移行専用」「移行はwipeより前」「現役の移行挿入点/移行tests/性能計測」を現仕様から外す。tag_item_state/source/markerの歴史値を保持する説明、他の現役タグ設定migrationは維持。§7.2（v3.9.1）/§7.3（v3.4.0）の既廃止statusと撤去日/releaseの区別を保つ |
+| docs/search-architecture.md §4.8/§4.9/§6のタグ背景 | 起動時Tantivy→tags.db取込・marker依存を撤去済み仕様へ更新。旧XMPを「移行元として読む」現役経路のように書かない。一般XMP/通常タグwrite/sidecar復元/検索分離は維持 |
+| 本plan、async/ui-responsiveness等の現役参照 | 実装時の最終仕様へ更新。新しいadmission/notice/非終端migration eventを追加しないことを確認。歴史・archiveの記録は過去の記録と区別し、全面書き換えない |
+
+**CHANGELOG候補（次release用。CHANGELOG自体は今回編集しない）:**
+「v1.0〜v1.3の旧タグを検索索引からアプリ内タグへ自動移行する処理を終了しました。
+v1.4.0以降で取り込み済みのタグはそのまま残ります。v1.0〜v1.3から直接更新する場合、
+ファイルのXMPに残る旧タグはアプリ内タグへ取り込まれません。」
+release leadが次releaseの説明へ採否・配置を判断する。起動停止の原因確定やGPU問題解消とは表現しない。
+
+実装の回帰・参照消滅確認は§8のchunk Cに含める。今回この文書以外の上記docsは編集せず、
+製品コード/CHANGELOGにも変更を加えない。
+
+### 5.4 機能ごとの「準備中」契約
+
+Indexer Pending は全サービスの readiness ではない。Unavailable も全文/アイテム索引についての終端で、
+独立サービスの状態を上書きしない。各行の既存 request/read owner が入力・取消・再評価を所有する。
+
+| 機能 / master 経路・owner | Pending の契約 / Ready・Unavailable の扱い / 試験 |
+| --- | --- |
+| Ctrl+G アイテム検索 / src/global_search_ui.rs:2210, :2247, :2280 / global_search owner | query/filter入力を保持し「検索の準備中」。Pendingを「インデクサが利用できません」へ落とさず、manager取得より前に結果準備workerやlast_executedを更新しない。Ready採用が同じ debounce owner を一度wakeし、**まだ検索viewがactiveで現入力が非空の時だけ**最新query/filterを既存経路で実行。閉じる/別navigation/空入力なら実行しない。別のpending query queueは作らない。Unavailableは終端の説明に切替、入力を保持し自動再試行しない。Pending中のA→B、閉じる、空、失敗、Readyとdebounce同時でBだけ一回を試験 |
+| Ctrl+S コンテナ検索 / src/app.rs:27953, :28022 / favsearch + search_index_db（名前索引） | Indexerと独立に通常実行。名前索引自体の準備/失敗は既存契約を維持。Indexerを止めても名前検索結果が得られ、late Readyが結果/queryをresetしないことを試験 |
+| Ctrl+F 現在地フィルタ / src/app.rs:63859, :63932, :64006 / search owner | 現items/on-demand metadata workerを維持。Indexer不在でも通常実行。独立 worker の取消/新query/採用を保つ。Pending/Unavailableの両方で結果・取消とlate adoption非干渉を試験 |
+| タグ / src/tags_db.rs、src/tag_write_worker.rs / 既存読取・write owner | catalog/writerは独立。IndexerPending/Unavailableでも通常の編集/読取/sidecar復元/Undo/Redoを維持。旧移行を§5.3で撤去し、marker確認・準備中notice・queue・追加admissionは不要。タグservice自身の既存失敗は保持。タグ操作成功・永続化・lateReady非干渉を試験 |
+| スマートフォルダ / src/app/smart_folder.rs:2124, :3578 / smart-folder request | 独立scan/DB読取を維持。managerなし時の既存local I/O semaphoreをそのrequestのまま使い、late Readyでworkerを作り直さない。タグ条件も現tags.dbを通常どおり読む。独立条件/タグ条件のscan成功・取消、semaphore owner数、late Ready非干渉を試験 |
+| コレクション / src/ui_dialogs/collections.rs:43, :723, :1991 / collection actor + UI request | collection固有のStarting/Ready/Unavailableとread demandを維持。IndexerPendingで新しい待ちを足さない。collectionStarting中の要求保持、Indexer停止中のReady読取、late adoption非干渉を試験 |
+| Remote / src/remote_ipc/collections.rs:167, :310, :341、src/remote_ipc/ui.rs:4002 / 各service + session owner | 名前検索・タグ・collectionは各serviceの準備状態。全文索引のPendingへ一括変換せず、タグ移行理由の新Busy/wire状態も追加しない。Remote取得は既存cancel、初期explicit延期、返却時fallbackとowned wakeを保持。running-instance activationも別ownerへ新startupを作らない。サービス毎の成功/固有待ちと取得→返却→取消を試験 |
+| similar / 別バージョン索引 / src/app.rs:26123, :26893、src/metadata_reconfiguration.rs:533 / 既存watch-bootstrap owner | overlay解除/normalreadyで共有watcher barrierを閉じない。実bootstrapのready、またはIndexer終端Unavailable/disconnectの既存terminal tailでのみ閉じる。Pendingで独立similarを早期失敗にせず最新password設定を保つ。UI先行→barrier継続→latebootstrap、terminal失敗一度閉鎖を試験 |
 
 ## 6. 初期フォルダの解決・走査を通常 UI 後へ
 
@@ -353,6 +497,25 @@ archive cache lookup / stamp / format probe が同期なら既存 background pre
 `open_loaded_file_fullscreen` (`src/app/startup_ops.rs:1355`) に同じ required-file continuation を渡す。
 default target は従来通り `auto_fullscreen=false`、明示 argv / activation の既存 auto-open 条件を維持する。
 
+**Deferred の起床契約（P1-2）:** 要求を保持する既存 navigation owner が root wake を所有する。
+overlay 解除時に normal paint 待ちを開始し、ROOT を明示した request_repaint_after_for（100msを提案）を
+normal present 未成功の各 root pass で再武装する。Indexer の Pending/終端と切り離す。
+normal-present callback は生きた要求 handle に一回の request_repaint_of(ROOT) を発行し、
+次の外側 root poll が milestone と admission を検査して Deferred → Resolving を一度だけ遷移させる。
+callback は navigation state を書かず、退役 handle への遅い callback は dispatch を再生しない。
+timeout/skip/surface再作成の場合は milestone を立てず、同じ owner の timer を維持する。
+これは未完了の所有処理を進める wake であり、描画症状を隠す任意の repaint 追加ではない。
+
+利用者の hide/OS minimize 中は normal present 待ちの定期要求を止め、既存 restore/unminimize owner が
+同じ Deferred 要求を wake する。modal/Remote admission に移った後も、解除/返却/取消を扱う既存 owner が
+その要求を再評価する root wake を発行する。独立した resume worker や待ち bool は加えない。
+すでに normal present 済みなら再描画成功を要求せず、admission が開いた pass で dispatch する。
+Resolving の worker result/cancel/disconnect も同じ request owner に ROOT wake を渡す
+（現 master の worker は startup_ops.rs:267 で current viewport の repaint を要求するため明示 ROOT へ揃える）。
+ユーザー navigation の受理で Deferred が退役したら timer/登録も退役し、旧要求を開き直さない。
+eframe が Wait に戻る境界（vendor/eframe/src/native/wgpu_integration.rs:958）に依存した無入力停止を
+防ぐ契約であり、hidden render scheduler 自体は再設計しない。
+
 ### 6.2 target の意味、取消、兄弟経路
 
 | 入力 | 保持する仕様 |
@@ -363,7 +526,7 @@ default target は従来通り `auto_fullscreen=false`、明示 argv / activatio
 | Previous（§1.335 merge 後） | `startup_list_restore` の logical target と cursor。Unavailable / ancestor / Desktop fallback は同枝の契約 |
 | Drives / ReadingHistory | mode routing は維持。ドライブ照会/必要な DB 読取があれば同じ prepared worker に載せる。通常 UI を先に描く |
 | 明示 argv、SendTo、activation | default より優先。requested file / auto fullscreen / password / converted-source 意味を維持 |
-| 明示 open の NotOpenable / disconnect | 現 `startup_ops.rs:381`, `:508`, `:523` の default fallback も同じ非同期 default input へ。Explicit→Default 一回だけ。Default 自身の失敗は terminal にし、default worker を再帰起動しない |
+| 明示 open の NotOpenable | 現 `startup_ops.rs:508`, `:523` の default fallback も同じ非同期 default input へ。Explicit→Default 一回だけ。Default 自身の失敗は terminal にし、default worker を再帰起動しない |
 | Remote fallback | `src/remote_ipc/ui.rs:4002` の default 入口も同期処理を呼ばない。Remote ownership の既存 defer/reject を保持 |
 
 Deferred はユーザー navigation が受理されたら退役。Resolving は同じ既存
@@ -378,6 +541,30 @@ Remote が初期 explicit target を延期する既存 semantics も保持。tar
 admission 待ち以外のパス解決/scan全体はモーダルにしない。モーダルを無期限に保つと本目標と矛盾し、
 遅い share が別フォルダへ移る操作まで止める。代わりに既存 navigation の取消・単一採用を使う。
 変換・パスワード・保存は既存モーダルのままで、今回その内部の interleaving を増やさない。
+
+### 6.2.1 resolver の spawn failure / disconnect（P2-3）
+
+startup_ops.rs:297 の同期 fallback を InitialStartup / Activation / Bookmark の **全経路**で削除する。
+同じ resolver に scan を載せた後も UI thread で resolve/scan を行わない。spawn error と実行中の channel
+disconnect は、既存 owner と requested resource lease を受ける共通 terminal tail に渡す。
+記録と一度の「場所を開く準備ができませんでした。もう一度開いてください」通知で終わる。
+自動 retry や代替 worker は作らず、次に利用者が open すれば通常の新要求になる。
+
+| owner | 失敗時の終端処理 |
+| --- | --- |
+| InitialStartup（default含む） | 当該 Deferred/Resolving を Idle にして requested EPUB 等の lease を解放し、trace を terminal にする。通常 shell/current list を保持し overlay を再表示しない。リソース失敗を NotOpenable と混同して default resolver を再 spawn しない |
+| Activation | 新 activation を terminal にし、当該 lease を解放。snapshot admission のため保留した prior request があれば resume_activation_held_open（startup_ops.rs:543）の既存契約でその **同じ receiver/要求**を戻し、実 held duration を bookmark timeout へ加算する。新 activation の失敗で held request を取り消さない。通常 supersede により受理時に取消済みの旧要求（:208/:240）は復活させない |
+| Bookmark(request_id) | 同じ ID の cancel_bookmark_open_request（:769）へ渡し、当該 bookmark の pending/lease/preparing host を既存 terminal 所有規約で退役する。他の bookmark、parked viewer、sibling の要求を取消しない。共通通知で一度だけ説明する |
+
+spawn が失敗して worker が存在しない場合も cancel handle を terminal にし、held 要求の elapsed は
+受理から失敗判明までで計る。結果 channel が途切れた場合も成功扱い・空 scan 採用をしない。
+従来の Initial disconnect → default（:381）は自動の新 worker を作るため、このまれなリソース失敗では
+上の粗い終端処理へ統一する提案。通常の「指定場所が開けない」時の一回の default fallback は維持する。
+rare failure の多段 recovery は設計しない（§9 の設計 lead 確認事項）。
+RequestedOwner/held-request の退役を分岐ごとに複製せず、既存 finish/cancel/resume tail を共有して通知の
+二重発行も防ぐ。Detached preparing host の具体的な terminal helper 変更は §7 の構造合意対象とする。
+同じterminal tailでも終了/取消済みownerへの遅い失敗ではnotice/held復帰を行わず、lease解放だけを行う。
+App終了時はheldも当該要求として退役させ、以前の場所を再openしない。
 
 ### 6.3 §1.335 と compose、merge 順序
 
@@ -416,22 +603,30 @@ first-setup overflow 枝は first_setup.rs のみを独立統合でき、本枝�
 - folder resolver と別の startup scan owner: 不採用。同じ request が解決/scan/continuation を運ぶ。
 - 起動 target の高速化のため Desktop を空一覧へ変更: semantics 退行なので不採用。通常 shell を先に出し、同じ target を開く。
 - 画面を後から専用に live-rebuild: 不要。通常 navigation の既存 install / adopt を使う。
+- 旧タグ移行と編集をqueueで順序付ける/overlayを延長する/タグ操作を一時制限する:
+  §5.3の2026-10-06利用者決定で全案不採用。まれな旧版直更新の自動救済を撤去し、
+  競合の組合せ自体をなくす。通常タグwriter/admissionとsidecar ownerは変更しない。
 
-新しい業務状態は既存の分割状態を enum に置換する範囲。タイマー・診断 stage は観測の owner であり、
+Indexerとnavigationの業務状態は既存の分割状態を enum に置換する範囲。
+タグの移行安全性state、proof event、追加notice/queue/保留処理は導入しない。
+タイマー・診断 stage は観測の owner であり、
 App の機能状態を書き換える第2 coordinator にはしない。まれな診断 I/O / spawn failure は
 記録可能な範囲のログと一度の通知 + 次回起動に留め、回復の失敗をさらに回復する仕組みを作らない。
-利用者作成 settings / tags / collections の削除・defaults 上書きは承認されていない。
+利用者作成 settings / 現tags.db / collections の削除・defaults 上書きは承認されていない。
+例外として、未移行の旧タグを新たに救済しない仕様変更だけを§5.3で明示的に受け入れている。
 
 **detached / viewport 構造合意が必要な箇所:**
 
 1. first-present hook は `vendor/eframe/src/native/wgpu_integration.rs:877` と共通
    `vendor/egui-wgpu/src/winit.rs:479` に触れる。root-only event を足すが、同 painter の deferred/immediate viewport が通る。
    paint skip / texture delta の既存契約を変えず、root milestone を detached paint で確定しない構造変更。
+   §6.1の要求handleに対するroot wake/最小化通知もこのobserver境界の一部として合意対象に含める。
 2. Directory prepared-scan を使う loader は `src/app.rs:24695` / `:25655` の shared path。
    context-owned folder pending と history/navigation owner、§1.335 intent を保持する必要がある。
 3. 明示 startup file の既存 fullscreen continuation は detached host を作り得る。
    `src/app/startup_ops.rs:874` 以降には bookmark の detached predicate 群もある。
    初期/default の main owner を明示し、共有 helper の変更が sibling branch に及ばないか review する。
+   §6.2.1のBookmark失敗時にpreparing hostを退役する既存terminal helperへの到達も同じ合意対象。
 4. 外側 root update への App-global Indexer poll 移動は context mount/swap で manager を移譲しない。
    新しい detached predicate、HWND owner 推測、placement、viewport generation、terminal close effect は追加しない。
 
@@ -451,9 +646,23 @@ App の機能状態を書き換える第2 coordinator にはしない。まれ�
 | --- | --- | --- |
 | A: timeline process owner / writer | 共通小 crate、launcher/core entry、全 stage、watchdog | fake monotonic clock で begin/end・error・skipped・parent duration、5/15/30秒各一回、heartbeat が動いても発火、stage切替/reset、並行 lane、overflow/drop、writer blocked/failed でも publisher 完了、UNC/extended UNC/mapped/unknown、env 上限/不正/直接core/同run相関。遅い sink は latch で止め、UI側が待たないことを実際の API で確認 |
 | B: root presenter の証拠 owner | vendor の observer / frame tag 接続、outer first-update | fake paint outcome: surface absent/timeout/recreated/zero-size/skip/submit-only は成功なし、present-return だけ一度、root以外なし、Overlay→NormalShell、multi-pass/discard の最終tag、first-updateだけでreadyにならない。既存 texture-delivery / font-atlas / surface regression を保持 |
-| C: App-global IndexerInit owner | enum、全consumer、単一採用、overlay/status | 実 receiver と injected spawn で4.999秒/5秒/期限同時Ready、恒久Emptyでも通常UIへ、30秒Ready後一度採用、Unavailable/Failed/disconnect/spawn失敗一度通知、poll early-return/idle、Pending中のfull-check集約、favorite ON/OFF/root/PDF password変更後に最新configuration採用、speed変更は次回起動反映のまま、similar bootstrap非早期閉鎖、close前late-result、manager/writer生成数1 |
+| C: App-global IndexerInit owner | enum、全consumer、単一採用、overlay/status、§5.3の旧タグ移行撤去（code/test/docs） | 実 receiver と injected spawn で4.999秒/5秒/期限同時Ready、恒久Emptyでも通常UIへ、30秒Ready後一度採用、Unavailable/Failed/disconnect/spawn失敗一度通知、poll early-return/idle、Pending中のfull-check集約、favorite ON/OFF/root/PDF password変更後に最新configuration採用、speed変更は次回起動反映のまま、similar bootstrap非早期閉鎖、close前late-result、manager/writer生成数1、旧移行非実行と既存タグ保持 |
 | D: 既存 initial navigation request owner | target snapshot、defer until present、resolve+pre-scan、async adopt、§1.335 compose | fake resolver/scanを停止して先にNormal root present・navigation可を確認。再navigation/activation/Remote取得/closeでstale結果非採用・旧trace非再活性化、modal-held保持、scan errorと空を区別、default fallbackは一度。実temp directory/ZIP/PDF/変換fixtureでtarget・cursor・source・prefix・auto-open保持 |
 | E: pure UI renderer | Japanese overlay / persistent status | fixed clock snapshot: light/dark/strong contrast、480×360、小viewport、長いstage名/999秒、Overlay/Pending/Unavailable。glyph check zero。first_setup snapshotを更新せず別枝責任 |
+
+独立レビューに対応した追加必須試験（上表の担当を再利用し、第2検証ownerを置かない）:
+
+| 担当 / 対象 | 操作と不変条件 |
+| --- | --- |
+| A / parent watchdog | fake clockで親40秒の下に1秒のchildを連続。parentの5/15/30秒が各一回、parent復帰でも再通知なし。stage用thresholdとparent用thresholdを混同しない。heartbeatは更新し続ける |
+| A / 監視寿命 | normalready後もIndexerを40秒止めて記録。run_nativeが100秒常駐するだけでは警告なし。modal/Remote admissionを100秒保留しても実resolver停止扱いなし。visible4秒→hide100秒→restore1秒でpresent-awaitの有効5秒が一度、Indexerの実停止はhide中も記録。全terminal/quitでwatch終了 |
+| B+D / Deferred wake | Indexer ReadyまたはUnavailable、他worker全idle、無入力のfake event loopをWaitまで進め、normalpresent完了のowned wakeのみでdispatchが一回起こる。skip/timeoutを複数回→成功でもtimerが継続。cancel前後の遅いcallbackは再openしない。複数egui passで未採用frame tagを使わない |
+| C / visibility採用 | Pending→tray hide→Ready（hiddenのまま実outer pollで採用）→restore。同じmanagerのthrottleがtrue→false、設定変更/ActivityGateを巻き戻さない。pause設定ON/OFF、外部ShowWindowによる復帰、hidden quit Pending/Ready、late result非採用を分ける |
+| C / minimize/activation区別 | OS minimizeだけではwindow_visibleや新throttle契約を変更しない。runninginstance activation→restoreでは新init/overlay/defaultfolder無し。起動途中hideの結果採用はROOT requested-workで進み、hiddenidleへ恒久timerを作らない |
+| C / legacy移行撤去 | disposable旧索引（STORED #タグあり）と空tags.dbで既存store startupを実行し、旧タグ非取込・marker非新設を確認。既存catalogのタグ/source/state/markerは有無にかかわらず起動/rebuild後も保持。XMP fixtureのbytes/hash不変。Indexer停止→5秒UI解除中もAdd/Remove/改名/Undo/Redo/sidecar復元、タグ保存copy/move/delete/metadata操作とRemoteタグ読取に新制限無し。専用tests削除後も閉じたFTSタグ検索の回帰を維持。実データは使わない |
+| C / サービス別契約 | §5.4各行をPendingとUnavailableで検証。Ctrl+G最新query一回/取消、Ctrl+S/F通常動作、tag/smart/collection/Remote個別readiness、共有watchbarrierをoverlaydeadlineで閉じない。lateReadyは独立要求をresetしない |
+| D / resolver resource failure | 既存FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILUREをInitial(default/explicit)/Activation/Bookmarkへ注入。resolve/scanの呼出し数0、UIからsyncfallback無し、通知一回、lease/trace退役。Activationのheldあり/なし・snapshot拒否・交代activation、Bookmarkのmain/detachedを分け、prior receiver同一・timeout補正・sibling非取消を確認。disconnectも同じterminal tail。NotOpenableだけ一回defaultfallback |
+| D / admission wake | normalpresent後modal終了/Remote返却で同じ要求をwakeし一度dispatch。意図的hide/minimize中はdispatch/presentを捏造せず、restore後ownedwakeで再開。Resolver結果のwakeもROOTへ届くことを確認 |
 
 folder 回帰 matrix は Desktop / Previous / Specific / Drives / ReadingHistory、missing child→ancestor、
 missing drive→Desktop、network/OneDrive解決停止、カーソル同一場所だけ、argv file / ZIP / PDF / EPUB /
@@ -465,6 +674,9 @@ items/generation/channel/cancel/cache/restore recordが siblingに及ばない�
 headless試験のnormal-presentは実painter証拠の代替ではなく、同一adoption APIに fake outcomeを注入する。
 
 実装順は A → B → C → D → E、各chunkの終了で関連試験と独立review。
+§5.3の撤去はchunk C内でコード・専用tests・現役docsを同じ担当が完結させる。
+全source参照監査で専用関数/型/文字列が消えたこと、共有helperを過剰削除しないことを確認する。
+CHANGELOG候補は本planからrelease leadへ引き渡し、今回の設計作業ではCHANGELOGを編集しない。
 最初は narrow lib / 指定integration test、共有startup/viewport完了時には
 `scripts/test-full.ps1`、`cargo fmt --check`、`python scripts/check_ui_glyphs.py`。
 docs/README、async-architecture、ui-responsiveness、仕様/ユーザー説明は実装で変わった最終仕様へ更新する。
@@ -487,9 +699,15 @@ fallbackを試すならDX12列挙を含まないVulkan-onlyまたは明示softwa
 native FFIにfuture timeoutを足すだけでは停止threadを解放できない。子processの停止/既存mutex/
 設定migration/optional bridge ownershipを含む独立設計が必要で、plan Aに混ぜない。
 
-利用者への必須の追加情報質問は現時点ではない。レビューで決める提案値は
-overlay 5秒、watchdog 5/15/30秒、診断1024件/24KiB handoff、2MiB/file・10run保持。
-稀なdiagnostics保存不能は「一度通知し次回起動」、Indexer spawn/errorは検索Unavailable・閲覧継続・再起動を提案する。
-データ損失を伴わず、retry機構を増やさない。設計leadがこの割り切りを利用者判断と照合し、
+**利用者決定済み（2026-10-06）:** §5.3の旧Tantivyタグ一括移行撤去と、旧版直接更新での
+旧タグ非取込を受け入れる。タグ制限/queue/準備notice/proof機構と、それらに付随する移行失敗の
+復旧案は不要となった。通常タグ操作と既存catalog/XMPを保持する。この決定を改めて承認待ちにしない。
+現時点で追加の必須利用者判断はない。実装範囲、docs更新、CHANGELOG候補は§5.3へ記録済み。
+
+設計leadの確認事項: resolverのspawn/disconnectは通常UIに留め、一度通知して利用者の新openを待つ
+（§6.2.1）。従来disconnect時の自動defaultへの新workerは作らない。diagnostics保存不能、
+Indexer spawn/errorも一度通知・次回起動に留める。rare failure内の多段 recovery は増やさない。
+レビューで確定する提案値はoverlay5秒、watchdog5/15/30秒、診断1024件/24KiB handoff、2MiB/file・10run保持。
+P1-2/P2-3/4/5と§5.4は本改訂で契約化したが、独立再レビューとdetached構造合意はまだ必要。
 より複雑な復旧が必要なら実装前に相談する。画面前の同期停止まで正常UI保証が必要という判断なら、
 今回のscopeを拡張せず、上記launcher監視か必須初期化の背景化を別のcoherent phaseとして相談する。
