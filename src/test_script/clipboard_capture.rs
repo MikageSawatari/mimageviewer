@@ -354,6 +354,8 @@ fn two_phase_write(writer: &mut impl ClipboardWriter, content: &[Payload]) -> Re
 struct NativeWriter<'a> {
     bridge: &'a RunnerBridge,
     hwnd: u64,
+    /// Process that held the clipboard at the last failed open (None = unknown).
+    last_holder_pid: Option<u32>,
 }
 
 #[cfg(windows)]
@@ -368,6 +370,16 @@ impl ClipboardWriter for NativeWriter<'_> {
         .map_err(|e| {
             // Name the holder: mIV's own readers and third-party clipboard tools differ.
             let holder = unsafe { windows::Win32::System::DataExchange::GetOpenClipboardWindow() };
+            self.last_holder_pid = holder.as_ref().ok().and_then(|hwnd| {
+                let mut pid = 0;
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                        *hwnd,
+                        Some(&mut pid),
+                    )
+                };
+                (pid != 0).then_some(pid)
+            });
             format!(
                 "{e} (clipboard held by {})",
                 holder.map_or_else(|e| format!("unknown ({e})"), describe_window)
@@ -495,6 +507,7 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                     &mut NativeWriter {
                         bridge: &write_bridge,
                         hwnd: owner.hwnd(),
+                        last_holder_pid: None,
                     },
                     &content,
                 )
@@ -527,18 +540,45 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                 let mut writer = NativeWriter {
                     bridge: &excel_bridge,
                     hwnd: owner.hwnd(),
+                    last_holder_pid: None,
                 };
-                for round in 1..=repetitions {
-                    // A busy second open is the regression under test: report it as a
-                    // script failure, not as an environment problem.
-                    two_phase_write(&mut writer, &content)
-                        .map_err(|e| rhai_error(format!("round {round}/{repetitions}: {e}")))?;
+                // Other desktop readers (observed: explorer.exe CLIPBRDWNDCLASS) also open
+                // the clipboard on each update, as they would against real Excel. A round
+                // blocked by another identified process is redone, at most
+                // FOREIGN_BUSY_LIMIT times in total; a round blocked by mIV itself, or by
+                // an unidentified holder, fails at once.
+                const FOREIGN_BUSY_LIMIT: i64 = 10;
+                let own_pid = std::process::id();
+                let mut foreign_busy = 0_i64;
+                let mut round = 1;
+                while round <= repetitions {
+                    // A busy open caused by mIV is the regression under test: report it as
+                    // a script failure, not as an environment problem.
+                    writer.last_holder_pid = None;
+                    if let Err(e) = two_phase_write(&mut writer, &content) {
+                        let foreign = writer.last_holder_pid.is_some_and(|pid| pid != own_pid);
+                        if !foreign || foreign_busy >= FOREIGN_BUSY_LIMIT {
+                            return Err(rhai_error(format!(
+                                "round {round}/{repetitions} (foreign retries {foreign_busy}): {e}"
+                            )));
+                        }
+                        foreign_busy += 1;
+                        crate::logger::log(format!(
+                            "[test-script] Excel two-phase round {round} redone: {e}"
+                        ));
+                        writer
+                            .delay(Duration::from_millis(100))
+                            .map_err(rhai_error)?;
+                        continue;
+                    }
+                    round += 1;
                     writer
                         .delay(Duration::from_millis(100))
                         .map_err(rhai_error)?;
                 }
                 let mut result = Map::new();
                 result.insert("successful_second_opens".into(), repetitions.into());
+                result.insert("foreign_busy_retries".into(), foreign_busy.into());
                 result.insert(
                     "sequence".into(),
                     i64::from(unsafe {
