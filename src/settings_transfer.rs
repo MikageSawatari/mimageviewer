@@ -313,6 +313,9 @@ preferences_policy! {
         skip_duplicate_images: bool => ("同名の重複画像を省略", |_, _| true, plain, plain);
         image_ext_priority: Vec<String> => ("画像拡張子の優先順", valid_extensions, plain, plain);
         minimize_to_tray_on_close: bool => ("閉じるときトレイに常駐", |_, _| true, plain, plain);
+        clipboard_capture_image_enabled: bool => ("コピーした画像を自動保存", |_, _| true, plain, plain);
+        clipboard_capture_html_enabled: bool => ("コピーしたページの画像を選んで保存", |_, _| true, plain, plain);
+        clipboard_capture_min_short_side_px: u32 => ("クリップボード取り込みの最小サイズ (短辺 px)", |v, _| *v <= CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX, plain, plain);
         pause_indexer_while_minimized: bool => ("最小化中は索引を停止", |_, _| true, plain, plain);
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
@@ -452,6 +455,7 @@ preferences_policy! {
         favorite_view_overlay => "runtime overlay / PC のウィンドウ配置";
         smart_folders => "利用データ・登録先・履歴・検索対象";
         last_folder => "利用データ・登録先・履歴・検索対象";
+        startup_list_restore => "利用データ・登録先・履歴・検索対象";
         startup_folder_mode => "起動・保存・整理先の PC 固有パス";
         startup_folder_path => "起動・保存・整理先の PC 固有パス";
         last_cursor_name => "利用データ・登録先・履歴・検索対象";
@@ -540,6 +544,7 @@ preferences_policy! {
         exif_hidden_tags => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
         capture_output_dir => "起動・保存・整理先の PC 固有パス";
         book_root => "起動・保存・整理先の PC 固有パス";
+        clipboard_capture_output_dir => "起動・保存・整理先の PC 固有パス";
         active_book_name => "利用データ・登録先・履歴・検索対象";
         pinned_books => "同上";
         conceal_type => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1025,6 +1030,7 @@ mod tests {
                 crate::bake_stage::BakeStage::DisplayAdjust,
             ],
         );
+        settings.clipboard_capture_min_short_side_px = 240;
         settings.archive_file_handling = different_enum(
             &settings.archive_file_handling,
             &[
@@ -1533,14 +1539,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        // video_watched_to_end is already an excluded field in the base policy.
-        assert_eq!(entries.len(), 441);
+        assert_eq!(entries.len(), 446);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            131
+            134
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1550,7 +1555,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 129);
+        assert_eq!(wire.len(), 132);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1604,6 +1609,16 @@ mod tests {
         let sentinel = r"C:\Users\private-alice\SECRET_PIN_184729";
         let mut settings = Settings::default();
         settings.last_folder = Some(sentinel.into());
+        settings.startup_list_restore = Some(crate::settings::StartupListRestore::V1 {
+            target: crate::settings::StartupListTarget::PhysicalList {
+                logical_path: sentinel.into(),
+                zip_prefix: Some("private-inner-book/".into()),
+            },
+            cursor: Some(crate::settings::ListCursorHint {
+                name: "private-book-and-tag-name".into(),
+                rows_above: Some(3),
+            }),
+        });
         settings.startup_folder_path = Some(sentinel.into());
         settings.capture_output_dir = Some(sentinel.into());
         settings.last_cursor_name = Some("private-book-and-tag-name".into());
@@ -1976,6 +1991,11 @@ mod tests {
                 (10).to_string().parse().unwrap(),
             ),
             (
+                "clipboard_capture_min_short_side_px",
+                0.0,
+                f64::from(CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX),
+            ),
+            (
                 "folder_skip_limit",
                 (1).to_string().parse().unwrap(),
                 (30).to_string().parse().unwrap(),
@@ -2092,6 +2112,7 @@ mod tests {
             let integer = matches!(
                 key,
                 "slideshow_continuous_scroll_percent"
+                    | "clipboard_capture_min_short_side_px"
                     | "folder_thumb_depth"
                     | "folder_skip_limit"
                     | "spread_page_gap_px"

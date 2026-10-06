@@ -393,6 +393,11 @@ rexif = "0.7"
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 sha2 = "0.10"
+url = "2"
+# CF_HTML uses a browser-grade HTML parser; inline background-image values use
+# the same CSS tokenizer already required by scraper (ISC / MPL-2.0).
+scraper = { version = "0.27", default-features = false }
+cssparser = "0.37"
 # `rc`: サイドカーの items を `Arc` のまま直列化・復元する (deep clone を作らない)。
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

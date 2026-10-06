@@ -83,6 +83,7 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 | `app/viewer_context_registry.rs` | main / detached / parked viewer context の唯一の bundle 保管先。`ViewerContextId`、`ContextResidence`、window binding の双方向表と、mount / build / fork / retire / promote の 5 transaction を所有する。`App` の viewer field 群は常に registry が選んだ 1 context の投影であり、active / parked は bundle の保管場所ではなく detached window runtime state が表す。窓 ID は App / bundle に保存せず、mounted binding（build 中は非公開の予約）から導出するため、一覧差し替えや表示終了で所有窓が変わらない |
 | `app/vram_accounting.rs` | `App` が所有する全 GPU テクスチャキャッシュを、実寸・mip chain・`TextureId` 重複排除で横断集計する。サブシステム別会計、モード判定、共有予算の参照、1 秒間隔の perf 計装を担当する |
 | `app/folder_scan.rs` | 通常実フォルダの列挙と、1 物理フォルダ内に限定した同名メディア / コンテナ正規化の所有者。動画 + sidecar 画像、実フォルダ + ZIP/PDF/対応アーカイブ、ZIP + 変換元アーカイブ、画像拡張子優先度の規則を通常一覧・サブ展開・スマートフォルダで共有する |
+| `app/startup_list_restore.rs` | 「前回終了した場所」の明示一覧 record と唯一の reducer。main の採用済み物理一覧／本／Drive の適格性を投影し、明示一覧採用、既存一覧の表示要求受理、同じ一覧の cursor 捕捉を分ける。直接読書・内部 load・合成 root・F12 表示先切替・independent viewer は target を更新しない。既存 typed request が intent を運び、ZIP prefix を含む restore hydration は最初の materialization に渡す。詳細と検証状況は [起動復元の所有設計](startup-restore-target-plan.md) |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理。native Touch は render overlay 内で完結し、App の legacy mouse 操作へは再注入しない |
 | `touch_input.rs` | 静止画 egui viewport と native video presenter が共有する、接点集合・所有・tap zone・pinch/pan/scroll の純粋な認識器 |
 | `touch_debug.rs` | `MIV_TOUCH_DEBUG=1` の入力源診断。Win32 pointer/mouse source に加え、native presenter / HUD の stream 所有、座標変換、認識コマンド、promoted mouse 破棄を source 別に記録する |
@@ -127,6 +128,9 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | `settings_transfer.rs` | 環境設定の持ち運び。全 Settings field の一つの分類 policy から転送対象 projection / 検証 / draft 適用を生成し、形式 v1 の JSON だけを処理する。App 内の環境設定・操作カスタマイズの大きな draft はそれぞれ Box に収納し、既存の寿命を保つ。設定の復元画面が一つの転送状態を所有し、worker は App / DB を持たない。確定済み設定を書き出し、取り込みは検証成功後に環境設定の draft へ反映し、既存 OK で確定する。分類・所有・既存 OK の限界は [settings-export-import-plan.md](settings-export-import-plan.md) |
 | `settings_restore.rs` | 設定全体の世代復元に加え、過去世代を一時ディレクトリへ読み取り専用展開して操作カスタマイズだけを抽出し、取り込み前の `.mivkeys.json` 自動退避を管理 |
 | `books.rs` | 製本機能と source-based headless compositor。製本ルート直下の通常フォルダを本として扱い、`0001_元名.ext` のページ保存、通常画像/ZIP 内画像の無加工コピー、補正/PDF/動画フレームの焼き込み追加、2 パス temp rename による並べ替えフラッシュを担当する。`CompositeSource` + `BakedEditSnapshot` の適用順、Ctrl+E の conceal / crop override、合成寸法予測は単枚・一括・製本・外部ツールで共有する |
+| `clipboard_capture/` | App が process に 1 つ所有する画像・HTML の取り込み。`mod.rs` が不変設定・最新通知・検出時の HTML snapshot・typed event と手動要求を所有し、`native.rs` が listener / reader / 自動画像保存 worker、`popup.rs` が非アクティブ Win32 / GDI 小窓を担当する。`data.rs` は形式分類・上限付き画像デコード・ファイル名・保存公開・Zone.Identifier、`html.rs` は CF_HTML の context / fragment 分離と候補抽出、`fetch.rs` は App 所有 `CaptureFetchService` の固定 4 worker、session ごとの Agent / resolver / pool、原本ハッシュ・一時予算・背景保存・cleanup を所有する。既定保存先は起動後に背景解決し、通知は reader 上で 300 ms 合流して sequence / 世代を検査する。DIB 解釈は製本と共有し、寸法制限は取り込み入口だけで適用する。切り取り表示や viewer bundle から独立する。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |
+| `ui_dialogs/clipboard_capture.rs` | App 所有の `CaptureSelection` と `Fetching` → `Saving` のモーダル。監視小窓・Ctrl+V の HTML snapshot を同じ受付へ集約し、現在の実フォルダ / 自動取り込みの月別フォルダを intent で区別する。原本内容による統合・最小サイズ・選択・取得失敗の表示・1 frame 最大 2 枚の texture upload・保存中の閉じる操作拒否を担当し、背景サービスの完了をメインのトーストへ返す。最小サイズは live Settings へ反映し、既存の設定保存境界で永続化する |
+| `window_activation.rs` | トレイ・2 重起動・取り込み event を受理した App が共有するメイン HWND の前面化。小窓 thread は前面化しない。配置スロットの lock を外してから、非表示・通常の最小化・表示中を分けて復帰する。App の `sync_after_restore` と viewer の経路は既存の所有者に残す |
 | `book_fs_journal.rs` | 製本の改名・並べ替え・別本移動を crash-safe な filesystem step plan として実行する。永続 temp 名、copy/move の SHA-256 identity、冪等な forward / rollback 判定を所有し、phase と進捗の SQLite 永続化は `book_bookmarks.rs` に委譲する |
 | `reading_history_db.rs` | 閲覧履歴 (`%APPDATA%/mimageviewer/reading_history.db`)。ユーザーが開いた画像本 / 動画 / 音声を MRU として保持し、`reading-history-writer` で upsert / prune、メディア進捗更新、file metadata 補完を行う |
 | `rename_key_migration.rs` | アプリ内リネーム後の path-keyed 永続データ移行と回復ジャーナル、および content-identity 復元用の非破壊 copy。rename / hard purge / copy は同じ `STORES` descriptor を正本とし、copy は `unique: true` のストアだけを `INSERT OR IGNORE` で複製する。copy の generic SQL は store 非依存のまま、`rating.source_path`、`reading_history.path`、edit-preview の所有 WebP + path 列を per-store fixup する。descriptor transaction の成功境界は path-keyed snapshot の共通 mutation effect も生成し、`edit_origin.file_key` の rewrite / delete 完了時は App が旧 content-identity index を Loading で gate して Low-priority cancellable worker から全件再読込する。未完了 rename 集合の正本は App の in-flight + FIFO queue + boot-retry に置き、ジャーナル書き出しは App-global の単一 latest-value worker が直列化する。起動時の初回 enqueue / poll 前だけ同期 load し、終了時は最新 revision の完了まで flush する |
@@ -273,7 +277,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ui_conceal.rs` | 隠蔽加工モード (同じマスク編集 UI でモザイク / 塗りつぶし / ぼかしを合成) |
 | `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブ管理と EPUB 変換キャッシュ管理の独立したダイアログ (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定・ネットワーク上のデータ保存先に関する起動案内等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
 | `native_name_dialog.rs` | 名前変更 / 新規フォルダ作成で共有する Windows 標準の単一行入力画面。メモリ上のダイアログテンプレートを同期モーダル表示し、IME・書記素編集・クリップボード・Undo を OS に委譲する。非 Windows では no-op stub |
-| `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
+| `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch。環境設定と操作カスタマイズの draft は App が `Option<Box<PreferencesState>>` で所有し、ページ追加による App のスタックサイズ増大を避ける |
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「ファイル処理 → Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
 | `changelog_markdown.rs` | 更新履歴 (GitHub release body) の Markdown サブセット描画。バージョン更新ダイアログ (`ui_dialogs/update_notice.rs`) から呼ばれ、見出し / 箇条書き / `**強調**` / `` `コード` `` / `<kbd>キー</kbd>` を整形。`egui_kittest` のスナップショットテスト対象 |
@@ -364,6 +368,11 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 `settings.db` の追加表 `video_audio_track_choices` は動画・音声ファイルごとの明示的な音声トラック選択を保持する。
 再生位置の表とは独立し、`Settings::save()` 時に既知列だけを書き込む。
+
+§1.335 の `startup_list_restore` は既存 Settings 全体保存の一つの record として `settings.db` に
+置き、専用 DB／journal／別の pending 正本は作らない。明示一覧の target と対応 cursor を対で
+保存し、旧 `last_folder` と cursor は初回だけ移行する。Preferences OK は live record を保持し、
+設定 transfer は利用データとして除外する。新しい field の存在が移行済みの証拠になる。
 
 | ファイル | 内容 | 書き込むモジュール |
 | --- | --- | --- |

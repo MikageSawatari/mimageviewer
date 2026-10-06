@@ -276,6 +276,37 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["PNG", "JPEG", "JPG", "キャプチャ"]
     ),
     entry!(
+        "clipboard-capture/image",
+        ClipboardCapture,
+        "画像がコピーされたら自動で保存する",
+        [
+            "クリップボード",
+            "clipboard",
+            "コピー",
+            "画像",
+            "自動保存",
+            "監視"
+        ]
+    ),
+    entry!(
+        "clipboard-capture/folder",
+        ClipboardCapture,
+        "保存先フォルダ",
+        [
+            "クリップボード",
+            "clipboard",
+            "保存場所",
+            "出力先",
+            "既定に戻す"
+        ]
+    ),
+    entry!(
+        "clipboard-capture/html",
+        ClipboardCapture,
+        "ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする",
+        ["クリップボード", "HTML", "ページ", "画像", "コピー", "監視"]
+    ),
+    entry!(
         "capture/folder",
         Capture,
         "保存先フォルダ",
@@ -1551,5 +1582,19 @@ mod tests {
             .find(|entry| entry.anchor == "spread/seek-strip")
             .expect("静止画サムネイル列の最大高さが検索できる");
         assert_eq!(still_height.page, PreferencesPage::SpreadMode);
+    }
+
+    #[test]
+    fn clipboard_capture_search_finds_monitor_and_output_folder() {
+        for (query, anchor) in [
+            ("clipboard 自動保存", "clipboard-capture/image"),
+            ("クリップボード 保存場所", "clipboard-capture/folder"),
+        ] {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("clipboard capture settings must be discoverable");
+            assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
     }
 }

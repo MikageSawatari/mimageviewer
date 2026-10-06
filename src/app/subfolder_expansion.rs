@@ -1892,7 +1892,9 @@ impl App {
         self.subfolder_expansion_saved_folder
             .clone()
             .or_else(|| self.subfolder_expansion_root.clone())
-            .map(crate::ui_main::AddressBarNav::Direct)
+            .map(|path| {
+                crate::ui_main::AddressBarNav::Direct(path, super::StartupListIntent::ExplicitList)
+            })
     }
 
     pub(crate) fn poll_subfolder_expansion(&mut self, ctx: &egui::Context) {
@@ -2306,6 +2308,7 @@ impl App {
             self.start_subfolder_expansion_prepare(prepared.snapshot, prepared.show_toast);
             return;
         }
+        self.capture_main_list_restore_cursor();
         let install_t0 = Instant::now();
         let perf_on = crate::perf::is_enabled();
         let seq = self.input_seq;

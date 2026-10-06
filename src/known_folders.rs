@@ -49,6 +49,25 @@ pub fn location_menu_entries(settings: &Settings) -> Vec<LocationMenuEntry> {
     location_menu_entries_from(settings, desktop, pictures, downloads, drives)
 }
 
+/// Main-only destination; never changes the shared Remote location enumeration.
+pub(crate) fn main_clipboard_capture_location(settings: &Settings) -> Option<PathBuf> {
+    main_clipboard_capture_location_from(settings, crate::clipboard_capture::default_destination())
+}
+
+fn main_clipboard_capture_location_from(
+    settings: &Settings,
+    resolved_default: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if settings.clipboard_capture_image_enabled || settings.clipboard_capture_html_enabled {
+        settings
+            .clipboard_capture_output_dir
+            .clone()
+            .or(resolved_default)
+    } else {
+        None
+    }
+}
+
 fn location_menu_entries_from(
     settings: &Settings,
     desktop: Option<PathBuf>,
@@ -297,6 +316,51 @@ pub fn available_drives() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipboard_capture_location_is_main_only_and_either_switch_enables_it() {
+        let mut settings = crate::settings::Settings::default();
+        let shared = super::location_menu_entries_from(&settings, None, None, None, vec![]);
+        for (image, html) in [(false, false), (true, false), (false, true), (true, true)] {
+            settings.clipboard_capture_image_enabled = image;
+            settings.clipboard_capture_html_enabled = html;
+            settings.clipboard_capture_output_dir = Some(PathBuf::from("C:/clipboard"));
+            let remote = super::location_menu_entries_from(&settings, None, None, None, vec![]);
+            assert_eq!(
+                remote, shared,
+                "Remote locations must not depend on capture switches"
+            );
+            if image || html {
+                assert_eq!(
+                    super::main_clipboard_capture_location(&settings),
+                    Some(PathBuf::from("C:/clipboard"))
+                );
+            } else {
+                assert_eq!(super::main_clipboard_capture_location(&settings), None);
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_capture_default_location_is_hidden_until_resolved() {
+        let mut settings = Settings {
+            clipboard_capture_image_enabled: true,
+            ..Settings::default()
+        };
+        let resolved = PathBuf::from("C:/Pictures/mimageviewer/clipboard");
+        assert_eq!(
+            super::main_clipboard_capture_location_from(&settings, None),
+            None
+        );
+        assert_eq!(
+            super::main_clipboard_capture_location_from(&settings, Some(resolved.clone())),
+            Some(resolved)
+        );
+        settings.clipboard_capture_output_dir = Some(PathBuf::from("D:/explicit"));
+        assert_eq!(
+            super::main_clipboard_capture_location_from(&settings, None),
+            Some(PathBuf::from("D:/explicit"))
+        );
+    }
     use super::{
         LocationMenuEntry, QuickLocation, location_menu_entries_from, push_unique_location,
         startup_cursor_hint, startup_folder, startup_folder_is_last_folder,

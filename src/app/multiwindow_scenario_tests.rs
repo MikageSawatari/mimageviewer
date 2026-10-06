@@ -1673,6 +1673,8 @@ fn run_multiwindow_rar_tree_nav(
     let _main_conversion_sender = if pending_main_conversion {
         let (tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: app.tmp.path().join("pending-main.7z"),
             input_seq: 0,
             format: crate::archive_converter::ArchiveFormat::SevenZ,

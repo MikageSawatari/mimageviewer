@@ -1644,7 +1644,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Delete | 選択/チェック済みの実ファイル / 実フォルダを削除（確認あり。実項目と ZIP/PDF 内ページなど仮想項目が混在する場合は実項目だけを削除せず、理由とページ選択を外す対処をトーストで示して全体を中止する。確認中は背景を暗くして背面 UI の操作を遮断し、背景クリックは何もせず吸収する。確認ダイアログは対象名を先頭 10 件まで列挙し、超過分を「他 M 件」で示す。削除対象に実フォルダを含む場合は「フォルダの中には一覧に表示していないファイルも含まれます」を常に表示する。この判定は既存の一覧項目だけを使い、確認表示のためにフォルダを走査しない。本文は固定幅で折り返し、画面高に収まる縦スクロール領域に置く。Y = 削除、N / Esc = キャンセル、Enter = 無効の固定操作。通常はゴミ箱に移動。リムーバブル / ネットワーク / ゴミ箱を使わない設定のドライブ / ゴミ箱容量を超える対象では確認文言で警告） |
 | Ctrl + C | `GridCopyFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のコピー verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルコピーを実行せずトーストで通知する |
 | Ctrl + X | `GridCutFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のカット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルカットを実行せずトーストで通知する。現在の Windows file clipboard が cut として保持する実項目はサムネイル / 詳細一覧の内容だけを半透明にし、選択・チェック・hoverは通常表示のままにする。copy、別clipboard内容、確定したmove完了で表示を更新し、paste verbの受付だけでは解除しない |
-| Ctrl + V | Windows Shell の背景ペースト verb で、クリップボードのファイル / フォルダを現在の実フォルダにペーストする |
+| Ctrl + V | ファイル類は Windows Shell の背景ペースト verb、画像データは現在の実フォルダへ PNG 保存、HTML は画像の選択ダイアログから現在の実フォルダへ保存。それ以外は Shell 貼り付け。従来無効な一覧では無効。固定入力。詳細は [keymap-spec.md](keymap-spec.md) と §8.11 |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイルをドラッグ＆ドロップでコピー送出。複数チェック選択中はその実パス群をまとめて送出。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外。操作はコピーのみ (移動はしない) |
 | エクスプローラ等からのドロップ | mIV ウィンドウへファイルをドロップすると、現在表示中のフォルダへコピー (**フォルダは v1.1.0 で一旦無効化・skip**)。ZIP / PDF / 検索結果グリッドなど実フォルダ以外を表示中はトーストで拒否。操作はコピーのみ |
 | Ctrl + F | 現在地フィルタを表示 (現グリッドの表示中アイテムを絞り込み。PDF ページ表示中は無効) |
@@ -1865,6 +1865,11 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   初回設定・入力移行・重要な変更点が同時に対象なら、それらを閉じた後に表示する。「閉じる」や
   タイトルバーの × / Escape は当該起動中だけ閉じる。「この保存先では今後表示しない」は現在の
   パスを設定へ保存し、正規化後に同じ場所である間は次回以降表示しない。保存先が変われば再表示する。
+
+初回設定と起動時の通知/復元案内は、1093×614 logical points の小画面でも操作できる。
+長い本文/選択肢をスクロールさせ、開始/閉じる/終了ボタンは本文の外に固定する。
+初回設定は「開始」または選択肢にフォーカスがないときの Enter で現在の設定を確定する。
+IME 変換中の Enter は確定に使わず、Esc ではセットアップを省略しない。
 
 ### 環境設定の持ち運び
 
@@ -2098,19 +2103,20 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `show_address_bar_stack_toggle` | bool | true | フォルダバーに「スタック」表示トグルボタンを出すか。フォルダバー左端「フォルダ:」の右クリックメニューで切替 |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ。最大 100 件 (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` / `auto_index_similar` の 4 フラグ)。`auto_index_similar` は欠落時 false の加算フィールド。キー割り当てで直接開ける番号枠は 1〜20 |
 | `smart_folders` | Vec\<SmartFolderDefinition\> | [] | 任意の複数実フォルダを横断する保存済み snapshot view。定義 UUID、名前、ルールごとの検索元 UUID/path/enabled、保存フィルタ、相対フォルダの並び単位を保持。通常一覧と共通のソート順・サムネイル / 詳細表示は保持せず、索引 / watcher も持たない。開く・更新時に再走査する |
-| `last_folder` | Option\<PathBuf\> | None | 前回終了した場所。実フォルダの場合はそのパス、ドライブ一覧の場合は空パス sentinel を保存する。起動時の場所が「前回終了した場所」のときに使用する。実フォルダの末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |
+| `last_folder` | Option\<PathBuf\> | None | 旧復元値と互換 carrier。実フォルダ／本はパス、ドライブ一覧は空パス sentinel を保存する。新しい起動復元 record が無い旧設定の初回移行と、Desktop／Specific の既存 fallback 用に保持する。新 record をこの値で上書きしない |
+| `startup_list_restore` | Option\<StartupListRestore\> | V1 / Unavailable | 「前回終了した場所」の正本。main で最後に明示した復元可能な物理フォルダ／本／ドライブ一覧と、対応する名前・行位置の cursor hint を一つの record に保存する。本の内部 load／直接ページ表示／読書中の本移動／reload は target を更新しない。採用済みの本一覧を明示表示する要求は main の受理時に更新し、遅延 close 完了時に再更新しない。ZIP の実効 prefix と変換書庫の元 logical source を保持する。合成一覧と independent viewer は更新しない。旧設定で欠落時は旧 `last_folder` と cursor を一度だけそのまま移行する。環境設定 export/import の対象外 |
 | `book_root` | Option\<PathBuf\> | None | 製本ルート。`None` のときは `Pictures\mimageviewer\books` を使う。Ctrl+S/Ctrl+G の自動索引対象外で、お気に入り追加対象外。本棚メニューからは Explorer ではなく mIV 内の `本棚` 仮想表示として開く |
 | `active_book_name` | String | `名前なし` | 製本メニュー / ツールバー / 追加ショートカットからページを追加する先の本名。製本ルート直下のフォルダ名として使う |
-| `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=前回終了した場所、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ |
+| `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=最後に明示した復元可能な一覧、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ。Previous は一覧を開き、自動 fullscreen は開始しない |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
-| `restore_last_cursor` | bool | true | 前回終了時に選んでいた項目へカーソルを戻すか。**前回いた場所そのものを開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。既存利用者は `serde(default)` で ON になる |
-| `last_cursor_name` | Option\<String\> | None | 前回終了時に選んでいた項目の名前。`last_folder` と対でしか意味を持たないので、合成ビュー (検索結果など) やドライブ一覧で終了したときは `None` を書いて破棄する。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
+| `restore_last_cursor` | bool | true | 復元する一覧で選んでいた項目へカーソルを戻すか。**同じ論理場所と ZIP 階層を開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。直接読書中は出発元一覧の hint を保持し、本のページ名を親一覧に保存しない。既存利用者は `serde(default)` で ON になる |
+| `last_cursor_name` | Option\<String\> | None | `last_folder` と対になる旧 cursor の互換 carrier。新 record が無い旧設定の初回移行に使う。新しい明示一覧の cursor は `startup_list_restore` が所有し、合成一覧・読書中の終了で旧値を転用しない。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
 | `last_cursor_rows_above` | Option\<u32\> | None | そのカーソルが画面の一番上の行から何行下にあったか。スクロール位置 (pt) を保存しないのは、ウィンドウ幅や列数が変わると同じ pt が別の行を指すため。復元は現在の列数と行高から計算し直す。`None` は「一番上にいた」ではなく**分からない**で、その場合は従来どおり見える最小限だけ動かす |
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。フォルダバー左端の `フォルダ:` ラベルの右クリックメニューからクリアできる |
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
-| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所の選択は従来の `last_folder` / 起動設定のまま |
+| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所は起動設定と Previous 専用の明示一覧 record から選び、保存スロットの場所で上書きしない |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |
@@ -2199,8 +2205,33 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 
 ### 8.4 その他
 
+環境設定「起動と連携 → クリップボード取り込み」では画像コピーの自動保存、HTML の画像選択通知と保存先を設定する。
+監視は mIV の起動中だけ動き、タスクトレイ常駐と組み合わせて使える。保存先は変更・既定に戻す・
+フォルダを開くに対応し、月ごとのサブフォルダを最初の保存時に作成する。監視が有効なときは
+メインウィンドウの「場所▼」に保存先を表示する。既定保存先は App 起動後に背景 thread で一度だけ
+解決し、監視・設定画面・場所▼で同じ結果を共有する。解決前は場所▼に項目を出さず、設定画面は
+「確認中」と表示する。保存 worker は解決を待つが、UI thread は待たない。Remote の場所一覧には追加しない。
+画像・HTML の監視は個別に ON/OFF できる。HTML の選択ダイアログと手動 Ctrl+V は §8.11 を参照。
+監視の reader は最後の通知から 300 ms 新しい通知がなくなるまで待ち、複数回に分けたコピーの書き込みを妨げない。
+UI thread は待たず、待機中の通知は合流し、stop・設定世代の変更で解除する。除外形式・自身の印・ファイル類・
+既知の Office 形式・有効設定と種別ごとの基準 sequence を満たす画像も HTML もない内容はクリップボードを開かずに除外する。
+候補でも要求・形式確認前・形式確認後の sequence が一致しなければ開かず、最新通知を優先して読み直す。
+通知なしで読み直す場合は観測時刻から 300 ms 待つ。同じ設定スナップショットでの読み直しは 1 回までとする。
+履歴フラグの値と PowerPoint prefix は開いた後に確認する。受理と重複判定は sequence・世代・内容で行う。
+保存完了の小窓の「開く」は、一覧表示中でモーダル・Remote の操作占有・移動の準備が
+ない場合だけ App がメインを前面に出し、保存先へ移動して保存ファイルを選択する。小窓 thread は
+typed event の送信だけを行い、前面化しない。受付できない場合は前面化せず、小窓を
+「一覧画面に戻ると、場所▼の『クリップボード取り込み』から開けます」に差し替える。
+メインのトーストは使わず、フルスクリーンの終了や保留は行わない。
+「開く」は送信時に応答待ちとなり、同じ通知の連続クリックで要求を重複送信しない。
+保存先選択の結果は表示ページに関係なく環境設定の共通 poll で回収し、選択処理中は OK を無効化する。
+
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
+| `clipboard_capture_image_enabled` | bool | false | 起動中にコピーされた画像を自動保存する |
+| `clipboard_capture_html_enabled` | bool | false | コピーされたページ HTML の画像候補を小窓で通知し、「画像を選んで保存」からダイアログを開く |
+| `clipboard_capture_output_dir` | Option\<PathBuf\> | None | None は `capture::default_output_dir().join("clipboard")` (= ピクチャ/mimageviewer/clipboard、Pictures を得られない場合は data-dir の captures/clipboard) |
+| `clipboard_capture_min_short_side_px` | u32 | 100 | 選択ダイアログの最小サイズ (短辺 px)。0〜32768。live 設定へ反映し、既存の保存境界で永続化。次のダイアログの初期値。`settings_transfer` 対象 |
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `pdf_worker_count` | u32 | 5 | PDF worker pool のプロセス数。UI と起動時読み出しは 3〜10 に clamp する。pool は遅延初期化だが、起動時に static snapshot へ固定するため変更は常に次回起動から有効 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30）。PDF/変換アーカイブはコンテナ候補として停止対象 |
@@ -2239,7 +2270,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズの全体 ON/OFF。ON のとき、選択中の音声トラックの測定値を使い -14 LUFS 相当の音量にする。測定結果はトラックごとに保存し、再生開始前から適用する。未測定のトラックは再生前に自動測定し、長い動画では途中の測定値で再生を始めて、測定完了後に音量を徐々に合わせる。測定を中止したトラックは、同じ動画を表示している間は自動で測り直さず、Norm ボタンから再開できる。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
-| `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
+| `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。main の静止画読書（画像のみフォルダ本を含む）を閉じる際、明示一覧 record が現在の本の親一覧なら既存の親戻りでそこへ戻し、record と読書位置を保持する。判定は採用済みの一覧に基づき、読書中の画像フォルダ自動オープン設定変更には依存しない。本一覧を明示済みならその一覧に留まる。tray 復帰は起動復元を実行しない。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
 | `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動や途中終了による未反映は [今すぐ確認] で反映する。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
@@ -2589,6 +2620,40 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
   (`SHGetKnownFolderPath(FOLDERID_Desktop)` で解決) に
   `mImageViewer_diag_<日時>.zip` として保存する。rotate 済みの perf 世代
   (`perf_events.1.jsonl` 等) は巨大なので除外する。
+
+### 8.11 クリップボード取り込み
+
+Windows のクリップボードから画像とページ HTML を取り込む。App 所有のサービスで、
+切り取り表示 (`cut_clipboard`) と viewer context の寿命から独立する。
+詳細な取得・除外・上限・受付規則は [clipboard-capture-plan.md](clipboard-capture-plan.md) を正本とする。
+
+設定項目・既定値は §8.4 を参照。「画像がコピーされたら自動で保存する」は画像を PNG にして
+自動保存する。「ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする」は
+SourceURL と画像候補のある HTML を検出して小窓へ通知する。自動取り込みは取り込み時の日時の
+`YYYY-MM` 子フォルダへ保存し、手動取り込みは現在の実フォルダ直下へ保存する。
+
+- 監視はチェックが ON の種類に限る。自動監視ではファイル類、Office 形式、文章だけの内容、
+  自身の印、監視除外形式、直前と同じデコード画像などを除外する。HTML は画像形式より優先しない。
+  `場所▼` の「クリップボード取り込み」は画像・HTML のいずれかが ON のときだけ表示する。
+- 手動 Ctrl+V はファイル類 → 画像 → HTML → 従来 Shell の順に分岐する。監視設定・Office 除外・
+  自身の印・重複抑止は適用しない。画像と選んだ HTML 画像は `current_favorite_target()` の実フォルダ直下へ
+  保存する。HTML 分岐で SourceURL なし・候補 0 件のときはトーストだけで終了し、Shell へ戻さない。
+- 選択ダイアログの受付は一覧表示中・モーダルなし・Remote が操作を握っていない・移動準備中でないこと。
+  小窓からの要求も App が判定し、受付後だけ前面化する。拒否時は小窓を
+  「一覧画面で Ctrl+V を押すと開けます」へ差し替える。開いている間の新たな HTML 検出は無視する。
+  検出時のスナップショットを使い、クリック時にクリップボードを読み直さない。
+- ダイアログは `Fetching` → `Saving` の一方通行。取得した原本のハッシュで同一内容を統合し、
+  最小サイズ以上を既定で選択する。取得失敗は理由付きで選択不可。取得完了後に保存でき、
+  Saving 中の「閉じる」・Esc・タイトルバー × は拒否する。完了・途中失敗の件数と理由はメインのトーストで通知し、
+  保存済みは残す。
+- HTML は context の base と fragment の候補を分離し、SVG を候補から除く。取得は 4 worker、
+  session ごとの Agent / resolver / pool、最大 5 段の自前 redirect と段ごとの参照元・宛先検査を使う。
+  Cookie やブラウザの認証状態は共有しない。HTTP(S) は GET、`data:` は通信せずにデコードする。
+  取得・読取・デコード・保存は UI thread で行わない。
+- 自動画像は PNG、HTML は先頭バイトで識別した対応画像形式の原本を保存する。
+  `日時[-衝突番号][-ページドメイン]_連番.拡張子` により 1 コピーを 1 スタックにまとめられる。
+  `.part` から上書きなしで公開し、URL がある場合は Zone.Identifier に `ZoneId=3`、
+  `ReferrerUrl`（ページ）、`HostUrl`（画像）を記録する。
 
 ### Ctrl+E エクスポート
 

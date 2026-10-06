@@ -4789,6 +4789,8 @@ mod tests {
                 super::super::ClassifiedOpenContinuation::Direct {
                     auto_fullscreen: false,
                     owner: super::super::OpenRequestOwner::Navigation,
+
+                    restore_intent: crate::app::StartupListIntent::ExplicitList,
                 },
             ),
             super::super::OpenAdmission::Accepted
@@ -4819,6 +4821,7 @@ mod tests {
                 super::super::OpenRequestOwner::Navigation,
                 &path,
                 super::super::PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             super::super::PdfOpenFailureRoute::ConversionDialogOpened,
         );
@@ -4858,6 +4861,7 @@ mod tests {
                 auto_fullscreen: false,
             },
             epub.clone(),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         app.settle_open_path_classification_for_test();
         let Some(super::super::HistoryNavigationTransition::Physical(mut request)) =
@@ -4937,6 +4941,7 @@ mod tests {
                     super::super::OpenRequestOwner::Navigation,
                     &epub,
                     super::super::PdfOpenFailure::NotConverted,
+                    crate::app::StartupListIntent::ExplicitList,
                 ),
                 super::super::PdfOpenFailureRoute::ConversionDialogOpened
             );

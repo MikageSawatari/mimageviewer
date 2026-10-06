@@ -1303,10 +1303,21 @@ impl App {
             });
         }
         match self.collection_grid_physical_load_owner(index, &path) {
-            Some(owner) => crate::ui_main::AddressBarNav::CollectionSource { path, owner },
+            Some(owner) => crate::ui_main::AddressBarNav::CollectionSource {
+                path,
+                owner,
+                restore_intent: super::StartupListIntent::container_open(auto_fullscreen),
+            },
             None => match self.rating_view_physical_load_owner(&path) {
-                Some(owner) => crate::ui_main::AddressBarNav::RatingSource { path, owner },
-                None => crate::ui_main::AddressBarNav::Direct(path),
+                Some(owner) => crate::ui_main::AddressBarNav::RatingSource {
+                    path,
+                    owner,
+                    restore_intent: super::StartupListIntent::container_open(auto_fullscreen),
+                },
+                None => crate::ui_main::AddressBarNav::Direct(
+                    path,
+                    super::StartupListIntent::container_open(auto_fullscreen),
+                ),
             },
         }
     }
@@ -2297,6 +2308,7 @@ impl App {
                             String::new()
                         },
                     },
+                    crate::app::StartupListIntent::ExplicitList,
                 )
             }
             PhysicalHistoryPreflightPayload::Zip(enumeration)
@@ -2305,6 +2317,7 @@ impl App {
                     backing.clone(),
                     enumeration,
                     aliased.then_some(path.as_path()),
+                    crate::app::StartupListIntent::ExplicitList,
                 );
                 if aliased {
                     self.address = path.to_string_lossy().to_string();
@@ -2329,7 +2342,8 @@ impl App {
                     self.load_pdf_as_folder_prepared_with_password(
                         path,
                         pages,
-                        pdf_password_override
+                        pdf_password_override,
+                        crate::app::StartupListIntent::ExplicitList,
                     ),
                     super::FolderOpenOutcome::Loaded
                 )
@@ -3680,6 +3694,7 @@ mod tests {
             child.clone(),
             Some(scan),
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.collection_grid_parent_nav(),
@@ -3739,7 +3754,7 @@ mod tests {
             let parent = temp.path().to_path_buf();
             assert!(matches!(
                 history_grid_key(resumed, egui::Key::Backspace),
-                Some(crate::ui_main::AddressBarNav::Direct(path))
+                Some(crate::ui_main::AddressBarNav::Direct(path, _))
                     if crate::folder_tree::path_eq(&path, &parent)
             ));
             let scan =
@@ -3749,6 +3764,7 @@ mod tests {
                 parent.clone(),
                 Some(scan),
                 super::super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
             ));
             assert_eq!(resumed.current_folder.as_deref(), Some(parent.as_path()));
             assert!(matches!(
@@ -4131,7 +4147,7 @@ mod tests {
         app.open_collection_grid(collection.collection_id(), None);
         wait_for_grid(&mut app, collection.collection_id());
         app.selected = Some(0);
-        let Some(crate::ui_main::AddressBarNav::CollectionSource { path, owner }) =
+        let Some(crate::ui_main::AddressBarNav::CollectionSource { path, owner, .. }) =
             history_grid_key(&mut app, egui::Key::Enter)
         else {
             panic!("Enter must route the Collection root row to its physical child");
@@ -4142,6 +4158,7 @@ mod tests {
             path,
             Some(scan),
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         let child_target = app.folder_nav_current_target().expect("adopted child");
         let root_target = app
@@ -4234,7 +4251,7 @@ mod tests {
         else {
             panic!("Enter must route the Rating row to its physical child");
         };
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         poll_real_history_load(&mut app, Some(&rated_child), None);
         let child_target = app.folder_nav_current_target().expect("Rating child");
         assert_eq!(app.folder_history_back_target(), Some(&root_target));
@@ -4281,11 +4298,12 @@ mod tests {
                 path.clone(),
                 Some(scan),
                 super::super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
             ));
         }
         let child_target = app.folder_nav_current_target().expect("physical child");
         let parent_target = app.folder_history_back_target().cloned().expect("parent");
-        let Some(crate::ui_main::AddressBarNav::Direct(path)) =
+        let Some(crate::ui_main::AddressBarNav::Direct(path, _)) =
             history_grid_key(&mut app, egui::Key::Backspace)
         else {
             panic!("Backspace must route to the physical parent");
@@ -4297,6 +4315,7 @@ mod tests {
             path,
             Some(scan),
             super::super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.folder_nav_current_target(), Some(parent_target.clone()));
         assert_eq!(app.folder_history_back_target(), Some(&child_target));
@@ -4332,6 +4351,7 @@ mod tests {
                 path,
                 Some(scan),
                 super::super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
             ));
             assert_eq!(app.folder_history_forward_target(), forward);
         }
@@ -5781,6 +5801,7 @@ mod tests {
             physical_b.clone(),
             Some(scan),
             super::super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(
             matches!(
@@ -5829,6 +5850,7 @@ mod tests {
             temp.path().join("missing-folder"),
             None,
             super::super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -5909,6 +5931,7 @@ mod tests {
             physical_b.clone(),
             Some(scan),
             super::super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(physical_b.as_path()));
         assert!(
@@ -7082,6 +7105,7 @@ mod tests {
             root.clone(),
             Some(scan),
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.folder_history_back_target(),
@@ -7104,6 +7128,7 @@ mod tests {
             descendant.clone(),
             Some(scan),
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.folder_history_back_target(),
@@ -7167,6 +7192,7 @@ mod tests {
             zip_path.clone(),
             None,
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.top_level_grid_view
@@ -7311,6 +7337,7 @@ mod tests {
                 source.clone(),
                 None,
                 super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+                crate::app::StartupListIntent::ExplicitList,
             ));
             app.settle_open_path_classification_for_test();
             assert!(
@@ -7324,7 +7351,9 @@ mod tests {
             );
         } else {
             let owner = app.rating_view_physical_load_owner(&source).unwrap();
-            assert!(app.start_rating_physical_open(owner));
+            assert!(
+                app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList)
+            );
         }
         poll_real_history_load(&mut app, Some(&source), pdf_pages.as_ref());
         assert!(
@@ -7485,6 +7514,7 @@ mod tests {
                 super::super::OpenRequestOwner::Navigation,
                 None,
                 Some(source.clone()),
+                crate::app::StartupListIntent::ExplicitList,
             ),
             super::super::FolderOpenOutcome::Loaded
         );
@@ -7656,6 +7686,7 @@ mod tests {
             epub.clone(),
             None,
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         poll_until(
             &mut app,
@@ -7694,6 +7725,7 @@ mod tests {
             epub.clone(),
             None,
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         poll_until(
             &mut app,
@@ -7711,6 +7743,7 @@ mod tests {
             },
             original.surface_generation,
             original.smart_transition_sequence,
+            crate::app::StartupListIntent::ExplicitList,
         );
         saved.continuation = original.continuation.clone();
         app.epub_convert = Some(saved);
@@ -7791,6 +7824,7 @@ mod tests {
             source.clone(),
             false,
             owner,
+            crate::app::StartupListIntent::ExplicitList,
         );
         app.settle_open_path_classification_for_test();
         poll_until(&mut app, "stale Collection tile did not settle", |app| {
@@ -7839,6 +7873,7 @@ mod tests {
             zip_path,
             None,
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         poll_until(&mut app, "failed ZIP preflight did not finish", |app| {
             app.top_level_grid_view
@@ -7881,6 +7916,7 @@ mod tests {
                 pdf_path.clone(),
                 None,
                 super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+                crate::app::StartupListIntent::ExplicitList,
             ));
             seed_physical_history_preflight(
                 &mut app,
@@ -7958,6 +7994,7 @@ mod tests {
             root.clone(),
             Some(scan),
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         let index = app.items.iter().position(|item| {
             matches!(item, GridItem::ZipFile(path) if crate::folder_tree::path_eq(path, &zip_path))
@@ -7971,6 +8008,7 @@ mod tests {
             zip_path.clone(),
             None,
             super::super::OpenRequestOwner::CollectionGridPhysical(owner.clone()),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.items, before_items);
         assert_eq!(app.folder_nav_back_stack, before_back);
@@ -7994,11 +8032,13 @@ mod tests {
             other.clone(),
             Some(scan),
             super::super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(!app.load_folder_with_scan_owned(
             zip_path,
             None,
             super::super::OpenRequestOwner::CollectionGridPhysical(stale_owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(other.as_path()));
         app.shutdown_collection_runtime_for_exit();
@@ -8026,7 +8066,8 @@ mod tests {
         assert!(app.load_folder_with_scan_owned(
             folder.clone(),
             Some(scan),
-            super::super::OpenRequestOwner::CollectionGridPhysical(owner)
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         app.selected = app
             .items
@@ -8313,7 +8354,7 @@ mod tests {
         app.with_viewer_context(sibling, |sibling| {
             assert!(matches!(
                 sibling.resolve_return_to_parent_nav(),
-                Some(crate::ui_main::AddressBarNav::Direct(path)) if path == sibling_parent
+                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == sibling_parent
             ));
             assert_eq!(sibling.select_after_load.as_deref(), Some("other.pdf"));
         })
@@ -8353,6 +8394,7 @@ mod tests {
             physical.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -8423,6 +8465,7 @@ mod tests {
             temp.path().join("missing"),
             None,
             crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -8919,6 +8962,7 @@ mod tests {
             root.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::CollectionGridPhysical(stale_root.clone()),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.top_level_grid_view
@@ -8939,6 +8983,7 @@ mod tests {
             root.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::CollectionGridPhysical(stale_root),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.top_level_grid_view
@@ -9036,6 +9081,7 @@ mod tests {
             nested.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::CollectionGridPhysical(continuation),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
         assert!(matches!(
@@ -9051,6 +9097,7 @@ mod tests {
             nested.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::CollectionGridPhysical(reload_owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
 
@@ -9088,6 +9135,7 @@ mod tests {
             deeper.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(deeper.as_path()));
         assert!(matches!(

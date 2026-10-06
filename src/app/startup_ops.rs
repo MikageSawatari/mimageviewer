@@ -1039,6 +1039,7 @@ impl App {
             result.elapsed_ms
         ));
 
+        self.capture_main_list_restore_cursor();
         let select_requested_file = resolution.requested_is_file
             && matches!(
                 resolution.kind,
@@ -1061,6 +1062,7 @@ impl App {
                     openable,
                     true,
                     owner.open_request_owner(),
+                    super::StartupListIntent::PageContinuation,
                 );
                 if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.open_startup_file_if_visible(&result.requested);
@@ -1158,6 +1160,11 @@ impl App {
             openable,
             auto_fullscreen,
             owner.open_request_owner(),
+            if select_requested_file {
+                super::StartupListIntent::PageContinuation
+            } else {
+                super::StartupListIntent::container_open(auto_fullscreen)
+            },
         );
         if let Some(scan) = scan {
             scan.finish(
@@ -1481,6 +1488,14 @@ impl App {
         correlation: u64,
         watch: Option<WatchHandle>,
     ) -> Outcome {
+        if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Previous {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("previous-list-call-return");
+            self.open_previous_startup_list();
+            load.finish(Outcome::Ok);
+            return Outcome::Ok;
+        }
         if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::ReadingHistory {
             let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
                 .watched_optional(watch)

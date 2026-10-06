@@ -24,6 +24,8 @@ use crate::key_input::{
 use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 
 mod capture;
+#[cfg(feature = "test-script")]
+mod clipboard_capture;
 pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -1000,8 +1002,55 @@ pub(crate) fn collection_sort_popup_snapshot(ctx: &egui::Context) -> TestScriptC
     })
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ClipboardCaptureSmokeSnapshot {
+    pub(crate) monitor_ready: bool,
+    pub(crate) image_enabled: bool,
+    pub(crate) html_enabled: bool,
+    pub(crate) dialog_open: bool,
+    pub(crate) fetch_complete: bool,
+    pub(crate) selected_count: i64,
+    pub(crate) dialog_destination: String,
+    pub(crate) minimum_short_side_px: i64,
+    pub(crate) popup_visible: bool,
+    pub(crate) popup_shows: i64,
+    pub(crate) popup_requests: i64,
+    pub(crate) save_requests: i64,
+    pub(crate) open_count: i64,
+    pub(crate) automatic_sequence: i64,
+    pub(crate) paste_count: i64,
+}
+
+impl ClipboardCaptureSmokeSnapshot {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        macro_rules! insert {
+            ($field:ident) => {
+                map.insert(stringify!($field).into(), self.$field.clone().into());
+            };
+        }
+        insert!(image_enabled);
+        insert!(monitor_ready);
+        insert!(html_enabled);
+        insert!(dialog_open);
+        insert!(fetch_complete);
+        insert!(selected_count);
+        insert!(dialog_destination);
+        insert!(minimum_short_side_px);
+        insert!(popup_visible);
+        insert!(popup_shows);
+        insert!(popup_requests);
+        insert!(save_requests);
+        insert!(open_count);
+        insert!(automatic_sequence);
+        insert!(paste_count);
+        map
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
+    pub(crate) clipboard_capture: ClipboardCaptureSmokeSnapshot,
     pub(crate) is_fullscreen: bool,
     pub(crate) always_on_top: bool,
     pub(crate) window_visible: bool,
@@ -1136,6 +1185,7 @@ impl TestScriptHostStyle {
 impl Default for TestScriptSnapshot {
     fn default() -> Self {
         Self {
+            clipboard_capture: ClipboardCaptureSmokeSnapshot::default(),
             is_fullscreen: false,
             always_on_top: false,
             window_visible: true,
@@ -1206,6 +1256,10 @@ impl Default for TestScriptSnapshot {
 impl TestScriptSnapshot {
     fn to_rhai_map(&self) -> Map {
         let mut map = Map::new();
+        map.insert(
+            "clipboard_capture".into(),
+            self.clipboard_capture.to_rhai_map().into(),
+        );
         macro_rules! insert {
             ($field:ident) => {
                 map.insert(
@@ -1433,6 +1487,8 @@ enum CaptureScope {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiSmokeAction {
+    ClipboardMonitorsOn,
+    ClipboardMonitorsOff,
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
@@ -2809,6 +2865,8 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    #[cfg(feature = "test-script")]
+    clipboard_capture::register(engine, bridge.clone());
     let always_on_top_bridge = bridge.clone();
     engine.register_fn(
         "always_on_top_smoke",
@@ -6026,6 +6084,15 @@ mod tests {
         }
     }
 
+    fn wait_for_runner_exit(rx: &mpsc::Receiver<UiCommand>) {
+        // Finished is sent before its wake callback. The last sender drops only
+        // after that callback returns, so disconnection fences wake assertions.
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
     #[test]
     fn cli_requires_isolated_data_dir() {
         let parsed = cli_script_path_from(&args(&[
@@ -6243,6 +6310,7 @@ mod tests {
                 ..
             }))
         ));
+        wait_for_runner_exit(&rx);
         assert_eq!(wakes.load(AtomicOrdering::Relaxed), commands.len());
     }
 
@@ -6680,6 +6748,7 @@ mod tests {
                 ..
             }))
         ));
+        wait_for_runner_exit(&rx);
         assert_eq!(
             wakes.load(AtomicOrdering::Relaxed),
             commands.len() + 1,
@@ -7028,6 +7097,48 @@ mod tests {
         let (bridge, _, _) = runner_bridge(ready_snapshot());
         let source = include_str!("../scripts/ui-smoke/audio-tracks.rhai");
         build_engine(bridge).compile(source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn clipboard_capture_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        build_engine(bridge)
+            .compile(include_str!("../scripts/ui-smoke/clipboard-capture.rhai"))
+            .unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn clipboard_capture_registered_api_rejects_unknown_actions_without_os_access() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        let error = build_engine(bridge)
+            .eval::<()>("clipboard_capture_smoke(\"unknown\");")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown clipboard smoke action"));
+        assert!(rx.try_recv().is_err());
+        let snapshot = ClipboardCaptureSmokeSnapshot {
+            monitor_ready: true,
+            open_count: 17,
+            popup_requests: 23,
+            popup_shows: 29,
+            save_requests: 31,
+            automatic_sequence: 37,
+            paste_count: 41,
+            ..Default::default()
+        };
+        let map = snapshot.to_rhai_map();
+        assert!(map["monitor_ready"].as_bool().unwrap());
+        for (field, expected) in [
+            ("open_count", 17),
+            ("popup_requests", 23),
+            ("popup_shows", 29),
+            ("save_requests", 31),
+            ("automatic_sequence", 37),
+            ("paste_count", 41),
+        ] {
+            assert_eq!(map[field].as_int().unwrap(), expected);
+        }
     }
 
     #[cfg(feature = "test-script")]

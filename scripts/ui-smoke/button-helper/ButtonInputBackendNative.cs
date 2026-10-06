@@ -321,6 +321,18 @@ namespace Miv.UiSmoke.ButtonHelperDraft
         {
             [FieldOffset(0)]
             internal MouseInput Mouse;
+            [FieldOffset(0)]
+            internal KeyboardInput Keyboard;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct KeyboardInput
+        {
+            internal ushort VirtualKey;
+            internal ushort ScanCode;
+            internal uint Flags;
+            internal uint Time;
+            internal UIntPtr ExtraInfo;
         }
 
         [StructLayout(LayoutKind.Sequential)]

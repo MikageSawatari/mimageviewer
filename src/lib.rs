@@ -60,6 +60,7 @@ pub mod canonical_image_loader;
 pub mod capture;
 pub mod catalog;
 pub mod changelog_markdown;
+mod clipboard_capture;
 pub mod collection_store;
 pub mod color_search;
 pub mod colorize;
@@ -97,6 +98,7 @@ pub(crate) mod presentation_observer;
 mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
+mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
 /// (HWND 引数の関数群の呼び出し元はすべて cfg(windows) 済み)。
@@ -296,6 +298,14 @@ pub use ui_raw::{
 };
 pub mod ui_dialogs;
 mod ui_sns_split;
+#[doc(hidden)]
+pub use ui_dialogs::clipboard_capture::draw_capture_selection_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_clipboard_capture_html_settings_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_clipboard_capture_settings_pending_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_clipboard_capture_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_effetune_input_limit_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;

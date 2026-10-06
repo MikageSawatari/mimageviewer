@@ -20,7 +20,8 @@ function Import-UiSmokeButtonHelperTypes {
         (Join-Path $HelperRoot 'ButtonInputBackendNative.cs'),
         (Join-Path $HelperRoot 'LocalButtonPipe.cs'),
         (Join-Path $HelperRoot 'ButtonHelperHost.cs'),
-        (Join-Path $HelperRoot 'ButtonHelperRunnerApi.cs')
+        (Join-Path $HelperRoot 'ButtonHelperRunnerApi.cs'),
+        (Join-Path $HelperRoot 'ClipboardKeyHelper.cs')
     )
     foreach ($sourcePath in $sourcePaths) {
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {

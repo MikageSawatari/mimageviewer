@@ -25,6 +25,7 @@
 | [section164-force-new-crop-frame.md](section164-force-new-crop-frame.md) | §1.164 修飾キーによる切り取り枠の新規作成。開始時の操作決定、Spaceパン優先、キー割り当てと入力所有の維持 |
 | [section221-context-menu-layout.md](section221-context-menu-layout.md) | §1.221 右クリック専用設定ページ、表示場面の確認と項目・区切り線の編集。静的項目と動的固定枠の分離、設定互換性、共通メニュー解決と検証記録 |
 | [section220-cut-item-appearance.md](section220-cut-item-appearance.md) | §1.220 切り取り中の実項目表示。クリップボードの所有・通知・貼り付け結果、Explorer形式の読取と、半透明の一覧内容・ハサミ表示の描画境界 |
+| [clipboard-capture-plan.md](clipboard-capture-plan.md) | **設計確定 (第 8 版)・S1 実装中**。クリップボード取り込み。コピーした画像の自動保存と、コピーしたページ HTML の画像を選んで保存する機能。専用 listener、右下の非アクティブ小窓、参照元の規則、ファイル名とスタック、段階と検証 |
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
@@ -41,6 +42,7 @@
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
+| [startup-restore-target-plan.md](startup-restore-target-plan.md) | §1.335「前回終了した場所」の明示一覧所有、物理／本／Drive の復元範囲、旧データの初回移行、ZIP 内階層、一覧復帰要求の受理境界と回帰検証。実機確認は未実施 |
 | [collection-rereview-fixes-20260921.md](collection-rereview-fixes-20260921.md) | v4.0.0再レビューの追加修正。指摘の妥当性、直列の実装範囲、バックアップ・復旧・待機要求の設計合意と検証記録 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
 | [collection-playback-plan.md](collection-playback-plan.md) | Phase 4のPC向けCtrl+上下、通常next / prev、slideshow、三媒体EOFを最新prepared順へ接続した所有設計と検収記録 |
@@ -81,7 +83,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全433フィールドの分類 (130対象 / 303除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全441フィールドの分類 (131対象 / 310除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
@@ -154,6 +156,7 @@
 | [development-build-and-test.md](development-build-and-test.md) | 開発中の `cargo check` / 絞り込みテスト / 軽量 core ビルドと、リリース前の全体テストゲートの使い分け |
 | [test-video-generation.md](test-video-generation.md) | `testimage/movie/test_*fps_*p_sync.mp4` (FFmpeg testsrc2 + sine ビープ) の再生成手順 |
 | [ui-snapshot-policy.md](ui-snapshot-policy.md) | egui_kittest によるスナップショットテストの運用方針 |
+| [startup-dialog-small-screen.md](startup-dialog-small-screen.md) | §1.241の小画面初回設定対策。起動時通知/復元経路の監査と1093×614 / 1366×728の描画回帰 |
 | [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) | 静止画縮小時のモアレ原因と、vendored `egui-wgpu` による opt-in GPU mipmap、旧手動縮小フィルタの互換撤去方針 |
 | [keymap-spec.md](keymap-spec.md) | キー / マウス操作仕様。フルスクリーン横断の詳細は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) も参照 |
 | [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 |
