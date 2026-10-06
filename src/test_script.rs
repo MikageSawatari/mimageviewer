@@ -6026,6 +6026,15 @@ mod tests {
         }
     }
 
+    fn wait_for_runner_exit(rx: &mpsc::Receiver<UiCommand>) {
+        // Finished is sent before its wake callback. The last sender drops only
+        // after that callback returns, so disconnection fences wake assertions.
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
     #[test]
     fn cli_requires_isolated_data_dir() {
         let parsed = cli_script_path_from(&args(&[
@@ -6243,6 +6252,7 @@ mod tests {
                 ..
             }))
         ));
+        wait_for_runner_exit(&rx);
         assert_eq!(wakes.load(AtomicOrdering::Relaxed), commands.len());
     }
 
@@ -6680,6 +6690,7 @@ mod tests {
                 ..
             }))
         ));
+        wait_for_runner_exit(&rx);
         assert_eq!(
             wakes.load(AtomicOrdering::Relaxed),
             commands.len() + 1,
