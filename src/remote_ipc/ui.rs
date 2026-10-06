@@ -3999,6 +3999,10 @@ impl crate::app::App {
                         crate::app::top_level_grid_view::TopLevelGridSurface::Folder
                     )
                 {
+                    miv_startup::record_detail(
+                        "initial-navigation.remote-return",
+                        "default-target-redispatch-timeline-only",
+                    );
                     self.open_default_startup_target();
                 }
             }

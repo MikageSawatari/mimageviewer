@@ -1533,7 +1533,8 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 440);
+        // video_watched_to_end is already an excluded field in the base policy.
+        assert_eq!(entries.len(), 441);
         assert_eq!(
             entries
                 .iter()

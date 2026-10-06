@@ -8869,6 +8869,11 @@ impl Settings {
         let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
+        let keymap_span =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::SettingsKeymap)
+                .watched_optional(miv_startup::watch_handle(
+                    miv_startup::WatchSlot::CoreStartup,
+                ));
         let legacy_keymap_import =
             if db_loaded && !MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
                 settings
@@ -8877,6 +8882,15 @@ impl Settings {
             } else {
                 crate::keymap::LegacyKeymapIniImport::default()
             };
+        keymap_span.finish(
+            if !db_loaded || MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
+                miv_startup::Outcome::Skipped
+            } else if legacy_keymap_import.warnings.is_empty() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            },
+        );
         if legacy_keymap_import.imported {
             settings_diag_log("settings: legacy keymap.ini imported into settings; backup pending");
         }
@@ -9022,9 +9036,19 @@ impl Settings {
             false
         };
         if bootstrap_saved && legacy_keymap_import.imported {
+            let keymap_span =
+                miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::SettingsKeymap)
+                    .watched_optional(miv_startup::watch_handle(
+                        miv_startup::WatchSlot::CoreStartup,
+                    ));
             let legacy_keymap_backup = settings
                 .keymap
                 .rename_imported_legacy_ini(&legacy_keymap_ini_path);
+            keymap_span.finish(if legacy_keymap_backup.warnings.is_empty() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            });
             if let Some(path) = legacy_keymap_backup.backup_path.as_ref() {
                 settings_diag_log(&format!(
                     "settings: legacy keymap.ini backup saved {}",

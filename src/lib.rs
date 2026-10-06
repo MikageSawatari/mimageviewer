@@ -308,6 +308,7 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
     draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
@@ -944,17 +945,80 @@ fn write_to_parent_console(msg: &str) {
     print!("{msg}");
 }
 
+/// Always-on startup observation. The work and its result retain their existing owner.
+pub(crate) fn startup_operation<T>(
+    stage: miv_startup::Stage,
+    detail: &str,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let span = miv_startup::span(miv_startup::Lane::Core, stage).detail(detail);
+    let span = if let Some(watch) = miv_startup::watch_handle(miv_startup::WatchSlot::CoreStartup) {
+        span.watched(watch)
+    } else {
+        span
+    };
+    let result = operation();
+    span.finish(miv_startup::Outcome::Ok);
+    result
+}
+
+pub(crate) fn startup_result<T, E>(
+    stage: miv_startup::Stage,
+    detail: &str,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let span = miv_startup::span(miv_startup::Lane::Core, stage).detail(detail);
+    let result = operation();
+    span.finish(if result.is_ok() {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
+    result
+}
+
+fn exit_startup(code: i32) -> ! {
+    miv_startup::terminal(if code == 0 {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
+    std::process::exit(code)
+}
+
 pub fn run() -> eframe::Result {
+    miv_startup::init_process(
+        miv_startup::Role::Core,
+        env!("CARGO_PKG_VERSION"),
+        cfg!(feature = "portable"),
+    );
+    let entry_trace = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::Entry);
+
     // Executable ownership is independent of --data-dir and includes workers.
     #[cfg(all(windows, not(feature = "portable")))]
-    let _runtime_lease = runtime_cleanup::pin_running_version()
-        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    let _runtime_lease = match startup_result(
+        miv_startup::Stage::RuntimePin,
+        "RuntimePin",
+        runtime_cleanup::pin_running_version,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            entry_trace.finish(miv_startup::Outcome::Error);
+            return Err(eframe::Error::AppCreation(Box::new(error)));
+        }
+    };
     #[cfg(windows)]
     let _startup_windows_diagnostics = startup_windows_diag::start();
     // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
     // worker モード等の前に処理する (これらは内部フラグで --version と衝突しない)。
-    if maybe_handle_version_or_help() {
-        std::process::exit(0);
+    if startup_operation(
+        miv_startup::Stage::Help,
+        "help-or-version",
+        maybe_handle_version_or_help,
+    ) {
+        miv_startup::record_detail("process.disposition", "help-or-version");
+        entry_trace.finish(miv_startup::Outcome::Ok);
+        exit_startup(0);
     }
     #[cfg(any(not(feature = "test-script"), not(windows)))]
     let test_script_requested = std::env::args_os()
@@ -966,12 +1030,14 @@ pub fn run() -> eframe::Result {
         write_to_parent_console(
             "error: --test-script requires a build with the test-script feature\n",
         );
-        std::process::exit(2);
+        entry_trace.finish(miv_startup::Outcome::Error);
+        exit_startup(2);
     }
     #[cfg(all(feature = "test-script", not(windows)))]
     if test_script_requested {
         write_to_parent_console("error: --test-script is only supported on Windows\n");
-        std::process::exit(2);
+        entry_trace.finish(miv_startup::Outcome::Error);
+        exit_startup(2);
     }
     #[cfg(all(feature = "test-script", windows))]
     let (test_script_path, test_evidence_dir) = {
@@ -983,7 +1049,8 @@ pub fn run() -> eframe::Result {
             (Ok(path), Ok(dir)) => (path, dir),
             (Err(error), _) | (_, Err(error)) => {
                 write_to_parent_console(&format!("error: {error}\n"));
-                std::process::exit(2);
+                entry_trace.finish(miv_startup::Outcome::Error);
+                exit_startup(2);
             }
         }
     };
@@ -993,19 +1060,23 @@ pub fn run() -> eframe::Result {
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
     let prog_start = Instant::now();
+    let arguments_trace = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::Args);
     let play_test_config = parse_play_test_config();
     #[cfg(windows)]
     let dcomp_presenter_config = dcomp_presenter_test::parse_config();
     let perf_log_path = parse_perf_log_path_arg();
     let startup_open_path = parse_startup_open_path_arg();
+    arguments_trace.finish(miv_startup::Outcome::Ok);
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
     if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
         // 親が `--data-dir` を継承させる。worker 分岐は通常 GUI 初期化より前なので、
         // ここで明示的に初期化しないと既定 APPDATA の pdfium.dll を見てしまう。
-        data_dir::init();
+        startup_operation(miv_startup::Stage::DataDir, "DataDir", || data_dir::init());
+        miv_startup::record_detail("process.disposition", "pdf-worker");
         pdf_loader::run_worker_process();
-        std::process::exit(0);
+        entry_trace.finish(miv_startup::Outcome::Ok);
+        exit_startup(0);
     }
 
     // --tensorrt-build <model_kind> モード: TensorRT エンジンビルダーワーカー。
@@ -1013,7 +1084,11 @@ pub fn run() -> eframe::Result {
     // load_model することで engine cache を populate する。stdout に進捗 JSON。
     if std::env::args().any(|a| a == ai::tensorrt_builder::TRT_BUILD_ARG) {
         // data_dir 初期化が必要 (engine cache path や DLL extract で使う)
-        data_dir::init();
+        startup_operation(miv_startup::Stage::DataDir, "DataDir", || data_dir::init());
+        miv_startup::record_detail("process.disposition", "tensorrt-build-worker");
+        entry_trace.finish(miv_startup::Outcome::Ok);
+        miv_startup::record_detail("process.disposition", "tensorrt-builder-handoff");
+        miv_startup::terminal(miv_startup::Outcome::Ok);
         ai::tensorrt_builder::run_worker_process();
     }
 
@@ -1022,23 +1097,42 @@ pub fn run() -> eframe::Result {
     // コマンドを受けて TRT セッションで推論を実行、共有メモリで結果を返す。
     // ホットリロード時の再起動なしバックエンド切替を実現するための分離。
     if ai::trt_worker_runtime::is_worker_invocation() {
-        data_dir::init();
+        startup_operation(miv_startup::Stage::DataDir, "DataDir", || data_dir::init());
+        miv_startup::record_detail("process.disposition", "tensorrt-infer-worker");
+        entry_trace.finish(miv_startup::Outcome::Ok);
+        miv_startup::record_detail("process.disposition", "tensorrt-inference-handoff");
+        miv_startup::terminal(miv_startup::Outcome::Ok);
         ai::trt_worker_runtime::run_infer_worker();
     }
 
     // --trt-smoke-test モード: TRT ワーカープール起動の動作確認用 (開発者向け)。
     // current_exe() が正しく mimageviewer.exe を返すため、本体に組み込んでいる。
     if std::env::args().any(|a| a == "--trt-smoke-test") {
-        data_dir::init();
-        logger::init();
+        startup_operation(miv_startup::Stage::DataDir, "DataDir", || data_dir::init());
+        startup_operation(miv_startup::Stage::Logger, "Logger", || logger::init());
+        entry_trace.finish(miv_startup::Outcome::Ok);
+        miv_startup::record_detail("process.disposition", "trt-smoke-handoff");
+        miv_startup::terminal(miv_startup::Outcome::Ok);
         run_trt_smoke_test();
     }
 
     // single-instance の実行時 namespace は、解決済み data_dir から導出する。
     // perf::init も logs_dir を使うため、従来どおり通常 logger より先に初期化する。
     let t0 = Instant::now();
-    data_dir::init();
+    startup_operation(miv_startup::Stage::DataDir, "DataDir", || data_dir::init());
     let data_dir_elapsed = t0.elapsed();
+    let selection = if std::env::args().any(|a| a == "--data-dir") {
+        "explicit"
+    } else if cfg!(feature = "portable") {
+        "portable"
+    } else {
+        "APPDATA"
+    };
+    miv_startup::record_data_dir(
+        &data_dir::get(),
+        selection,
+        std::env::current_exe().ok().as_deref(),
+    );
     #[cfg(windows)]
     if startup_windows_diag::enabled() {
         startup_windows_diag::set_log_dir(data_dir::get().join("logs"));
@@ -1070,18 +1164,30 @@ pub fn run() -> eframe::Result {
     let _single_instance = if skip_single_instance {
         None
     } else {
-        let guard = single_instance::SingleInstanceGuard::acquire();
+        let guard = startup_operation(
+            miv_startup::Stage::Instance,
+            "core-instance",
+            single_instance::SingleInstanceGuard::acquire,
+        );
         if !guard.is_first_instance() {
-            let forwarded = startup_open_path
-                .as_ref()
-                .is_some_and(|path| single_instance::send_open_path_to_existing(path));
+            let forwarded = startup_open_path.as_ref().is_some_and(|path| {
+                startup_operation(miv_startup::Stage::Ipc, "activation-open-path", || {
+                    single_instance::send_open_path_to_existing(path)
+                })
+            });
             // 2 重起動: 既存インスタンスの activate event を叩いてウィンドウを前面に出す。
             // ユーザーが「もう一度 mIV を起動」した意図を既存インスタンスで復帰として解釈する。
-            let signaled = single_instance::signal_activate_existing();
+            let signaled = startup_operation(
+                miv_startup::Stage::Ipc,
+                "activation-signal",
+                single_instance::signal_activate_existing,
+            );
+            miv_startup::record_detail("process.disposition", "second-instance-activation");
             eprintln!(
                 "mImageViewer is already running (path forwarded: {forwarded}, activate signaled: {signaled}). Exiting second instance."
             );
-            std::process::exit(0);
+            entry_trace.finish(miv_startup::Outcome::Ok);
+            exit_startup(0);
         }
         Some(guard)
     };
@@ -1097,12 +1203,16 @@ pub fn run() -> eframe::Result {
     // 旧仕様ではリリースビルドで `--log` 引数が必要だったが、「不具合が起きる
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
-    logger::init();
+    startup_operation(miv_startup::Stage::Logger, "Logger", || logger::init());
 
     #[cfg(all(windows, not(feature = "portable")))]
     {
         // Resolve/pin before egui construction, never in update or App::new.
-        effetune::prepare_startup_bundle();
+        startup_operation(
+            miv_startup::Stage::EffeTunePin,
+            "effetune-bundle",
+            effetune::prepare_startup_bundle,
+        );
         if let Err(error) = runtime_locks::signal_ready() {
             logger::log(format!("runtime lease handoff: {error}"));
         }
@@ -1110,7 +1220,11 @@ pub fn run() -> eframe::Result {
 
     // Keep the shared liveness lock alive until run() returns. A disabled gate is
     // retained as a typed outcome for the EPUB integration in the next stage.
-    pdf_loader::install_epub_gate(epub_cache::startup_gate(&data_dir::get()));
+    pdf_loader::install_epub_gate(startup_operation(
+        miv_startup::Stage::EpubGate,
+        "EpubGate",
+        || epub_cache::startup_gate(&data_dir::get()),
+    ));
 
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。
@@ -1131,7 +1245,8 @@ pub fn run() -> eframe::Result {
                 "play-test: path is not a file: {}",
                 config.path.display()
             ));
-            std::process::exit(2);
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(2);
         }
         logger::log(format!(
             "play-test: path={} duration_ms={} mute={}",
@@ -1152,7 +1267,8 @@ pub fn run() -> eframe::Result {
                 "dcomp-presenter-test: path is not a file: {}",
                 config.path.display()
             ));
-            std::process::exit(2);
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(2);
         }
         logger::log(format!(
             "dcomp-presenter-test: path={} duration_ms={} window={}x{} sync_interval={} force_sw={} pixel_probe_strict={}",
@@ -1167,10 +1283,12 @@ pub fn run() -> eframe::Result {
         if let Err(e) = dcomp_presenter_test::run(config) {
             eprintln!("dcomp-presenter-test failed: {e}");
             logger::log(format!("dcomp-presenter-test failed: {e}"));
-            std::process::exit(1);
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup(1);
         }
         perf::flush();
-        std::process::exit(0);
+        entry_trace.finish(miv_startup::Outcome::Ok);
+        exit_startup(0);
     }
 
     // 起動時間計測: data_dir 初期化は先行ステップなので perf::init 後に後追いで打つ。
@@ -1195,13 +1313,17 @@ pub fn run() -> eframe::Result {
 
     // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
     let t = Instant::now();
-    ai::model_manager::ensure_models_extracted();
+    startup_operation(miv_startup::Stage::AiModel, "AiModel", || {
+        ai::model_manager::ensure_models_extracted()
+    });
     emit_startup("models_extract", Some(t));
 
     // Susie 32bit ワーカー exe を %APPDATA%\mimageviewer\mimageviewer-susie32.exe に展開。
     // PDFium DLL と同じパターンで本体 exe に埋め込み、初回起動時に書き出す。
     let t = Instant::now();
-    susie_loader::ensure_worker_extracted();
+    startup_operation(miv_startup::Stage::SusieWorker, "SusieWorker", || {
+        susie_loader::ensure_worker_extracted()
+    });
     emit_startup("susie_worker_extract", Some(t));
 
     // 保存済み設定 (= spec §8 で main thread の **唯一の** `Settings::load()` 呼び出し)。
@@ -1209,7 +1331,9 @@ pub fn run() -> eframe::Result {
     // 結果、起動時に Settings::load() が走るのはここだけ。`saved` を後段の Susie 初期化、
     // ウィンドウ位置、`App::default` などすべてに引き回す。
     let t = Instant::now();
-    let settings_load = settings::Settings::load_with_meta();
+    let settings_load = startup_operation(miv_startup::Stage::Settings, "Settings", || {
+        settings::Settings::load_with_meta()
+    });
     #[allow(unused_mut)]
     let mut saved = settings_load.settings;
     let settings_load_meta = settings_load.meta;
@@ -1237,7 +1361,8 @@ pub fn run() -> eframe::Result {
                     // unexplained exit 2.
                     crate::logger::log(format!("[settings-override] FAILED: {error}"));
                     eprintln!("error: {error}");
-                    std::process::exit(2);
+                    entry_trace.finish(miv_startup::Outcome::Error);
+                    exit_startup(2);
                 }
             }
         }
@@ -1287,7 +1412,11 @@ pub fn run() -> eframe::Result {
     ];
 
     let t = Instant::now();
-    let icon = Arc::new(load_icon());
+    let icon = Arc::new(startup_operation(
+        miv_startup::Stage::Icon,
+        "icon",
+        load_icon,
+    ));
     emit_startup("load_icon", Some(t));
 
     // 起動時の最大化。`--window-size` はスクリーンショット用に厳密なサイズを要求する
@@ -1328,6 +1457,53 @@ pub fn run() -> eframe::Result {
     // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
+    wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
+        use egui_wgpu::{StartupDiagnosticEvent as Event, StartupGpuStage as Gpu};
+        let stage = |gpu| match gpu {
+            Gpu::TextureDelivery => miv_startup::Stage::TextureDelivery,
+            Gpu::Buffers => miv_startup::Stage::Buffers,
+            Gpu::Encode => miv_startup::Stage::Encode,
+            Gpu::WindowCreate => miv_startup::Stage::WindowCreate,
+            Gpu::SurfaceCapabilities => miv_startup::Stage::SurfaceCapabilities,
+            Gpu::PipelineCreate => miv_startup::Stage::PipelineCreate,
+            Gpu::Instance => miv_startup::Stage::WgpuInstance,
+            Gpu::AdapterEnumeration => miv_startup::Stage::AdapterEnumerate,
+            Gpu::AdapterSelection => miv_startup::Stage::AdapterSelect,
+            Gpu::Device => miv_startup::Stage::DeviceRequest,
+            Gpu::SurfaceCreate => miv_startup::Stage::SurfaceCreate,
+            Gpu::SurfaceConfigure => miv_startup::Stage::SurfaceConfigure,
+            Gpu::SurfaceAcquire => miv_startup::Stage::SurfaceAcquire,
+            Gpu::QueueSubmit => miv_startup::Stage::Submit,
+            Gpu::Present => miv_startup::Stage::Present,
+        };
+        match event {
+            Event::Begin(gpu) => miv_startup::observer_begin(miv_startup::Lane::Core, stage(gpu)),
+            Event::End {
+                stage: gpu,
+                success,
+            } => miv_startup::observer_end(
+                miv_startup::Lane::Core,
+                stage(gpu),
+                if success {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Error
+                },
+            ),
+            Event::AdapterSelected(adapter) => miv_startup::record_detail(
+                "gpu.adapter",
+                &format!(
+                    "{} {:?} {:?} vendor={} device={}",
+                    adapter.name,
+                    adapter.backend,
+                    adapter.device_type,
+                    adapter.vendor,
+                    adapter.device
+                ),
+            ),
+            Event::RootPresented { normal, .. } => miv_startup::mark_present(normal),
+        }
+    }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
         create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
@@ -1369,8 +1545,15 @@ pub fn run() -> eframe::Result {
 
     // Collection DBはproduction起動だけで開始する。actorのjoin権限はrun_native外のprocess
     // ownerに残し、Appへはclientとevent streamだけを渡す。
-    let collection_runtime =
-        collection_store::CollectionStoreRuntime::start_at(data_dir::get().join("collection.db"));
+    let collection_runtime = startup_result(
+        miv_startup::Stage::CollectionActor,
+        "CollectionActor",
+        || {
+            collection_store::CollectionStoreRuntime::start_at(
+                data_dir::get().join("collection.db"),
+            )
+        },
+    );
     let collection_install = collection_runtime
         .as_ref()
         .map(|runtime| (runtime.client(), runtime.event_stream()))
@@ -1387,13 +1570,21 @@ pub fn run() -> eframe::Result {
     let remote_service_status = remote_ipc::RemoteServiceStatus::stopped();
     saved.raw_develop_parallelism = saved.raw_develop_parallelism.clamp(1, 10);
     let raw_develop_executor = Arc::new(
-        raw::RawDevelopExecutor::new(saved.raw_develop_parallelism as usize)
-            .expect("RAW develop worker startup"),
+        startup_result(miv_startup::Stage::RawExecutor, "raw-workers", || {
+            raw::RawDevelopExecutor::new(saved.raw_develop_parallelism as usize)
+        })
+        .expect("RAW develop worker startup"),
     );
-    let mut remote_ipc_server = match remote_ipc::RemoteIpcServer::start(
-        saved.clone(),
-        collection_remote_producer.clone(),
-        Arc::clone(&raw_develop_executor),
+    let mut remote_ipc_server = match startup_result(
+        miv_startup::Stage::RemoteReader,
+        "remote-ipc-server-start",
+        || {
+            remote_ipc::RemoteIpcServer::start(
+                saved.clone(),
+                collection_remote_producer.clone(),
+                Arc::clone(&raw_develop_executor),
+            )
+        },
     ) {
         Ok(server) => Some(server),
         Err(error) => {
@@ -1417,15 +1608,21 @@ pub fn run() -> eframe::Result {
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
     let mut remote_service_manager = if remote_ipc_server.is_some() {
-        match data_dir::remote_service_log_dir(&remote_data_dir).and_then(|log_dir| {
-            remote_ipc::RemoteServiceManager::start(
-                remote_data_dir,
-                log_dir,
-                mimageviewer_ipc::DEFAULT_REMOTE_PORT,
-                saved.remote_service_enabled,
-                remote_service_status.clone(),
-            )
-        }) {
+        match startup_result(
+            miv_startup::Stage::RemoteService,
+            "remote-service-start",
+            || {
+                data_dir::remote_service_log_dir(&remote_data_dir).and_then(|log_dir| {
+                    remote_ipc::RemoteServiceManager::start(
+                        remote_data_dir,
+                        log_dir,
+                        mimageviewer_ipc::DEFAULT_REMOTE_PORT,
+                        saved.remote_service_enabled,
+                        remote_service_status.clone(),
+                    )
+                })
+            },
+        ) {
             Ok(manager) => Some(manager),
             Err(error) => {
                 logger::log(format!("remote_service: manager startup failed: {error}"));
@@ -1446,12 +1643,16 @@ pub fn run() -> eframe::Result {
     install_ui_heartbeat_watchdog();
     double_click_time::capture_startup_setting();
 
+    entry_trace.finish(miv_startup::Outcome::Ok);
+    let native_trace = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::RunNative);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
         Box::new(move |cc| {
             // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
+            let creator_trace =
+                miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::Creator);
             emit_startup("creator_enter", None);
             #[cfg(windows)]
             startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
@@ -1463,14 +1664,18 @@ pub fn run() -> eframe::Result {
             ui_fullscreen::install_fs_navigator_input_tracking(&cc.egui_ctx);
             double_click_time::configure_context(&cc.egui_ctx);
             let t = Instant::now();
-            ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font);
+            startup_operation(miv_startup::Stage::Fonts, "fonts", || {
+                ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font)
+            });
             emit_startup("setup_fonts", Some(t));
             // 起動時点で UI テーマを先行適用して、初回フレームでの
             // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから
             // 効くため、App::update 内で適用すると 1 フレームだけデフォルト
             // ダーク表示になる)。
             let t = Instant::now();
-            let resolved = os_theme::resolve(saved.ui_theme);
+            let resolved = startup_operation(miv_startup::Stage::Theme, "theme-resolve", || {
+                os_theme::resolve(saved.ui_theme)
+            });
             os_theme::apply_resolved_with_contrast(&cc.egui_ctx, resolved, saved.text_contrast);
             emit_startup("apply_theme", Some(t));
             // UI 表示倍率も初回フレーム前に復元する。キーボードズームは settings と
@@ -1482,12 +1687,14 @@ pub fn run() -> eframe::Result {
             // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
             let repaint_ctx = cc.egui_ctx.clone();
-            let mut app = app::App::new_from_settings_with_load_meta_and_raw_executor(
-                saved.clone(),
-                settings_load_meta.clone(),
-                move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
-                Arc::clone(&raw_develop_executor),
-            );
+            let mut app = startup_operation(miv_startup::Stage::AppCreate, "App", || {
+                app::App::new_from_settings_with_load_meta_and_raw_executor(
+                    saved.clone(),
+                    settings_load_meta.clone(),
+                    move || repaint_ctx.request_repaint_of(egui::ViewportId::ROOT),
+                    Arc::clone(&raw_develop_executor),
+                )
+            });
             match collection_install.clone() {
                 Ok((client, events)) => {
                     app.install_process_owned_collection_runtime(client, events)
@@ -1542,7 +1749,9 @@ pub fn run() -> eframe::Result {
                     // GpuVideoDevice は wgpu backend に依存せず独立した D3D11 device を
                     // 持つため、native presenter の動作前提として常に作成を試みる。
                     // 失敗時は decoder が SW デコード + CPU upload にフォールバックする。
-                    match crate::video::gpu_renderer::GpuVideoDevice::new() {
+                    match startup_result(miv_startup::Stage::D3d11Device, "D3d11Device", || {
+                        crate::video::gpu_renderer::GpuVideoDevice::new()
+                    }) {
                         Ok(dev) => {
                             crate::logger::log(
                                 "GPU video device: created (D3D11 + video processor)".to_string(),
@@ -1560,14 +1769,24 @@ pub fn run() -> eframe::Result {
             }
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
             let t = Instant::now();
-            app.hydrate_adjustment_favorite_params();
-            app.hydrate_favorite_view_states();
+            startup_operation(
+                miv_startup::Stage::FavoriteAdjustment,
+                "FavoriteAdjustment",
+                || app.hydrate_adjustment_favorite_params(),
+            );
+            startup_operation(miv_startup::Stage::ViewState, "ViewState", || {
+                app.hydrate_favorite_view_states()
+            });
             emit_startup("hydrate_adj_favs", Some(t));
             // name index supervisor を起動時に spawn (auto_index_structure=true なお気に入り)。
             // IndexerManager::sync_with_favorites がメタ側の対応処理を既に走らせているが、
             // 名前索引は IndexerManager 外の管理なのでここで別途 spawn する。
             let t = Instant::now();
-            app.spawn_initial_name_index_supervisors();
+            startup_operation(
+                miv_startup::Stage::NameIndexerSpawn,
+                "NameIndexerSpawn",
+                || app.spawn_initial_name_index_supervisors(),
+            );
             emit_startup("spawn_name_idx_sup", Some(t));
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
@@ -1588,10 +1807,16 @@ pub fn run() -> eframe::Result {
                 )
                 .map_err(std::io::Error::other)?;
             }
+            creator_trace.finish(miv_startup::Outcome::Ok);
             emit_startup("creator_exit", None);
             Ok(Box::new(app))
         }),
     );
+    native_trace.finish(if run_result.is_ok() {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
     // Stop public admission before named-pipe workers, then close the only Remote collection
     // producer before joining the actor. The App normally completed its drain in on_exit; this
     // outer fallback also covers creator failure/panic and is deliberately idempotent.
@@ -1614,8 +1839,18 @@ pub fn run() -> eframe::Result {
     perf::flush();
     #[cfg(all(feature = "test-script", windows))]
     if scripted_run && run_result.is_ok() {
+        miv_startup::terminal(if test_script::process_exit_code() == Some(0) {
+            miv_startup::Outcome::Ok
+        } else {
+            miv_startup::Outcome::Error
+        });
         test_script::exit_after_run_native();
     }
+    miv_startup::terminal(if run_result.is_ok() {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
     run_result
 }
 

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/startup-diagnostics",
     "crates/epub-pdf-worker",
     "crates/susie-worker",
     "crates/susie-crash-plugin",
@@ -350,6 +351,7 @@ windows-numerics = "0.2"
 winreg = "0.52"
 
 [dependencies]
+miv-startup = { path = "crates/startup-diagnostics" }
 eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
 egui-wgpu = "0.33"

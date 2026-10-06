@@ -5,6 +5,21 @@
 
 ---
 
+§1.241 Phase A: `crates/startup-diagnostics` の常時timelineはlauncher/coreの共通QPC基準と
+run ID/PIDを持つ。呼出元は固定サイズeventとstage atomicsをpublishし、独立writerがJSONLを
+保存する（UIからファイルwrite/flush/joinしない）。通常保存先は
+`%LOCALAPPDATA%\mimageviewer\startup-logs`、明示data-dir/portableは当該data内の
+`logs\startup`。network/UNC/mapped drive/reparse調査も専用workerが担当する。
+独立watchdogは5/15/30秒で単一ownerの起動awaitを記録し、heartbeatに依存しない。
+metadata watch登録とRemote返却後の初期target再dispatchはtimelineのみ。
+
+`App::indexer_init` がNotStarted/Pending/Ready/Unavailableと結果receiverを一つに所有する。
+rootの外側updateでstart/pollし、PendingはROOT wakeを持つ。5秒でoverlayを解除しても同じ
+Pending/workerが続き、単一adoptionで現可視状態のthrottleと最新設定を反映する。
+spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同期fallbackを行わない。
+初期フォルダの同期loaderはPhase Bまで現状維持。詳しくは
+[startup-diagnostics-plan.md](startup-diagnostics-plan.md) §10を参照。
+
 ## 1. ワーカー一覧
 
 | ワーカー | 実装 | 個数 | 用途 |

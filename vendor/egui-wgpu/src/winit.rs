@@ -1,7 +1,10 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use crate::{RenderState, SurfaceErrorAction, WgpuConfiguration, renderer};
+use crate::{
+    RenderState, RootStartupFrameTag, StartupGpuStage, SurfaceErrorAction, WgpuConfiguration,
+    renderer,
+};
 use crate::{
     RendererOptions,
     capture::{CaptureReceiver, CaptureSender, CaptureState, capture_channel},
@@ -60,6 +63,7 @@ struct SurfaceState {
 ///
 /// NOTE: all egui viewports share the same painter.
 pub struct Painter {
+    startup_present: crate::startup_diagnostics::RootPresentObserver,
     context: Context,
     configuration: WgpuConfiguration,
     options: RendererOptions,
@@ -97,9 +101,12 @@ impl Painter {
         options: RendererOptions,
     ) -> Self {
         let (capture_tx, capture_rx) = capture_channel();
+        configuration.startup_begin(StartupGpuStage::Instance);
         let instance = configuration.wgpu_setup.new_instance().await;
+        configuration.startup_end(StartupGpuStage::Instance, true);
 
         Self {
+            startup_present: Default::default(),
             context,
             configuration,
             options,
@@ -129,11 +136,28 @@ impl Painter {
         surface_state: &SurfaceState,
         render_state: &RenderState,
         config: &WgpuConfiguration,
+        viewport_id: ViewportId,
+        observe_startup: bool,
     ) {
         profiling::function_scope!();
 
         let width = surface_state.width;
         let height = surface_state.height;
+
+        let observe = viewport_id == ViewportId::ROOT && observe_startup;
+        if observe {
+            config.startup_begin(StartupGpuStage::SurfaceCapabilities);
+        }
+        let default_config =
+            surface_state
+                .surface
+                .get_default_config(&render_state.adapter, width, height);
+        if observe {
+            config.startup_end(
+                StartupGpuStage::SurfaceCapabilities,
+                default_config.is_some(),
+            );
+        }
 
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -141,19 +165,22 @@ impl Painter {
             present_mode: config.present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
-            ..surface_state
-                .surface
-                .get_default_config(&render_state.adapter, width, height)
-                .expect("The surface isn't supported by this adapter")
+            ..default_config.expect("The surface isn't supported by this adapter")
         };
 
         if let Some(desired_maximum_frame_latency) = config.desired_maximum_frame_latency {
             surf_config.desired_maximum_frame_latency = desired_maximum_frame_latency;
         }
 
+        if observe {
+            config.startup_begin(StartupGpuStage::SurfaceConfigure);
+        }
         surface_state
             .surface
             .configure(&render_state.device, &surf_config);
+        if observe {
+            config.startup_end(StartupGpuStage::SurfaceConfigure, true);
+        }
     }
 
     /// Updates (or clears) the [`winit::window::Window`] associated with the [`Painter`]
@@ -187,7 +214,16 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                let surface = self.instance.create_surface(window)?;
+                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
+                    self.configuration
+                        .startup_begin(StartupGpuStage::SurfaceCreate);
+                }
+                let result = self.instance.create_surface(window);
+                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
+                    self.configuration
+                        .startup_end(StartupGpuStage::SurfaceCreate, result.is_ok());
+                }
+                let surface = result?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
@@ -214,10 +250,21 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                let surface = unsafe {
-                    self.instance
-                        .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&window)?)?
-                };
+                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
+                    self.configuration
+                        .startup_begin(StartupGpuStage::SurfaceCreate);
+                }
+                let result =
+                    (|| unsafe {
+                        Ok::<_, crate::WgpuError>(self.instance.create_surface_unsafe(
+                            wgpu::SurfaceTargetUnsafe::from_window(&window)?,
+                        )?)
+                    })();
+                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
+                    self.configuration
+                        .startup_end(StartupGpuStage::SurfaceCreate, result.is_ok());
+                }
+                let surface = result?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
@@ -245,7 +292,15 @@ impl Painter {
             self.render_state.get_or_insert(render_state)
         };
         let alpha_mode = if self.support_transparent_backbuffer {
+            if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
+                self.configuration
+                    .startup_begin(StartupGpuStage::SurfaceCapabilities);
+            }
             let supported_alpha_modes = surface.get_capabilities(&render_state.adapter).alpha_modes;
+            if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
+                self.configuration
+                    .startup_end(StartupGpuStage::SurfaceCapabilities, true);
+            }
 
             // Prefer pre multiplied over post multiplied!
             if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
@@ -311,7 +366,13 @@ impl Painter {
         surface_state.width = width;
         surface_state.height = height;
 
-        Self::configure_surface(surface_state, render_state, &self.configuration);
+        Self::configure_surface(
+            surface_state,
+            render_state,
+            &self.configuration,
+            viewport_id,
+            self.startup_present.pending(),
+        );
 
         if let Some(depth_format) = self.options.depth_stencil_format {
             self.depth_texture_view.insert(
@@ -410,6 +471,8 @@ impl Painter {
                         state,
                         self.render_state.as_ref().unwrap(),
                         &self.configuration,
+                        viewport_id,
+                        self.startup_present.pending(),
                     );
                 }
             }
@@ -485,7 +548,31 @@ impl Painter {
         textures_delta: &epaint::textures::TexturesDelta,
         capture_data: Vec<UserData>,
     ) -> f32 {
+        self.paint_and_update_textures_with_startup_tag(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            None,
+        )
+    }
+
+    /// Like [`Self::paint_and_update_textures`], with the accepted root pass tag.
+    pub fn paint_and_update_textures_with_startup_tag(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &epaint::textures::TexturesDelta,
+        capture_data: Vec<UserData>,
+        startup_tag: Option<RootStartupFrameTag>,
+    ) -> f32 {
         profiling::function_scope!();
+        let observe = self.configuration.startup_diagnostics.is_some()
+            && self.startup_present.observes(viewport_id, startup_tag);
 
         let capture = !capture_data.is_empty();
         if capture && crate::atlas_diag::capture_probe_active() {
@@ -508,11 +595,19 @@ impl Painter {
         //   "Copy of Y 45..126 would end up overrunning the bounds of ... Y size 32".
         // The same dropped-upload boundary previously showed up as permanently black
         // thumbnails. See docs/display-pipeline.md.
+        if observe {
+            self.configuration
+                .startup_begin(StartupGpuStage::TextureDelivery);
+        }
         let begin = begin_delivery(
             self.render_state.as_ref(),
             textures_delta,
             crate::atlas_diag::Site::AppliedPaint,
         );
+        if observe {
+            self.configuration
+                .startup_end(StartupGpuStage::TextureDelivery, begin.is_ok());
+        }
 
         let outcome = match begin {
             Err(outcome) => outcome,
@@ -524,7 +619,13 @@ impl Painter {
                 let Some(surface_state) = self.surfaces.get(&viewport_id) else {
                     break 'paint PaintOutcome::SurfaceAbsent;
                 };
+                // A zero-sized surface cannot establish startup presentation.
+                // This only narrows observation; texture/render delivery is unchanged.
+                let observe = observe && surface_state.width > 0 && surface_state.height > 0;
 
+                if observe {
+                    self.configuration.startup_begin(StartupGpuStage::Buffers);
+                }
                 let mut encoder =
                     render_state
                         .device
@@ -550,12 +651,24 @@ impl Painter {
                         &screen_descriptor,
                     )
                 };
+                if observe {
+                    self.configuration
+                        .startup_end(StartupGpuStage::Buffers, true);
+                }
 
                 let output_frame = {
                     profiling::scope!("get_current_texture");
                     // This is what vsync-waiting happens on my Mac.
                     let start = web_time::Instant::now();
+                    if observe {
+                        self.configuration
+                            .startup_begin(StartupGpuStage::SurfaceAcquire);
+                    }
                     let output_frame = surface_state.surface.get_current_texture();
+                    if observe {
+                        self.configuration
+                            .startup_end(StartupGpuStage::SurfaceAcquire, output_frame.is_ok());
+                    }
                     vsync_sec += start.elapsed().as_secs_f32();
                     output_frame
                 };
@@ -571,12 +684,17 @@ impl Painter {
                                 surface_state,
                                 render_state,
                                 &self.configuration,
+                                viewport_id,
+                                self.startup_present.pending(),
                             );
                         }
                         break 'paint outcome;
                     }
                 };
 
+                if observe {
+                    self.configuration.startup_begin(StartupGpuStage::Encode);
+                }
                 let mut capture_buffer = None;
                 {
                     let renderer = render_state.renderer.read();
@@ -657,15 +775,27 @@ impl Painter {
                     profiling::scope!("CommandEncoder::finish");
                     encoder.finish()
                 };
+                if observe {
+                    self.configuration
+                        .startup_end(StartupGpuStage::Encode, true);
+                }
 
                 // Submit the commands: both the main buffer and user-defined ones.
                 {
                     profiling::scope!("Queue::submit");
                     // wgpu doesn't document where vsync can happen. Maybe here?
                     let start = web_time::Instant::now();
+                    if observe {
+                        self.configuration
+                            .startup_begin(StartupGpuStage::QueueSubmit);
+                    }
                     render_state
                         .queue
                         .submit(user_cmd_bufs.into_iter().chain([encoded]));
+                    if observe {
+                        self.configuration
+                            .startup_end(StartupGpuStage::QueueSubmit, true);
+                    }
                     vsync_sec += start.elapsed().as_secs_f32();
                 };
 
@@ -690,7 +820,18 @@ impl Painter {
                     profiling::scope!("present");
                     // wgpu doesn't document where vsync can happen. Maybe here?
                     let start = web_time::Instant::now();
+                    if observe {
+                        self.configuration.startup_begin(StartupGpuStage::Present);
+                    }
                     output_frame.present();
+                    if observe {
+                        self.configuration
+                            .startup_end(StartupGpuStage::Present, true);
+                        if let Some(event) = self.startup_present.returned(viewport_id, startup_tag)
+                        {
+                            self.configuration.startup_event(event);
+                        }
+                    }
                     vsync_sec += start.elapsed().as_secs_f32();
                 }
 
@@ -705,7 +846,17 @@ impl Painter {
         }
 
         probe_atlas_delivery("paint", textures_delta, outcome);
+        if observe {
+            self.configuration
+                .startup_begin(StartupGpuStage::TextureDelivery);
+        }
         finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
+        if observe {
+            self.configuration.startup_end(
+                StartupGpuStage::TextureDelivery,
+                self.render_state.is_some(),
+            );
+        }
         vsync_sec
     }
 
@@ -872,6 +1023,29 @@ mod tests {
     #[test]
     fn paint_and_update_textures_delivers_set_and_free_without_surface() {
         let mut configuration = WgpuConfiguration::default();
+        let present_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = present_count.clone();
+        let delivery_begin = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delivery_end = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_begin = delivery_begin.clone();
+        let callback_end = delivery_end.clone();
+        configuration.startup_diagnostics = Some(Arc::new(move |event| {
+            match event {
+                crate::StartupDiagnosticEvent::Begin(StartupGpuStage::TextureDelivery) => {
+                    callback_begin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::StartupDiagnosticEvent::End {
+                    stage: StartupGpuStage::TextureDelivery,
+                    ..
+                } => {
+                    callback_end.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            if matches!(event, crate::StartupDiagnosticEvent::RootPresented { .. }) {
+                callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
         let WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup else {
             unreachable!("default configuration must create a new wgpu setup");
         };
@@ -884,6 +1058,14 @@ mod tests {
             false,
             options,
         ));
+        paint_without_surface(&mut painter, &TexturesDelta::default());
+        assert_eq!(delivery_begin.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(delivery_end.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            present_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "render-state absence cannot prove root presentation"
+        );
         let render_state = match pollster::block_on(RenderState::create(
             &configuration,
             &painter.instance,
@@ -956,6 +1138,20 @@ mod tests {
         assert!(
             render_state.renderer.read().texture(&freed_id).is_none(),
             "free must reach the shared renderer without a surface"
+        );
+        assert_eq!(
+            present_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "texture-only delivery cannot prove root presentation"
+        );
+        let begins = delivery_begin.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            begins > 2,
+            "real texture-only delivery must emit startup phase observations"
+        );
+        assert_eq!(
+            begins,
+            delivery_end.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 

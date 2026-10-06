@@ -220,15 +220,16 @@ heartbeat/spinner/短いchild完了で期限をresetしない。writer I/O/普�
 App状態、navigation、watcher readiness/barrierには作用しない。overlay期限とは別の診断である。
 
 **公開方法:** current-childとは別の固定parent-watch slotを、
-launcher handoff、core first-update、normal-root-present、await-Indexer-init、
+launcher handoff、core first-present、normal-root-present、await-Indexer-init、
 initial-target-first-dispatchだけに限定する。metadata/fallback/再dispatch用slotは作らない。
 各slotはrun/slot IDと元のbegin時刻を持ち、実行ownerだけがAtomicU64のwatch clockをpublishする。
-clockはActive（有効開始時刻）/Suspended（意図的待機までの有効経過）/Retired。
+clockはReserved（未開始）/Active（有効開始時刻）/Suspended（意図的待機までの有効経過）/Retired。
+Reservedはresumeで開始せず、実dispatch/paintのbeginだけがActiveにする。診断時計のみの区別で、業務stateではない。
 pause時はnow − effective_start、resume時はnow − saved_elapsedを使う。
 watchdogは元identityごとの3bit通知maskを自分だけで所有する。childへの出入り/親復帰で
 親時計や通知済みmaskをresetせず、parent beginを再発行しない。snapshot再読ループは作らない。
 
-初回dispatch前のslotはSuspended(0)で予約し、present完了→次updateのdispatch間で
+初回dispatch前のslotはReservedで予約し、present完了→次updateのdispatch間で
 全slotが一瞬退役してwatchdogが先に終了することを防ぐ。不要/取消/Remote取得はこの予約も退役する。
 初回のwatch handleだけを当該dispatchへ渡し、slotは再利用しない。後続要求のtimeline handleには
 watch handleを付けない。新しい業務dispatch count、Remote resume state、第2coordinatorは追加しない。
@@ -236,7 +237,7 @@ watch handleを付けない。新しい業務dispatch count、Remote resume stat
 | watch対象 / 単一発行owner | 開始・終端 |
 | --- | --- |
 | launcher handoff / launcher main | entry → core spawn/lease handoff成功、起動失敗または終了。展開childが切替わっても総待ちを監視。core画面のlauncher監督はfollow-up |
-| core first-update / core main → root updateへの所有権受渡し | core entry → 最初のroot updateが戻る、fatalまたは終了。settings/App構築/GPU/surfaceをこの経路のchildとして記録・監視。run_nativeのプロセス寿命は監視しない |
+| core first-present / core main → root presenterへの所有権受渡し | core entry → 最初のroot PRESENTが戻る、fatalまたは終了。settings/App構築/GPU/surfaceをこの経路のchildとして記録・監視。run_nativeのプロセス寿命は監視しない |
 | root paint / 既存root presenter・normal-root-present owner | first PRESENTのacquire/submit/present呼出しは経路内のchild。normal-root-presentの親はoverlay解除後の通常paint要求 → NormalShellのpresent-return、fatal/取消/終了。利用者hide/OS minimizeは既存ownerの事実で意図的待機とし、restoreで同じ画面待ちを再開。白フラッシュ対策のbootstrap非表示は利用者hideと区別 |
 | await-Indexer-init / App-global初期化owner | worker dispatch → 単一採用点のReady/Unavailable（spawn失敗/disconnect含む）または終了。normalready/tray hideで実初期化の監視を止めない |
 | initial-target-first-dispatch / 初期navigation request owner | 初回のresolver/scan dispatch → 当該結果の採用/失敗/取消、Remote取得または終了。初回がdefault targetでも同じ。modal admission前は未dispatch予約であり停止扱いしない。Remote以外の既存modal-held待ちは意図的待機として扱う |
@@ -749,3 +750,48 @@ Indexer spawn/errorも一度通知・次回起動に留める。rare failure内�
 監視範囲の限定により扱う。今回の限定変更の再確認と、実装前のdetached §11記録はまだ必要。
 より複雑な復旧が必要なら実装前に相談する。画面前の同期停止まで正常UI保証が必要という判断なら、
 今回のscopeを拡張せず、上記launcher監視か必須初期化の背景化を別のcoherent phaseとして相談する。
+
+## 10. 実装分割（2026-10-06利用者指示）
+
+f2fcef6b2は独立設計レビューready、指摘なし。detached到達部も構造変更として設計owner
+ClaudeCodeと独立Codexが合意済み。Phase Aの正確な到達scopeはdetached-rework-plan §11へ記録した。
+
+Phase Aは常時launcher/core timeline、実root PRESENT、stage/elapsed overlay、Indexerの
+5秒上限・同じworker継続・単一late adoption・ROOT wake・現tray throttle・Unavailable、
+狭いwatchdog、旧Tantivyタグ移行撤去を実装する。§6の初期フォルダoff-UI化、resolverの
+同期fallback撤去、Deferred normal-present wake ownerはPhase Bへ保留する。
+first_setup.rsとCHANGELOG.mdは変更しない。変更候補は§5.3のままrelease leadへ渡す。
+
+Phase Aのfirst-dispatch watch終端は既存resolver結果のUI admission／同期default loaderのreturn。
+非同期page enumerationやconversionの完了を意味するmilestoneではない。それらの既存ownerを
+今回移動・再設計しない。Remote取得はreserved/active initial watchを
+`suspended (not watched)`として退役し、返却再dispatchはtimelineのみ。metadata registrationも
+supervisorごとのtimelineだけでwatchdog寿命を延ばさない。NormalPresentは実際のnormal grid描画要求で開始し、
+既存tray hideとOS minimize中は同じ時計を停止する。CoreStartupは最初の実root PRESENTのreturnまで監視する。
+既存の起動fullscreenがnormal gridを通らない場合はNormalPresentをSkippedで退役し、readyを捏造しない。
+未採用Readyが入ったreceiverの破棄も終了時に背景disposalへ移す。破棄workerさえspawn不可な
+まれな終了時失敗は記録し、その派生index所有物をprocess終了まで保持する。UI同期shutdownやretryはしない。
+
+先に§1.335 next-startup-restoreを検収・統合し、本枝を更新してからPhase Bを実装する。
+Phase Aの自動gateはnormal／portable／portable+test-script check、fmt、diff、glyph、
+full lib testと共有診断・vendor・launcherのfocused tests。利用者指示によりbuild-devを用意し、
+agentは起動しない。launcher extraction/release性能の実機確認はrelease leadの別検証枠に残す。
+
+### 10.1 Phase A実装・検証記録（2026-10-06）
+
+Phase Aを未commit差分として実装した。独立Sol/xhigh実装レビューは修正後ready、指摘なし。
+最後の追加確認では、spinner snapshotを既存の固定frame方式へ統一し、PendingのCtrl+Gでも
+メモリ内の無効favorite filter正規化を先に行うことを確認した。query保持・prepare/search非開始は維持する。
+
+`scripts/test-full.ps1 -SuppressCrashDialogs` はPASS。本体libは10,659成功・52既存ignore・失敗0、
+UI snapshotは94成功（起動表示6件のPNGを目視確認）、launcherは39成功、共通診断crateは21成功。
+workspace除外vendorもegui 25／egui-wgpu 11／eframe 18成功。normal／portable／portable+test-scriptの
+core check、workspace fmtと変更vendorのrustfmt、diff check、glyph lintも成功した。
+本体の既存設定転送テストは、変更前policyに既にある`video_watched_to_end`を含む441項目へ
+期待件数だけを更新した。転送policy・許可131項目・wire129項目は変更していない。
+Susie統合試験には不足していた実体fixtureを補い、skipではなく8件成功を確認した。
+
+利用者指定の通常feature `build-dev` は成功し、core／Remote／EPUBとVC runtime/PE検査を完了。
+検証用アプリは起動していない。証拠と環境条件は`target/planA-msg-A.txt`、最終全体gateは
+`target/planA-full-final-{stdout,stderr}.txt`、buildは`target/planA-build-dev-final-{stdout,stderr}.txt`。
+Phase Bの初期フォルダoff-UI化・resolver fallback撤去・Deferred wakeは未実装で、§1.335統合後に続ける。

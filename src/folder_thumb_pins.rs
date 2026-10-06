@@ -308,8 +308,14 @@ impl FolderThumbPinDb {
 
     /// Open the pin store and report whether its additive revision schema was installed.
     pub fn open_with_migration_info() -> SqlResult<(Self, bool)> {
-        let path = Self::db_path();
-        Self::open_at_with_migration_info(&path)
+        crate::startup_result(
+            miv_startup::Stage::AppDbMigrate,
+            "folder-thumb-pin-schema-migration",
+            || {
+                let path = Self::db_path();
+                Self::open_at_with_migration_info(&path)
+            },
+        )
     }
 
     /// 任意の data directory 配下で使うため、DB ファイルを明示して開く。

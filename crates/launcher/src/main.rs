@@ -13,6 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use miv_startup::{Lane, Outcome, Role, Stage, WatchSlot};
 use sha2::{Digest, Sha256};
 
 #[path = "../../../src/effetune/bundle_location.rs"]
@@ -110,63 +111,123 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
 ];
 
 fn main() {
-    if let Err(e) = run() {
-        show_error(&e);
-        std::process::exit(1);
+    miv_startup::init_process(Role::Launcher, VERSION, false);
+    match run() {
+        Ok(reason) => {
+            miv_startup::record_detail("launcher_terminal", reason);
+            miv_startup::terminal(Outcome::Ok);
+        }
+        Err(e) => {
+            miv_startup::record_detail("launcher_terminal", &e);
+            miv_startup::terminal(Outcome::Error);
+            show_error(&e);
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), String> {
-    let user_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+/// Observe the existing operation at its ownership boundary; diagnostics never
+/// changes its result or adds a wait for the writer.
+fn trace<T, E>(
+    stage: Stage,
+    detail: &str,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let span = miv_startup::span(Lane::Launcher, stage)
+        .detail(detail)
+        .watched_optional(miv_startup::watch_handle(WatchSlot::Launcher));
+    let result = operation();
+    span.finish(if result.is_ok() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
+fn run() -> Result<&'static str, String> {
+    let user_args = trace(Stage::Args, "launcher arguments", || {
+        Ok::<_, String>(std::env::args_os().skip(1).collect::<Vec<OsString>>())
+    })?;
 
     // --version / -V / --help / -h: 版 / usage を表示して終了 (core を spawn しない)。
     // 既存インスタンスの activate より前に処理する。
-    if maybe_handle_version_or_help(&user_args) {
-        return Ok(());
+    if trace(Stage::Args, "help/version decision", || {
+        Ok::<_, String>(maybe_handle_version_or_help(&user_args))
+    })? {
+        return Ok("help_or_version");
     }
 
     // `--data-dir` 指定時の mutex / event / open-path pipe 名は core が解決済み path から
     // 導出する。launcher は基底名しか埋め込んでいないため、ここでは先回りせず core に渡す。
     #[cfg(windows)]
-    if !has_data_dir_option(&user_args) && try_activate_existing(&user_args) {
-        return Ok(());
+    if !has_data_dir_option(&user_args)
+        && trace(Stage::Instance, "existing instance", || {
+            Ok::<_, String>(try_activate_existing(&user_args))
+        })?
+    {
+        return Ok("existing_instance_activated");
     }
 
-    let runtime_dir = appdata_runtime_dir()?;
+    let runtime_dir = trace(Stage::RuntimePath, "APPDATA runtime", appdata_runtime_dir)?;
+    miv_startup::record_detail("runtime_path", &runtime_dir.to_string_lossy());
     let runtime_parent = runtime_dir.parent().ok_or("runtime has no parent")?;
-    std::fs::create_dir_all(runtime_parent)
-        .map_err(|e| format!("create runtime parent failed: {e}"))?;
+    // Mirror core's existing data-dir argument choice without resolving paths or
+    // querying the filesystem merely for diagnostics.
+    let explicit_data_dir = user_args
+        .windows(2)
+        .find(|pair| pair[0] == std::ffi::OsStr::new("--data-dir"))
+        .map(|pair| PathBuf::from(&pair[1]));
+    if let Some(path) = explicit_data_dir.as_deref() {
+        miv_startup::record_data_dir(path, "explicit", Some(&runtime_dir));
+    } else if let Some(path) = runtime_parent.parent() {
+        miv_startup::record_data_dir(path, "normal APPDATA", Some(&runtime_dir));
+    }
+    trace(Stage::RuntimeParentCreate, "runtime parent", || {
+        std::fs::create_dir_all(runtime_parent)
+    })
+    .map_err(|e| format!("create runtime parent failed: {e}"))?;
     // Lock before creating the deletable version directory. A concurrent
     // collector must not remove a directory we created before acquiring its lease.
     // Lease the real resource while preserving existing redirected APPDATA use.
     // Cleanup's reparse refusal must not turn a runnable install into an error.
-    let lock_dir = std::fs::canonicalize(runtime_parent)
-        .map_err(|e| format!("runtime identity failed: {e}"))?
-        .join(VERSION);
-    let _runtime_lease = effetune_bundle::wait_for_shared_lock(
-        runtime_locks::open(&lock_dir, runtime_locks::IN_USE)
-            .map_err(|e| format!("runtime lease failed: {e}"))?,
-        std::time::Duration::from_secs(60),
-    )
+    let lock_dir = trace(Stage::RuntimeCanonicalize, "runtime identity", || {
+        std::fs::canonicalize(runtime_parent)
+    })
+    .map_err(|e| format!("runtime identity failed: {e}"))?
+    .join(VERSION);
+    let _runtime_lease = trace(Stage::RuntimeLease, "runtime in-use lease", || {
+        effetune_bundle::wait_for_shared_lock(
+            runtime_locks::open(&lock_dir, runtime_locks::IN_USE)?,
+            std::time::Duration::from_secs(60),
+        )
+    })
     .map_err(|e| format!("runtime lease failed: {e}"))?;
-    std::fs::create_dir_all(&runtime_dir)
-        .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
+    trace(Stage::RuntimeVersionDir, "version directory", || {
+        std::fs::create_dir_all(&runtime_dir)
+    })
+    .map_err(|e| format!("create runtime dir failed ({}): {e}", runtime_dir.display()))?;
     // Main assets had no extraction lock before this change. Serialize writers,
     // and share this lock with the collector of other versions.
-    let extraction = effetune_bundle::wait_for_publish_lock(
-        runtime_locks::open(&lock_dir, runtime_locks::EXTRACTION)
-            .map_err(|e| format!("extraction lock failed: {e}"))?,
-        std::time::Duration::from_secs(60),
+    let extraction = trace(
+        Stage::RuntimeExtractionLock,
+        "asset extraction lock",
+        || {
+            effetune_bundle::wait_for_publish_lock(
+                runtime_locks::open(&lock_dir, runtime_locks::EXTRACTION)?,
+                std::time::Duration::from_secs(60),
+            )
+        },
     )
     .map_err(|e| format!("extraction lock failed: {e}"))?;
 
     extract_assets(&runtime_dir)?;
     // EffeTune preparation is optional to application startup. Never run a
     // damaged/old bundle silently when this launcher's preparation failed.
-    let (effetune_lease, effetune) = match effetune_bundle::ensure_pinned_bundle(
-        &runtime_dir,
-        EFFETUNE_FILES,
-        EFFETUNE_MANIFEST,
+    let (effetune_lease, effetune) = match trace(
+        Stage::EffeTunePrepare,
+        "optional EffeTune preparation",
+        || effetune_bundle::ensure_pinned_bundle(&runtime_dir, EFFETUNE_FILES, EFFETUNE_MANIFEST),
     ) {
         Ok(pin) => {
             let path = pin.path.clone();
@@ -180,7 +241,12 @@ fn run() -> Result<(), String> {
 
     let mut cmd = Command::new(&core_path);
     #[cfg(windows)]
-    let handoff = runtime_locks::Handoff::new().map_err(|e| format!("runtime handoff: {e}"))?;
+    let handoff = trace(
+        Stage::RuntimeHandoff,
+        "handoff setup",
+        runtime_locks::Handoff::new,
+    )
+    .map_err(|e| format!("runtime handoff: {e}"))?;
     #[cfg(windows)]
     handoff.configure(&mut cmd);
     cmd.args(&user_args);
@@ -188,19 +254,49 @@ fn run() -> Result<(), String> {
     if let Some(path) = launcher_path {
         cmd.env("MIV_LAUNCHER_EXE_PATH", path);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
+    let spawn = miv_startup::span(Lane::Launcher, Stage::CoreSpawn)
+        .watched_optional(miv_startup::watch_handle(WatchSlot::Launcher));
+    if let Some(snapshot) = miv_startup::inherited_snapshot() {
+        cmd.env(miv_startup::HANDOFF_ENV, snapshot);
+    } else {
+        cmd.env_remove(miv_startup::HANDOFF_ENV);
+    }
+    let child_result = cmd.spawn();
+    spawn.finish(if child_result.is_ok() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    let mut child =
+        child_result.map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
     drop(extraction);
+    miv_startup::record_detail("child_pid", &child.id().to_string());
     #[cfg(windows)]
-    handoff
-        .wait(&mut child)
-        .map_err(|e| format!("runtime handoff: {e}"))?;
+    trace(Stage::RuntimeHandoff, "runtime lease handoff", || {
+        handoff.wait(&mut child)
+    })
+    .map_err(|e| format!("runtime handoff: {e}"))?;
     #[cfg(not(windows))]
-    child.wait().map_err(|e| format!("wait core: {e}"))?;
+    trace(Stage::RuntimeHandoff, "wait core", || child.wait())
+        .map_err(|e| format!("wait core: {e}"))?;
     drop(effetune_lease);
 
-    Ok(())
+    Ok(if is_worker_invocation(&user_args) {
+        "worker_handoff"
+    } else {
+        "core_handoff"
+    })
+}
+
+fn is_worker_invocation(args: &[OsString]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_os_str() != std::ffi::OsStr::new("--"))
+        .any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("--pdf-worker" | "--tensorrt-build" | "--tensorrt-infer-worker")
+            )
+        })
 }
 
 fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
@@ -251,13 +347,27 @@ fn prepare_effetune(
 fn extract_asset(runtime_dir: &Path, asset: &(&str, &[u8], &str)) -> Result<(), String> {
     let (name, bytes, expected_hash) = *asset;
     let path = runtime_dir.join(name);
-    ensure_asset(
+    let span = miv_startup::span(Lane::Launcher, Stage::AssetVerify)
+        .detail(&format!("asset={name} bytes={}", bytes.len()))
+        .watched_optional(miv_startup::watch_handle(WatchSlot::Launcher));
+    let result = ensure_asset(
         &path,
         bytes,
         expected_hash,
         requires_content_hash_on_launch(name),
-    )
-    .map_err(|e| {
+    );
+    let disposition = match &result {
+        Ok(true) => "reused",
+        Ok(false) => "extracted",
+        Err(_) => "error",
+    };
+    span.detail(&format!("asset={name} bytes={} {disposition}", bytes.len()))
+        .finish(if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+    result.map(|_| ()).map_err(|e| {
         format!(
             "extract {name} failed: {e}\n(runtime dir: {})",
             runtime_dir.display()
@@ -366,20 +476,22 @@ fn ensure_asset(
     bytes: &[u8],
     expected_hash: &str,
     always_verify_contents: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let hash_path = sidecar_hash_path(path);
 
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = trace(Stage::AssetVerify, &path.to_string_lossy(), || {
+        std::fs::metadata(path)
+    }) {
         if meta.len() == bytes.len() as u64
             && asset_hash_matches(path, &hash_path, expected_hash, always_verify_contents)?
         {
-            return Ok(());
+            return Ok(true);
         }
     }
 
     write_atomic(path, bytes)?;
     write_atomic(&hash_path, expected_hash.as_bytes())?;
-    Ok(())
+    Ok(false)
 }
 
 fn asset_hash_matches(
@@ -388,28 +500,34 @@ fn asset_hash_matches(
     expected_hash: &str,
     always_verify_contents: bool,
 ) -> std::io::Result<bool> {
-    // Core, remote, and FFmpeg assets retain the versioned sidecar shortcut. The small EPUB
-    // worker and four loader-critical app-local CRT files are hashed on every launch, so a
-    // current sidecar cannot bless same-length corruption in those assets.
-    if !always_verify_contents && let Ok(stored) = std::fs::read_to_string(hash_path) {
-        return Ok(stored.trim().eq_ignore_ascii_case(expected_hash));
-    }
-
-    let actual_hash = sha256_file_hex(path)?;
-    if actual_hash.eq_ignore_ascii_case(expected_hash) {
-        let sidecar_is_current = std::fs::read_to_string(hash_path)
-            .is_ok_and(|stored| stored.trim().eq_ignore_ascii_case(expected_hash));
-        if !sidecar_is_current {
-            write_atomic(hash_path, expected_hash.as_bytes())?;
+    trace(Stage::AssetHash, &path.to_string_lossy(), || {
+        // Core, remote, and FFmpeg assets retain the versioned sidecar shortcut. The small EPUB
+        // worker and four loader-critical app-local CRT files are hashed on every launch, so a
+        // current sidecar cannot bless same-length corruption in those assets.
+        if !always_verify_contents && let Ok(stored) = std::fs::read_to_string(hash_path) {
+            return Ok(stored.trim().eq_ignore_ascii_case(expected_hash));
         }
-        return Ok(true);
-    }
-    Ok(false)
+
+        let actual_hash = sha256_file_hex(path)?;
+        if actual_hash.eq_ignore_ascii_case(expected_hash) {
+            let sidecar_is_current = std::fs::read_to_string(hash_path)
+                .is_ok_and(|stored| stored.trim().eq_ignore_ascii_case(expected_hash));
+            if !sidecar_is_current {
+                write_atomic(hash_path, expected_hash.as_bytes())?;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    })
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp_path = tmp_path_for(path);
-    std::fs::write(&tmp_path, bytes)?;
+    trace(
+        Stage::AssetWrite,
+        &format!("{} bytes={}", path.display(), bytes.len()),
+        || std::fs::write(&tmp_path, bytes),
+    )?;
 
     // T57 (Codex P2 / 2026-05-16): 旧コードは `remove_file(path)` → `rename(tmp, path)` の
     // 2 ステップで、削除と rename の間に他プロセスが path を開くと「ファイル無し」を見る
@@ -417,7 +535,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // rename` は Windows でも同名既存ファイルを atomic replace するので remove_file は不要
     // (version-scoped runtime dir のおかげで発火確率は低かったが、他所で修正済の旧パターン
     // を残さないために統一する)。
-    std::fs::rename(&tmp_path, path)?;
+    trace(Stage::AssetRename, &path.to_string_lossy(), || {
+        std::fs::rename(&tmp_path, path)
+    })?;
     Ok(())
 }
 
@@ -491,7 +611,13 @@ fn try_activate_existing(user_args: &[OsString]) -> bool {
     if let Some(path) =
         parse_startup_open_path_arg_from(user_args).map(absolutize_startup_open_path)
     {
-        let _ = send_open_path_to_existing(&path);
+        let _ = trace(Stage::Ipc, "existing-instance open path", || {
+            if send_open_path_to_existing(&path) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        });
     }
 
     let event_wide = wide_nul(ACTIVATE_EVENT_NAME);
@@ -671,6 +797,34 @@ fn show_error(msg: &str) {
 #[cfg(not(windows))]
 fn show_error(msg: &str) {
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    #[test]
+    fn asset_disposition_preserves_content_verification_and_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("asset.dll");
+        let bytes = b"valid asset";
+        let hash = super::hex_lower(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
+        assert!(!super::ensure_asset(&path, bytes, &hash, true).unwrap());
+        assert!(super::ensure_asset(&path, bytes, &hash, true).unwrap());
+        std::fs::write(&path, b"wrong asset").unwrap();
+        assert!(!super::ensure_asset(&path, bytes, &hash, true).unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn worker_terminal_classification_respects_path_delimiter() {
+        for flag in [
+            "--pdf-worker",
+            "--tensorrt-build",
+            "--tensorrt-infer-worker",
+        ] {
+            assert!(super::is_worker_invocation(&[flag.into()]));
+            assert!(!super::is_worker_invocation(&["--".into(), flag.into()]));
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

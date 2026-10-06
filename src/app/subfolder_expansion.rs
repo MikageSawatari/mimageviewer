@@ -1784,7 +1784,7 @@ impl App {
             subfolder_expansion_view_label("サブ展開中", &root, &roots, Some(&options.scan_filter));
 
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.io_sem())
             .unwrap_or_else(|| {

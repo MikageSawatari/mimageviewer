@@ -633,14 +633,21 @@ impl GpuVideoDevice {
             GpuVideoError::DeviceCreate("D3D11CreateDevice returned null context".into())
         })?;
 
-        let video_device: ID3D11VideoDevice =
-            device.cast().map_err(|_| GpuVideoError::NoVideoDevice)?;
-        let video_context: ID3D11VideoContext =
-            context.cast().map_err(|_| GpuVideoError::NoVideoDevice)?;
-        let video_context1: ID3D11VideoContext1 = video_context
-            .cast()
-            .map_err(|e| GpuVideoError::DeviceCreate(format!("ID3D11VideoContext1 cast: {e:?}")))?;
+        let (video_device, video_context, video_context1) = crate::startup_result(
+            miv_startup::Stage::D3d11VideoInterface,
+            "video-interfaces",
+            || {
+                let video_device: ID3D11VideoDevice =
+                    device.cast().map_err(|_| GpuVideoError::NoVideoDevice)?;
+                let video_context: ID3D11VideoContext =
+                    context.cast().map_err(|_| GpuVideoError::NoVideoDevice)?;
+                let video_context1: ID3D11VideoContext1 = video_context.cast().map_err(|e| {
+                    GpuVideoError::DeviceCreate(format!("ID3D11VideoContext1 cast: {e:?}"))
+                })?;
 
+                Ok::<_, GpuVideoError>((video_device, video_context, video_context1))
+            },
+        )?;
         crate::logger::log(format!(
             "GpuVideoDevice: created (feature_level=0x{:X})",
             feature_level.0
@@ -649,31 +656,40 @@ impl GpuVideoDevice {
         // 共有 fence を作成。ID3D11Device5 (= D3D11.4) で初めて利用可能だが、
         // Windows 10 1809 以降の更新済み環境では存在する。失敗したら呼び出し側で
         // SW フォールバックされるよう Err を返す。
-        let device5: ID3D11Device5 = device
-            .cast()
-            .map_err(|e| GpuVideoError::DeviceCreate(format!("cast ID3D11Device5: {e:?}")))?;
-        let context4: ID3D11DeviceContext4 = context.cast().map_err(|e| {
-            GpuVideoError::DeviceCreate(format!("cast ID3D11DeviceContext4: {e:?}"))
-        })?;
-        let mut fence_opt: Option<ID3D11Fence> = None;
-        unsafe {
-            device5
-                .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)
-                .map_err(|e| GpuVideoError::DeviceCreate(format!("CreateFence: {e:?}")))?;
-        }
-        let fence = fence_opt
-            .ok_or_else(|| GpuVideoError::DeviceCreate("CreateFence returned null".into()))?;
-        let fence_shared_handle = unsafe {
-            fence
-                .CreateSharedHandle(
-                    None,
-                    windows::Win32::Foundation::GENERIC_ALL.0,
-                    windows::core::PCWSTR::null(),
-                )
-                .map_err(|e| {
-                    GpuVideoError::DeviceCreate(format!("Fence CreateSharedHandle: {e:?}"))
-                })?
-        };
+        let (fence, context4) =
+            crate::startup_result(miv_startup::Stage::D3d11Fence, "shared-fence", || {
+                let device5: ID3D11Device5 = device.cast().map_err(|e| {
+                    GpuVideoError::DeviceCreate(format!("cast ID3D11Device5: {e:?}"))
+                })?;
+                let context4: ID3D11DeviceContext4 = context.cast().map_err(|e| {
+                    GpuVideoError::DeviceCreate(format!("cast ID3D11DeviceContext4: {e:?}"))
+                })?;
+                let mut fence_opt: Option<ID3D11Fence> = None;
+                unsafe {
+                    device5
+                        .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)
+                        .map_err(|e| GpuVideoError::DeviceCreate(format!("CreateFence: {e:?}")))?;
+                }
+                let fence = fence_opt.ok_or_else(|| {
+                    GpuVideoError::DeviceCreate("CreateFence returned null".into())
+                })?;
+                Ok::<_, GpuVideoError>((fence, context4))
+            })?;
+        let fence_shared_handle = crate::startup_result(
+            miv_startup::Stage::D3d11SharedHandle,
+            "shared-handle",
+            || unsafe {
+                fence
+                    .CreateSharedHandle(
+                        None,
+                        windows::Win32::Foundation::GENERIC_ALL.0,
+                        windows::core::PCWSTR::null(),
+                    )
+                    .map_err(|e| {
+                        GpuVideoError::DeviceCreate(format!("Fence CreateSharedHandle: {e:?}"))
+                    })
+            },
+        )?;
 
         // プロセス内ユニーク世代 ID。0 は予約 (= 未開封キャッシュ判定で使う)、
         // GpuVideoDevice の生成ごとに 1, 2, 3, ... と進む。HANDLE 値は kernel が

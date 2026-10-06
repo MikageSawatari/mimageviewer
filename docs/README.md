@@ -27,6 +27,7 @@
 | [section220-cut-item-appearance.md](section220-cut-item-appearance.md) | §1.220 切り取り中の実項目表示。クリップボードの所有・通知・貼り付け結果、Explorer形式の読取と、半透明の一覧内容・ハサミ表示の描画境界 |
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
+| [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
 | [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中・トレイ常駐中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |

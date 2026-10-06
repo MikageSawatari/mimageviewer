@@ -12826,10 +12826,10 @@ mod paused_similar_feature_tests {
         app.kick_off_startup_init();
         wait_until("ordinary startup index manager did not complete", || {
             app.poll_startup_init();
-            app.startup_done
+            app.indexer_init.is_terminal()
         });
         assert!(
-            app.indexer_manager.is_some(),
+            app.indexer_init.is_some(),
             "paused Similar must not disable the ordinary metadata/name index manager"
         );
         assert!(app.similar_index.is_none());
@@ -12901,15 +12901,16 @@ mod paused_similar_feature_tests {
         // barrier itself: it panics/drops its sender before publishing a manager result.
         let (tx, rx) = mpsc::channel();
         drop(tx);
-        app.startup_init = Some(StartupInitPending {
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
-        app.startup_done = false;
         app.poll_startup_init();
-        assert!(app.startup_done);
-        assert!(app.indexer_manager.is_none());
+        assert!(app.indexer_init.is_terminal());
+        assert!(app.indexer_init.is_none());
         wait_until(
             "disconnected startup did not release the initial Full",
             || {
@@ -12956,17 +12957,18 @@ mod paused_similar_feature_tests {
                 .to_string(),
         })
         .unwrap();
-        app.startup_init = Some(StartupInitPending {
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
-        app.startup_done = false;
 
         app.poll_startup_init();
-        assert!(app.startup_done);
-        assert!(app.startup_init.is_none());
-        assert!(app.indexer_manager.is_none());
+        assert!(app.indexer_init.is_terminal());
+        assert!(app.indexer_init.pending().is_none());
+        assert!(app.indexer_init.is_none());
         assert_eq!(
             app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
             Some("全文検索索引を再構築できませんでした。次回起動時に再試行します")
@@ -14477,6 +14479,7 @@ mod startup_open_path_resolve_tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(requested).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
                 crate::bookmark_browser::BookmarkOpenRequestOwner {
@@ -14827,6 +14830,7 @@ mod startup_open_path_resolve_tests {
         let (_resolve_tx, resolve_rx) = mpsc::channel::<StartupOpenPathResolveResult>();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(
                 app.tmp.path().join("unresolved-startup-target"),
             )
@@ -15701,6 +15705,7 @@ mod startup_open_path_resolve_tests {
         let mut app = setup_app();
         let (_tx, rx) = mpsc::channel();
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                 r"\\server\offline\book.zip",
             ))
@@ -15734,6 +15739,7 @@ mod startup_open_path_resolve_tests {
         let (_tx, rx) = mpsc::channel();
         let old_cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                 r"\\server\slow\old.zip",
             ))
@@ -18249,8 +18255,7 @@ mod phase_c_key_tests {
         app.global_search.active = true;
         app.global_search.filters.favorite = Some(bogus);
         app.global_search.query = "x".to_string();
-        // spawn_global_search は indexer_manager が None のときに reject_message を出して早期 return するが、
-        // その前に filter の健全化は行う (コードは filter 正規化 → manager 存在確認 → spawn の順)。
+        // 準備中/利用不能でも、reject_messageで戻る前にfilterの健全化を行う。
         app.spawn_global_search(&egui::Context::default());
         assert_eq!(
             app.global_search.filters.favorite, None,
@@ -63149,6 +63154,7 @@ mod still_window_mode_key_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(media.clone()).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
                 crate::bookmark_browser::BookmarkOpenRequestOwner {
@@ -67346,6 +67352,7 @@ mod still_window_mode_key_tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+                diagnostic: None,
                 requested: crate::pdf_loader::LeasedEpubPath::try_new(target.clone()).unwrap(),
                 owner: StartupOpenPathOwner::Activation,
                 cancel: std::sync::Arc::clone(&cancel),

@@ -1558,6 +1558,25 @@ fn unlock(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
+fn startup_gate_operation<T>(
+    stage: miv_startup::Stage,
+    detail: &str,
+    operation: impl FnOnce() -> Result<T, GateReason>,
+) -> Result<T, GateReason> {
+    let operation_span = miv_startup::span(miv_startup::Lane::Core, stage)
+        .watched_optional(miv_startup::watch_handle(
+            miv_startup::WatchSlot::CoreStartup,
+        ))
+        .detail(detail);
+    let result = operation();
+    operation_span.finish(if result.is_ok() {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
+    result
+}
+
 pub fn startup_gate(data_dir: &Path) -> GateOutcome {
     let result = (|| -> Result<(AliveGuard, bool, Vec<i64>), GateReason> {
         fs::create_dir_all(data_dir).map_err(GateReason::Lock)?;
@@ -1578,45 +1597,91 @@ pub fn startup_gate(data_dir: &Path) -> GateOutcome {
             use std::os::windows::fs::OpenOptionsExt as _;
             options.share_mode(0x0000_0001 | 0x0000_0002); // no FILE_SHARE_DELETE
         }
-        let file = options.open(alive_path).map_err(GateReason::Lock)?;
+        let file = startup_gate_operation(
+            miv_startup::Stage::EpubLock,
+            &format!("alive-file-open path={}", alive_path.display()),
+            || options.open(alive_path).map_err(GateReason::Lock),
+        )?;
+        let exclusive_span =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::EpubLock)
+                .watched_optional(miv_startup::watch_handle(
+                    miv_startup::WatchSlot::CoreStartup,
+                ))
+                .detail("alive-exclusive-lock immediate=true");
         let exclusive = lock(&file, true, true).is_ok();
+        exclusive_span.finish(if exclusive {
+            miv_startup::Outcome::Ok
+        } else {
+            miv_startup::Outcome::Skipped
+        });
         let mut sibling_ids = Vec::new();
         if exclusive {
             let cleanup = (|| -> Result<(), GateReason> {
-                let mut db = EpubCache::open_at(&data_dir).map_err(GateReason::Schema)?;
-                db.collect_retired().map_err(GateReason::Cleanup)?;
-                db.collect_pending().map_err(GateReason::Cleanup)?;
-                sibling_ids = match db.outstanding_sibling_ids() {
-                    Ok(ids) => ids,
-                    Err(error) => {
-                        crate::logger::log(format!(
-                            "epub sibling leftover listing failed: {error:?}"
-                        ));
-                        Vec::new()
-                    }
-                };
-                crate::materializer::cleanup_epub_sibling_work_startup(&data_dir);
-                db.prune_closed_reservations()
-                    .map_err(GateReason::Cleanup)?;
-                Ok(())
+                let mut db = startup_gate_operation(
+                    miv_startup::Stage::EpubGate,
+                    "cache-library-open-schema",
+                    || EpubCache::open_at(&data_dir).map_err(GateReason::Schema),
+                )?;
+                startup_gate_operation(
+                    miv_startup::Stage::EpubGate,
+                    "startup-cache-library-cleanup",
+                    || {
+                        db.collect_retired().map_err(GateReason::Cleanup)?;
+                        db.collect_pending().map_err(GateReason::Cleanup)?;
+                        sibling_ids = match db.outstanding_sibling_ids() {
+                            Ok(ids) => ids,
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "epub sibling leftover listing failed: {error:?}"
+                                ));
+                                Vec::new()
+                            }
+                        };
+                        crate::materializer::cleanup_epub_sibling_work_startup(&data_dir);
+                        db.prune_closed_reservations()
+                            .map_err(GateReason::Cleanup)?;
+                        Ok(())
+                    },
+                )
             })();
-            unlock(&file).map_err(GateReason::Lock)?;
+            startup_gate_operation(
+                miv_startup::Stage::EpubLock,
+                "alive-exclusive-unlock",
+                || unlock(&file).map_err(GateReason::Lock),
+            )?;
             cleanup?;
         }
-        lock(&file, false, false).map_err(GateReason::Lock)?;
+        startup_gate_operation(
+            miv_startup::Stage::EpubLock,
+            "alive-shared-lock immediate=false",
+            || lock(&file, false, false).map_err(GateReason::Lock),
+        )?;
         if !exclusive {
             // Another process owns this profile: do not initialize its schema or scan files.
             let db_path = data_dir.join("epub_cache.db");
             if !db_path.exists() {
-                let _ = unlock(&file);
+                let _ = startup_gate_operation(
+                    miv_startup::Stage::EpubLock,
+                    "alive-shared-unlock-schema-missing",
+                    || unlock(&file).map_err(GateReason::Lock),
+                );
                 return Err(GateReason::Schema(CacheError::InvalidState(
                     "schema missing",
                 )));
             }
-            let conn =
-                Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                    .map_err(|e| GateReason::Schema(e.into()))?;
-            validate_schema(&conn).map_err(GateReason::Schema)?;
+            let conn = startup_gate_operation(
+                miv_startup::Stage::EpubGate,
+                "cache-library-read-only-open",
+                || {
+                    Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .map_err(|e| GateReason::Schema(e.into()))
+                },
+            )?;
+            startup_gate_operation(
+                miv_startup::Stage::EpubGate,
+                "cache-library-read-only-schema",
+                || validate_schema(&conn).map_err(GateReason::Schema),
+            )?;
         }
         Ok((AliveGuard { file, data_dir }, exclusive, sibling_ids))
     })();

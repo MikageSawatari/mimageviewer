@@ -2,6 +2,7 @@
 use crate::indexer_supervisor::{self, SupervisorControl, SupervisorHandle, SupervisorParams};
 use crate::metadata_ownership::{MetadataOwnership, metadata_ownership, root_key};
 use crate::settings::FavoriteEntry;
+use miv_startup::{Lane, Outcome, Stage, span};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -346,16 +347,30 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
         shared.checkpoint(&next, "snapshot");
         if startup {
             let t = Instant::now();
-            match startup_cleanup(&stores, &next) {
+            let cleanup = span(Lane::Metadata, Stage::MetadataCleanup);
+            let cleanup_result = startup_cleanup(&stores, &next);
+            cleanup.finish(if cleanup_result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            });
+            match cleanup_result {
                 Ok(roots) => shared.state.lock().unwrap().must_scan_roots.extend(roots),
                 Err(e) => cleanup_failure(&stores, &shared, e),
             }
-            match crate::indexer_manager::run_reconciliation_via_dispatcher(
+            let reconciliation = span(Lane::Metadata, Stage::MetadataReconciliation);
+            let reconciliation_result = crate::indexer_manager::run_reconciliation_via_dispatcher(
                 &stores.meta,
                 &stores.fts,
                 &stores.writer,
                 &next.favorites,
-            ) {
+            );
+            reconciliation.finish(if reconciliation_result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            });
+            match reconciliation_result {
                 Ok(report) => shared.state.lock().unwrap().failed_cleaned = report.failed_cleaned,
                 Err(e) => cleanup_failure(&stores, &shared, e),
             }
@@ -559,6 +574,11 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
         }
         view.busy = false;
         shared.changed.notify_all();
+        if initial_configuration {
+            // Orchestration idle is this worker's checkpoint, not watcher readiness.
+            let idle = span(Lane::Metadata, Stage::MetadataOrchestrationIdle);
+            idle.finish(Outcome::Ok);
+        }
     }
     let deadline = shared
         .state

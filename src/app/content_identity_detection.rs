@@ -35,7 +35,7 @@ impl App {
     fn spawn_content_identity_index_load(&mut self) {
         self.content_identity_ledger_state = ContentIdentityLedgerState::Loading;
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::io_sem)
             .unwrap_or_else(|| Arc::clone(&self.content_identity_fallback_io_sem));
@@ -159,7 +159,7 @@ impl App {
             return;
         }
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::io_sem)
             .unwrap_or_else(|| Arc::clone(&self.content_identity_fallback_io_sem));
