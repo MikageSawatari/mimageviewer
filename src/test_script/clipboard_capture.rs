@@ -79,7 +79,11 @@ fn hdrop(path: &Path) -> Vec<u8> {
     let mut bytes = vec![0; 20]; // DROPFILES
     bytes[0..4].copy_from_slice(&20_u32.to_le_bytes());
     bytes[16..20].copy_from_slice(&1_u32.to_le_bytes());
-    bytes.extend(unicode_text(&path.to_string_lossy()));
+    // Explorer puts plain drive paths in CF_HDROP. The Shell copy engine does not resolve
+    // the verbatim prefix that canonicalize() adds; it shows an error dialog instead.
+    let spelled = path.to_string_lossy();
+    let spelled = spelled.strip_prefix(r"\\?\").unwrap_or(&spelled);
+    bytes.extend(unicode_text(spelled));
     bytes.extend([0, 0]); // terminating empty path
     bytes
 }
@@ -197,7 +201,7 @@ impl Fixture {
             return Err("clipboard fixture requires exact disposable portable-smoke/data/clipboard-capture/manual".into());
         }
         let captures = root.join("captures");
-        let source = root.join("source/shell-copy.png");
+        let source = root.join("source").join("shell-copy.png");
         let png = std::fs::read(manual.join("seed.png")).map_err(|e| e.to_string())?;
         if !source.is_file() || !captures.is_dir() {
             return Err("clipboard fixture siblings were not prepared".into());
@@ -876,6 +880,11 @@ mod tests {
         assert_eq!(
             &drop[20..],
             [unicode_text("C:/日本語.png"), vec![0, 0]].concat()
+        );
+        let verbatim = hdrop(Path::new(r"\\?\C:\smoke\source\shell-copy.png"));
+        assert_eq!(
+            &verbatim[20..],
+            [unicode_text(r"C:\smoke\source\shell-copy.png"), vec![0, 0]].concat()
         );
         let parsed = crate::clipboard_capture::html::parse_cf_html(
             &payloads(
