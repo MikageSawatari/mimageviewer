@@ -315,6 +315,7 @@ preferences_policy! {
         minimize_to_tray_on_close: bool => ("閉じるときトレイに常駐", |_, _| true, plain, plain);
         clipboard_capture_image_enabled: bool => ("コピーした画像を自動保存", |_, _| true, plain, plain);
         clipboard_capture_html_enabled: bool => ("コピーしたページの画像を選んで保存", |_, _| true, plain, plain);
+        clipboard_capture_min_short_side_px: u32 => ("クリップボード取り込みの最小サイズ (短辺 px)", |v, _| *v <= CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX, plain, plain);
         pause_indexer_while_minimized: bool => ("最小化中は索引を停止", |_, _| true, plain, plain);
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
@@ -1026,6 +1027,7 @@ mod tests {
                 crate::bake_stage::BakeStage::DisplayAdjust,
             ],
         );
+        settings.clipboard_capture_min_short_side_px = 240;
         settings.archive_file_handling = different_enum(
             &settings.archive_file_handling,
             &[
@@ -1534,13 +1536,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 442);
+        assert_eq!(entries.len(), 443);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            133
+            134
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1550,7 +1552,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 131);
+        assert_eq!(wire.len(), 132);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1975,6 +1977,11 @@ mod tests {
                 (10).to_string().parse().unwrap(),
             ),
             (
+                "clipboard_capture_min_short_side_px",
+                0.0,
+                f64::from(CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX),
+            ),
+            (
                 "folder_skip_limit",
                 (1).to_string().parse().unwrap(),
                 (30).to_string().parse().unwrap(),
@@ -2091,6 +2098,7 @@ mod tests {
             let integer = matches!(
                 key,
                 "slideshow_continuous_scroll_percent"
+                    | "clipboard_capture_min_short_side_px"
                     | "folder_thumb_depth"
                     | "folder_skip_limit"
                     | "spread_page_gap_px"

@@ -51904,6 +51904,8 @@ impl App {
         let (Some(hwnd), Some(folder)) = (self.main_hwnd, self.current_favorite_target()) else {
             return;
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::clipboard_capture::diagnostics::paste_dispatched();
         match query() {
             Ok(kind) => execute(self, ctx, kind, hwnd, folder),
             Err(error) => self.show_feedback_toast_on(error, ActionSurface::MainWindow),
@@ -84884,6 +84886,19 @@ impl App {
                 self.open_preferences_page(
                     crate::ui_dialogs::preferences::PreferencesPage::Thumbnail,
                 );
+            }
+            for (action, enabled) in [
+                (crate::test_script::UiSmokeAction::ClipboardMonitorsOn, true),
+                (
+                    crate::test_script::UiSmokeAction::ClipboardMonitorsOff,
+                    false,
+                ),
+            ] {
+                if crate::test_script::take_smoke_action(action) {
+                    self.settings.clipboard_capture_image_enabled = enabled;
+                    self.settings.clipboard_capture_html_enabled = enabled;
+                    ctx.request_repaint();
+                }
             }
             if crate::test_script::take_smoke_action(
                 crate::test_script::UiSmokeAction::OpenFirstSmartFolder,

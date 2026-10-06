@@ -4740,6 +4740,9 @@ pub struct Settings {
     /// HTML コピー内の画像を選んで保存する監視。S2 で UI に公開する。
     #[serde(default)]
     pub clipboard_capture_html_enabled: bool,
+    /// HTML 選択ダイアログの短辺フィルター (px)。既定 100。
+    #[serde(default = "default_clipboard_capture_min_short_side_px")]
+    pub clipboard_capture_min_short_side_px: u32,
     /// None は capture::default_output_dir()/clipboard。保存まで作成しない。
     #[serde(default)]
     pub clipboard_capture_output_dir: Option<PathBuf>,
@@ -7075,6 +7078,12 @@ fn default_raw_develop_parallelism() -> u8 {
 fn default_slideshow_interval() -> f32 {
     3.0
 }
+
+pub(crate) const CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX: u32 = 32768;
+
+fn default_clipboard_capture_min_short_side_px() -> u32 {
+    100
+}
 fn default_slideshow_continuous_wait_secs() -> f32 {
     1.5
 }
@@ -7366,6 +7375,7 @@ impl Default for Settings {
             slideshow_end_action: SlideshowEndAction::default(),
             clipboard_capture_image_enabled: false,
             clipboard_capture_html_enabled: false,
+            clipboard_capture_min_short_side_px: default_clipboard_capture_min_short_side_px(),
             clipboard_capture_output_dir: None,
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
@@ -9591,6 +9601,9 @@ impl Settings {
         } else {
             FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
         };
+        self.clipboard_capture_min_short_side_px = self
+            .clipboard_capture_min_short_side_px
+            .min(CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX);
         self.retained_final_ai_cache_max_entries = self.retained_final_ai_cache_max_entries.clamp(
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN,
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
@@ -18288,10 +18301,12 @@ mod tests {
         let defaults: super::Settings = serde_json::from_str("{}").unwrap();
         assert!(!defaults.clipboard_capture_image_enabled);
         assert!(!defaults.clipboard_capture_html_enabled);
+        assert_eq!(defaults.clipboard_capture_min_short_side_px, 100);
         assert!(defaults.clipboard_capture_output_dir.is_none());
         let configured = super::Settings {
             clipboard_capture_image_enabled: true,
             clipboard_capture_html_enabled: true,
+            clipboard_capture_min_short_side_px: 240,
             clipboard_capture_output_dir: Some(std::path::PathBuf::from("C:/captures/clipboard")),
             ..defaults
         };
@@ -18299,9 +18314,23 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
         assert!(restored.clipboard_capture_image_enabled);
         assert!(restored.clipboard_capture_html_enabled);
+        assert_eq!(restored.clipboard_capture_min_short_side_px, 240);
         assert_eq!(
             restored.clipboard_capture_output_dir,
             configured.clipboard_capture_output_dir
+        );
+    }
+
+    #[test]
+    fn clipboard_capture_minimum_is_bounded() {
+        let mut live = super::Settings {
+            clipboard_capture_min_short_side_px: u32::MAX,
+            ..Default::default()
+        };
+        live.sanitize();
+        assert_eq!(
+            live.clipboard_capture_min_short_side_px,
+            super::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX
         );
     }
 }

@@ -196,6 +196,8 @@ mod native {
         resolve_reveal, resolve_selection, scaled,
     };
     use crate::clipboard_capture::CaptureEvent;
+    #[cfg(feature = "test-script")]
+    use std::sync::atomic::AtomicIsize;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
     use std::thread::JoinHandle;
@@ -238,6 +240,8 @@ mod native {
     }
 
     struct Mailbox {
+        #[cfg(feature = "test-script")]
+        smoke_hwnd: AtomicIsize,
         latest: Mutex<Option<Command>>,
         current_generation: Arc<AtomicU64>,
         selection_open: Arc<AtomicBool>,
@@ -262,6 +266,8 @@ mod native {
                 dark,
                 content,
             });
+            #[cfg(feature = "test-script")]
+            crate::clipboard_capture::diagnostics::popup_requested();
             true
         }
 
@@ -320,6 +326,12 @@ mod native {
     }
 
     impl PopupRuntime {
+        #[cfg(feature = "test-script")]
+        pub(crate) fn smoke_visible(&self) -> bool {
+            let hwnd = self.mailbox.smoke_hwnd.load(Ordering::Acquire);
+            hwnd != 0 && unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
+        }
+
         pub(crate) fn start(
             current_generation: Arc<AtomicU64>,
             selection_open: Arc<AtomicBool>,
@@ -328,6 +340,8 @@ mod native {
             repaint: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<Self, String> {
             let mailbox = Arc::new(Mailbox {
+                #[cfg(feature = "test-script")]
+                smoke_hwnd: AtomicIsize::new(0),
                 latest: Mutex::new(None),
                 current_generation: current_generation.clone(),
                 selection_open: selection_open.clone(),
@@ -357,6 +371,8 @@ mod native {
                         (state.repaint)();
                     }
                     worker_mailbox.thread_id.store(0, Ordering::Release);
+                    #[cfg(feature = "test-script")]
+                    worker_mailbox.smoke_hwnd.store(0, Ordering::Release);
                 })
                 .map_err(|error| format!("clipboard capture popup thread: {error}"))?;
             Ok(Self {
@@ -524,6 +540,10 @@ mod native {
                                 .map_err(|e| format!("CreateWindowExW popup: {e}"))?,
                             );
                         }
+                        #[cfg(feature = "test-script")]
+                        mailbox
+                            .smoke_hwnd
+                            .store(window.unwrap().0 as isize, Ordering::Release);
                         show(window.unwrap(), state_ptr, generation, dark, content);
                     }
                     Some(Command::Hide) => {
@@ -666,6 +686,8 @@ mod native {
                 return;
             }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            #[cfg(feature = "test-script")]
+            crate::clipboard_capture::diagnostics::popup_shown();
             let _ = InvalidateRect(Some(hwnd), None, false);
             let mut cursor = POINT::default();
             let mut rect = RECT::default();
@@ -999,6 +1021,8 @@ mod native {
 
         fn mailbox(generation: u64) -> Mailbox {
             Mailbox {
+                #[cfg(feature = "test-script")]
+                smoke_hwnd: AtomicIsize::new(0),
                 latest: Mutex::new(None),
                 current_generation: Arc::new(AtomicU64::new(generation)),
                 selection_open: Arc::new(AtomicBool::new(false)),

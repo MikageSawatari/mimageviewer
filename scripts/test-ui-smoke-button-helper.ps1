@@ -1,4 +1,4 @@
-param()
+param([switch] $ClipboardOnly)
 
 $ErrorActionPreference = 'Stop'
 $helperRoot = Join-Path $PSScriptRoot 'ui-smoke\button-helper'
@@ -14,6 +14,8 @@ $sourcePaths = @(
     (Join-Path $helperRoot 'LocalButtonPipe.cs'),
     (Join-Path $helperRoot 'ButtonHelperHost.cs'),
     (Join-Path $helperRoot 'ButtonHelperRunnerApi.cs'),
+    (Join-Path $helperRoot 'ClipboardKeyHelper.cs'),
+    (Join-Path $helperRoot 'tests\ClipboardKeyHelperTests.cs'),
     (Join-Path $helperRoot 'tests\ButtonGestureReducerTests.cs'),
     (Join-Path $helperRoot 'tests\ButtonInputBackendDraftTests.cs'),
     (Join-Path $helperRoot 'tests\ButtonHelperHostDraftTests.cs'),
@@ -45,5 +47,7 @@ $bodies = $sourcePaths | ForEach-Object {
 $source = $usingBlock + [Environment]::NewLine + ($bodies -join [Environment]::NewLine)
 Add-Type -TypeDefinition $source -Language CSharp
 
+[Miv.UiSmoke.ButtonHelperDraft.ClipboardKeyHelperTests]::RunAll()
+if ($ClipboardOnly) { return }
 [ButtonGestureReducerTests]::RunAll()
 [ButtonHelperDraftTests]::RunAll()

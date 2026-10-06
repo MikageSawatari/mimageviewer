@@ -63,6 +63,26 @@ impl App {
         self.capture_selection.is_some()
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn clipboard_capture_smoke_selection(&self) -> Option<(bool, usize, String, u32)> {
+        let selection = self.capture_selection.as_ref()?;
+        let destination = match &selection.snapshot.intent {
+            CaptureIntent::Manual { destination } => destination.display().to_string(),
+            CaptureIntent::Automatic { snapshot } => snapshot
+                .config
+                .destination
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        };
+        Some((
+            selection.fetch_complete,
+            selection.selected_images().len(),
+            destination,
+            selection.minimum,
+        ))
+    }
+
     pub(crate) fn handle_capture_selection(
         &mut self,
         snapshot: Arc<SelectionSnapshot>,
@@ -135,7 +155,7 @@ impl App {
             session,
             phase: SelectionPhase::Fetching,
             hashes: HashSet::new(),
-            minimum: 100,
+            minimum: self.settings.clipboard_capture_min_short_side_px,
             fetched: 0,
             fetch_complete: false,
         });
@@ -261,6 +281,9 @@ impl App {
             save = actions.save;
             close |= actions.close;
         });
+        // Drawing only updates the live preference; settings persistence belongs
+        // to the settings save boundary rather than the UI frame.
+        self.settings.clipboard_capture_min_short_side_px = selection.minimum;
         if save {
             let images = selection.selected_images();
             let total = images.len();
@@ -320,8 +343,12 @@ fn draw_selection_contents(
     }
     ui.add_enabled_ui(can_close, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label("最小サイズ (短辺 px)");
-            ui.add(egui::DragValue::new(minimum).range(0..=32768));
+            let label = ui.label("最小サイズ (短辺 px)");
+            ui.add(
+                egui::DragValue::new(minimum)
+                    .range(0..=crate::settings::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX),
+            )
+            .labelled_by(label.id);
             for (label, selected) in [("全選択", true), ("全解除", false)] {
                 if ui.button(label).clicked() {
                     for cell in cells.iter_mut() {
@@ -664,6 +691,69 @@ mod tests {
             harness.run();
             assert!(!harness.state().capture_selection_open(), "{route}");
         }
+    }
+
+    #[test]
+    fn clipboard_minimum_dialog_edit_save_reload_sets_next_dialog_initial_value() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_state(
+                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+                    app.show_capture_selection_dialog(ctx)
+                },
+                ready_dialog(),
+            );
+        harness.run();
+        let snapshot = harness
+            .state()
+            .capture_selection
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .clone();
+        harness
+            .get_by(|node| {
+                node.min_numeric_value() == Some(0.0)
+                    && node.max_numeric_value()
+                        == Some(f64::from(
+                            crate::settings::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX,
+                        ))
+            })
+            .focus();
+        harness.run();
+        harness
+            .get_by(|node| {
+                node.min_numeric_value() == Some(0.0)
+                    && node.max_numeric_value()
+                        == Some(f64::from(
+                            crate::settings::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX,
+                        ))
+            })
+            .type_text("240");
+        harness.run();
+        harness.get_by_label("閉じる").click();
+        harness.run();
+        assert_eq!(
+            harness.state().settings.clipboard_capture_min_short_side_px,
+            240
+        );
+        // AppTestEnv keeps the data-dir override and serialized test lease alive
+        // across the production save/load calls and the next dialog.
+        assert_eq!(crate::data_dir::get(), harness.state().tmp.path());
+        assert!(!crate::settings_db::save_suppressed());
+        assert!(harness.state().settings.save_checked());
+        let loaded = crate::settings::Settings::load_with_meta();
+        assert!(loaded.meta.db_loaded);
+        assert_eq!(loaded.settings.clipboard_capture_min_short_side_px, 240);
+        harness.state_mut().settings = loaded.settings;
+        let ctx = harness.ctx.clone();
+        harness
+            .state_mut()
+            .handle_capture_selection(snapshot, &ctx, |_, _| {});
+        assert_eq!(
+            harness.state().capture_selection.as_ref().unwrap().minimum,
+            240
+        );
     }
 
     #[test]

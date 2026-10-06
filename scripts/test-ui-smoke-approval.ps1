@@ -58,6 +58,9 @@ $scenarios = @($validateSet[0].PositionalArguments | ForEach-Object { [string]$_
 if ($scenarios.Count -eq 0) {
     throw 'Scenario ValidateSet was empty'
 }
+if ($scenarios -notcontains 'ClipboardCapture') {
+    throw 'ClipboardCapture is missing from the approval-gated scenario registration'
+}
 $gateIndex = $runnerSource.IndexOf('if (-not $InteractiveApproved)', [System.StringComparison]::Ordinal)
 $initializationIndex = $runnerSource.IndexOf('$ErrorActionPreference =', [System.StringComparison]::Ordinal)
 if ($gateIndex -lt 0 -or $initializationIndex -lt 0 -or $gateIndex -gt $initializationIndex) {

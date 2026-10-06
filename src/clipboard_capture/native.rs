@@ -52,6 +52,8 @@ struct Shared {
     serial: AtomicU64,
     stop: AtomicBool,
     hwnd: AtomicIsize,
+    #[cfg(feature = "test-script")]
+    listener_ready: AtomicBool,
     wake: mpsc::SyncSender<()>,
     events: mpsc::Sender<CaptureEvent>,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -177,6 +179,11 @@ fn listener(state: Arc<Shared>) {
             return Err(format!("AddClipboardFormatListener: {e}"));
         }
         // Deliberately no initial read: enabling captures only subsequent copies.
+        #[cfg(feature = "test-script")]
+        {
+            state.listener_ready.store(true, Ordering::Release);
+            (state.repaint)();
+        }
         let mut msg = MSG::default();
         loop {
             let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -196,6 +203,8 @@ fn listener(state: Arc<Shared>) {
         state.fail(format!("listener: {e}"));
     }
     state.hwnd.store(0, Ordering::Release);
+    #[cfg(feature = "test-script")]
+    state.listener_ready.store(false, Ordering::Release);
     LISTENER.with(|s| *s.borrow_mut() = None);
 }
 
@@ -414,6 +423,8 @@ fn requested_payload(
 }
 
 fn read_clipboard(intent: ClipboardReadIntent<'_>) -> Result<Observation, String> {
+    #[cfg(feature = "test-script")]
+    super::diagnostics::reader_open_attempt();
     unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard: {e}"))?;
     let guard = ClipboardGuard;
     let before = unsafe { GetClipboardSequenceNumber() };
@@ -658,6 +669,8 @@ fn reader(
                                                 state.generation.load(Ordering::Acquire),
                                                 AcceptedContent::Image(image.content_hash),
                                             ) {
+                                                #[cfg(feature = "test-script")]
+                                                super::diagnostics::save_requested();
                                                 let _ = save.send(SaveJob {
                                                     request: request.clone(),
                                                     image,
@@ -740,6 +753,11 @@ fn reader(
                             }
                         }
                     }
+                    #[cfg(feature = "test-script")]
+                    {
+                        super::diagnostics::automatic_completed(request.sequence);
+                        (state.repaint)();
+                    }
                     active = state.take_latest().or(newer);
                 }
             }
@@ -755,6 +773,16 @@ pub(super) struct CaptureRuntime {
     popup: Arc<popup::PopupRuntime>,
 }
 impl CaptureRuntime {
+    #[cfg(feature = "test-script")]
+    pub(super) fn smoke_monitor_ready(&self) -> bool {
+        self.state.listener_ready.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(super) fn smoke_popup_visible(&self) -> bool {
+        self.popup.smoke_visible()
+    }
+
     pub(super) fn start(
         snapshot: Arc<CaptureSnapshot>,
         generation: Arc<AtomicU64>,
@@ -780,6 +808,8 @@ impl CaptureRuntime {
             serial: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             hwnd: AtomicIsize::new(0),
+            #[cfg(feature = "test-script")]
+            listener_ready: AtomicBool::new(false),
             wake,
             events,
             repaint,
@@ -997,6 +1027,8 @@ mod tests {
             stop: AtomicBool::new(false),
             hwnd: AtomicIsize::new(0),
             wake: wake_tx,
+            #[cfg(feature = "test-script")]
+            listener_ready: AtomicBool::new(false),
             events,
             repaint: Arc::new(|| {}),
         });
@@ -1070,6 +1102,8 @@ mod tests {
             wake,
             events,
             repaint: Arc::new(|| {}),
+            #[cfg(feature = "test-script")]
+            listener_ready: AtomicBool::new(false),
         };
         state.notify(11);
         state.selection_open.store(false, Ordering::Release);

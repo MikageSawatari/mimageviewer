@@ -1,6 +1,8 @@
 //! App-owned clipboard capture. Notifications carry immutable settings; viewer contexts
 //! never own or reset this service. The native reader only copies bytes while open.
 pub(crate) mod data;
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) mod diagnostics;
 pub(crate) mod fetch;
 pub(crate) mod html;
 #[cfg(windows)]
@@ -487,6 +489,20 @@ impl Default for ClipboardCaptureService {
 }
 
 impl ClipboardCaptureService {
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn smoke_monitor_ready(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.smoke_monitor_ready())
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn smoke_popup_visible(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.smoke_popup_visible())
+    }
+
     pub(crate) fn startup_failed(&self) -> bool {
         self.startup_error.is_some()
     }
