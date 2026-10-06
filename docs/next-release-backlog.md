@@ -34,7 +34,7 @@
 
 ### 1.335 本を直接ページ表示したまま終了すると、次回起動が見ていないページ一覧になる — mIV スレ >>508 (2026-10-06)
 
-- Phase 1 設計のみ (2026-10-06): 正本は [startup-restore-target-plan.md](startup-restore-target-plan.md)。指定条件の ZIP direct page → 終了保存 → 再起動を通常ハンドラの headless red test で確認した。全 `last_folder` reader/writer、移行、入れ子・多窓・一覧所有の回帰計画を記録。既存値を保った Previous 専用の単一復元レコードを提案中。合成親一覧を起動復元の対象に含める範囲と初回移行方針の判断後に実装へ進む。製品コード変更・コミットなし。
+- Phase 1 設計改訂 (2026-10-06): 正本は [startup-restore-target-plan.md](startup-restore-target-plan.md)。指定条件の ZIP direct page → 終了保存 → 再起動を通常ハンドラの headless red test で確認した。全 `last_folder` reader/writer と Previous 専用の単一復元レコードを記録。ユーザー決定 A/B: 復元対象は物理フォルダ／本／Drive のみ、合成一覧とそこからの直接読書は直前の対象と cursor を保持。初回移行は legacy 値を維持。初稿の独立レビュー revise を受け、最終表示意図の全経路、ZIP 親階層・cursor の復元順序、現在一覧の適格性と handler 回帰を補完。改訂の再レビューは未実施。今回も設計のみ、製品コード変更・コミットなし。
 - 報告: v4.3.0 ポータブル版で ZIP の画像を表示して終了すると、再起動時にその ZIP のページ一覧が開く。ZIP を選択しただけで終了した場合は親のアーカイブ一覧が開く。報告者のビューワモード・本の開き方・起動時の場所の設定は未確認。
 - 現状のコード: メイン側で本のページを読み込むと `start_loading_items` が `settings.last_folder` に ZIP/PDF 自身を保存する (`src/app.rs`)。「前回終了した場所」での次回起動は `open_default_startup_target` がそのパスを `load_folder_or_convert_archive(..., auto_fullscreen=false)` で開くため、ページ一覧になる (`src/app/startup_ops.rs`)。独立した複数ウィンドウの本コンテキストではメイン側の履歴保存を抑止している。
 - **期待する復元先は、内部で読み込んだ場所ではなく、利用者が最後に明示的に開いた一覧。** 本をページ一覧で開いてから画像を表示した場合はその本のページ一覧へ戻る。本を直接ページ表示で開き、ページ一覧を見ていない場合は、開く前の親一覧へ戻る。直接表示後に Backspace 等でページ一覧を明示的に開いた場合は、そこを復元先にする。
