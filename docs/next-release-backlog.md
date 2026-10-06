@@ -2298,7 +2298,36 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
       FFmpeg / VCRT DLL / EffeTune bundle を配置、VCRT PE 検査は runtime=4 / pe=3 で成功。
       初回 native 構築の並列競合を避け、`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` で実行。
       製品バイナリは起動していない。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で全ファイル EOL 差分が無いことを確認。
-- 残る検収: 独立レビューと、利用者による実アプリの ZIP / レーティング / 変換書庫 / PDF / BS 確認。
+- 追加調査 (2026-10-07、`d72808b03` の実機報告):
+  - 利用者は ZIP → ← の修正を確認。★3 → 実フォルダ → 画像一覧 → ← では選択を失うと報告。
+    この追加報告は未解決。製品コードの追加修正は原因・red が確認できるまで保留する。
+  - コードの追跡: Folder の double-click / Enter は `grid_physical_navigation` → `RatingSource` →
+    `start_rating_physical_open`。採用時に `commit_rating_physical_load_owner` が履歴の ★3 と
+    `rating_view_nav_stack` の opened path を記録し、通常 install がその path を `current_folder` に採用する。
+    `folder_history` は画像一覧の位置用で、rating synthetic 一覧には保存しない。
+    ← / → replay は発行前の `effective_folder()` を `select_opened_path` に運び、
+    `finish_rating_view_install` と publication 後に `select_rating_view_row_for_opened_path` で照合する。
+    Folder も `container_path()` の照合対象。Backspace は既存の nav stack の path を渡す。
+  - 追加した handler / state 回帰 4 件は `d72808b03` の製品コードで全件成功 (valid red 未取得)。
+    フォルダ → ←、→後の←、Backspace の対照、PDF → ← / →後の← / Backspace の対照。
+    各ケースは通常 / A / B の履歴と sidecar 有効で実行し、opened path の運搬・履歴 owner・
+    4 枚目を選択した後の一覧行の選択 / ensure-visible を確認。
+    PDF は prepared pages の採用を検証し、外部 decoder 実行は対象外。
+  - 実フォルダの同型経路を再照合: 通常 / A / B は同じ `start_loading_items_inner` の位置保存、
+    smart root は returned root entry、collection は既存 entry anchor、bookmark の本フォルダは
+    stable row key の帰路を使う。検索 / snapshot 所有中の ← は拒否される。
+    閲覧履歴・サブ展開は上表の別原因の anchor 未保持が残る。これらの owner は変更していない。
+  - 利用者セッションの既存ログを読み取り、rating synthetic 一覧から実フォルダへの直接 activation と
+    rating 一覧の再 install を確認した。選択値の記録は無く、このログだけでは喪失箇所を確定できない。
+    実データの書換え・製品バイナリ起動は行わない。実操作 / grid・詳細表示 / 選択と scroll の差を追加確認中。
+  - 追加調査時の検証: §1.328 は 14/14 (追加 4 件を含む)、full lib は pipe なしで
+    10904 成功 / 0 失敗 / 52 ignored、exit 0。fmt、normal / portable core check、glyph (危険 glyph 0)
+    は全て exit 0。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で局所差分を確認。
+    成功の証跡は `target/1328-followup-baseline.txt`。追加報告の red / 修正完了を意味しない。
+    `.\scripts\build-dev.ps1 -PreserveRuntime` も exit 0 (core / remote / EPUB PDF worker、VCRT PE: runtime=4 / pe=3)。
+    製品バイナリは起動していない。コミット文案は `target/1328-msg-2.txt`、未コミット。
+- 残る検収: 追加の実フォルダ報告の再現条件と原因特定、独立レビュー、
+  利用者による実アプリのレーティング / 変換書庫 / PDF / BS 確認。
   閲覧履歴・サブ展開の anchor を含む構造変更はこの bounded fix では実装しない。
 - 規模 / 優先度: Small〜Medium / P2 (利用者報告あり)。
 

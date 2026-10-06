@@ -21787,6 +21787,161 @@ mod phase_c_folder_nav_history_tests {
         rating_1328_zip_return(true, FolderHistoryDirection::Back);
     }
 
+    fn rating_1328_folder_or_pdf_return(backspace: bool, replay_forward: bool, pdf: bool) {
+        for slot in [None, Some(QuickFolderSlotId::A), Some(QuickFolderSlotId::B)] {
+            let mut app = setup_app();
+            app.settings.sidecar_backup_enabled = true;
+            app.settings.tag_sidecar_backup_enabled = true;
+            app.settings.rating_view_sort =
+                crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+            app.active_quick_folder_slot = slot;
+            let parent = app.tmp.path().join("rated-folders");
+            let mut opened = PathBuf::new();
+            for i in 0..6 {
+                let path = parent.join(if pdf {
+                    format!("{i:02}.pdf")
+                } else {
+                    format!("{i:02}")
+                });
+                if pdf {
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+                } else {
+                    std::fs::create_dir_all(&path).unwrap();
+                    for page in 0..4 {
+                        image::RgbImage::new(2, 2)
+                            .save(path.join(format!("{page:02}.png")))
+                            .unwrap();
+                    }
+                }
+                let key = crate::adjustment_db::normalize_path(&path);
+                let meta = crate::rating_db::RatingMeta::new(if pdf {
+                    crate::rating_db::RatingItemKind::PdfFile
+                } else {
+                    crate::rating_db::RatingItemKind::Folder
+                })
+                .with_source_path(&path);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+                if i == 4 {
+                    opened = path;
+                }
+            }
+            app.current_folder = Some(parent);
+            app.enter_rating_view(3);
+            finish_rating_navigation_for_test(&mut app);
+            app.select_rating_view_row_for_opened_path(&opened);
+            assert_eq!(app.selected, Some(4));
+            let nav = app.grid_physical_navigation(4, opened.clone(), false);
+            assert!(app.apply_fullscreen_close_nav_immediate(nav));
+            if pdf {
+                replace_physical_history_preflight_for_test(
+                    &mut app,
+                    crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                        (0..4)
+                            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                                page_num,
+                                mtime: 1,
+                                file_size: 1,
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            finish_staged_physical_history_for_test(&mut app);
+            let ctx = egui::Context::default();
+            for _ in 0..1000 {
+                if !app.sidecar_restore_active() {
+                    break;
+                }
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!app.sidecar_restore_active());
+            assert_eq!(app.effective_folder(), Some(opened.clone()));
+            assert_eq!(app.rating_view_nav_stack, vec![opened.clone()]);
+            assert_eq!(
+                app.folder_history_back_target(),
+                Some(&FolderNavHistoryTarget::Rating { stars: 3 })
+            );
+            app.selected = Some(3);
+            if backspace {
+                app.rating_view_back();
+            } else {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+            }
+            assert_eq!(
+                app.rating_view_pending
+                    .as_ref()
+                    .unwrap()
+                    .navigation
+                    .as_ref()
+                    .unwrap()
+                    .select_opened_path,
+                Some(opened.clone())
+            );
+            finish_rating_navigation_for_test(&mut app);
+            assert!(app.items_are_rating_view);
+            assert_eq!(app.selected, Some(4));
+            assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
+            assert!(app.scroll_to_selected);
+            if replay_forward {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                if pdf {
+                    replace_physical_history_preflight_for_test(
+                    &mut app,
+                    crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                        (0..4).map(|page_num| crate::pdf_loader::PdfPageEntry {
+                            page_num, mtime: 1, file_size: 1,
+                        }).collect(),
+                    ),
+                );
+                }
+                finish_staged_physical_history_for_test(&mut app);
+                for _ in 0..1000 {
+                    if !app.sidecar_restore_active() {
+                        break;
+                    }
+                    app.poll_sidecar_restore(&ctx);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(!app.sidecar_restore_active());
+                assert_eq!(app.effective_folder(), Some(opened.clone()));
+                app.selected = Some(3);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+                finish_rating_navigation_for_test(&mut app);
+                assert!(app.items_are_rating_view);
+                assert_eq!(app.selected, Some(4));
+                assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
+                assert!(app.scroll_to_selected);
+            }
+        }
+    }
+
+    #[test]
+    fn section1328_rating_folder_history_back_selects_opened_folder() {
+        rating_1328_folder_or_pdf_return(false, false, false);
+    }
+
+    #[test]
+    fn section1328_rating_folder_forward_then_back_selects_opened_folder() {
+        rating_1328_folder_or_pdf_return(false, true, false);
+    }
+
+    #[test]
+    fn section1328_rating_folder_backspace_control_selects_opened_folder() {
+        rating_1328_folder_or_pdf_return(true, false, false);
+    }
+
+    #[test]
+    fn section1328_rating_pdf_history_and_backspace_control_select_opened_pdf() {
+        rating_1328_folder_or_pdf_return(false, true, true);
+        rating_1328_folder_or_pdf_return(true, false, true);
+    }
+
     fn rating_1328_install_rows(app: &mut App) -> Vec<crate::rating_view::RatingViewRow> {
         let GridItem::Image(previous) = &app.items[0] else {
             panic!("expected an image fixture");
