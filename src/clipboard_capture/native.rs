@@ -1145,6 +1145,51 @@ mod tests {
     }
 
     #[test]
+    fn html_only_powerpoint_payload_is_rejected_automatically_and_accepted_manually() {
+        let mut request = read_request(11);
+        Arc::make_mut(&mut request.snapshot).config.html = true;
+        let context = "<html><img src='/image.png'></html>";
+        let header = |start: usize, end: usize| {
+            format!(
+                "Version:1.0\r\nStartHTML:{start:010}\r\nEndHTML:{end:010}\r\nSourceURL:https://example.com/page\r\n"
+            )
+        };
+        let start = header(0, 0).len();
+        let raw = format!("{}{context}", header(start, start + context.len())).into_bytes();
+        let html = html::parse_cf_html(&raw).unwrap();
+        assert_eq!(html.page_url, "https://example.com/page");
+        assert_eq!(html.candidates, ["https://example.com/image.png"]);
+
+        for office_format in [
+            "PowerPoint 12.0 Internal Shapes",
+            "pOwErPoInT 12.0 Internal Shapes",
+        ] {
+            let formats = data::ClipboardFormats {
+                names: vec![office_format.into(), "HTML Format".into()],
+                ..Default::default()
+            };
+            // The unknown prefix cannot be observed by the fixed preflight
+            // queries, so the complete predicate must act after opening.
+            assert!(data::should_open_automatic(&formats, false, true));
+            assert_eq!(
+                requested_payload(&formats, &ClipboardReadIntent::Automatic(&request)),
+                data::ClipboardKind::Other
+            );
+            assert_eq!(
+                data::classify_automatic(&formats, Some(&html.page_url)),
+                data::ClipboardKind::Ignored
+            );
+            assert_eq!(
+                requested_payload(
+                    &formats,
+                    &ClipboardReadIntent::Manual(data::ClipboardKind::Html)
+                ),
+                data::ClipboardKind::Html
+            );
+        }
+    }
+
+    #[test]
     fn preflight_exclusions_do_not_call_the_opened_reader() {
         let request = read_request(11);
         for excluded in [
@@ -1349,7 +1394,10 @@ mod tests {
             (vec!["HTML Format"], true, true, 10, 11, false),
             (vec!["PNG"], true, true, 11, 10, false),
             (vec!["PNG"], false, true, 10, 10, false),
-            (vec!["PNG", "HTML Format"], true, true, 11, 10, true),
+            (vec!["PNG", "HTML Format"], false, true, 10, 10, false),
+            (vec!["CF_DIBV5", "HTML Format"], false, true, 10, 10, false),
+            (vec!["CF_DIB", "HTML Format"], false, true, 10, 10, false),
+            (vec!["PNG", "HTML Format"], true, true, 11, 10, false),
             (vec!["PNG", "HTML Format"], true, true, 10, 11, true),
             (vec!["PNG", "HTML Format"], true, true, 11, 11, false),
         ] {

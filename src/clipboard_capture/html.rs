@@ -7,6 +7,60 @@ use std::collections::HashSet;
 use url::Url;
 
 const MAX_CANDIDATES: usize = 500;
+const MAX_HTTP_URL_BYTES: usize = 16 * 1024;
+const MAX_DATA_URL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RETAINED_URL_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct CandidateCollector {
+    seen: HashSet<String>,
+    candidates: Vec<String>,
+    omitted: usize,
+    retained_bytes: usize,
+    byte_limit_reached: bool,
+}
+
+impl CandidateCollector {
+    fn add(&mut self, value: &str, base: &Url, image_link: bool) {
+        if self.byte_limit_reached {
+            self.omitted += 1;
+            return;
+        }
+        let Some(url) = resolve_candidate(value, base, image_link) else {
+            return;
+        };
+        let limit = if url.scheme() == "data" {
+            MAX_DATA_URL_BYTES
+        } else {
+            MAX_HTTP_URL_BYTES
+        };
+        if url.as_str().len() > limit {
+            self.omitted += 1;
+            return;
+        }
+        if self.seen.contains(url.as_str()) {
+            return;
+        }
+        if self.candidates.len() == MAX_CANDIDATES {
+            // Do not retain overflow URLs just to deduplicate omissions.
+            self.omitted += 1;
+            return;
+        }
+        // Each accepted URL is owned by both the candidate list and seen set.
+        // Check before making either retained String allocation.
+        let retained = url.as_str().len() * 2;
+        if retained > MAX_RETAINED_URL_BYTES - self.retained_bytes {
+            self.byte_limit_reached = true;
+            self.omitted += 1;
+            return;
+        }
+        self.retained_bytes += retained;
+        self.byte_limit_reached = self.retained_bytes == MAX_RETAINED_URL_BYTES;
+        self.seen.insert(url.as_str().to_owned());
+        // Do not retain the URL parser's spare capacity (e.g. a removed fragment).
+        self.candidates.push(url.as_str().to_owned());
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct HtmlCapture {
@@ -60,21 +114,8 @@ pub(crate) fn parse_cf_html(bytes: &[u8]) -> Result<HtmlCapture, String> {
     };
     let document = Html::parse_fragment(fragment);
     let selector = Selector::parse("*").unwrap();
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
-    let mut omitted = 0;
-    let mut add = |value: &str, image_link: bool| {
-        let Some(url) = resolve_candidate(value, &base, image_link) else {
-            return;
-        };
-        if seen.insert(url.clone()) {
-            if candidates.len() < MAX_CANDIDATES {
-                candidates.push(url);
-            } else {
-                omitted += 1;
-            }
-        }
-    };
+    let mut collector = CandidateCollector::default();
+    let mut add = |value: &str, image_link: bool| collector.add(value, &base, image_link);
     for element in document.select(&selector) {
         if declared_small(element) {
             continue;
@@ -115,8 +156,8 @@ pub(crate) fn parse_cf_html(bytes: &[u8]) -> Result<HtmlCapture, String> {
     }
     Ok(HtmlCapture {
         page_url,
-        candidates,
-        omitted,
+        candidates: collector.candidates,
+        omitted: collector.omitted,
     })
 }
 
@@ -186,7 +227,7 @@ fn resolve_http(value: &str, base: &Url) -> Option<Url> {
     (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
 }
 
-fn resolve_candidate(value: &str, base: &Url, image_link: bool) -> Option<String> {
+fn resolve_candidate(value: &str, base: &Url, image_link: bool) -> Option<Url> {
     let value = value.trim();
     if value.is_empty() || value.chars().any(char::is_control) {
         return None;
@@ -240,7 +281,7 @@ fn resolve_candidate(value: &str, base: &Url, image_link: bool) -> Option<String
     // Keep userinfo here: fetch rejects it, including credentials inherited
     // from <base>. Sanitizing candidates would hide that security violation.
     url.set_fragment(None);
-    Some(url.to_string())
+    Some(url)
 }
 
 /// Follow srcset's URL token boundary: commas inside a data URL are part of
@@ -583,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_limit_counts_unique_omissions() {
+    fn candidate_limit_does_not_retain_overflow_urls() {
         let mut fragment = String::new();
         for index in 0..503 {
             fragment.push_str(&format!(
@@ -592,8 +633,99 @@ mod tests {
         }
         let result = capture(&fragment);
         assert_eq!(result.candidates.len(), 500);
-        assert_eq!(result.omitted, 3);
+        // Overflow URLs are not kept in seen; both occurrences are omitted.
+        assert_eq!(result.omitted, 6);
         assert_eq!(result.candidates[499], "https://example.com/image499.png");
+        let base = Url::parse("https://example.com/").unwrap();
+        let mut collector = CandidateCollector::default();
+        for index in 0..503 {
+            collector.add(&format!("/image{index}.png"), &base, false);
+        }
+        assert_eq!(collector.seen.len(), MAX_CANDIDATES);
+        assert!(!collector.seen.contains("https://example.com/image500.png"));
+    }
+
+    #[test]
+    fn huge_base_cannot_amplify_retained_candidate_memory() {
+        let before = format!(
+            "<html><base href='https://cdn.example.com/{}/'>",
+            "a".repeat(8 * 1024 * 1024)
+        );
+        let mut fragment = String::new();
+        for index in 0..503 {
+            fragment.push_str(&format!("<img src='image{index}.png'>"));
+        }
+        fragment.push_str("<img src='https://example.com/valid.png'>");
+        let bytes = cf_html(&before, &fragment, "</html>", Some("https://example.com/"));
+        assert!(bytes.len() < MAX_HTML_BYTES);
+        let result = parse_cf_html(&bytes).unwrap();
+        assert_eq!(result.omitted, 503);
+        assert_eq!(result.candidates, ["https://example.com/valid.png"]);
+    }
+
+    #[test]
+    fn resolved_http_and_data_url_length_boundaries() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let mut collector = CandidateCollector::default();
+        let http = format!(
+            "{base}{}",
+            "a".repeat(MAX_HTTP_URL_BYTES - base.as_str().len())
+        );
+        collector.add(&http, &base, false);
+        collector.add(&format!("{http}b"), &base, false);
+        assert_eq!(collector.candidates.len(), 1);
+        assert_eq!(collector.candidates[0].len(), MAX_HTTP_URL_BYTES);
+        assert_eq!(collector.omitted, 1);
+
+        let prefix = "data:image/png;base64,";
+        let data = format!("{prefix}{}", "A".repeat(MAX_DATA_URL_BYTES - prefix.len()));
+        collector.add(&data, &base, false);
+        collector.add(&format!("{data}A"), &base, false);
+        assert_eq!(collector.candidates.len(), 2);
+        assert_eq!(collector.candidates[1].len(), MAX_DATA_URL_BYTES);
+        assert_eq!(collector.omitted, 2);
+    }
+
+    #[test]
+    fn retained_url_budget_counts_both_owners_and_stops_after_limit() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let prefix = "data:image/png;base64,";
+        let mut collector = CandidateCollector::default();
+        for byte in ['A', 'B'] {
+            let data = format!(
+                "{prefix}{}",
+                byte.to_string().repeat(MAX_DATA_URL_BYTES - prefix.len())
+            );
+            collector.add(&data, &base, false);
+        }
+        assert_eq!(collector.retained_bytes, MAX_RETAINED_URL_BYTES);
+        assert!(collector.byte_limit_reached);
+        collector.add("/later.png", &base, false);
+        assert_eq!(collector.omitted, 1);
+        assert_eq!(collector.candidates.len(), 2);
+        assert_eq!(collector.seen.len(), 2);
+        let retained: usize = collector
+            .candidates
+            .iter()
+            .chain(collector.seen.iter())
+            .map(String::capacity)
+            .sum();
+        assert_eq!(retained, MAX_RETAINED_URL_BYTES);
+    }
+
+    #[test]
+    fn removed_fragments_do_not_leave_unbudgeted_string_capacity() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let mut collector = CandidateCollector::default();
+        collector.add(&format!("/a.png#{}", "a".repeat(1024 * 1024)), &base, false);
+        let retained: usize = collector
+            .candidates
+            .iter()
+            .chain(collector.seen.iter())
+            .map(String::capacity)
+            .sum();
+        assert_eq!(retained, collector.retained_bytes);
+        assert!(retained < 100);
     }
 
     #[test]

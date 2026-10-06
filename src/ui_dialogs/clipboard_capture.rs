@@ -499,8 +499,6 @@ mod tests {
     use egui_kittest::{Harness, kittest::Queryable};
 
     fn ready_dialog() -> crate::app::AppTestEnvForTest {
-        let mut app = crate::app::setup_app_for_test();
-        let ctx = egui::Context::default();
         let mut bytes = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut bytes, 120, 100);
@@ -516,12 +514,27 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         );
+        let app = ready_dialog_with_urls(vec![url]);
+        assert_eq!(
+            app.capture_selection
+                .as_ref()
+                .unwrap()
+                .selected_images()
+                .len(),
+            1
+        );
+        app
+    }
+
+    fn ready_dialog_with_urls(urls: Vec<String>) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
         let snapshot = Arc::new(SelectionSnapshot {
             token: 77,
             html_epoch: 0,
             html: crate::clipboard_capture::html::HtmlCapture {
                 page_url: "https://example.com/page".into(),
-                candidates: vec![url],
+                candidates: urls,
                 omitted: 0,
             },
             intent: CaptureIntent::Manual {
@@ -539,15 +552,95 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(
-            app.capture_selection
-                .as_ref()
+        app
+    }
+
+    #[test]
+    fn clipboard_animations_with_same_first_frame_are_both_selectable() {
+        use image::AnimationDecoder;
+
+        fn animation(second: [u8; 4]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+                for color in [[255, 0, 0, 255], second] {
+                    encoder
+                        .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                            120,
+                            100,
+                            image::Rgba(color),
+                        )))
+                        .unwrap();
+                }
+            }
+            bytes
+        }
+
+        let first = animation([0, 255, 0, 255]);
+        let second = animation([0, 0, 255, 255]);
+        let frames = |bytes: &[u8]| {
+            image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
                 .unwrap()
-                .selected_images()
-                .len(),
+                .into_frames()
+                .collect_frames()
+                .unwrap()
+        };
+        let first_frames = frames(&first);
+        let second_frames = frames(&second);
+        assert_eq!(first_frames.len(), 2);
+        assert_eq!(second_frames.len(), 2);
+        assert_eq!(first_frames[0].buffer(), second_frames[0].buffer());
+        assert_ne!(first_frames[1].buffer(), second_frames[1].buffer());
+        let url = |bytes: &[u8]| {
+            format!(
+                "data:image/gif;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        // The repeated original still merges even when its fetch completes first.
+        let app = ready_dialog_with_urls(vec![url(&first), url(&second), url(&first)]);
+        let selection = app.capture_selection.as_ref().unwrap();
+        let selected = selection.selected_images();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected_count(&selection.cells, 100), 2);
+        assert_eq!(
+            selection
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, CaptureCell::Duplicate))
+                .count(),
             1
         );
-        app
+        assert_ne!(selected[0].content_hash, selected[1].content_hash);
+        assert_eq!(selected[0].extension, "gif");
+        assert_eq!(selected[1].extension, "gif");
+        let output = app.tmp.path().join("paste");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_state(
+                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+                    app.show_capture_selection_dialog(ctx)
+                },
+                app,
+            );
+        harness.run();
+        assert_eq!(harness.get_all_by_label("120 × 100").count(), 2);
+        harness.get_by_label("選んだ 2 枚を保存").click();
+        harness.run();
+        let ctx = harness.ctx.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while harness.state().capture_selection_open() {
+            harness.state_mut().poll_capture_selection(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let saved: Vec<_> = std::fs::read_dir(output)
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(saved.len(), 2);
+        assert!(saved.contains(&first));
+        assert!(saved.contains(&second));
     }
 
     #[test]

@@ -369,6 +369,7 @@ fn local_server_http_redirect_referer_failures_and_content_detection() {
     for image in results.into_iter().filter_map(Result::ok) {
         assert_eq!(image.extension, "png");
         assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.content_hash, <[u8; 32]>::from(Sha256::digest(png())));
     }
     server.join().unwrap();
     for headers in seen_rx.try_iter() {
@@ -618,6 +619,7 @@ fn data_urls_use_streaming_percent_decode_and_session_budget_is_atomic() {
     )
     .unwrap();
     assert_eq!(image.content_hash, other.content_hash);
+    assert_eq!(image.content_hash, <[u8; 32]>::from(Sha256::digest(png())));
     assert_eq!(std::fs::read(image.path).unwrap(), png());
     assert!(
         fetch_image(

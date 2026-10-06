@@ -36,6 +36,7 @@ pub(crate) struct FetchedImage {
     pub width: u32,
     pub height: u32,
     pub thumbnail: egui::ColorImage,
+    /// Hash of the original bytes that will be saved, including all frames.
     pub content_hash: [u8; 32],
     pub image_url: String,
     pub extension: String,
@@ -611,9 +612,9 @@ fn fetch_image(
         retained: false,
     };
     let result = (|| {
-        let final_url = if source.starts_with("data:") {
-            stream_data(source, &mut output, &mut budget, byte_limit, deadline)?;
-            source.to_owned()
+        let (final_url, content_hash) = if source.starts_with("data:") {
+            let hash = stream_data(source, &mut output, &mut budget, byte_limit, deadline)?;
+            (source.to_owned(), hash)
         } else {
             let mut url = Url::parse(source).map_err(|_| "画像 URL が不正です")?;
             let agent = session.agent.get().ok_or("取得の準備ができませんでした")?;
@@ -658,14 +659,14 @@ fn fetch_image(
                 {
                     return Err("画像が 64 MiB を超えています".into());
                 }
-                stream_bytes(
+                let hash = stream_bytes(
                     &mut response.into_reader(),
                     &mut output,
                     &mut budget,
                     byte_limit,
                     deadline,
                 )?;
-                break url.to_string();
+                break (url.to_string(), hash);
             }
         };
         output.flush().map_err(|e| e.to_string())?;
@@ -677,10 +678,6 @@ fn fetch_image(
         let width = decoded.width();
         let height = decoded.height();
         let rgba = decoded.into_rgba8();
-        let mut hash = Sha256::new();
-        hash.update(width.to_le_bytes());
-        hash.update(height.to_le_bytes());
-        hash.update(rgba.as_raw());
         let thumbnail = image::DynamicImage::ImageRgba8(rgba)
             .thumbnail(192, 192)
             .to_rgba8();
@@ -692,7 +689,7 @@ fn fetch_image(
                 [thumbnail.width() as usize, thumbnail.height() as usize],
                 thumbnail.as_raw(),
             ),
-            content_hash: hash.finalize().into(),
+            content_hash,
             image_url: final_url,
             extension,
             path: path.clone(),
@@ -736,8 +733,9 @@ fn stream_bytes(
     budget: &mut DownloadBudget<'_>,
     limit: u64,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<[u8; 32], String> {
     let mut bytes = 0u64;
+    let mut hash = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
         if !budget.session.fetching() {
@@ -766,8 +764,9 @@ fn stream_bytes(
         output
             .write_all(&buffer[..count])
             .map_err(|e| e.to_string())?;
+        hash.update(&buffer[..count]);
     }
-    Ok(())
+    Ok(hash.finalize().into())
 }
 fn stream_data(
     source: &str,
@@ -775,7 +774,7 @@ fn stream_data(
     budget: &mut DownloadBudget<'_>,
     limit: u64,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<[u8; 32], String> {
     let (header, encoded) = source
         .strip_prefix("data:")
         .and_then(|s| s.split_once(','))

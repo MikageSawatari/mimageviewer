@@ -109,7 +109,11 @@ pub(super) fn should_open_automatic(
         && !formats.has(ORIGIN_FORMAT_NAME)
         && !formats.has_files()
         && !formats.has_known_office()
-        && ((images_allowed && formats.has_image()) || (html_allowed && formats.has("HTML Format")))
+        && if formats.has_image() {
+            images_allowed
+        } else {
+            html_allowed && formats.has("HTML Format")
+        }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,12 +139,13 @@ pub(crate) fn classify_automatic(
     if formats.has_files() {
         return ClipboardKind::Files;
     }
+    // Office copies are excluded for both image and HTML capture. Prefix
+    // formats become known only after opening and enumerating the clipboard.
+    if formats.has_office() {
+        return ClipboardKind::Ignored;
+    }
     if formats.has_image() {
-        return if formats.has_office() {
-            ClipboardKind::Ignored
-        } else {
-            ClipboardKind::Image
-        };
+        return ClipboardKind::Image;
     }
     if formats.has("HTML Format") && source_url.and_then(sanitize_url).is_some() {
         return ClipboardKind::Html;
@@ -718,7 +723,7 @@ mod tests {
                     "Object Descriptor",
                 ],
                 None,
-                ClipboardKind::Other,
+                ClipboardKind::Ignored,
                 ClipboardKind::Html,
                 false,
             ),
@@ -911,7 +916,11 @@ mod tests {
                 for html_allowed in [false, true] {
                     assert_eq!(
                         should_open_automatic(&formats, images_allowed, html_allowed),
-                        (image && images_allowed) || (html && html_allowed),
+                        if image {
+                            images_allowed
+                        } else {
+                            html && html_allowed
+                        },
                         "{names:?}: images={images_allowed}, html={html_allowed}"
                     );
                 }
@@ -966,20 +975,25 @@ mod tests {
             "powerpoint 12.0 internal shapes".to_owned(),
             mixed_case("PowerPoint 12.0 Internal Shapes"),
         ] {
-            let formats = formats(&[&spelling, "PNG", "HTML Format"]);
-            assert!(should_open_automatic(&formats, true, true));
-            assert_eq!(
-                classify_automatic(&formats, Some("https://example.com")),
-                ClipboardKind::Ignored
-            );
+            for names in [
+                vec![&*spelling, "PNG", "HTML Format"],
+                vec![&*spelling, "HTML Format"],
+            ] {
+                let formats = formats(&names);
+                assert!(should_open_automatic(&formats, true, true));
+                assert_eq!(
+                    classify_automatic(&formats, Some("https://example.com")),
+                    ClipboardKind::Ignored
+                );
+            }
         }
-        // Preserve the raw classifier's HTML fallback: the new preflight is
-        // the boundary which excludes known Office HTML-only copies.
+        // The complete post-open classifier also excludes HTML-only Office
+        // copies; known markers are already rejected by preflight.
         let word_html = formats(&["Object Descriptor", "HTML Format"]);
         assert!(!should_open_automatic(&word_html, true, true));
         assert_eq!(
             classify_automatic(&word_html, Some("https://example.com")),
-            ClipboardKind::Html
+            ClipboardKind::Ignored
         );
     }
 
