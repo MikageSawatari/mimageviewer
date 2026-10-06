@@ -3531,3 +3531,93 @@ fn section1335_tray_image_folder_book_backspace_quit_restarts_explicit_book_list
     assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
     assert_eq!(env.settings.startup_list_restore, before);
 }
+
+#[cfg(windows)]
+fn disable_image_folder_book_setting_during_linked_reading(app: &mut App) {
+    let page = app.fullscreen_idx;
+    let before = app.settings.startup_list_restore.clone();
+    // Use the shared F12 command handler, including its real presentation transition.
+    app.toggle_detached_viewer_mode();
+    assert!(app.viewer_session_is_detached());
+    assert_eq!(app.fullscreen_idx, page);
+    // Match Preferences' snapshot, live-state merge, installation and persisted OK.
+    let mut edited = app.settings.preferences_snapshot();
+    edited.auto_fullscreen_image_folders = false;
+    assert!(app.settings.auto_fullscreen_image_folders);
+    crate::ui_dialogs::preferences::prepare_preferences_settings_for_commit(
+        &mut edited,
+        &mut app.settings,
+    );
+    app.install_preferences_settings(edited);
+    assert!(app.settings.save_checked());
+    assert!(!app.settings.auto_fullscreen_image_folders);
+    assert!(!app.auto_open_for_current_container());
+    assert_eq!(app.settings.startup_list_restore, before);
+    assert_eq!(app.fullscreen_idx, page);
+    app.toggle_detached_viewer_mode();
+    assert!(!app.viewer_session_is_detached_or_switching());
+    assert_eq!(app.fullscreen_idx, page);
+    assert_eq!(app.settings.startup_list_restore, before);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_keeps_resume() {
+    let (mut env, parent, book) = direct_tray_image_folder_book_env();
+    let before = env.settings.startup_list_restore.clone();
+    disable_image_folder_book_setting_during_linked_reading(&mut env);
+    close_root_to_tray(&mut env);
+    settle_book(&mut env);
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert_eq!(env.items[env.selected.unwrap()].name(), "book");
+    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert_eq!(
+        crate::settings::Settings::load().startup_list_restore,
+        before
+    );
+    assert_eq!(env.book_resume_db.as_ref().unwrap().get(&book), Some(1));
+    let generation = env.items_generation;
+    env.sync_after_restore(&egui::Context::default());
+    assert!(env.window_visible);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert_eq!(env.items_generation, generation);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "book");
+    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.settings.startup_list_restore, before);
+    // A later open uses the new preference, while the saved reading position survives.
+    let Some(crate::ui_main::AddressBarNav::Direct(path, intent)) =
+        env.handle_gamepad_grid_accept(&egui::Context::default())
+    else {
+        panic!("image folder reopen is ordinary grid navigation");
+    };
+    env.open_direct_navigation_target(path, None, OpenRequestOwner::Navigation, None, None, intent);
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.resume_page_for_container(), Some(1));
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_image_folder_book_setting_changed_in_f12_keeps_backspace_explicit_list() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let (mut env, _, book) = direct_tray_image_folder_book_env();
+    backspace_image_folder_book_to_list(&mut env, &book);
+    let before = env.settings.startup_list_restore.clone();
+    assert!(
+        env.handle_gamepad_grid_accept(&egui::Context::default())
+            .is_none()
+    );
+    assert_eq!(env.fullscreen_idx, Some(1));
+    disable_image_folder_book_setting_during_linked_reading(&mut env);
+    close_root_to_tray(&mut env);
+    env.sync_after_restore(&egui::Context::default());
+    assert!(env.window_visible);
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert_eq!(env.resume_page_for_container(), Some(1));
+}

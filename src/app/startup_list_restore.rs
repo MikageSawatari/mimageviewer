@@ -334,9 +334,9 @@ impl App {
             .current_folder
             .as_deref()
             .filter(|path| {
+                // Classify the adopted pages, not the preference used for future opens.
                 crate::folder_tree::is_open_as_container(path)
-                    || (self.settings.auto_fullscreen_image_folders_enabled()
-                        && self.items_are_image_only_folder_pages())
+                    || self.items_are_image_only_folder_pages()
             })
             .and_then(|_| self.restorable_current_main_list())
             .and_then(|current| {
