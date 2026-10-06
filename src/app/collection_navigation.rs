@@ -81,6 +81,13 @@ enum CollectionNavigationAction {
 }
 
 impl CollectionNavigationAction {
+    fn startup_list_intent(&self) -> super::StartupListIntent {
+        match self {
+            Self::OuterGrid { .. } => super::StartupListIntent::ExplicitList,
+            _ => super::StartupListIntent::PageContinuation,
+        }
+    }
+
     fn direction(&self) -> CollectionNavigationDirection {
         match self {
             Self::Manual { delta, .. } => direction(*delta > 0),
@@ -3309,6 +3316,8 @@ impl App {
         prepared: Arc<CollectionPreparedSnapshot>,
         ready: CollectionNavigationPreflightReady,
     ) {
+        let restore_intent = request.action.startup_list_intent();
+
         match observe_revision(&watch, request.origin.collection_id) {
             RevisionObservation::Deleted => {
                 self.finish_collection_navigation_without_target(ctx, &request.action);
@@ -3496,6 +3505,7 @@ impl App {
                 ready.target.source_path,
                 false,
                 owner,
+                restore_intent.clone(),
             );
             match action {
                 CollectionNavigationAction::OuterFullscreen {
@@ -3590,7 +3600,12 @@ impl App {
                         .collection_grid_playback_physical_load_owner(target_idx, &path)
                         .map(super::OpenRequestOwner::CollectionGridPhysical);
                     if let Some(owner) = owner {
-                        if self.load_folder_with_scan_owned(path, Some(scan), owner) {
+                        if self.load_folder_with_scan_owned(
+                            path,
+                            Some(scan),
+                            owner,
+                            restore_intent.clone(),
+                        ) {
                             FolderOpenOutcome::Loaded
                         } else {
                             FolderOpenOutcome::Ignored
@@ -3600,7 +3615,11 @@ impl App {
                     }
                 }
                 CollectionNavigationPreflightPayload::Zip(enumeration) => {
-                    self.load_zip_as_folder_prepared(ready.target.source_path.clone(), enumeration);
+                    self.load_zip_as_folder_prepared(
+                        ready.target.source_path.clone(),
+                        enumeration,
+                        restore_intent.clone(),
+                    );
                     FolderOpenOutcome::Loaded
                 }
                 CollectionNavigationPreflightPayload::PdfPages(pages) => {
@@ -3610,7 +3629,7 @@ impl App {
                         .map(super::OpenRequestOwner::CollectionGridPhysical);
                     if let Some(owner) = owner {
                         // The completed typed handle keeps direction and pages together.
-                        self.load_pdf_as_folder_prepared(path, pages, owner)
+                        self.load_pdf_as_folder_prepared(path, pages, owner, restore_intent.clone())
                     } else {
                         FolderOpenOutcome::Ignored
                     }
@@ -3621,7 +3640,12 @@ impl App {
                         .collection_grid_physical_load_owner(target_idx, &path)
                         .map(super::OpenRequestOwner::CollectionGridPhysical);
                     if let Some(owner) = owner {
-                        match self.route_pdf_open_failure(owner, &path, failure) {
+                        match self.route_pdf_open_failure(
+                            owner,
+                            &path,
+                            failure,
+                            restore_intent.clone(),
+                        ) {
                             super::PdfOpenFailureRoute::ConversionDialogOpened => {
                                 if let Some(state) = self.epub_convert.as_mut() {
                                     state.open_restore.history = epub_history_snapshot;
@@ -7190,7 +7214,7 @@ mod tests {
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
             crate::zip_tree::ZipTree::build(zip_path.clone(), entries),
         )));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         app.fullscreen_idx = app
             .items
             .iter()
@@ -7207,7 +7231,7 @@ mod tests {
 
         app.finish_fs_navigation_sequence(super::super::FsNavigationSequenceFinish::RequestFailed);
         app.zip_nav.as_mut().unwrap().enter("book-b/");
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         app.fullscreen_idx = Some(0);
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
         assert!(app.top_level_grid_view.collection_navigation_pending());
@@ -7278,7 +7302,7 @@ mod tests {
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
             crate::zip_tree::ZipTree::build(zip_path, entries),
         )));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         app.fullscreen_idx = app
             .items
             .iter()
@@ -7295,7 +7319,7 @@ mod tests {
 
         app.finish_fs_navigation_sequence(super::super::FsNavigationSequenceFinish::RequestFailed);
         app.zip_nav.as_mut().unwrap().enter("book-b/");
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         app.fullscreen_idx = Some(0);
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
         assert!(app.top_level_grid_view.collection_navigation_pending());

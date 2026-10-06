@@ -643,6 +643,7 @@ impl App {
                     path,
                     Some(scan),
                     super::OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::ExplicitList,
                 ) {
                     self.show_feedback_toast("本を開けませんでした".into());
                 }

@@ -286,9 +286,24 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 新しく「現在のフォルダ」を永続化・ナビゲーションに使う箇所を足すときは、`current_folder` を
 直接使わず **`effective_folder()` を使う** こと。過去に漏れた実例:
 
-- **`last_folder` (次回起動の復元先)**: `start_loading_items` の保存で `source_path` (= キャッシュ
+- **`last_folder` (旧復元値と互換 carrier)**: `start_loading_items` の保存で `source_path` (= キャッシュ
   ZIP) を入れていたため、再起動で `archive_cache\..\book.zip` を素の ZIP として開き、address に
   キャッシュパスが漏れた。`effective_folder()` を保存するよう修正。
+- **明示一覧の起動復元 (`startup_list_restore`)**: 「前回終了した場所」は main で最後に
+  明示した物理フォルダ／本／ドライブ一覧と、その一覧のカーソルを復元する。本を直接ページ
+  表示するための内部 load、読書中の本移動、reload は更新しない。本一覧を明示表示する要求を
+  main が受理したら採用済みの本一覧へ更新する。検索／Collection／Smart 等の合成 root と、
+  そこから直接ページ表示中は直前の物理一覧を保持し、実際に物理子の一覧を明示した時だけ更新する。
+  F12 linked の表示先切替と independent viewer は main の復元先を変更しない。
+  ZIP は現在の実効 prefix と cursor を対で保存する。変換書庫は元 source を保存し、cache ZIP の
+  hydration は `InternalHydration(Box<StartupListIntent>)` として、同じ request が元の意図を
+  所有する。materialization は内側の RestoreList を投影し、同期列挙でも保存 prefix の行を
+  最初から作る。hydration 自体は記録せず、override と surface 採用後に既存列挙 request へ
+  元の意図を渡すか、同期採用の tail で一度記録する。`InternalInstall` だけで prefix を落とす
+  経路や、root の行を作ってから階層を作り直す経路は使わない。EPUB、password、sidecar 等の
+  continuation も同じ意図を保持する。
+  旧値は初回だけそのまま移行し、現在の auto-open 設定で過去の一覧を推測しない。
+  所有契約と完了した自動検証、利用者の実機確認手順は [起動復元の所有設計](startup-restore-target-plan.md) を参照。
 - **起動時復元のルーティング**: `App::update` 初回フレームは `load_folder` ではなく
   `load_folder_or_convert_archive` を通す。元アーカイブパスを渡すとキャッシュ参照 →
   `open_archive_via_cache` で開き直し、キャッシュが無ければ変換ダイアログを出す。

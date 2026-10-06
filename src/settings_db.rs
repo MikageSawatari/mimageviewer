@@ -4629,6 +4629,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn section1335_missing_db_record_migrates_once_and_roundtrips_with_prefix() {
+        use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut legacy = Settings::default();
+        legacy.last_folder = Some(PathBuf::from(r"C:\books\released.zip"));
+        legacy.last_cursor_name = Some("page.png".into());
+        legacy.last_cursor_rows_above = Some(4);
+        db.save_full(&legacy).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'startup_list_restore'",
+                [],
+            )
+            .unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.startup_list_restore, None);
+        crate::settings::apply_load_time_migrations(&mut loaded);
+        assert_eq!(
+            loaded.startup_list_restore,
+            Some(StartupListRestore::V1 {
+                target: StartupListTarget::PhysicalList {
+                    logical_path: legacy.last_folder.clone().unwrap(),
+                    zip_prefix: None,
+                },
+                cursor: Some(ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(4)
+                }),
+            })
+        );
+        loaded.last_folder = Some(PathBuf::from(r"C:\books\another.zip"));
+        db.save_full(&loaded).unwrap();
+        let mut repeated = db.load_into_settings().unwrap();
+        assert!(!repeated.migrate_startup_list_restore());
+        assert_eq!(repeated.startup_list_restore, loaded.startup_list_restore);
+        repeated.startup_list_restore = Some(StartupListRestore::V1 {
+            target: StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from(r"C:\books\nested.zip"),
+                zip_prefix: Some("chapter/inner.zip/pages/".into()),
+            },
+            cursor: Some(ListCursorHint {
+                name: "p2.png".into(),
+                rows_above: Some(2),
+            }),
+        });
+        db.save_full(&repeated).unwrap();
+        drop(db);
+        assert_eq!(
+            SettingsDb::open(dir.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .startup_list_restore,
+            repeated.startup_list_restore
+        );
+    }
+
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;

@@ -2089,19 +2089,20 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `show_address_bar_stack_toggle` | bool | true | フォルダバーに「スタック」表示トグルボタンを出すか。フォルダバー左端「フォルダ:」の右クリックメニューで切替 |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ。最大 100 件 (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` / `auto_index_similar` の 4 フラグ)。`auto_index_similar` は欠落時 false の加算フィールド。キー割り当てで直接開ける番号枠は 1〜20 |
 | `smart_folders` | Vec\<SmartFolderDefinition\> | [] | 任意の複数実フォルダを横断する保存済み snapshot view。定義 UUID、名前、ルールごとの検索元 UUID/path/enabled、保存フィルタ、相対フォルダの並び単位を保持。通常一覧と共通のソート順・サムネイル / 詳細表示は保持せず、索引 / watcher も持たない。開く・更新時に再走査する |
-| `last_folder` | Option\<PathBuf\> | None | 前回終了した場所。実フォルダの場合はそのパス、ドライブ一覧の場合は空パス sentinel を保存する。起動時の場所が「前回終了した場所」のときに使用する。実フォルダの末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |
+| `last_folder` | Option\<PathBuf\> | None | 旧復元値と互換 carrier。実フォルダ／本はパス、ドライブ一覧は空パス sentinel を保存する。新しい起動復元 record が無い旧設定の初回移行と、Desktop／Specific の既存 fallback 用に保持する。新 record をこの値で上書きしない |
+| `startup_list_restore` | Option\<StartupListRestore\> | V1 / Unavailable | 「前回終了した場所」の正本。main で最後に明示した復元可能な物理フォルダ／本／ドライブ一覧と、対応する名前・行位置の cursor hint を一つの record に保存する。本の内部 load／直接ページ表示／読書中の本移動／reload は target を更新しない。採用済みの本一覧を明示表示する要求は main の受理時に更新し、遅延 close 完了時に再更新しない。ZIP の実効 prefix と変換書庫の元 logical source を保持する。合成一覧と independent viewer は更新しない。旧設定で欠落時は旧 `last_folder` と cursor を一度だけそのまま移行する。環境設定 export/import の対象外 |
 | `book_root` | Option\<PathBuf\> | None | 製本ルート。`None` のときは `Pictures\mimageviewer\books` を使う。Ctrl+S/Ctrl+G の自動索引対象外で、お気に入り追加対象外。本棚メニューからは Explorer ではなく mIV 内の `本棚` 仮想表示として開く |
 | `active_book_name` | String | `名前なし` | 製本メニュー / ツールバー / 追加ショートカットからページを追加する先の本名。製本ルート直下のフォルダ名として使う |
-| `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=前回終了した場所、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ |
+| `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=最後に明示した復元可能な一覧、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ。Previous は一覧を開き、自動 fullscreen は開始しない |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
-| `restore_last_cursor` | bool | true | 前回終了時に選んでいた項目へカーソルを戻すか。**前回いた場所そのものを開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。既存利用者は `serde(default)` で ON になる |
-| `last_cursor_name` | Option\<String\> | None | 前回終了時に選んでいた項目の名前。`last_folder` と対でしか意味を持たないので、合成ビュー (検索結果など) やドライブ一覧で終了したときは `None` を書いて破棄する。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
+| `restore_last_cursor` | bool | true | 復元する一覧で選んでいた項目へカーソルを戻すか。**同じ論理場所と ZIP 階層を開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。直接読書中は出発元一覧の hint を保持し、本のページ名を親一覧に保存しない。既存利用者は `serde(default)` で ON になる |
+| `last_cursor_name` | Option\<String\> | None | `last_folder` と対になる旧 cursor の互換 carrier。新 record が無い旧設定の初回移行に使う。新しい明示一覧の cursor は `startup_list_restore` が所有し、合成一覧・読書中の終了で旧値を転用しない。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
 | `last_cursor_rows_above` | Option\<u32\> | None | そのカーソルが画面の一番上の行から何行下にあったか。スクロール位置 (pt) を保存しないのは、ウィンドウ幅や列数が変わると同じ pt が別の行を指すため。復元は現在の列数と行高から計算し直す。`None` は「一番上にいた」ではなく**分からない**で、その場合は従来どおり見える最小限だけ動かす |
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。フォルダバー左端の `フォルダ:` ラベルの右クリックメニューからクリアできる |
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
-| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所の選択は従来の `last_folder` / 起動設定のまま |
+| `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所は起動設定と Previous 専用の明示一覧 record から選び、保存スロットの場所で上書きしない |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |

@@ -2335,6 +2335,7 @@ mod tests {
                 saved,
                 app.top_level_grid_view.generation(),
                 app.smart_folder_transition_sequence,
+                crate::app::StartupListIntent::ExplicitList,
             ),
         );
         let ctx = egui::Context::default();

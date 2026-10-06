@@ -1,9 +1,13 @@
 # §1.335 起動時に復元する明示一覧の所有設計
 
-2026-10-06、Phase 1（設計のみ）。製品実装・コミット・実アプリ検証は行わない。
-初稿は ClaudeCode が `02b301b8d` としてコミットした。今回の改訂も設計のみでコミットしない。
-独立設計レビュー `target/r1335d-review.txt` は revise（P1 1件・P2 2件）。
-以下はその指摘への改訂であり、改訂版の再レビュー済み／構造合意済みとは扱わない。
+2026-10-06。Phase 1 改訂は `23d885e11` で独立設計レビュー承認済み
+（ready to implement、指摘なし）。main 所有境界は detached の症状パッチではなく構造的修正と合意済み。
+Phase 2 は red 再現から着手し、遅延 close 完了経路へ達する案について一度停止した。
+その後、利用者・設計担当・独立 reviewer が、適格な既存一覧への表示要求を受理した時点で
+記録する簡素化案に合意し、実装を再開した（§10）。terminal event/effect は変更しない。
+Phase 2 の実装・自動検証・確認 binary のビルドは完了（未コミット）。独立実装レビューは
+未解消 blocker なし。製品は起動しておらず、利用者の実機確認と設計担当の検収は未実施。
+最終結果は §10.4 に集約する。
 
 ## 1. 対象と観測の区別
 
@@ -152,7 +156,7 @@ scan／ZIP/PDF／変換／パスワード／後続ページ open まで運ぶ。
 
 すべての採用元は `commit_main_list_restore(event)`（仮称）へ渡す。
 この reducer だけが新 record を変更する。event の作成は、**main の論理 navigation の
-最終採用境界**、または main の「現在の一覧を見せる」明示操作の完了境界で行う。
+最終採用境界**、または main の「現在の一覧を見せる」明示要求の受理境界で行う（§10.3）。
 SLI、低レベル `close_fullscreen`、viewport paint、folder path の変更そのものでは確定しない。
 ZIP の `zip_nav` を SLI の後に設定する現行順序を保ち、prefix が確定する tail で採用を通知する。
 PDF warm placeholder はその request の既存可視採用を使い、実列挙検証で二度確定しない。
@@ -161,7 +165,7 @@ PDF warm placeholder はその request の既存可視採用を使い、実列�
 | --- | --- |
 | 一覧 open が成功して main に採用 | target をその一覧へ置換。別 target の cursor を持ち込まない |
 | 一覧からページを直接 open / ページ中の本移動 / 読書 resume | target は保持。出発元一覧の cursor は同じ owner に捕捉する |
-| Backspace／「一覧へ」等で main の本一覧を明示表示 | §5.3.2 の適格な物理一覧だけを、現在本＋確定 prefix で通知。検索結果等へ戻る場合は target/cursor とも保持 |
+| Backspace／「一覧へ」等で main の本一覧を明示表示 | 適格な採用済み一覧への要求を受理した時点で、現在本＋確定 prefix を通知。遅延 close の完了を待たず、完了時の再通知もしない。検索結果等へ戻る場合は target/cursor とも保持 |
 | Escape 等で親一覧へ戻る | 実際に採用された親一覧の既存 navigation 完了が通知する。途中の本一覧は通知しない |
 | load/reload 内部 close、sort/filter/rebuild、thumbnail completion | target を変更しない |
 | 採用前の error/cancel/Ignore/Refused/stale result | record を変更しない。rollback 予約を作らない |
@@ -194,6 +198,13 @@ PageContinuation である。** 後から fullscreen が開いたので target �
 PreservePresentation、PageContinuation は SLI が何回走っても target の commit を発行しない。
 request が消える前に子 continuation へ所有を渡し、App-global の一時フラグや別 pending を足さない。
 
+変換書庫の source／surface 採用前の hydration は、既存 request 内の
+`InternalHydration(Box<StartupListIntent>)` が元の意図を所有する。列挙済み ZIP の同期採用でも
+その内側の RestoreList を materialization へ投影し、最初から保存 prefix の行だけを作る。
+hydration 自体は reducer へ通知せず、logical source と surface が確定してから既存の
+列挙 request に元の意図を渡すか、同期採用の semantic tail を一度実行する。
+別 pending bool／復元予約や root を表示してから階層を作り直す経路は追加しない。
+
 #### 5.2.2 表示意図の入口・所有者・採用先の棚卸し（P1 対応）
 
 下表は新 record のイベント作成についての契約である。現在の画面を変更する提案ではない。
@@ -203,6 +214,7 @@ request が消える前に子 continuation へ所有を渡し、App-global の�
 | 明示 PageList / PageFullscreen、通常 GridVirtual / MainGridArchive | `GridContainerOpenMode` / `GridVirtualOpenEffects` の解決時点で ExplicitList / PageContinuation を決める。`OpenRequestOwner` → classification → physical history / ZIP/PDF / archive convert owner → final adoption が同じ意図を運ぶ。各 loader の false を一覧要求と解釈しない |
 | 単体画像等の startup argument / SendTo / activation / bookmark | `src/app/startup_ops.rs:903` の `select_requested_file` と `:1011` の owned load、`:1033` の指定 file open、`:1347`–`:1355` の fullscreen seam は**同じ操作**。`StartupOpenPathOwner` と resolved requested-file 情報から load 前に PageContinuation とする。親 directory の load / Classifying の採用にもその意図を渡し、後段 exact-file open の有無で parent を先に commit しない。directory 明示 open と default startup は別の操作。独立 bookmark viewer (`:1259`) は main イベントを出さない |
 | 通常／画像フォルダの auto open | `src/app.rs:25813` と `:50079` の completed scan 分類が必要。画像以外を含む mixed folder は ExplicitList、画像本を直接開く要求は PageContinuation。auto 値だけで決めず、`ClassifyFolder` が同じ request の scan と既存実効設定方針で解決する。既存コードが scan 完了時の設定変更を反映する箇所はその方針も保つ |
+| grid の実 Folder／本棚の製本 Folder | `AddressBarNav::Direct` と既存 `CollectionSource`／`RatingSource` が、受理済みの `container_open(auto_fullscreen)` を運ぶ。通常住所・親・履歴からの Direct は ExplicitList。既存の実行 owner／優先順位／auto-open 予約は変更せず、winning consumer が意図を分類 request へ渡す。Rating の実 Folder は既存の採用分岐が自動ページ表示を予約しないため、設定 ON でも実一覧として分類する。設定だけでページ続行と推測しない |
 | 読書中 DFS / sibling / SlideshowNext | `FolderNavMode :3623` と `PhysicalHistoryDfsContinuation :450` の fullscreen / resume_slideshow を起点に決める。`:50531` 付近は `Navigation { auto_fullscreen:false }` でも continuation.fullscreen=true なので PageContinuation。`FolderNavPending` / result → staged request.dfs_continuation → `commit_physical_history_transition :29832` → `reopen_fullscreen_after_folder_nav_load :50121` / `DeferredFsReopen` が運ぶ。Grid / SiblingGrid の着地は ExplicitList、Favsearch / Smart の fullscreen=false は適格一覧の採用だけを通知 |
 | 読書 DFS が通常 folder に着地し、内部の本へ続く | `src/app.rs:50606` の folder load → `:50638` reopen → `find_fullscreen_nav_target_filtered :50765` → `:50812` 付近の inner book load。`load_folder_nav_target` と inner selection helper に同じ PageContinuation を渡す。intermediate folder、inner ZIP/PDF/converted の全採用で commit しない。`reopen_fullscreen_after_folder_nav_load :50151` の enumerate 再継続も同じ意図。inner open が失敗／空でも明示一覧へ自動昇格させない |
 | slideshow / Collection playback / EOF の続行 | SlideshowNext は上記 PageContinuation に resume_slideshow を持つ。Smart は `start_smart_folder_scope_nav` (`src/app/smart_folder.rs:8013`) → typed FolderNavMode の fullscreen を保持。Collection は `CollectionNavigationAction` (`src/app/collection_navigation.rs:40`) の Manual.landing／OuterGrid 対 OuterFullscreen／Slideshow／EOF から request (`:180`) 内で意図を決め、preflight 結果へ渡す。OuterGrid／Manual の一覧着地だけ ExplicitList、読書・再生の継続は PageContinuation。変換 owner と `CollectionArchiveNavigationContinuation` (`:3482`)、auto_fullscreen=false の load (`:3495`)、prepared ZIP/PDF の採用 (`:3601` 周辺)、`DeferredFsReopen` (`:3669`) と reopen tail に同じ意図を運ぶ。outer folder / inner book の全 adoption に適用し、再生再開／動画除外の動作を保つ |
@@ -213,7 +225,7 @@ request が消える前に子 continuation へ所有を渡し、App-global の�
 | `FolderOpenScanPurpose::JumpToPhysicalFolder` | `:49703` → `apply_jump_to_physical_folder_ready :49136`。元の場所へ一覧移動する ExplicitList。`JumpToFolderSelection::{None,ExactPath}` (`src/ui_dialogs/context_menu.rs:62`) は**一覧の選択**であり required fullscreen ではない。selection適用後の適格 main 一覧を通知 |
 | `FolderOpenScanPurpose::RequiredFullscreenTarget` | `:49707` → exact-page の上記 owner。ExplicitList に落とさない |
 | `FolderOpenScanPurpose::CurrentViewOrderRefresh` | `:49722` → `apply_current_view_order_refresh :49732`。order snapshot / typed reload owner に PreservePresentation を運ばせる。通常 Navigation owner を再利用していても新一覧要求ではない |
-| F5 / sort / pin / preferences / placeholder verification / sidecar continuation | `current_folder_reload_owner :22886`、`reload_current_view_in_place :22907`、`reload_top_level_grid` (`src/app/top_level_grid_view.rs:1246`) は PreservePresentation。未完了の同一 open の PDF verification／sidecar deferred fullscreen (`src/app/sidecar_restore.rs:145`) は元 request の意図を引き継ぐ。再buildだから ExplicitList を生成することも、deferred-page が残る間に commit することもしない |
+| 現在一覧の reload / sort / pin / preferences / placeholder verification / sidecar continuation | `current_folder_reload_owner :22886`、`reload_current_view_in_place :22907`、`reload_top_level_grid` (`src/app/top_level_grid_view.rs:1246`) は PreservePresentation。未完了の同一 open の PDF verification／sidecar deferred fullscreen (`src/app/sidecar_restore.rs:145`) は元 request の意図を引き継ぐ。再buildだから ExplicitList を生成することも、deferred-page が残る間に commit することもしない。F5 は評価操作であり reload shortcut とは扱わない |
 | explicit 一覧復帰 / search close / A/B / history / default restore | ユーザーの一覧復帰操作と既存 navigation owner が ExplicitList を所有する。最終的に合成一覧なら §5.3.2 で通知しない。Previous の ZIP prefix 復元は §5.3.1 の最終 cursor 適用後が commit。内部 close・F12・tray・quit は一覧復帰 intent を生成しない |
 
 この inventory の各 loader / adoption 呼出しは、Phase 2 で intent の投影と受け渡しをテストする。
@@ -231,6 +243,13 @@ cursor として捨てる問題が残る。新 record は親一覧の名前／�
 その一覧を表示中の時だけ、quit/tray は最新 cursor を reducer へ渡す。
 synthetic list、ページ表示、内部 loader の途中状態では target と保存済み cursor をともに保持する。
 independent context を一時 mount 中でも、cursor と target をその viewer に差し替えない。
+
+`PreservePresentation` は新 target の採用を発行せず、reload の途中は保存 cursor も保持する。
+既存の released reload が完了して、既に明示・保存した同じ target の一覧を実際に表示している
+場合は、通常の exit／tray／departure がその一覧の最新 cursor を捕捉できる。
+直接読書で一度も明示していない別本の reload は新 target に昇格しない。
+この区別は同じ target と採用済み一覧表示の照合で行い、新しい状態や固定の fullscreen reopen、
+既存の reload 後の見え方の変更は加えない。
 legacy cursor 保存判定は他 mode 用に維持する。
 
 A/B それぞれの navigation/history は現状どおり。復元 record は application main に一つ。
@@ -310,7 +329,7 @@ projection の代用にしない。この API は既存の戻り navigation 専�
 | `TopLevelGridSurface::Folder` | main の installed context と一致する物理 source があり、合成行集合でなければ PhysicalList。local filter は同じ物理一覧の絞り込みなので適格。旧 synthetic の return_to、rating stars、saved_folder を target にしない |
 | `DriveList` | 実際の Drive surface と main install が一致すれば DriveList。現行の Drive cursor 保存方針を保ち、残った folder cursor を結び付けない |
 | Smart root / Collection root | 合成一覧なので結果なし。real path の item が並んでも物理一覧とは扱わない |
-| Smart `Container` / `Scoped`、Collection `PhysicalSource` | typed position の現在 path／source key と installed physical context が一致する実一覧だけ PhysicalList。`SmartFolderPosition` (`src/app/top_level_grid_view.rs:21`)／`CollectionGridPosition` (`:395`) と既存採用 authority を使い、root session の snapshot／return_to を使わない |
+| Smart `Container` / `Scoped`、Collection `PhysicalSource` | typed position の現在 path／source key と installed physical context が一致する実一覧だけ PhysicalList。Collection の `PhysicalSource.path` は親 source のまま内側の本へ移動し得るので、現在採用済みの `effective_folder()` と position の所有関係を照合する。`SmartFolderPosition` (`src/app/top_level_grid_view.rs:21`)／`CollectionGridPosition` (`:395`) と既存採用 authority を使い、root session の snapshot／return_to を使わない |
 | Global / Favorite / Tag の検索結果、合成 drill rows | 結果なし。`items_are_global_search_view` 等の installed aggregate-row 情報を含めて判定する。drill.current_path が実 path でも、検索条件で再構築した合成 items は物理一覧ではない |
 | Search から実 folder／book に入った physical drill | 現在の drill／nav position と loaded physical source が一致し、合成-row install ではなくその source の一覧を採用した時だけ PhysicalList。`global_search.active` 単独では付与も除外もしない。`advance_drilled_current_path` (`src/global_search_ui.rs:2990`) と物理 install の対応を確認する |
 | Rating root / ReadingHistory / Bookmarks / Snapshot | 合成 rows なので結果なし。そこから採用した physical child は、その実際の Folder surface／physical position で上記判定を行う。合成親へ戻るための provenance は保存しない |
@@ -400,8 +419,8 @@ field を狭義化する代案でも 2 の情報不足は解消しない。新 s
 挙動が残り得ることを了承済み。旧 book path を一律親へ変更せず、過去の明示一覧を推測しない。
 以後は新 record を正本にし、新しい明示一覧の採用を §5 の契約で記録する。
 
-A/B の製品判断は解決済み。独立レビュー revise の再確認と、detached predicate／viewport に
-触れる場合の構造合意・§11 記録は別の実装着手条件であり、この決定をもって完了とは扱わない。
+A/B の製品判断は解決済み。改訂設計の独立承認は `23d885e11`、受理 caller の追加合意は
+`target/r1335d3-review.txt` に記録済み。構造合意と検証結果は §10 と detached plan §11 を参照。
 
 ## 8. 回帰設計と影響ファイル
 
@@ -410,7 +429,7 @@ A/B の製品判断は解決済み。独立レビュー revise の再確認と�
 | full feature: ZIP/PDF の page list→page→quit | book 一覧を復元。読書 resume とは独立、startup は auto fullscreen=false |
 | full feature: parent→direct page→quit | parent 一覧と選択 book の hint を復元。本のページ名を parent cursor にしない |
 | explicit PageList / PageFullscreen の一時 override | 設定 ON/OFF に関係なく入口の実際の意図で決める。表示設定を変えて過去 target を推測し直さない |
-| direct page→Backspace／一覧ボタン→quit | 明示した book 一覧へ更新。Esc の親戻りは途中 book 一覧を記録しない。close が deferred の場合も完了で一度だけ更新 |
+| direct page→Backspace／一覧ボタン→quit | 適格な採用済み book 一覧への明示要求を受理した時点で更新。Esc の親戻りは途中 book 一覧を記録しない。close が deferred の場合も受理時に一度だけ更新し、effect 完了では再更新しない。受理直後の quit でも book 一覧を復元 |
 | folder book／本棚の製本フォルダ | 直接読書では親、一覧を明示すれば当該実フォルダ。本棚は仮想 sentinel としない |
 | F12 linked root↔child、繰り返し／close | page list/direct のどちらも元 target 不変。表示先だけが変わり、F12 移動で一覧を見たことにしない |
 | independent main list + 2 viewers | A/B viewer の ZIP/PDF/Folder/converted open、Ctrl traverse、activation、park、close、main quit 中も main record/cursor 不変。sibling context の items/receiver/cache/history を変えない |
@@ -426,7 +445,7 @@ A/B の製品判断は解決済み。独立レビュー revise の再確認と�
 | required-page / Snapshot / similar / bookmark 移動 | location load と completed-scan load、folder と virtual-book を各 handler で通す。exact page を開く前後とも中間一覧 commit なし。required target 不在／失敗を一覧要求に変えない |
 | 全 FolderOpenScanPurpose と画像フォルダ分類 | PaneNavigation／JumpToPhysicalFolder は selection 完了後の適格一覧を commit。GridFolderCandidate は mixed／image-book と auto 設定の組合せ、scan 中設定変更、main／independent lease を確認。DetachedFolder／DetachedImage は main 不変、RequiredFullscreenTarget は direct、CurrentViewOrderRefresh は preserve。purpose を default false で同一扱いしない |
 | folder Back/Forward / A/B / same-path / no active slot | 採用した一覧だけを記録。失敗／置換／取消で target 不変。A/B histories と slot ownership は既存契約を維持 |
-| F5 / sort / filter / pin / preferences / PDF placeholder verification / sidecar | PreservePresentation と新 ExplicitList を同じ物理 source で対比。reload は一覧未表示の book を新 target にしない。cursor と target の世代を混ぜず、元 request の後段 page／verification で2回 commit しない |
+| 現在一覧の reload / sort / filter / pin / preferences / PDF placeholder verification / sidecar | PreservePresentation と新 ExplicitList を同じ物理 source で対比。reload は一覧未表示の book を新 target にしない。reload 中は cursor を保持し、完了して同じ保存済み明示一覧を表示した場合は通常の exit／tray／departure で最新 cursor を捕捉する。別の direct book との対比も置く。cursor と target の世代を混ぜず、元 request の後段 page／verification で2回 commit しない |
 | tray hide/restore→quit | hide による target 変更なし。読書／再生表示を保持して restore。session を restart restore で再構築しない |
 | Previous 以外 | Desktop/Specific の成功・失敗→Desktop→legacy fallback、Drive、ReadingHistory すべて現状の target/cursor/auto fullscreen を確認 |
 | command-line / SendTo / activation / Remote fallback | 明示 file/book/folder open 優先を維持。default restore が結果を上書きしない。同名 path、Ignore/Refused、解決失敗も既存意味 |
@@ -442,12 +461,23 @@ ZIP stack の導出／適格性 projection は pure tests に加え、deep-prefi
 Backspace と、上表の実 request→adoption→page の handler tests で検証する。
 「親→本一覧→ページ」と「親→direct page」の現在本／ページが同じでも、新 record は
 それぞれ book／parent になる対比を置く。各中間 seam の record を確認して、最終結果だけ
-同じにする巻き戻し実装が通らないようにする。上表の追加 tests は計画であり、まだ実装していない。
+同じにする巻き戻し実装が通らないようにする。
+
+2026-10-06 現在、`src/app/tests/startup_restore.rs` には上記の handler／状態／exit-restart
+回帰を 52 test case として実装した。元の direct-ZIP red は `src/app/tests.rs` に保持し、
+settings／DB／transfer、ZIP tree、変換／EPUB、headless multiwindow にも対応する回帰を置く。
+実行結果は §10.4 に集約する。独立 completion review は、Folder carrier／Rating の実行分岐による
+分類／password owner のサイズ修正まで確認し、未解消 blocker なし（`target/1335-implementation-review.txt`）。
+自動 gate の実行所有は implementer で、reviewer は実アプリを起動していない。
 
 想定 ownership / file scope:
 
-Phase 2 の製品・テスト・対応 docs の writer は、この coherent chunk の implementer 一人。
-設計担当／独立 reviewer は read-only で判断し、別 agent の同時編集を前提にしない。
+Phase 2 は repository の bounded Sol handoff 方針に従い、root implementer が共有 App と
+全体検証を所有し、変換、専用回帰、対応 docs を範囲の決まった Sol agent へ分担する。
+**各ファイルの writer は一人**とし、担当を替える時は safe checkpoint と差分を引き継ぐ。
+独立 reviewer は別 context で read-only の設計・completion review を行う。
+実装は `gpt-6.1-sol / high`、独立 review は `gpt-6.1-sol / xhigh` の指定を使い、
+追加の Astra coordinator は置かない。分担は必要な coherent chunk に限る。
 
 - `src/settings.rs`, `src/settings_db.rs`, `src/settings_transfer.rs`: record・legacy projection・保存／除外・live 引継ぎ。
 - startup domain の新 module（候補 `src/app/startup_list_restore.rs`）: reducer と唯一の new record writer。
@@ -465,12 +495,13 @@ Phase 2 の製品・テスト・対応 docs の writer は、この coherent chu
 - `docs/virtual-folders.md`, `docs/folder-history-location-plan.md`, `docs/architecture-overview.md`,
   本 plan、必要時 detached §11、manual の startup 説明: 実装時に意味と所有境界を追記。
 
-Phase 2 の検証担当は implementer。narrow filtered lib tests → owner 横断回帰 →
-`scripts/test-full.ps1`、fmt、UI string を変える場合 glyph check を実行する。
-成功後 `scripts/build-dev.ps1` で未起動の確認 binary を用意する。
-実アプリ suite はシナリオ・時間・desktop/input・disposable data を提示した明示了承後のみ。
+Phase 2 の検証担当は root implementer。narrow filtered lib tests → owner 横断回帰 →
+利用者指定の full lib、normal／portable／portable+test-script check、fmt、必要な glyph check を
+集約し、重い Cargo command を並行実行しない。成功後 `scripts/build-dev.ps1` で未起動の
+確認 binary を用意する。現在の依頼は check／build までで、実アプリを起動・操作しない。
+将来の実アプリ suite はシナリオ・時間・desktop/input・disposable data を提示した明示了承後のみ。
 normal profile binary をエージェントが launch しない。Phase 1 は docs/test probe のみなので
-確認 binary は不要。今回の red を修正済み／全体 gate 成功として扱わない。
+確認 binary は不要。Phase 1 の証跡だけを修正済み／全体 gate 成功として扱わない。
 
 ## 9. Phase 1 証跡
 
@@ -494,4 +525,154 @@ normal profile binary をエージェントが launch しない。Phase 1 は do
 **revise**。本改訂は P1 を §5.2.1／§5.2.2、ZIP の P2 を §5.3.1、適格性の P2 を
 §5.3.2 と各 §8 handler 回帰へ反映した。終了時推測案との比較は §5.4、ユーザー決定 A/B は
 §7 に記録した。改訂の独立再レビュー・実装・detached §11 の構造合意記録・ユーザー実機確認は
-未実施。今回も製品コードは変更せず、再テスト／確認 binary は不要。コミットしない。
+未実施だった。以上は Phase 1 改訂時点の履歴であり、後の承認・Phase 2 の状況は冒頭と §10 を参照。
+
+## 10. Phase 2 の安全な区切りと viewport 完了経路への追加合意事項
+
+### 10.1 変更前に停止した理由と具体的な経路（当時の記録）
+
+今回のユーザー指示は「detached predicates / viewport paths に触れる必要がある場合は、
+変更前に停止・報告し、design owner + reviewer の合意後に §11 へ記録する」。
+main ownership の設計承認は有効だが、以下の terminal close の変更範囲まで承認済みとは扱わない。
+`docs/detached-rework-plan.md` §2 の構造合意条件も併せて適用する。
+
+`23d885e11` の実コード:
+
+1. `src/ui_fullscreen.rs:35565` の Backspace（ページ一覧へ）は `:35581` の
+   `close_fullscreen()` を呼ぶ。呼び出し直後の commit は閉じ終えたことを証明しない。
+2. `src/app.rs:68481` の `close_fullscreen()` は、Windows の表示遷移中には
+   `:68489` の `PresentationTransitionEvent::TerminalClose` を配送して return する。
+3. `src/app/presentation_transition.rs:191`, `:234`, `:1078`, `:1149` の既存 owner が
+   `TerminalSessionClose` effect を生成し、`src/app/native_video.rs:3035` の effect consumer が
+   実際の通常 close を後段で実行する。ここは main／detached の動画表示遷移・viewport 完了経路。
+4. `src/app.rs:68287` の一般 close は auto-open 設定により親への navigation を予約する。
+   途中の本一覧を記録せず、親採用の semantic completion に任せる契約を維持する。
+
+当時は §5.2 の「main の明示操作の完了境界で確定」を実際の close 完了と解釈し、明示一覧へ戻る意図を
+既存の close request → terminal effect → 実際の close 完了まで運ぶ必要があると判断した。
+この解釈は §10.3 の受理境界への変更により不要となった。polling、新しい App pending bool、低レベル close での無条件 commit、
+`close_fullscreen_to_completion` を Backspace に流用して既存の遅延 timing を変える案は採用しない。
+
+### 10.2 terminal close purpose 案（不採用）
+
+停止時には、明示一覧復帰の purpose と main owner／世代を既存 terminal event/effect に載せ、
+実際の teardown 完了後だけ record を更新する案を提示した。これは「実際の close 完了まで
+記録しない」という旧解釈を守るための案であり、実装していない。
+
+利用者が §10.3 の受理時記録を了承し、独立 reviewer も
+`target/r1335d3-review.txt` で承認したため、この運搬は不要と判断した。
+terminal event/effect、`TerminalSessionClose` consumer、presentation transition reducer に
+新しい purpose／完了 tail を加えない。既存の close timing、lease、native teardown、focus、
+promotion は従来の owner が処理する。
+
+### 10.3 受理境界での簡素化案（2026-10-06 合意）
+
+利用者・設計担当（ClaudeCode）・独立 reviewer の合意は、**main が既に採用した適格な
+一覧を明示表示する要求を受理した時点で、起動復元先を記録する**こと。
+`target/r1335d3-review.txt` は、この所有・確定境界の変更を detached の症状パッチではないと
+確認した。§7 A/B の対象範囲と migration 判断は変えない。
+
+- semantic caller は、modal による拒否、別 action への配送、親へ戻る navigation の分岐を
+  済ませてから共通 helper を呼ぶ。即時 close と遅延 close は同じ受理境界を使い、
+  terminal effect の完了時には record を更新しない。
+- main identity と現在採用済みの surface／physical-child position、logical source、ZIP の
+  実効 prefix を §5.3.2 の projection で照合する。合成 root、independent context、
+  未採用の列挙先、holdover の表示を採用済み main 一覧の証拠にしない。
+  変換書庫は元 source、Collection 内の本は現在の `effective_folder()` を使う。
+- `src/app/native_video.rs` の **`FsBackToList` semantic caller** も同じ helper へ接続する。
+  「native_video を一切変更しない」とは扱わない。terminal effect consumer／表示遷移処理は
+  変更しない。`src/ui_fullscreen.rs` の既存 Backspace caller も同じ契約を使う。
+- gamepad B の通常 close は auto-open 設定により親へ戻る場合がある。
+  その場合は途中の本一覧を記録せず、親 navigation の実際の採用完了に任せる。
+- cursor は受理前の `selected` をそのまま保存せず、通常 close が同期する閲覧中ページ／
+  編集 anchor と同じ選択先から導出する。ファイル名スタックの flat 行は戻る集約行と
+  一致しないため、不確かな hint は空にする。ページ名を親一覧 cursor にしない。
+
+**了承した境界の差**: 要求を受理してから遅延 close が終わるまでに終了した場合でも、
+次回起動は受理済みの本一覧を復元する。実際に一覧が描画されるまで記録を遅らせる保証は
+設けない。新しい rollback／supersession／完了待ち状態を加えず、既存の modal 排他と
+採用済み一覧の証拠を使う簡素化として採用する。
+
+必須回帰は、即時／遅延 close の受理直後に更新され effect 完了で再更新しないこと、
+親戻り・入力拒否・合成一覧・independent context で保持すること、受理直後の quit、
+閲覧中ページ／編集 anchor の cursor と flat stack の hint を含む。
+触れた範囲と構造合意は `docs/detached-rework-plan.md` §11 に記録する。
+
+### 10.4 現在の差分と検証の扱い
+
+- permanent red: `section1335_direct_zip_exit_restart_keeps_explicit_parent_list`。
+  Phase 2 の最初に既存実装で失敗を確認した（0 passed / 1 failed、実際は ZIP、期待は親）。
+  legacy `last_folder` の book 保存は引き続き期待し、Previous の復元先だけを親とする。
+- 保持した準備: versioned Settings record、released `last_folder` と cursor の一度だけの移行、
+  通常 load／JSON 移行への接続、Preferences OK の live 引継ぎ、設定 transfer 除外、
+  列挙済み tree から wrapper collapse を考慮した ZIP prefix の親 stack 再構築。
+  保存失敗の retry／journal／recovery は追加していない。
+- 停止時の navigation 途中配線は `target/1335-navigation-wip.patch` と
+  `target/1335-startup-list-restore-wip.rs` へ退避していた。再開時に各入口・continuation・採用 tail を
+  再確認して製品差分へ接続しており、退避ファイルを検証済み完成パッチとして扱っていない。
+- 現在の作業範囲: Previous の record 消費、明示一覧／ページ続行／reload の typed intent、
+  scan／ZIP／PDF／変換／password／sidecar／history／Collection／Smart の既存 owner への運搬、
+  source／prefix／cursor の最終採用、§10.3 の受理 caller、main／independent の隔離回帰。
+  関連 spec／virtual-folders／manual は新しい利用契約に更新する。
+- 実装・自動回帰確認は完了。準備部分の成功と、下表の最終差分の自動 gate／構成別 check／
+  build-dev 完了を区別する。利用者の実機確認は未実施で、実アプリは起動していない。
+- 停止時点の準備差分の確認: 新規 filtered 6 件、settings DB 129 件、transfer 16 件、ZIP tree 50 件が
+  すべて成功。transfer の全 field 分類数は追加前 440／追加後 441（出す 131／除く 310、wire 129）。
+  fmt／diff check／glyph lint も成功。当時の red 再実行は最後の ZIP 対 parent assert で
+  0 passed / 1 failed、10706 filtered out（0.36 秒）。全体成功や修正完了を意味しない。
+  当時は normal／portable／portable+test-script check も全経路実装後の gate として残っていた。
+
+#### 最終差分の自動検証（2026-10-06）
+
+初回 full lib は 10706 passed / 1 failed / 52 ignored。唯一の失敗は既存
+`history_transition_storage_keeps_app_stack_footprint_bounded` で、追加した Legacy password intent が
+owner を 88 bytes に増やしたことだった。Legacy variant 内で意図を Box に置き、既存条件を変えず
+16 bytes へ戻した。失敗ログは `target/1335-full-lib-before-box.log` に保持する。
+
+実操作による本棚 Folder direct 読書と、Rating Folder auto 要求の実一覧着地もそれぞれ red を確認し、
+既存 navigation carrier と最終 scan 分類を修正した。ログは `target/1335-bookshelf-red.log`、
+`target/1335-rating-folder-red.log`。既存の実行 owner、表示 timing、modal／優先順位を変えず、
+Rating Folder は従来の一覧着地を維持する。設定値だけから page continuation と推測しない。
+
+| 確認（最終 source freeze 差分） | 結果・ログ |
+| --- | --- |
+| `cargo test -p mimageviewer --lib section1335 -- --test-threads=1` | 59 passed / 0 failed。`target/1335-final-narrow.log` |
+| 既存 App / password owner サイズ回帰 | 1 passed。`target/1335-final-stack.log` |
+| archive conversion tests | 8 passed。`target/1335-final-archive.log` |
+| settings tests | 277 passed / 12 ignored。`target/1335-final-settings.log` |
+| settings DB tests | 129 passed。`target/1335-final-settings-db.log` |
+| settings transfer tests | 16 passed。`target/1335-final-transfer.log` |
+| ZIP tree tests | 50 passed。`target/1335-final-zip.log` |
+| normal / portable / portable+test-script core check | いずれも exit 0。`target/1335-final-{normal,portable,portable-test-script}.log` |
+| `cargo fmt --all -- --check` | exit 0。`target/1335-final-fmt.log` |
+| `git -c core.safecrlf=false diff --check` | exit 0。`target/1335-final-diff.log`。当該コマンドだけ改行警告を抑制し、repo 設定は変更していない |
+| `python scripts/check_ui_glyphs.py` | 危険な UI glyph 0。`target/1335-final-glyph.log` |
+| `cargo test -p mimageviewer --lib` | 10710 passed / 0 failed / 52 ignored、764.79 秒。`target/1335-full-lib.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit 0。normal feature set の core／remote service／EPUB PDF worker を配置し、runtime=4 / pe=3 の検査成功。`target/1335-build-dev.log`。製品・確認 binary は起動していない |
+
+集計と実行 command は `target/1335-final-gates.json` に保持する。
+full lib の PowerShell runner 終了値は 1 だったが、先頭の stderr warning が
+`NativeCommandError` として扱われたためで、末尾は全件 `test result: ok`、Cargo の後続エラーもない。
+同じ warning／リダイレクトを狭いサイズ回帰で再現し、明示的に捕捉した `$LASTEXITCODE` は 0
+（`target/1335-full-runner-probe.log`）。テスト失敗と混同せず、完走した full lib の結果を再利用する。
+利用者の実機確認と設計担当の検収は未実施。通常 profile と実データを使う確認は利用者へ引き渡す。
+
+#### 利用者への確認手順
+
+インストール版／トレイ常駐中の mImageViewer を閉じてから、worktree で実行する。
+single-instance mutex を共有する。確認 binary は通常の `%APPDATA%\mimageviewer` を使い、
+起動すると実際の設定／利用データを移行・更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+1. 起動場所を「前回終了した場所」、フル機能の本表示を直接ページ表示にする。
+   親の本一覧を開き、ZIP を直接読んで終了・再起動する。親一覧と選択した本へ戻る。
+2. 同じ本を直接読み、ページを移動して Backspace でページ一覧を明示し、終了・再起動する。
+   本のページ一覧と対応する選択へ戻る。PDF／変換書庫でも同じ違いを確認する。
+3. ネスト ZIP の内部一覧を明示して終了・再起動する。同じ階層へ戻り、Backspace が親階層へ進む。
+   F12 の表示先切替や独立窓内の読書で main の復元先が変わらないことも確認する。
+
+更新後の最初の起動だけは、決定 B に従い旧設定の復元先を引き継ぐ。上記は親一覧を新たに
+明示するところから確認する。起動引数なしで再起動し、トレイ退避を実終了と取り違えない。

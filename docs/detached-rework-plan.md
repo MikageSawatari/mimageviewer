@@ -1455,6 +1455,33 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-06 §1.335 main の起動復元先と明示一覧復帰の受理境界**
+
+起動復元先を読書用 load や表示先切替から分離し、既存 typed navigation request が
+明示一覧／ページ続行／reload の意図を scan・列挙・変換・password・sidecar と最終採用まで
+運ぶ。復元 record の writer は main の一つの reducer に集約する。main ownership は既存の
+context identity で判定し、F12 linked の表示先切替と independent viewer 内の操作は記録しない。
+`ViewerContextBundle` は既存 request の意図をその owner と一緒に保存・復元する。
+
+一覧復帰は main が既に採用した適格な一覧への要求を受理した時点で記録する。
+`src/ui_fullscreen.rs` の Backspace と `src/app/native_video.rs` の `FsBackToList` は
+同じ semantic helper に接続する。native の変更はこの **caller** に限定し、terminal event/effect、
+`TerminalSessionClose` consumer、presentation transition reducer の変更は行わない。
+gamepad B の親戻りは親 navigation の採用完了が記録し、途中の本一覧は記録しない。
+cursor は通常 close が選ぶ閲覧中ページ／編集 anchor と一致させ、flat stack の不確かな hint は空にする。
+
+設計担当（ClaudeCode）と独立 reviewer は、利用者が了承した受理時記録の契約なら、
+実際の close 完了へ purpose を運ぶ旧案は不要と合意した（`target/r1335d3-review.txt`、
+[起動復元設計 §10](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項)）。
+合成 root、未採用の列挙先、holdover、別 context を採用済み main 一覧の証拠にせず、
+logical source／ZIP prefix／現在の physical-child position を照合する所有境界の修正である。
+新しい detached bool／Option、時間窓、delay、retry、repaint、viewport 再生成、
+placement／focus の所有変更を加えないため、detached の症状パッチではなく §2 に適合する。
+要求受理後・遅延 close 完了前に終了しても受理済み本一覧を復元する差は利用者了承済み。
+実装・自動回帰確認・normal／portable／portable+test-script check・full lib・build-dev は完了。
+独立実装レビューは未解消 blocker なし。結果は上記設計 §10.4 に集約し、製品は起動していない。
+利用者の実機確認と設計担当の検収は未実施で、この構造合意を実機検収として扱わない。
+
 **2026-10-05 §1.319 AudioTracks が Opening host を選ぶ readiness 契約の修正**
 
 `20261004T154102775Z-79036-AudioTracks-b6d55588` は root fullscreen の F12 が新規 window 3 の

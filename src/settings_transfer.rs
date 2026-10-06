@@ -452,6 +452,7 @@ preferences_policy! {
         favorite_view_overlay => "runtime overlay / PC のウィンドウ配置";
         smart_folders => "利用データ・登録先・履歴・検索対象";
         last_folder => "利用データ・登録先・履歴・検索対象";
+        startup_list_restore => "利用データ・登録先・履歴・検索対象";
         startup_folder_mode => "起動・保存・整理先の PC 固有パス";
         startup_folder_path => "起動・保存・整理先の PC 固有パス";
         last_cursor_name => "利用データ・登録先・履歴・検索対象";
@@ -1532,7 +1533,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 440);
+        assert_eq!(entries.len(), 441);
         assert_eq!(
             entries
                 .iter()
@@ -1602,6 +1603,16 @@ mod tests {
         let sentinel = r"C:\Users\private-alice\SECRET_PIN_184729";
         let mut settings = Settings::default();
         settings.last_folder = Some(sentinel.into());
+        settings.startup_list_restore = Some(crate::settings::StartupListRestore::V1 {
+            target: crate::settings::StartupListTarget::PhysicalList {
+                logical_path: sentinel.into(),
+                zip_prefix: Some("private-inner-book/".into()),
+            },
+            cursor: Some(crate::settings::ListCursorHint {
+                name: "private-book-and-tag-name".into(),
+                rows_above: Some(3),
+            }),
+        });
         settings.startup_folder_path = Some(sentinel.into());
         settings.capture_output_dir = Some(sentinel.into());
         settings.last_cursor_name = Some("private-book-and-tag-name".into());

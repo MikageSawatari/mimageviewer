@@ -34,13 +34,13 @@
 
 ### 1.335 本を直接ページ表示したまま終了すると、次回起動が見ていないページ一覧になる — mIV スレ >>508 (2026-10-06)
 
-- Phase 1 設計改訂 (2026-10-06): 正本は [startup-restore-target-plan.md](startup-restore-target-plan.md)。指定条件の ZIP direct page → 終了保存 → 再起動を通常ハンドラの headless red test で確認した。全 `last_folder` reader/writer と Previous 専用の単一復元レコードを記録。ユーザー決定 A/B: 復元対象は物理フォルダ／本／Drive のみ、合成一覧とそこからの直接読書は直前の対象と cursor を保持。初回移行は legacy 値を維持。初稿の独立レビュー revise を受け、最終表示意図の全経路、ZIP 親階層・cursor の復元順序、現在一覧の適格性と handler 回帰を補完。改訂の再レビューは未実施。今回も設計のみ、製品コード変更・コミットなし。
+- Phase 2 状況 (2026-10-06): **実装・自動検証完了、未コミット、実機確認・設計担当の検収待ち**。改訂設計 `23d885e11` と受理時記録の簡素化（`target/r1335d3-review.txt`）に従い、適格な採用済み main 一覧への要求を受理した時点で記録する。native `FsBackToList` caller も共通 helper に接続し、terminal event/effect は変更していない。§1.335 回帰59件、full lib10710件（52 ignored）、設定／DB／transfer／ZIP tests、normal／portable／portable+test-script check、fmt／diff／glyph、build-dev が成功。独立実装レビューは未解消 blocker なし。製品は起動せず、確認 binary を利用者へ引き渡す。合意・結果・手順は [設計 §10](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項)、触れた範囲は detached plan §11 に記録済み。
 - 報告: v4.3.0 ポータブル版で ZIP の画像を表示して終了すると、再起動時にその ZIP のページ一覧が開く。ZIP を選択しただけで終了した場合は親のアーカイブ一覧が開く。報告者のビューワモード・本の開き方・起動時の場所の設定は未確認。
-- 現状のコード: メイン側で本のページを読み込むと `start_loading_items` が `settings.last_folder` に ZIP/PDF 自身を保存する (`src/app.rs`)。「前回終了した場所」での次回起動は `open_default_startup_target` がそのパスを `load_folder_or_convert_archive(..., auto_fullscreen=false)` で開くため、ページ一覧になる (`src/app/startup_ops.rs`)。独立した複数ウィンドウの本コンテキストではメイン側の履歴保存を抑止している。
+- 修正前のコード: メイン側で本のページを読み込むと `start_loading_items` が `settings.last_folder` に ZIP/PDF 自身を保存する (`src/app.rs`)。「前回終了した場所」での次回起動は `open_default_startup_target` がそのパスを `load_folder_or_convert_archive(..., auto_fullscreen=false)` で開くため、ページ一覧になる (`src/app/startup_ops.rs`)。独立した複数ウィンドウの本コンテキストではメイン側の履歴保存を抑止している。
 - **期待する復元先は、内部で読み込んだ場所ではなく、利用者が最後に明示的に開いた一覧。** 本をページ一覧で開いてから画像を表示した場合はその本のページ一覧へ戻る。本を直接ページ表示で開き、ページ一覧を見ていない場合は、開く前の親一覧へ戻る。直接表示後に Backspace 等でページ一覧を明示的に開いた場合は、そこを復元先にする。
 - F12 の linked 別ウィンドウは表示先の切替であり、戻り先を変更しない。複数ウィンドウの independent ビューアはメイン一覧と別コンテキストなので、ビューア内の本をメイン側の起動復元先にしない。通常画像フォルダ・変換アーカイブでも同じ所有規則を確認する。
 - 対象は起動時の場所が「前回終了した場所」の場合。デスクトップ・指定フォルダ・ドライブ一覧・閲覧履歴、および起動引数による明示オープンの意味は変えない。本の読書位置 (`book_open_resume`) と、終了せずトレイへ退避・復帰する状態も別に扱う。
-- 実装前に、戻り先を決める時点と所有者を `docs/virtual-folders.md` / `docs/detached-rework-plan.md` と突き合わせる。`last_folder` が担う「現在の本」と「起動時に復元する一覧」を混同したままモード別 guard を増やさない。フル機能 (ページ一覧 / 直接ページ表示)、F12 linked、複数ウィンドウ independent、明示的なページ一覧への復帰、ZIP/PDF/変換書庫、起動設定別の回帰を追加する。
+- 合意した所有設計: `last_folder` は旧互換値として残し、Previous 専用の明示一覧 record を正本にする。旧設定は path と cursor を初回だけそのまま移行する。Search／Collection／Smart 等の合成 root は復元対象を追加せず、直前の物理一覧と cursor を保持する。フル機能 (ページ一覧 / 直接ページ表示)、F12 linked、複数ウィンドウ independent、明示的なページ一覧への復帰、ZIP/PDF/変換書庫、起動設定別の回帰を確認する。
 - 優先度: P2。「前回終了した場所」+ ZIP の直接ページ表示で上記コード経路を headless 再現済み。外部報告者の設定は未確認であり、報告者自身の環境まで再現できたとは扱わない。
 
 ### 1.329 外部ツールへ、渡すファイルの一覧を書いたリストファイルを渡す (`{file_list}`) — 利用者要望 (2026-10-05)

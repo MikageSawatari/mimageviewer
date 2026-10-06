@@ -12532,7 +12532,7 @@ impl App {
                 }
             }
             _ if !key.repeat && resolved_action == Some(KeyAction::FsBackToList) => {
-                self.close_fullscreen();
+                self.close_fullscreen_to_page_list();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::FsBackToList)
             }
