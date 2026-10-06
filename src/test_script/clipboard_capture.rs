@@ -655,6 +655,38 @@ impl KeyPipeClient {
     }
 }
 
+/// Names the window that took the foreground (process image and class only; no title).
+#[cfg(windows)]
+fn describe_foreground(foreground: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    if foreground.0.is_null() {
+        return "none".into();
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(foreground, Some(&mut pid)) };
+    let mut class = [0_u16; 256];
+    let class_len = unsafe { GetClassNameW(foreground, &mut class) }.max(0) as usize;
+    let mut image = String::from("?");
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if !handle.is_null() {
+        let mut buffer = [0_u16; 1024];
+        let mut size = buffer.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) } != 0 {
+            image = String::from_utf16_lossy(&buffer[..size as usize]);
+        }
+        unsafe { CloseHandle(handle) };
+    }
+    format!(
+        "hwnd={:#x} pid={pid} image={image} class={}",
+        foreground.0 as usize,
+        String::from_utf16_lossy(&class[..class_len])
+    )
+}
+
 #[cfg(windows)]
 fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, String> {
     use windows::Win32::UI::{
@@ -700,15 +732,20 @@ fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, 
     let deadline = Instant::now() + Duration::from_secs(5);
     bridge.validate_selected_owner_fresh(&owner, deadline)?;
     let hwnd = HWND(owner.hwnd() as usize as *mut _);
-    let validate = || -> Result<(), String> {
+    let validate = |phase: &str| -> Result<(), String> {
         bridge.validate_selected_owner_cached(&owner, deadline)?;
         let mut process = 0;
         let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
+        let foreground = unsafe { GetForegroundWindow() };
         if process != unsafe { GetCurrentProcessId() }
             || !unsafe { IsWindowVisible(hwnd).as_bool() }
-            || unsafe { GetForegroundWindow() } != hwnd
+            || foreground != hwnd
         {
-            return Err("clipboard paste exact root is not the visible foreground owner".into());
+            return Err(format!(
+                "clipboard paste exact root is not the visible foreground owner (phase={phase}, visible={}, foreground={})",
+                unsafe { IsWindowVisible(hwnd).as_bool() },
+                describe_foreground(foreground)
+            ));
         }
         let input = unsafe { OpenInputDesktop(0, 0, 1) };
         if input.is_null() {
@@ -730,7 +767,7 @@ fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, 
         }
         Ok(())
     };
-    validate()?;
+    validate("before-down")?;
     for key in [VK_CONTROL, VK_V, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN] {
         if unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0 {
             return Err("clipboard paste requires released user modifiers and V".into());
@@ -741,7 +778,7 @@ fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, 
     // The external owner holds keys until the real GetAsyncKeyState consumer ACK.
     let accepted = (|| -> Result<i64, String> {
         loop {
-            validate()?;
+            validate("awaiting-paste")?;
             let count = bridge.latest_snapshot()?.clipboard_capture.paste_count;
             if count > initial {
                 return Ok(count);
@@ -757,7 +794,7 @@ fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, 
     released?;
     let released_frame = bridge.latest_snapshot()?.snapshot_frame;
     while bridge.latest_snapshot()?.snapshot_frame <= released_frame + 1 {
-        validate()?;
+        validate("after-release")?;
         (bridge.wake)();
         super::wait_interruptibly(&bridge.interrupt, Duration::from_millis(10))
             .map_err(|e| e.to_string())?;
