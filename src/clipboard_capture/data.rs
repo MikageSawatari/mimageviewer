@@ -480,6 +480,15 @@ pub(crate) fn save_image(
     timestamp: &CaptureTimestamp,
 ) -> Result<SavedImage, String> {
     let directory = destination.join(&timestamp.month);
+    save_image_in_folder(image, &directory, timestamp)
+}
+
+/// Manual paste writes directly into the folder captured at the input boundary.
+pub(crate) fn save_image_in_folder(
+    image: &CapturedImage,
+    directory: &Path,
+    timestamp: &CaptureTimestamp,
+) -> Result<SavedImage, String> {
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("保存先を作成できませんでした: {error}"))?;
     let domain = image.origin.domain();
@@ -520,7 +529,7 @@ pub(crate) fn save_image(
     })
 }
 
-fn write_motw(path: &Path, origin: &CaptureOrigin) -> Result<(), String> {
+pub(super) fn write_motw(path: &Path, origin: &CaptureOrigin) -> Result<(), String> {
     #[cfg(windows)]
     if let Some(contents) = motw_contents(origin) {
         let mut ads = path.as_os_str().to_os_string();

@@ -292,6 +292,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "clipboard-capture/html",
+        ClipboardCapture,
+        "ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする",
+        ["クリップボード", "HTML", "ページ", "画像", "コピー", "監視"]
+    ),
+    entry!(
         "capture/folder",
         Capture,
         "保存先フォルダ",

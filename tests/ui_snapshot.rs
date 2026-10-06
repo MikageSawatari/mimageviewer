@@ -692,6 +692,50 @@ fn preferences_clipboard_capture_light() {
 }
 
 #[test]
+fn clipboard_html_settings_light() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_settings_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(720.0, 400.0),
+        |ui| mimageviewer::draw_clipboard_capture_html_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn clipboard_html_settings_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(720.0, 400.0),
+        |ui| mimageviewer::draw_clipboard_capture_html_settings_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn clipboard_html_selection_fetching_light() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_selection_fetching_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(760.0, 500.0),
+        |ui| mimageviewer::draw_capture_selection_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn clipboard_html_selection_saving_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_selection_saving_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(760.0, 500.0),
+        |ui| mimageviewer::draw_capture_selection_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
 fn preferences_clipboard_capture_pending_default_light() {
     snapshot_with_theme(
         "preferences_clipboard_capture_pending_default_light",

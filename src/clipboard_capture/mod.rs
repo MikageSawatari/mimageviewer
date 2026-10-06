@@ -1,6 +1,8 @@
 //! App-owned clipboard capture. Notifications carry immutable settings; viewer contexts
 //! never own or reset this service. The native reader only copies bytes while open.
 pub(crate) mod data;
+pub(crate) mod fetch;
+pub(crate) mod html;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
@@ -9,7 +11,7 @@ mod popup;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -210,9 +212,19 @@ pub(crate) struct ReadRequest {
     pub snapshot: Arc<CaptureSnapshot>,
     pub notified_at: Instant,
     pub reread: bool,
+    // Admission is captured by the listener. A copy made while the modal is
+    // open must not become eligible merely because it closes before reading.
+    pub html_detection_allowed: bool,
+    // Opening a selection retires pre-existing HTML work through reader,
+    // popup and App event drain; automatic image saves keep their own lifetime.
+    pub html_epoch: u64,
 }
 
 impl ReadRequest {
+    fn allows_html(&self) -> bool {
+        self.html_detection_allowed && self.snapshot.allows_html(self.sequence)
+    }
+
     fn reread_at(mut self, sequence: u32, observed_at: Instant) -> Self {
         self.sequence = sequence;
         self.notified_at = observed_at;
@@ -273,8 +285,7 @@ struct ReaderState {
 impl ReaderState {
     fn should_read(&self, request: &ReadRequest, generation: u64) -> bool {
         request.snapshot.generation == generation
-            && (request.snapshot.allows_images(request.sequence)
-                || request.snapshot.allows_html(request.sequence))
+            && (request.snapshot.allows_images(request.sequence) || request.allows_html())
             && self.accepted_sequence != Some(request.sequence)
     }
 
@@ -343,8 +354,100 @@ impl ReaderState {
     }
 }
 
+/// The explicit source owns the destination and eligibility rules. Manual work
+/// never consults monitor generations, settings, sequence dedup or exclusions.
+#[derive(Clone, Debug)]
+pub(crate) enum CaptureIntent {
+    Automatic { snapshot: Arc<CaptureSnapshot> },
+    Manual { destination: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SelectionSnapshot {
+    pub token: u64,
+    pub html: html::HtmlCapture,
+    pub intent: CaptureIntent,
+    pub timestamp: data::CaptureTimestamp,
+    pub html_epoch: u64,
+}
+
+impl SelectionSnapshot {
+    fn new(html: html::HtmlCapture, intent: CaptureIntent, html_epoch: u64) -> Arc<Self> {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        Arc::new(Self {
+            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            html,
+            intent,
+            timestamp: data::CaptureTimestamp::now(),
+            html_epoch,
+        })
+    }
+
+    fn current(&self, generation: u64, html_epoch: u64) -> bool {
+        match &self.intent {
+            CaptureIntent::Automatic { snapshot } => {
+                snapshot.generation == generation && self.html_epoch == html_epoch
+            }
+            CaptureIntent::Manual { .. } => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SelectionEvent {
+    OpenCaptureSelection(Arc<SelectionSnapshot>),
+    ManualSaved {
+        path: PathBuf,
+        metadata_error: Option<String>,
+    },
+    ManualFailed(String),
+}
+
+fn capture_manual_content(
+    raw: data::RawClipboardData,
+    kind: data::ClipboardKind,
+    destination: PathBuf,
+) -> Result<SelectionEvent, String> {
+    match kind {
+        data::ClipboardKind::Image => {
+            let image = data::decode_image(&raw)?;
+            let saved =
+                data::save_image_in_folder(&image, &destination, &data::CaptureTimestamp::now())?;
+            Ok(SelectionEvent::ManualSaved {
+                path: saved.path,
+                metadata_error: saved.metadata_error,
+            })
+        }
+        data::ClipboardKind::Html => {
+            let bytes = raw.html.as_deref().unwrap_or_default();
+            if data::html_source_url(bytes).is_none() {
+                return Err("取り込める画像がありません".into());
+            }
+            let html = html::parse_cf_html(bytes)?;
+            if html.candidates.is_empty() {
+                return Err("取り込める画像がありません".into());
+            }
+            Ok(SelectionEvent::OpenCaptureSelection(
+                SelectionSnapshot::new(html, CaptureIntent::Manual { destination }, 0),
+            ))
+        }
+        _ => Err("取り込める画像がありません".into()),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn manual_kind() -> Result<data::ClipboardKind, String> {
+    native::manual_kind()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn manual_kind() -> Result<data::ClipboardKind, String> {
+    Ok(data::ClipboardKind::Other)
+}
+
 pub(crate) enum CaptureEvent {
     StartupFailed(String),
+    OpenCaptureSelection(Arc<SelectionSnapshot>),
     RevealSaved { generation: u64, path: PathBuf },
 }
 
@@ -353,17 +456,30 @@ pub(crate) struct ClipboardCaptureService {
     generation: Arc<AtomicU64>,
     startup_error: Option<String>,
     event_rx: Option<mpsc::Receiver<CaptureEvent>>,
+    selection_open: Arc<AtomicBool>,
+    html_epoch: Arc<AtomicU64>,
+    manual_busy: Arc<AtomicBool>,
+    manual_tx: mpsc::Sender<SelectionEvent>,
+    manual_rx: mpsc::Receiver<SelectionEvent>,
+    selection_events: Vec<SelectionEvent>,
     #[cfg(windows)]
     runtime: Option<native::CaptureRuntime>,
 }
 
 impl Default for ClipboardCaptureService {
     fn default() -> Self {
+        let (manual_tx, manual_rx) = mpsc::channel();
         Self {
             snapshot: None,
             generation: Arc::new(AtomicU64::new(0)),
             startup_error: None,
             event_rx: None,
+            selection_open: Arc::new(AtomicBool::new(false)),
+            html_epoch: Arc::new(AtomicU64::new(0)),
+            manual_busy: Arc::new(AtomicBool::new(false)),
+            manual_tx,
+            manual_rx,
+            selection_events: Vec::new(),
             #[cfg(windows)]
             runtime: None,
         }
@@ -431,6 +547,8 @@ impl ClipboardCaptureService {
                 let runtime = native::CaptureRuntime::start(
                     snapshot.clone(),
                     self.generation.clone(),
+                    self.selection_open.clone(),
+                    self.html_epoch.clone(),
                     tx,
                     repaint,
                 )?;
@@ -466,6 +584,16 @@ impl ClipboardCaptureService {
         for event in events {
             match event {
                 CaptureEvent::StartupFailed(error) => self.record_startup_error(error),
+                CaptureEvent::OpenCaptureSelection(snapshot) => {
+                    if snapshot.current(
+                        self.generation.load(Ordering::Acquire),
+                        self.html_epoch.load(Ordering::Acquire),
+                    ) && !self.selection_open.load(Ordering::Acquire)
+                    {
+                        self.selection_events
+                            .push(SelectionEvent::OpenCaptureSelection(snapshot));
+                    }
+                }
                 CaptureEvent::RevealSaved { generation, path } => {
                     if generation == self.generation.load(Ordering::Acquire) {
                         reveal.push(path);
@@ -474,6 +602,102 @@ impl ClipboardCaptureService {
             }
         }
         reveal
+    }
+
+    pub(crate) fn poll_selection(&mut self) -> Vec<SelectionEvent> {
+        self.selection_events.extend(self.manual_rx.try_iter());
+        let generation = self.generation.load(Ordering::Acquire);
+        std::mem::take(&mut self.selection_events)
+            .into_iter()
+            .filter(|event| match event {
+                SelectionEvent::OpenCaptureSelection(snapshot) => {
+                    snapshot.current(generation, self.html_epoch.load(Ordering::Acquire))
+                        && !self.selection_open.load(Ordering::Acquire)
+                }
+                _ => true,
+            })
+            .collect()
+    }
+
+    pub(crate) fn set_selection_open(&mut self, open: bool) {
+        let was_open = self.selection_open.swap(open, Ordering::AcqRel);
+        if open && !was_open {
+            self.html_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        if open {
+            self.selection_events
+                .retain(|event| !matches!(event, SelectionEvent::OpenCaptureSelection(_)));
+            #[cfg(windows)]
+            if let Some(runtime) = &self.runtime {
+                runtime.hide_popup();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn resolve_selection(&self, token: u64, admitted: bool) {
+        if let Some(runtime) = &self.runtime {
+            runtime.resolve_selection(
+                self.generation.load(Ordering::Acquire),
+                token,
+                if admitted {
+                    popup::RevealResponse::Accepted
+                } else {
+                    popup::RevealResponse::Unavailable
+                },
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn manual_capture(
+        &self,
+        kind: data::ClipboardKind,
+        destination: PathBuf,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if !matches!(kind, data::ClipboardKind::Image | data::ClipboardKind::Html) {
+            return Err("取り込める画像がありません".into());
+        }
+        if self.manual_busy.swap(true, Ordering::AcqRel) {
+            return Err("クリップボードの取り込み中です".into());
+        }
+        let busy = self.manual_busy.clone();
+        let events = self.manual_tx.clone();
+        let ctx = ctx.clone();
+        let result = std::thread::Builder::new()
+            .name("clipboard-capture-manual".into())
+            .spawn(move || {
+                let result = native::read_manual(kind)
+                    .and_then(|raw| capture_manual_content(raw, kind, destination));
+                let event = result.unwrap_or_else(SelectionEvent::ManualFailed);
+                let _ = events.send(event);
+                busy.store(false, Ordering::Release);
+                ctx.request_repaint();
+            });
+        if let Err(error) = result {
+            self.manual_busy.store(false, Ordering::Release);
+            return Err(format!("取り込みを開始できませんでした: {error}"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn manual_capture(
+        &self,
+        _: data::ClipboardKind,
+        _: PathBuf,
+        _: &egui::Context,
+    ) -> Result<(), String> {
+        Err("この環境ではクリップボードの取り込みは利用できません".into())
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn resolve_selection(&self, _: u64, _: bool) {}
+
+    #[cfg(test)]
+    pub(crate) fn inject_selection_event_for_test(&mut self, event: SelectionEvent) {
+        self.manual_tx.send(event).unwrap();
     }
 
     #[cfg(test)]
@@ -507,6 +731,153 @@ impl ClipboardCaptureService {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn html_selection(intent: CaptureIntent, epoch: u64) -> Arc<SelectionSnapshot> {
+        SelectionSnapshot::new(
+            html::HtmlCapture {
+                page_url: "https://example.com/page".into(),
+                candidates: vec!["https://example.com/a.png".into()],
+                omitted: 0,
+            },
+            intent,
+            epoch,
+        )
+    }
+
+    #[test]
+    fn selection_open_invalidates_automatic_html_across_close_but_manual_ignores_monitor_generation()
+     {
+        let mut service = ClipboardCaptureService::default();
+        service.generation.store(1, Ordering::Release);
+        let automatic = html_selection(
+            CaptureIntent::Automatic {
+                snapshot: snapshot(false, true, 10),
+            },
+            0,
+        );
+        let manual = html_selection(
+            CaptureIntent::Manual {
+                destination: PathBuf::from("current-folder"),
+            },
+            0,
+        );
+        service
+            .selection_events
+            .push(SelectionEvent::OpenCaptureSelection(automatic.clone()));
+        service.set_selection_open(true);
+        assert!(service.poll_selection().is_empty());
+        service.set_selection_open(false);
+        service
+            .selection_events
+            .push(SelectionEvent::OpenCaptureSelection(automatic));
+        service
+            .manual_tx
+            .send(SelectionEvent::OpenCaptureSelection(manual.clone()))
+            .unwrap();
+        service.generation.store(99, Ordering::Release);
+        let events = service.poll_selection();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], SelectionEvent::OpenCaptureSelection(snapshot) if snapshot.token == manual.token)
+        );
+    }
+
+    #[test]
+    fn html_notifications_during_selection_are_not_eligible_after_close() {
+        let mut request = request(11);
+        request.snapshot = snapshot(false, true, 10);
+        request.html_detection_allowed = false;
+        assert!(!ReaderState::default().should_read(&request, 1));
+        let reread = request.reread_at(12, Instant::now());
+        assert!(!reread.allows_html());
+        // The same request still permits automatic image saves.
+        let mut image = reread;
+        image.snapshot = snapshot(true, true, 10);
+        assert!(ReaderState::default().should_read(&image, 1));
+    }
+
+    #[test]
+    fn manual_images_save_repeatedly_directly_in_current_folder_without_monitor() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let png = bytes.into_inner();
+        let mut paths = Vec::new();
+        for _ in 0..2 {
+            let event = capture_manual_content(
+                data::RawClipboardData {
+                    png: Some(png.clone()),
+                    ..Default::default()
+                },
+                data::ClipboardKind::Image,
+                folder.path().to_path_buf(),
+            )
+            .unwrap();
+            let SelectionEvent::ManualSaved { path, .. } = event else {
+                panic!("manual image did not save");
+            };
+            assert_eq!(path.parent(), Some(folder.path()));
+            assert!(path.exists());
+            paths.push(path);
+        }
+        assert_ne!(paths[0], paths[1]);
+    }
+
+    fn manual_html_fixture(fragment: &str, source: &str) -> Vec<u8> {
+        let context = format!("<html><!--StartFragment-->{fragment}<!--EndFragment--></html>");
+        let header = |start: usize, end: usize| {
+            format!(
+                "Version:1.0\r\nStartHTML:{start:010}\r\nEndHTML:{end:010}\r\nStartFragment:-1\r\nEndFragment:-1\r\nSourceURL:{source}\r\n"
+            )
+        };
+        let start = header(0, 0).len();
+        format!("{}{context}", header(start, start + context.len())).into_bytes()
+    }
+
+    #[test]
+    fn manual_html_without_source_or_candidates_returns_no_image_and_never_a_shell_event() {
+        for html in [
+            b"<html><img src='https://example.com/a.png'></html>".to_vec(),
+            manual_html_fixture("<p>text</p>", "https://example.com/page"),
+        ] {
+            let result = capture_manual_content(
+                data::RawClipboardData {
+                    html: Some(html),
+                    ..Default::default()
+                },
+                data::ClipboardKind::Html,
+                PathBuf::from("current-folder"),
+            );
+            assert!(matches!(result, Err(ref message) if message == "取り込める画像がありません"));
+        }
+    }
+
+    #[test]
+    fn manual_html_keeps_current_destination_and_never_consults_monitor_config() {
+        let destination = PathBuf::from("current-folder");
+        let result = capture_manual_content(
+            data::RawClipboardData {
+                html: Some(manual_html_fixture(
+                    "<img src='/a.png'>",
+                    "https://example.com/page",
+                )),
+                ..Default::default()
+            },
+            data::ClipboardKind::Html,
+            destination.clone(),
+        )
+        .unwrap();
+        let SelectionEvent::OpenCaptureSelection(snapshot) = result else {
+            panic!("manual html did not select");
+        };
+        assert!(
+            matches!(&snapshot.intent, CaptureIntent::Manual { destination: captured } if captured == &destination)
+        );
+        assert_eq!(snapshot.html.candidates, ["https://example.com/a.png"]);
+        assert!(snapshot.current(999, 999));
+    }
 
     #[test]
     fn default_destination_is_resolved_once_off_caller_and_shared_with_save_waiters() {
@@ -680,6 +1051,8 @@ mod tests {
             snapshot: snapshot(true, false, 10),
             notified_at: Instant::now(),
             reread: false,
+            html_detection_allowed: true,
+            html_epoch: 0,
         }
     }
 

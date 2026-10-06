@@ -791,7 +791,9 @@ pub fn draw_clipboard_capture_settings_snapshot_fixture(ui: &mut egui::Ui, start
         Some(PathBuf::from("C:/Pictures/mimageviewer/clipboard"));
     state.clipboard_capture_startup_failed = startup_failed;
     state.selected = PreferencesPage::ClipboardCapture;
-    draw_page(ui, &mut state, false);
+    ui.heading(state.selected.label());
+    ui.add_space(8.0);
+    pages::page_clipboard_capture_s1_snapshot(ui, &mut state);
 }
 
 #[doc(hidden)]
@@ -807,6 +809,30 @@ pub fn draw_clipboard_capture_settings_pending_snapshot_fixture(ui: &mut egui::U
         0,
     );
     state.clipboard_capture_default_output_dir = None;
+    state.selected = PreferencesPage::ClipboardCapture;
+    ui.heading(state.selected.label());
+    ui.add_space(8.0);
+    pages::page_clipboard_capture_s1_snapshot(ui, &mut state);
+}
+
+#[doc(hidden)]
+pub fn draw_clipboard_capture_html_settings_snapshot_fixture(
+    ui: &mut egui::Ui,
+    startup_failed: bool,
+) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.clipboard_capture_default_output_dir =
+        Some(PathBuf::from("C:/Pictures/mimageviewer/clipboard"));
+    state.clipboard_capture_startup_failed = startup_failed;
     state.selected = PreferencesPage::ClipboardCapture;
     draw_page(ui, &mut state, false);
 }

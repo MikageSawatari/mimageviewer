@@ -299,6 +299,10 @@ pub use ui_raw::{
 pub mod ui_dialogs;
 mod ui_sns_split;
 #[doc(hidden)]
+pub use ui_dialogs::clipboard_capture::draw_capture_selection_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_clipboard_capture_html_settings_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_dialogs::preferences::draw_clipboard_capture_settings_pending_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_clipboard_capture_settings_snapshot_fixture;

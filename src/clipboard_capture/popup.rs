@@ -1,13 +1,18 @@
 //! An ownerless, nonactivating notification window, owned by its own thread.
 //! The mailbox and displayed content each retain only the latest notification.
 
+use super::SelectionSnapshot;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DISPLAY_LIFETIME: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug)]
 pub(crate) enum PopupContent {
+    Html(Arc<SelectionSnapshot>),
+    HtmlAwaitingResponse(Arc<SelectionSnapshot>),
+    SelectionUnavailable,
     Saved(PathBuf),
     SavedAwaitingResponse(PathBuf),
     Failure(String),
@@ -36,6 +41,43 @@ fn begin_reveal(
     Some(crate::clipboard_capture::CaptureEvent::RevealSaved { generation, path })
 }
 
+fn begin_selection(
+    shown: &mut Option<(u64, PopupContent)>,
+    current_generation: u64,
+    html_epoch: u64,
+) -> Option<super::CaptureEvent> {
+    let Some((generation, PopupContent::Html(snapshot))) = shown.as_ref() else {
+        return None;
+    };
+    if *generation != current_generation || !snapshot.current(current_generation, html_epoch) {
+        return None;
+    }
+    let generation = *generation;
+    let snapshot = snapshot.clone();
+    *shown = Some((
+        generation,
+        PopupContent::HtmlAwaitingResponse(snapshot.clone()),
+    ));
+    Some(super::CaptureEvent::OpenCaptureSelection(snapshot))
+}
+
+fn resolve_selection(
+    shown: &mut Option<(u64, PopupContent)>,
+    generation: u64,
+    token: u64,
+    response: RevealResponse,
+) -> bool {
+    if !matches!(shown.as_ref(), Some((g, PopupContent::HtmlAwaitingResponse(snapshot))) if *g == generation && snapshot.token == token)
+    {
+        return false;
+    }
+    *shown = match response {
+        RevealResponse::Accepted => None,
+        RevealResponse::Unavailable => Some((generation, PopupContent::SelectionUnavailable)),
+    };
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RevealResponse {
     Accepted,
@@ -62,8 +104,21 @@ fn resolve_reveal(
 }
 
 impl PopupContent {
+    fn current(&self, generation: u64, html_epoch: u64) -> bool {
+        match self {
+            Self::Html(snapshot) | Self::HtmlAwaitingResponse(snapshot) => {
+                snapshot.current(generation, html_epoch)
+            }
+            _ => true,
+        }
+    }
+
     fn text(&self) -> String {
         match self {
+            Self::Html(snapshot) | Self::HtmlAwaitingResponse(snapshot) => {
+                format!("このページの画像 {} 件", snapshot.html.candidates.len())
+            }
+            Self::SelectionUnavailable => "一覧画面で Ctrl+V を押すと開けます".into(),
             Self::Saved(_) | Self::SavedAwaitingResponse(_) => {
                 "クリップボードの画像を保存しました".into()
             }
@@ -137,7 +192,8 @@ fn bottom_right(work: [i32; 4], dpi: u32) -> [i32; 4] {
 #[cfg(windows)]
 mod native {
     use super::{
-        Lifetime, PopupContent, RevealResponse, begin_reveal, bottom_right, resolve_reveal, scaled,
+        Lifetime, PopupContent, RevealResponse, begin_reveal, begin_selection, bottom_right,
+        resolve_reveal, resolve_selection, scaled,
     };
     use crate::clipboard_capture::CaptureEvent;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -169,6 +225,11 @@ mod native {
             content: PopupContent,
         },
         Hide,
+        SelectionResult {
+            generation: u64,
+            token: u64,
+            response: RevealResponse,
+        },
         RevealResult {
             generation: u64,
             path: std::path::PathBuf,
@@ -179,6 +240,8 @@ mod native {
     struct Mailbox {
         latest: Mutex<Option<Command>>,
         current_generation: Arc<AtomicU64>,
+        selection_open: Arc<AtomicBool>,
+        html_epoch: Arc<AtomicU64>,
         thread_id: AtomicU32,
         stop: AtomicBool,
     }
@@ -188,7 +251,10 @@ mod native {
             let mut latest = self.latest.lock().unwrap_or_else(|p| p.into_inner());
             // Validate inside the same ownership boundary as replacement: an old
             // worker must not erase a pending Hide or a newer generation's Show.
-            if generation != self.current_generation.load(Ordering::Acquire) {
+            if generation != self.current_generation.load(Ordering::Acquire)
+                || self.selection_open.load(Ordering::Acquire)
+                || !content.current(generation, self.html_epoch.load(Ordering::Acquire))
+            {
                 return false;
             }
             *latest = Some(Command::Show {
@@ -205,6 +271,26 @@ mod native {
                 // The thread publishes its id only after creating a message queue.
                 let _ = unsafe { PostThreadMessageW(id, WAKE, WPARAM(0), LPARAM(0)) };
             }
+        }
+
+        fn publish_selection_result(
+            &self,
+            generation: u64,
+            token: u64,
+            response: RevealResponse,
+        ) -> bool {
+            let mut latest = self.latest.lock().unwrap_or_else(|p| p.into_inner());
+            if generation != self.current_generation.load(Ordering::Acquire)
+                || matches!(latest.as_ref(), Some(Command::Show { .. } | Command::Hide))
+            {
+                return false;
+            }
+            *latest = Some(Command::SelectionResult {
+                generation,
+                token,
+                response,
+            });
+            true
         }
 
         fn publish_reveal_result(
@@ -236,12 +322,16 @@ mod native {
     impl PopupRuntime {
         pub(crate) fn start(
             current_generation: Arc<AtomicU64>,
+            selection_open: Arc<AtomicBool>,
+            html_epoch: Arc<AtomicU64>,
             event_tx: mpsc::Sender<CaptureEvent>,
             repaint: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<Self, String> {
             let mailbox = Arc::new(Mailbox {
                 latest: Mutex::new(None),
                 current_generation: current_generation.clone(),
+                selection_open: selection_open.clone(),
+                html_epoch: html_epoch.clone(),
                 thread_id: AtomicU32::new(0),
                 stop: AtomicBool::new(false),
             });
@@ -251,6 +341,8 @@ mod native {
                 .spawn(move || {
                     let mut state = Box::new(WindowState {
                         current_generation,
+                        selection_open,
+                        html_epoch,
                         event_tx,
                         repaint,
                         shown: None,
@@ -288,6 +380,20 @@ mod native {
             self.mailbox.wake();
         }
 
+        pub(crate) fn resolve_selection(
+            &self,
+            generation: u64,
+            token: u64,
+            response: RevealResponse,
+        ) {
+            if self
+                .mailbox
+                .publish_selection_result(generation, token, response)
+            {
+                self.mailbox.wake();
+            }
+        }
+
         pub(crate) fn resolve_reveal(
             &self,
             generation: u64,
@@ -318,6 +424,8 @@ mod native {
 
     struct WindowState {
         current_generation: Arc<AtomicU64>,
+        selection_open: Arc<AtomicBool>,
+        html_epoch: Arc<AtomicU64>,
         event_tx: mpsc::Sender<CaptureEvent>,
         repaint: Arc<dyn Fn() + Send + Sync>,
         shown: Option<(u64, PopupContent)>,
@@ -391,7 +499,11 @@ mod native {
                         generation,
                         dark,
                         content,
-                    }) if generation == (*state_ptr).current_generation.load(Ordering::Acquire) => {
+                    }) if generation == (*state_ptr).current_generation.load(Ordering::Acquire)
+                        && !mailbox.selection_open.load(Ordering::Acquire)
+                        && content
+                            .current(generation, mailbox.html_epoch.load(Ordering::Acquire)) =>
+                    {
                         if window.is_none() {
                             let module = GetModuleHandleW(None).map_err(|e| e.to_string())?;
                             window = Some(
@@ -417,6 +529,29 @@ mod native {
                     Some(Command::Hide) => {
                         if let Some(hwnd) = window {
                             hide(hwnd, state_ptr);
+                        }
+                    }
+                    Some(Command::SelectionResult {
+                        generation,
+                        token,
+                        response,
+                    }) if generation == (*state_ptr).current_generation.load(Ordering::Acquire) => {
+                        if resolve_selection(&mut (*state_ptr).shown, generation, token, response)
+                            && let Some(hwnd) = window
+                        {
+                            match response {
+                                RevealResponse::Accepted => hide(hwnd, state_ptr),
+                                RevealResponse::Unavailable => {
+                                    let dark = (*state_ptr).dark;
+                                    show(
+                                        hwnd,
+                                        state_ptr,
+                                        generation,
+                                        dark,
+                                        PopupContent::SelectionUnavailable,
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(Command::RevealResult {
@@ -448,10 +583,20 @@ mod native {
                 // and before its Hide arrives. Draining always retires any old
                 // displayed notification, including when the drained Show was
                 // discarded as stale.
-                let shown_stale = (*state_ptr).shown.as_ref().is_some_and(|(generation, _)| {
-                    *generation != mailbox.current_generation.load(Ordering::Acquire)
-                });
-                if shown_stale && let Some(hwnd) = window {
+                let shown_stale =
+                    (*state_ptr)
+                        .shown
+                        .as_ref()
+                        .is_some_and(|(generation, content)| {
+                            *generation != mailbox.current_generation.load(Ordering::Acquire)
+                                || !content.current(
+                                    *generation,
+                                    mailbox.html_epoch.load(Ordering::Acquire),
+                                )
+                        });
+                if (shown_stale || mailbox.selection_open.load(Ordering::Acquire))
+                    && let Some(hwnd) = window
+                {
                     hide(hwnd, state_ptr);
                 }
                 // A producer may have replaced the mailbox while show() dispatched
@@ -580,7 +725,7 @@ mod native {
         x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
     }
 
-    fn buttons(width: i32, height: i32, dpi: u32) -> (RECT, RECT) {
+    fn buttons(width: i32, height: i32, dpi: u32, html: bool) -> (RECT, RECT) {
         let margin = scaled(12, dpi);
         let close = RECT {
             left: (width - scaled(36, dpi)).max(0),
@@ -591,7 +736,7 @@ mod native {
         let open = RECT {
             left: margin,
             top: (height - scaled(42, dpi)).max(0),
-            right: (margin + scaled(76, dpi)).min(width),
+            right: (margin + scaled(if html { 180 } else { 76 }, dpi)).min(width),
             bottom: (height - margin).max(0),
         };
         (open, close)
@@ -644,7 +789,18 @@ mod native {
             let old_font = SelectObject(dc, font);
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, foreground);
-            let (mut open, mut close) = buttons(client.right, client.bottom, (*state).dpi);
+            let (mut open, mut close) = buttons(
+                client.right,
+                client.bottom,
+                (*state).dpi,
+                matches!(
+                    (*state).shown.as_ref(),
+                    Some((
+                        _,
+                        PopupContent::Html(_) | PopupContent::HtmlAwaitingResponse(_)
+                    ))
+                ),
+            );
             if let Some((_, content)) = &(*state).shown {
                 let mut text_rect = RECT {
                     left: scaled(16, (*state).dpi),
@@ -661,12 +817,19 @@ mod native {
                 );
                 if matches!(
                     content,
-                    PopupContent::Saved(_) | PopupContent::SavedAwaitingResponse(_)
+                    PopupContent::Saved(_)
+                        | PopupContent::SavedAwaitingResponse(_)
+                        | PopupContent::Html(_)
+                        | PopupContent::HtmlAwaitingResponse(_)
                 ) {
                     let brush = CreateSolidBrush(button_color);
                     FillRect(dc, &open, brush);
                     let _ = DeleteObject(brush.into());
-                    if matches!(content, PopupContent::SavedAwaitingResponse(_)) {
+                    if matches!(
+                        content,
+                        PopupContent::SavedAwaitingResponse(_)
+                            | PopupContent::HtmlAwaitingResponse(_)
+                    ) {
                         SetTextColor(
                             dc,
                             if dark {
@@ -676,7 +839,15 @@ mod native {
                             },
                         );
                     }
-                    let mut label: Vec<u16> = "開く".encode_utf16().collect();
+                    let label = if matches!(
+                        content,
+                        PopupContent::Html(_) | PopupContent::HtmlAwaitingResponse(_)
+                    ) {
+                        "画像を選んで保存"
+                    } else {
+                        "開く"
+                    };
+                    let mut label: Vec<u16> = label.encode_utf16().collect();
                     DrawTextW(
                         dc,
                         &mut label,
@@ -776,12 +947,30 @@ mod native {
                     let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
                     let mut client = RECT::default();
                     let _ = GetClientRect(hwnd, &mut client);
-                    let (open, close) = buttons(client.right, client.bottom, (*state).dpi);
+                    let (open, close) = buttons(
+                        client.right,
+                        client.bottom,
+                        (*state).dpi,
+                        matches!(
+                            (*state).shown.as_ref(),
+                            Some((
+                                _,
+                                PopupContent::Html(_) | PopupContent::HtmlAwaitingResponse(_)
+                            ))
+                        ),
+                    );
                     if contains(close, x, y) {
                         hide(hwnd, state);
                     } else if contains(open, x, y) {
                         let generation = (*state).current_generation.load(Ordering::Acquire);
-                        if let Some(event) = begin_reveal(&mut (*state).shown, generation) {
+                        if !(*state).selection_open.load(Ordering::Acquire)
+                            && let Some(event) = begin_selection(
+                                &mut (*state).shown,
+                                generation,
+                                (*state).html_epoch.load(Ordering::Acquire),
+                            )
+                            .or_else(|| begin_reveal(&mut (*state).shown, generation))
+                        {
                             let events = (*state).event_tx.clone();
                             let repaint = (*state).repaint.clone();
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -812,9 +1001,48 @@ mod native {
             Mailbox {
                 latest: Mutex::new(None),
                 current_generation: Arc::new(AtomicU64::new(generation)),
+                selection_open: Arc::new(AtomicBool::new(false)),
+                html_epoch: Arc::new(AtomicU64::new(0)),
                 thread_id: AtomicU32::new(0),
                 stop: AtomicBool::new(false),
             }
+        }
+
+        #[test]
+        fn selection_open_discards_popup_publication_without_replacing_pending_hide() {
+            let mailbox = mailbox(1);
+            *mailbox.latest.lock().unwrap() = Some(Command::Hide);
+            mailbox.selection_open.store(true, Ordering::Release);
+            assert!(!mailbox.publish_show(
+                1,
+                false,
+                PopupContent::Failure("saved while dialog open".into())
+            ));
+            assert!(matches!(
+                *mailbox.latest.lock().unwrap(),
+                Some(Command::Hide)
+            ));
+        }
+
+        #[test]
+        fn selection_reply_retains_latest_notification_mailbox() {
+            let mailbox = mailbox(1);
+            assert!(mailbox.publish_selection_result(1, 10, RevealResponse::Unavailable));
+            assert!(mailbox.publish_selection_result(1, 11, RevealResponse::Accepted));
+            assert!(matches!(
+                mailbox.latest.lock().unwrap().take(),
+                Some(Command::SelectionResult {
+                    token: 11,
+                    response: RevealResponse::Accepted,
+                    ..
+                })
+            ));
+            assert!(mailbox.publish_show(1, false, PopupContent::Abandoned));
+            assert!(!mailbox.publish_selection_result(1, 10, RevealResponse::Accepted));
+            assert!(matches!(
+                *mailbox.latest.lock().unwrap(),
+                Some(Command::Show { .. })
+            ));
         }
 
         #[test]
@@ -900,6 +1128,8 @@ pub(crate) struct PopupRuntime;
 impl PopupRuntime {
     pub(crate) fn start(
         _: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        _: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _: std::sync::Arc<std::sync::atomic::AtomicU64>,
         _: std::sync::mpsc::Sender<crate::clipboard_capture::CaptureEvent>,
         _: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
@@ -912,6 +1142,104 @@ impl PopupRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn html_snapshot() -> Arc<SelectionSnapshot> {
+        super::super::SelectionSnapshot::new(
+            super::super::html::HtmlCapture {
+                page_url: "https://example.com/page".into(),
+                candidates: vec!["https://example.com/image.png".into()],
+                omitted: 0,
+            },
+            super::super::CaptureIntent::Manual {
+                destination: PathBuf::from("capture"),
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn html_click_emits_snapshot_once_and_acceptance_is_correlated_without_clipboard_read() {
+        let snapshot = html_snapshot();
+        let mut shown = Some((4, PopupContent::Html(snapshot.clone())));
+        assert!(begin_selection(&mut shown, 3, 0).is_none());
+        let event = begin_selection(&mut shown, 4, 0).unwrap();
+        assert!(
+            matches!(event, super::super::CaptureEvent::OpenCaptureSelection(ref captured) if Arc::ptr_eq(captured, &snapshot))
+        );
+        assert!(begin_selection(&mut shown, 4, 0).is_none());
+        assert!(!resolve_selection(
+            &mut shown,
+            4,
+            snapshot.token + 1,
+            RevealResponse::Accepted
+        ));
+        assert!(resolve_selection(
+            &mut shown,
+            4,
+            snapshot.token,
+            RevealResponse::Accepted
+        ));
+        assert!(shown.is_none());
+    }
+
+    #[test]
+    fn automatic_html_epoch_retires_content_and_clicks_permanently_after_dialog_close() {
+        let config = super::super::CaptureConfig {
+            images: false,
+            html: true,
+            destination: Some(PathBuf::from("capture")),
+        };
+        let settings = Arc::new(super::super::CaptureSnapshot::updated(
+            None, config, 10, false,
+        ));
+        let snapshot = super::super::SelectionSnapshot::new(
+            html_snapshot().html.clone(),
+            super::super::CaptureIntent::Automatic { snapshot: settings },
+            0,
+        );
+        let content = PopupContent::Html(snapshot);
+        assert!(content.current(1, 0));
+        assert!(!content.current(1, 1));
+        let mut shown = Some((1, content));
+        assert!(begin_selection(&mut shown, 1, 1).is_none());
+        assert!(matches!(shown, Some((1, PopupContent::Html(_)))));
+    }
+
+    #[test]
+    fn unavailable_html_replaces_only_clicked_token_with_ctrl_v_instruction() {
+        let old = html_snapshot();
+        let latest = html_snapshot();
+        let mut shown = Some((4, PopupContent::Html(old.clone())));
+        assert!(begin_selection(&mut shown, 4, 0).is_some());
+        shown = Some((4, PopupContent::Html(latest.clone())));
+        assert!(!resolve_selection(
+            &mut shown,
+            4,
+            old.token,
+            RevealResponse::Unavailable
+        ));
+        assert!(begin_selection(&mut shown, 4, 0).is_some());
+        assert!(!resolve_selection(
+            &mut shown,
+            3,
+            latest.token,
+            RevealResponse::Unavailable
+        ));
+        assert!(resolve_selection(
+            &mut shown,
+            4,
+            latest.token,
+            RevealResponse::Unavailable
+        ));
+        assert!(matches!(
+            shown,
+            Some((4, PopupContent::SelectionUnavailable))
+        ));
+        assert_eq!(
+            shown.unwrap().1.text(),
+            "一覧画面で Ctrl+V を押すと開けます"
+        );
+    }
 
     #[test]
     fn repeated_clicks_emit_one_event_and_keep_the_accepted_response() {

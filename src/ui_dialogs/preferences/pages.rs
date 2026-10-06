@@ -1840,11 +1840,33 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
 }
 
 pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    page_clipboard_capture_controls(ui, state, true);
+}
+
+// Preserve the already-approved S1 snapshots; S3 has separate snapshots of the
+// complete production page, including the new HTML monitoring control.
+pub(super) fn page_clipboard_capture_s1_snapshot(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    page_clipboard_capture_controls(ui, state, false);
+}
+
+fn page_clipboard_capture_controls(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    html_control: bool,
+) {
     anchored(ui, state, "clipboard-capture/image", |ui, state| {
         ui.checkbox(
             &mut state.settings.clipboard_capture_image_enabled,
             "画像がコピーされたら自動で保存する",
         );
+        if html_control {
+            anchored(ui, state, "clipboard-capture/html", |ui, state| {
+                ui.checkbox(
+                    &mut state.settings.clipboard_capture_html_enabled,
+                    "ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする",
+                );
+            });
+        }
         ui.label(egui::RichText::new(
             "監視は mImageViewer の起動中だけ動きます。タスクトレイ常駐と組み合わせて使えます。",
         ).weak());

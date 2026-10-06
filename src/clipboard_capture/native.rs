@@ -1,6 +1,6 @@
 use super::{
-    AcceptedContent, CaptureEvent, CaptureSnapshot, ReadDecision, ReadRequest, ReaderState,
-    await_quiet_request, data, popup,
+    AcceptedContent, CaptureEvent, CaptureIntent, CaptureSnapshot, ReadDecision, ReadRequest,
+    ReaderState, SelectionSnapshot, await_quiet_request, data, html, popup,
 };
 use std::{
     cell::RefCell,
@@ -46,6 +46,8 @@ impl Drop for Sta {
 struct Shared {
     snapshot: Mutex<Arc<CaptureSnapshot>>,
     generation: Arc<AtomicU64>,
+    selection_open: Arc<AtomicBool>,
+    html_epoch: Arc<AtomicU64>,
     latest: Mutex<Option<ReadRequest>>,
     serial: AtomicU64,
     stop: AtomicBool,
@@ -75,12 +77,19 @@ impl Shared {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        // Read the cancellation generation before admission. If a dialog opens
+        // across these loads, either admission is false or the old epoch retires
+        // the request permanently, including after the dialog has closed.
+        let html_epoch = self.html_epoch.load(Ordering::Acquire);
+        let html_detection_allowed = !self.selection_open.load(Ordering::Acquire);
         let request = ReadRequest {
             serial: self.serial.fetch_add(1, Ordering::AcqRel) + 1,
             sequence,
             snapshot,
             notified_at: Instant::now(),
             reread: false,
+            html_detection_allowed,
+            html_epoch,
         };
         *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(request);
         let _ = self.wake.try_send(());
@@ -245,6 +254,12 @@ enum ObservedContent {
 }
 
 fn preflight_format_ids() -> Result<Vec<(u32, &'static str)>, String> {
+    static IDS: std::sync::OnceLock<Result<Vec<(u32, &'static str)>, String>> =
+        std::sync::OnceLock::new();
+    IDS.get_or_init(register_preflight_formats).clone()
+}
+
+fn register_preflight_formats() -> Result<Vec<(u32, &'static str)>, String> {
     data::PREFLIGHT_FORMAT_NAMES
         .iter()
         .map(|&name| {
@@ -269,6 +284,42 @@ fn preflight_format_ids() -> Result<Vec<(u32, &'static str)>, String> {
         .collect()
 }
 
+fn available_formats(formats: &[(u32, &'static str)]) -> data::ClipboardFormats {
+    data::ClipboardFormats {
+        names: formats
+            .iter()
+            .filter(|(id, _)| unsafe { IsClipboardFormatAvailable(*id) }.is_ok())
+            .map(|(_, name)| (*name).to_owned())
+            .collect(),
+        ..Default::default()
+    }
+}
+
+pub(super) fn manual_kind() -> Result<data::ClipboardKind, String> {
+    Ok(data::classify_manual(&available_formats(
+        &preflight_format_ids()?,
+    )))
+}
+
+/// Explicit paste reads independently of monitor lifetime/settings. A bounded
+/// OpenClipboard retry runs only on this worker; no sequence/hash is consulted.
+pub(super) fn read_manual(kind: data::ClipboardKind) -> Result<data::RawClipboardData, String> {
+    let _sta = Sta::new()?;
+    for attempt in 0..=4 {
+        match read_clipboard(ClipboardReadIntent::Manual(kind)) {
+            Ok(observation) => {
+                return match observation.data? {
+                    ObservedContent::Read(_, raw) => Ok(raw),
+                    ObservedContent::Skipped => Err("取り込める画像がありません".into()),
+                };
+            }
+            Err(error) if attempt == 4 => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis([25, 50, 100, 250][attempt])),
+        }
+    }
+    unreachable!()
+}
+
 // The rejected observation uses the same sequence fence as an opened read.
 // It becomes Other only after acceptance, never after an unstable availability
 // query or an obsolete generation. Candidates must pass the request/before/after
@@ -289,7 +340,7 @@ fn read_with_preflight(
         && data::should_open_automatic(
             &formats,
             request.snapshot.allows_images(request.sequence),
-            request.snapshot.allows_html(request.sequence),
+            request.allows_html(),
         )
     {
         read()
@@ -321,6 +372,48 @@ fn read(request: &ReadRequest, formats: &[(u32, &'static str)]) -> Result<Observ
 }
 
 fn read_opened(request: &ReadRequest) -> Result<Observation, String> {
+    read_clipboard(ClipboardReadIntent::Automatic(request))
+}
+
+enum ClipboardReadIntent<'a> {
+    Automatic(&'a ReadRequest),
+    Manual(data::ClipboardKind),
+}
+
+// Pick the bounded payload once at the raw-byte ownership boundary. A manual
+// request keeps its UI-selected route if the clipboard changes; it cannot
+// fall back to Shell or acquire monitor-only exclusions.
+fn requested_payload(
+    formats: &data::ClipboardFormats,
+    intent: &ClipboardReadIntent<'_>,
+) -> data::ClipboardKind {
+    match intent {
+        ClipboardReadIntent::Manual(selected) => {
+            if data::classify_manual(formats) == *selected {
+                *selected
+            } else {
+                data::ClipboardKind::Other
+            }
+        }
+        ClipboardReadIntent::Automatic(request) => {
+            let classified = data::classify_automatic(formats, None);
+            if classified == data::ClipboardKind::Image
+                && request.snapshot.allows_images(request.sequence)
+            {
+                data::ClipboardKind::Image
+            } else if classified == data::ClipboardKind::Other
+                && data::classify_manual(formats) == data::ClipboardKind::Html
+                && data::should_open_automatic(formats, false, request.allows_html())
+            {
+                data::ClipboardKind::Html
+            } else {
+                data::ClipboardKind::Other
+            }
+        }
+    }
+}
+
+fn read_clipboard(intent: ClipboardReadIntent<'_>) -> Result<Observation, String> {
     unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard: {e}"))?;
     let guard = ClipboardGuard;
     let before = unsafe { GetClipboardSequenceNumber() };
@@ -353,22 +446,28 @@ fn read_opened(request: &ReadRequest) -> Result<Observation, String> {
         let get = |name: &str, limit: usize| -> Result<Option<Vec<u8>>, String> {
             copy_named_format(&entries, name, limit, copy_format)
         };
-        let history = get("CanIncludeInClipboardHistory", 256)?.and_then(|b| {
+        let history = if matches!(intent, ClipboardReadIntent::Automatic(_)) {
+            get("CanIncludeInClipboardHistory", 256)?
+        } else {
+            None
+        }
+        .and_then(|b| {
             b.get(..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()) != 0)
         });
-        let marker = get(data::ORIGIN_FORMAT_NAME, 256)
-            .ok()
-            .flatten()
-            .is_some_and(|b| data::marker_is_ours(&b));
+        let marker = matches!(intent, ClipboardReadIntent::Automatic(_))
+            && get(data::ORIGIN_FORMAT_NAME, 256)
+                .ok()
+                .flatten()
+                .is_some_and(|b| data::marker_is_ours(&b));
         let formats = data::ClipboardFormats {
             names: entries.iter().map(|(_, n)| n.clone()).collect(),
             history_allowed: history,
             own_marker: marker,
         };
         let mut raw = data::RawClipboardData::default();
-        let kind = data::classify_automatic(&formats, None);
-        if kind == data::ClipboardKind::Image && request.snapshot.allows_images(request.sequence) {
+        let kind = requested_payload(&formats, &intent);
+        if kind == data::ClipboardKind::Image {
             // Copy only bounded bytes. Interpretation, URL parsing and decoding follow CloseClipboard.
             for (name, target) in [
                 ("PNG", &mut raw.png),
@@ -389,6 +488,11 @@ fn read_opened(request: &ReadRequest) -> Result<Observation, String> {
                     Err(error) => origin_warnings.push(error),
                 }
             }
+        }
+        // SourceURL is parsed only after CloseClipboard. Image+HTML always
+        // stays on the image route, even when image monitoring is disabled.
+        if kind == data::ClipboardKind::Html {
+            raw.html = get("HTML Format", data::MAX_HTML_BYTES)?;
         }
         Ok(ObservedContent::Read(formats, raw))
     })();
@@ -586,6 +690,31 @@ fn reader(
                                     state.generation.load(Ordering::Acquire),
                                     AcceptedContent::Other,
                                 );
+                                if !state.selection_open.load(Ordering::Acquire)
+                                    && request.html_epoch
+                                        == state.html_epoch.load(Ordering::Acquire)
+                                    && request.allows_html()
+                                    && let Some(bytes) = raw.html.as_deref()
+                                    && let Ok(html) = html::parse_cf_html(bytes)
+                                    && !html.candidates.is_empty()
+                                    && state.still_latest(&request)
+                                    && !state.selection_open.load(Ordering::Acquire)
+                                    && request.html_epoch
+                                        == state.html_epoch.load(Ordering::Acquire)
+                                {
+                                    let snapshot = SelectionSnapshot::new(
+                                        html,
+                                        CaptureIntent::Automatic {
+                                            snapshot: request.snapshot.clone(),
+                                        },
+                                        request.html_epoch,
+                                    );
+                                    popup.show(
+                                        request.snapshot.generation,
+                                        request.snapshot.dark,
+                                        popup::PopupContent::Html(snapshot),
+                                    );
+                                }
                             }
                         }
                         Ok(ObservedContent::Skipped) => {
@@ -629,11 +758,15 @@ impl CaptureRuntime {
     pub(super) fn start(
         snapshot: Arc<CaptureSnapshot>,
         generation: Arc<AtomicU64>,
+        selection_open: Arc<AtomicBool>,
+        html_epoch: Arc<AtomicU64>,
         events: mpsc::Sender<CaptureEvent>,
         repaint: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
         let popup = Arc::new(popup::PopupRuntime::start(
             generation.clone(),
+            selection_open.clone(),
+            html_epoch.clone(),
             events.clone(),
             repaint.clone(),
         )?);
@@ -641,6 +774,8 @@ impl CaptureRuntime {
         let state = Arc::new(Shared {
             snapshot: Mutex::new(snapshot),
             generation,
+            selection_open,
+            html_epoch,
             latest: Mutex::new(None),
             serial: AtomicU64::new(0),
             stop: AtomicBool::new(false),
@@ -748,6 +883,19 @@ impl CaptureRuntime {
         self.state.update_snapshot(snapshot);
     }
 
+    pub(super) fn hide_popup(&self) {
+        self.popup.hide();
+    }
+
+    pub(super) fn resolve_selection(
+        &self,
+        generation: u64,
+        token: u64,
+        response: popup::RevealResponse,
+    ) {
+        self.popup.resolve_selection(generation, token, response);
+    }
+
     pub(super) fn resolve_reveal(
         &self,
         generation: u64,
@@ -830,6 +978,8 @@ mod tests {
             )),
             notified_at: Instant::now(),
             reread: false,
+            html_detection_allowed: true,
+            html_epoch: 0,
         }
     }
 
@@ -840,6 +990,8 @@ mod tests {
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(request.snapshot.clone()),
             generation: Arc::new(AtomicU64::new(1)),
+            selection_open: Arc::new(AtomicBool::new(false)),
+            html_epoch: Arc::new(AtomicU64::new(0)),
             latest: Mutex::new(None),
             serial: AtomicU64::new(1),
             stop: AtomicBool::new(false),
@@ -898,6 +1050,98 @@ mod tests {
                 .store(snapshot.generation, Ordering::Release);
             shared.update_snapshot(snapshot);
         });
+    }
+
+    #[test]
+    fn listener_captures_dialog_admission_without_disabling_automatic_images() {
+        let mut request = read_request(11);
+        Arc::make_mut(&mut request.snapshot).config.html = true;
+        let (wake, _) = mpsc::sync_channel(1);
+        let (events, _) = mpsc::channel();
+        let state = Shared {
+            snapshot: Mutex::new(request.snapshot),
+            generation: Arc::new(AtomicU64::new(1)),
+            selection_open: Arc::new(AtomicBool::new(true)),
+            html_epoch: Arc::new(AtomicU64::new(1)),
+            latest: Mutex::new(None),
+            serial: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            hwnd: AtomicIsize::new(0),
+            wake,
+            events,
+            repaint: Arc::new(|| {}),
+        };
+        state.notify(11);
+        state.selection_open.store(false, Ordering::Release);
+        let captured = state.take_latest().unwrap();
+        assert_eq!(captured.html_epoch, 1);
+        assert!(!captured.allows_html());
+        assert!(captured.snapshot.allows_images(11));
+        assert!(ReaderState::default().should_read(&captured, 1));
+    }
+
+    #[test]
+    fn raw_payload_owner_preserves_manual_exclusion_bypass_and_automatic_image_precedence() {
+        let mut request = read_request(11);
+        Arc::make_mut(&mut request.snapshot).config.html = true;
+        for names in [
+            vec!["PNG", "ExcludeClipboardContentFromMonitorProcessing"],
+            vec!["PNG", "Object Descriptor"],
+            vec!["PNG", data::ORIGIN_FORMAT_NAME],
+        ] {
+            let formats = data::ClipboardFormats {
+                names: names.into_iter().map(str::to_owned).collect(),
+                own_marker: true,
+                history_allowed: Some(false),
+            };
+            assert_eq!(
+                requested_payload(&formats, &ClipboardReadIntent::Automatic(&request)),
+                data::ClipboardKind::Other
+            );
+            assert_eq!(
+                requested_payload(
+                    &formats,
+                    &ClipboardReadIntent::Manual(data::ClipboardKind::Image)
+                ),
+                data::ClipboardKind::Image
+            );
+        }
+        let mixed = data::ClipboardFormats {
+            names: vec!["PNG".into(), "HTML Format".into()],
+            ..Default::default()
+        };
+        Arc::make_mut(&mut request.snapshot).config.images = false;
+        assert_eq!(
+            requested_payload(&mixed, &ClipboardReadIntent::Automatic(&request)),
+            data::ClipboardKind::Other
+        );
+        assert_eq!(
+            requested_payload(
+                &mixed,
+                &ClipboardReadIntent::Manual(data::ClipboardKind::Html)
+            ),
+            data::ClipboardKind::Other
+        );
+        let html = data::ClipboardFormats {
+            names: vec!["HTML Format".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            requested_payload(&html, &ClipboardReadIntent::Automatic(&request)),
+            data::ClipboardKind::Html
+        );
+        request.html_detection_allowed = false;
+        assert_eq!(
+            requested_payload(&html, &ClipboardReadIntent::Automatic(&request)),
+            data::ClipboardKind::Other
+        );
+        assert_eq!(
+            requested_payload(
+                &html,
+                &ClipboardReadIntent::Manual(data::ClipboardKind::Html)
+            ),
+            data::ClipboardKind::Html
+        );
     }
 
     #[test]

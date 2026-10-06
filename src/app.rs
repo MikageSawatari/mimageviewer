@@ -39,6 +39,32 @@ mod clipboard_capture_admission_tests {
     use super::clipboard_capture_reveal_admitted;
 
     #[test]
+    fn clipboard_idle_polling_with_both_monitors_enabled_does_not_request_repaint() {
+        let mut app = super::tests::phase_c_support::setup_app();
+        app.settings.clipboard_capture_image_enabled = true;
+        app.settings.clipboard_capture_html_enabled = true;
+        let ctx = egui::Context::default();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        ctx.set_request_repaint_callback(move |info| received.lock().unwrap().push(info));
+        // Model a quiet notification stream without reading the real clipboard.
+        // Consume egui's initial settling repaint before checking the UI drains.
+        let _ = ctx.run(Default::default(), |_| {});
+        requests.lock().unwrap().clear();
+        for _ in 0..40 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                app.poll_clipboard_capture_with_activation(ctx, |_, _| {
+                    panic!("idle monitoring activated main")
+                });
+                app.poll_capture_selection(ctx);
+                app.show_capture_selection_dialog(ctx);
+            });
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(!app.capture_selection_open());
+    }
+
+    #[test]
     fn saved_reveal_requires_list_and_all_admission_conditions() {
         for list in [false, true] {
             for modal in [false, true] {
@@ -153,6 +179,202 @@ mod clipboard_capture_admission_tests {
         assert!(app.folder_pane_open_pending.is_some());
         assert_eq!(app.select_after_load.as_deref(), Some("saved.png"));
         assert!(app.fs_feedback_toast.is_none());
+    }
+
+    #[test]
+    fn clipboard_manual_handler_routes_formats_without_monitor_suppression() {
+        use crate::clipboard_capture::data::{ClipboardFormats, ClipboardKind, classify_manual};
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("paste");
+        std::fs::create_dir(&folder).unwrap();
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        app.main_hwnd = Some(1);
+        for (names, expected) in [
+            (vec!["CF_HDROP", "PNG", "HTML Format"], ClipboardKind::Files),
+            (vec!["FileGroupDescriptorW", "PNG"], ClipboardKind::Files),
+            (
+                vec!["Shell IDList Array", "HTML Format"],
+                ClipboardKind::Files,
+            ),
+            (
+                vec![
+                    "PNG",
+                    "HTML Format",
+                    "Embed Source",
+                    "Clipboard Viewer Ignore",
+                ],
+                ClipboardKind::Image,
+            ),
+            (
+                vec!["CF_DIB", "mImageViewer Clipboard Origin v1"],
+                ClipboardKind::Image,
+            ),
+            (
+                vec![
+                    "HTML Format",
+                    "ExcludeClipboardContentFromMonitorProcessing",
+                ],
+                ClipboardKind::Html,
+            ),
+            (vec!["CF_UNICODETEXT"], ClipboardKind::Other),
+        ] {
+            let formats = ClipboardFormats {
+                names: names.into_iter().map(str::to_owned).collect(),
+                history_allowed: Some(false),
+                own_marker: true,
+            };
+            let mut calls = 0;
+            app.handle_clipboard_paste_with(
+                &ctx,
+                || Ok(classify_manual(&formats)),
+                |_, _, kind, _, path| {
+                    assert_eq!(kind, expected);
+                    assert_eq!(path, folder);
+                    calls += 1;
+                },
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn clipboard_manual_handler_invalid_list_never_queries_clipboard_or_dispatches() {
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        app.main_hwnd = Some(1);
+        app.current_folder = Some(app.tmp.path().join("paste"));
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        for route in ["search", "tag", "no-folder", "no-hwnd"] {
+            app.items_are_global_search_view = route == "search";
+            app.items_are_tag_view = route == "tag";
+            app.current_folder = (route != "no-folder").then(|| app.tmp.path().join("paste"));
+            app.main_hwnd = (route != "no-hwnd").then_some(1);
+            app.handle_clipboard_paste_with(
+                &ctx,
+                || panic!("invalid list queried clipboard"),
+                |_, _, _, _, _| panic!("invalid list dispatched paste"),
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_manual_no_images_event_only_sets_main_toast() {
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        app.clipboard_capture_service
+            .inject_selection_event_for_test(
+                crate::clipboard_capture::SelectionEvent::ManualFailed(
+                    "取り込める画像がありません".into(),
+                ),
+            );
+        app.poll_clipboard_capture_with_activation(&ctx, |_, _| {
+            panic!("manual failure activated main")
+        });
+        assert!(app.capture_selection.is_none());
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "取り込める画像がありません"
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(super::ActionSurface::MainWindow)
+        );
+    }
+
+    #[test]
+    fn clipboard_html_dialog_registers_both_modal_owners_and_blocks_second_snapshot() {
+        use crate::clipboard_capture::{
+            CaptureIntent, SelectionSnapshot, data::CaptureTimestamp, html::HtmlCapture,
+        };
+        use std::sync::Arc;
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let snapshot = Arc::new(SelectionSnapshot {
+            token: 1,
+            html_epoch: 0,
+            html: HtmlCapture {
+                page_url: "https://example.com/page".into(),
+                candidates: vec!["data:image/png;base64,AA==".into()],
+                omitted: 0,
+            },
+            intent: CaptureIntent::Manual {
+                destination: app.tmp.path().join("paste"),
+            },
+            timestamp: CaptureTimestamp {
+                stamp: "20261006-120000-000".into(),
+                month: "2026-10".into(),
+            },
+        });
+        app.handle_capture_selection(snapshot.clone(), &ctx, |_, _| {
+            panic!("manual entry activated main")
+        });
+        assert!(app.capture_selection_open());
+        assert!(app.common_modal_dialog_open());
+        assert!(app.document_open_modal_admission_blocked());
+        assert_eq!(
+            app.modal_dialog_block_reason(),
+            Some("clipboard_capture_selection")
+        );
+        assert!(!app.clipboard_capture_admission_allowed());
+        app.handle_capture_selection(snapshot, &ctx, |_, _| {
+            panic!("second snapshot activated main")
+        });
+        assert!(app.capture_selection_open());
+        app.capture_selection = None;
+        app.clipboard_capture_service.set_selection_open(false);
+        assert!(!app.common_modal_dialog_open());
+        assert!(!app.document_open_modal_admission_blocked());
+    }
+
+    #[test]
+    fn clipboard_html_automatic_event_keeps_fullscreen_and_never_activates() {
+        use crate::clipboard_capture::{
+            CaptureConfig, CaptureIntent, CaptureSnapshot, SelectionEvent, SelectionSnapshot,
+            data::CaptureTimestamp, html::HtmlCapture,
+        };
+        use std::sync::Arc;
+        let mut app = super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        app.fullscreen_idx = Some(0);
+        let snapshot = Arc::new(SelectionSnapshot {
+            token: 2,
+            html_epoch: 0,
+            html: HtmlCapture {
+                page_url: "https://example.com/page".into(),
+                candidates: vec!["https://example.com/image.png".into()],
+                omitted: 0,
+            },
+            intent: CaptureIntent::Automatic {
+                snapshot: Arc::new(CaptureSnapshot {
+                    config: CaptureConfig {
+                        images: false,
+                        html: true,
+                        destination: Some(app.tmp.path().join("capture")),
+                    },
+                    generation: 0,
+                    image_baseline: 0,
+                    html_baseline: 0,
+                    image_enable_count: 0,
+                    dark: false,
+                }),
+            },
+            timestamp: CaptureTimestamp {
+                stamp: "20261006-120000-000".into(),
+                month: "2026-10".into(),
+            },
+        });
+        app.clipboard_capture_service
+            .inject_selection_event_for_test(SelectionEvent::OpenCaptureSelection(snapshot));
+        app.poll_clipboard_capture_with_activation(&ctx, |_, _| {
+            panic!("rejected HTML foregrounded main")
+        });
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.capture_selection.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.folder_pane_open_pending.is_none());
     }
 }
 
@@ -17115,6 +17337,8 @@ pub struct App {
     /// normalized path snapshot; OS listener/reader ownership stays outside every bundle.
     pub(crate) cut_clipboard: crate::cut_clipboard::CutClipboardObserver,
     pub(crate) clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService,
+    pub(crate) capture_fetch_service: Option<crate::clipboard_capture::fetch::CaptureFetchService>,
+    pub(crate) capture_selection: Option<crate::ui_dialogs::clipboard_capture::CaptureSelection>,
     /// 2 重起動されたプロセスが Named Pipe で送ってきた「開くパス」を UI スレッドへ
     /// 渡すための channel。listener thread は App を直接触らず、ここへ積むだけにする。
     #[cfg(windows)]
@@ -17292,6 +17516,34 @@ impl App {
         for path in self.clipboard_capture_service.poll() {
             self.handle_clipboard_capture_reveal(path, ctx, &mut activate);
         }
+        for event in self.clipboard_capture_service.poll_selection() {
+            use crate::clipboard_capture::SelectionEvent;
+            match event {
+                SelectionEvent::OpenCaptureSelection(snapshot) => {
+                    self.handle_capture_selection(snapshot, ctx, &mut activate);
+                }
+                SelectionEvent::ManualSaved { metadata_error, .. } => {
+                    let text = metadata_error.map_or_else(
+                        || "1 枚保存しました".to_owned(),
+                        |error| format!("1 枚保存しました: {error}"),
+                    );
+                    self.show_feedback_toast_on(text, ActionSurface::MainWindow);
+                }
+                SelectionEvent::ManualFailed(error) => {
+                    self.show_feedback_toast_on(error, ActionSurface::MainWindow)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clipboard_capture_admission_allowed(&self) -> bool {
+        clipboard_capture_reveal_admitted(
+            self.fullscreen_idx.is_none()
+                && !self.current_viewer_session_is_detached_or_switching(),
+            self.common_modal_dialog_open() || self.document_open_modal_admission_blocked(),
+            self.remote_session_blocks_local_control(),
+            self.clipboard_capture_navigation_preparing(),
+        )
     }
 
     fn activate_clipboard_capture_main(&mut self, ctx: &egui::Context) {
@@ -19139,6 +19391,18 @@ impl App {
             activation_listener: None,
             cut_clipboard: crate::cut_clipboard::CutClipboardObserver::default(),
             clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService::default(),
+            capture_fetch_service: {
+                #[cfg(not(test))]
+                {
+                    crate::clipboard_capture::fetch::CaptureFetchService::new(crate::data_dir::get())
+                    .map_err(|error| crate::logger::log(format!("clipboard_capture: {error}"))).ok()
+                }
+                #[cfg(test)]
+                {
+                    None
+                }
+            },
+            capture_selection: None,
             #[cfg(windows)]
             activation_open_path_tx,
             #[cfg(windows)]
@@ -20433,6 +20697,7 @@ impl App {
             };
         }
         first![
+            self.capture_selection_open() => "clipboard_capture_selection",
             self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
             self.remote_connection_dialog_open() => "remote_connection",
@@ -34004,7 +34269,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.epub_convert_pending_in_any_context()
+        self.capture_selection_open()
+            || self.epub_convert_pending_in_any_context()
             || self.pdf_password_request_pending_in_any_context()
             || self.smart_pdf_password_dialog_path().is_some()
             || self.epub_batch_convert.is_some()
@@ -51567,33 +51833,80 @@ impl App {
         }
 
         if ctrl_v {
-            // 検索結果グリッド表示中はペースト無効 (D&D と同じ判定。検索前の実フォルダへ
-            // 誤って貼り付けない)。検索から実フォルダを開いた後は有効に戻る。
-            let on_search_results = self.items_are_global_search_view
-                || self.favsearch.on_results_grid()
-                || self.items_are_tag_view
-                || self.tag_view.on_results_grid();
-            if !on_search_results
-                && let (Some(hwnd), Some(folder)) = (self.main_hwnd, self.current_favorite_target())
-            {
-                // Shell が何を作るか (衝突時の改名を含めて) はこちらには分からないので、
-                // 呼ぶ**前**に今の一覧を控えて差分で拾う。
-                self.request_post_operation_selection_for_added_items(folder.clone());
-                let result = crate::native_context_menu::invoke_shell_folder_background_verb(
-                    hwnd,
-                    &folder,
-                    crate::native_context_menu::ShellClipboardVerb::Paste,
-                );
-                Self::resync_egui_modifiers_from_os(ctx);
-                match result {
-                    Ok(()) => ctx.request_repaint(),
-                    Err(err) => {
-                        crate::logger::log(format!("shell_clipboard: Paste failed: {err}"));
-                        // 貼り付けは起きなかった。控えた差分要求もここで捨てる (R-08)。
-                        self.cancel_post_operation_selection("shell_paste_failed");
+            self.handle_clipboard_paste_with(
+                ctx,
+                crate::clipboard_capture::manual_kind,
+                |app, ctx, kind, hwnd, folder| {
+                    match kind {
+                        crate::clipboard_capture::data::ClipboardKind::Image
+                        | crate::clipboard_capture::data::ClipboardKind::Html => {
+                            if !app.clipboard_capture_admission_allowed() {
+                                app.show_feedback_toast_on(
+                                    "一覧画面で Ctrl+V を押すと開けます".into(),
+                                    ActionSurface::MainWindow,
+                                );
+                                return;
+                            }
+                            if let Err(error) = app
+                                .clipboard_capture_service
+                                .manual_capture(kind, folder, ctx)
+                            {
+                                app.show_feedback_toast_on(error, ActionSurface::MainWindow);
+                            }
+                        }
+                        _ => {
+                            // Keep the Shell's existing added-item selection behavior.
+                            app.request_post_operation_selection_for_added_items(folder.clone());
+                            let result =
+                                crate::native_context_menu::invoke_shell_folder_background_verb(
+                                    hwnd,
+                                    &folder,
+                                    crate::native_context_menu::ShellClipboardVerb::Paste,
+                                );
+                            Self::resync_egui_modifiers_from_os(ctx);
+                            match result {
+                                Ok(()) => ctx.request_repaint(),
+                                Err(error) => {
+                                    crate::logger::log(format!(
+                                        "shell_clipboard: Paste failed: {error}"
+                                    ));
+                                    app.cancel_post_operation_selection("shell_paste_failed");
+                                }
+                            }
+                        }
                     }
-                }
-            }
+                },
+            );
+        }
+    }
+
+    /// The fixed Ctrl+V entry shares the Shell paste's existing list admission.
+    /// Query availability only after admission; bytes are copied by the worker.
+    fn handle_clipboard_paste_with(
+        &mut self,
+        ctx: &egui::Context,
+        query: impl FnOnce() -> Result<crate::clipboard_capture::data::ClipboardKind, String>,
+        execute: impl FnOnce(
+            &mut Self,
+            &egui::Context,
+            crate::clipboard_capture::data::ClipboardKind,
+            isize,
+            PathBuf,
+        ),
+    ) {
+        let on_search_results = self.items_are_global_search_view
+            || self.favsearch.on_results_grid()
+            || self.items_are_tag_view
+            || self.tag_view.on_results_grid();
+        if on_search_results {
+            return;
+        }
+        let (Some(hwnd), Some(folder)) = (self.main_hwnd, self.current_favorite_target()) else {
+            return;
+        };
+        match query() {
+            Ok(kind) => execute(self, ctx, kind, hwnd, folder),
+            Err(error) => self.show_feedback_toast_on(error, ActionSurface::MainWindow),
         }
     }
 
@@ -87493,6 +87806,7 @@ impl eframe::App for App {
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
         self.poll_clipboard_capture(ctx);
+        self.poll_capture_selection(ctx);
         // Retired asset requests must cancel even when presentation returns early.
         self.prune_current_view_pin_refreshes();
         // Collection startup/revision/worker responses must likewise progress even when
@@ -87514,6 +87828,7 @@ impl eframe::App for App {
         self.update_frame(ctx, frame);
         #[cfg(windows)]
         self.sync_clipboard_capture(ctx);
+        self.show_capture_selection_dialog(ctx);
         // Dedicated viewer viewports draw their mounted owner's dialog in their callback.
         // Root and embedded presentations draw here; parked contexts are not serviced.
         if self.fullscreen_idx.is_none()
