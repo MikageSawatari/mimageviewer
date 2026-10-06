@@ -333,7 +333,11 @@ impl App {
         let parent_restore = self
             .current_folder
             .as_deref()
-            .filter(|path| crate::folder_tree::is_open_as_container(path))
+            .filter(|path| {
+                crate::folder_tree::is_open_as_container(path)
+                    || (self.settings.auto_fullscreen_image_folders_enabled()
+                        && self.items_are_image_only_folder_pages())
+            })
             .and_then(|_| self.restorable_current_main_list())
             .and_then(|current| {
                 let StartupListTarget::PhysicalList { logical_path, .. } = current else {

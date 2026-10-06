@@ -3354,3 +3354,180 @@ fn section1335_tray_smart_book_with_matching_physical_parent_keeps_book_list_and
         Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == synthetic
     ));
 }
+
+#[cfg(windows)]
+fn open_selected_image_folder_book(app: &mut App, book: &Path) {
+    let Some(crate::ui_main::AddressBarNav::Direct(path, intent)) =
+        app.handle_gamepad_grid_accept(&egui::Context::default())
+    else {
+        panic!("an ordinary image Folder uses accepted main-grid direct navigation");
+    };
+    assert_eq!(path, book);
+    assert_eq!(intent, StartupListIntent::ClassifyFolder);
+    assert!(app.pending_auto_fs_open);
+    // Match App::update's Folder dispatch and its existing completed-scan book classifier.
+    app.open_direct_navigation_target(path, None, OpenRequestOwner::Navigation, None, None, intent);
+    settle_book(app);
+    assert_eq!(app.current_folder.as_deref(), Some(book));
+    assert!(app.fullscreen_idx.is_some());
+    assert!(app.items_are_image_only_folder_pages());
+    assert!(app.auto_open_for_current_container());
+}
+
+#[cfg(windows)]
+fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
+    let mut env = phase_c_support::setup_app();
+    let parent = env.tmp.path().join("image-folder-parent");
+    let book = parent.join("book");
+    std::fs::create_dir_all(&book).unwrap();
+    for index in 0..12 {
+        std::fs::create_dir_all(parent.join(format!("before-{index:02}"))).unwrap();
+    }
+    for name in ["a.png", "b.png"] {
+        std::fs::write(book.join(name), png_bytes()).unwrap();
+    }
+    // Keep this outside book_root so a genuine image-only folder scan decides book status.
+    assert!(!crate::books::is_direct_book_folder(
+        &env.book_root_path(),
+        &book
+    ));
+    env.settings.startup_folder_mode = crate::settings::StartupFolderMode::Previous;
+    env.settings.restore_last_cursor = true;
+    env.settings.auto_fullscreen_zip_pdf = true;
+    env.settings.auto_fullscreen_image_folders = true;
+    env.settings.book_open_resume = crate::settings::ResumeMode::Resume;
+    env.settings.detached_viewer_open_images_in_window = false;
+    env.settings.video_in_window_mode = false;
+    env.settings.sort_order = crate::settings::SortOrder::FileName;
+    env.load_folder(parent.clone());
+    let index = env
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Folder(path) if path == &book))
+        .unwrap();
+    assert_eq!(index, 12);
+    env.last_grid_cols = 3;
+    env.last_cell_h = 40.0;
+    env.scroll_offset_y = 80.0;
+    env.selected = Some(index);
+    open_selected_image_folder_book(&mut env, &book);
+    assert_eq!(
+        restore_cursor(&env),
+        Some(&ListCursorHint {
+            name: "book".into(),
+            rows_above: Some(2),
+        })
+    );
+    env.open_fullscreen(1, HistoryTrigger::UserChosen);
+    assert_eq!(env.items[env.fullscreen_idx.unwrap()].name(), "b.png");
+    assert_physical(&env, &parent, None);
+    (env, parent, book)
+}
+
+#[cfg(windows)]
+fn backspace_image_folder_book_to_list(app: &mut App, book: &Path) {
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::Backspace)],
+        ..Default::default()
+    });
+    assert!(app.handle_fullscreen_root_key_input(&ctx));
+    let _ = ctx.end_pass();
+    assert!(app.fullscreen_idx.is_none());
+    assert_eq!(app.current_folder.as_deref(), Some(book));
+    assert_physical(app, book, None);
+    assert_eq!(app.items[app.selected.unwrap()].name(), "b.png");
+    app.capture_main_list_restore_cursor();
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_image_folder_book_direct_hide_restore_preserves_parent_cursor_and_resume() {
+    for restore_last_cursor in [true, false] {
+        let (mut env, parent, book) = direct_tray_image_folder_book_env();
+        env.settings.restore_last_cursor = restore_last_cursor;
+        let before = env.settings.startup_list_restore.clone();
+        close_root_to_tray(&mut env);
+        settle_book(&mut env);
+        assert!(env.fullscreen_idx.is_none());
+        assert_eq!(env.current_folder.as_ref(), Some(&parent));
+        assert_eq!(env.items[env.selected.unwrap()].name(), "book");
+        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.settings.startup_list_restore, before);
+        assert_eq!(
+            crate::settings::Settings::load().startup_list_restore,
+            before
+        );
+        let generation = env.items_generation;
+        env.sync_after_restore(&egui::Context::default());
+        assert!(env.window_visible);
+        assert_eq!(env.current_folder.as_ref(), Some(&parent));
+        assert_eq!(env.items_generation, generation);
+        assert_eq!(env.items[env.selected.unwrap()].name(), "book");
+        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.settings.startup_list_restore, before);
+        open_selected_image_folder_book(&mut env, &book);
+        assert_eq!(env.fullscreen_idx, Some(1));
+        assert_eq!(env.settings.startup_list_restore, before);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_image_folder_book_backspace_hide_restore_keeps_explicit_book_list() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for restore_last_cursor in [true, false] {
+        let (mut env, _, book) = direct_tray_image_folder_book_env();
+        env.settings.restore_last_cursor = restore_last_cursor;
+        backspace_image_folder_book_to_list(&mut env, &book);
+        let before = env.settings.startup_list_restore.clone();
+        assert!(
+            env.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert_eq!(env.fullscreen_idx, Some(1));
+        close_root_to_tray(&mut env);
+        env.sync_after_restore(&egui::Context::default());
+        assert!(env.window_visible);
+        assert!(env.fullscreen_idx.is_none());
+        assert_eq!(env.current_folder.as_ref(), Some(&book));
+        assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
+        assert_eq!(env.settings.startup_list_restore, before);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_image_folder_book_direct_quit_restarts_parent_and_preserves_resume() {
+    let (mut env, parent, book) = direct_tray_image_folder_book_env();
+    let before = env.settings.startup_list_restore.clone();
+    // Exercise ordinary process exit independently of tray's close handler.
+    restart_previous(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.items[env.selected.unwrap()].name(), "book");
+    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.settings.startup_list_restore, before);
+    open_selected_image_folder_book(&mut env, &book);
+    assert_eq!(env.fullscreen_idx, Some(1));
+    assert_eq!(env.settings.startup_list_restore, before);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_image_folder_book_backspace_quit_restarts_explicit_book_list() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let (mut env, _, book) = direct_tray_image_folder_book_env();
+    backspace_image_folder_book_to_list(&mut env, &book);
+    let before = env.settings.startup_list_restore.clone();
+    assert!(
+        env.handle_gamepad_grid_accept(&egui::Context::default())
+            .is_none()
+    );
+    assert_eq!(env.fullscreen_idx, Some(1));
+    restart_previous(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
+    assert_eq!(env.settings.startup_list_restore, before);
+}
