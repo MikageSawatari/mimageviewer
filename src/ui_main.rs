@@ -15615,6 +15615,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if !self.grid_item_input_allowed() {
             return None;
         }
+        #[cfg(feature = "test-script")]
+        if ctx.viewport_id() == egui::ViewportId::ROOT {
+            crate::test_script::register_clickable_widget(
+                &format!(
+                    "grid-row:{}:{}:{}",
+                    self.items_generation,
+                    idx,
+                    self.items[idx].name()
+                ),
+                &response,
+            );
+        }
         self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
         let (
             time_since_last_click,
@@ -18805,6 +18817,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
+
+                        // Reveal a virtualized diagnostic pointer target through the existing
+                        // ScrollArea/readback owner. Selection and activation remain cell clicks.
+                        #[cfg(feature = "test-script")]
+                        if let Some((generation, index, name)) = crate::test_script::requested_grid_row(ui.ctx())
+                            && generation == self.items_generation
+                            && self.items.get(index).is_some_and(|item| item.name() == name)
+                            && let Some(position) = self.visible_indices.iter().position(|visible| *visible == index)
+                        {
+                            let rect = egui::Rect::from_min_size(
+                                content_rect.min + egui::vec2(
+                                    (position % cols) as f32 * cell_w,
+                                    (position / cols) as f32 * cell_h,
+                                ),
+                                egui::vec2(cell_w, cell_h),
+                            );
+                            if !ui.clip_rect().contains(rect.center()) {
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                            }
+                        }
 
                         #[cfg(feature = "test-script")]
                         {

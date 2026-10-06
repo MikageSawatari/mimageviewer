@@ -979,6 +979,7 @@ if ($script:archiveErrors.Count -gt 0) {
             auto_fullscreen_zip_pdf = $false
             sort_order = 'FileName'
             grid_view_mode = 'Thumbnail'
+            grid_open_selected_item_on_click = $false
             grid_cols = 3
             thumb_aspect_auto = $false
             thumb_aspect = 'Square'

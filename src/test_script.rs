@@ -1464,6 +1464,7 @@ enum UiCommand {
     SmokeAction(UiSmokeAction),
     ClickWidget {
         label: String,
+        kind: WidgetClickKind,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     SortPopupPointer {
@@ -1526,6 +1527,15 @@ pub(crate) fn seeded_collection_smoke_id() -> crate::collection_store::Collectio
 enum WidgetClickPhase {
     Down,
     Up,
+    DoubleDown,
+    DoubleUp,
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WidgetClickKind {
+    Single,
+    Double,
     Hover,
 }
 
@@ -1537,7 +1547,7 @@ enum SortPopupPointerKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WidgetPointerRequestKind {
-    ClickEnabled,
+    ClickEnabled(WidgetClickKind),
     SortPopup(SortPopupPointerKind),
 }
 
@@ -1564,11 +1574,37 @@ thread_local! {
         RefCell::new(WidgetClickDriver::default());
 }
 
+#[cfg(test)]
 fn request_widget_click(
     label: String,
     reply: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
-    request_widget_pointer(label, WidgetPointerRequestKind::ClickEnabled, reply)
+    request_widget_pointer(
+        label,
+        WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Single),
+        reply,
+    )
+}
+
+/// Only a current ROOT request can reveal its exact generation/index/name in the grid.
+/// This scrolls a pending pointer target, never changes selection or opens an item.
+pub(crate) fn requested_grid_row(ctx: &egui::Context) -> Option<(u64, usize, String)> {
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return None;
+    }
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        let request = driver.requested.as_ref()?;
+        if !matches!(request.kind, WidgetPointerRequestKind::ClickEnabled(_)) {
+            return None;
+        }
+        let mut parts = request.label.strip_prefix("grid-row:")?.splitn(3, ':');
+        Some((
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.to_owned(),
+        ))
+    })
 }
 
 fn request_widget_pointer(
@@ -1592,7 +1628,8 @@ pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) 
     WIDGET_CLICK_DRIVER.with(|driver| {
         let mut driver = driver.borrow_mut();
         if !driver.requested.as_ref().is_some_and(|request| {
-            request.label == label && request.kind == WidgetPointerRequestKind::ClickEnabled
+            request.label == label
+                && matches!(request.kind, WidgetPointerRequestKind::ClickEnabled(_))
         }) {
             return;
         }
@@ -1605,11 +1642,20 @@ pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) 
         }
         let point = response.rect.center();
         let request = driver.requested.take().expect("matching request exists");
+        let phase = match request.kind {
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Single) => {
+                WidgetClickPhase::Down
+            }
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Double) => {
+                WidgetClickPhase::DoubleDown
+            }
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Hover) => {
+                WidgetClickPhase::Hover
+            }
+            _ => unreachable!("matched enabled widget pointer request"),
+        };
         if request.reply.send(Ok(())).is_ok() {
-            driver.active = Some(WidgetClick {
-                point,
-                phase: WidgetClickPhase::Down,
-            });
+            driver.active = Some(WidgetClick { point, phase });
         }
     });
 }
@@ -1682,7 +1728,10 @@ pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
             return;
         };
         let point = click.point;
-        let pressed = matches!(click.phase, WidgetClickPhase::Down);
+        let pressed = matches!(
+            click.phase,
+            WidgetClickPhase::Down | WidgetClickPhase::DoubleDown
+        );
         input.events.push(egui::Event::PointerMoved(point));
         if !matches!(click.phase, WidgetClickPhase::Hover) {
             input.events.push(egui::Event::PointerButton {
@@ -1694,6 +1743,8 @@ pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
         }
         match click.phase {
             WidgetClickPhase::Down => click.phase = WidgetClickPhase::Up,
+            WidgetClickPhase::DoubleDown => click.phase = WidgetClickPhase::DoubleUp,
+            WidgetClickPhase::DoubleUp => click.phase = WidgetClickPhase::Down,
             WidgetClickPhase::Up | WidgetClickPhase::Hover => driver.active = None,
         }
     });
@@ -2953,36 +3004,43 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             }
         },
     );
-    let click_widget_bridge = bridge.clone();
-    engine.register_fn(
-        "click_widget",
-        move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let (reply, received) = mpsc::sync_channel(1);
-            click_widget_bridge
-                .send(UiCommand::ClickWidget {
-                    label: label.to_string(),
-                    reply,
-                })
-                .map_err(rhai_error)?;
-            let started = Instant::now();
-            loop {
-                click_widget_bridge.interrupt.check().map_err(rhai_error)?;
-                if started.elapsed() >= Duration::from_secs(30) {
-                    return Err(rhai_error(format!(
-                        "click_widget timed out waiting for visible widget: {label}"
-                    )));
-                }
-                match received.recv_timeout(WAIT_POLL_INTERVAL) {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(message)) => return Err(rhai_error(message)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(rhai_error("widget click acknowledgement disconnected"));
+    for (name, kind) in [
+        ("click_widget", WidgetClickKind::Single),
+        ("double_click_widget", WidgetClickKind::Double),
+        ("hover_widget", WidgetClickKind::Hover),
+    ] {
+        let click_widget_bridge = bridge.clone();
+        engine.register_fn(
+            name,
+            move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                let (reply, received) = mpsc::sync_channel(1);
+                click_widget_bridge
+                    .send(UiCommand::ClickWidget {
+                        label: label.to_string(),
+                        kind,
+                        reply,
+                    })
+                    .map_err(rhai_error)?;
+                let started = Instant::now();
+                loop {
+                    click_widget_bridge.interrupt.check().map_err(rhai_error)?;
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        return Err(rhai_error(format!(
+                            "click_widget timed out waiting for visible widget: {label}"
+                        )));
+                    }
+                    match received.recv_timeout(WAIT_POLL_INTERVAL) {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(message)) => return Err(rhai_error(message)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(rhai_error("widget click acknowledgement disconnected"));
+                        }
                     }
                 }
-            }
-        },
-    );
+            },
+        );
+    }
     for (name, kind) in [
         ("hover_sort_row", SortPopupPointerKind::Hover),
         ("click_sort_row", SortPopupPointerKind::Click),
@@ -5041,10 +5099,14 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
                     runtime.smoke_actions.push_back(action);
                 }
             }
-            UiCommand::ClickWidget { label, reply } => {
+            UiCommand::ClickWidget { label, kind, reply } => {
                 if runtime.finish.is_some() {
                     let _ = reply.send(Err("script is already finishing".to_string()));
-                } else if let Err(message) = request_widget_click(label, reply.clone()) {
+                } else if let Err(message) = request_widget_pointer(
+                    label,
+                    WidgetPointerRequestKind::ClickEnabled(kind),
+                    reply.clone(),
+                ) {
                     let _ = reply.send(Err(message));
                 } else {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -5650,6 +5712,88 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn widget_pointer_double_click_and_hover_work_without_focus() {
+        for kind in [
+            super::WidgetClickKind::Double,
+            super::WidgetClickKind::Hover,
+        ] {
+            let (reply, received) = std::sync::mpsc::sync_channel(1);
+            super::request_widget_pointer(
+                "row".into(),
+                super::WidgetPointerRequestKind::ClickEnabled(kind),
+                reply,
+            )
+            .unwrap();
+            let ctx = egui::Context::default();
+            let render = |time, inject| {
+                let mut input = egui::RawInput {
+                    time: Some(time),
+                    focused: false,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                };
+                if inject {
+                    super::append_widget_click_events(&mut input);
+                }
+                ctx.begin_pass(input);
+                let mut result = (false, false);
+                egui::CentralPanel::default().show(&ctx, |ui| {
+                    let response = ui.button("row");
+                    super::register_clickable_widget("row", &response);
+                    result = (response.clicked(), response.double_clicked());
+                });
+                let _ = ctx.end_pass();
+                result
+            };
+            assert_eq!(render(0.0, false), (false, false));
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            if kind == super::WidgetClickKind::Double {
+                assert_eq!(render(0.01, true), (false, false));
+                assert_eq!(render(0.02, true), (true, false));
+                assert_eq!(render(0.03, true), (false, false));
+                assert_eq!(render(0.04, true), (true, true));
+            } else {
+                assert_eq!(render(0.01, true), (false, false));
+            }
+            assert!(!super::widget_click_in_progress());
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn grid_pointer_request_identifies_generation_index_and_name() {
+        let ctx = egui::Context::default();
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "grid-row:42:11:12-folder".into(),
+            super::WidgetPointerRequestKind::ClickEnabled(super::WidgetClickKind::Hover),
+            reply,
+        )
+        .unwrap();
+        assert_eq!(
+            super::requested_grid_row(&ctx),
+            Some((42, 11, "12-folder".into()))
+        );
+        super::WIDGET_CLICK_DRIVER.with(|driver| *driver.borrow_mut() = Default::default());
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "places-menu".into(),
+            super::WidgetPointerRequestKind::ClickEnabled(super::WidgetClickKind::Single),
+            reply,
+        )
+        .unwrap();
+        assert_eq!(super::requested_grid_row(&ctx), None);
+        super::WIDGET_CLICK_DRIVER.with(|driver| *driver.borrow_mut() = Default::default());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn rating_folder_back_scenario_compiles_with_the_registered_api() {
         let (bridge, _, _) = runner_bridge(ready_snapshot());
         build_engine(bridge)
@@ -5661,6 +5805,155 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_waits_allow_unfocused_but_reject_unadopted_snapshots() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut scope = rhai::Scope::new();
+        let mut adopted = ready_snapshot();
+        adopted.grid_surface = "Folder".into();
+        adopted.current_folder_path = r"C:\fixture\12-folder".into();
+        adopted.item_names = vec!["page-04.png".into()];
+        adopted.items_generation = 10;
+        adopted.target_registered = false;
+        adopted.focused = false;
+        let arrival = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        "Folder".to_string(),
+                        r"C:\fixture\12-folder".to_string(),
+                        vec![rhai::Dynamic::from("page-04.png")],
+                        9_i64,
+                    ),
+                )
+                .unwrap()
+        };
+        assert!(arrival(adopted.clone()));
+        for field in [
+            "startup_open_pending",
+            "is_fullscreen",
+            "popup_open",
+            "modal_open",
+            "text_input_or_pending_focus",
+            "ime_active",
+            "grid_surface",
+            "current_folder_path",
+            "item_names",
+            "items_generation",
+        ] {
+            let mut stale = adopted.clone();
+            match field {
+                "startup_open_pending" => stale.startup_open_pending = true,
+                "is_fullscreen" => stale.is_fullscreen = true,
+                "popup_open" => stale.popup_open = true,
+                "modal_open" => stale.modal_open = true,
+                "text_input_or_pending_focus" => stale.text_input_or_pending_focus = true,
+                "ime_active" => stale.ime_active = true,
+                "grid_surface" => stale.grid_surface = "Rating { stars: 3 }".into(),
+                "current_folder_path" => {
+                    stale.current_folder_path = r"C:\fixture\other-folder".into()
+                }
+                "item_names" => stale.item_names = vec!["other.png".into()],
+                "items_generation" => stale.items_generation = 9,
+                _ => unreachable!(),
+            }
+            assert!(!arrival(stale), "accepted incomplete adoption: {field}");
+        }
+        let mut unregistered = ready_snapshot();
+        unregistered.target_registered = false;
+        assert!(
+            !engine
+                .call_fn::<bool>(
+                    &mut scope,
+                    &helpers,
+                    "input_ready",
+                    (unregistered.to_rhai_map(),)
+                )
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_capture_names_and_budget_fit_the_harness() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut cases = 0;
+        let mut return_captures = 0;
+        for target in ["12-folder", "23-book.zip"] {
+            for kind in [
+                "toolbar",
+                "alt",
+                "browser",
+                "appcommand",
+                "mouse",
+                "backspace",
+            ] {
+                for roundtrip in [false, true] {
+                    if kind == "backspace" && roundtrip {
+                        continue;
+                    }
+                    cases += 1;
+                    let label = engine
+                        .call_fn::<String>(
+                            &mut rhai::Scope::new(),
+                            &helpers,
+                            "case_label",
+                            (target.to_string(), kind.to_string(), roundtrip),
+                        )
+                        .unwrap();
+                    for suffix in [
+                        "-back",
+                        "-second-back",
+                        "-before-open",
+                        "-fourth-page",
+                        "-forward-fourth-page",
+                        "-error-22",
+                    ] {
+                        let checkpoint = format!("{label}{suffix}");
+                        assert!(
+                            !checkpoint.is_empty() && checkpoint.len() <= 48,
+                            "{checkpoint}"
+                        );
+                        assert!(
+                            checkpoint
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        );
+                    }
+                    return_captures += if roundtrip { 2 } else { 1 };
+                }
+            }
+        }
+        assert_eq!((cases, return_captures), (22, 32));
+        assert!(
+            return_captures + cases <= 64,
+            "even one error capture per case must fit"
+        );
     }
 
     #[test]

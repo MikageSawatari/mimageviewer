@@ -2302,7 +2302,7 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   - 利用者は ZIP → ← の修正を確認。★3 → 実フォルダ → 画像一覧 → ← では選択を失うと報告。
     この追加報告は未解決。製品コードの追加修正は原因・red が確認できるまで保留する。
   - 採取用Suiteを追加: `ui-smoke.ps1 -Suite RatingFolderBack`。隔離した12フォルダ／3 ZIPの
-    ★3一覧を場所▼の実メニューから開き、下方の項目をEnterで開いて第4画像を選ぶ。
+    ★3一覧を場所▼の実メニューから開き、下方の項目を実セルのdouble-clickで開いて第4画像をクリックする。
     ツールバー←、Alt+Left、BrowserBack、WM_APPCOMMAND、X1、Backspaceを独立openで検査し、
     前5入口は → then ← も検査する (22ケース／32戻り観測)。選択key/name/index、一覧identity、
     実scroll offset／セル矩形／viewportと画面を残し、不一致でも残りを採取する。
@@ -2314,6 +2314,33 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
     glyph checkはexit 0。今回の実アプリの結果は未採取で、前回のfull libと混同しない。
     `prepare-portable-smoke.ps1 -TestScript` はexit 0。隔離markerとcore／remote／EPUB workerの
     manifest SHA256一致を確認。実アプリ／scenarioは起動していない。
+    coordinatorの初回run `20261006T190934152Z-160208-RatingFolderBack-b2cb5320` は
+    入力対象の登録待ちがなく、全22ケースが最初のEscapeで失敗 (exit 1、★3一覧へ未到達)。
+    scenarioで登録・focus・ROOTと各遷移の一覧種別／パス／項目名／世代の採用を待ち、
+    第4画像選択を確認してから戻るよう修正。撮影名の「.」／長さと64枚上限も修正。
+    製品の履歴／選択ownerは変更せず、選択喪失の再現結果は修正版の再実行待ち。
+    修正版の非対話確認: test-script 120成功／0失敗 (採用条件・撮影契約の追加2件を含む)、
+    fixture 5成功。normal／portable core check、fmt／glyph／PowerShell ASTは成功。
+    起動前のRhai変数生成もheadlessで実行し、libraryを保持した★一覧パス、15行／8画像を確認。
+    Rhaiの `replace` は値を返さないため、libraryのコピーへ適用する。実アプリは起動していない。
+    修正版の `prepare-portable-smoke.ps1 -TestScript` はexit 0 (VCRT runtime=4 / pe=17)。
+    隔離marker、core／remote／EPUB workerのmanifest SHA256一致、CRLFと局所差分を確認。
+    2回目run `20261006T193735951Z-178504-RatingFolderBack-9ce99859` は
+    background launchのforeground lockで `target_registered=false focused=false` のまま
+    起動時待ちがtimeout。これも選択喪失の再現ではない。必須toolbar経路はfocus不要の
+    widget pointerへ変更し、画面外セルは世代／index／名前を照合して既存scroll ownerで表示、
+    実double-clickでopenする。戻りの選択／scrollには介入しない。
+    toolbarの4ケース／6戻り観測は必須。他の18ケースは1秒以内のfocus確認ができなければ
+    `SKIPPED no-focus` とし、実行／skip／失敗数を区別する。キーguardやfocus取得処理は変更しない。
+    今回の実アプリ実行はcoordinatorへ引き継ぎ、原因確認・製品の追加修正は引き続き保留。
+    無人実行向け変更の非対話確認: test-script 122成功／0失敗 (未focusのdouble-click／hoverと
+    行identityの追加2件を含む)、fixture 5成功。normal／portable core check、fmt／glyph／
+    PowerShell AST、起動前Rhai変数生成も成功。
+    実Rhaiのケースループもwidget setupをmockしてheadless評価し、未focus時はtoolbar 4実行／
+    18 skip／0失敗になることを確認。これは実アプリの選択復元の証拠ではない。
+    今回の `prepare-portable-smoke.ps1 -TestScript` もexit 0 (core 22分48秒、VCRT runtime=4 / pe=17)。
+    新しいsource fingerprint、隔離marker、core／remote／EPUB workerのmanifest SHA256一致を確認。
+    全変更ファイルはCRLF、numstatは局所差分。実アプリは起動せず、未コミットで引き継ぐ。
   - コードの追跡: Folder の double-click / Enter は `grid_physical_navigation` → `RatingSource` →
     `start_rating_physical_open`。採用時に `commit_rating_physical_load_owner` が履歴の ★3 と
     `rating_view_nav_stack` の opened path を記録し、通常 install がその path を `current_folder` に採用する。
