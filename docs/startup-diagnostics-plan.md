@@ -1,7 +1,8 @@
 # 起動診断と起動オーバーレイの有界化 — plan A
 
-2026-10-06 / Phase 1 **設計のみ・未実装**。`c9b2d0aa8` への独立レビュー
-`target/rplanA-review.txt`（revise: P1×2 / P2×3）を反映した改訂案。
+2026-10-06 / Phase 1 **設計のみ・未実装**。`58967bb9c` への再レビュー
+`target/rplanA2-review.txt`（watchdogの所有/寿命にP2×2、他は受入れ）と、
+設計ownerの「診断の監視対象を絞る」決定を反映した改訂案。
 P1-1 は **2026-10-06 利用者決定: 旧Tantivyタグ一括移行を撤去**（§5.3）。
 他のレビュー修正は維持する。本改訂を全体の独立レビュー承認済み・実装許可済みとは扱わない。
 利用者指定: 次回 Microsoft Store 再申請に向けた plan A。
@@ -87,9 +88,11 @@ env だけの案は core entry 前の停止に記録が残らないため不採�
 
 ### 3.2 起動側は publish だけ、writer は独立
 
-- lane は固定の少数（launcher main、core main/render、Indexer init、initial navigation、metadata bootstrap）。
+- lane は固定の少数（launcher main、core main/render、Indexer init、initial navigation、metadata orchestration）。
   実行 owner が begin/end を発行し、その lane の現在 stage と stage 開始単調時刻を atomic に公開する。
   子 span へ入る前後は owner-local な固定深さ stack で親を復帰し、親 total と子 duration を二重加算しない。
+  supervisorごとのwatch登録は既存registration ID等を添えた個別timeline eventにし、
+  並行supervisorが一つのcurrent-stage laneを上書きする形にしない。watchdog対象とは別（§3.5）。
 - この current-child と local stack だけでは親 await を監視できない。§3.5 の固定 parent-watch slot を
   別に公開する。子 stage の開始・終了・親への復帰は、その slot の時計や通知済み threshold を変更しない。
 - current stage の ID と開始時刻は一つの `AtomicU64` に pack し、watchdog/UI が異なる世代の ID と時刻を組み合わせない。
@@ -99,9 +102,11 @@ env だけの案は core entry 前の停止に記録が残らないため不採�
   mutex 下で QPC 以外の OS API、format、JSON、ファイル I/O をしない。current stage は登録失敗でも先に publish する。
   journal は 1024 件 / process を上限とする。過剰時は diagnostics を欠落させ、起動を待たせない。
 - 初期navigationのtraceはrequest ID付きのhandleをそのrequestが所有する。取消時にtraceをterminalにして
-  live-stageの監視対象から外し、止まらない旧workerのlate eventで別requestのstageを上書きさせない。
+  止まらない旧workerのlate eventで別requestのstageを上書きさせない。
   初期explicitと一度のdefault fallback以外の通常navigationへstartup laneを使い回さない。
   Indexerはprocess-wide、フォルダ要求はmain-context固有とし、ログの相関もこの境界を保つ。
+  watchdogは初回dispatchだけ。Remote返却後の再dispatch/default fallbackはtimelineを残しても
+  watch slotを再利用・新設しない。Remote取得時の監視退役は§3.5の限定契約による。
 - writer は queue から固定 batch を取り、guard を解放して JSONL encode / directory 作成 / write / flush を行う。
   begin、end、watchdog event は短い buffer のまま放置せず writer 側で flush。`sync_all` は要求しない。
   disk が止まっても publisher/watchdog/UI は進める。watchdog と writer は別 thread とする。
@@ -193,56 +198,77 @@ Indexer 内部も「整理中」の一段へ丸めない。
 | inventory reset / marker complete | `src/indexer_manager.rs:274`, `:287` | 同じ worker |
 | IndexWriter / dispatcher start | `src/indexer_manager.rs:422`, `:438` → `src/fts_index.rs:406` | 同じ worker、生成後の唯一の writer は既存 dispatcher |
 | metadata runtime spawn / manager return | `src/indexer_manager.rs:446`, `:467` 前後 → `src/metadata_reconfiguration.rs:93` | startup-init worker |
-| cleanup / reconciliation / supervisor spawn / watch bootstrap | `src/metadata_reconfiguration.rs:271`, `:345`, `:349`, `:518`, `:533` | 既存 metadata worker。別 lane で begin/end、UI-ready の待ち条件にしない |
+| cleanup / reconciliation / supervisor spawn / orchestration idle | `src/metadata_reconfiguration.rs:271`, `:345`, `:349`, `:518`, `:533`, `:560` | 既存metadata worker。自身の作業begin/endだけを記録し、idleをwatch登録完了と呼ばない。timelineのみ、watchdog対象外 |
+| supervisorごとのrecursive watch登録 begin/end（Ready/Unavailable/cancel） | `src/indexer_supervisor.rs:377` 前後、既存集約判定は `src/similar_index.rs:1880` | FsWatcher::startと既存registration terminalを扱う当該supervisor。利用可能な既存registration ID/favorite IDとspan IDで相関。timelineのみ、watchdogのparent/終端通知/新しい集約ownerは足さない |
 
 timeline の観測を入れるために DB の recovery / 索引再構築仕様は変更しない。
 背景 AI / WASAPI / Susie / VST / EffeTune / tray の開始と結果は補足として区別し、
 それらが通常 UI の待ち条件であるような単一「起動中 stage」を上書きしない。
 
-### 3.5 UI heartbeat と独立した watchdog（P2-5）
+### 3.5 UI heartbeat と独立した watchdog — 監視経路の限定
 
-launcher entry / core entry に専用 watchdog を開始。250 ms 程度の timed wait で公開メモリを読み、
-**監視対象の同じ span の 5 / 15 / 30 秒**を各一回だけ非待機 enqueue する。
-UI heartbeat、spinner、短い child の完了で期限を reset しない。writer の I/O や普通の logger を呼ばない。
-5秒の warning と §5 の overlay limit は別の意味で、watchdog は App の機能状態を変更しない。
+**2026-10-06 設計owner決定（再レビューP2×2への対応）:** watchdogは診断であって正しさのownerではない。
+Remote延期/返却/再dispatchやmetadata登録のライフサイクルを診断のために新しく集約せず、
+既に単一ownerが明確な **launcher → core entry → settings → GPU/surface → first PRESENT →
+Indexer init（採用/終端まで）→ 初期targetのFIRST dispatch → normal UI ready** の起動経路だけを見る。
+この列挙は監視範囲であり、処理を直列化する指定ではない。§3.6どおりnormal UIのroot presentは
+初期target dispatchより先でよく、Indexer Pendingはnormal UI ready後も同じ採用点の終端まで監視する。
 
-**公開方法と単一 owner:** current-child lane に加え、起動時に固定 parent-watch slot を確保する。
-launcher handoff、core first-update、normal-root-present、Indexer init、初期 target の実作業
-（明示要求と一回の default fallback は別 slot）、metadata watch-bootstrap の有限集合とする。
-各 slot は run/slot ID と元の begin 時刻を持ち、実行 owner だけが watch clock を一つの AtomicU64 に publish する。
-clock は Active（有効開始時刻）/ Suspended（それまでの有効経過）/ Retired の tagged 値。
-pause 時は now − effective_start、resume 時は now − saved_elapsed を新しい effective_start とする。
-意図的待機の時間を除きつつ、親の identity と通知済み threshold を維持できる。観測用時計であり業務状態は増やさない。
-slot は run 内で再利用しない。watchdog は元の親 identity ごとの 3bit 通知 mask を自分だけで所有する。
-予定済みだが未 dispatch の slot は Suspended(0) として予約し、NotApplicable/取消/不要になった
-fallback は owner が Retired にする。present完了→次のupdateでdispatchの間に全slotが一瞬Retiredとなり、
-watchdogが先に終了することを防ぐ。予約は警告対象ではなく、業務requestの新状態を追加するものではない。
-child の ID/時刻を読む必要がある場合も一回の snapshot とし、再読ループで起動 owner を待たない。
-local stack はログの親子 duration 用にだけ残す。parent の Active clock は子へ入っても上書きしない。
-stage を親へ復帰する際にも parent begin を再発行せず、5/15/30秒を再通知しない。
+launcher entry / core entry に専用watchdogを開始。250ms程度のtimed waitで公開メモリを読み、
+同じ監視spanの **5/15/30秒を各一回**だけ非待機enqueueする。
+heartbeat/spinner/短いchild完了で期限をresetしない。writer I/O/普通のloggerを呼ばず、
+App状態、navigation、watcher readiness/barrierには作用しない。overlay期限とは別の診断である。
 
-| parent / 発行 owner | 開始・終了と意図的待機 |
+**公開方法:** current-childとは別の固定parent-watch slotを、
+launcher handoff、core first-update、normal-root-present、await-Indexer-init、
+initial-target-first-dispatchだけに限定する。metadata/fallback/再dispatch用slotは作らない。
+各slotはrun/slot IDと元のbegin時刻を持ち、実行ownerだけがAtomicU64のwatch clockをpublishする。
+clockはActive（有効開始時刻）/Suspended（意図的待機までの有効経過）/Retired。
+pause時はnow − effective_start、resume時はnow − saved_elapsedを使う。
+watchdogは元identityごとの3bit通知maskを自分だけで所有する。childへの出入り/親復帰で
+親時計や通知済みmaskをresetせず、parent beginを再発行しない。snapshot再読ループは作らない。
+
+初回dispatch前のslotはSuspended(0)で予約し、present完了→次updateのdispatch間で
+全slotが一瞬退役してwatchdogが先に終了することを防ぐ。不要/取消/Remote取得はこの予約も退役する。
+初回のwatch handleだけを当該dispatchへ渡し、slotは再利用しない。後続要求のtimeline handleには
+watch handleを付けない。新しい業務dispatch count、Remote resume state、第2coordinatorは追加しない。
+
+| watch対象 / 単一発行owner | 開始・終端 |
 | --- | --- |
-| launcher handoff / launcher main | entry → lease handoff 成功または起動失敗/終了。展開の child が切り替わっても総待ちを監視。core の画面を監督する役割は持たない |
-| first-update / core main → root update への所有権受渡し | core entry → 最初の root update が戻る、fatal または終了。run_native の begin/end は timeline に残すが、run_native 自体を生涯監視しない |
-| normal-root-present / Deferred owner | overlay 解除後の描画要求 → NormalShell の present-return、取消または終了。利用者の hide / OS minimize 中は Suspended。eframe が白フラッシュ対策で最初だけ非表示にする bootstrap は利用者 hide と区別し、初回描画の総待ちを監視する |
-| await-Indexer-init / App-global 初期化 owner | worker dispatch → 単一採用点の Ready / Unavailable（spawn失敗・disconnectを含む）または終了。通常 UI ready では退役しない。トレイ hide でも実初期化は継続するため監視を続ける |
-| initial-target-work / 同じ navigation request owner | resolver/scan dispatch → 採用/失敗/取消。Deferred の modal・Remote admission 待ちはこの実作業 span を開始しない。hold した結果の採用待ちは Suspended。普通の navigation に slot を転用しない |
-| metadata watch-bootstrap / 既存 metadata worker | bootstrap 開始 → 実 bootstrap 完了/Unavailable/shutdown。ActivityGate で意図的に待つ区間だけ Suspended。日常の全フォルダ reconciliation や常駐 supervisor の寿命は監視対象にしない |
+| launcher handoff / launcher main | entry → core spawn/lease handoff成功、起動失敗または終了。展開childが切替わっても総待ちを監視。core画面のlauncher監督はfollow-up |
+| core first-update / core main → root updateへの所有権受渡し | core entry → 最初のroot updateが戻る、fatalまたは終了。settings/App構築/GPU/surfaceをこの経路のchildとして記録・監視。run_nativeのプロセス寿命は監視しない |
+| root paint / 既存root presenter・normal-root-present owner | first PRESENTのacquire/submit/present呼出しは経路内のchild。normal-root-presentの親はoverlay解除後の通常paint要求 → NormalShellのpresent-return、fatal/取消/終了。利用者hide/OS minimizeは既存ownerの事実で意図的待機とし、restoreで同じ画面待ちを再開。白フラッシュ対策のbootstrap非表示は利用者hideと区別 |
+| await-Indexer-init / App-global初期化owner | worker dispatch → 単一採用点のReady/Unavailable（spawn失敗/disconnect含む）または終了。normalready/tray hideで実初期化の監視を止めない |
+| initial-target-first-dispatch / 初期navigation request owner | 初回のresolver/scan dispatch → 当該結果の採用/失敗/取消、Remote取得または終了。初回がdefault targetでも同じ。modal admission前は未dispatch予約であり停止扱いしない。Remote以外の既存modal-held待ちは意図的待機として扱う |
 
-hide/restore と modal admission の事実は、その既存 owner が診断 slot に公開する。watchdog が
-heartbeat の停止や HWND geometry から推測して gate を変えない。normal-root-present は実際の restore/
-unminimize イベントで resume し、modal 待ちは理由を timeline に残す。Indexer の native I/O が
-止まっている時は、画面を隠してもその clock を止めない。Active な child の native 呼出しも独立して監視する。
-root が描けない driver 停止では adapter/device/D3D11/present の最後の begin と overdue が境界を指す。
-GPU 停止の解除は保証しない。各ログには wall elapsed、有効 elapsed、現在 child、heartbeat を添える。
-childの監視も固定stage表の実startup呼出しだけを対象とし、run_native/通常フレーム/
-admissionを表す親へlaneが戻っても、それを新しいstuck stageとして監視しない。
+**Remote取得の限定契約:** startup_ops.rs:698の既存取得/取消ownerが初回dispatchのwatch spanを
+**suspended (not watched)** と記録して監視を終了する。これは再開可能なwatch clockのSuspendedではなく、
+診断上のterminal outcomeであり、slotはRetiredにする。初回dispatch前に取得された場合も予約を退役する。
+論理argvを保持して返却後に再dispatchする既存仕様（startup_ops.rs:32）はそのまま維持するが、
+返却/再dispatch/繰返し取得でwatchdogを再起動・slot再利用・新slot作成しない。
+旧workerのlate eventで退役slotを復活させない。Explicit→Defaultの一回fallbackも初回の次ならtimelineのみ。
 
-normal UI ready 後は画面到達の監視を終え、少なくとも Indexer の監視をその終端まで継続する。
-dispatch 済み初期 target と metadata bootstrap の有限実作業が残っていればそれぞれの span だけを継続し、
-ユーザー操作待ちを起動停止扱いしない。全対象の退役か process shutdown で watchdog を終了する。
-終了時も UI は watchdog/writer の無期限 join をしない。30秒以降の連打、親復帰時の再通知はしない。
+**監視しないが記録するもの:** Remote返却後の再dispatch、fallback等の後続要求と、
+metadata watch-bootstrapの各registrationはrequest/registration ID付きtimeline begin/endを残す。
+再dispatchのresolver/scanは当該request owner、FsWatcher::startの実登録とReady/Unavailable/cancelは
+当該supervisor（indexer_supervisor.rs:377）が記録する。reconfiguration workerのspawn/idle
+（metadata_reconfiguration.rs:533/:560）は自身の作業終端であり、実watch登録完了の代理ではない。
+similar_index.rs:1880の既存readiness集約には、新しい診断終端通知/parent slot/集約ownerを足さない。
+登録が止まればそのregistrationのbeginにendが無いことからログで境界を追えるが、
+5/15/30秒のoverdue通知、watchdog延命、再起動は保証しない。product側のbarrierは変更しない。
+
+watchdogのchild allowlistも上の起動経路と初回dispatchの有効watch handleだけに限定する。
+timeline laneの全current-stageを走査して、対象外の再dispatch/metadataを間接的に監視してはならない。
+GPU停止では最後のadapter/device/D3D11/present beginと対象経路のoverdueが境界を示すが、停止解除はscope外。
+run_native常駐、通常フレーム、modal/Remote操作待ち、background supervisor寿命は起動停止扱いしない。
+
+**終了条件:** launcher watchdogは自身のhandoff終端、core watchdogは自身の上記slotが全て
+Retired（NotApplicable/Remoteのsuspended-not-watchedを含むterminal outcome）になった時、
+またはprocess shutdownで終わる。
+normalreadyだけではIndexer Pendingや初回dispatchの予約/実作業を退役しない。
+一方、監視経路が終端ならRemoteの保留/再dispatchや未完了metadata登録が残っていても終了する。
+timeline writer/event publisherは必要なbegin/end記録を継続し、watchdog寿命とは連動させない。
+終了時にUIからwatchdog/writerを無期限joinせず、30秒以降の連打/親復帰時の再通知もしない。
 
 ### 3.6 first PRESENT と通常 UI ready の正本
 
@@ -462,7 +488,7 @@ Indexer Pending は全サービスの readiness ではない。Unavailable も�
 | スマートフォルダ / src/app/smart_folder.rs:2124, :3578 / smart-folder request | 独立scan/DB読取を維持。managerなし時の既存local I/O semaphoreをそのrequestのまま使い、late Readyでworkerを作り直さない。タグ条件も現tags.dbを通常どおり読む。独立条件/タグ条件のscan成功・取消、semaphore owner数、late Ready非干渉を試験 |
 | コレクション / src/ui_dialogs/collections.rs:43, :723, :1991 / collection actor + UI request | collection固有のStarting/Ready/Unavailableとread demandを維持。IndexerPendingで新しい待ちを足さない。collectionStarting中の要求保持、Indexer停止中のReady読取、late adoption非干渉を試験 |
 | Remote / src/remote_ipc/collections.rs:167, :310, :341、src/remote_ipc/ui.rs:4002 / 各service + session owner | 名前検索・タグ・collectionは各serviceの準備状態。全文索引のPendingへ一括変換せず、タグ移行理由の新Busy/wire状態も追加しない。Remote取得は既存cancel、初期explicit延期、返却時fallbackとowned wakeを保持。running-instance activationも別ownerへ新startupを作らない。サービス毎の成功/固有待ちと取得→返却→取消を試験 |
-| similar / 別バージョン索引 / src/app.rs:26123, :26893、src/metadata_reconfiguration.rs:533 / 既存watch-bootstrap owner | overlay解除/normalreadyで共有watcher barrierを閉じない。実bootstrapのready、またはIndexer終端Unavailable/disconnectの既存terminal tailでのみ閉じる。Pendingで独立similarを早期失敗にせず最新password設定を保つ。UI先行→barrier継続→latebootstrap、terminal失敗一度閉鎖を試験 |
+| similar / 別バージョン索引 / src/app.rs:26123, :26893、src/indexer_supervisor.rs:377、src/similar_index.rs:1880 / 各registrationと既存readiness集約owner | overlay解除/normalreadyで共有watcher barrierを閉じない。実bootstrapのready、またはIndexer終端Unavailable/disconnectの既存terminal tailでのみ閉じる。Pendingで独立similarを早期失敗にせず最新password設定を保つ。UI先行→barrier継続→latebootstrap、terminal失敗一度閉鎖を試験。watchdog対象外でもこのproduct契約は維持 |
 
 ## 6. 初期フォルダの解決・走査を通常 UI 後へ
 
@@ -606,6 +632,12 @@ first-setup overflow 枝は first_setup.rs のみを独立統合でき、本枝�
 - 旧タグ移行と編集をqueueで順序付ける/overlayを延長する/タグ操作を一時制限する:
   §5.3の2026-10-06利用者決定で全案不採用。まれな旧版直更新の自動救済を撤去し、
   競合の組合せ自体をなくす。通常タグwriter/admissionとsidecar ownerは変更しない。
+- Remoteの論理初期要求へwatch slotを保持し、返却/繰返し取得/fallbackで再開する診断契約:
+  再レビューの指摘に対し設計ownerが不採用を決定。初回dispatchだけ監視し、Remote取得で
+  suspended (not watched) terminalにする。業務上の延期/再dispatchは既存ownerのまま、timelineだけ残す。
+- metadata registration generation/readinessを新しいwatchdog集約ownerへ結ぶ:
+  不採用。既存per-supervisor registrationとsimilarの集約にはbegin/end eventだけを置き、
+  watchdogの監視/終了条件から外す。診断のために正しさのlifecycle機械を増やさない。
 
 Indexerとnavigationの業務状態は既存の分割状態を enum に置換する範囲。
 タグの移行安全性state、proof event、追加notice/queue/保留処理は導入しない。
@@ -644,7 +676,7 @@ App の機能状態を書き換える第2 coordinator にはしない。まれ�
 
 | chunk / owner | 実装範囲 | 必須の自動試験 |
 | --- | --- | --- |
-| A: timeline process owner / writer | 共通小 crate、launcher/core entry、全 stage、watchdog | fake monotonic clock で begin/end・error・skipped・parent duration、5/15/30秒各一回、heartbeat が動いても発火、stage切替/reset、並行 lane、overflow/drop、writer blocked/failed でも publisher 完了、UNC/extended UNC/mapped/unknown、env 上限/不正/直接core/同run相関。遅い sink は latch で止め、UI側が待たないことを実際の API で確認 |
+| A: timeline process owner / writer | 共通小 crate、launcher/core entry、全stage記録、限定watchdog（§3.5） | fake monotonic clockでbegin/end・error・skipped・parent duration、対象経路の5/15/30秒各一回、heartbeatが動いても発火、stage切替/reset、並行timeline、overflow/drop、writer blocked/failedでもpublisher完了、UNC/extended UNC/mapped/unknown、env上限/不正/直接core/同run相関。対象外の再dispatch/metadataはtimelineだけでwatchdogを延命/再起動しない。遅いsinkはlatchで止め、UI側が待たないことを実APIで確認 |
 | B: root presenter の証拠 owner | vendor の observer / frame tag 接続、outer first-update | fake paint outcome: surface absent/timeout/recreated/zero-size/skip/submit-only は成功なし、present-return だけ一度、root以外なし、Overlay→NormalShell、multi-pass/discard の最終tag、first-updateだけでreadyにならない。既存 texture-delivery / font-atlas / surface regression を保持 |
 | C: App-global IndexerInit owner | enum、全consumer、単一採用、overlay/status、§5.3の旧タグ移行撤去（code/test/docs） | 実 receiver と injected spawn で4.999秒/5秒/期限同時Ready、恒久Emptyでも通常UIへ、30秒Ready後一度採用、Unavailable/Failed/disconnect/spawn失敗一度通知、poll early-return/idle、Pending中のfull-check集約、favorite ON/OFF/root/PDF password変更後に最新configuration採用、speed変更は次回起動反映のまま、similar bootstrap非早期閉鎖、close前late-result、manager/writer生成数1、旧移行非実行と既存タグ保持 |
 | D: 既存 initial navigation request owner | target snapshot、defer until present、resolve+pre-scan、async adopt、§1.335 compose | fake resolver/scanを停止して先にNormal root present・navigation可を確認。再navigation/activation/Remote取得/closeでstale結果非採用・旧trace非再活性化、modal-held保持、scan errorと空を区別、default fallbackは一度。実temp directory/ZIP/PDF/変換fixtureでtarget・cursor・source・prefix・auto-open保持 |
@@ -655,7 +687,9 @@ App の機能状態を書き換える第2 coordinator にはしない。まれ�
 | 担当 / 対象 | 操作と不変条件 |
 | --- | --- |
 | A / parent watchdog | fake clockで親40秒の下に1秒のchildを連続。parentの5/15/30秒が各一回、parent復帰でも再通知なし。stage用thresholdとparent用thresholdを混同しない。heartbeatは更新し続ける |
-| A / 監視寿命 | normalready後もIndexerを40秒止めて記録。run_nativeが100秒常駐するだけでは警告なし。modal/Remote admissionを100秒保留しても実resolver停止扱いなし。visible4秒→hide100秒→restore1秒でpresent-awaitの有効5秒が一度、Indexerの実停止はhide中も記録。全terminal/quitでwatch終了 |
+| A / 監視寿命 | normalready後もIndexerを40秒止めて記録。run_nativeが100秒常駐するだけでは警告なし。modal admissionを100秒保留しても実resolver停止扱いなし。visible4秒→hide100秒→restore1秒でpresent-awaitの有効5秒が一度、Indexerの実停止はhide中も記録。自身の全slot terminal/quitでwatch終了、timelineは継続 |
+| A+D / 初回dispatch・Remote除外 | 初回resolverを停止→5/15秒の対象警告→Remote取得でsuspended (not watched) terminalを記録。初回slotがRetiredとなり他の対象slotも終端ならwatchdog終了。返却→同じ初期argvの再dispatchを40秒停止しても新overdue/slot再利用/watchdog再起動無し、timeline beginは残り完了時にend。繰返し取得/返却、初回dispatch前取得、初回失敗→default fallbackも同じ除外を確認。Indexer Pendingが残る場合はその監視だけ継続 |
+| A / metadata登録除外 | 複数supervisor登録の一つを停止。reconfiguration workerのspawn/idle記録がその登録のendにならず、当該registration beginだけが残ることを確認。normalready・Indexer採用・初回dispatch終端でwatchdogが終了し、40秒以上の登録待ちでもoverdue/延命/再起動無し。登録が返れば同じregistrationのReady/Unavailable endをtimelineへ記録。既存similar集約/barrierは別ownerのまま維持 |
 | B+D / Deferred wake | Indexer ReadyまたはUnavailable、他worker全idle、無入力のfake event loopをWaitまで進め、normalpresent完了のowned wakeのみでdispatchが一回起こる。skip/timeoutを複数回→成功でもtimerが継続。cancel前後の遅いcallbackは再openしない。複数egui passで未採用frame tagを使わない |
 | C / visibility採用 | Pending→tray hide→Ready（hiddenのまま実outer pollで採用）→restore。同じmanagerのthrottleがtrue→false、設定変更/ActivityGateを巻き戻さない。pause設定ON/OFF、外部ShowWindowによる復帰、hidden quit Pending/Ready、late result非採用を分ける |
 | C / minimize/activation区別 | OS minimizeだけではwindow_visibleや新throttle契約を変更しない。runninginstance activation→restoreでは新init/overlay/defaultfolder無し。起動途中hideの結果採用はROOT requested-workで進み、hiddenidleへ恒久timerを作らない |
@@ -703,11 +737,15 @@ native FFIにfuture timeoutを足すだけでは停止threadを解放できな�
 旧タグ非取込を受け入れる。タグ制限/queue/準備notice/proof機構と、それらに付随する移行失敗の
 復旧案は不要となった。通常タグ操作と既存catalog/XMPを保持する。この決定を改めて承認待ちにしない。
 現時点で追加の必須利用者判断はない。実装範囲、docs更新、CHANGELOG候補は§5.3へ記録済み。
+**watchdog範囲も設計owner決定済み:** §3.5のcore startup経路と初回dispatchだけ。
+Remote取得で当該監視はsuspended (not watched) terminal、再dispatch/metadata登録はtimelineのみ。
+この対象外処理のためにwatchdogの寿命を延ばす/再開する設計は行わない。
 
 設計leadの確認事項: resolverのspawn/disconnectは通常UIに留め、一度通知して利用者の新openを待つ
 （§6.2.1）。従来disconnect時の自動defaultへの新workerは作らない。diagnostics保存不能、
 Indexer spawn/errorも一度通知・次回起動に留める。rare failure内の多段 recovery は増やさない。
 レビューで確定する提案値はoverlay5秒、watchdog5/15/30秒、診断1024件/24KiB handoff、2MiB/file・10run保持。
-P1-2/P2-3/4/5と§5.4は本改訂で契約化したが、独立再レビューとdetached構造合意はまだ必要。
+再レビューでは旧移行撤去/P1-2/P2-3/4/機能表等は受入れ。残るwatchdog P2×2は本改訂で
+監視範囲の限定により扱う。今回の限定変更の再確認と、実装前のdetached §11記録はまだ必要。
 より複雑な復旧が必要なら実装前に相談する。画面前の同期停止まで正常UI保証が必要という判断なら、
 今回のscopeを拡張せず、上記launcher監視か必須初期化の背景化を別のcoherent phaseとして相談する。
