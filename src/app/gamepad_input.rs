@@ -3572,7 +3572,10 @@ impl App {
                 Some(&format!("path={}", target.display())),
             );
             ctx.request_repaint();
-            return Some(AddressBarNav::Direct(target));
+            return Some(AddressBarNav::Direct(
+                target,
+                crate::app::StartupListIntent::ExplicitList,
+            ));
         }
         if let Some(definition_id) = smart_folder_target {
             self.bump_input_seq(
@@ -3685,7 +3688,7 @@ impl App {
                     self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
                     return None;
                 };
-                AddressBarNav::Direct(resolved)
+                AddressBarNav::Direct(resolved, crate::app::StartupListIntent::ExplicitList)
             }
         };
         self.bump_input_seq("gamepad_location_nav", Some(&format!("{nav:?}")));
@@ -5467,7 +5470,10 @@ impl App {
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
-        Some(AddressBarNav::Direct(target))
+        Some(AddressBarNav::Direct(
+            target,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_ring_drive_letter(
@@ -5487,7 +5493,10 @@ impl App {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
-        Some(AddressBarNav::Direct(resolved))
+        Some(AddressBarNav::Direct(
+            resolved,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_current_drive_root(&mut self, source: &'static str) -> Option<AddressBarNav> {
@@ -5512,7 +5521,10 @@ impl App {
             source,
             Some(&format!("current_drive_root={}", path.display())),
         );
-        Some(AddressBarNav::Direct(resolved))
+        Some(AddressBarNav::Direct(
+            resolved,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_switch_drive_letter(
@@ -5558,7 +5570,10 @@ impl App {
                 target.display()
             )),
         );
-        Some(AddressBarNav::Direct(target))
+        Some(AddressBarNav::Direct(
+            target,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_ring_location_action(
@@ -5711,7 +5726,10 @@ impl App {
             self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
             return None;
         };
-        Some(AddressBarNav::Direct(resolved))
+        Some(AddressBarNav::Direct(
+            resolved,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_tree_folder_nav(&mut self, ctx: &egui::Context, forward: bool, source: &'static str) {
@@ -6394,7 +6412,7 @@ impl App {
                 ctx.request_repaint();
             }
             RingShortcutContext::VideoFullscreen => {
-                self.close_fullscreen();
+                self.close_fullscreen_to_page_list();
                 ctx.request_repaint();
             }
             RingShortcutContext::Grid => {}
@@ -7261,6 +7279,7 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
+        self.capture_main_list_restore_cursor();
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
         if self.stack_try_open_from_grid(ctx, idx, false) {
@@ -7274,7 +7293,12 @@ impl App {
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
                 let auto_fullscreen = self.should_auto_fullscreen_grid_container(idx);
-                if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fullscreen) {
+                if self.begin_smart_grid_container_navigation(
+                    idx,
+                    p.clone(),
+                    auto_fullscreen,
+                    crate::app::StartupListIntent::container_open(auto_fullscreen),
+                ) {
                     return None;
                 }
                 if crate::folder_tree::is_virtual_folder(&p) {
@@ -7286,7 +7310,10 @@ impl App {
                     }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
-                    Some(AddressBarNav::Direct(p))
+                    Some(AddressBarNav::Direct(
+                        p,
+                        crate::app::StartupListIntent::container_open(auto_fullscreen),
+                    ))
                 }
             }
             Some(GridItem::Image(_))
@@ -7301,6 +7328,7 @@ impl App {
                     return None;
                 }
                 self.bump_input_seq_for_item("gamepad_grid_open", idx);
+
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 None
@@ -7312,12 +7340,20 @@ impl App {
                     self.show_feedback_toast(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
-                } else if self.begin_smart_grid_container_navigation(idx, path.clone(), auto_fs) {
+                } else if self.begin_smart_grid_container_navigation(
+                    idx,
+                    path.clone(),
+                    auto_fs,
+                    crate::app::StartupListIntent::container_open(auto_fs),
+                ) {
                     // The Smart request owns conversion and adopts its logical source once.
                 } else {
                     let owner = self.main_grid_archive_open_owner(idx, &path);
                     let _outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                        path, auto_fs, owner,
+                        path,
+                        auto_fs,
+                        owner,
+                        crate::app::StartupListIntent::container_open(auto_fs),
                     );
                 }
                 None
@@ -8400,6 +8436,7 @@ mod tests {
                 super::super::OpenRequestOwner::Navigation,
                 &epub,
                 super::super::PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             super::super::PdfOpenFailureRoute::ConversionDialogOpened
         );

@@ -14,6 +14,21 @@
 
 検索 Ctrl+G/S/T と Snapshot は一時 surface で、現在表示中の場所として明示的に `Search` / `Snapshot` と識別する。従来仕様どおり検索中の ←/→ は無効、検索中と close 復帰は履歴を積まない [`src/app.rs:20377`](../src/app.rs)、[`docs/keymap-spec.md:338`](keymap-spec.md)。この間の history cursor は**休止**し、検索結果を元 Folder や Rating と偽らない。退出時には entry 時点の typed origin を `return_to` から採用して再開する [`src/app.rs:24176`](../src/app.rs)、[`src/app.rs:24257`](../src/app.rs)。Snapshot の範囲内 navigation と退出も同じ origin 契約を守る。これは「履歴が有効なら現在地＝表示地」の例外ではなく、一時 surface で履歴操作を許さない状態である。
 
+### §1.335 起動復元との境界（2026-10-06 追記）
+
+「前回終了した場所」に使う明示一覧 record は、各 context の現在地／戻る・進む履歴とは別の
+main 所有状態である。読書のための物理 load は従来どおり可視場所と履歴を採用するが、
+明示一覧要求でなければ起動復元 target を更新しない。合成 root の戻り session／filter／
+root anchor を起動復元 record に追加せず、実際に採用した physical child の一覧を明示した
+場合だけ物理 target を保存する。Collection の `PhysicalSource.path` が親 source を保持する
+場合も、現在の `effective_folder()` と採用済み position の所有関係を照合する。
+
+既存 typed history／navigation request が一覧・ページ続行・reload の意図を運ぶ。
+元の戻り chain、失敗／取消／stale の採用条件、各 context の履歴 ownership は変更しない。
+F12 linked の表示先切替と independent viewer の navigation は main の起動復元へ通知しない。
+起動復元の確定境界・cursor・ZIP prefix と進行中の回帰確認は
+[起動復元設計](startup-restore-target-plan.md) を参照する。
+
 ## 2. 可視場所の対応と採用境界
 
 | 表示 | 現在地と退出先 | 実装上の確認点 |

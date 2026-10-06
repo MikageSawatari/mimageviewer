@@ -74,6 +74,101 @@ const STARTUP_DIALOG_CASES: &[(&str, &[&str])] = &[
 ];
 
 #[test]
+fn startup_status_light() {
+    startup_status_snapshot(
+        "startup_status_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn startup_status_dark() {
+    startup_status_snapshot(
+        "startup_status_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+fn startup_status_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme) {
+    snapshot_with_theme_and_contrast_settling(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| {
+            mimageviewer::ui_startup::draw_status(
+                ui,
+                "検索の記録を読み込んでいます",
+                std::time::Duration::from_millis(1250),
+                std::time::Duration::from_millis(12500),
+            );
+        },
+    );
+}
+
+#[test]
+fn startup_preparing_dark() {
+    snapshot_with_theme(
+        "startup_preparing_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::ui_startup::draw_preparing,
+    );
+}
+
+#[test]
+fn startup_status_strong_light() {
+    startup_strong_snapshot(
+        "startup_status_strong_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn startup_status_strong_dark() {
+    startup_strong_snapshot(
+        "startup_status_strong_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+fn startup_strong_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme) {
+    snapshot_with_theme_and_contrast_settling(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Strong,
+        Some(4),
+        |ui| {
+            mimageviewer::ui_startup::draw_status(
+                ui,
+                "検索の記録を読み込んでいます",
+                std::time::Duration::from_secs(999),
+                std::time::Duration::from_secs(1005),
+            );
+        },
+    );
+}
+
+#[test]
+fn startup_status_small_long_stage() {
+    snapshot_with_theme_options(
+        "startup_status_small_long_stage",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(240.0, 240.0),
+        Some(4),
+        |ui| {
+            mimageviewer::ui_startup::draw_status(
+                ui,
+                "検索するフォルダーの変更を確認しています",
+                std::time::Duration::from_secs(999),
+                std::time::Duration::from_secs(1005),
+            );
+        },
+        |_| {},
+    );
+}
+
+#[test]
 fn startup_dialogs_small_viewport() {
     use egui_kittest::kittest::NodeT;
     #[derive(Default)]

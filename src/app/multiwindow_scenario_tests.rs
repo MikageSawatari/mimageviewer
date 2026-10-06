@@ -707,8 +707,7 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
         app.settings.final_cover_spread_enabled = false;
@@ -914,8 +913,7 @@ fn page_alone_white_companion_does_not_paint_as_a_failed_real_texture() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
         app.settings.detached_viewer_window_placement =
@@ -970,8 +968,7 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.singleton_spread_first_enabled = true;
         app.settings.singleton_spread_last_enabled = false;
@@ -1075,8 +1072,7 @@ fn scenario_b_endpoint_paint_center(
     let mut app = setup_app_for_test();
     let mut driver = ScenarioDriver::new();
     crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-    app.startup_done = true;
-    app.startup_init = None;
+    app.indexer_init.mark_unavailable_if_not_ready();
     app.settings.detached_viewer_open_images_in_window = true;
     app.settings.singleton_spread_first_enabled = global_first;
     app.settings.singleton_spread_last_enabled = global_last;
@@ -1234,8 +1230,7 @@ fn run_scenario_a(book: ScenarioABook) {
     let mut app = setup_app_for_test();
     let mut driver = ScenarioDriver::new();
     crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-    app.startup_done = true;
-    app.startup_init = None;
+    app.indexer_init.mark_unavailable_if_not_ready();
     app.settings.sidecar_backup_enabled = true;
     app.settings.tag_sidecar_backup_enabled = false;
     app.settings.detached_viewer_open_images_in_window = true;
@@ -1378,8 +1373,7 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.sidecar_backup_enabled = true;
         app.settings.tag_sidecar_backup_enabled = false;
         app.settings.detached_viewer_open_images_in_window = true;
@@ -1525,8 +1519,7 @@ fn run_multiwindow_rar_tree_nav(
     let mut app = setup_app_for_test();
     let mut driver = ScenarioDriver::new();
     crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-    app.startup_done = true;
-    app.startup_init = None;
+    app.indexer_init.mark_unavailable_if_not_ready();
     app.settings.detached_viewer_open_images_in_window = true;
     app.settings.auto_fullscreen_image_folders = true;
     app.settings.auto_fullscreen_zip_pdf = true;
@@ -1680,6 +1673,8 @@ fn run_multiwindow_rar_tree_nav(
     let _main_conversion_sender = if pending_main_conversion {
         let (tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: app.tmp.path().join("pending-main.7z"),
             input_seq: 0,
             format: crate::archive_converter::ArchiveFormat::SevenZ,
@@ -2248,8 +2243,7 @@ fn multiwindow_scenario_collection_order_full_mode_control() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = false;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2270,8 +2264,7 @@ fn run_detached_collection_order_case(open_index: usize, forward: Option<bool>) 
     let mut app = setup_app_for_test();
     let mut driver = ScenarioDriver::new();
     crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-    app.startup_done = true;
-    app.startup_init = None;
+    app.indexer_init.mark_unavailable_if_not_ready();
     app.settings.detached_viewer_open_images_in_window = true;
     driver.root(&mut app);
     let temp = app.tmp.path().to_path_buf();
@@ -2314,8 +2307,7 @@ fn multiwindow_scenario_collection_root_detached_boundaries_and_spread() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2376,8 +2368,7 @@ fn multiwindow_scenario_collection_root_passive_reopen_without_bundle() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2430,8 +2421,7 @@ fn multiwindow_scenario_collection_root_removed_source_reopen_current_behavior()
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2496,8 +2486,7 @@ fn multiwindow_scenario_collection_root_detached_edit_delete_and_reopen() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2597,8 +2586,7 @@ fn multiwindow_scenario_collection_root_f12_modes() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = false;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2636,8 +2624,7 @@ fn multiwindow_scenario_collection_root_detached_bs_and_esc() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2702,8 +2689,7 @@ fn multiwindow_scenario_collection_root_sibling_watch_owners() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2807,8 +2793,7 @@ fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
@@ -2885,8 +2870,7 @@ fn multiwindow_scenario_collection_root_ctrl_outer_navigation() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_image_folders = true;
         driver.root(&mut app);
@@ -2927,8 +2911,7 @@ fn multiwindow_scenario_collection_root_slideshow_next_folder() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_image_folders = true;
         driver.root(&mut app);
@@ -2964,8 +2947,7 @@ fn multiwindow_scenario_collection_root_detached_folder_child_restore() {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_image_folders = true;
         driver.root(&mut app);
@@ -3249,8 +3231,7 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
     std::thread::spawn(|| {
         let mut app = setup_app_for_test();
         let mut driver = ScenarioDriver::new();
-        app.startup_done = true;
-        app.startup_init = None;
+        app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();

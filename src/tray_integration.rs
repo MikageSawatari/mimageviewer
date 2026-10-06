@@ -139,7 +139,7 @@ impl App {
                     return;
                 };
                 if let Some((rgba, w, h)) = crate::tray::load_embedded_icon_rgba() {
-                    let io_sem = self.indexer_manager.as_ref().map(|m| m.io_sem());
+                    let io_sem = self.indexer_init.as_ref().map(|m| m.io_sem());
                     // 配置共有スロットをまだ作っていなければ作成。
                     if self.placement_slot.is_none() {
                         self.placement_slot = Some(crate::tray::new_placement_slot());
@@ -171,7 +171,7 @@ impl App {
             (false, true) => {
                 // 停止: Drop 実装がスレッド shutdown を処理する。
                 self.tray_controller = None;
-                if let Some(mgr) = self.indexer_manager.as_ref() {
+                if let Some(mgr) = self.indexer_init.as_ref() {
                     mgr.set_io_throttled(false);
                 }
                 self.activity_gate.set_paused(false);
@@ -318,7 +318,7 @@ impl App {
         }
 
         // I/O throttle: 他アプリへの帯域影響を抑える
-        if let Some(mgr) = self.indexer_manager.as_ref() {
+        if let Some(mgr) = self.indexer_init.as_ref() {
             mgr.set_io_throttled(true);
         }
 
@@ -363,7 +363,7 @@ impl App {
             false,
             "App::update heartbeat resumed after tray restore".to_string(),
         );
-        if let Some(mgr) = self.indexer_manager.as_ref() {
+        if let Some(mgr) = self.indexer_init.as_ref() {
             mgr.set_io_throttled(false);
         }
         self.activity_gate.set_paused(false);
@@ -426,7 +426,7 @@ impl App {
                  fullscreen={:?} fs_video={} native_pending={}",
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
-            self.close_fullscreen();
+            self.close_main_still_fullscreen_for_tray();
         } else if fs_cache_has_video
             || native_video_pending
             || self.viewer_session_is_detached_or_switching()

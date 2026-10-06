@@ -3802,10 +3802,47 @@ pub enum QuickFolderSlotId {
     B,
 }
 
+/// Previous-startup state. Released `last_folder` remains a separate compatibility carrier.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "version", rename_all = "snake_case")]
+pub enum StartupListRestore {
+    V1 {
+        target: StartupListTarget,
+        cursor: Option<ListCursorHint>,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartupListTarget {
+    Unavailable,
+    DriveList,
+    PhysicalList {
+        logical_path: PathBuf,
+        /// Effective, tree-relative ZIP directory; never a filesystem path.
+        zip_prefix: Option<String>,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ListCursorHint {
+    pub name: String,
+    pub rows_above: Option<u32>,
+}
+
+impl Default for StartupListRestore {
+    fn default() -> Self {
+        Self::V1 {
+            target: StartupListTarget::Unavailable,
+            cursor: None,
+        }
+    }
+}
+
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFolderMode {
-    /// 前回終了時に表示していた場所。既存挙動との互換のためデフォルト。
+    /// 最後に明示した復元可能な一覧。
     #[default]
     Previous,
     /// Windows のデスクトップ。
@@ -4285,6 +4322,9 @@ pub struct Settings {
     pub smart_folders: Vec<SmartFolderDefinition>,
     #[serde(default)]
     pub last_folder: Option<PathBuf>,
+    /// Missing only for released settings awaiting their one-time legacy projection.
+    #[serde(default)]
+    pub startup_list_restore: Option<StartupListRestore>,
     #[serde(default)]
     pub startup_folder_mode: StartupFolderMode,
     #[serde(default)]
@@ -7292,6 +7332,7 @@ impl Default for Settings {
             favorite_view_overlay: None,
             smart_folders: Vec::new(),
             last_folder: None,
+            startup_list_restore: Some(StartupListRestore::default()),
             restore_last_cursor: true,
             last_cursor_name: None,
             last_cursor_rows_above: None,
@@ -8120,6 +8161,33 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 // migration / decision tree は data_dir 引数を唯一の真として `data_dir.join("settings.json")`
 // を使うので、`data_dir::get()` 経由のパス計算は不要になった。
 
+impl Settings {
+    /// Released values do not say whether the book's list was ever shown. Preserve that first
+    /// destination once; subsequent loads must never project the changing legacy carrier again.
+    pub(crate) fn migrate_startup_list_restore(&mut self) -> bool {
+        if self.startup_list_restore.is_some() {
+            return false;
+        }
+        let target = match self.last_folder.as_ref() {
+            None => StartupListTarget::Unavailable,
+            Some(path) if path.as_os_str().is_empty() => StartupListTarget::DriveList,
+            Some(path) => StartupListTarget::PhysicalList {
+                logical_path: path.clone(),
+                zip_prefix: None,
+            },
+        };
+        let cursor = matches!(target, StartupListTarget::PhysicalList { .. })
+            .then(|| self.last_cursor_name.as_ref())
+            .flatten()
+            .map(|name| ListCursorHint {
+                name: name.clone(),
+                rows_above: self.last_cursor_rows_above,
+            });
+        self.startup_list_restore = Some(StartupListRestore::V1 { target, cursor });
+        true
+    }
+}
+
 /// `Settings::load()` 経路で適用される **load-time migrations** を、外部呼び出し用に
 /// 公開した版 (Codex P2 v8b-1 2026-05-14)。Phase 2 の JSON migration はこの関数を
 /// 介して読み込んだ Settings を正規化してから SQLite に書き込む必要がある。
@@ -8129,12 +8197,14 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// - video_loop=true の旧 bool が video_loop_mode に伝搬しない
 ///
 /// `Settings::load()` の中身と同じ migrations を呼ぶ:
+/// 0. `migrate_startup_list_restore` (released last_folder の一度だけの移行)
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
 /// 3. `migrate_legacy_archive_file_handling`
 /// 4. ツールバーの列数・ソート候補・フォルダセクションの一度きりの補完
 /// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
+    settings.migrate_startup_list_restore();
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
     settings.migrate_legacy_archive_file_handling();
@@ -8882,6 +8952,7 @@ impl Settings {
             settings.video_seek_strip_min_interval_secs;
         let video_seek_strip_waveform_span_before_sanitize =
             settings.video_seek_strip_waveform_span_secs;
+        let startup_list_restore_migrated = settings.migrate_startup_list_restore();
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
@@ -8893,6 +8964,11 @@ impl Settings {
         let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
+        let keymap_span =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::SettingsKeymap)
+                .watched_optional(miv_startup::watch_handle(
+                    miv_startup::WatchSlot::CoreStartup,
+                ));
         let legacy_keymap_import =
             if db_loaded && !MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
                 settings
@@ -8901,6 +8977,15 @@ impl Settings {
             } else {
                 crate::keymap::LegacyKeymapIniImport::default()
             };
+        keymap_span.finish(
+            if !db_loaded || MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
+                miv_startup::Outcome::Skipped
+            } else if legacy_keymap_import.warnings.is_empty() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            },
+        );
         if legacy_keymap_import.imported {
             settings_diag_log("settings: legacy keymap.ini imported into settings; backup pending");
         }
@@ -9020,7 +9105,8 @@ impl Settings {
         // `save_internal_no_rotation` を使う。spec §6.1 で rotation は「**user** save の
         // 最初の 1 回」と定義されており、`load()` 内の migration/version 書き戻しで
         // rotation を消費すると次の真の user save が in-place 書込みになってしまう。
-        let bootstrap_save_needed = vst3_migrated
+        let bootstrap_save_needed = startup_list_restore_migrated
+            || vst3_migrated
             || settings.image_ext_priority.len() != image_ext_priority_len_before_sanitize
             || autoplay_mode_migrated
             || video_loop_migrated
@@ -9046,9 +9132,19 @@ impl Settings {
             false
         };
         if bootstrap_saved && legacy_keymap_import.imported {
+            let keymap_span =
+                miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::SettingsKeymap)
+                    .watched_optional(miv_startup::watch_handle(
+                        miv_startup::WatchSlot::CoreStartup,
+                    ));
             let legacy_keymap_backup = settings
                 .keymap
                 .rename_imported_legacy_ini(&legacy_keymap_ini_path);
+            keymap_span.finish(if legacy_keymap_backup.warnings.is_empty() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            });
             if let Some(path) = legacy_keymap_backup.backup_path.as_ref() {
                 settings_diag_log(&format!(
                     "settings: legacy keymap.ini backup saved {}",
@@ -9980,6 +10076,7 @@ impl Settings {
         self.batch_cache_pdf_contents = src.batch_cache_pdf_contents;
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
+        self.startup_list_restore = src.startup_list_restore.take();
         // カーソル名は `last_folder` と対の実行時状態。環境設定 OK の全体差し替えで
         // 片方だけ live 値、片方だけダイアログ側の値になると対応が崩れる。
         self.last_cursor_name = src.last_cursor_name.take();
@@ -14729,6 +14826,72 @@ mod tests {
     }
 
     #[test]
+    fn section1335_legacy_json_migration_preserves_first_target_once() {
+        for path in [
+            None,
+            Some(PathBuf::new()),
+            Some(PathBuf::from(r"C:\books\released.zip")),
+        ] {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("startup_list_restore");
+            value["last_folder"] = serde_json::to_value(&path).unwrap();
+            value["last_cursor_name"] = serde_json::json!("page.png");
+            value["last_cursor_rows_above"] = serde_json::json!(5);
+            let mut loaded: Settings = serde_json::from_value(value).unwrap();
+            assert!(loaded.migrate_startup_list_restore());
+            let target = match path.as_ref() {
+                None => StartupListTarget::Unavailable,
+                Some(path) if path.as_os_str().is_empty() => StartupListTarget::DriveList,
+                Some(path) => StartupListTarget::PhysicalList {
+                    logical_path: path.clone(),
+                    zip_prefix: None,
+                },
+            };
+            let cursor =
+                matches!(target, StartupListTarget::PhysicalList { .. }).then(|| ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(5),
+                });
+            let expected = Some(StartupListRestore::V1 { target, cursor });
+            assert_eq!(loaded.startup_list_restore, expected);
+            assert_eq!(loaded.last_folder, path);
+            assert_eq!(loaded.last_cursor_name.as_deref(), Some("page.png"));
+            loaded.last_folder = Some(PathBuf::from(r"C:\other"));
+            let mut reloaded: Settings =
+                serde_json::from_str(&serde_json::to_string(&loaded).unwrap()).unwrap();
+            assert!(!reloaded.migrate_startup_list_restore());
+            assert_eq!(reloaded.startup_list_restore, expected);
+        }
+    }
+
+    #[test]
+    fn section1335_preferences_ok_preserves_live_restore_record() {
+        let mut live = Settings::default();
+        live.startup_list_restore = Some(StartupListRestore::V1 {
+            target: StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from(r"C:\books\nested.zip"),
+                zip_prefix: Some("chapter/".into()),
+            },
+            cursor: Some(ListCursorHint {
+                name: "p2.png".into(),
+                rows_above: Some(2),
+            }),
+        });
+        let expected = live.startup_list_restore.clone();
+        let mut dialog = Settings::default();
+        dialog.overwrite_non_preferences_from(&mut live);
+        assert_eq!(dialog.startup_list_restore, expected);
+        assert!(!dialog.migrate_startup_list_restore());
+        assert_eq!(
+            Settings::default().startup_list_restore,
+            Some(StartupListRestore::default())
+        );
+    }
+
+    #[test]
     fn sanitize_clamps_fullscreen_gap_settings() {
         let mut s = Settings::default();
         s.spread_page_gap_px = 999;
@@ -18198,6 +18361,43 @@ mod tests {
             );
             let reloaded = Settings::load();
             assert_eq!(reloaded.favorites[0].name, "first_install");
+        }
+
+        #[test]
+        fn section1335_normal_load_persists_legacy_projection_without_user_rotation() {
+            let _env = setup_backup_env();
+            let mut legacy = Settings::load();
+            legacy.startup_list_restore = None;
+            legacy.last_folder = Some(PathBuf::from(r"C:\books\released.zip"));
+            legacy.last_cursor_name = Some("page.png".into());
+            legacy.last_cursor_rows_above = Some(3);
+            legacy.save();
+            reset_backup_state_for_test();
+            let migrated = Settings::load();
+            let expected = Some(StartupListRestore::V1 {
+                target: StartupListTarget::PhysicalList {
+                    logical_path: legacy.last_folder.clone().unwrap(),
+                    zip_prefix: None,
+                },
+                cursor: Some(ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(3),
+                }),
+            });
+            assert_eq!(migrated.startup_list_restore, expected);
+            assert!(
+                !BACKUP_DONE_THIS_SESSION.load(Ordering::Relaxed),
+                "load-time migration must not consume the user-save rotation"
+            );
+            assert_eq!(
+                crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+                    .unwrap()
+                    .load_into_settings()
+                    .unwrap()
+                    .startup_list_restore,
+                expected
+            );
+            assert_eq!(Settings::load().startup_list_restore, expected);
         }
 
         /// settings.db を壊して bak1 から復旧されるシナリオ (= spec §5 decision tree)。

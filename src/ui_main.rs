@@ -226,15 +226,17 @@ enum PinButtonClick {
 
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
-    Direct(PathBuf),
+    Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {
         path: PathBuf,
         owner: crate::app::RatingPhysicalLoadOwner,
+        restore_intent: crate::app::StartupListIntent,
     },
     CollectionSource {
         path: PathBuf,
         owner: crate::app::top_level_grid_view::CollectionGridPhysicalLoadOwner,
+        restore_intent: crate::app::StartupListIntent,
     },
     DriveList(Option<PathBuf>),
     ReadingHistory,
@@ -14131,7 +14133,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 .hover_tip(tooltip);
                             if response.clicked() {
                                 match self.activate_quick_folder_slot(slot) {
-                                    QuickFolderSwitchTarget::Current => {}
+                                    QuickFolderSwitchTarget::Current => {
+                                        if self.fullscreen_idx.is_none() {
+                                            self.finish_main_list_open(
+                                                crate::app::StartupListIntent::ExplicitList,
+                                            );
+                                        }
+                                    }
                                     QuickFolderSwitchTarget::DriveList => {
                                         result = Some(AddressBarNav::DriveList(None));
                                     }
@@ -14185,7 +14193,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .to_string()
                             } else {
                                 match parent_nav_target.as_ref() {
-                                    Some(AddressBarNav::Direct(p))
+                                    Some(AddressBarNav::Direct(p, _))
                                     | Some(AddressBarNav::RatingSource { path: p, .. })
                                     | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
@@ -14396,7 +14404,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                             if let Some(resolved) =
                                                                 resolve_folder_bar_nav_path(&destination.path)
                                                             {
-                                                                result = Some(AddressBarNav::Direct(resolved));
+                                                                result = Some(AddressBarNav::Direct(
+    resolved,
+    crate::app::StartupListIntent::ExplicitList,
+));
                                                             }
                                                             ui.close();
                                                         }
@@ -14420,7 +14431,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             if let Some(resolved) =
                                                 resolve_folder_bar_nav_path(&location.path)
                                             {
-                                                result = Some(AddressBarNav::Direct(resolved));
+                                                result = Some(AddressBarNav::Direct(
+                                                    resolved,
+                                                    crate::app::StartupListIntent::ExplicitList,
+                                                ));
                                             }
                                             ui.close();
                                         }
@@ -14435,7 +14449,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             if let Some(resolved) =
                                                 resolve_folder_bar_nav_path(&drive)
                                             {
-                                                result = Some(AddressBarNav::Direct(resolved));
+                                                result = Some(AddressBarNav::Direct(
+                                                    resolved,
+                                                    crate::app::StartupListIntent::ExplicitList,
+                                                ));
                                             }
                                             ui.close();
                                         }
@@ -14603,6 +14620,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                         {
                                                             result = Some(AddressBarNav::Direct(
                                                                 resolved,
+                                                                crate::app::StartupListIntent::ExplicitList,
                                                             ));
                                                         }
                                                         ui.close();
@@ -14710,6 +14728,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             } else if address_text == "本棚" {
                                                 result = Some(AddressBarNav::Direct(
                                                     self.book_root_path(),
+                                                    crate::app::StartupListIntent::ExplicitList,
                                                 ));
                                             } else if let Some(book_name) =
                                                 address_text.strip_prefix("本棚 > ")
@@ -14719,13 +14738,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                         &self.book_root_path(),
                                                         book_name.trim(),
                                                     ),
+                                                    crate::app::StartupListIntent::ExplicitList,
                                                 ));
                                             } else if let Some(resolved) =
                                                 resolve_folder_bar_nav_path(&PathBuf::from(
                                                     &self.address,
                                                 ))
                                             {
-                                                result = Some(AddressBarNav::Direct(resolved));
+                                                result = Some(AddressBarNav::Direct(
+                                                    resolved,
+                                                    crate::app::StartupListIntent::ExplicitList,
+                                                ));
                                             }
                                         }
                                     });
@@ -15875,6 +15898,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
+            self.capture_main_list_restore_cursor();
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
             if self.stack_try_open_from_grid(ctx, idx, true) {
@@ -15901,7 +15925,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         {
                             return nav;
                         }
-                        if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
+                        if self.begin_smart_grid_container_navigation(
+                            idx,
+                            p.clone(),
+                            auto_fs,
+                            crate::app::StartupListIntent::container_open(auto_fs),
+                        ) {
                             return nav;
                         }
                         self.note_reading_history_open(idx);
@@ -15921,7 +15950,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                         return nav;
                     }
-                    if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
+                    if self.begin_smart_grid_container_navigation(
+                        idx,
+                        p.clone(),
+                        auto_fs,
+                        crate::app::StartupListIntent::container_open(auto_fs),
+                    ) {
                         return nav;
                     }
                     nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
@@ -15968,6 +16002,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         idx,
                         pf.clone(),
                         self.settings.effective_auto_fullscreen_zip_pdf(),
+                        crate::app::StartupListIntent::container_open(
+                            self.settings.effective_auto_fullscreen_zip_pdf(),
+                        ),
                     ) {
                         return nav;
                     }
@@ -15991,7 +16028,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                     let open_outcome = self
                         .load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                            pf, auto_fs, owner,
+                            pf,
+                            auto_fs,
+                            owner,
+                            crate::app::StartupListIntent::container_open(auto_fs),
                         );
                     match (open_outcome, search_rollback) {
                         (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
@@ -24638,6 +24678,7 @@ mod collection_toolbar_interaction_tests {
             physical.clone(),
             Some(scan),
             crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         let video_index = app
             .items
@@ -26868,7 +26909,7 @@ mod section207_tests {
         click_location_menu(&mut harness, "保管");
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &target)
         );
         assert!(
             harness.query_by_label("保管").is_none(),
@@ -26973,7 +27014,7 @@ mod section207_tests {
         click_location_menu(&mut harness, "整理先 099");
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &target)
         );
         assert!(harness.query_by_label("整理先 099").is_none());
     }
@@ -27368,7 +27409,7 @@ mod section207_tests {
         harness.key_press(egui::Key::Enter);
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, _)] if path == &target)
         );
         assert!(!app.borrow().address_has_focus);
         nav.borrow_mut().clear();

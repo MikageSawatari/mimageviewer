@@ -1165,6 +1165,8 @@ impl SmartPhysicalPreflight {
 }
 
 pub(crate) struct SmartFolderTransition {
+    restore_intent: super::StartupListIntent,
+
     request_id: u64,
     source: SmartFolderSourceLease,
     intent: SmartTransitionIntent,
@@ -1735,8 +1737,7 @@ impl App {
         };
         if self.epub_convert.as_ref().is_some_and(|state| {
             matches!(&state.continuation,
-                crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct(
-                    super::OpenRequestOwner::MainGridArchive(intent))
+                crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct { owner: super::OpenRequestOwner::MainGridArchive(intent), .. }
                     if matches!(intent.smart_folder_owner,
                         super::SmartGridArchiveOwner::Transition(id) if id == transition.request_id))
         }) {
@@ -2113,6 +2114,7 @@ impl App {
         intent: SmartTransitionIntent,
         target: SmartFolderTransitionTarget,
     ) -> Result<u64, String> {
+        self.capture_main_list_restore_cursor();
         let source = self
             .smart_folder_source_lease()
             .ok_or_else(|| "メインの表示状態を確認できません".to_owned())?;
@@ -2121,7 +2123,7 @@ impl App {
             request_id = 1;
         }
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.io_sem())
             .unwrap_or_else(|| {
@@ -2151,6 +2153,12 @@ impl App {
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
         self.smart_folder_transition = Some(SmartFolderTransition {
+            restore_intent: if matches!(intent, SmartTransitionIntent::Refresh) {
+                super::StartupListIntent::PreservePresentation
+            } else {
+                super::StartupListIntent::ExplicitList
+            },
+
             request_id,
             source,
             intent,
@@ -2171,6 +2179,7 @@ impl App {
         state: super::top_level_grid_view::SmartFolderViewState,
         intent: SmartTransitionIntent,
     ) -> Result<u64, String> {
+        self.capture_main_list_restore_cursor();
         let source = self
             .smart_folder_source_lease()
             .ok_or_else(|| "メインの表示状態を確認できません".to_owned())?;
@@ -2180,6 +2189,8 @@ impl App {
         }
         adopt_smart_folder_presentation(&mut snapshot.definition, definition);
         let mut transition = SmartFolderTransition {
+            restore_intent: super::StartupListIntent::ExplicitList,
+
             request_id,
             source,
             intent,
@@ -2259,6 +2270,8 @@ impl App {
         auto_fullscreen: bool,
         pre_scan: Option<ScannedDir>,
         source_index: Option<usize>,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> Result<(), Option<ScannedDir>> {
         let Some(mut state) = self.smart_physical_target_state(&path) else {
             return Err(pre_scan);
@@ -2343,6 +2356,8 @@ impl App {
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
         self.smart_folder_transition = Some(SmartFolderTransition {
+            restore_intent: restore_intent.clone(),
+
             request_id,
             source: source_lease,
             intent: SmartTransitionIntent::Direct(
@@ -2381,7 +2396,14 @@ impl App {
         history_trigger: super::HistoryTrigger,
         restore_video_tile: bool,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation(path, kind, false, pre_scan, None)?;
+        self.begin_smart_physical_navigation(
+            path,
+            kind,
+            false,
+            pre_scan,
+            None,
+            super::StartupListIntent::folder_navigation(&mode),
+        )?;
         if let Some(transition) = self.smart_folder_transition.as_mut() {
             let request_id = transition.request_id;
             let fullscreen = matches!(
@@ -2440,6 +2462,8 @@ impl App {
         index: usize,
         path: PathBuf,
         auto_fullscreen: bool,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
@@ -2451,6 +2475,8 @@ impl App {
             return match self.start_open_path_classification(
                 path,
                 super::ClassifiedOpenContinuation::SmartGrid {
+                    restore_intent: restore_intent.clone(),
+
                     index,
                     auto_fullscreen,
                 },
@@ -2471,6 +2497,7 @@ impl App {
             auto_fullscreen,
             super::OpenPathKind::File,
             None,
+            restore_intent.clone(),
         )
     }
 
@@ -2481,6 +2508,8 @@ impl App {
         auto_fullscreen: bool,
         classified_kind: super::OpenPathKind,
         pre_scan: Option<super::ScannedDir>,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
@@ -2520,6 +2549,7 @@ impl App {
                 auto_fullscreen,
                 pre_scan,
                 Some(index),
+                restore_intent.clone(),
             )
             .is_err()
         {
@@ -2567,13 +2597,25 @@ impl App {
         let started = match format {
             Some(crate::archive_converter::ArchiveFormat::Rar) => {
                 let fallback = self.try_archive_cache_lookup(&path);
-                self.request_rar_open_owned(path, auto_fullscreen, fallback, owner)
+                self.request_rar_open_owned(
+                    path,
+                    auto_fullscreen,
+                    fallback,
+                    owner,
+                    transition.restore_intent.clone(),
+                )
             }
             Some(format) => {
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
                     self.supply_smart_archive_load_alias(&path, &cached, &owner)
                 } else {
-                    self.request_archive_convert_owned(path, format, auto_fullscreen, owner)
+                    self.request_archive_convert_owned(
+                        path,
+                        format,
+                        auto_fullscreen,
+                        owner,
+                        transition.restore_intent.clone(),
+                    )
                 }
             }
             None => false,
@@ -3248,6 +3290,8 @@ impl App {
         path: PathBuf,
         scan: ScannedDir,
         authority: super::VisibleInstallAuthority<'_>,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         let started = std::time::Instant::now();
         let folder_changes = self
@@ -3280,6 +3324,7 @@ impl App {
                     String::new()
                 },
             },
+            restore_intent.clone(),
         )
     }
 
@@ -3292,7 +3337,18 @@ impl App {
         child: SmartPhysicalReady,
         auto_fullscreen: bool,
         effects: SmartPhysicalOpenEffects,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
+        let restore_intent = match &child {
+            SmartPhysicalReady::Folder(scan) => restore_intent.for_scanned_folder(
+                auto_fullscreen
+                    && self.settings.auto_fullscreen_image_folders_enabled()
+                    && self.scanned_folder_is_image_book(&source.load_path, scan),
+            ),
+            _ => restore_intent.for_book(),
+        };
+        let successful = !matches!(&child, SmartPhysicalReady::Error(_));
         let definition_id = target.definition_id;
         let path = source.load_path.clone();
         if self.smart_folder_navigation_target_removed(definition_id, &source.logical_source)
@@ -3324,9 +3380,14 @@ impl App {
         // ZIP row construction before retiring the prior owner. The installed side then has
         // no fallible or I/O-bearing materialization step.
         let child = match child {
-            SmartPhysicalReady::Zip(enumeration) => SmartPhysicalReady::ZipPrepared(
-                self.prepare_zip_grid(path.clone(), enumeration, Some(&source.logical_source)),
-            ),
+            SmartPhysicalReady::Zip(enumeration) => {
+                SmartPhysicalReady::ZipPrepared(self.prepare_zip_grid(
+                    path.clone(),
+                    enumeration,
+                    Some(&source.logical_source),
+                    restore_intent.clone(),
+                ))
+            }
             other => other,
         };
         if !self.adopt_smart_child_session(request_id, root, target, &source) {
@@ -3387,10 +3448,13 @@ impl App {
             logical_source: &source.logical_source,
             load_path: &source.load_path,
         };
-        match child {
-            SmartPhysicalReady::Folder(scan) => {
-                self.install_smart_scanned_folder(path, scan, authority)
-            }
+        let adopted = match child {
+            SmartPhysicalReady::Folder(scan) => self.install_smart_scanned_folder(
+                path,
+                scan,
+                authority,
+                super::StartupListIntent::InternalInstall,
+            ),
             SmartPhysicalReady::PdfPages {
                 pages,
                 direction,
@@ -3510,7 +3574,13 @@ impl App {
                 true
             }
             SmartPhysicalReady::ZipPrepared(prepared) => {
-                self.finalize_prepared_zip_grid(path, self.input_seq, prepared, authority);
+                self.finalize_prepared_zip_grid(
+                    path,
+                    self.input_seq,
+                    prepared,
+                    authority,
+                    super::StartupListIntent::InternalInstall,
+                );
                 true
             }
             SmartPhysicalReady::Zip(_) => unreachable!("ZIP rows were prepared before adoption"),
@@ -3532,7 +3602,11 @@ impl App {
                 self.set_empty_items_reason(reason);
                 true
             }
+        };
+        if adopted && successful {
+            self.finish_main_list_open(restore_intent);
         }
+        adopted
     }
 
     fn spawn_smart_transition_count(
@@ -3575,7 +3649,7 @@ impl App {
         refresh: bool,
     ) -> Result<SmartFolderPending, String> {
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.io_sem())
             .unwrap_or_else(|| {
@@ -4264,8 +4338,12 @@ impl App {
                             collection_navigation_continuation: None,
                         },
                     );
-                    if self.route_pdf_open_failure(owner, &path, failure)
-                        == super::PdfOpenFailureRoute::ConversionDialogOpened
+                    if self.route_pdf_open_failure(
+                        owner,
+                        &path,
+                        failure,
+                        transition.restore_intent.clone(),
+                    ) == super::PdfOpenFailureRoute::ConversionDialogOpened
                     {
                         Some(SmartFolderTransitionPhase::ChildPreflight {
                             root,
@@ -4322,6 +4400,7 @@ impl App {
                             child,
                             *auto_fullscreen,
                             effects.clone(),
+                            transition.restore_intent.clone(),
                         );
                         if adopted && let Some(commit) = archive_commit.clone() {
                             self.commit_smart_folder_archive_source(commit);
@@ -8040,16 +8119,21 @@ impl App {
         {
             return Some(crate::ui_main::AddressBarNav::Direct(
                 smart_folder_synthetic_path(state.definition_id),
+                crate::app::StartupListIntent::ExplicitList,
             ));
         }
         match target? {
             super::top_level_grid_view::SmartFolderParentTarget::Root => {
                 Some(crate::ui_main::AddressBarNav::Direct(
                     smart_folder_synthetic_path(state.definition_id),
+                    crate::app::StartupListIntent::ExplicitList,
                 ))
             }
             super::top_level_grid_view::SmartFolderParentTarget::Folder(path) => {
-                Some(crate::ui_main::AddressBarNav::Direct(path))
+                Some(crate::ui_main::AddressBarNav::Direct(
+                    path,
+                    crate::app::StartupListIntent::ExplicitList,
+                ))
             }
         }
     }
@@ -8141,6 +8225,7 @@ impl App {
         else {
             return false;
         };
+        self.capture_main_list_restore_cursor();
         if !self.resident_smart_root_restore_is_exact(&definition) {
             let state = self
                 .top_level_grid_view
@@ -9387,6 +9472,8 @@ mod tests {
         let request_id = app.smart_folder_transition_sequence.wrapping_add(1);
         app.smart_folder_transition_sequence = request_id;
         app.smart_folder_transition = Some(SmartFolderTransition {
+            restore_intent: super::StartupListIntent::ExplicitList,
+
             request_id,
             source: lease,
             intent: SmartTransitionIntent::Direct(
@@ -9423,7 +9510,12 @@ mod tests {
         app.settings
             .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
         assert_eq!(
-            app.route_pdf_open_failure(owner.clone(), &path, PdfOpenFailure::NotConverted),
+            app.route_pdf_open_failure(
+                owner.clone(),
+                &path,
+                PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
             PdfOpenFailureRoute::ConversionDialogOpened,
         );
         (path, owner)
@@ -9558,6 +9650,7 @@ mod tests {
             false,
             super::OpenPathKind::File,
             None,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         let transition = app.smart_folder_transition.as_mut().unwrap();
         let request_id = transition.request_id;
@@ -9687,6 +9780,7 @@ mod tests {
                 crate::app::OpenRequestOwner::Navigation,
                 &next,
                 crate::app::PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             crate::app::PdfOpenFailureRoute::ConversionDialogOpened,
         );

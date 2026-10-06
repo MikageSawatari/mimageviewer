@@ -26,6 +26,11 @@ mod mipmap;
 mod renderer;
 
 mod setup;
+mod startup_diagnostics;
+pub use startup_diagnostics::{
+    RootStartupFrameTag, StartupDiagnosticEvent, StartupDiagnosticsCallback, StartupGpuStage,
+    set_root_startup_frame_tag, take_root_startup_frame_tag,
+};
 
 pub use mipmap::{MipmapGenerator, mip_chain_texel_count, mip_level_count};
 pub use renderer::*;
@@ -183,13 +188,16 @@ impl RenderState {
         // This is always an empty list on web.
         #[cfg(not(target_arch = "wasm32"))]
         let available_adapters = {
+            config.startup_begin(StartupGpuStage::AdapterEnumeration);
             let backends = if let WgpuSetup::CreateNew(create_new) = &config.wgpu_setup {
                 create_new.instance_descriptor.backends
             } else {
                 wgpu::Backends::all()
             };
 
-            instance.enumerate_adapters(backends)
+            let adapters = instance.enumerate_adapters(backends);
+            config.startup_end(StartupGpuStage::AdapterEnumeration, true);
+            adapters
         };
 
         let (adapter, device, queue) = match config.wgpu_setup.clone() {
@@ -199,7 +207,8 @@ impl RenderState {
                 native_adapter_selector: _native_adapter_selector,
                 device_descriptor,
             }) => {
-                let adapter = {
+                config.startup_begin(StartupGpuStage::AdapterSelection);
+                let adapter_result = {
                     #[cfg(target_arch = "wasm32")]
                     {
                         request_adapter(instance, power_preference, compatible_surface, &[]).await
@@ -217,13 +226,22 @@ impl RenderState {
                         )
                         .await
                     }
-                }?;
+                };
+                config.startup_end(StartupGpuStage::AdapterSelection, adapter_result.is_ok());
+                let adapter = adapter_result?;
+                if config.startup_diagnostics.is_some() {
+                    config
+                        .startup_event(StartupDiagnosticEvent::AdapterSelected(adapter.get_info()));
+                }
 
                 let (device, queue) = {
                     profiling::scope!("request_device");
-                    adapter
+                    config.startup_begin(StartupGpuStage::Device);
+                    let result = adapter
                         .request_device(&(*device_descriptor)(&adapter))
-                        .await?
+                        .await;
+                    config.startup_end(StartupGpuStage::Device, result.is_ok());
+                    result?
                 };
 
                 (adapter, device, queue)
@@ -238,14 +256,28 @@ impl RenderState {
 
         let surface_formats = {
             profiling::scope!("get_capabilities");
-            compatible_surface.map_or_else(
+            let formats = compatible_surface.map_or_else(
                 || vec![wgpu::TextureFormat::Rgba8Unorm],
-                |s| s.get_capabilities(&adapter).formats,
-            )
+                |s| {
+                    config.startup_begin(StartupGpuStage::SurfaceCapabilities);
+                    let formats = s.get_capabilities(&adapter).formats;
+                    config.startup_end(StartupGpuStage::SurfaceCapabilities, true);
+                    formats
+                },
+            );
+            formats
         };
-        let target_format = crate::preferred_framebuffer_format(&surface_formats)?;
 
+        config.startup_begin(StartupGpuStage::PipelineCreate);
+        let target_format = match crate::preferred_framebuffer_format(&surface_formats) {
+            Ok(format) => format,
+            Err(error) => {
+                config.startup_end(StartupGpuStage::PipelineCreate, false);
+                return Err(error);
+            }
+        };
         let renderer = Renderer::new(&device, target_format, options);
+        config.startup_end(StartupGpuStage::PipelineCreate, true);
 
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.
@@ -288,6 +320,8 @@ pub enum SurfaceErrorAction {
 /// Configuration for using wgpu with eframe or the egui-wgpu winit feature.
 #[derive(Clone)]
 pub struct WgpuConfiguration {
+    /// Optional nonblocking startup observation. It must not do I/O or render.
+    pub startup_diagnostics: Option<StartupDiagnosticsCallback>,
     /// Present mode used for the primary surface.
     pub present_mode: wgpu::PresentMode,
 
@@ -320,6 +354,7 @@ impl std::fmt::Debug for WgpuConfiguration {
             desired_maximum_frame_latency,
             wgpu_setup,
             on_surface_error: _,
+            startup_diagnostics: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("present_mode", &present_mode)
@@ -335,6 +370,7 @@ impl std::fmt::Debug for WgpuConfiguration {
 impl Default for WgpuConfiguration {
     fn default() -> Self {
         Self {
+            startup_diagnostics: None,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: None,
             wgpu_setup: Default::default(),
@@ -349,6 +385,22 @@ impl Default for WgpuConfiguration {
                 SurfaceErrorAction::SkipFrame
             }),
         }
+    }
+}
+
+impl WgpuConfiguration {
+    pub(crate) fn startup_event(&self, event: StartupDiagnosticEvent) {
+        if let Some(callback) = &self.startup_diagnostics {
+            callback(event);
+        }
+    }
+
+    pub(crate) fn startup_begin(&self, stage: StartupGpuStage) {
+        self.startup_event(StartupDiagnosticEvent::Begin(stage));
+    }
+
+    pub(crate) fn startup_end(&self, stage: StartupGpuStage, success: bool) {
+        self.startup_event(StartupDiagnosticEvent::End { stage, success });
     }
 }
 

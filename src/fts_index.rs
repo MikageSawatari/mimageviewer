@@ -30,7 +30,7 @@
 //! png_prompt_text  TEXT   bigram | STORED     PNG tEXt/iTXt / EXIF UserComment AI プロンプト
 //! pdf_meta_text    TEXT   bigram | STORED     PDFium document info
 //! video_meta_text  TEXT   bigram | STORED     FFmpeg container metadata (video only)
-//! tags             TEXT   STORED              旧 XMP dc:subject 移行用 (通常検索対象外)
+//! tags             TEXT   STORED              旧タグschema互換用 (通常検索/移行対象外)
 //! sidecar_text     TEXT   bigram | STORED     外部メタデータサイドカー (JSON/TXT) の値 (image only)
 //! ```
 //!
@@ -51,6 +51,7 @@
 //! これにより新規 ingest 完了直後の検索は確実に新 snapshot を見えており、STORED 原文
 //! の post-filter で偽陽性 (古い原文が新 doc にマッチ) が起きないようにしている。
 
+use miv_startup::{Lane, Outcome, Stage, span};
 use std::path::Path;
 
 use tantivy::collector::TopDocs;
@@ -70,7 +71,7 @@ pub const PAGE_SIZE: usize = 500;
 
 /// 検索対象となるメタソース種別 (§19.2 + tag 機能統合)。
 /// `name` は独立フィールドだが、検索 UX 上「ファイル名で検索」も同じ target として扱えるよう enum に含める。
-/// `Tags` は旧 XMP dc:subject 由来の移行専用ソース。通常検索には含めない。
+/// `Tags` は旧schema互換用ソース。通常検索/移行には含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     Filename,
@@ -236,12 +237,6 @@ pub struct IndexDoc {
     pub norms: crate::ingest_text::PerSourceText,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyTagDoc {
-    pub item_key: String,
-    pub tags_column: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
     Fs,
@@ -348,45 +343,77 @@ impl FtsIndex {
     /// フィールドのどちらかが無い) が残っていたらディレクトリごと破棄して新規作成する。
     /// fts_meta.db 側の `needs_rebuild` と合わせて「起動時は自動でフル再インデックス」を実現する。
     pub fn open_at(dir: &Path) -> tantivy::Result<Self> {
-        std::fs::create_dir_all(dir).ok();
-        // 既存インデックスがあれば 1 回だけ open して schema を確認し、そのまま使い回す。
-        // 旧スキーマだったら drop して wipe + create に切り替える。
-        let mmap_dir = tantivy::directory::MmapDirectory::open(dir)?;
-        let existing = if Index::exists(&mmap_dir)? {
-            Some(Index::open_in_dir(dir)?)
-        } else {
-            None
-        };
-        drop(mmap_dir);
+        let open = span(Lane::Indexer, Stage::FtsOpen);
+        let result = (|| {
+            std::fs::create_dir_all(dir).ok();
+            // 既存インデックスがあれば 1 回だけ open して schema を確認し、そのまま使い回す。
+            // 旧スキーマだったら drop して wipe + create に切り替える。
+            let mmap_dir = tantivy::directory::MmapDirectory::open(dir)?;
+            let existing = if Index::exists(&mmap_dir)? {
+                Some(Index::open_in_dir(dir)?)
+            } else {
+                None
+            };
+            drop(mmap_dir);
 
-        let recreated_on_open = existing
-            .as_ref()
-            .is_none_or(|idx| schema_is_stale(&idx.schema()));
-        let index = match existing {
-            Some(idx) if schema_is_stale(&idx.schema()) => {
-                drop(idx);
-                crate::logger::log(format!(
-                    "fts_index: detected old schema at {} — wiping dir for rebuild",
-                    dir.display()
-                ));
-                wipe_index_dir(dir)?;
-                Index::create_in_dir(dir, build_schema())?
-            }
-            Some(idx) => idx,
-            None => Index::create_in_dir(dir, build_schema())?,
-        };
-        register_tokenizer(&index);
-        let reader = index
-            .reader_builder()
-            .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
-        let fields = Fields::from_schema(&index.schema());
-        Ok(Self {
-            index,
-            reader,
-            fields,
-            recreated_on_open,
-        })
+            let recreated_on_open = existing
+                .as_ref()
+                .is_none_or(|idx| schema_is_stale(&idx.schema()));
+            let index = match existing {
+                Some(idx) if schema_is_stale(&idx.schema()) => {
+                    drop(idx);
+                    crate::logger::log(format!(
+                        "fts_index: detected old schema at {} — wiping dir for rebuild",
+                        dir.display()
+                    ));
+                    let recreate = span(Lane::Indexer, Stage::FtsSchemaRecreate);
+                    let result = wipe_index_dir(dir)
+                        .and_then(|()| Index::create_in_dir(dir, build_schema()));
+                    recreate.finish(if result.is_ok() {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Error
+                    });
+                    result?
+                }
+                Some(idx) => idx,
+                None => {
+                    let create = span(Lane::Indexer, Stage::FtsSchemaRecreate);
+                    let result = Index::create_in_dir(dir, build_schema());
+                    create.finish(if result.is_ok() {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Error
+                    });
+                    result?
+                }
+            };
+            register_tokenizer(&index);
+            let reader_span = span(Lane::Indexer, Stage::FtsReader);
+            let reader_result: tantivy::Result<IndexReader> = index
+                .reader_builder()
+                .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+                .try_into();
+            reader_span.finish(if reader_result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            });
+            let reader = reader_result?;
+            let fields = Fields::from_schema(&index.schema());
+            Ok(Self {
+                index,
+                reader,
+                fields,
+                recreated_on_open,
+            })
+        })();
+        open.finish(if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        result
     }
 
     /// 新規作成・schema 再構築を同じ起動の省略判断へ渡す。
@@ -404,7 +431,14 @@ impl FtsIndex {
 
     /// 新しい `IndexWriter` を確保する (heap 64MB)。ingest worker が保有・1 本に固定する。
     pub fn writer(&self) -> tantivy::Result<IndexWriter> {
-        self.index.writer(WRITER_HEAP_MB * 1024 * 1024)
+        let writer_span = span(Lane::Indexer, Stage::FtsWriter);
+        let result = self.index.writer(WRITER_HEAP_MB * 1024 * 1024);
+        writer_span.finish(if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        result
     }
 
     /// Searcher を取得 (§9.1 ステップ 4 の snapshot 固定用)。
@@ -620,8 +654,7 @@ pub fn search_page(
 }
 
 /// `path` で Tantivy doc を 1 件引いてその `DocAddress` を返す。
-/// タグ書き込み worker が「既存 doc に tags だけ差し替えて upsert する」ために使う。
-/// ヒットしなければ None (まだ ingest が未完了 / pending → 通常経路に任せる)。
+/// ヒットしなければ None。通常タグwriterはtags.dbのみを書き、このhelperを使わない。
 pub fn find_doc_by_path(
     searcher: &tantivy::Searcher,
     fields: &Fields,
@@ -635,8 +668,8 @@ pub fn find_doc_by_path(
 }
 
 /// 指定 doc の STORED `*_text` 全ソースを `PerSourceText` に詰めて返す。
-/// `tag_write_worker` が「他ソースの text を保ったまま tags だけ差し替えて upsert」
-/// するのに使う (INDEX_VERSION=5 以降は fts_meta.db に norms が無いため)。
+/// INDEX_VERSION=5以降はfts_meta.dbにnormsが無いため、原文はTantivyから取得する。
+/// 通常タグwriterはtags.dbのみを書き、このhelperを使わない。
 pub fn doc_per_source_text(
     searcher: &tantivy::Searcher,
     fields: &Fields,
@@ -659,63 +692,6 @@ pub fn doc_per_source_text(
         tags: read(fields.tags),
         sidecar: read(fields.sidecar_text),
     })
-}
-
-/// 旧 Tantivy STORED `tags` フィールドから、mIV 旧タグ移行用の行を読む。
-///
-/// 通常検索には使わない。`SourceKind::Tags` を閉じたまま、起動時の一括移行だけが
-/// `#タグ` 列を tags.db へコピーするための read-only helper。
-pub fn collect_legacy_tag_docs_at(dir: &Path) -> tantivy::Result<Vec<LegacyTagDoc>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mmap_dir = tantivy::directory::MmapDirectory::open(dir)?;
-    let exists = Index::exists(&mmap_dir)?;
-    drop(mmap_dir);
-    if !exists {
-        return Ok(Vec::new());
-    }
-    let index = Index::open_in_dir(dir)?;
-    collect_legacy_tag_docs_from_index(&index)
-}
-
-fn collect_legacy_tag_docs_from_index(index: &Index) -> tantivy::Result<Vec<LegacyTagDoc>> {
-    let schema = index.schema();
-    let Ok(path_field) = schema.get_field("path") else {
-        return Ok(Vec::new());
-    };
-    let Ok(tags_field) = schema.get_field("tags") else {
-        return Ok(Vec::new());
-    };
-    if !stored_text_field(&schema, path_field) || !stored_text_field(&schema, tags_field) {
-        return Ok(Vec::new());
-    }
-
-    let reader = index.reader()?;
-    let searcher = reader.searcher();
-    let mut out = Vec::new();
-    for segment_reader in searcher.segment_readers() {
-        let store = segment_reader.get_store_reader(64)?;
-        for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
-            let doc = doc?;
-            let read = |f: Field| -> String {
-                doc.get_first(f)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            };
-            let item_key = read(path_field);
-            let tags_column = read(tags_field);
-            if item_key.is_empty() || tags_column.trim().is_empty() {
-                continue;
-            }
-            out.push(LegacyTagDoc {
-                item_key,
-                tags_column,
-            });
-        }
-    }
-    Ok(out)
 }
 
 /// STORED フィールドから target に対応するテキストをスペース連結で取り出す
@@ -829,11 +805,6 @@ fn schema_is_stale(schema: &Schema) -> bool {
     false
 }
 
-fn stored_text_field(schema: &Schema, field: Field) -> bool {
-    let entry = schema.get_field_entry(field);
-    matches!(entry.field_type(), FieldType::Str(opts) if opts.is_stored())
-}
-
 /// ディレクトリ配下のファイルを全削除してから、ディレクトリ自体も再作成する。
 /// Tantivy が内部的に持つ .lock / meta.json / segments を一掃するため。
 fn wipe_index_dir(dir: &Path) -> tantivy::Result<()> {
@@ -882,7 +853,7 @@ fn build_schema() -> Schema {
     // 外部メタデータサイドカー (JSON/TXT) の値テキスト (INDEX_VERSION=8)。bigram + STORED。
     // mIV タグとは別系統の読み取り専用フリーテキスト (docs/sidecar-metadata-ingest.md)。
     b.add_text_field("sidecar_text", text_opts.clone());
-    // 旧タグ移行用に STORED 原文を残す。通常検索対象には含めない。
+    // 旧schema互換用に STORED fieldを残す。通常検索/旧タグ移行には使わない。
     b.add_text_field("tags", text_opts);
     b.build()
 }
@@ -998,36 +969,6 @@ mod tests {
 
     fn q_all(fields: &Fields, tokens: &[&str]) -> Option<BooleanQuery> {
         build_bigram_and_query(fields, tokens, &QueryFilters::default())
-    }
-
-    #[test]
-    fn collect_legacy_tag_docs_reads_stored_tags_only() {
-        let (dir, idx) = new_index();
-        let fav = Uuid::new_v4();
-        let mut writer = idx.writer().unwrap();
-        upsert_doc(
-            &writer,
-            idx.fields(),
-            &sample_doc_with_tags("c:/a.jpg", fav, "#原神 external #風景"),
-        )
-        .unwrap();
-        upsert_doc(
-            &writer,
-            idx.fields(),
-            &sample_doc_with_tags("c:/b.jpg", fav, ""),
-        )
-        .unwrap();
-        writer.commit().unwrap();
-        idx.reload_reader().unwrap();
-
-        let docs = collect_legacy_tag_docs_at(dir.path()).unwrap();
-        assert_eq!(
-            docs,
-            vec![LegacyTagDoc {
-                item_key: "c:/a.jpg".to_string(),
-                tags_column: "#原神 external #風景".to_string(),
-            }]
-        );
     }
 
     #[test]

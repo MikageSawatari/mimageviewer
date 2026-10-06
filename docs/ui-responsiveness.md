@@ -8,6 +8,14 @@ UI スレッドをブロックしないための設計方針と、2026-04 の Ct
 - [async-architecture.md](async-architecture.md) §5 よくある事故パターン (並列処理のアンチパターン)
 - [async-architecture.md](async-architecture.md) §7 perf.rs 計装の使い方
 
+§1.241 Phase AではIndexer初期化の全面overlayを5秒に制限し、以降は通常UIに
+「検索の準備中」を表示する。同じworkerの遅い結果は外側root pollで一度だけ採用する。
+Ctrl+Gは最新入力を保持して準備完了後に既存debounceへ戻り、Ctrl+S/F、タグ、
+smart folder、collection、Remoteは各serviceの既存readinessを保つ。
+overlayの段階名と経過時間は常時timelineのmemory snapshotを使う。
+初期フォルダの同期解決・走査は§1.335統合後のPhase Bで移すため、Phase Aだけでは
+その同期停止を解消したとは扱わない。GPU driver内の停止も診断だけで、backend fallbackは別設計。
+
 ---
 
 ## 1. 原則: UI スレッドで避けるべき処理

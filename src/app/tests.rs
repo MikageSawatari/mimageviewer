@@ -24,8 +24,9 @@ mod file_organize_tests {
         let history = app.folder_nav_history_snapshot();
         assert!(
             app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
-                destination.clone()
-            ),)
+                destination.clone(),
+                crate::app::StartupListIntent::ExplicitList,
+            ))
         );
         assert_eq!(app.current_folder.as_ref(), Some(&destination));
         assert!(app.top_level_grid_view.open_path_classification().is_none());
@@ -1606,7 +1607,8 @@ fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
         assert!(app.load_folder_with_scan_owned(
             path,
             None,
-            OpenRequestOwner::RatingPhysical(owner)
+            OpenRequestOwner::RatingPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
         ));
     }
     let future = app.tmp.path().join("future");
@@ -1881,7 +1883,7 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
     let mut nav = metadata_panel_test_zip_nav(zip, &["chapter/a.jpg", "chapter/b.jpg"]);
     nav.enter("chapter/");
     app.zip_nav = Some(nav);
-    app.zip_nav_show_current_level();
+    app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
     app.selected = Some(1);
     app.scroll_offset_y = 53.0;
     app.checked.insert(1);
@@ -2308,7 +2310,11 @@ fn epub_d10_off_pdf_open_policy_skips_spread_lookup() {
     app.settings.follow_document_reading_direction = false;
     app.spread_db = Err("この経路では参照しない".into());
     assert_eq!(
-        app.load_pdf_as_folder_owned(pdf.to_path_buf(), OpenRequestOwner::Navigation),
+        app.load_pdf_as_folder_owned(
+            pdf.to_path_buf(),
+            OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         FolderOpenOutcome::Loaded
     );
     assert!(
@@ -2353,7 +2359,8 @@ fn epub_modal_rejects_second_direct_open_and_cancel_restores_history() {
         app.route_pdf_open_failure(
             OpenRequestOwner::Navigation,
             old,
-            PdfOpenFailure::NotConverted
+            PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened
     );
@@ -2368,7 +2375,11 @@ fn epub_modal_rejects_second_direct_open_and_cancel_restores_history() {
     });
     app.fs_nav_locked_gen = Some(7);
     assert_eq!(
-        app.load_pdf_as_folder_owned(new.to_path_buf(), OpenRequestOwner::Navigation),
+        app.load_pdf_as_folder_owned(
+            new.to_path_buf(),
+            OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         FolderOpenOutcome::Ignored
     );
     assert_eq!(app.epub_convert.as_ref().unwrap().src_path, old);
@@ -2400,7 +2411,11 @@ fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
     let mut app = setup_app_for_test();
     let other = PathBuf::from("C:/books/current.pdf");
     assert_eq!(
-        app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation),
+        app.load_pdf_as_folder_owned(
+            other.clone(),
+            OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         FolderOpenOutcome::Loaded
     );
     let path = PathBuf::from("C:/books/stale.epub");
@@ -2421,6 +2436,7 @@ fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
             crate::epub_cache::PublishOutcome::Published,
             app.top_level_grid_view.generation(),
             app.smart_folder_transition_sequence,
+            crate::app::StartupListIntent::ExplicitList,
         ),
     );
     let ctx = egui::Context::default();
@@ -2442,6 +2458,7 @@ fn epub_navigation_published_after_collection_root_open_cannot_replace_root() {
             OpenRequestOwner::Navigation,
             &path,
             PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
@@ -2481,7 +2498,8 @@ fn epub_modal_blocks_collection_navigation_and_preserves_back_history() {
         app.route_pdf_open_failure(
             OpenRequestOwner::Navigation,
             &epub,
-            PdfOpenFailure::NotConverted
+            PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
@@ -2524,6 +2542,7 @@ fn epub_modal_blocks_smart_root_request_until_cancel() {
             OpenRequestOwner::Navigation,
             &path,
             PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
@@ -2556,7 +2575,8 @@ fn epub_modal_blocks_pane_scan_until_cancel() {
         app.route_pdf_open_failure(
             OpenRequestOwner::Navigation,
             &epub,
-            PdfOpenFailure::NotConverted
+            PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
@@ -2628,6 +2648,7 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
             OpenRequestOwner::Navigation,
             &epub,
             PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
@@ -2700,6 +2721,7 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
             OpenRequestOwner::Navigation,
             &epub,
             PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
@@ -2758,6 +2780,7 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
             resolved.path,
             Some(resolved.scan),
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         app.finish_pane_open_restore(resolved.epub_restore.take(), PaneOpenRestoreExit::Adopted);
         assert_eq!(app.current_folder.as_deref(), Some(c.as_path()));
@@ -2797,7 +2820,11 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
     let mut app = setup_app_for_test();
     let other = PathBuf::from("C:/books/current.pdf");
     assert_eq!(
-        app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation),
+        app.load_pdf_as_folder_owned(
+            other.clone(),
+            OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         FolderOpenOutcome::Loaded
     );
     let path = PathBuf::from("C:/books/stale.epub");
@@ -2830,6 +2857,7 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         crate::epub_cache::PublishOutcome::Published,
         app.top_level_grid_view.generation(),
         app.smart_folder_transition_sequence,
+        crate::app::StartupListIntent::ExplicitList,
     );
     state.open_restore.history = Some(app.folder_nav_history_snapshot());
     state.deferred_fullscreen = Some(DeferredFsReopen {
@@ -2862,19 +2890,29 @@ fn epub_failure_route_preserves_owner_and_uses_epub_handling_policy() {
         .set_archive_file_handling(ArchiveFileHandling::Convert);
     app.settings.epub_file_handling = EpubFileHandling::Ignore;
     assert_eq!(
-        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
+        app.route_pdf_open_failure(
+            owner.clone(),
+            path,
+            PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         PdfOpenFailureRoute::Handled
     );
     assert!(app.epub_convert.is_none());
 
     app.settings.epub_file_handling = EpubFileHandling::Ask;
     assert_eq!(
-        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
+        app.route_pdf_open_failure(
+            owner.clone(),
+            path,
+            PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         PdfOpenFailureRoute::ConversionDialogOpened
     );
     let state = app.epub_convert.take().unwrap();
     assert!(matches!(state.continuation,
-        crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct(ref actual)
+        crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct { owner: ref actual, .. }
             if actual == &owner));
     assert_eq!(state.src_path, path);
     assert!(matches!(state.phase, EpubConvertPhase::Scanning));
@@ -2882,12 +2920,17 @@ fn epub_failure_route_preserves_owner_and_uses_epub_handling_policy() {
 
     app.settings.epub_file_handling = EpubFileHandling::Convert;
     assert_eq!(
-        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
+        app.route_pdf_open_failure(
+            owner.clone(),
+            path,
+            PdfOpenFailure::NotConverted,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         PdfOpenFailureRoute::ConversionDialogOpened
     );
     let state = app.epub_convert.take().unwrap();
     assert!(matches!(state.continuation,
-        crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct(ref actual)
+        crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct { owner: ref actual, .. }
             if actual == &owner));
     assert!(matches!(state.phase, EpubConvertPhase::Converting(_)));
     drop(state);
@@ -2900,17 +2943,28 @@ fn epub_failure_route_preserves_owner_and_uses_epub_handling_policy() {
         app.route_pdf_open_failure(
             owner.clone(),
             path,
-            PdfOpenFailure::EpubUnavailable("起動時の確認に失敗".into())
+            PdfOpenFailure::EpubUnavailable("起動時の確認に失敗".into()),
+            crate::app::StartupListIntent::ExplicitList,
         ),
         PdfOpenFailureRoute::Handled
     );
     assert!(app.epub_convert.is_none());
     assert_eq!(
-        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::PasswordRequired),
+        app.route_pdf_open_failure(
+            owner.clone(),
+            path,
+            PdfOpenFailure::PasswordRequired,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         PdfOpenFailureRoute::Unhandled
     );
     assert_eq!(
-        app.route_pdf_open_failure(owner, path, PdfOpenFailure::Other("test".into())),
+        app.route_pdf_open_failure(
+            owner,
+            path,
+            PdfOpenFailure::Other("test".into()),
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         PdfOpenFailureRoute::Unhandled
     );
 }
@@ -2921,7 +2975,12 @@ fn epub_ignore_rejects_direct_open_before_pdf_cache_lookup() {
     let source = app.tmp.path().join("cached-book.epub");
     std::fs::write(&source, b"book").unwrap();
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
-    assert!(app.load_folder_with_scan_owned(source, None, OpenRequestOwner::Navigation));
+    assert!(app.load_folder_with_scan_owned(
+        source,
+        None,
+        OpenRequestOwner::Navigation,
+        crate::app::StartupListIntent::ExplicitList,
+    ));
     app.settle_open_path_classification_for_test();
     assert!(app.pdf_enumerate_pending.is_none());
     assert!(app.epub_convert.is_none());
@@ -2956,7 +3015,14 @@ fn ignored_epub_in_stale_search_view_does_not_advance_normal_navigation() {
         ))
     );
 
-    app.open_direct_navigation_target(epub.clone(), None, OpenRequestOwner::Navigation, None, None);
+    app.open_direct_navigation_target(
+        epub.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        crate::app::StartupListIntent::ExplicitList,
+    );
     app.settle_open_path_classification_for_test();
 
     assert_eq!(
@@ -3006,6 +3072,7 @@ fn ignored_epub_grid_preflight_preserves_reading_history_return() {
             epub,
             false,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         FolderOpenOutcome::Classifying
     );
@@ -3034,6 +3101,7 @@ fn ignored_epub_stale_tile_that_became_directory_is_not_refused() {
         path.clone(),
         false,
         OpenRequestOwner::Navigation,
+        crate::app::StartupListIntent::ExplicitList,
     );
     assert_eq!(outcome, FolderOpenOutcome::Classifying);
     let ctx = egui::Context::default();
@@ -3064,6 +3132,7 @@ fn listed_epub_directory_opens_as_folder_under_ignore() {
             child.clone(),
             false,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         FolderOpenOutcome::Classifying
     );
@@ -3092,6 +3161,7 @@ fn archive_suffix_directories_open_as_folders_under_ignore() {
                 child.clone(),
                 false,
                 OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             FolderOpenOutcome::Classifying
         );
@@ -3112,7 +3182,11 @@ fn ignored_archive_file_does_not_retire_pending_direct_pdf_owner() {
     std::fs::write(&ignored, b"RAR").unwrap();
     app.load_folder(root);
     assert_eq!(
-        app.load_pdf_as_folder_owned(source.clone(), OpenRequestOwner::Navigation),
+        app.load_pdf_as_folder_owned(
+            source.clone(),
+            OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        ),
         FolderOpenOutcome::Loaded
     );
     let address = app.address.clone();
@@ -3129,6 +3203,7 @@ fn ignored_archive_file_does_not_retire_pending_direct_pdf_owner() {
             ignored,
             false,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         FolderOpenOutcome::Classifying
     );
@@ -3176,7 +3251,11 @@ fn accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it() 
         replay: None,
         auto_fullscreen: false,
     };
-    assert!(app.start_physical_history_transition(intent, epub.clone()));
+    assert!(app.start_physical_history_transition(
+        intent,
+        epub.clone(),
+        crate::app::StartupListIntent::ExplicitList,
+    ));
     app.settle_open_path_classification_for_test();
     assert!(app.folder_nav_pending.is_some());
     assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -3188,7 +3267,11 @@ fn accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it() 
         replay: None,
         auto_fullscreen: false,
     };
-    assert!(app.start_physical_history_transition(intent, epub));
+    assert!(app.start_physical_history_transition(
+        intent,
+        epub,
+        crate::app::StartupListIntent::ExplicitList,
+    ));
     app.settle_open_path_classification_for_test();
     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(app.folder_nav_pending.is_none());
@@ -3218,6 +3301,7 @@ fn newer_open_classification_cancels_old_result_without_adopting_it() {
             first.clone(),
             false,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         FolderOpenOutcome::Classifying
     );
@@ -3237,6 +3321,7 @@ fn newer_open_classification_cancels_old_result_without_adopting_it() {
             second.clone(),
             false,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ),
         FolderOpenOutcome::Classifying
     );
@@ -3281,7 +3366,14 @@ fn ignored_convertible_archives_in_stale_search_view_keep_normal_navigation() {
         app.settings
             .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
 
-        app.open_direct_navigation_target(archive, None, OpenRequestOwner::Navigation, None, None);
+        app.open_direct_navigation_target(
+            archive,
+            None,
+            OpenRequestOwner::Navigation,
+            None,
+            None,
+            crate::app::StartupListIntent::ExplicitList,
+        );
         app.settle_open_path_classification_for_test();
         assert!(
             app.top_level_grid_view
@@ -3316,7 +3408,12 @@ fn epub_openable_path_uses_staged_pdf_preflight() {
     std::fs::write(&source, b"not converted yet").unwrap();
     let resolved = crate::folder_tree::resolve_openable_path_detailed(&source).unwrap();
     assert_eq!(resolved.path, source);
-    assert!(app.load_folder_with_scan_owned(source.clone(), None, OpenRequestOwner::Navigation));
+    assert!(app.load_folder_with_scan_owned(
+        source.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        crate::app::StartupListIntent::ExplicitList,
+    ));
     app.settle_open_path_classification_for_test();
     assert!(
         matches!(app.top_level_grid_view.history_navigation_transition(),
@@ -3558,6 +3655,8 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
         }),
         super::PdfOpenPhase::ColdCandidate {
             retained_source: None,
+
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
         },
         crate::pdf_loader::LeasedEpubPath::try_new(source.clone()).unwrap(),
     ));
@@ -3566,7 +3665,10 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
     assert_eq!(state.src_path, source);
     assert!(matches!(
         state.continuation,
-        crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct(OpenRequestOwner::Navigation)
+        crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct {
+            owner: OpenRequestOwner::Navigation,
+            ..
+        }
     ));
     assert!(state.open_restore.history.is_some());
     let ctx = egui::Context::default();
@@ -6084,7 +6186,7 @@ fn phase_b_reading_history_opened_zip_resolves_masked_member_before_paint() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     app.note_reading_history_open(0);
-    app.load_zip_as_folder(archive.clone());
+    app.load_zip_as_folder(archive.clone(), crate::app::StartupListIntent::ExplicitList);
     for _ in 0..100 {
         app.poll_zip_enumerate();
         app.poll_sidecar_restore(&ctx);
@@ -6212,6 +6314,7 @@ fn epub_single_save_modal_blocks_grid_keyboard() {
         crate::epub_cache::PublishOutcome::Published,
         app.top_level_grid_view.generation(),
         app.smart_folder_transition_sequence,
+        crate::app::StartupListIntent::ExplicitList,
     );
     state.phase = crate::ui_dialogs::epub_convert::EpubConvertPhase::Saving(None);
     app.epub_convert = Some(state);
@@ -12546,7 +12649,14 @@ pub(crate) mod phase_c_support {
                 return false;
             };
             self.app
-                .begin_smart_physical_navigation(path.to_path_buf(), kind, false, None, None)
+                .begin_smart_physical_navigation(
+                    path.to_path_buf(),
+                    kind,
+                    false,
+                    None,
+                    None,
+                    crate::app::StartupListIntent::ExplicitList,
+                )
                 .is_ok()
         }
 
@@ -12826,10 +12936,10 @@ mod paused_similar_feature_tests {
         app.kick_off_startup_init();
         wait_until("ordinary startup index manager did not complete", || {
             app.poll_startup_init();
-            app.startup_done
+            app.indexer_init.is_terminal()
         });
         assert!(
-            app.indexer_manager.is_some(),
+            app.indexer_init.is_some(),
             "paused Similar must not disable the ordinary metadata/name index manager"
         );
         assert!(app.similar_index.is_none());
@@ -12901,15 +13011,16 @@ mod paused_similar_feature_tests {
         // barrier itself: it panics/drops its sender before publishing a manager result.
         let (tx, rx) = mpsc::channel();
         drop(tx);
-        app.startup_init = Some(StartupInitPending {
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
-        app.startup_done = false;
         app.poll_startup_init();
-        assert!(app.startup_done);
-        assert!(app.indexer_manager.is_none());
+        assert!(app.indexer_init.is_terminal());
+        assert!(app.indexer_init.is_none());
         wait_until(
             "disconnected startup did not release the initial Full",
             || {
@@ -12956,17 +13067,18 @@ mod paused_similar_feature_tests {
                 .to_string(),
         })
         .unwrap();
-        app.startup_init = Some(StartupInitPending {
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
             started_at: std::time::Instant::now(),
             full_check_requested: false,
+            #[cfg(test)]
+            disposal_witness: None,
         });
-        app.startup_done = false;
 
         app.poll_startup_init();
-        assert!(app.startup_done);
-        assert!(app.startup_init.is_none());
-        assert!(app.indexer_manager.is_none());
+        assert!(app.indexer_init.is_terminal());
+        assert!(app.indexer_init.pending().is_none());
+        assert!(app.indexer_init.is_none());
         assert_eq!(
             app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
             Some("全文検索索引を再構築できませんでした。次回起動時に再試行します")
@@ -13112,6 +13224,7 @@ mod startup_open_path_resolve_tests {
                 OpenRequestOwner::Navigation,
                 &epub,
                 PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             PdfOpenFailureRoute::ConversionDialogOpened
         );
@@ -13251,7 +13364,12 @@ mod startup_open_path_resolve_tests {
                 let address = app.address.clone();
                 let before = app.folder_nav_history_snapshot();
                 let source = app.folder_nav_current_target();
-                assert!(app.load_folder_with_scan_owned(epub.clone(), None, owner));
+                assert!(app.load_folder_with_scan_owned(
+                    epub.clone(),
+                    None,
+                    owner,
+                    crate::app::StartupListIntent::ExplicitList,
+                ));
                 app.settle_open_path_classification_for_test();
                 if conversion_started {
                     // The lib executable has no PDF worker child. Deliver its typed NotConverted
@@ -13275,6 +13393,7 @@ mod startup_open_path_resolve_tests {
                             auto_fullscreen: false,
                         },
                         staged.clone(),
+                        crate::app::StartupListIntent::ExplicitList,
                     ));
                     assert!(app.epub_convert.is_some());
                     app.finish_epub_convert(
@@ -13290,6 +13409,7 @@ mod startup_open_path_resolve_tests {
                         auto_fullscreen: false,
                     },
                     staged,
+                    crate::app::StartupListIntent::ExplicitList,
                 ));
                 assert!(app.epub_convert.is_none());
                 assert!(app.pdf_enumerate_pending.is_none());
@@ -13459,6 +13579,7 @@ mod startup_open_path_resolve_tests {
                     OpenRequestOwner::Navigation,
                     &epub_for_owner,
                     super::PdfOpenFailure::NotConverted,
+                    crate::app::StartupListIntent::ExplicitList,
                 ),
                 super::PdfOpenFailureRoute::ConversionDialogOpened
             );
@@ -13526,6 +13647,7 @@ mod startup_open_path_resolve_tests {
                     OpenRequestOwner::Navigation,
                     &epub,
                     super::PdfOpenFailure::NotConverted,
+                    crate::app::StartupListIntent::ExplicitList,
                 ),
                 super::PdfOpenFailureRoute::ConversionDialogOpened
             );
@@ -13564,6 +13686,7 @@ mod startup_open_path_resolve_tests {
                     OpenRequestOwner::Navigation,
                     &epub,
                     super::PdfOpenFailure::NotConverted,
+                    crate::app::StartupListIntent::ExplicitList,
                 ),
                 super::PdfOpenFailureRoute::ConversionDialogOpened
             );
@@ -13675,6 +13798,7 @@ mod startup_open_path_resolve_tests {
                             auto_fullscreen: false,
                         },
                         target,
+                        crate::app::StartupListIntent::ExplicitList,
                     ));
                     assert!(
                         app.top_level_grid_view
@@ -13685,7 +13809,11 @@ mod startup_open_path_resolve_tests {
                 "pdf" => {
                     std::fs::write(&target, b"%PDF-1.4\n").unwrap();
                     assert!(matches!(
-                        app.load_pdf_as_folder_owned(target, OpenRequestOwner::Navigation),
+                        app.load_pdf_as_folder_owned(
+                            target,
+                            OpenRequestOwner::Navigation,
+                            crate::app::StartupListIntent::ExplicitList,
+                        ),
                         FolderOpenOutcome::Loaded
                     ));
                     assert!(app.pdf_enumerate_pending.is_some());
@@ -13698,6 +13826,8 @@ mod startup_open_path_resolve_tests {
                         input_seq: app.input_seq,
                         cancel: std::sync::Arc::clone(&cancel),
                         rx,
+
+                        restore_intent: crate::app::StartupListIntent::ExplicitList,
                     });
                     app.pause_mounted_background_work_keep_current_frame();
                     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -13826,6 +13956,7 @@ mod startup_open_path_resolve_tests {
                 #[cfg(windows)]
                 detached_lease: None,
             }),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
         assert_eq!(app.address, pdf.to_string_lossy());
@@ -13887,6 +14018,7 @@ mod startup_open_path_resolve_tests {
                     #[cfg(windows)]
                     detached_lease: None,
                 }),
+                crate::app::StartupListIntent::ExplicitList,
             ));
             assert!(app.pdf_enumerate_pending.is_some());
             assert!(matches!(
@@ -13919,6 +14051,7 @@ mod startup_open_path_resolve_tests {
                     auto_fullscreen: false,
                 },
                 staged,
+                crate::app::StartupListIntent::ExplicitList,
             ));
             assert!(app.pdf_enumerate_pending.is_some());
             if fail_preflight {
@@ -13989,7 +14122,11 @@ mod startup_open_path_resolve_tests {
             );
             app.load_folder(folder);
             assert_eq!(
-                app.load_pdf_as_folder_owned(pdf.clone(), OpenRequestOwner::Navigation),
+                app.load_pdf_as_folder_owned(
+                    pdf.clone(),
+                    OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::ExplicitList,
+                ),
                 FolderOpenOutcome::Loaded
             );
             assert!(matches!(
@@ -14074,7 +14211,8 @@ mod startup_open_path_resolve_tests {
                     target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(warm.clone()),
                     #[cfg(windows)]
                     detached_lease: None,
-                })
+                }),
+                crate::app::StartupListIntent::ExplicitList,
             ));
             let rows = app.items.clone();
             let address = app.address.clone();
@@ -14085,13 +14223,18 @@ mod startup_open_path_resolve_tests {
             ));
 
             assert_eq!(
-                app.load_pdf_as_folder_owned(cold.clone(), OpenRequestOwner::Navigation),
+                app.load_pdf_as_folder_owned(
+                    cold.clone(),
+                    OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::ExplicitList,
+                ),
                 FolderOpenOutcome::Loaded
             );
             assert!(matches!(
                 app.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
                 Some(super::PdfOpenPhase::ColdCandidate {
-                    retained_source: Some(_)
+                    retained_source: Some(_),
+                    restore_intent: crate::app::StartupListIntent::ExplicitList,
                 })
             ));
             assert_eq!(app.items, rows);
@@ -14144,6 +14287,7 @@ mod startup_open_path_resolve_tests {
                 #[cfg(windows)]
                 detached_lease: None,
             }),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.items, rows);
         assert!(matches!(
@@ -14199,6 +14343,7 @@ mod startup_open_path_resolve_tests {
                 #[cfg(windows)]
                 detached_lease: None,
             }),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         app.settle_open_path_classification_for_test();
         app.pdf_enumerate_pending.as_mut().unwrap().2 =
@@ -14283,6 +14428,7 @@ mod startup_open_path_resolve_tests {
                     #[cfg(windows)]
                     detached_lease: None,
                 }),
+                crate::app::StartupListIntent::ExplicitList,
             ));
             app.pdf_enumerate_pending.as_mut().unwrap().2 =
                 crate::pdf_loader::completed_enumerate_result_handle(
@@ -14340,6 +14486,7 @@ mod startup_open_path_resolve_tests {
                             auto_fullscreen: false,
                         },
                         missing,
+                        crate::app::StartupListIntent::ExplicitList,
                     ));
                     assert!(app.pdf_password_request.is_some());
                     assert!(app.cancel_pdf_password_request_in_mounted_context());
@@ -14370,7 +14517,11 @@ mod startup_open_path_resolve_tests {
         app.pdf_password_request = Some(super::PdfPasswordRequest::legacy(prompt.clone()));
         assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
         assert_eq!(
-            app.load_pdf_as_folder_owned(other, OpenRequestOwner::Navigation),
+            app.load_pdf_as_folder_owned(
+                other,
+                OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
             FolderOpenOutcome::Ignored,
         );
         assert!(app.pdf_password_request.is_some());
@@ -14409,7 +14560,11 @@ mod startup_open_path_resolve_tests {
             });
         assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
         assert_eq!(
-            app.load_pdf_as_folder_owned(other, OpenRequestOwner::Navigation),
+            app.load_pdf_as_folder_owned(
+                other,
+                OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
             FolderOpenOutcome::Ignored
         );
         assert_eq!(app.items, rows);
@@ -14441,6 +14596,7 @@ mod startup_open_path_resolve_tests {
                 auto_fullscreen: false,
             },
             staged,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(18);
         arm_book_bookmark(&mut app, owner_id, book.clone(), std::time::Instant::now());
@@ -14453,6 +14609,7 @@ mod startup_open_path_resolve_tests {
                 #[cfg(windows)]
                 detached_lease: None,
             }),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(
             app.top_level_grid_view
@@ -14477,6 +14634,7 @@ mod startup_open_path_resolve_tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(requested).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
                 crate::bookmark_browser::BookmarkOpenRequestOwner {
@@ -14644,6 +14802,8 @@ mod startup_open_path_resolve_tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: source,
             input_seq: 0,
             format,
@@ -14678,6 +14838,8 @@ mod startup_open_path_resolve_tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: source,
             input_seq: 0,
             format: ArchiveFormat::SevenZ,
@@ -14827,6 +14989,7 @@ mod startup_open_path_resolve_tests {
         let (_resolve_tx, resolve_rx) = mpsc::channel::<StartupOpenPathResolveResult>();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(
                 app.tmp.path().join("unresolved-startup-target"),
             )
@@ -14974,6 +15137,7 @@ mod startup_open_path_resolve_tests {
             archive_b.clone(),
             false,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         );
 
         assert_eq!(outcome, FolderOpenOutcome::Classifying);
@@ -15701,6 +15865,7 @@ mod startup_open_path_resolve_tests {
         let mut app = setup_app();
         let (_tx, rx) = mpsc::channel();
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                 r"\\server\offline\book.zip",
             ))
@@ -15734,6 +15899,7 @@ mod startup_open_path_resolve_tests {
         let (_tx, rx) = mpsc::channel();
         let old_cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                 r"\\server\slow\old.zip",
             ))
@@ -16656,7 +16822,7 @@ mod phase_c_key_tests {
         let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
 
         match nav {
-            Some(crate::ui_main::AddressBarNav::Direct(path)) => assert_eq!(path, origin),
+            Some(crate::ui_main::AddressBarNav::Direct(path, _)) => assert_eq!(path, origin),
             _ => panic!("子フォルダでは BS で Ctrl+F 元フォルダへ戻れること"),
         }
     }
@@ -16697,7 +16863,7 @@ mod phase_c_key_tests {
         let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::F13);
 
         match nav {
-            Some(crate::ui_main::AddressBarNav::Direct(path)) => assert_eq!(path, origin),
+            Some(crate::ui_main::AddressBarNav::Direct(path, _)) => assert_eq!(path, origin),
             _ => panic!("custom GridParentFolder key should navigate to the parent folder"),
         }
     }
@@ -16835,6 +17001,10 @@ mod phase_c_key_tests {
         let mut settings = crate::settings::Settings {
             startup_folder_mode: crate::settings::StartupFolderMode::Previous,
             last_folder: Some(drive_list_last_folder_sentinel()),
+            startup_list_restore: Some(crate::settings::StartupListRestore::V1 {
+                target: crate::settings::StartupListTarget::DriveList,
+                cursor: None,
+            }),
             ..Default::default()
         };
         assert!(should_start_in_drive_list(&settings));
@@ -18249,8 +18419,7 @@ mod phase_c_key_tests {
         app.global_search.active = true;
         app.global_search.filters.favorite = Some(bogus);
         app.global_search.query = "x".to_string();
-        // spawn_global_search は indexer_manager が None のときに reject_message を出して早期 return するが、
-        // その前に filter の健全化は行う (コードは filter 正規化 → manager 存在確認 → spawn の順)。
+        // 準備中/利用不能でも、reject_messageで戻る前にfilterの健全化を行う。
         app.spawn_global_search(&egui::Context::default());
         assert_eq!(
             app.global_search.filters.favorite, None,
@@ -18443,6 +18612,8 @@ mod quick_folder_restart_tests {
         env.active_quick_folder_slot = None;
         env.sync_quick_folder_settings();
         env.settings.last_folder = Some(pdf.clone());
+        // Exercise the released-data migration before the ordinary startup/password route.
+        env.settings.startup_list_restore = None;
         env.settings.save();
         drop(env.app);
         env.app = App::new_from_settings(crate::settings::Settings::load());
@@ -18517,6 +18688,7 @@ mod quick_folder_restart_tests {
         env.sync_quick_folder_settings();
         env.active_quick_folder_slot = active;
         env.settings.last_folder = Some(previous.clone());
+        env.settings.startup_list_restore = None;
         env.current_folder = exiting_folder(previous);
         let before = env.quick_folder_workspaces.clone();
         env.on_exit_inner();
@@ -18750,6 +18922,7 @@ mod phase_c_folder_nav_history_tests {
             suffix_folder.clone(),
             None,
             super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(
             app.top_level_grid_view
@@ -18792,6 +18965,7 @@ mod phase_c_folder_nav_history_tests {
                 suffix_folder.clone(),
                 false,
                 super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
             );
             app.settle_open_path_classification_for_test();
             assert_eq!(app.current_folder.as_ref(), Some(&suffix_folder));
@@ -19412,6 +19586,7 @@ mod phase_c_folder_nav_history_tests {
                 auto_fullscreen: false,
             },
             epub.to_path_buf(),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         app.settle_open_path_classification_for_test();
         let request_id = match app.top_level_grid_view.history_navigation_transition() {
@@ -19601,6 +19776,7 @@ mod phase_c_folder_nav_history_tests {
                 auto_fullscreen: true,
             },
             epub.clone(),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         replace_physical_history_preflight_for_test(
             &mut app,
@@ -19646,6 +19822,7 @@ mod phase_c_folder_nav_history_tests {
                 auto_fullscreen: false
             },
             epub.clone(),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         app.settle_open_path_classification_for_test();
         assert!(app.epub_convert.is_none());
@@ -19721,6 +19898,7 @@ mod phase_c_folder_nav_history_tests {
             },
             old_state.surface_generation,
             old_state.smart_transition_sequence,
+            crate::app::StartupListIntent::ExplicitList,
         );
         saved.continuation = continuation;
         app.epub_convert = Some(saved);
@@ -19774,7 +19952,11 @@ mod phase_c_folder_nav_history_tests {
             _ => panic!("staged EPUB owner"),
         };
         assert_eq!(
-            app.load_pdf_as_folder_owned(epub.clone(), super::OpenRequestOwner::Navigation),
+            app.load_pdf_as_folder_owned(
+                epub.clone(),
+                super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
             super::FolderOpenOutcome::Ignored,
         );
         assert!(app.epub_convert.is_some());
@@ -19795,7 +19977,8 @@ mod phase_c_folder_nav_history_tests {
             app.route_pdf_open_failure(
                 super::OpenRequestOwner::Navigation,
                 &epub,
-                super::PdfOpenFailure::NotConverted
+                super::PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             super::PdfOpenFailureRoute::ConversionDialogOpened
         );
@@ -19804,7 +19987,8 @@ mod phase_c_folder_nav_history_tests {
                 replay: None,
                 auto_fullscreen: false
             },
-            epub.clone()
+            epub.clone(),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(app.epub_convert.is_some());
         assert!(app.pdf_enumerate_pending.is_none());
@@ -19820,7 +20004,7 @@ mod phase_c_folder_nav_history_tests {
 
     fn start_staged_rating_conversion_for_test(app: &mut App, source: &std::path::Path) -> u64 {
         let owner = app.rating_view_physical_load_owner(source).unwrap();
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         replace_physical_history_preflight_for_test(
             app,
             crate::app::collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired,
@@ -19871,6 +20055,7 @@ mod phase_c_folder_nav_history_tests {
                 resume_slideshow: false,
                 fullscreen: false,
             }),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         // Archive-looking suffixes are classified on a worker before the staged owner exists.
         app.settle_open_path_classification_for_test();
@@ -19901,6 +20086,7 @@ mod phase_c_folder_nav_history_tests {
             zip,
             false,
             super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         );
         assert!(
             app.top_level_grid_view
@@ -19965,6 +20151,7 @@ mod phase_c_folder_nav_history_tests {
             pdf.clone(),
             false,
             super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         );
         assert!(matches!(
             app.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
@@ -20035,6 +20222,7 @@ mod phase_c_folder_nav_history_tests {
             zip_path.clone(),
             false,
             super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         );
         assert!(
             app.top_level_grid_view
@@ -20242,6 +20430,7 @@ mod phase_c_folder_nav_history_tests {
             target.clone(),
             false,
             owner,
+            crate::app::StartupListIntent::ExplicitList,
         );
         app.settle_open_path_classification_for_test();
         finish_staged_physical_history_for_test(&mut app);
@@ -20384,6 +20573,7 @@ mod phase_c_folder_nav_history_tests {
                 auto_fullscreen: false,
             },
             winner.clone(),
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.pending_folder_nav_steps, 0);
@@ -20744,7 +20934,7 @@ mod phase_c_folder_nav_history_tests {
         let nav = app
             .resolve_return_to_parent_nav()
             .expect("override の親が取れるので Some を返す");
-        let crate::ui_main::AddressBarNav::Direct(parent) = nav else {
+        let crate::ui_main::AddressBarNav::Direct(parent, _) = nav else {
             panic!("AddressBarNav::Direct を期待");
         };
         assert_eq!(
@@ -20822,6 +21012,8 @@ mod phase_c_folder_nav_history_tests {
 
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: archive.clone(),
             input_seq: 0,
             format: ArchiveFormat::Lzh,
@@ -20885,6 +21077,8 @@ mod phase_c_folder_nav_history_tests {
 
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: archive,
             input_seq: 0,
             format: ArchiveFormat::Lzh,
@@ -20926,6 +21120,8 @@ mod phase_c_folder_nav_history_tests {
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
             input_seq: 0,
             format: ArchiveFormat::Lzh,
@@ -20974,6 +21170,8 @@ mod phase_c_folder_nav_history_tests {
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
             input_seq: 0,
             format: ArchiveFormat::Lzh,
@@ -21286,6 +21484,7 @@ mod phase_c_folder_nav_history_tests {
             folder.clone(),
             Some(scan),
             super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
 
         assert!(matches!(
@@ -21444,7 +21643,7 @@ mod phase_c_folder_nav_history_tests {
         let owner = app
             .rating_view_physical_load_owner(&missing)
             .expect("visible Rating owns a physical child open");
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         assert!(!app.grid_item_input_allowed());
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -21482,7 +21681,7 @@ mod phase_c_folder_nav_history_tests {
         finish_rating_navigation_for_test(&mut app);
         let before = app.folder_nav_history_snapshot();
         let owner = app.rating_view_physical_load_owner(&pdf).unwrap();
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         replace_physical_history_preflight_for_test(
             &mut app,
             crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired,
@@ -21523,7 +21722,7 @@ mod phase_c_folder_nav_history_tests {
         let before = app.folder_nav_history_snapshot();
 
         let owner = app.rating_view_physical_load_owner(&pdf).unwrap();
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         replace_physical_history_preflight_for_test(
             &mut app,
             crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired,
@@ -21579,7 +21778,9 @@ mod phase_c_folder_nav_history_tests {
         finish_rating_navigation_for_test(&mut app);
 
         let pdf_owner = app.rating_view_physical_load_owner(&pdf).unwrap();
-        assert!(app.start_rating_physical_open(pdf_owner));
+        assert!(
+            app.start_rating_physical_open(pdf_owner, crate::app::StartupListIntent::ExplicitList)
+        );
         replace_physical_history_preflight_for_test(
             &mut app,
             crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired,
@@ -21588,11 +21789,21 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.pdf_password_dialog_path(), Some(pdf.clone()));
 
         let winner_owner = app.rating_view_physical_load_owner(&winner).unwrap();
-        assert!(!app.start_rating_physical_open(winner_owner));
+        assert!(
+            !app.start_rating_physical_open(
+                winner_owner,
+                crate::app::StartupListIntent::ExplicitList
+            )
+        );
         assert_eq!(app.pdf_password_dialog_path(), Some(pdf.clone()));
         assert!(app.cancel_pdf_password_dialog_request());
         let winner_owner = app.rating_view_physical_load_owner(&winner).unwrap();
-        assert!(app.start_rating_physical_open(winner_owner));
+        assert!(
+            app.start_rating_physical_open(
+                winner_owner,
+                crate::app::StartupListIntent::ExplicitList
+            )
+        );
         finish_staged_physical_history_for_test(&mut app);
 
         assert_eq!(app.current_folder.as_deref(), Some(winner.as_path()));
@@ -21701,7 +21912,12 @@ mod phase_c_folder_nav_history_tests {
 
         let stale_id = start_staged_rating_conversion_for_test(&mut app, &source);
         let winner_owner = app.rating_view_physical_load_owner(&winner).unwrap();
-        assert!(app.start_rating_physical_open(winner_owner));
+        assert!(
+            app.start_rating_physical_open(
+                winner_owner,
+                crate::app::StartupListIntent::ExplicitList
+            )
+        );
         app.complete_staged_history_archive_conversion(stale_id, cached);
         finish_staged_physical_history_for_test(&mut app);
 
@@ -21775,7 +21991,9 @@ mod phase_c_folder_nav_history_tests {
         let owner_f = app
             .rating_view_physical_load_owner(&f)
             .expect("Rating root owns F");
-        assert!(app.start_rating_physical_open(owner_f));
+        assert!(
+            app.start_rating_physical_open(owner_f, crate::app::StartupListIntent::ExplicitList)
+        );
         assert_eq!(
             app.folder_history_back_target(),
             Some(&FolderNavHistoryTarget::Path(saved.clone()))
@@ -21793,7 +22011,9 @@ mod phase_c_folder_nav_history_tests {
         let owner_g = app
             .rating_view_physical_load_owner(&g)
             .expect("Rating child F owns G");
-        assert!(app.start_rating_physical_open(owner_g));
+        assert!(
+            app.start_rating_physical_open(owner_g, crate::app::StartupListIntent::ExplicitList)
+        );
         assert_eq!(app.folder_history_back_target(), Some(&rating));
         finish_staged_physical_history_for_test(&mut app);
         assert_eq!(app.current_folder.as_deref(), Some(g.as_path()));
@@ -25264,7 +25484,7 @@ mod phase_c_drill_nav_tests {
         assert!(app.use_full_path_cache_keys());
         assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
         match app.subfolder_expansion_back_nav() {
-            Some(AddressBarNav::Direct(path)) => assert_eq!(path, root),
+            Some(AddressBarNav::Direct(path, _)) => assert_eq!(path, root),
             other => panic!("expected subfolder back nav to root, got {other:?}"),
         }
     }
@@ -34439,7 +34659,7 @@ mod favorite_adjustment_defaults_tests {
         let nav = app
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become input navigation");
-        let crate::ui_main::AddressBarNav::Direct(parent) = nav else {
+        let crate::ui_main::AddressBarNav::Direct(parent, _) = nav else {
             panic!("AddressBarNav::Direct を期待");
         };
         assert_eq!(parent, std::path::PathBuf::from("c:/manga"));
@@ -34901,7 +35121,7 @@ mod favorite_adjustment_defaults_tests {
         ];
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         let names: Vec<&str> = app
             .items
@@ -35391,7 +35611,7 @@ mod favorite_adjustment_defaults_tests {
             "book-b/chapter/p010.jpg",
         ]));
         app.zip_nav.as_mut().expect("zip nav").enter("book-a/");
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         let bookmark = BookBookmark {
             id: 1,
@@ -35421,7 +35641,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(zip_path.clone());
         app.zip_nav = Some(test_zip_nav(&["cover.jpg", "chapter/001.jpg"]));
         app.zip_nav.as_mut().expect("zip nav").enter("chapter/");
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         let bookmark = BookBookmark {
             id: 1,
             container_key: crate::book_bookmarks::container_key(&zip_path),
@@ -35450,7 +35670,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(zip_path.clone());
         app.zip_nav = Some(test_zip_nav(&["cover.jpg", "chapter/001.jpg"]));
         app.zip_nav.as_mut().expect("zip nav").enter("chapter/");
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         let before_prefix = app.zip_nav.as_ref().expect("zip nav").current().to_vec();
         let before_items = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
         let bookmark = BookBookmark {
@@ -35484,7 +35704,7 @@ mod favorite_adjustment_defaults_tests {
         let zip_path = PathBuf::from(r"C:\test\outer.zip");
         app.current_folder = Some(zip_path.clone());
         app.zip_nav = Some(test_zip_nav(&["cover.jpg", "chapter/001.jpg"]));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         let bookmark = BookBookmark {
             id: 1,
             container_key: crate::book_bookmarks::container_key(&zip_path),
@@ -37204,7 +37424,7 @@ mod favorite_adjustment_defaults_tests {
         app.archive_source_override = source_override;
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         app
     }
 
@@ -37333,7 +37553,7 @@ mod favorite_adjustment_defaults_tests {
                 "root_a.png",
             ],
         ));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert_eq!(
             zip_dir_prefixes(&app),
@@ -37419,7 +37639,7 @@ mod favorite_adjustment_defaults_tests {
                 "03_last/p1.png",
             ],
         ));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.zip_nav_handle_ctrl_updown(true));
         assert_eq!(zip_image_entries(&app), vec!["01_first/p1.png"]);
@@ -37468,7 +37688,7 @@ mod favorite_adjustment_defaults_tests {
                 "03_tail/p1.png",
             ],
         ));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.zip_nav_handle_ctrl_updown(true));
         assert_eq!(
@@ -40077,7 +40297,7 @@ mod favorite_adjustment_defaults_tests {
             zip_path.clone(),
             &["bookA/p1.jpg", "bookB/only/p1.jpg"],
         ));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         let idx = app
             .items
@@ -40325,7 +40545,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(cache.clone());
         app.archive_source_override = Some(src.clone());
         app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.set_current_folder_rating(2).unwrap());
 
@@ -40362,7 +40582,7 @@ mod favorite_adjustment_defaults_tests {
         let mut nav = test_zip_nav_for(cache.clone(), &["bookA/p1.jpg", "bookB/p1.jpg"]);
         nav.enter("bookA/");
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.set_current_folder_rating(4).unwrap());
 
@@ -40397,7 +40617,7 @@ mod favorite_adjustment_defaults_tests {
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
         nav.enter("bookA/");
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.set_current_folder_rating(4).unwrap());
 
@@ -40432,7 +40652,7 @@ mod favorite_adjustment_defaults_tests {
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/only/p1.jpg"]);
         nav.enter("bookB/"); // 実表示は bookB/only/ まで collapse される。
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.set_current_folder_rating(5).unwrap());
 
@@ -40470,7 +40690,7 @@ mod favorite_adjustment_defaults_tests {
         // ルート階層 (bookA / bookB の ZipDir セルが並ぶ) を表示。
         let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         // bookA を ★5 に設定。
         let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
@@ -40517,7 +40737,7 @@ mod favorite_adjustment_defaults_tests {
 
         let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.png"]);
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         app.settings
             .facet_filter
@@ -40575,7 +40795,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(zip_path.clone());
         let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         let mut rf = [false; 6];
         rf[5] = true;
@@ -40604,7 +40824,7 @@ mod favorite_adjustment_defaults_tests {
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
         nav.enter("bookA/");
         app.zip_nav = Some(nav);
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert!(app.set_current_folder_rating(3).unwrap());
         let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
@@ -40839,7 +41059,7 @@ mod favorite_adjustment_defaults_tests {
             "bookA/page2.jpg",
             "bookB/page1.jpg",
         ]));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         let idx = app
             .items
             .iter()
@@ -40869,7 +41089,7 @@ mod favorite_adjustment_defaults_tests {
         let preview_key = "c:/test/outer.zip::book/page1.jpg".to_owned();
         app.thumb_edit_preview_keys.insert(idx, preview_key.clone());
 
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         let restored_idx = app
             .items
@@ -43956,6 +44176,8 @@ mod favorite_adjustment_defaults_tests {
         let mut app = setup_app();
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\books\02.7z"),
             input_seq: 0,
             format: ArchiveFormat::SevenZ,
@@ -43998,6 +44220,8 @@ mod favorite_adjustment_defaults_tests {
 
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\books\03.7z"),
             input_seq: 0,
             format: ArchiveFormat::SevenZ,
@@ -44032,6 +44256,8 @@ mod favorite_adjustment_defaults_tests {
 
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\books\04.rar"),
             input_seq: 0,
             format: ArchiveFormat::Rar,
@@ -44093,6 +44319,8 @@ mod favorite_adjustment_defaults_tests {
         )
         .unwrap();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\books\locked.rar"),
             input_seq: 0,
             format: ArchiveFormat::Rar,
@@ -44154,6 +44382,8 @@ mod favorite_adjustment_defaults_tests {
         )
         .unwrap();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: PathBuf::from(r"C:\books\gone.rar"),
             input_seq: 0,
             format: ArchiveFormat::Rar,
@@ -63149,6 +63379,7 @@ mod still_window_mode_key_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(media.clone()).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
                 crate::bookmark_browser::BookmarkOpenRequestOwner {
@@ -63566,6 +63797,8 @@ mod still_window_mode_key_tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: source,
             input_seq: app.input_seq,
             format,
@@ -63634,6 +63867,8 @@ mod still_window_mode_key_tests {
                 input_seq: pending.input_seq,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
+
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
             });
             mounted.poll_zip_enumerate();
         })
@@ -63998,6 +64233,7 @@ mod still_window_mode_key_tests {
                 auto_fullscreen: false,
             },
             staged,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         let rows = app.items.clone();
         let visible = app.visible_indices.clone();
@@ -64585,6 +64821,7 @@ mod still_window_mode_key_tests {
             resolved.path,
             Some(resolved.scan),
             OpenRequestOwner::CollectionGridPhysical(resolved.collection_owner.unwrap()),
+            crate::app::StartupListIntent::ExplicitList,
         );
         assert!(matches!(
             app.top_level_grid_view
@@ -64797,7 +65034,12 @@ mod still_window_mode_key_tests {
             .collection_owner
             .map(OpenRequestOwner::CollectionGridPhysical)
             .unwrap_or(OpenRequestOwner::Navigation);
-        assert!(app.load_folder_with_scan_owned(resolved.path, Some(resolved.scan), owner));
+        assert!(app.load_folder_with_scan_owned(
+            resolved.path,
+            Some(resolved.scan),
+            owner,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         run_active_detached_frame_for_test(&mut app, &ctx);
 
         assert_eq!(app.current_folder, Some(child));
@@ -66226,6 +66468,8 @@ mod still_window_mode_key_tests {
                 input_seq: 0,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: zip_rx,
+
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
             });
         });
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -67110,6 +67354,8 @@ mod still_window_mode_key_tests {
                 ClassifiedOpenContinuation::Direct {
                     auto_fullscreen: false,
                     owner: OpenRequestOwner::Navigation,
+
+                    restore_intent: crate::app::StartupListIntent::ExplicitList,
                 },
             ),
             OpenAdmission::Refused(OpenAdmissionRefusal::RemoteControl)
@@ -67129,6 +67375,7 @@ mod still_window_mode_key_tests {
             target.clone(),
             None,
             OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(app.top_level_grid_view.open_path_classification().is_some());
 
@@ -67163,6 +67410,7 @@ mod still_window_mode_key_tests {
                 OpenRequestOwner::Navigation,
                 &epub,
                 super::PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
             ),
             super::PdfOpenFailureRoute::ConversionDialogOpened
         );
@@ -67346,6 +67594,7 @@ mod still_window_mode_key_tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+                diagnostic: None,
                 requested: crate::pdf_loader::LeasedEpubPath::try_new(target.clone()).unwrap(),
                 owner: StartupOpenPathOwner::Activation,
                 cancel: std::sync::Arc::clone(&cancel),
@@ -67444,6 +67693,8 @@ mod still_window_mode_key_tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
+
                 src_path: target.clone(),
                 input_seq: app.input_seq,
                 format: ArchiveFormat::Rar,
@@ -68574,7 +68825,7 @@ mod still_window_mode_key_tests {
             },
         );
 
-        app.load_zip_as_folder(zip_path);
+        app.load_zip_as_folder(zip_path, crate::app::StartupListIntent::ExplicitList);
 
         app.with_active_viewer_context(|active| {
             assert_eq!(active.fullscreen_idx, Some(video));
@@ -76584,7 +76835,10 @@ mod still_window_mode_key_tests {
 
         app.current_folder = Some(cache_zip.clone());
         app.archive_source_override = Some(source_zip);
-        app.load_zip_as_folder(next_zip.clone());
+        app.load_zip_as_folder(
+            next_zip.clone(),
+            crate::app::StartupListIntent::ExplicitList,
+        );
 
         assert_eq!(app.current_folder.as_ref(), Some(&next_zip));
         assert!(
@@ -76615,6 +76869,7 @@ mod still_window_mode_key_tests {
             Ok(enumeration),
             None,
             VisibleInstallAuthority::Ordinary,
+            crate::app::StartupListIntent::ExplicitList,
         );
 
         let state = app
@@ -82313,7 +82568,7 @@ mod still_window_mode_key_tests {
         app.current_folder = Some(cache.clone());
         app.archive_source_override = Some(src.clone());
         app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
         let idx = app
             .items
             .iter()
@@ -82826,7 +83081,7 @@ mod rating_view_navigation_tests {
             None,
         );
         let owner = app.rating_view_physical_load_owner(&path).unwrap();
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         assert!(
             app.rating_view_nav_stack.is_empty(),
             "preflight does not commit the child"
@@ -82851,7 +83106,7 @@ mod rating_view_navigation_tests {
         assert_eq!(app.rating_view_nav_stack, vec![path.clone()]);
 
         let owner = app.rating_view_physical_load_owner(&path).unwrap();
-        assert!(app.start_rating_physical_open(owner));
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         for _ in 0..200 {
             if app
                 .top_level_grid_view
@@ -83314,7 +83569,7 @@ mod always_visible_selection_cursor_tests {
         app.selected = None;
         app.scroll_to_selected = false;
 
-        app.zip_nav_show_current_level();
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
         assert_eq!(app.selected, Some(0));
         assert!(
@@ -84928,7 +85183,12 @@ mod smart_folder_transition_tests {
             .iter()
             .position(|item| item.drag_source_path() == Some(child.as_path()))
             .unwrap();
-        assert!(app.begin_smart_grid_container_navigation(index, child.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            child.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(child.as_path()) {
             assert!(std::time::Instant::now() < deadline);
@@ -85025,7 +85285,12 @@ mod smart_folder_transition_tests {
             .position(|item| item.drag_source_path() == Some(pdf.as_path()))
             .expect("root PDF row");
         app.scroll_offset_y = 320.0;
-        assert!(app.begin_smart_grid_container_navigation(index, pdf.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            pdf.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         assert!(app.replace_staged_pdf_enumeration_for_test(
             &pdf,
             Ok(vec![crate::pdf_loader::PdfPageEntry {
@@ -85102,7 +85367,12 @@ mod smart_folder_transition_tests {
         );
         write_outer_zip(b"NEW CONTENT");
         let index = select_real_path(&mut app, &pdf);
-        assert!(app.begin_smart_grid_container_navigation(index, pdf.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            pdf.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(pdf.as_path()) {
             assert!(
@@ -85171,7 +85441,12 @@ mod smart_folder_transition_tests {
         app.open_smart_folder_staged(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         let index = select_real_path(&mut app, &first);
-        assert!(app.begin_smart_grid_container_navigation(index, first.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            first.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         finish_smart_pdf_enumeration(&mut app, &first);
         assert_eq!(app.current_folder.as_deref(), Some(first.as_path()));
 
@@ -85238,7 +85513,12 @@ mod smart_folder_transition_tests {
             let start = source.join(source_name);
             let target = source.join(target_name);
             let index = select_real_path(&mut app, &start);
-            assert!(app.begin_smart_grid_container_navigation(index, start.clone(), false));
+            assert!(app.begin_smart_grid_container_navigation(
+                index,
+                start.clone(),
+                false,
+                crate::app::StartupListIntent::ExplicitList,
+            ));
             finish_smart_pdf_enumeration(&mut app, &start);
             app.fullscreen_idx = Some(0);
             app.handle_fullscreen_ctrl_nav_context(&ctx, 0, forward, false);
@@ -85401,7 +85681,12 @@ mod smart_folder_transition_tests {
         app.open_smart_folder_staged(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         let index = select_real_path(&mut app, &first);
-        assert!(app.begin_smart_grid_container_navigation(index, first.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            first.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         let mut reversed = app
             .top_level_grid_view
             .smart_folder()
@@ -85450,7 +85735,12 @@ mod smart_folder_transition_tests {
             .position(|item| item.drag_source_path() == Some(pdf.as_path()))
             .expect("root PDF row");
         app.scroll_offset_y = 250.0;
-        assert!(app.begin_smart_grid_container_navigation(index, pdf.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            pdf.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         assert!(app.replace_staged_pdf_enumeration_for_test(
             &pdf,
             Err(std::io::Error::new(
@@ -85510,7 +85800,12 @@ mod smart_folder_transition_tests {
             .iter()
             .position(|item| item.drag_source_path() == Some(entry.as_path()))
             .expect("selected root child");
-        assert!(app.begin_smart_grid_container_navigation(index, entry.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            entry.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(entry.as_path()) {
             assert!(
@@ -85521,7 +85816,7 @@ mod smart_folder_transition_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let parent = match app.resolve_grid_parent_nav() {
-            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
         assert!(matches!(
@@ -85560,7 +85855,12 @@ mod smart_folder_transition_tests {
             .iter()
             .position(|item| item.drag_source_path() == Some(child.as_path()))
             .expect("root child row");
-        assert!(app.begin_smart_grid_container_navigation(index, child.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            child.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         assert!(app.items_are_smart_folder_view);
         assert_eq!(app.items.len(), root_items);
         assert_eq!(app.scroll_offset_y, 230.0);
@@ -85611,6 +85911,7 @@ mod smart_folder_transition_tests {
                 false,
                 None,
                 None,
+                crate::app::StartupListIntent::ExplicitList,
             )
             .is_ok()
         );
@@ -86049,6 +86350,8 @@ mod smart_folder_transition_tests {
             app.fs_nav_locked_gen = Some(app.items_generation);
         }
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
+
             src_path: source.to_path_buf(),
             input_seq: app.input_seq,
             format: ArchiveFormat::Rar,
@@ -86371,7 +86674,12 @@ mod smart_folder_transition_tests {
         let before_items = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
         let before_address = app.address.clone();
 
-        assert!(app.begin_smart_grid_container_navigation(index, source.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            source.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         app.settle_open_path_classification_for_test();
         assert_eq!(app.address, before_address);
         assert!(app.archive_source_override.is_none());
@@ -86431,11 +86739,18 @@ mod smart_folder_transition_tests {
             None,
             super::PdfOpenPhase::ColdCandidate {
                 retained_source: None,
+
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
             },
             crate::pdf_loader::LeasedEpubPath::try_new(old).unwrap(),
         ));
 
-        assert!(app.begin_smart_grid_container_navigation(index, target.clone(), true));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            target.clone(),
+            true,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         assert!(
             app.staged_smart_loading_message()
                 .is_some_and(|message| message.contains("PDF"))
@@ -86478,7 +86793,12 @@ mod smart_folder_transition_tests {
             app.open_smart_folder_staged(id, false);
             wait_for_smart_folder(&mut app, &ctx, id);
             let index = select_real_path(&mut app, &target);
-            assert!(app.begin_smart_grid_container_navigation(index, target.clone(), false));
+            assert!(app.begin_smart_grid_container_navigation(
+                index,
+                target.clone(),
+                false,
+                crate::app::StartupListIntent::ExplicitList,
+            ));
 
             app.settings.sort_order = SortOrder::DateDesc;
             assert!(app.reprepare_current_smart_folder_for_sort());
@@ -86537,9 +86857,16 @@ mod smart_folder_transition_tests {
             input_seq: 1,
             cancel: std::sync::Arc::clone(&old_cancel),
             rx,
+
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
 
-        assert!(app.begin_smart_grid_container_navigation(index, zip_path.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            zip_path.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         assert!(app.zip_enumerate_pending.is_some());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(zip_path.as_path()) {
@@ -86583,9 +86910,16 @@ mod smart_folder_transition_tests {
             input_seq: 1,
             cancel: std::sync::Arc::clone(&old_cancel),
             rx,
+
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
 
-        assert!(app.begin_smart_grid_container_navigation(index, zip_path.clone(), true));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            zip_path.clone(),
+            true,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(zip_path.as_path()) {
             assert!(std::time::Instant::now() < deadline, "ZIP adopt timed out");
@@ -86627,6 +86961,8 @@ mod smart_folder_transition_tests {
             None,
             super::PdfOpenPhase::ColdCandidate {
                 retained_source: None,
+
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
             },
             crate::pdf_loader::LeasedEpubPath::try_new(old_pdf).unwrap(),
         ));
@@ -86641,6 +86977,8 @@ mod smart_folder_transition_tests {
             input_seq: 1,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
+
+            restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
         app.poll_zip_enumerate();
         assert!(app.fs_navigation_sequence_owned_by_smart_folder());
@@ -86782,7 +87120,7 @@ mod smart_folder_transition_tests {
         assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
         assert!(matches!(
             app.resolve_grid_parent_nav(),
-            Some(crate::ui_main::AddressBarNav::Direct(path))
+            Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &nested)
         ));
     }
@@ -86879,7 +87217,7 @@ mod smart_folder_transition_tests {
         assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
         assert!(matches!(
             app.resolve_grid_parent_nav(),
-            Some(crate::ui_main::AddressBarNav::Direct(path))
+            Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &folder)
         ));
     }
@@ -86906,7 +87244,12 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         app.open_staged_smart_folder_and_wait(&ctx, &folder);
         let index = select_real_path(&mut app, &archive);
-        assert!(app.begin_smart_grid_container_navigation(index, archive.clone(), false));
+        assert!(app.begin_smart_grid_container_navigation(
+            index,
+            archive.clone(),
+            false,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
         wait_for_snapshot_archive_listing(&mut app, &cached);
         let saved = app.top_level_grid_view.smart_folder().unwrap().clone();
         assert!(matches!(
@@ -86939,7 +87282,7 @@ mod smart_folder_transition_tests {
         assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
         assert!(matches!(
             app.resolve_grid_parent_nav(),
-            Some(crate::ui_main::AddressBarNav::Direct(path))
+            Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &folder)
         ));
     }
@@ -86966,7 +87309,12 @@ mod smart_folder_transition_tests {
             .unwrap();
         assert_ne!(app.current_folder.as_deref(), Some(cached.as_path()));
         let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&cached).unwrap();
-        let grid = app.prepare_zip_grid(cached, enumeration, Some(&source));
+        let grid = app.prepare_zip_grid(
+            cached,
+            enumeration,
+            Some(&source),
+            crate::app::StartupListIntent::ExplicitList,
+        );
         assert!(
             grid.existing_keys
                 .iter()
@@ -87031,6 +87379,7 @@ mod smart_folder_transition_tests {
             ArchiveFormat::SevenZ,
             false,
             owner,
+            crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(matches!(
             app.archive_convert.as_ref().map(|state| &state.completion),
@@ -87548,13 +87897,13 @@ mod smart_folder_transition_tests {
         assert!(app.address.contains("child"));
         assert!(matches!(
             app.resolve_grid_parent_nav(),
-            Some(crate::ui_main::AddressBarNav::Direct(path))
+            Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &entry)
         ));
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(matches!(
             app.resolve_grid_parent_nav(),
-            Some(crate::ui_main::AddressBarNav::Direct(path))
+            Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &synthetic)
         ));
 
@@ -87726,7 +88075,7 @@ mod smart_folder_transition_tests {
         app.scroll_to_selected = false;
         app.open_staged_smart_folder_and_wait(&ctx, entry);
         let parent = match app.resolve_grid_parent_nav() {
-            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
         assert!(crate::folder_tree::path_eq(
@@ -87770,7 +88119,7 @@ mod smart_folder_transition_tests {
         finish_smart_pdf_enumeration(&mut app, &pdf);
 
         let parent = match app.resolve_grid_parent_nav() {
-            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
         assert!(crate::folder_tree::path_eq(
@@ -87867,7 +88216,7 @@ mod smart_folder_transition_tests {
         app.open_staged_smart_folder_and_wait(&ctx, entry);
         assert_eq!(app.settings.sort_order, SortOrder::FileName);
         let parent = match app.resolve_grid_parent_nav() {
-            Some(crate::ui_main::AddressBarNav::Direct(path)) => path,
+            Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
         assert!(matches!(
@@ -97557,3 +97906,61 @@ fn selection_info_lazy_loading_prioritizes_new_selection_during_full_or_ai_fetch
         drop(events_tx);
     }
 }
+
+#[test]
+fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
+    let mut env = phase_c_support::setup_app();
+    let parent = env.tmp.path().join("books");
+    std::fs::create_dir_all(&parent).unwrap();
+    let book = parent.join("direct.zip");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([80, 140, 210, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+    zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut zip, png.get_ref()).unwrap();
+    zip.finish().unwrap();
+    env.settings.startup_folder_mode = crate::settings::StartupFolderMode::Previous;
+    env.settings.auto_fullscreen_zip_pdf = true;
+    env.load_folder(parent.clone());
+    assert_eq!(env.settings.last_folder.as_ref(), Some(&parent));
+    assert!(matches!(
+        env.load_folder_or_convert_archive_with_auto_fullscreen(book.clone(), true),
+        crate::app::FolderOpenOutcome::Loaded
+    ));
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert!(
+        env.fullscreen_idx.is_some(),
+        "direct open must reach page view"
+    );
+    env.on_exit_inner();
+    drop(env.app);
+    let saved = crate::settings::Settings::load();
+    assert_eq!(
+        saved.last_folder.as_ref(),
+        Some(&book),
+        "probe: current released write"
+    );
+    env.app = App::new_from_settings(saved);
+    env.open_default_startup_target();
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+    assert!(
+        env.fullscreen_idx.is_none(),
+        "probe: released restore reaches unseen page list"
+    );
+    assert_eq!(
+        env.current_folder.as_ref(),
+        Some(&parent),
+        "1.335: restore the last explicitly opened list"
+    );
+}
+
+#[path = "tests/startup_restore.rs"]
+mod startup_restore_tests;

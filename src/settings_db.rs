@@ -27,6 +27,7 @@
 //! - 複合テーブルは hash skip (VST3) や hot-path upsert (video_resume_positions)
 //!   などの最適化を別個に適用できる
 
+use miv_startup::{Lane, Outcome, Stage, WatchSlot, span, watch_handle};
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -549,6 +550,12 @@ impl SettingsDb {
     }
 
     fn open_with_mode(data_dir: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
+        startup_operation(Stage::SettingsOpen, || {
+            Self::open_with_mode_inner(data_dir, mode)
+        })
+    }
+
+    fn open_with_mode_inner(data_dir: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
         let path = settings_db_path(data_dir);
         if let Some(parent) = path.parent() {
             // dir 作成失敗は無視 (= conn open でも同じエラーが出るのでそちらに任せる)。
@@ -557,7 +564,15 @@ impl SettingsDb {
 
         let mut last_err: Option<SettingsDbError> = None;
         for attempt in 0..OPEN_RETRY_ATTEMPTS {
-            match Self::try_open_once(&path, mode) {
+            let attempt_span =
+                startup_span(Stage::SettingsOpen).detail(&format!("attempt={}", attempt + 1));
+            let attempt_result = Self::try_open_once(&path, mode);
+            attempt_span.finish(if attempt_result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            });
+            match attempt_result {
                 Ok(db) => {
                     if attempt > 0 {
                         log_diag(&format!(
@@ -588,6 +603,12 @@ impl SettingsDb {
     /// 途中のどのステップで `rusqlite::Error` が出ても、`classify_rusqlite_error_for_open`
     /// を通すことで Corrupted / Permission / Transient へ正しく分類される (Codex P1 対応)。
     fn try_open_once(path: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
+        startup_operation(Stage::SettingsOpen, || {
+            Self::try_open_once_inner(path, mode)
+        })
+    }
+
+    fn try_open_once_inner(path: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
         use rusqlite::OpenFlags;
         let flags = match mode {
             OpenMode::RequireExisting => {
@@ -646,6 +667,10 @@ impl SettingsDb {
     /// 完了時点で in-memory と DB が一致するので、VST3 hash を初期化する
     /// (= 起動後最初の `save_full` で無駄に DELETE+INSERT しないため)。
     pub fn load_into_settings(&self) -> Result<Settings, SettingsDbError> {
+        startup_operation(Stage::Settings, || self.load_into_settings_inner())
+    }
+
+    fn load_into_settings_inner(&self) -> Result<Settings, SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
         // 未知 enum の Incompatible だけは返す。これは「新しい版が書いた設定」の合図で、
         // 上層が save 抑止へ倒すために要る。それ以外 (書き込み失敗など) で load 全体を
@@ -1225,6 +1250,17 @@ pub enum FamilyPresence {
 /// 同等に扱う (新規環境の clean install を許可するため。data_dir が ambiguous なら
 /// per-file metadata 側で先に Ambiguous が立つ)。
 pub fn settings_db_family_presence(data_dir: &Path) -> FamilyPresence {
+    let stage = startup_span(Stage::SettingsFamily);
+    let result = settings_db_family_presence_inner(data_dir);
+    stage.finish(if result == FamilyPresence::Ambiguous {
+        Outcome::Error
+    } else {
+        Outcome::Ok
+    });
+    result
+}
+
+fn settings_db_family_presence_inner(data_dir: &Path) -> FamilyPresence {
     let mut ambiguous = false;
     let candidates = family_filenames();
     for name in &candidates {
@@ -1320,7 +1356,30 @@ fn is_family_filename(name: &str) -> bool {
 // open / pragmas / schema
 // ---------------------------------------------------------------------------
 
+fn startup_span(stage: Stage) -> miv_startup::Span {
+    let operation = span(Lane::Core, stage);
+    match watch_handle(WatchSlot::CoreStartup) {
+        Some(watch) => operation.watched(watch),
+        None => operation,
+    }
+}
+
+fn startup_operation<T, E>(stage: Stage, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let operation_span = startup_span(stage);
+    let result = operation();
+    operation_span.finish(if result.is_ok() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
 fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    startup_operation(Stage::SettingsPragma, || apply_pragmas_inner(conn))
+}
+
+fn apply_pragmas_inner(conn: &Connection) -> rusqlite::Result<()> {
     // journal_mode=WAL は in-memory DB で no-op になるので silently ignore する
     // (rusqlite が "memory" を返すケース)。本番では WAL に切り替わる。
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
@@ -1536,6 +1595,12 @@ fn existing_bootstrap_marker_present(conn: &Connection) -> Result<bool, Settings
 /// 戻り文字列が "ok" 以外なら `Corrupted` を返す (Codex P1 対応で旧
 /// `check_integrity` を retire したものの代替)。
 fn check_integrity_classified(conn: &Connection) -> Result<(), SettingsDbError> {
+    startup_operation(Stage::SettingsIntegrity, || {
+        check_integrity_classified_inner(conn)
+    })
+}
+
+fn check_integrity_classified_inner(conn: &Connection) -> Result<(), SettingsDbError> {
     let result: String = conn
         .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
         .map_err(|e| classify_rusqlite_error_for_open(e, "integrity_check"))?;
@@ -1601,6 +1666,10 @@ fn reject_newer_app_version(conn: &Connection) -> Result<(), SettingsDbError> {
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    startup_operation(Stage::SettingsSchema, || init_schema_inner(conn))
+}
+
+fn init_schema_inner(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_meta (
             key   TEXT PRIMARY KEY,
@@ -3468,6 +3537,14 @@ fn rename_legacy_json_files(data_dir: &Path) -> usize {
 pub fn migrate_from_settings_json(
     data_dir: &Path,
 ) -> Result<(SettingsDb, Settings), SettingsDbError> {
+    startup_operation(Stage::SettingsJsonMigration, || {
+        migrate_from_settings_json_inner(data_dir)
+    })
+}
+
+fn migrate_from_settings_json_inner(
+    data_dir: &Path,
+) -> Result<(SettingsDb, Settings), SettingsDbError> {
     // Codex P2 v8b-2 (2026-05-14): data_dir 引数を **唯一の真** として使う。
     // `data_dir::get()` 経由のパスは一切経由しない。これで data_dir override と
     // 引数が乖離しても DB と JSON が別 dir に分裂しない。
@@ -3562,6 +3639,18 @@ pub fn migrate_from_settings_json(
 /// FailedFallbackDefault に倒れ、SAVE_SUPPRESSED でセッション全体を poison」する race を
 /// 防ぐ。
 pub fn boot_settings_db(data_dir: &Path) -> BootOutcome {
+    let stage = startup_span(Stage::Settings);
+    let result = boot_settings_db_observed(data_dir);
+    let stage = stage.detail(&format!("source={:?}", result.source));
+    stage.finish(if result.db.is_some() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
+fn boot_settings_db_observed(data_dir: &Path) -> BootOutcome {
     let _boot_guard = BOOT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     // Fast-path: 同じ data_dir で既に boot 済みなら、その handle で再 load する。
@@ -3851,6 +3940,17 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
 
 /// 壊れた main DB の家族を quarantine し、bak1..bak10 を新しい順に試行して復旧する。
 fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
+    let stage = startup_span(Stage::SettingsRecovery);
+    let result = boot_recover_from_bak_inner(data_dir);
+    stage.finish(if result.db.is_some() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
+fn boot_recover_from_bak_inner(data_dir: &Path) -> BootOutcome {
     let result = quarantine_db_files(data_dir);
     // T06 Codex P2 round 5: quarantine が不完全 (sidecar 退避失敗で main を残した、
     // または main 退避失敗) のまま bak 復旧に進むと、新しい main (bak1 を copy したもの)
@@ -4626,6 +4726,68 @@ mod tests {
                 .unwrap()
                 .active_quick_folder_slot,
             Some(crate::settings::QuickFolderSlotId::A)
+        );
+    }
+
+    #[test]
+    fn section1335_missing_db_record_migrates_once_and_roundtrips_with_prefix() {
+        use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut legacy = Settings::default();
+        legacy.last_folder = Some(PathBuf::from(r"C:\books\released.zip"));
+        legacy.last_cursor_name = Some("page.png".into());
+        legacy.last_cursor_rows_above = Some(4);
+        db.save_full(&legacy).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'startup_list_restore'",
+                [],
+            )
+            .unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.startup_list_restore, None);
+        crate::settings::apply_load_time_migrations(&mut loaded);
+        assert_eq!(
+            loaded.startup_list_restore,
+            Some(StartupListRestore::V1 {
+                target: StartupListTarget::PhysicalList {
+                    logical_path: legacy.last_folder.clone().unwrap(),
+                    zip_prefix: None,
+                },
+                cursor: Some(ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(4)
+                }),
+            })
+        );
+        loaded.last_folder = Some(PathBuf::from(r"C:\books\another.zip"));
+        db.save_full(&loaded).unwrap();
+        let mut repeated = db.load_into_settings().unwrap();
+        assert!(!repeated.migrate_startup_list_restore());
+        assert_eq!(repeated.startup_list_restore, loaded.startup_list_restore);
+        repeated.startup_list_restore = Some(StartupListRestore::V1 {
+            target: StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from(r"C:\books\nested.zip"),
+                zip_prefix: Some("chapter/inner.zip/pages/".into()),
+            },
+            cursor: Some(ListCursorHint {
+                name: "p2.png".into(),
+                rows_above: Some(2),
+            }),
+        });
+        db.save_full(&repeated).unwrap();
+        drop(db);
+        assert_eq!(
+            SettingsDb::open(dir.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .startup_list_restore,
+            repeated.startup_list_restore
         );
     }
 

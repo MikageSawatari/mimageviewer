@@ -87,7 +87,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `details_selection_bar_mode` | Dedicated への変更を OK すると、除外対象の詳細列設定を既存 A→C 複製で書き換えるため。取り込みでは変更しない。 | `src/settings.rs` |
 | 除く | `stack_script_enabled` | 移行先の `stack_rules.rhai` に依存する有効化設定。本体を転送しないため一組で除外する。 | `src/settings.rs` |
 | 除く | `keymap`, `ring_shortcuts`, `menu_layout`, `context_menu_layout`, `gamepad_enabled` | 既存の操作カスタマイズ共有が正本。環境設定にも編集入口があっても重複転送しない。 | `src/settings.rs:5198` |
-| 除く | `favorites`, `smart_folders`, `tags`, `recent_folders`, `quick_folder_recent_folders`, `quick_folder_slots`, `quick_folder_drive_current_dirs`, `last_folder`, `last_cursor_name`, `last_cursor_rows_above`, `search_index_checks`, `active_book_name` | 利用データ・登録先・履歴・検索対象。名前や ID も含めない。 | `src/settings.rs:4262` |
+| 除く | `favorites`, `smart_folders`, `tags`, `recent_folders`, `quick_folder_recent_folders`, `quick_folder_slots`, `quick_folder_drive_current_dirs`, `last_folder`, `startup_list_restore`, `last_cursor_name`, `last_cursor_rows_above`, `search_index_checks`, `active_book_name` | 利用データ・登録先・履歴・検索対象。名前や ID も含めない。起動復元先とその一覧カーソルも利用データとして除外する。 | `src/settings.rs:4262` |
 | 除く | `pinned_books`, `pinned_collections`, `toolbar_collection_target_id`, `video_resume_positions`, `video_watched_to_end`, `video_audio_track_choices` | 同上。本棚・コレクション参照・再生位置・音声トラック選択。 | `src/settings.rs:4752` |
 | 除く | `favorite_view_overlay`, `window_pos`, `window_size`, `window_maximized`, `detached_viewer_window_placement`, `effetune_gui_pos`, `effetune_gui_size`, `vst3_panel_pos` | runtime overlay / PC のウィンドウ配置。serde(skip) も明示分類。 | `src/settings.rs:4273` |
 | 除く | `first_setup_completed`, `touch_still_chrome_learned`, `touch_video_chrome_learned`, `last_seen_version`, `update_check_dismissed_version`, `network_data_dir_notice_dismissed_for`, `perf_log_enabled` | 初回/学習/通知/保存版の内部記録。診断ログは移行先で明示有効化。 | `src/settings.rs:5063` |
@@ -115,7 +115,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `video_seek_strip_span`, `video_autoplay`, `video_autoplay_mode`, `video_continuous_mode`, `video_muted`, `video_adjustments`, `video_scale_filter`, `video_downscale_smoothing_percent`, `video_anime4k_budget` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5467` |
 | 除く | `video_anime4k_measurement`, `video_preset_slots`, `video_tile_columns`, `video_in_window_mode`, `detached_viewer_enabled`, `vst3_gui_visible`, `vst3_video_compact`, `audio_normalize_enabled`, `audio_normalize_target_lufs_milli` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5544` |
 
-現在の内訳: 出す130 / 除く303 / 合計433フィールド。§1.333追加watched集合は個人の視聴履歴・pathとして除外する。調査時点の432という記録は履歴として保持する。
+現在の内訳: 出す131 / 除く310 / 合計441フィールド（`all_settings_fields_are_classified` の確認値）。互換フィールドをまとめるため転送ファイルの項目数は129。§1.333追加watched集合は個人の視聴履歴・pathとして除外する。§1.335の起動復元レコードは、最後に明示した利用者の一覧とその cursor を対で持つため利用データとして除外する。転送や Preferences OK で移行済み record を旧 `last_folder` から作り直さず、live record を保持する。表示・復元の実装と自動検証は完了、実機確認待ち。結果は [設計 §10](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項) に集約する。調査時点の432という記録は履歴として保持する。
 
 ### 2.2 実装時の唯一の policy と強制テスト
 

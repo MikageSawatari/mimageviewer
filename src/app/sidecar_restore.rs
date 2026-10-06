@@ -88,6 +88,7 @@ impl SidecarProbeReuseCache {
 }
 
 pub(super) struct SidecarLoadContinuation {
+    pub(super) restore_intent: super::StartupListIntent,
     pub(super) source_path: PathBuf,
     /// Captured from the same metadata read that initialized folder-watch state. Extensions are
     /// not source kinds: a real directory may legitimately be named `photos.zip`.
@@ -630,6 +631,19 @@ impl App {
         self.sidecar_restore.is_some()
     }
 
+    pub(super) fn defer_startup_list_adoption(
+        &mut self,
+        intent: &super::StartupListIntent,
+    ) -> bool {
+        let Some(state) = self.sidecar_restore.as_mut() else {
+            return false;
+        };
+        if let ContinuationOwner::Live(continuation) = &mut state.common.continuation {
+            continuation.restore_intent = intent.clone();
+        }
+        true
+    }
+
     /// Whether the currently projected viewer is the restore target.
     ///
     /// The coordinator and persistence barriers remain App-global, but only the target
@@ -741,6 +755,8 @@ impl App {
                     tx,
                     cancel: Arc::new(AtomicBool::new(false)),
                     restore_started_at: started_at,
+
+                    restore_intent: crate::app::StartupListIntent::PreservePresentation,
                 }),
                 deferred_fullscreen: None,
                 favorite_failures: Vec::new(),
@@ -2653,6 +2669,8 @@ mod tests {
             tx: thumb_tx,
             cancel: Arc::new(AtomicBool::new(false)),
             restore_started_at: started_at,
+
+            restore_intent: crate::app::StartupListIntent::PreservePresentation,
         };
         assert!(app.begin_sidecar_restore(continuation, false).is_ok());
         assert!(app.sidecar_restore_blocks_projected_context());
@@ -2736,6 +2754,8 @@ mod tests {
                     tx,
                     cancel: Arc::new(AtomicBool::new(false)),
                     restore_started_at: now,
+
+                    restore_intent: crate::app::StartupListIntent::PreservePresentation,
                 },
                 false
             )
@@ -3246,6 +3266,8 @@ mod tests {
             tx,
             cancel: Arc::clone(&cancel),
             restore_started_at: std::time::Instant::now(),
+
+            restore_intent: crate::app::StartupListIntent::PreservePresentation,
         });
 
         assert!(owner.discard());
