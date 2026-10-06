@@ -402,12 +402,14 @@ fn draw_selection_contents(
         SelectionPhase::Fetching => {
             let selected = selected_count(cells, *minimum);
             ui.horizontal(|ui| {
-                actions.save = ui
-                    .add_enabled(
-                        fetch_complete && selected > 0,
-                        egui::Button::new(format!("選んだ {selected} 枚を保存")),
-                    )
-                    .clicked();
+                let label = format!("選んだ {selected} 枚を保存");
+                let save = ui.add_enabled(
+                    fetch_complete && selected > 0,
+                    egui::Button::new(label.as_str()),
+                );
+                #[cfg(all(windows, feature = "test-script"))]
+                crate::test_script::register_clickable_widget(&label, &save);
+                actions.save = save.clicked();
                 actions.close |= ui.button("閉じる").clicked();
             });
         }
