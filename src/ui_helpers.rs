@@ -1912,7 +1912,7 @@ pub fn draw_path_hierarchy(
 
 /// `draw_path_hierarchy` のレイアウト部分だけを返す (位置決め / 描画は呼び出し側)。
 /// 単体テストしやすいように分離してある。
-fn layout_path_hierarchy(
+pub(crate) fn layout_path_hierarchy(
     painter: &egui::Painter,
     components: &[&str],
     color: egui::Color32,

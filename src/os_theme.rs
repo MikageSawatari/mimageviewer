@@ -292,7 +292,7 @@ pub fn is_dark_effective(theme: UiTheme) -> bool {
     matches!(resolve(theme), ResolvedTheme::Dark)
 }
 
-/// Opaque reading-position colors, resolved from the painting UI's theme.
+/// Opaque saved-position colors, resolved from the painting UI's theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookResumeMeterPalette {
     pub track: egui::Color32,
@@ -304,13 +304,13 @@ pub fn book_resume_meter_palette(dark: bool) -> BookResumeMeterPalette {
     if dark {
         BookResumeMeterPalette {
             track: egui::Color32::from_gray(45),
-            fill: egui::Color32::from_rgb(56, 200, 182),
+            fill: egui::Color32::from_rgb(142, 176, 234),
             boundary: egui::Color32::from_gray(155),
         }
     } else {
         BookResumeMeterPalette {
             track: egui::Color32::from_gray(232),
-            fill: egui::Color32::from_rgb(0, 108, 100),
+            fill: egui::Color32::from_rgb(38, 67, 122),
             boundary: egui::Color32::from_gray(85),
         }
     }
@@ -399,7 +399,18 @@ mod tests {
             assert_eq!(palette.fill.a(), 255);
             assert_eq!(palette.boundary.a(), 255);
             assert!(contrast_ratio(palette.track, palette.fill) >= 3.0);
+            assert!(
+                palette.fill.b() > palette.fill.g(),
+                "separate from green folder labels"
+            );
+            assert!(
+                contrast_ratio(palette.fill, Color32::from_rgb(60, 120, 220)) >= 1.5,
+                "separate from selection frame"
+            );
             assert!(contrast_ratio(palette.track, palette.boundary) >= 2.0);
+            for cover in [Color32::WHITE, Color32::BLACK] {
+                assert!(contrast_ratio(palette.boundary, cover) >= 2.0);
+            }
         }
     }
 
