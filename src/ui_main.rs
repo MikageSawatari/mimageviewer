@@ -14058,14 +14058,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 .map(|label| format!("フォルダ履歴を戻る\n{label}"))
                                 .unwrap_or_else(|| "フォルダ履歴を戻る".to_string())
                         };
-                        if ui
+                        let back_response = ui
                             .add_enabled(
                                 back_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("←"),
                             )
-                            .hover_tip(back_hover)
-                            .clicked()
-                        {
+                            .hover_tip(back_hover);
+                        #[cfg(feature = "test-script")]
+                        crate::test_script::register_clickable_widget(
+                            "history-back",
+                            &back_response,
+                        );
+                        if back_response.clicked() {
                             result = Some(AddressBarNav::HistoryBack);
                         }
                         let forward_hover = if snapshot_active {
@@ -14078,14 +14082,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 .map(|label| format!("フォルダ履歴を進む\n{label}"))
                                 .unwrap_or_else(|| "フォルダ履歴を進む".to_string())
                         };
-                        if ui
+                        let forward_response = ui
                             .add_enabled(
                                 forward_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("→"),
                             )
-                            .hover_tip(forward_hover)
-                            .clicked()
-                        {
+                            .hover_tip(forward_hover);
+                        #[cfg(feature = "test-script")]
+                        crate::test_script::register_clickable_widget(
+                            "history-forward",
+                            &forward_response,
+                        );
+                        if forward_response.clicked() {
                             result = Some(AddressBarNav::HistoryForward);
                         }
                     }
@@ -14358,20 +14366,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         }
                                     }
                                     crate::known_folders::LocationMenuEntry::Rating { stars } => {
-                                        ui.menu_button("レーティング", |ui| {
+                                        let rating_menu = ui.menu_button("レーティング", |ui| {
                                             for stars in stars {
-                                                if ui
-                                                    .button(rating_view_menu_label(
+                                                let rating_response = ui.button(rating_view_menu_label(
                                                         stars,
                                                         rating_counts,
-                                                    ))
-                                                    .clicked()
-                                                {
+                                                    ));
+                                                #[cfg(feature = "test-script")]
+                                                if stars == 3 {
+                                                    crate::test_script::register_clickable_widget("rating-three", &rating_response);
+                                                }
+                                                if rating_response.clicked() {
                                                     self.enter_rating_view_from_menu(stars);
                                                     ui.close();
                                                 }
                                             }
                                         });
+                                        #[cfg(feature = "test-script")]
+                                        crate::test_script::register_clickable_widget("rating-menu", &rating_menu.response);
                                     }
                                     crate::known_folders::LocationMenuEntry::Bookshelf => {
                                         if ui
@@ -14476,6 +14488,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     show_sticky_context_menu(&place_response, |ui| {
                         self.draw_folder_bar_settings_menu(ui);
                     });
+                    #[cfg(feature = "test-script")]
+                    crate::test_script::register_clickable_widget("places-menu", &place_response);
                     ui.add_space(4.0);
                     ui.separator();
 
@@ -18791,6 +18805,34 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
+
+                        #[cfg(feature = "test-script")]
+                        {
+                            let position = self.selected.and_then(|index| {
+                                self.visible_indices.iter().position(|visible| *visible == index)
+                            });
+                            let item = self.selected.and_then(|index| self.items.get(index));
+                            crate::test_script::grid_observation::publish(ui.ctx(),
+                                crate::test_script::grid_observation::GridObservation {
+                                    frame: ui.ctx().cumulative_frame_nr() as i64,
+                                    generation: self.items_generation as i64,
+                                    selected_index: self.selected.map_or(-1, |index| index as i64),
+                                    selected_key: item.and_then(GridItem::container_path)
+                                        .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                                    selected_name: item.map_or_else(String::new, |item| item.name().into_owned()),
+                                    scroll_offset: viewport.min.y,
+                                    viewport: ui.clip_rect().intersect(ui.ctx().viewport_rect()),
+                                    row_rect: position.map(|position| egui::Rect::from_min_size(
+                                        content_rect.min + egui::vec2(
+                                            (position % cols) as f32 * cell_w,
+                                            (position / cols) as f32 * cell_h),
+                                        egui::vec2(cell_w, cell_h))),
+                                    row_content_y: position.map_or(-1.0, |position| (position / cols) as f32 * cell_h),
+                                    cell_height: cell_h,
+                                    columns: cols,
+                                    content_height: total_h,
+                                });
+                        }
 
                         let first_row = (viewport.min.y / cell_h) as usize;
                         let fractional_extra_row =

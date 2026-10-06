@@ -9,6 +9,7 @@ Automation must not pass this switch until that approval has been obtained.
 .PARAMETER Scenario
 MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one detached window.
 FolderHistory checks Rating and Collection folder history with real shortcut input.
+RatingFolderBack records scrolled Rating folder/ZIP returns for every default history input.
 #>
 # Run an isolated, diagnostic portable UI smoke scenario.
 #
@@ -26,7 +27,8 @@ FolderHistory checks Rating and Collection folder history with real shortcut inp
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop', 'ClipboardCapture')]
+    [Alias('Suite')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -779,7 +781,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop', 'ClipboardCapture')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -942,6 +944,45 @@ if ($script:archiveErrors.Count -gt 0) {
             }
             video_in_window_mode = $true
             video_loop_mode = 'Full'
+        })
+    }
+    'RatingFolderBack' {
+        $scenarioRoot = Join-Path $dataDir 'rating-folder-back'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\rating-folder-back.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'library'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_rating_folder_back_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'ui-smoke\generate_rating_sort_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\rating-folder-back') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] rating-folder-back input not found: $path"
+            }
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir $dataDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] rating-folder-back fixture generator failed with exit $LASTEXITCODE"
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'rating-folder-back-fixture'
+        if (@(Get-ChildItem -LiteralPath $candidateFixtureDir -Directory).Count -ne 12 -or
+            @(Get-ChildItem -LiteralPath $candidateFixtureDir -File -Filter '*.zip').Count -ne 3) {
+            throw '[ui-smoke] rating-folder-back fixture must have 12 folders and 3 ZIPs'
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            auto_fullscreen_image_folders = $false
+            auto_fullscreen_zip_pdf = $false
+            sort_order = 'FileName'
+            grid_view_mode = 'Thumbnail'
+            grid_cols = 3
+            thumb_aspect_auto = $false
+            thumb_aspect = 'Square'
+            ring_shortcuts = @{ mouse_nav_prompt_done = $true }
         })
     }
     'FolderHistory' {
@@ -1672,6 +1713,9 @@ $arguments = @(
             $script:lifetimeSamplesPath,
             '',
             (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($Scenario -eq 'RatingFolderBack') {
+        $arguments = @('--window-size', '900x650') + $arguments
     }
     Try-AddUiSmokeEvidenceFile $scriptPath 'inputs/scenario.rhai' 'scenario-script'
     Try-AddUiSmokeEvidenceFile $settingsPath 'inputs/settings-override.json' 'settings-override'

@@ -28407,6 +28407,7 @@ impl App {
             items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
             snapshot_frame: i64::try_from(ctx.cumulative_frame_nr()).unwrap_or(i64::MAX),
             action_wait_diagnostic: String::new(),
+            grid_observation: crate::test_script::grid_observation::snapshot(ctx),
             selected_index: self
                 .selected
                 .map_or(-1, |index| i64::try_from(index).unwrap_or(i64::MAX)),

@@ -472,6 +472,41 @@ scenarioの期限はアプリ起動時のmonotonic clockから一度決め、foc
 prepare・App・runnerの終了値は分ける。cleanupとarchiveに例外があっても外側finallyで
 排他を解放する。fixtureも新しく作成できた領域だけを今回の証跡の対象にする。
 
+### §1.328: rating-folder-back の採取用Suite (2026-10-07、実行は引き継ぎ待ち)
+
+`scripts/ui-smoke.ps1 -Suite RatingFolderBack` (`-Scenario` の別名) は、隔離 data に
+12 フォルダ × 8 PNG と 3 ZIP × 8 PNG を作り、15 コンテナすべてを ★3 にする。
+900×650、3列の一覧で `12-folder` / `23-book.zip` を下方までスクロールして選ぶ。
+場所▼ → レーティング → ★★★ の実 widget をクリックし、実キー Enter で開いて第4画像を選ぶ。
+rating/history の直接 action や既存 `open_rating_one` helper は使わない。
+
+各コンテナについてツールバー←、Alt+Left、BrowserBack、WM_APPCOMMAND backward、X1、
+Backspace を独立した新規 open から試す。前5入口では同じ入口の forward → back も試す
+(計22ケース、戻り観測32回)。不一致はログと画面を残して次ケースへ進み、最後に集約して失敗する。
+初期fixture／focusなどの環境不成立も成功扱いにしない。
+
+test-script 限定の `root_history_input` は明示選択した exact ROOT HWND の現存・focusを検証し、
+BrowserBack/Forward の WM_KEYDOWN/UP、WM_APPCOMMAND、WM_XBUTTONDOWN/UP を PostMessage する。
+前2者は既存 WH_GETMESSAGE hook、X1/X2 は winit → egui Extra1/2 から既存マウス設定へ入る。
+handler直呼び／pending count の注入はしない。物理マウスドライバー自体の試験ではない。
+複数窓への入力や OS foreground の切替は加えず、単一 ROOT の直列ケースに範囲を絞る。
+
+`snapshot().grid` は実サムネイル ScrollArea の描画時に記録した generation、frame、選択key/name/index、
+実scroll offset、選択セル矩形、clip viewport、content高／列数を返す。状態snapshotは次pass冒頭なので、
+scenario は generation/index の一致を待ち、セル中心が clip viewport 内かを visible として判定する。
+観測のための再選択、scroll-to-me、一覧採用はしない。widget用 alias の登録だけを足し、通常buildの
+producer／履歴／描画の動作は維持する。
+
+各ケースの before-open／第4画像／戻りを `log` と `capture` に保存する。runner の
+`target/ui-smoke-runs/*-RatingFolderBack-*/` に run metadata、stdout/stderr、perf／アプリログ、
+`screenshots/*.png` と screenshot manifest、fixture／script／override のコピーが残る。
+通常見込み3〜5分、失敗時も採取を続けるため `-TimeoutSeconds 900` を指定する。
+起動は coordinator に引き継ぎ、実アプリでの再現／PASSはこの準備だけでは主張しない。
+
+非対話確認は `python -B scripts/ui-smoke/test_rating_folder_back_fixture.py` と
+`cargo test -p mimageviewer --lib --features test-script rating_folder_back`、`grid_observation`、
+`history_input`。portable/test-script の準備は `prepare-portable-smoke.ps1 -TestScript` で行う。
+
 ## S1: 窓snapshotとtargetの所有
 
 App投影だけでなくregistryのread-only参照から、window ID・context serial・residence・

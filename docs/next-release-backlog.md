@@ -2301,6 +2301,19 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 - 追加調査 (2026-10-07、`d72808b03` の実機報告):
   - 利用者は ZIP → ← の修正を確認。★3 → 実フォルダ → 画像一覧 → ← では選択を失うと報告。
     この追加報告は未解決。製品コードの追加修正は原因・red が確認できるまで保留する。
+  - 採取用Suiteを追加: `ui-smoke.ps1 -Suite RatingFolderBack`。隔離した12フォルダ／3 ZIPの
+    ★3一覧を場所▼の実メニューから開き、下方の項目をEnterで開いて第4画像を選ぶ。
+    ツールバー←、Alt+Left、BrowserBack、WM_APPCOMMAND、X1、Backspaceを独立openで検査し、
+    前5入口は → then ← も検査する (22ケース／32戻り観測)。選択key/name/index、一覧identity、
+    実scroll offset／セル矩形／viewportと画面を残し、不一致でも残りを採取する。
+    test-script限定の読取観測／Windows入力APIを使い、製品の履歴ownerや選択挙動は変更しない。
+    portable/test-script版の準備後にcoordinatorへ実行を引き継ぐ。再現・PASSは実行結果待ち。
+    範囲と観測契約は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の§1.328参照。
+    非対話確認: `cargo test -p mimageviewer --lib --features test-script test_script::` は
+    118成功／0失敗、fixtureのPythonテストは5成功。normal／portable core check、fmt check、
+    glyph checkはexit 0。今回の実アプリの結果は未採取で、前回のfull libと混同しない。
+    `prepare-portable-smoke.ps1 -TestScript` はexit 0。隔離markerとcore／remote／EPUB workerの
+    manifest SHA256一致を確認。実アプリ／scenarioは起動していない。
   - コードの追跡: Folder の double-click / Enter は `grid_physical_navigation` → `RatingSource` →
     `start_rating_physical_open`。採用時に `commit_rating_physical_load_owner` が履歴の ★3 と
     `rating_view_nav_stack` の opened path を記録し、通常 install がその path を `current_folder` に採用する。

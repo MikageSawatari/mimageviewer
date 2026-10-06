@@ -26,6 +26,10 @@ use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 mod capture;
 #[cfg(feature = "test-script")]
 mod clipboard_capture;
+#[cfg(feature = "test-script")]
+pub(crate) mod grid_observation;
+#[cfg(feature = "test-script")]
+mod history_input;
 pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -1076,6 +1080,8 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) action_wait_diagnostic: String,
     /// Raw index in `item_names`/the mounted grid, or -1 when nothing is selected.
     pub(crate) selected_index: i64,
+    #[cfg(feature = "test-script")]
+    pub(crate) grid_observation: grid_observation::GridObservation,
     pub(crate) item_names: Vec<String>,
     pub(crate) item_ratings: Vec<i64>,
     pub(crate) sort_order: String,
@@ -1203,6 +1209,8 @@ impl Default for TestScriptSnapshot {
             snapshot_frame: 0,
             action_wait_diagnostic: String::new(),
             selected_index: -1,
+            #[cfg(feature = "test-script")]
+            grid_observation: grid_observation::GridObservation::default(),
             item_names: Vec::new(),
             item_ratings: Vec::new(),
             sort_order: String::new(),
@@ -1284,6 +1292,8 @@ impl TestScriptSnapshot {
         insert!(items_len);
         insert!(snapshot_frame);
         insert!(selected_index);
+        #[cfg(feature = "test-script")]
+        map.insert("grid".into(), self.grid_observation.to_rhai_map().into());
         map.insert(
             "item_names".into(),
             self.item_names
@@ -2865,6 +2875,8 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    #[cfg(feature = "test-script")]
+    history_input::register(engine, bridge.clone());
     #[cfg(feature = "test-script")]
     clipboard_capture::register(engine, bridge.clone());
     let always_on_top_bridge = bridge.clone();
@@ -5634,6 +5646,21 @@ mod tests {
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        build_engine(bridge)
+            .compile(
+                &std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("scripts/ui-smoke/rating-folder-back.rhai"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
 
     #[test]
