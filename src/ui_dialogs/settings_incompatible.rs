@@ -46,30 +46,7 @@ impl App {
             return;
         };
 
-        let mut open_restore = false;
-        let mut quit = false;
-        egui::Modal::new(egui::Id::new("settings_boot_problem_modal")).show(ctx, |ui| {
-            ui.set_min_width(500.0);
-            ui.heading(copy.heading);
-            ui.add_space(8.0);
-            ui.label(copy.lead);
-            ui.label("設定ファイルとバックアップは変更せず、この起動中の設定保存を停止しました。");
-            ui.add_space(8.0);
-            ui.label(format!("現在のアプリ: v{}", env!("CARGO_PKG_VERSION")));
-            ui.add_space(8.0);
-            ui.label(copy.guidance);
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("設定の復元を開く").clicked() {
-                    open_restore = true;
-                }
-                if ui.button("アプリを終了").clicked() {
-                    quit = true;
-                }
-            });
-        });
+        let (open_restore, quit) = draw_settings_boot_problem_dialog(ctx, &copy);
 
         if open_restore {
             self.show_settings_boot_problem_notice = false;
@@ -100,4 +77,49 @@ mod tests {
 
         assert!(settings_boot_problem_copy(crate::settings_db::BootSource::CleanInstall).is_none());
     }
+}
+
+fn draw_settings_boot_problem_dialog(
+    ctx: &egui::Context,
+    copy: &SettingsBootProblemCopy,
+) -> (bool, bool) {
+    let mut open_restore = false;
+    let mut quit = false;
+    egui::Modal::new(egui::Id::new("settings_boot_problem_modal")).show(ctx, |ui| {
+        ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
+        ui.heading(copy.heading);
+        ui.add_space(8.0);
+        let footer =
+            super::startup_dialog_footer_height(ui, &["設定の復元を開く", "アプリを終了"], 24.0);
+        super::startup_dialog_scroll_body(ui, "settings_boot_problem_body", footer, |ui| {
+            ui.label(copy.lead);
+            ui.label("設定ファイルとバックアップは変更せず、この起動中の設定保存を停止しました。");
+            ui.add_space(8.0);
+            ui.label(format!("現在のアプリ: v{}", env!("CARGO_PKG_VERSION")));
+            ui.add_space(8.0);
+            ui.label(copy.guidance);
+        });
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("設定の復元を開く").clicked() {
+                open_restore = true;
+            }
+            if ui.button("アプリを終了").clicked() {
+                quit = true;
+            }
+        });
+    });
+
+    (open_restore, quit)
+}
+
+pub(super) fn draw_boot_problem_snapshot_fixture(ctx: &egui::Context, incompatible: bool) {
+    let source = if incompatible {
+        crate::settings_db::BootSource::IncompatibleSettings
+    } else {
+        crate::settings_db::BootSource::FailedFallbackDefault
+    };
+    draw_settings_boot_problem_dialog(ctx, &settings_boot_problem_copy(source).unwrap());
 }
