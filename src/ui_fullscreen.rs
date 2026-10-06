@@ -35604,7 +35604,7 @@ impl App {
             #[cfg(not(windows))]
             let presentation_was_transitioning = false;
             self.finish_fullscreen_navigation_for_true_close();
-            self.close_fullscreen();
+            self.close_fullscreen_to_page_list();
             if !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 #[cfg(windows)]
@@ -47403,7 +47403,7 @@ impl App {
         let escape_for_tile = false;
 
         if close_video {
-            self.close_fullscreen();
+            self.close_fullscreen_to_page_list();
             return;
         }
         if shift_enter {

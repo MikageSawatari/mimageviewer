@@ -165,6 +165,8 @@ pub(crate) struct ArchiveConvertState {
     /// Existing conversion cache, used only when the direct-read probe rejects the RAR.
     pub fallback_cached_zip: Option<PathBuf>,
     pub completion: ArchiveConvertCompletionPolicy,
+    /// The original open's final presentation intent survives scan, password and conversion.
+    pub restore_intent: crate::app::StartupListIntent,
     pub pending_sibling_output: Option<PathBuf>,
     /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
     /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
@@ -301,12 +303,15 @@ impl App {
         src: PathBuf,
         cached_zip: PathBuf,
         auto_fullscreen: bool,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         self.open_archive_via_cache_owned(
             src,
             cached_zip,
             auto_fullscreen,
             crate::app::OpenRequestOwner::Navigation,
+            restore_intent,
         )
     }
 
@@ -316,6 +321,8 @@ impl App {
         cached_zip: PathBuf,
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if let crate::app::OpenRequestOwner::DetachedGridArchive(detached_owner) = &owner {
             crate::logger::log(format!(
@@ -359,7 +366,12 @@ impl App {
             })
             .cloned();
         self.transition_favorite_view_for_path(Some(&src));
-        let load_accepted = self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
+        let load_accepted = self.load_folder_with_scan_owned(
+            cached_zip.clone(),
+            None,
+            owner,
+            crate::app::StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
+        );
         if !load_accepted {
             self.abort_smart_archive_open_for_owner(&transition_owner);
             let current = self.effective_folder();
@@ -397,7 +409,36 @@ impl App {
         self.archive_source_override = Some(src.clone());
         self.transition_favorite_view_for_path(Some(&src));
         self.commit_main_grid_archive_transition(&transition_owner);
+        self.finish_converted_archive_list_open(&cached_zip, restore_intent);
         true
+    }
+
+    /// Cache hydration materializes the original ZIP prefix but cannot commit before the
+    /// logical source and surface owner are installed.
+    /// Move the original intent into the already-owned enumeration, or finish its synchronous
+    /// adoption after the source-facing tail. No independent pending restore state is created.
+    fn finish_converted_archive_list_open(
+        &mut self,
+        cached_zip: &std::path::Path,
+        restore_intent: crate::app::StartupListIntent,
+    ) {
+        if let Some(pending) = self.zip_enumerate_pending.as_mut()
+            && crate::folder_tree::path_eq(&pending.zip_path, cached_zip)
+        {
+            pending.restore_intent = restore_intent.for_book();
+        } else if self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, cached_zip))
+            && self
+                .zip_nav
+                .as_ref()
+                .is_some_and(|nav| crate::folder_tree::path_eq(&nav.tree.zip_path, cached_zip))
+        {
+            // A synchronous enumerate error installs an empty failure surface without a ZIP
+            // navigation tree. Only a proven materialization may finish a semantic adoption.
+            self.finish_main_list_open(restore_intent.for_book());
+        }
     }
 
     /// Complete only the source-facing half of a Smart Folder archive open. The common visible
@@ -441,12 +482,14 @@ impl App {
         src: PathBuf,
         format: ArchiveFormat,
         auto_fullscreen: bool,
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         self.request_archive_convert_owned(
             src,
             format,
             auto_fullscreen,
             crate::app::OpenRequestOwner::Navigation,
+            restore_intent,
         )
     }
 
@@ -456,6 +499,7 @@ impl App {
         format: ArchiveFormat,
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible() {
             return false;
@@ -516,6 +560,7 @@ impl App {
                 }
             },
             pending_sibling_output: None,
+            restore_intent,
             nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
@@ -533,6 +578,7 @@ impl App {
         auto_fullscreen: bool,
         fallback_cached_zip: Option<PathBuf>,
         owner: crate::app::OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible()
             || self.archive_convert.is_some()
@@ -592,6 +638,7 @@ impl App {
                 }
             },
             pending_sibling_output: None,
+            restore_intent,
             nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
@@ -632,6 +679,7 @@ impl App {
             allow_direct_read: false,
             fallback_cached_zip: None,
             completion: ArchiveConvertCompletionPolicy::SiblingZip,
+            restore_intent: crate::app::StartupListIntent::PreservePresentation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -911,6 +959,7 @@ impl App {
             let auto_fs = state.auto_fullscreen;
             let deferred = state.deferred_fullscreen.take();
             let completion = state.completion.clone();
+            let restore_intent = state.restore_intent.clone();
             let nav_history_rollback = state.nav_history_rollback.clone();
             drop(state);
             if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
@@ -1008,7 +1057,11 @@ impl App {
             if auto_fs {
                 self.pending_auto_fs_open = true;
             }
-            self.load_zip_as_folder_with_input_seq(src.clone(), input_seq);
+            self.load_zip_as_folder_with_input_seq(
+                src.clone(),
+                input_seq,
+                crate::app::StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
+            );
             let loaded = self
                 .current_folder
                 .as_ref()
@@ -1046,6 +1099,9 @@ impl App {
             if self.tag_view.active {
                 self.update_tag_view_address();
             }
+            if loaded {
+                self.finish_converted_archive_list_open(&src, restore_intent);
+            }
             if let Some(deferred) = deferred {
                 let reason = self.reopen_fullscreen_after_folder_nav_load(
                     ctx,
@@ -1081,7 +1137,12 @@ impl App {
                     .is_some_and(|current| crate::folder_tree::path_eq(current, &parent))
             {
                 self.select_after_load = Some(output_name);
-                self.load_folder(parent);
+                self.load_folder_with_scan_owned(
+                    parent,
+                    None,
+                    crate::app::OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::PreservePresentation,
+                );
             }
             return;
         }
@@ -1137,6 +1198,12 @@ impl App {
                     .as_ref()
                     .map(|s| s.completion.clone())
                     .unwrap_or(ArchiveConvertCompletionPolicy::Navigation);
+                let restore_intent = self
+                    .archive_convert
+                    .as_ref()
+                    .expect("pending archive navigation owns its conversion state")
+                    .restore_intent
+                    .clone();
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion
                     && !self.bookmark_open_owner_is_current(owner)
                 {
@@ -1249,7 +1316,14 @@ impl App {
                     self.transition_favorite_view_for_path(Some(source));
                 }
                 let transition_owner = open_owner.clone();
-                let load_accepted = self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
+                let load_accepted = self.load_folder_with_scan_owned(
+                    nav.clone(),
+                    None,
+                    open_owner,
+                    crate::app::StartupListIntent::InternalHydration(Box::new(
+                        restore_intent.clone(),
+                    )),
+                );
                 if !load_accepted {
                     self.abort_smart_archive_open_for_owner(&transition_owner);
                 }
@@ -1297,6 +1371,7 @@ impl App {
                     self.transition_favorite_view_for_path(Some(&src));
                 }
                 self.commit_main_grid_archive_transition(&transition_owner);
+                self.finish_converted_archive_list_open(&nav, restore_intent);
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                     self.begin_bookmark_page_wait(owner);
                 }
@@ -1991,6 +2066,7 @@ mod tests {
             allow_direct_read: false,
             fallback_cached_zip: None,
             completion: ArchiveConvertCompletionPolicy::Navigation,
+            restore_intent: crate::app::StartupListIntent::PageContinuation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -2009,17 +2085,153 @@ mod tests {
         assert_eq!(password, "mivtest2026");
         assert_eq!(state.password.as_deref(), Some("mivtest2026"));
         assert!(state.password_input.is_empty());
+        assert_eq!(
+            state.restore_intent,
+            crate::app::StartupListIntent::PageContinuation
+        );
     }
 
     #[test]
     fn prepare_password_retry_keeps_convert_resume() {
         let mut state = state_for_password_resume(ArchivePasswordResume::Convert);
+        state.restore_intent = crate::app::StartupListIntent::RestoreList {
+            target: crate::settings::StartupListTarget::PhysicalList {
+                logical_path: state.src_path.clone(),
+                zip_prefix: Some("chapter/".into()),
+            },
+            cursor: Some(crate::settings::ListCursorHint {
+                name: "003.jpg".into(),
+                rows_above: Some(2),
+            }),
+        };
+        let restore_intent = state.restore_intent.clone();
         let (resume, password) = prepare_archive_password_retry(&mut state).unwrap();
 
         assert_eq!(resume, ArchivePasswordResume::Convert);
         assert_eq!(password, "mivtest2026");
         assert_eq!(state.password.as_deref(), Some("mivtest2026"));
         assert!(state.password_input.is_empty());
+        assert_eq!(state.restore_intent, restore_intent);
+    }
+
+    #[test]
+    fn converted_archive_hands_intent_to_existing_enumeration_without_committing() {
+        let mut app = crate::app::setup_app_for_test();
+        let before = app.settings.startup_list_restore.clone();
+        let cached = PathBuf::from("C:/cache/converted.zip");
+        let (_tx, rx) = mpsc::channel();
+        app.zip_enumerate_pending = Some(crate::app::ZipEnumeratePending {
+            zip_path: cached.clone(),
+            restore_intent: crate::app::StartupListIntent::InternalInstall,
+            input_seq: 7,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        let intent = crate::app::StartupListIntent::RestoreList {
+            target: crate::settings::StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from("C:/books/source.rar"),
+                zip_prefix: Some("chapter/".into()),
+            },
+            cursor: None,
+        };
+        app.finish_converted_archive_list_open(&cached, intent.clone());
+        assert_eq!(
+            app.zip_enumerate_pending.as_ref().unwrap().restore_intent,
+            intent
+        );
+        assert_eq!(app.settings.startup_list_restore, before);
+    }
+
+    #[test]
+    fn synchronous_archive_hydration_materializes_restored_prefix_before_source_commit() {
+        use crate::app::StartupListIntent;
+        use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
+
+        for cached in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            let tmp = tempfile::tempdir().unwrap();
+            let source = tmp.path().join("source.rar");
+            let backing = if cached {
+                tmp.path().join("cache.zip")
+            } else {
+                source.clone()
+            };
+            let before = app.settings.startup_list_restore.clone();
+            let target = StartupListTarget::PhysicalList {
+                logical_path: source.clone(),
+                zip_prefix: Some("chapter/".into()),
+            };
+            let cursor = ListCursorHint {
+                name: "003.jpg".into(),
+                rows_above: Some(0),
+            };
+            let intent = StartupListIntent::RestoreList {
+                target: target.clone(),
+                cursor: Some(cursor.clone()),
+            };
+            let enumeration = crate::zip_loader::ZipEnumeration {
+                entries: ["cover.jpg", "chapter/001.jpg", "chapter/003.jpg"]
+                    .into_iter()
+                    .map(|entry_name| crate::zip_loader::ZipImageEntry {
+                        entry_name: entry_name.into(),
+                        uncompressed_size: 1,
+                        mtime: 0,
+                    })
+                    .collect(),
+                has_foreign_archives: false,
+                legacy_renames: Vec::new(),
+            };
+
+            // Prepared enumeration exercises the production synchronous finalize path without
+            // spawning a RAR/ZIP scanner or relying on a rare OS thread-spawn failure.
+            app.load_zip_as_folder_prepared(
+                backing.clone(),
+                enumeration,
+                StartupListIntent::InternalHydration(Box::new(intent.clone())),
+            );
+            assert!(app.zip_enumerate_pending.is_none());
+            assert_eq!(
+                app.zip_nav.as_ref().unwrap().current(),
+                &["chapter".to_string()]
+            );
+            assert_eq!(
+                app.items.iter().map(|item| item.name()).collect::<Vec<_>>(),
+                ["001.jpg", "003.jpg"]
+            );
+            assert_eq!(
+                app.settings.startup_list_restore, before,
+                "hydration must not commit the backing alias"
+            );
+
+            if cached {
+                app.archive_source_override = Some(source.clone());
+            }
+            app.finish_converted_archive_list_open(&backing, intent);
+            assert_eq!(app.effective_folder().as_ref(), Some(&source));
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(
+                app.settings.startup_list_restore,
+                Some(StartupListRestore::V1 {
+                    target,
+                    cursor: Some(cursor)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn converted_archive_failed_materialization_keeps_restore_record() {
+        let mut app = crate::app::setup_app_for_test();
+        let before = app.settings.startup_list_restore.clone();
+        let cached = PathBuf::from("C:/cache/converted.zip");
+        app.current_folder = Some(cached.clone());
+        app.archive_source_override = Some(PathBuf::from("C:/books/source.rar"));
+        app.zip_nav = None;
+        app.finish_converted_archive_list_open(
+            &cached,
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        assert_eq!(app.settings.startup_list_restore, before);
     }
 
     #[test]

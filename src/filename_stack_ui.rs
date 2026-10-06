@@ -1763,6 +1763,7 @@ impl crate::app::App {
         if from_double_click && matches!(self.items.get(agg_idx), Some(GridItem::Video(_))) {
             self.fs_primary_suppression.arm_pointer_stream();
         }
+        self.capture_main_list_restore_cursor();
         self.stack_enter_flat_fullscreen(ctx, flat_idx);
         true
     }

@@ -41,6 +41,7 @@
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
+| [startup-restore-target-plan.md](startup-restore-target-plan.md) | §1.335「前回終了した場所」の明示一覧所有、物理／本／Drive の復元範囲、旧データの初回移行、ZIP 内階層、一覧復帰要求の受理境界と回帰検証。実機確認は未実施 |
 | [collection-rereview-fixes-20260921.md](collection-rereview-fixes-20260921.md) | v4.0.0再レビューの追加修正。指摘の妥当性、直列の実装範囲、バックアップ・復旧・待機要求の設計合意と検証記録 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
 | [collection-playback-plan.md](collection-playback-plan.md) | Phase 4のPC向けCtrl+上下、通常next / prev、slideshow、三媒体EOFを最新prepared順へ接続した所有設計と検収記録 |
@@ -81,7 +82,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全433フィールドの分類 (130対象 / 303除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全441フィールドの分類 (131対象 / 310除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |

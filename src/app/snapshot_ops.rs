@@ -648,6 +648,7 @@ impl App {
             self.show_feedback_toast("固定する items がありません".into());
             return;
         }
+        self.capture_main_list_restore_cursor();
         let captured_thumbnails: Vec<crate::grid_item::ThumbnailState> = self
             .visible_indices
             .iter()
@@ -1688,6 +1689,7 @@ impl App {
         history_trigger: crate::app::HistoryTrigger,
         navigation_purpose: crate::app::FsNavigationPurpose,
     ) {
+        self.capture_main_list_restore_cursor();
         if matches!(target, crate::snapshot::SnapshotTarget::Fs(_)) {
             // Accepting the new scan supersedes any old ZIP/PDF enumerate or password retry.
             // The current viewer remains intact until this physical scan succeeds.
@@ -1827,6 +1829,7 @@ impl App {
                         navigation_purpose,
                     },
                     folder_path,
+                    crate::app::StartupListIntent::PageContinuation,
                 );
             self.snapshot_internal_nav = false;
             if !started {
@@ -1839,7 +1842,12 @@ impl App {
             return;
         }
         self.snapshot_internal_nav = true;
-        self.load_folder(folder_path);
+        self.load_folder_with_scan_owned(
+            folder_path,
+            None,
+            crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::PageContinuation,
+        );
         self.snapshot_internal_nav = false;
         self.finish_required_fullscreen_load(target, history_trigger);
     }
@@ -1858,7 +1866,12 @@ impl App {
             return;
         }
         self.snapshot_internal_nav = true;
-        self.load_folder_with_scan(folder_path, Some(scan));
+        self.load_folder_with_scan_owned(
+            folder_path,
+            Some(scan),
+            crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::PageContinuation,
+        );
         self.snapshot_internal_nav = false;
         self.finish_required_fullscreen_load(target, history_trigger);
     }
@@ -1934,7 +1947,7 @@ impl App {
         });
         if !already_materialized {
             self.zip_nav.as_mut()?.enter(&target.effective_prefix);
-            self.zip_nav_show_current_level();
+            self.zip_nav_show_current_level(crate::app::StartupListIntent::PageContinuation);
         }
         Some(crate::snapshot::SnapshotTarget::ZipImage {
             zip_path: tree_path,

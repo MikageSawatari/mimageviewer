@@ -37,6 +37,16 @@
 - `TagDef` は `{ id, tag_key, name, show_shortcut }` になり、`FacetFilter.tags` は
   表示文字列 `#タグ` ではなく `tag_key` を永続化する。
 
+2026-10-06 追記（起動時に戻る一覧）:
+- `startup_list_restore` は既存 `settings_kv` に保存する、一覧 target と対応 cursor の一つの record。
+  新しい DB テーブルや永続 navigation stack は追加しない。
+- released `last_folder` は引き続き互換値として保存する。新 key が欠落する既存 DB／旧 JSON だけ、
+  `last_folder` と旧 cursor を一度そのまま移行する。更新直後の最初の復元先には旧挙動が残り得る。
+  新 key がある設定を legacy 値で再構築せず、Preferences OK は live record を維持する。
+- load 時の移行書き戻しは既存の rotation なし保存を使い、ユーザー保存の backup 世代を消費しない。
+  保存失敗への retry／journal／recovery は追加しない。record は環境設定の export/import から除外する。
+  契約と検証は [起動復元の所有設計](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項) を参照。
+
 将来の delete (本ロードマップ外):
 - **旧 `*.json` save 経路の物理削除**: spec §9 Phase 6 で「数バージョン後に」と明記。
   現状は `try_load_with_recovery` / `rotate_backups` / `write_atomic` / `quarantine_path` /

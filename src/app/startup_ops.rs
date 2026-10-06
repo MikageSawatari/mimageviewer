@@ -900,6 +900,7 @@ impl App {
             result.elapsed_ms
         ));
 
+        self.capture_main_list_restore_cursor();
         let select_requested_file = resolution.requested_is_file
             && matches!(
                 resolution.kind,
@@ -922,6 +923,7 @@ impl App {
                     openable,
                     true,
                     owner.open_request_owner(),
+                    super::StartupListIntent::PageContinuation,
                 );
                 if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.open_startup_file_if_visible(&result.requested);
@@ -1014,6 +1016,11 @@ impl App {
             openable,
             auto_fullscreen,
             owner.open_request_owner(),
+            if select_requested_file {
+                super::StartupListIntent::PageContinuation
+            } else {
+                super::StartupListIntent::container_open(auto_fullscreen)
+            },
         );
         match outcome {
             FolderOpenOutcome::Ignored => return StartupOpenApplyOutcome::NotOpenable,
@@ -1309,6 +1316,10 @@ impl App {
     }
 
     pub(crate) fn open_default_startup_target(&mut self) {
+        if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Previous {
+            self.open_previous_startup_list();
+            return;
+        }
         if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::ReadingHistory {
             self.enter_reading_history();
         } else if should_start_in_drive_list(&self.settings) {

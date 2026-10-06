@@ -51,7 +51,10 @@ pub(crate) struct EpubOpenRestore {
 
 #[derive(Clone, Debug)]
 pub(crate) enum EpubOpenContinuation {
-    Direct(OpenRequestOwner),
+    Direct {
+        owner: OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
+    },
     StagedHistory {
         context: ViewerContextId,
         request_id: u64,
@@ -132,6 +135,7 @@ impl EpubConvertState {
         outcome: PublishOutcome,
         surface_generation: u64,
         smart_transition_sequence: u64,
+        restore_intent: crate::app::StartupListIntent,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubConvertMsg::ConvertDone(Ok(outcome))).unwrap();
@@ -139,7 +143,10 @@ impl EpubConvertState {
         Self {
             src_owner: crate::pdf_loader::LeasedEpubPath::try_new(src_path.clone()).unwrap(),
             src_path,
-            continuation: EpubOpenContinuation::Direct(owner),
+            continuation: EpubOpenContinuation::Direct {
+                owner,
+                restore_intent,
+            },
             surface_generation,
             smart_transition_sequence,
             open_restore: EpubOpenRestore {
@@ -162,6 +169,7 @@ impl EpubConvertState {
         saved: epub_convert::SavedPdf,
         surface_generation: u64,
         smart_transition_sequence: u64,
+        restore_intent: crate::app::StartupListIntent,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubConvertMsg::SaveDone(Ok(saved))).unwrap();
@@ -169,7 +177,10 @@ impl EpubConvertState {
         Self {
             src_owner: crate::pdf_loader::LeasedEpubPath::try_new(src_path.clone()).unwrap(),
             src_path,
-            continuation: EpubOpenContinuation::Direct(owner),
+            continuation: EpubOpenContinuation::Direct {
+                owner,
+                restore_intent,
+            },
             surface_generation,
             smart_transition_sequence,
             open_restore: EpubOpenRestore {
@@ -363,9 +374,14 @@ impl App {
         owner: OpenRequestOwner,
         logical: &Path,
         failure: PdfOpenFailure,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> PdfOpenFailureRoute {
         self.route_pdf_open_failure_with_continuation(
-            EpubOpenContinuation::Direct(owner),
+            EpubOpenContinuation::Direct {
+                owner,
+                restore_intent,
+            },
             logical,
             failure,
         )
@@ -398,14 +414,14 @@ impl App {
             PdfOpenFailure::NotConverted => {
                 if self.settings.epub_file_handling_ignores_epub() {
                     self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
-                    if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                    if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                         self.restore_address_after_epub_open_aborted(logical);
                     }
                     return PdfOpenFailureRoute::Handled;
                 }
                 let Ok(cancel) = CancelToken::new() else {
                     self.show_feedback_toast("EPUB の変換を開始できませんでした".into());
-                    if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                    if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                         self.restore_address_after_epub_open_aborted(logical);
                     }
                     return PdfOpenFailureRoute::Handled;
@@ -450,7 +466,7 @@ impl App {
             }
             PdfOpenFailure::EpubUnavailable(reason) => {
                 self.show_feedback_toast(format!("EPUB 変換が無効です: {reason}"));
-                if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                     self.restore_address_after_epub_open_aborted(logical);
                 }
                 PdfOpenFailureRoute::Handled
@@ -494,7 +510,7 @@ impl App {
         );
         drop(state);
         match &continuation {
-            EpubOpenContinuation::Direct(owner) => {
+            EpubOpenContinuation::Direct { owner, .. } => {
                 self.abort_smart_archive_open_for_owner(owner);
             }
             EpubOpenContinuation::StagedHistory {
@@ -514,7 +530,7 @@ impl App {
         }
         match exit {
             EpubConvertExit::Abort | EpubConvertExit::Parked => {
-                if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                     self.restore_epub_open(restore);
                 }
             }
@@ -575,7 +591,11 @@ impl App {
             );
             return;
         }
-        let EpubOpenContinuation::Direct(mut owner) = continuation else {
+        let EpubOpenContinuation::Direct {
+            mut owner,
+            restore_intent,
+        } = continuation
+        else {
             unreachable!()
         };
         if saved_sibling && let OpenRequestOwner::CollectionGridPhysical(collection) = &mut owner {
@@ -597,10 +617,15 @@ impl App {
             return;
         }
         let reopened = if matches!(owner, OpenRequestOwner::CollectionGridPhysical(_)) {
-            self.load_folder_with_scan_owned(path.clone(), None, owner.clone())
+            self.load_folder_with_scan_owned(
+                path.clone(),
+                None,
+                owner.clone(),
+                restore_intent.clone(),
+            )
         } else {
             matches!(
-                self.load_pdf_as_folder_owned(path.clone(), owner.clone()),
+                self.load_pdf_as_folder_owned(path.clone(), owner.clone(), restore_intent.clone()),
                 crate::app::FolderOpenOutcome::Loaded
             )
         };
@@ -839,7 +864,10 @@ mod tests {
                     "C:/books/book.epub",
                 ))
                 .unwrap(),
-                continuation: EpubOpenContinuation::Direct(OpenRequestOwner::Navigation),
+                continuation: EpubOpenContinuation::Direct {
+                    owner: OpenRequestOwner::Navigation,
+                    restore_intent: crate::app::StartupListIntent::PageContinuation,
+                },
                 surface_generation: 0,
                 smart_transition_sequence: 0,
                 open_restore: EpubOpenRestore {
@@ -1023,7 +1051,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, tx, _) = fake_state(EpubConvertPhase::Converting(None));
         let source = state.src_path.clone();
-        let EpubOpenContinuation::Direct(owner) = state.continuation.clone() else {
+        let EpubOpenContinuation::Direct { owner, .. } = state.continuation.clone() else {
             unreachable!()
         };
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
@@ -1047,6 +1075,13 @@ mod tests {
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
         assert_eq!(app.fs_nav_locked_gen, Some(7));
+        assert!(matches!(
+            &app.pdf_enumerate_pending.as_ref().unwrap().5,
+            crate::app::PdfOpenPhase::ColdCandidate {
+                restore_intent: crate::app::StartupListIntent::PageContinuation,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1055,7 +1090,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, tx, _) = fake_state(EpubConvertPhase::Saving(None));
         let pdf = state.src_path.with_extension("pdf");
-        let EpubOpenContinuation::Direct(owner) = state.continuation.clone() else {
+        let EpubOpenContinuation::Direct { owner, .. } = state.continuation.clone() else {
             unreachable!()
         };
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
@@ -1082,6 +1117,13 @@ mod tests {
                 .is_some_and(|pending| pending.0 == pdf && pending.3.as_ref() == &owner)
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
+        assert!(matches!(
+            &app.pdf_enumerate_pending.as_ref().unwrap().5,
+            crate::app::PdfOpenPhase::ColdCandidate {
+                restore_intent: crate::app::StartupListIntent::PageContinuation,
+                ..
+            }
+        ));
     }
 
     #[test]

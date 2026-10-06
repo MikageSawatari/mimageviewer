@@ -1762,6 +1762,7 @@ impl App {
             );
         }
         let navigation_purpose = self.similar_book_navigation_purpose(&target, diagnostic_trace);
+        self.capture_main_list_restore_cursor();
         if let Some(index) = existing_index {
             self.supersede_required_fullscreen_folder_open();
             match (self.fullscreen_idx, navigation_purpose) {

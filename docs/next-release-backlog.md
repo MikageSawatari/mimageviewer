@@ -42,13 +42,17 @@
 
 ### 1.335 本を直接ページ表示したまま終了すると、次回起動が見ていないページ一覧になる — mIV スレ >>508 (2026-10-06)
 
+- tray 設定変更 P2 (2026-10-06): `b026c5e3e` の再レビューに対応。直接画像フォルダ本の読書中に F12 別窓から環境設定で本扱いを OFF にしても、採用済み一覧と保存済み親の事実で格納時の親戻りを判断する。新しい状態や detached 経路の変更なし。F12／環境設定／×／tray 復帰の回帰と Backspace 明示一覧の対照を追加し、独立 source review 承認、回帰80件・3構成 check・fmt／diff／glyph が成功。full lib（10731 passed / 52 ignored）も成功。保護付き確認 build は dev core（PID 21232）の実行中に更新を拒否したため未完了、停止・再試行なし。結果は [設計 §10.9](startup-restore-target-plan.md#109-読書中の画像フォルダ設定変更と-tray-親戻り-p22026-10-06) に記録する。未コミット、製品未起動。
+- tray 再レビュー P2 (2026-10-06): `42cc83e73` の画像のみフォルダ本の対象漏れに対応済み。既存分類を tray の同じ適格性判定へ含め、親 cursor／読書再開／Backspace 明示と通常終了・再起動を確認。通常終了側の追加修正は不要。独立 source review 承認、回帰78件・3構成 check・fmt／diff／glyph・full lib（10729 passed / 52 ignored）が成功。normal 確認 build は旧 dev-runtime core の実行中に `-PreserveRuntime` が更新を拒否し、利用者の完全終了後の再実行待ち。未コミット、今回のアプリ起動なし。対応と検証は [設計 §10.8](startup-restore-target-plan.md#108-画像フォルダ本の-tray-対象漏れ-p22026-10-06) に記録。
+- tray 追補 (2026-10-06): 先行修正は `cd4c68c96` でコミットされ独立レビュー承認済み。実機確認で main の直接 ZIP 読書から × で格納すると未明示本一覧が露出するケースが判明し、利用者は option B（保存済み親一覧に一致する場合、格納時に既存の親戻りで戻す）を決定。非採用の自動復帰で親 cursor と読書位置を保持し、明示本一覧・動画・detached／switching・tray 復帰の仕組みは維持する。追補は独立レビュー承認済み、回帰74件・3構成 check・fmt／diff／glyph・full lib（10725 passed / 52 ignored）・normal 確認 build が成功。設計と検証は [§10.7](startup-restore-target-plan.md#107-tray-格納時の直接読書からの親戻り2026-10-06option-b) に記録。未コミット、製品未起動、追補の実機確認と最終検収は未実施。
+- 先行 Phase 2 (2026-10-06): 初回実装 `83d2ac3c1` の独立レビュー P2 3件（Collection 採用通知、動画リング、全体 gate）に対応し、native close 2箇所と egui close 1箇所も設計担当・独立 reviewer の合意後に適用した。`cd4c68c96` でコミット・独立レビュー承認済み。settings／workspace／統合／doc／補助 bin／vendor の先行 gate は [設計 §10.5](startup-restore-target-plan.md#105-独立実装レビュー-p2-対応2026-10-06)、追加 close caller の66回帰と full lib／確認 build は [§10.6](startup-restore-target-plan.md#106-追加動画-close-caller-の合意適用2026-10-06) に保持する。改訂設計 `23d885e11` と受理時記録（`target/r1335d3-review.txt`）の単一所有・migration 判断を維持する。
 - 報告: v4.3.0 ポータブル版で ZIP の画像を表示して終了すると、再起動時にその ZIP のページ一覧が開く。ZIP を選択しただけで終了した場合は親のアーカイブ一覧が開く。報告者のビューワモード・本の開き方・起動時の場所の設定は未確認。
-- 現状のコード: メイン側で本のページを読み込むと `start_loading_items` が `settings.last_folder` に ZIP/PDF 自身を保存する (`src/app.rs`)。「前回終了した場所」での次回起動は `open_default_startup_target` がそのパスを `load_folder_or_convert_archive(..., auto_fullscreen=false)` で開くため、ページ一覧になる (`src/app/startup_ops.rs`)。独立した複数ウィンドウの本コンテキストではメイン側の履歴保存を抑止している。
+- 修正前のコード: メイン側で本のページを読み込むと `start_loading_items` が `settings.last_folder` に ZIP/PDF 自身を保存する (`src/app.rs`)。「前回終了した場所」での次回起動は `open_default_startup_target` がそのパスを `load_folder_or_convert_archive(..., auto_fullscreen=false)` で開くため、ページ一覧になる (`src/app/startup_ops.rs`)。独立した複数ウィンドウの本コンテキストではメイン側の履歴保存を抑止している。
 - **期待する復元先は、内部で読み込んだ場所ではなく、利用者が最後に明示的に開いた一覧。** 本をページ一覧で開いてから画像を表示した場合はその本のページ一覧へ戻る。本を直接ページ表示で開き、ページ一覧を見ていない場合は、開く前の親一覧へ戻る。直接表示後に Backspace 等でページ一覧を明示的に開いた場合は、そこを復元先にする。
 - F12 の linked 別ウィンドウは表示先の切替であり、戻り先を変更しない。複数ウィンドウの independent ビューアはメイン一覧と別コンテキストなので、ビューア内の本をメイン側の起動復元先にしない。通常画像フォルダ・変換アーカイブでも同じ所有規則を確認する。
 - 対象は起動時の場所が「前回終了した場所」の場合。デスクトップ・指定フォルダ・ドライブ一覧・閲覧履歴、および起動引数による明示オープンの意味は変えない。本の読書位置 (`book_open_resume`) と、終了せずトレイへ退避・復帰する状態も別に扱う。
-- 実装前に、戻り先を決める時点と所有者を `docs/virtual-folders.md` / `docs/detached-rework-plan.md` と突き合わせる。`last_folder` が担う「現在の本」と「起動時に復元する一覧」を混同したままモード別 guard を増やさない。フル機能 (ページ一覧 / 直接ページ表示)、F12 linked、複数ウィンドウ independent、明示的なページ一覧への復帰、ZIP/PDF/変換書庫、起動設定別の回帰を追加する。
-- 優先度: P2。現時点では報告者の設定が未確認のため、上記の現状経路を原因候補として扱い、実装時に再現条件を確定する。
+- 合意した所有設計: `last_folder` は旧互換値として残し、Previous 専用の明示一覧 record を正本にする。旧設定は path と cursor を初回だけそのまま移行する。Search／Collection／Smart 等の合成 root は復元対象を追加せず、直前の物理一覧と cursor を保持する。フル機能 (ページ一覧 / 直接ページ表示)、F12 linked、複数ウィンドウ independent、明示的なページ一覧への復帰、ZIP/PDF/変換書庫、起動設定別の回帰を確認する。
+- 優先度: P2。「前回終了した場所」+ ZIP の直接ページ表示で上記コード経路を headless 再現済み。外部報告者の設定は未確認であり、報告者自身の環境まで再現できたとは扱わない。
 
 ### 1.329 外部ツールへ、渡すファイルの一覧を書いたリストファイルを渡す (`{file_list}`) — 利用者要望 (2026-10-05)
 

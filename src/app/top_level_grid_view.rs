@@ -1413,6 +1413,12 @@ impl TopLevelGridView {
         self.history_navigation_transition.as_deref()
     }
 
+    pub(crate) fn history_navigation_transition_mut(
+        &mut self,
+    ) -> Option<&mut super::HistoryNavigationTransition> {
+        self.history_navigation_transition.as_deref_mut()
+    }
+
     pub(crate) fn take_history_navigation_transition(
         &mut self,
     ) -> Option<super::HistoryNavigationTransition> {
