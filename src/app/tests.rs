@@ -13,6 +13,32 @@ mod file_organize_tests {
     };
 
     #[test]
+    fn file_organize_destinations_direct_handler_adopts_folder_and_history() {
+        let mut app = phase_c_support::setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("origin");
+        let destination = app.tmp.path().join("destination");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        app.load_folder(origin.clone());
+        let history = app.folder_nav_history_snapshot();
+        assert!(
+            app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+                destination.clone()
+            ),)
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        let after = app.folder_nav_history_snapshot();
+        assert_eq!(after.back_stack.len(), history.back_stack.len() + 1);
+        assert_eq!(
+            after.back_stack.last(),
+            Some(&FolderNavHistoryTarget::Path(origin))
+        );
+        assert!(after.forward_stack.is_empty());
+    }
+
+    #[test]
     fn file_organize_completion_requests_existing_external_rescan_only_for_current_real_folder() {
         let mut env = phase_c_support::setup_app();
         let root = env.tmp.path().to_owned();

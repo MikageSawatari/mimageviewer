@@ -777,6 +777,9 @@ Remote は「整理先」見出しの下に通常の folder card を登録順で
 持たせ、既存 `folderHash` / `navigate` 経路から開く。登録先の存在確認や独自除去を Home 生成へ
 追加せず、不在先は元の絶対パスを維持する。開く時の実在・種別・Remote path guard は他の
 folder entry と同じであり、UNC 等の既存拒否条件も変えない。設定変更は既存 Home 更新で反映する。
+2026-10-06 の P2 修正で整理先の Home entry は登録名・パスの直接写像へ変更した。
+canonicalize／存在確認を行わず、応答の遅い登録先が Home worker と IPC deadline を塞がない。
+wire shape は同じなので protocol 66 を維持する。その他の場所項目の既存解決処理は変更しない。
 
 スマートフォルダの定義一覧と、ドライブ一覧・読書履歴・レーティング・本棚・ブックマーク・
 スマートフォルダの評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を

@@ -442,6 +442,15 @@ TextureIdで重複排除して見積もり、補正レイヤーの比較preview�
 次の pass 開始時に失われる。deadline / debounce / backstop の owner は期限に達するまで毎 pass
 残り時間を再要求し、入力イベント時の 1 回だけの呼び出しに起床責任を持たせない。
 
+**既知例外: 場所▼の選択解決（2026-10-06 利用者決定、§1.263 follow-up）**。
+整理先・QuickLocation・drive は、従来の Desktop / drive と同じ menu callback 内の
+`resolve_folder_bar_nav_path` → `AddressBarNav::Direct` で同期解決する。到達不能なネットワーク先は
+OS が諦めるまで UI をブロックし得る。この制約は利用者が明示的に了承した。
+非同期・モーダル案で後続移動、先行検索、入力／背景完了の境界についてレビュー指摘が繰り返され、
+利用者は元の単純な同期経路へ戻す判断をした。実機での停止時間や応答を観測した主張ではない。
+登録先の存在確認は選択時だけに行い、menu 描画や Remote Home の整理先生成には追加しない。
+他の処理にこの例外を広げない。判断と検証記録は `file-organize-destinations-plan.md` §13 を参照。
+
 ### 4.1 オーバーレイパネルの ScrollArea
 
 `egui::Area + Frame::popup + ScrollArea` でフルスクリーン左パネルを作る場合は、

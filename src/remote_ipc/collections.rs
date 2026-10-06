@@ -1290,7 +1290,16 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
                     name: "整理先".to_owned(),
                     entries: destinations
                         .into_iter()
-                        .map(|destination| remote_folder_entry(destination.name, destination.path))
+                        .map(|destination| RemoteEntry {
+                            path: destination.path.to_string_lossy().into_owned(),
+                            name: destination.name,
+                            kind: RemoteEntryKind::Folder,
+                            thumbnail_address: None,
+                            detail: None,
+                            progress_current: None,
+                            progress_total: None,
+                            rating: None,
+                        })
                         .collect(),
                 }
             }
@@ -1910,7 +1919,7 @@ mod tests {
             },
             FileOrganizeDestination {
                 name: "保管".into(),
-                path: existing.clone(),
+                path: existing.join("..").join("existing"),
             },
         ];
         let PlaceSummary::FileOrganizeDestinations { name, entries } = group(&settings).unwrap()
@@ -1931,6 +1940,12 @@ mod tests {
                 .all(|entry| entry.kind == RemoteEntryKind::Folder)
         );
         assert_eq!(PathBuf::from(&entries[0].path), missing);
+        assert_eq!(
+            entries[1].path,
+            settings.file_organize_destinations[1]
+                .path
+                .to_string_lossy()
+        );
         assert!(super::super::path_guard::resolve_existing(&entries[0].path).is_err());
         assert!(super::super::path_guard::resolve_existing(&entries[1].path).is_ok());
         settings.show_location_file_organize_destinations = false;

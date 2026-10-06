@@ -353,15 +353,17 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 このフィールドは `overwrite_non_preferences_from` で live 値を上書きせず draft 値を確定する。
 
 一覧の唯一の正本は `known_folders::LocationMenuEntry::FileOrganizeDestinations`。
-ローカルは既存 `resolve_folder_bar_nav_path` → `AddressBarNav::Direct` を返すだけとし、
-履歴、戻る stack、viewer context、検索／★固定の入口 gate を既存場所移動に揃える。
+ローカルの選択は他の場所項目と同じ `resolve_folder_bar_nav_path` → `AddressBarNav::Direct` の
+同期解決を使う。到達不能なネットワーク先では OS が諦めるまで UI をブロックし得る
+(2026-10-06 利用者了承、判断理由と既知例外は §13)。履歴、戻る stack、viewer context、
+検索／★固定の入口 gate は既存場所移動に揃える。
 存在しない先も登録から消さず、他の場所項目と同じ解決・移動経路に委ねる。
 Remote Home は同じグループを `PlaceSummary` へ写像し、通常フォルダ route で開く。
 Remote IPC は 65 → 66、両 exe は共有 crate の同一定数を参照して一緒にビルドする。
 コピー・移動の実行、clipboard、ファイル変更の後始末には変更を加えない。
 
 既存の単発 navigation と Home 更新を再利用するので、追加の非同期 owner、live rebuild、
-rollback／resume は不要。表示切替は列挙時に読むだけで、登録先の走査や新しい同期 I/O は足さない。
+rollback／resume は不要。表示切替は列挙時に読むだけで、menu 描画には登録先の存在確認を足さない。
 
 場所 UI の PNG は次の 2 枚を新規追加し、どちらも目視確認した。
 
@@ -423,3 +425,58 @@ clean を行って再構築した。対象は生成済み dev/test cache のみ�
 インストール済み／tray 常駐の mImageViewer を先に終了する (single-instance mutex を共有)。
 `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` は通常の
 `%APPDATA%\mimageviewer` を使用し、実設定・データを更新し得る。
+
+## 13. 同期選択へ戻す利用者決定と P2 修正の保持 (2026-10-06)
+
+対象: `next-organize-location-sync` / `1c49e9efa` の follow-up。
+`d897257c6` の未コミット cherry-pick から、ローカルの場所選択を変更する部分を取り除く。
+後続の失効・モーダル・終了境界の案はこの branch に取り込まない。
+
+利用者決定: 整理先・QuickLocation・drive の選択解決は、元の Desktop / drive と同じ
+`resolve_folder_bar_nav_path` → `AddressBarNav::Direct` の同期経路へ戻す。
+非同期／モーダル案では後続移動、先行検索、native input と背景完了の境界についてレビュー指摘が
+繰り返されたため、利用者は元の単純な振る舞いを選んだ。到達不能なネットワーク先は OS が諦める
+まで UI がブロックされ得ることを明示的に了承した。これを ui-responsiveness §4 の既知例外に
+記録する。停止時間・描画・応答の実機観測を主張するものではない。
+場所選択専用の非同期要求、取消・確認 UI、入力遮断、背景完了保留は設けない。
+本／書庫を開く既存の分類・変換など、他の通常ナビ処理は変更しない。
+
+残す変更は次の 2 点:
+
+1. Remote Home の整理先は `RemoteEntry` に登録名・パスをそのまま格納する。
+   canonicalize / 存在確認をせず、開く要求に既存の存在・種別・Remote path guard を委ねる。
+   登録順・不在先・名称・パス・wire shape・protocol 66 は維持する。
+2. 整理先 submenu は画面高と 400px で制限した縦 ScrollArea を使う。
+   開いている frame は描画後に raw / smooth delta と MouseWheel event を消費し、背面一覧へ通さない。
+   100 件の末尾を実ホイールで表示し、通常の `Direct` として選択する headless test を維持する。
+
+QuickLocation / DriveRoot の callback と App の通常 nav handler は初版と同じコードへ戻す。
+organize destinations も同じ同期 helper を使い、親 fallback と履歴・戻る／進むを通常ナビへ委ねる。
+`LocationMenuEntry` は引き続き両 UI の単一の正本。表示設定・§1.317 の分類・設定移行方針は維持する。
+この機能は未公開のため settings migration は不要。変更は detached 述語や viewport 所有へ触れない。
+
+PNG は cherry-pick の `folder_bar_organize_destinations_scrolled.png` を保持する。
+100 件の末尾 (084〜099)、高さ制限、solid scrollbar の余白、名前の一行表示を示す画像であり、
+同期解決へ戻す操作結果は描画を変えない。既存 menu / Preferences PNG も比較する。
+製品起動・実機ネットワーク確認は行わず、検証 build と手動確認を利用者へ引き継ぐ。
+
+手動確認: 多件数 submenu の末尾を選び、フォルダ表示・戻る／進む・tooltip を確認する。
+整理先／Desktop 等／drive が通常の同期選択で動くこと、Remote Home が登録名・パスを保ち、
+整理先を開くことを確認する。ネットワーク切断先の選択には UI 停止の既知制約がある。
+
+自動検証 (最終未コミット差分、2026-10-06。Cargo は `CARGO_BUILD_JOBS=1`):
+
+| command / 条件 | 結果 / log (`target/`) |
+| --- | --- |
+| `cargo test -p mimageviewer --lib file_organize_destinations` | exit 0、9 成功。即時 Direct の現在地・履歴、空／OFF／順序、Remote の登録パス保持、末尾選択・wheel 消費・menu／表示設定 PNG 比較。`orgloc6-narrow.log` |
+| `cargo test -p mimageviewer --lib remote_ipc::collections::tests` | exit 0、37 成功。`orgloc6-remote-collections.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、normal。`orgloc6-normal-check.log` |
+| 上記 check に `--features portable` | exit 0。`orgloc6-portable-check.log` |
+| `cargo fmt --all -- --check` / `git -c core.safecrlf=false diff HEAD --check` / `python scripts/check_ui_glyphs.py` | 全て exit 0、危険 glyph 0。 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | exit 0、PASS。本体 10,605 成功・52 ignored、UI integration snapshot 88、Remote IPC 64、Remote-web 134 成功・1 ignored、vendor egui / egui-wgpu / eframe は 25 / 9 / 18 成功。その他 workspace・integration・doc test も成功。`orgloc6-full.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit 0、DONE。normal feature set の core・Remote service・EPUB PDF worker を生成。`orgloc6-build-dev.log` |
+
+PNG 比較は期待画像を更新せずに実施した。新規 scrolled PNG の目視確認も行った。
+製品起動・実機ネットワーク確認・commit は行っていない。
+共有 Git 管理領域への書込制限で index の復元はできなかったため、commit 担当は最終作業ファイルを
+再 stage する必要がある。検証は HEAD と index の差ではなく、最終作業ツリーに対して行った。
