@@ -237,19 +237,49 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 重なる場合は左下の低優先要素を表示しない。右下の絞り込み件数は左上・左下と重ならない位置まで上げ、余地がなければ省略する。色・角丸・フォントなど各要素の見た目は
 `ui_helpers.rs` の個別描画関数が持つ。
 スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
-本のFolder/ZipFile/PdfFileと動画/音声セルには、保存済み位置の有効な比率がある場合だけ下端へ3ptの
-メーターを重ねる。`ThumbnailOverlayLayout` が帯と2pt gapを予約し、左下だけでなく
-cell基準の右下件数もその上へ配置する。極小セルで既存バッジが失われる場合は帯を省略する。
+共有設定 `thumb_show_resume_meter` がONなら、`ThumbnailOverlayLayout` は本・動画・音声・画像・その他の
+全セルに固定下端帯を予約する。位置記録なし・長さ未取得でも同じ予約を行い、設定boolを
+`fraction.is_some()` へ置き換えない。帯は `inner = cell.shrink(4)` の全幅、高さ9 logical pt、
+下端 `inner.max.y` (セル下端から4pt)。描画時は左端ceil・右端/下端floorでphysical pixelへ揃え、
+上端を丸めた下端から `floor(9 * pixels_per_point)` pixels戻す。上端まで元の矩形の内側へ丸める規則ではない。
+100/125/150/200%の厚さは9/11/13/18px (9/8.8/8.667/9 logical pt)。保存済み位置の有効な比率がある本のFolder/ZipFile/PdfFileと
+動画/音声だけ、不透明な角丸バーを描く。位置のないセルはtrackも描かず予約した空き領域を残す。
+ONでは左右の下端ラベルを一律13 logical pt上へ移す。右下の従来基準 `cell.max.y - 3` に対し、
+9ptの帯と最低3ptのgapを確保する量は `9 + 3 + (4 - 3) = 13`。右下のgapは3pt、
+左下の従来基準 `inner.max.y - 3` からのgapは7ptとなる。ファイル名・形式・フォルダ名・評価・
+長さ・絞り込み件数に同じ予約量を使う。純layout外のSearchContainerの件数とCollectionPlaceholderの
+単行captionも13pt移動する。SearchContainerの代表画像なし・未ロードの多行階層パスだけ、上端を固定アイコン下の元位置に保ち、
+下端だけ13pt縮めた矩形で既存階層layoutを再計算し、親階層から省略して末端の本/フォルダ名を優先する。
+代表画像ありでは、もともと小さい固定種別アイコンより下にある背景/パス全体の13pt移動を維持し、高さを縮めない。
+通常サイズで末端名の全消去を許さない。
+単行captionはON時だけ描画と同じpixel原点のgalley inkを確認し、cell・帯・固定主アイコンに
+収まらなければ省略する。代表画像なし・未ロードの階層パス全体を上へ移して交差時に丸ごと消す方式は使用しない。
+代替位置を探さず、収まりはviewport clipでなくcell境界で判定する。
+SearchContainerの代表画像ありのラベル背景はONなら元の上部アイコンより先に描き、OFFは元の順序を維持する。
+階層パスは `ui_helpers::layout_path_hierarchy` の既存計算を共有するため `pub(crate)` 可視性だけを変更する。
+OFFでは予約せず従来位置へ戻す。同じ設定状態では、媒体種別や
+バーの有無で帯・ラベルのgeometryを変えない。極小セルでは既存の低優先badge省略を使い、
+帯の位置・厚さは固定のまま既存のcell clipを適用する。
+画像fit・中央の再生/音楽アイコンの位置/大きさは維持し、画像幅との対応・バーの空き領域の上移動探索・実glyph/アイコンのobstacle追跡を行わない。
+通常セルの描画順はサムネイル/内容→バー→媒体アイコン/切り取りマーク→通常ラベル→選択/見開きcursorの枠→check。
+固定予約帯とラベルは交差しないため、バーをラベルより先に描く。実際にバーがあるセルだけ主マークを
+バー直後・通常ラベル前まで遅らせ、極小セルでバーが主マークを隠さず、主マークがファイル名を覆わない従来の優先関係を保つ。
+SearchContainer / CollectionPlaceholderの特殊captionは内容描画内の上記規則に従う。OFF/位置なしでは元の順序を維持し、
+枠とcheckのopacity、cutのcontent opacityも従来どおり。
 セル高・画像fit・並び順・hit-testは変更せず、内容bitmapへ焼き込まない。色は
-`os_theme::book_resume_meter_palette`。メーターは常に左から右へ伸び、`fullscreen_seek_direction` と本の読み方向には連動しない。
+`os_theme::book_resume_meter_palette`。採用fillはLightがRGB(38, 67, 122) / `#26437A`、
+DarkがRGB(142, 176, 234) / `#8EB0EA`。選択strokeのRGB(60, 120, 220)と明度/彩度を変え、
+緑のFolder badgeとも区別する。track/boundaryは従来の不透明灰色を維持する。fill/trackのコントラスト比は
+Light 7.91 / Dark 6.26、fill/選択strokeはLight 2.27 / Dark 1.94。
+メーターは常に左から右へ伸び、`fullscreen_seek_direction` と本の読み方向には連動しない。
 本の比率はHUDの読み順で記録したanchor ordinal/totalで、見開きの相手ページは加算しない。
 動画/音声はliveのwatched集合にあれば長さ不要で満タンとする。それ以外はliveの再生位置表と現在source stampに一致した取得済み長さから求める。
-右下の長さバッジも帯+gapの上へ予約する。watchedなし・位置なしなら帯を出さない。途中位置は長さ不明・失敗/不正比率では帯を出さない。
+watchedなし・位置なしならバーを出さない。途中位置は長さ不明・失敗/不正比率ではバーを出さないが、ONなら帯予約とラベル位置は維持する。
 長さバッジOFFでも共通の前回位置設定がONなら既存の可視+近傍workerで長さを取得する。
 本は起動時writer全行readと稀なDB変更後read以外はAppのpath memo/mapだけを参照する。
 動画/音声用の位置mapは複製せず、描画からDB/ファイル/FFmpegへは到達しない。
 未読・NULL・不正値はtrackも出さず、設定OFFでも位置の記録は続く。動画/音声の長さ取得は、長さバッジまたは共通の前回位置設定がONのときに要求する。
-詳細は [book-resume-meter-plan.md](book-resume-meter-plan.md)。
+新しい状態・設定・worker・DB I/Oは追加しない。詳細と今回の検証記録は [book-resume-meter-plan.md §14](book-resume-meter-plan.md#14-全セルに固定下端帯を予約する方式へ再改訂) を参照する。
 補正済みサムネイルの生成は `thumb.adjustment_build` perf event で色調処理と
 `ctx.load_texture` を分けて計測できる。`origin=visible` は一覧描画中、
 `origin=prefetch` は可視外の先読み、`n` は `frame.begin` と同じ更新フレーム番号。

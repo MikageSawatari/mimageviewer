@@ -11,8 +11,15 @@ pub const TOP_LEFT_GAP: f32 = 2.0;
 pub const TOP_RIGHT_RESERVE: f32 = 28.0;
 pub const BOTTOM_LEFT_OFFSET: f32 = 3.0;
 pub const BOTTOM_ITEM_GAP: f32 = 4.0;
-pub const BOOK_RESUME_METER_HEIGHT: f32 = 3.0;
-pub const BOOK_RESUME_METER_GAP: f32 = 2.0;
+pub const BOOK_RESUME_METER_HEIGHT: f32 = 9.0;
+pub const BOOK_RESUME_METER_GAP: f32 = 3.0;
+
+const BOTTOM_RIGHT_OFFSET: f32 = 3.0;
+// The normal cell inner rectangle is inset by 4pt. Its meter bottom is 1pt above the
+// legacy right badge bottom, so both bottom lanes need the same 13pt reservation.
+const CELL_INNER_INSET: f32 = 4.0;
+pub const BOOK_RESUME_METER_RESERVE: f32 =
+    BOOK_RESUME_METER_HEIGHT + BOOK_RESUME_METER_GAP + CELL_INNER_INSET - BOTTOM_RIGHT_OFFSET;
 
 const FILE_BADGE_SCALE: f32 = 0.70;
 const FILE_BADGE_MIN_FONT_SIZE: f32 = 7.0;
@@ -184,7 +191,8 @@ impl BottomLeftOverlayLayout {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThumbnailOverlayLayout {
-    /// Shared saved-position strip for books, video, and audio (historical field name).
+    /// Shared saved-position slot for every cell while the display setting is on (historical name).
+    /// Fixed to the inner bottom; only cells with a valid fraction actually paint a meter.
     pub book_resume_meter: Option<egui::Rect>,
     pub check: Option<egui::Rect>,
     pub stack_count: Option<BadgePlacement>,
@@ -242,7 +250,7 @@ pub struct BottomContainerInput<'a> {
 pub struct ThumbnailOverlayLayoutInput<'a> {
     pub cell: egui::Rect,
     pub inner: egui::Rect,
-    /// Reserve the shared saved-position strip only when this cell has a valid fraction.
+    /// Shared display setting: reserve the bottom band for every cell, regardless of saved values.
     pub book_resume_meter: bool,
     pub checked: bool,
     pub stack_count: Option<usize>,
@@ -433,12 +441,9 @@ pub fn layout_thumbnail_overlays(
     input: ThumbnailOverlayLayoutInput<'_>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
-    let baseline = layout_badges(&input, None, &mut measure);
-    if !input.book_resume_meter
-        || input.inner.width() <= 0.0
-        || input.inner.height() < BOOK_RESUME_METER_HEIGHT + BOOK_RESUME_METER_GAP
-    {
-        return baseline;
+    let mut layout = layout_badges(&input, &mut measure);
+    if !input.book_resume_meter || input.inner.width() <= 0.0 || input.inner.height() <= 0.0 {
+        return layout;
     }
     let meter = egui::Rect::from_min_max(
         egui::pos2(
@@ -447,37 +452,16 @@ pub fn layout_thumbnail_overlays(
         ),
         input.inner.max,
     );
-    let mut reserved = layout_badges(&input, Some(meter), &mut measure);
-    // Small cells retain their existing badge content before reserving the meter strip.
-    let keeps_badges = baseline.badge_placements().all(|badge| {
-        reserved
-            .badge_placements()
-            .any(|candidate| candidate.kind == badge.kind && candidate.text == badge.text)
-    });
-    let clear_of_meter = !reserved.check.is_some_and(|rect| rect.intersects(meter))
-        && reserved
-            .badge_placements()
-            .all(|badge| badge.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP);
-    if keeps_badges && clear_of_meter {
-        reserved.book_resume_meter = Some(meter);
-        reserved
-    } else {
-        baseline
-    }
+    // Do not shrink or lift the slot for short cells or fitted images. The cell painter clips it;
+    // badge layout already reserves the same lower band for cells with and without saved values.
+    layout.book_resume_meter = Some(meter);
+    layout
 }
 
 fn layout_badges(
     input: &ThumbnailOverlayLayoutInput<'_>,
-    meter: Option<egui::Rect>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
-    let mut badges_inner = input.inner;
-    let mut badges_cell = input.cell;
-    if let Some(meter) = meter {
-        badges_inner.max.y = meter.min.y - BOOK_RESUME_METER_GAP;
-        // The right-bottom badges traditionally anchor to cell.max.y - 3, rather than inner.
-        badges_cell.max.y = badges_inner.max.y + 3.0;
-    }
     // The check state is the fixed-size interaction marker. Reserve its painted circle before
     // measuring any lower-priority badge, including the edit overflow summary.
     let check = input.checked.then(|| check_overlay_rect(input.cell));
@@ -614,10 +598,16 @@ fn layout_badges(
     }
 
     let mut bottom_left = BottomLeftOverlayLayout::default();
-    let bottom_y = badges_inner.max.y - BOTTOM_LEFT_OFFSET;
+    let bottom_reserve = if input.book_resume_meter {
+        BOOK_RESUME_METER_RESERVE
+    } else {
+        0.0
+    };
+    let bottom_y = input.inner.max.y - BOTTOM_LEFT_OFFSET - bottom_reserve;
     let left_x = input.inner.min.x + BOTTOM_LEFT_OFFSET;
     let blocked_by_top = |rect: egui::Rect| {
-        check.is_some_and(|check| check.intersects(rect))
+        (input.book_resume_meter && !input.cell.contains_rect(rect))
+            || check.is_some_and(|check| check.intersects(rect))
             || stack_count
                 .as_ref()
                 .is_some_and(|badge| badge.rect.intersects(rect))
@@ -760,7 +750,7 @@ fn layout_badges(
                 .find(|text| measure(text, style).x <= available)
                 .and_then(|text| {
                     let size = measured_badge_size(&text, style, &mut measure);
-                    let rect = place_bottom_right(badges_cell, size, &occupied)?;
+                    let rect = place_bottom_right(input.cell, size, bottom_reserve, &occupied)?;
                     Some(BadgePlacement {
                         kind: BadgeKind::FilterMatchCount,
                         priority: BadgePriority::FilterMatchCount,
@@ -779,7 +769,7 @@ fn layout_badges(
         .and_then(|text| {
             let style = media_duration_style();
             let size = measured_badge_size(text, style, &mut measure);
-            let rect = place_bottom_right(badges_cell, size, &occupied)?;
+            let rect = place_bottom_right(input.cell, size, bottom_reserve, &occupied)?;
             Some(BadgePlacement {
                 kind: BadgeKind::MediaDuration,
                 priority: BadgePriority::MediaDuration,
@@ -805,10 +795,11 @@ fn layout_badges(
 fn place_bottom_right(
     cell: egui::Rect,
     size: egui::Vec2,
+    bottom_reserve: f32,
     occupied: &[egui::Rect],
 ) -> Option<egui::Rect> {
-    let x = cell.max.x - size.x - 3.0;
-    let mut y = cell.max.y - size.y - 3.0;
+    let x = cell.max.x - size.x - BOTTOM_RIGHT_OFFSET;
+    let mut y = cell.max.y - size.y - BOTTOM_RIGHT_OFFSET - bottom_reserve;
     let mut rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
     for _ in 0..occupied.len() {
         let Some(blocker) = occupied.iter().find(|other| other.intersects(rect)) else {
@@ -880,27 +871,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn media_resume_meter_reserves_right_bottom_with_duration_badge_on_or_off() {
-        let (cell, inner) = square_cell(100.0);
-        for duration in [None, Some("0:07"), Some("1:02:03")] {
-            let mut input = duration_input(cell, inner);
-            input.media_duration = duration;
-            input.book_resume_meter = true;
-            let layout = layout_thumbnail_overlays(input, measure);
-            let meter = layout.book_resume_meter.expect("room for media meter");
-            assert_eq!(layout.media_duration.is_some(), duration.is_some());
-            if let Some(badge) = layout.media_duration {
-                assert_eq!(badge.rect.max.y, meter.min.y - BOOK_RESUME_METER_GAP);
-                assert!(!badge.rect.intersects(meter));
-            }
-        }
-    }
-
-    #[test]
-    fn media_resume_meter_preserves_duration_count_and_dense_badges_in_small_cells() {
+    fn saved_position_setting_reserves_the_same_slot_for_every_cell_content() {
         let tags = tags(&["#tag", "動画"]);
-        for width in [32.0, 48.0, 64.0, 100.0, 180.0, 240.0] {
+        for width in [16.0, 32.0, 48.0, 64.0, 100.0, 180.0, 240.0] {
             let (cell, inner) = square_cell(width);
+            let expected_meter = egui::Rect::from_min_max(
+                egui::pos2(inner.min.x, inner.max.y - BOOK_RESUME_METER_HEIGHT),
+                inner.max,
+            );
             for duration in [None, Some("0:07"), Some("1:02:03")] {
                 for count in [None, Some(42)] {
                     for dense in [false, true] {
@@ -908,10 +886,13 @@ mod tests {
                             tags: if dense { &tags } else { &[] },
                             ..duration_input(cell, inner)
                         };
+                        input.book_resume_meter = true;
                         input.media_duration = duration;
                         input.filter_match_count = count;
                         input.filename = Some("scene.mp4");
                         input.checked = dense;
+                        input.stack_count = dense.then_some(120);
+                        input.bookmark_time = dense.then_some("0:07");
                         input.upscaled_video = dense;
                         input.rating_text = dense.then_some("★★★★★");
                         input.edit_badges = EditBadgeFlags {
@@ -923,47 +904,19 @@ mod tests {
                             kind: BottomContainerKind::Format(FormatBadgeKind::Video),
                             label: "動画",
                         });
-                        let baseline = layout_thumbnail_overlays(input.clone(), measure);
-                        input.book_resume_meter = true;
+                        // There is deliberately no saved fraction/type input: valid/absent book,
+                        // video and audio values all consume exactly the same reserved geometry.
                         let layout = layout_thumbnail_overlays(input, measure);
-                        for badge in baseline.badge_placements() {
-                            assert!(
-                                layout.badge_placements().any(|candidate| {
-                                    candidate.kind == badge.kind && candidate.text == badge.text
-                                }),
-                                "{width}pt / {duration:?} / {count:?} / dense={dense}: lost {:?}",
-                                badge.kind
-                            );
-                        }
-                        if layout.book_resume_meter.is_none() {
-                            assert_eq!(layout, baseline);
-                        }
-                        if width == 32.0 && dense {
-                            assert!(layout.book_resume_meter.is_none());
-                        }
-                        if width >= 180.0 {
-                            assert!(layout.book_resume_meter.is_some());
-                        }
-                        let occupied: Vec<_> = layout
-                            .check
-                            .iter()
-                            .copied()
-                            .chain(layout.book_resume_meter.iter().copied())
-                            .chain(layout.badge_placements().map(|badge| badge.rect))
-                            .collect();
-                        for (index, rect) in occupied.iter().enumerate() {
-                            assert!(cell.contains_rect(*rect));
-                            for other in occupied.iter().skip(index + 1) {
-                                assert!(
-                                    !rect.intersects(*other),
-                                    "{width}pt / {duration:?} / {count:?} / dense={dense}: {rect:?} overlaps {other:?}"
-                                );
-                            }
-                        }
-                        if let Some(meter) = layout.book_resume_meter {
-                            assert!(layout.badge_placements().all(|badge| {
-                                badge.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP
-                            }));
+                        assert_eq!(layout.book_resume_meter, Some(expected_meter));
+                        assert_pairwise_non_intersecting(layout.badge_placements());
+                        for badge in layout
+                            .bottom_left
+                            .placements()
+                            .chain(layout.filter_match_count.iter())
+                            .chain(layout.media_duration.iter())
+                        {
+                            assert!(cell.contains_rect(badge.rect));
+                            assert!(!badge.rect.intersects(expected_meter));
                         }
                     }
                 }
@@ -972,71 +925,153 @@ mod tests {
     }
 
     #[test]
-    fn book_resume_meter_owns_bottom_strip_including_right_filter_count() {
-        let (cell, inner) = square_cell(100.0);
-        let mut input = duration_input(cell, inner);
-        input.media_duration = None;
-        input.book_resume_meter = true;
-        input.filter_match_count = Some(123);
-        let layout = layout_thumbnail_overlays(input, measure);
-        let meter = layout.book_resume_meter.expect("room for a meter");
-        assert_eq!(meter.min.x, inner.min.x);
-        assert_eq!(meter.max, inner.max);
-        assert_eq!(meter.height(), BOOK_RESUME_METER_HEIGHT);
-        let count = layout.filter_match_count.unwrap();
-        assert_eq!(count.rect.max.y, meter.min.y - BOOK_RESUME_METER_GAP);
-        assert!(!count.rect.intersects(meter));
-    }
-
-    #[test]
-    fn book_resume_meter_preserves_badges_and_never_intersects_any_corner() {
-        let tags = tags(&["#tag", "長い名前"]);
-        for width in [32.0, 48.0, 64.0, 100.0, 180.0, 240.0] {
-            let (cell, inner) = square_cell(width);
+    fn setting_on_shifts_all_bottom_labels_by_one_common_reservation() {
+        let tags = tags(&["#tag"]);
+        let (cell, inner) = square_cell(360.0);
+        for container in [
+            None,
+            Some(BottomContainerInput {
+                kind: BottomContainerKind::Folder,
+                label: "album",
+            }),
+            Some(BottomContainerInput {
+                kind: BottomContainerKind::Format(FormatBadgeKind::Pdf),
+                label: "PDF",
+            }),
+        ] {
             let mut input = ThumbnailOverlayLayoutInput {
                 tags: &tags,
                 ..duration_input(cell, inner)
             };
-            input.media_duration = None;
             input.checked = true;
-            input.filter_match_count = Some(42);
-            input.edit_badges = EditBadgeFlags {
-                page_override: true,
-                crop: true,
-                pin: true,
-                ..Default::default()
-            };
-            input.bottom_container = Some(BottomContainerInput {
-                kind: BottomContainerKind::Format(FormatBadgeKind::Pdf),
-                label: "PDF",
-            });
-            input.rating_text = Some("📁★★★★★");
-            input.filename = Some("long-book-name.pdf");
+            input.filter_match_count = Some(123);
+            input.bookmark_time = Some("0:07");
+            input.upscaled_video = true;
+            input.edit_badges.crop = true;
+            input.bottom_container = container;
+            input.rating_text = Some("★★★★★");
+            input.filename = Some("short-name.pdf");
             let baseline = layout_thumbnail_overlays(input.clone(), measure);
             input.book_resume_meter = true;
+            let layout = layout_thumbnail_overlays(input.clone(), measure);
+            assert_eq!(layout.check, baseline.check);
+            assert_eq!(layout.stack_count, baseline.stack_count);
+            assert_eq!(layout.top_left, baseline.top_left);
+            let bottom = |layout: &ThumbnailOverlayLayout| {
+                layout
+                    .bottom_left
+                    .placements()
+                    .chain(layout.filter_match_count.iter())
+                    .chain(layout.media_duration.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let baseline_bottom = bottom(&baseline);
+            let shifted_bottom = bottom(&layout);
+            assert_eq!(shifted_bottom.len(), baseline_bottom.len());
+            for (mut original, shifted) in baseline_bottom.into_iter().zip(shifted_bottom) {
+                original.rect = original
+                    .rect
+                    .translate(egui::vec2(0.0, -BOOK_RESUME_METER_RESERVE));
+                assert_eq!(shifted, original);
+            }
+            // Turning the setting off returns to the unreserved, pre-meter layout.
+            input.book_resume_meter = false;
+            assert_eq!(layout_thumbnail_overlays(input, measure), baseline);
+        }
+    }
+
+    #[test]
+    fn saved_position_band_has_three_point_clearance_from_bottom_right_labels() {
+        let (cell, inner) = square_cell(100.0);
+        let mut input = duration_input(cell, inner);
+        input.media_duration = None;
+        input.filter_match_count = Some(123);
+        input.book_resume_meter = true;
+        let layout = layout_thumbnail_overlays(input.clone(), measure);
+        let meter = layout.book_resume_meter.unwrap();
+        let count = layout.filter_match_count.unwrap();
+        assert_eq!(meter.min.x, inner.min.x);
+        assert_eq!(meter.max, inner.max);
+        assert_eq!(meter.height(), BOOK_RESUME_METER_HEIGHT);
+        assert_eq!(meter.min.y - count.rect.max.y, BOOK_RESUME_METER_GAP);
+        input.filter_match_count = None;
+        input.media_duration = Some("0:07");
+        let duration = layout_thumbnail_overlays(input, measure)
+            .media_duration
+            .unwrap();
+        assert_eq!(meter.min.y - duration.rect.max.y, BOOK_RESUME_METER_GAP);
+    }
+
+    #[test]
+    fn left_bottom_labels_share_the_reservation_and_keep_the_legacy_inset() {
+        let (cell, inner) = square_cell(240.0);
+        let mut input = duration_input(cell, inner);
+        input.book_resume_meter = true;
+        input.media_duration = None;
+        input.bottom_container = Some(BottomContainerInput {
+            kind: BottomContainerKind::Folder,
+            label: "album",
+        });
+        input.filename = Some("cover.jpg");
+        input.rating_text = Some("★★★★★");
+        let layout = layout_thumbnail_overlays(input, measure);
+        let meter = layout.book_resume_meter.unwrap();
+        for badge in layout.bottom_left.placements() {
+            assert!(cell.contains_rect(badge.rect));
+            assert!(!badge.rect.intersects(meter));
+        }
+        for badge in layout
+            .bottom_left
+            .container
+            .iter()
+            .chain(layout.bottom_left.filename.iter())
+        {
+            assert_eq!(meter.min.y - badge.rect.max.y, 7.0);
+        }
+        assert_pairwise_non_intersecting(layout.badge_placements());
+    }
+
+    #[test]
+    fn resume_meter_keeps_fixed_thickness_and_bottom_for_short_inner() {
+        for height in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 9.0, 10.0] {
+            let cell = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(32.0, height));
+            let mut input = duration_input(cell, cell);
+            input.book_resume_meter = true;
             let layout = layout_thumbnail_overlays(input, measure);
-            assert_placements_inside_cell(&layout, cell);
-            for badge in baseline.badge_placements() {
-                assert!(layout.badge_placements().any(|candidate| {
-                    candidate.kind == badge.kind && candidate.text == badge.text
-                }));
-            }
-            if let Some(meter) = layout.book_resume_meter {
-                assert!(cell.contains_rect(meter));
-                assert!(!layout.check.is_some_and(|check| check.intersects(meter)));
-                for badge in layout.badge_placements() {
-                    assert!(badge.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP);
-                }
+            if height > 0.0 {
+                let meter = layout.book_resume_meter.unwrap();
+                assert_eq!(meter.height(), BOOK_RESUME_METER_HEIGHT);
+                assert_eq!(meter.max, cell.max);
+                assert_eq!(meter.width(), cell.width());
             } else {
-                assert_eq!(layout, baseline);
-            }
-            if width == 32.0 {
                 assert!(layout.book_resume_meter.is_none());
             }
-            if width >= 100.0 {
-                assert!(layout.book_resume_meter.is_some());
-            }
-            assert_pairwise_non_intersecting(layout.badge_placements());
+            assert!(layout.media_duration.is_none());
+        }
+    }
+
+    #[test]
+    fn saved_position_geometry_uses_logical_points_at_fractional_dpi_origins() {
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            // Pixel-aligned viewport origins can be fractional logical coordinates. DPI changes
+            // the physical band thickness, never the reserved logical thickness or label shift.
+            let origin = egui::pos2(21.0 / pixels_per_point, 37.0 / pixels_per_point);
+            let cell = egui::Rect::from_min_size(origin, egui::vec2(240.0, 180.0));
+            let inner = cell.shrink(CELL_INNER_INSET);
+            let mut input = duration_input(cell, inner);
+            let off = layout_thumbnail_overlays(input.clone(), measure);
+            input.book_resume_meter = true;
+            let on = layout_thumbnail_overlays(input, measure);
+            let meter = on.book_resume_meter.unwrap();
+            let duration = on.media_duration.unwrap();
+            let off_duration = off.media_duration.unwrap();
+            assert!((meter.height() - 9.0).abs() < 0.0001);
+            assert!((meter.width() - inner.width()).abs() < 0.0001);
+            assert!((meter.max.y - inner.max.y).abs() < 0.0001);
+            assert!((off_duration.rect.max.y - duration.rect.max.y - 13.0).abs() < 0.0001);
+            assert!((meter.min.y - duration.rect.max.y - 3.0).abs() < 0.0001);
+            assert!((meter.height() * pixels_per_point - 9.0 * pixels_per_point).abs() < 0.0001);
         }
     }
 

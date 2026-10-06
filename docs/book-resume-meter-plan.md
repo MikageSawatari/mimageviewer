@@ -1,9 +1,9 @@
 # §1.256 一覧の本サムネイルの読書位置メーター — 記録値を表示する設計
 
-追加のwatched対応 (§11) は実装完了・全体ゲートと確認用ビルド済み。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を反映済み。前段§10の検証記録はそのまま保持する。
+現行の配置方針は、共有設定ONで全セルに固定下端帯を予約し、下端ラベルを一律13 logical pt上へ移す方式 (§5.1 / §14)。代表画像なし・未ロードの検索セルの多行階層パスは上端を元位置に保ち、下端だけ13pt縮めて末端名を優先する。代表画像ありは背景/パスの全体を13pt移動する方式を維持する (§14.4)。帯はセルの左右4pt内側の幅・高さ9 logical ptで、位置記録の有無や媒体種別によって位置・厚さを変えない。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を維持する。§10〜§13と§14.3の実装・検証記録は各修正時点の履歴として保持し、後続修正の成功証跡には流用しない。
 
 作成・改訂: 2026-10-04。コード調査基準: `next-file-ops` / `e804db069`。
-状態: **実装完了・関連自動検証済み。全体ゲートはlauncher入力用release binaryの準備待ち。** 独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。常に左→右への変更とその確認用ビルドも完了。commit・アプリ起動は行っていない。
+状態: **固定下端予約帯への改訂は検証・確認用ビルド済み。後続P2の検索セル名消失も修正済み (§14.4)、修正後gate・独立レビュー・確認用ビルドは完了。利用者の実機確認待ち。§12/§13と§14.3の成功記録は各修正時点の結果。** 保存・watched・常に左→右の仕様は維持する。独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。commit・アプリ起動は行っていない。
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
 
 ## 0. 合意した設計と前提
@@ -98,7 +98,7 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 | Stackセル / Image / ZipImage / PdfPage / ZipDir個別セル | メーターを描かない。flat stack閲覧が従来記録する値はHUDの読み順で補助値も記録でき、後の通常Folderセルに表示される。stack専用keyを新設しない |
 | ConvertibleArchive (直接閲覧RARを含む) | 初版の対象セルに含めない。変換cache ZIPと元書庫のkeyを解く処理も作らない。既存の位置記録・復元は維持 |
 | PdfFile扱いのEPUB | resume保存keyと当該cell pathが一致して行があれば同じmap参照で表示。変換generation/内容を解き直さず、異なるkeyを推測で結ばない |
-| 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | 今回の描画変更の対象外。通常物理一覧のFolder/ZipFile/PdfFileセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootは非対象 (既存surface/positionとinstalled itemflagsを参照) |
+| 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFileセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
 
 行無し、追加列が1つでもNULL、total==0、不正値 (ordinal<=0 / ordinal>total) ではtrackも含め描かない。0%への代用やclampはしない。既に保存された有効値は、内容の変更・外部削除・password状態・認識規則変更等と再照合しない。通常の一覧更新によりcellが消えると描画も消えるだけで、本ごとの監視は不要。
 
@@ -169,27 +169,35 @@ map更新はAppの単一受付へ集約し、起動読込中・再読込中のSe
 
 ## 5. 描画・方向・設定
 
-### 5.1 下端の専用領域 (前案を維持)
+### 5.1 全セルに固定下端帯を予約する配置 (2026-10-06再改訂)
 
-`layout_cell_overlays` は `rect.shrink(4)` のinnerと実測badgeを純layoutへ渡し、`draw_cell` は同じlayoutをcell内へclipする (`src/app/grid_paint.rs:254`, `src/app/grid_paint.rs:383`)。現行 `ThumbnailOverlayLayout` はcheck/stack/top-left/bottom-left/filter count/media durationを所有する (`src/thumb_overlay_layout.rs:184`, `src/thumb_overlay_layout.rs:426`)。ここにmeter rectを追加し、下端帯の所有を1箇所にする。backlog §2.2の古い未着手記録を理由に四隅を再実装しない。
+`layout_cell_overlays` は `rect.shrink(4)` のinnerと実測badgeを純layoutへ渡し、`draw_cell` は同じlayoutをcell内へclipする。現行 `ThumbnailOverlayLayout` はcheck/stack/top-left/bottom-left/filter count/media durationを所有する。ラベルの配置とバーの配置を同じ描画経路で解決し、backlog §2.2の古い未着手記録を理由に四隅を再実装しない。
 
-inner下端の高さ3 logical pt、左右はinner端、上に2pt gapを初期値とする。meterがある時だけ `badges_inner.max.y = meter.top - 2pt` として既存layoutへ予約を渡す。**独立レビューP2の決定:** 右下filter件数は `cell.max.y - 3` を基準にする (`src/thumb_overlay_layout.rs:712`, `:758`) ため、innerの縮小だけで済ませず、右下配置の基準にもmeter帯 + gapの予約を純layout内で反映する。形式/フォルダ名/filename/評価、右下filter countはその上に置く。左上編集/pin/tag/time/UP、右上check/stackは既存優先規則を維持。§1.333では動画/音声cellにも同じ帯を使い、右下の長さ表示にもmeter帯とgapを予約して非交差を保つ。長さバッジOFFでも帯を表示する。極小cellでは既存badgeを優先し、meterを省略する。
+共有設定 `thumb_show_resume_meter` がONなら、読書/再生位置がないセルも含め、本・動画・音声・画像・その他の全セルに同じ下端帯を予約する。layoutへ渡すboolはこの設定そのものとし、`fraction.is_some()` に置き換えない。有効な比率の有無は予約後のバー描画だけを決める。OFFなら予約せず従来の下端ラベル位置へ戻す。同じ設定状態では、記録の有無や媒体種別で帯・ラベルのgeometryを変えない。
 
-cell_h・cell rect・並び順・image fit・scroll content・hit-testは不変。回転/補正済bitmapやcatalog thumbnailに焼き込まない。選択borderは上層、cutは既存content painterのopacity、タグhit-testは同じBadgePlacementを使う。狭いcellでもmeterとbadgeは重ねない。
+帯の横範囲は `inner = cell.shrink(4)` の全幅、下端は `inner.max.y` (セル下端から4pt)、高さは9 logical ptで固定する。画像幅・縦横比・fit・回転に合わせない。描画時は左端をphysical pixelのceil、右端・下端をfloorへ揃え、上端を丸めた下端から `floor(9 * pixels_per_point)` pixels戻して決める。上端まで元の矩形の内側に丸める規則ではない。100/125/150/200%の描画厚さは9/11/13/18px (9/8.8/8.667/9 logical pt)。角丸の不透明バーをこの矩形へ描き、常に左から右へ塗る。位置のないセルはtrackも描かず、予約した空き領域だけが残る。
+
+ONでは下端ラベルを左右とも一律13 logical pt上へ移す。右下の既存基準が `cell.max.y - 3`、帯下端が `cell.max.y - 4` なので、9ptの帯と最低3ptのgapを確保する移動量は `9 + 3 + (4 - 3) = 13`。右下ラベルと帯上端のgapは3pt。左下の既存基準は `inner.max.y - 3` なので同じ13pt移動でgapは7ptとなる。ファイル名・形式・フォルダ名・評価と、右下の長さ/絞り込み件数を同じ予約量で配置する。純layout外のSearchContainerの件数とCollectionPlaceholderの単行captionも13pt移動する。SearchContainerの代表画像なし・未ロードの多行階層パスだけ、下記の専用規則で高さを13pt減らす。極小セルで下端badgeが入らない場合は既存の低優先省略を使い、帯の位置・厚さを変えない。clipは既存のcell境界を維持する。
+
+SearchContainerの代表画像なし・未ロードの階層パスは、ONでも矩形の上端を固定アイコン下の元の位置に保ち、下端だけを13pt縮める。縮めた矩形で `ui_helpers::layout_path_hierarchy` の既存計算を再実行し、入りきらない親階層から省略して末端の本/フォルダ名を優先する。この経路で階層パス全体を上へ移して固定アイコンと交差させ、その全体を非表示にする方式は採用しない。代表画像ありでは、もともと小さい固定種別アイコンより下に背景/パスがあるため、背景/パス全体を13pt上へ移す従来方式を維持し、高さを縮めない。通常サイズのセルで末端名が丸ごと消えることを許さない。
+
+SearchContainerの件数やCollectionPlaceholderの単行captionは、ONのときだけ描画と同じpixel原点へ丸めたgalleyの実際のinkを確認し、cellに収まらない、帯に交差する、固定の主アイコンに交差する場合は低優先captionを省略する。別の位置を探索せず、バー・主アイコンを移動しない。収まりの判定はcell境界を使い、viewportのclip境界とは分離するため、スクロールで一部だけ見えるcaptionを丸ごと消さない。SearchContainerの代表画像ありのラベル背景はONなら元の上部アイコンより先に描き、極小セルで背景が主アイコンを覆わないようにする。OFFは元の描画順を維持する。階層パスの既存計算を共有するため `layout_path_hierarchy` の可視性を `pub(crate)` とする。
+
+cell_h・cell rect・並び順・画像fit・中央の再生/音楽アイコンの位置/大きさ・scroll contentは不変。タグhit-testは移動後の同じBadgePlacementを使う。回転/補正済bitmapやcatalog thumbnailに焼き込まない。通常セルの描画順はサムネイル/内容→バー→媒体アイコン/切り取りマーク→通常ラベル→選択border/見開き相手cursorの枠→check。固定予約帯とラベルは交差しないため、バーをラベルより先に描ける。ONで実際にバーがあるセルだけ主マークの描画をバー直後まで遅らせ、ラベルより先という従来の優先関係を保持する。OFF/位置なしでは元の描画順、cutのcontent opacityも維持する。SearchContainer / CollectionPlaceholderの特殊captionは上記の内容描画内の収まり規則に従う。バー用の空き領域を探索して上へ移す処理、実glyph/中央アイコンのobstacle追跡、画像幅への対応を撤去する。captionには上記の既存階層layout再計算と、固定位置の単行caption省略だけを使う。新しい状態・設定・worker・DB I/Oは追加しない。設定だけから全セルの配置を決め、非同期の長さ取得や位置更新をlayout変更の契機にしない。この簡素化により、専用の再構築・失効・バーの障害物再計測は不要となる。snapshotと実測は§14へ記録する。
 
 ### 5.2 常に左から右へ伸ばす
 
 2026-10-04の利用者決定: メーターは常に左から右へ伸ばす。右綴じ・左綴じが混在する一覧の向きを揃えるため、`fullscreen_seek_direction` や本の実効読み方向とは連動させない。paint helperは方向引数を持たず、左端から `width * ordinal / total` だけ塗る。読み順での位置・見開きanchorの数え方は変えない。
 
-比率はordinal/total。1/N、途中、N/Nをそのまま描き、向きはrectの塗り起点だけを変える。seek方向設定の変更は全可視cellの次paintへ即時反映し、map/DBは変更しない。本の綴じ方向自体は次の位置記録で保存値が更新される。
+比率はordinal/total。1/N、途中、N/Nをそのまま左端から描く。seek方向や本の綴じ方向を変更してもバーの方向は変えず、方向をmap/DBへ保存しない。
 
-### 5.3 色・設定・再描画 (前案を維持)
+### 5.3 色・設定・再描画
 
-色は `os_theme::book_resume_meter_palette(effective_dark)` 相当のsemantic helperで所有し、paint側へLight/DarkのRGB分岐を分散させない (`src/os_theme.rs:291`, `src/os_theme.rs:343`)。trackは不透明の暗灰/明灰、fillはテーマ別青緑、1px境界を候補にsnapshotで確定する。白/黒/鮮やかな表紙上でもfillと未塗りを区別する。テーマは当該UIのresolved visualsを使い、OSテーマ固定値をcacheしない。テーマ変更はpalette再取得だけ。
+色は `os_theme::book_resume_meter_palette(effective_dark)` 相当のsemantic helperで所有し、paint側へLight/DarkのRGB分岐を分散させない。trackとboundaryは従来の不透明灰色を維持する。採用fillはLightがRGB(38, 67, 122) / `#26437A`、DarkがRGB(142, 176, 234) / `#8EB0EA`。選択strokeのRGB(60, 120, 220)とは明度/彩度の異なる紺色・明るい青紫とし、緑のFolder badgeとも区別する。fill/trackのコントラスト比はLight 7.91、Dark 6.26、fill/選択strokeはLight 2.27、Dark 1.94 (§14)。テーマは当該UIのresolved visualsを使い、OSテーマ固定値をcacheしない。テーマ変更はpalette再取得だけ。
 
 設定は **`thumb_show_resume_meter`、既定ON**、全体共通。環境設定 **表示 → サムネイル** に **「本・動画・音声のサムネイルに前回の位置を表示」**。説明は「メーターは常に左から右へ伸びます。記録されたページ位置を表示します。未読・位置やページ数を確認できない本には表示しません」。favorite/本別設定・方向独立設定は増やさない。閲覧表示の「ページシークバーの方向」には連動せず、以前追加したmeterへの適用説明を削除する。
 
-既存draft編集→OK→prepare/merge→ `install_preferences_settings` → `settings.save()` を使う (`src/ui_dialogs/preferences.rs:1924`, `src/ui_dialogs/preferences.rs:1957`, `src/ui_dialogs/preferences.rs:2448`, `src/ui_dialogs/preferences.rs:2592`)。OFFはpaintを止めるだけでmap/記録は保持、ONは保持mapから表示する。Cancelはruntimeへ適用しない。serde欠落既定値・settings.db roundtrip・default/reset・Preferences管理フィールドとしてのmergeを揃え、既存設定確定のrepaint経路へ接続する。
+既存draft編集→OK→prepare/merge→ `install_preferences_settings` → `settings.save()` を使う (`src/ui_dialogs/preferences.rs:1924`, `src/ui_dialogs/preferences.rs:1957`, `src/ui_dialogs/preferences.rs:2448`, `src/ui_dialogs/preferences.rs:2592`)。OFFはバー描画と帯予約を止め、map/記録は保持する。ONは全セルに帯を予約し、保持mapに有効な比率があれば表示する。Cancelはruntimeへ適用しない。serde欠落既定値・settings.db roundtrip・default/reset・Preferences管理フィールドとしてのmergeを揃え、既存設定確定のrepaint経路へ接続する。
 
 ## 6. Remoteの選択: 初版は追加2列をNULL保存
 
@@ -348,7 +356,7 @@ DB書込失敗・稀な再読込失敗については次を設計責任者/利�
 
 Video/Audioの可視cellは位置と、現在source stampに一致したメモリ上の長さを使う。位置なし・長さ未取得/不明/0/負数/失敗・source不一致、非有限値、位置<=0、位置>長さでは帯自体を描かない。比率はposition/durationでありclamp・0%/100%への代用・長さの推測をしない。等しい有効値なら1.0だが、通常の見終わりは既存保存規則が行を消すので表示しない。本は従来のordinal/totalであり、見開きanchorと対象判定を維持する。
 
-描画helperは本・Video・Audio共通の有効fractionを受け、常に左端から塗る。`ThumbnailOverlayLayout` の既存3pt帯+2pt gapを使い、右下duration/countにも予約を反映する。極小cellは既存badge優先で帯を省略する。セル高・順序・fit・hit-testは変更しない。色は同じos_theme helper、cut opacityも維持する。Remoteのwire/IPC版は変更しない。
+描画helperは本・Video・Audio共通の有効fractionを受け、常に左端から塗る。現在の配置は§5.1 / §14に従い、共有設定ONで位置なし・画像・その他を含む全セルに固定下端9pt帯を予約し、下端ラベルを一律13pt上へ移す。OFFは予約なしの従来位置へ戻す。セル高・順序・画像fit・中央アイコンは維持し、タグhit-testは同じBadgePlacementを使う。色は同じos_theme helper、cut opacityも維持する。Remoteのwire/IPC版は変更しない。
 
 ### 10.3 共有設定・未リリースの改名
 
@@ -424,7 +432,7 @@ Preferences OKは既存live media memory mergeへ集合を加え、draft生成�
 
 ### 11.4 描画・簡素化
 
-Video/Audioのwatched集合参照を最初に行い、あればSome(1.0)を共通LTR painterへ渡す。長さ取得を待たず満タンとする。本の最終anchorの保存済み比率も内容を後から数え直さないため、この扱いは本と一貫する。無ければ従来の途中比率、位置も無ければ帯なし。共通設定OFFは両方非表示。帯・色・バッジ予約・極小セル優先は変更しない。
+Video/Audioのwatched集合参照を最初に行い、あればSome(1.0)を共通LTR painterへ渡す。長さ取得を待たず満タンとする。本の最終anchorの保存済み比率も内容を後から数え直さないため、この扱いは本と一貫する。無ければ従来の途中比率、位置も無ければ帯なし。共通設定OFFは両方非表示。色は維持し、配置は§5.1の固定ラベル・背景へ重ねる規則に従う。
 
 本のような別map/DB worker、content監視、watch状態enumやDB読み直しは採用しない。判定と所有者を既存保存helperとSettingsへ揃え、まれな失敗への独自retry/回復は増やさない。旧版で再視聴した後の古いwatchedが残ることは、新版で途中を再記録するまで満タンが残る制限として扱う。再開位置は旧版と同じであり、triggerは作らない。
 
@@ -479,3 +487,230 @@ snapshot初回は75 passed / 1 failed (exit 101)。お気に入り設定fixture�
 `.\scripts\build-dev.ps1 -PreserveRuntime` はexit 0。normal feature set / dev-runtime profileでcore (11m50s)、Remote service (0.53s)、EPUB PDF worker (0.76s) をビルドし、`target/dev-runtime/`へ配置済み。runtime=4 / PE=3の検査も成功した。ログは `target/watched-build.log`。製品バイナリ起動・commitは行っていない。自動検証の未解決点はなく、実機確認は利用者が行う。
 
 範囲確定後の変更ファイルは `docs/book-resume-meter-plan.md`, `docs/next-release-backlog.md`, `htdocs/mimageviewer/manual/grid.html` と、全体ゲートで見つかったテスト不備を直す `src/content_identity/restore.rs`, `src/content_identity.rs`。後二者はcfg(test)内だけの修正である。
+
+## 12. ラベルを押し上げない重ね描き — 旧3pt配置の実装・検証記録 (2026-10-05)
+
+**履歴: この節のラベル固定・重ね描き配置は§14の固定下端予約帯へ置き換えた。以下の成功記録は旧案の証跡として保持する。**
+
+基準: `next-file-ops` / `570587339` 上の未コミット差分。利用者は§1.333の機能を実機確認済み。バーがあるセルだけラベルが上がる問題を解消するため、当時の§5.1の帯予約を撤去した。設定や保持状態を増やさず、既存のラベル配置一つに固定する。バーだけを実際の文字の下へ合わせ、背景への重なりを許す。DB・記録・再開・長さ取得の経路は変更しない。
+
+### 12.1 実装と確認した前提
+
+- `layout_thumbnail_overlays` (`src/thumb_overlay_layout.rs:432`) は一度だけラベルを配置し、候補バーを追加する。メーター有無による `inner` / 右下レーンの縮小や、ラベル維持のための二回目のlayoutは不要になった。左下は `:595`、右下は `:741` / `:760` の従来の基準を使う。
+- `layout_cell_overlays` (`src/app/grid_paint.rs:336`) は既存のcached galleyから `mesh_bounds` を取得する (`:379`)。文字の原点はepaintと同じphysical-pixel roundingへ合わせ、バーだけを縮小する (`:342`)。
+- `draw_cell` が比率を受け取り、ラベル→バー (`src/app/grid_paint.rs:914`) →選択枠/見開き枠 (`:916`) →チェック (`:933`) の順に描く。ライブ一覧とsnapshotが同じ入口を使う。切り取り時のバーには従来のcontent opacityを適用する。
+- Barあり/なし/設定OFFの全ラベル・チェック矩形一致を純layoutと実フォントの双方で検査する。CJK・descenderを含む文字、通常/密集ラベル、32/48/100/140/240pt幅、整数/端数原点、100/125/150/200% DPIでglyphとの非交差を検査する。
+- Light/Dark・小セル・150% DPIの本/動画/音声snapshotは対象10件だけ更新し、全10画像を目視確認した。既存7画像の更新と3画像の追加。設定のsnapshotは変更不要。
+- 独立レビュー (`gpt-6.1-sol` / `xhigh`) の指摘2件: Unicode fixtureの誤変換と見開き枠の描画順を修正。最終差分の残存P1/P2はなし。
+
+### 12.2 配置の実測
+
+候補: 左右4pt内側、下端3pt内側、最大厚さ3pt。描画はphysical pixelへ内側丸めする。glyphに当たる候補は文字の下端から1physical pixel離して細くし、1physical pixel未満なら省略する。3physical pixels未満の細いバーには輪郭を付けない。ラベル背景は重なってよい。
+
+実測値・今回の検証結果は以下へ記録する。前段§11の成功結果を今回の結果として流用しない。ログは `target/meter-overlay-*.log`。
+
+`thumbnail_resume_meter_keeps_all_label_rects_and_clears_real_glyphs_at_each_dpi` の本番font-backed layoutで、原点(20,20)、幅140/240pt、高さ94ptの `v.mp4` / `a.mp3` を実測した。セル下端はy=114pt。日本語と `gyjpq` を含む本/媒体名、小セル、密集ラベルも非交差assertで確認している。
+
+| DPI | ファイル名glyph下端 | 長さglyph下端 | バー上端〜下端 | 厚さ | 長さglyphからバーまで |
+|---|---:|---:|---:|---:|---:|
+| 100% | 100.000pt | 101.000pt | 108.000〜111.000pt | 3.000pt / 3px | 7.000pt |
+| 125% | 100.800pt | 100.800pt | 108.000〜110.400pt | 2.400pt / 3px | 7.200pt |
+| 150% | 100.000pt | 100.667pt | 108.000〜110.667pt | 2.667pt / 4px | 7.333pt |
+| 200% | 100.000pt | 101.000pt | 108.000〜111.000pt | 3.000pt / 6px | 7.000pt |
+
+これは当該fixtureの実測であり、固定値で全ラベルの文字位置を仮定するものではない。実際の各セルではそのラベルのglyph範囲に合わせてバーだけを縮める。背景との重なりを許す右下件数バッジも、同じ文字非交差検査を通る。
+
+### 12.3 検証記録 (2026-10-06)
+
+今回の未コミット差分に対して `CARGO_BUILD_JOBS=1` / `RUST_TEST_THREADS=4` をprocess-localで設定した。製品起動・commitは行わない。
+
+| コマンド | exit code | 結果 |
+|---|---:|---|
+| `cargo fmt` | 0 | 整形済み |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 本番描画経路の型確認 |
+| `cargo test -p mimageviewer --lib thumbnail_resume_meter -- --nocapture` | 0 | 5 passed、配置実測・描画順・薄いバー・切り取りopacity |
+| `cargo test -p mimageviewer --lib thumb_overlay_layout` | 0 | 22 passed |
+| `cargo test -p mimageviewer --lib resume_meter` | 0 | 56 passed、更新後snapshotを通常比較 |
+| `cargo test -p mimageviewer --lib media_duration` | 0 | 18 passed |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib resume_meter_snapshot` | 0 | 10 passed、対象画像のみ更新・目視済み |
+| `cargo fmt --check` | 0 | 最終ソース整形確認 |
+| `cargo test --test ui_snapshot` | 0 | 76 passed、既存integration期待画像は変更不要 |
+| `python scripts/check_ui_glyphs.py` | 0 | dangerous glyphsなし |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0 | 11,400 passed / 58 ignored / 0 failed。本体lib 10,305 passed / 52 ignored |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0 | normal feature set / dev-runtime、runtime=4 / PE=3検査成功 |
+
+全体ゲートはworkspaceとvendor/egui・egui-wgpu・eframeの全段成功。filtered-out=0の57集計の合計で、子processの限定再実行2件は重複計上しない。`target/meter-overlay-full.log` を証拠とする。初回で成功し、他機能のコード・テストを追加修正する必要はなかった。
+
+確認用coreは8m30s、Remote serviceは0.39s、EPUB PDF workerは0.36sでビルドし、`target/dev-runtime/`へ配置した。core生成時刻は2026-10-06 00:34:09。ログは `target/meter-overlay-build.log`。commit・製品バイナリ起動は行っていない。現在の自動検証に未解決点はなく、今回の配置の実機確認は利用者が行う。
+
+実機確認: 本/動画/音声のバーあり・なし・満タンを横に並べ、共有設定ON/OFFでもタイトル・長さ・件数などのラベルの高さが変わらないことを確認する。小セルと150/200% DPI、Light/Dark、長さバッジON/OFF、選択/チェック/見開き相手cursor/切り取り表示で文字と枠が読めることを確認する。バーの余地が足りない小セルでは、バーが細くなるか省略されてもラベルは動かない。
+
+## 13. 表示画像内の太いバーへ改訂
+
+**履歴: この節の画像幅・障害物を避ける配置は§14の固定下端予約帯へ置き換えた。以下の比較・実測・成功記録は旧案の証跡であり、現行方式の検証には使用しない。**
+
+2026-10-06: 実装・独立レビュー・自動検証・確認用ビルド完了。利用者の実機確認待ち。
+
+### 13.1 配置判断と不変条件
+
+§12のラベル固定を維持し、文字下の3pt帯から、表示画像内の公称9 logical ptの角丸バーへ変更する。厚さを増やすためにラベルを動かす予約帯は復活させない。画像幅・セル幅・文字へ半透明で重ねる案をsnapshotで比較し、不透明な画像幅のバーを採用した。色は既存 `os_theme::book_resume_meter_palette` を維持する。
+
+画像のfit・回転を含む実際の表示矩形を `draw_thumb_texture` と共有する。Folderは補正後texture、ZipFile/PdfFile/Videoは描画対象textureを使い、Audio/未ロードなど画像のないセルはinnerへフォールバックする。画像やその縦横比、cell高、ラベル・checkのrect、hit-testは変更しない。DB・位置の記録・長さ取得・共有設定にも変更を加えない。 本番のfit矩形は `src/app/grid_paint.rs:44`、帯の探索は `:348`、placeholderの実glyph取得は `:413`、draw_cellでのラベル後paintは `:991`。再生/音楽アイコンの描画範囲は既存helper (`src/ui_helpers.rs:1168`, `:1198`) が返す。
+
+配置範囲内で実glyph（未読込時の文字を含む）・再生/音楽アイコン・check・切り取りマークに当たらない最も下の水平帯を選び、衝突時はバー全体を上へ移して9ptを保つ。全幅の9pt帯がない場合だけ、最大の空き帯へ細くして収める。1physical pixelも確保できなければ省略し、ラベルは動かさない。実glyphとの1physical pixelの間隔、描画と同じ文字原点のpixel丸め、バーのpixel境界への丸めを使う。ラベル背景への重なりは許す。描画順はラベル→バー→選択/見開きcursorの枠→check、切り取り内容のopacityは従来どおりとする。
+
+### 13.2 比較と実測
+
+比較PNGは `tests/snapshots/thick_resume_meter_comparison_{light,dark,light_high_dpi,dark_high_dpi}.png`。各画像の左列が採用案（画像幅・不透明・文字を避ける）、中央がセル内幅、右が画像下端に半透明45%を重ねる案。Light/Dark・白/黒表紙・縦長/横長・動画/音声・小セルを比較した。
+
+- **採用: 画像幅・不透明**。縦長の表紙と幅が揃い、画像の中に収まる。塗り/未塗り/輪郭が白黒表紙の上でも明確で、文字を覆わない。文字・アイコンに当たる場合はバーだけを上へ動かすので、画像下端に完全固定ではない。
+- セル内幅: 縦長表紙の左右の余白まで横に伸び、表紙との対応が弱い。横長や音声では差が小さいが、縦長/横長が混ざる一覧には画像幅を選ぶ。
+- 半透明45%: 本の名前や形式文字へ重なる例があり、Darkの黒表紙とLightの白表紙で塗り/未塗りの区別が弱くなる。不採用。ラベルより先に描く案も、ラベル背景で太い部分が隠れて旧3pt相当の見た目に戻るため採用しない。
+
+実測は180×108 logical ptの比較fixture（左右4pt内側）。以下は採用列のpixel内側丸め後の矩形。全例でglyph交差数は0、ラベルrectはバーなし/設定OFFと同一。Folderの密集ラベルでは9pt帯のためバーだけを大きく上へ移す。
+
+| DPI / 種類 | 表示画像の幅 | バー x範囲 | バー y範囲 | 厚さ |
+|---|---:|---|---|---:|
+| 100% / Folder・縦長白 | 60.000pt | 68.000〜128.000 | 86.000〜95.000 | 9.000pt / 9px |
+| 100% / ZIP・縦長黒 | 60.000pt | 68.000〜128.000 | 223.000〜232.000 | 9.000pt / 9px |
+| 100% / PDF・横長白 | 166.667pt | 15.000〜181.000 | 336.000〜345.000 | 9.000pt / 9px |
+| 100% / Video・横長黒 | 166.667pt | 15.000〜181.000 | 451.000〜460.000 | 9.000pt / 9px |
+| 100% / Audio・固定アイコン | 172.000pt | 12.000〜184.000 | 565.000〜574.000 | 9.000pt / 9px |
+| 150% / Folder・縦長白 | 60.000pt | 68.000〜128.000 | 112.667〜121.333 | 8.667pt / 13px |
+| 150% / Video・横長黒 | 166.667pt | 15.333〜181.333 | 472.000〜480.667 | 8.667pt / 13px |
+
+公称9 logical ptを画像比率で変えず、内側pixel丸めで100/125/150/200%の厚さは9.000/8.800/8.667/9.000pt（9/11/13/18px）。glyphとの最小余白は1physical pixel。角丸は2 logical pt、輪郭は1physical pixel。9pt帯がない小領域は最大の空き帯へ縮め、1pixel未満なら省く（5ptだけ空くfixtureは5pt、0.5pixelのfixtureは省略）。固定ラベルの32/48/100/140/240pt・端数原点・CJK/descender・密集バッジ、実textureの縦横比/補正/全回転、未ロード/失敗時の文字と再生/音楽アイコンを本番draw_cellから検査する。輪郭は3physical pixels未満なら省略し、細いバーの塗りを残す。
+
+既存の本/媒体の10画像を今回の9pt表示へ更新し、比較4画像を追加した。全14画像を目視確認済み。元の描画と同じshapeのboundsを返すplay/music helperとplaceholder glyph boundsで、アイコンの見た目を変えず交差を避ける。独立レビューで見つかった未読込Video等の文字交差は、この所有境界で修正し実draw_cell回帰テストを追加した。保持状態は増やさない。
+
+### 13.3 今回の検証記録
+
+`CARGO_BUILD_JOBS=1` / `RUST_TEST_THREADS=4`。ログは `target/meter-thick-*.log`。追加fixtureの初回compileにDebug未実装型の診断文字列が含まれていたためexit 101となり、テストの診断文字列を修正して再実行した。製品コードにDebug実装は足していない。
+
+| コマンド | exit code | 結果 |
+|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` | 0 | 整形済み |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 本番経路の型確認 |
+| `cargo test -p mimageviewer --lib thumbnail_resume_meter -- --nocapture` | 0 | 9 passed、実glyph/placeholder/iconと厚さ/画像幅/回転 |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib resume_meter_snapshot -- --nocapture` | 0 | 14 passed、対象のみ更新・全画像目視済み |
+| `cargo test -p mimageviewer --lib thumb_overlay_layout` | 0 | 22 passed |
+| `cargo test -p mimageviewer --lib resume_meter` | 0 | 64 passed、更新後snapshot通常比較 |
+| `cargo test -p mimageviewer --lib media_duration` | 0 | 18 passed |
+| `python scripts/check_ui_glyphs.py` | 0 | dangerous glyphsなし |
+| `cargo test --test ui_snapshot` | 0 | 76 passed、integration期待画像は変更不要 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | 0 | 11,408 passed / 58 ignored / 0 failed。本体lib 10,313 passed / 52 ignored |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 0 | normal feature set / dev-runtime、runtime=4 / PE=3検査成功 |
+
+独立レビュー (`gpt-6.1-sol` / `xhigh`) の修正後のソース・snapshotで残存P1/P2はなし。比較PNGの再生三角はLight/Dark同一の白画素群も確認済み（100%: 73画素、150%: 180画素）。
+
+全体ゲートは初回で成功。filtered-out=0の57集計を合算し、子processの限定再実行2件は重複計上しない。本体libは890.01s。`target/meter-thick-full.log` を証拠とする。確認用coreは8m59s、Remote serviceは0.48s、EPUB PDF workerは0.42sでビルドした。`target/dev-runtime/`へ配置済み。core生成時刻は2026-10-06 01:52:10、ログは `target/meter-thick-build.log`。§12は旧3pt配置の成功記録として保持し、今回の9pt配置へ流用しない。製品バイナリ起動・commitは行わない。
+
+
+### 13.4 変更範囲と実機確認
+
+製品側は `src/app/grid_paint.rs`、`src/thumb_overlay_layout.rs`、`src/os_theme.rs`、`src/ui_helpers.rs`、`src/ui_main.rs`（前段のラベル固定差分を含む）。文書は本計画、`docs/spec.md`、`docs/display-pipeline.md`、`docs/next-release-backlog.md`、`htdocs/mimageviewer/manual/grid.html`。snapshotは本/媒体10画像と比較4画像。その他の機能・DB/設定・保存/再開・長さworkerは変更していない。HEADは`570587339`のまま、commit・製品バイナリ起動はなし。自動検証の未解決点はない。
+
+実機では本/動画/音声、縦長/横長、白/黒の画像を横に並べ、Light/Darkと100/150/200% DPIで塗り/未塗りの区別と文字の可読性を確認する。共有設定ON/OFF、バーなし/途中/満タン、長さバッジON/OFF、選択/チェック/切り取り、小セルでタイトル・長さなどのラベルの高さが変わらず、バーだけ移動/縮小/省略されることを確認する。確認用coreは通常の `%APPDATA%\mimageviewer` を使うため、利用者がインストール済み/トレイ常駐のmIVを閉じてから起動する。実機確認は未実施で、利用者が行う。
+
+## 14. 全セルに固定下端帯を予約する方式へ再改訂
+
+2026-10-06: 利用者の実機画像 `target/user-report/meter-video-overlap.png` を受け、§13の画像幅・障害物を避ける配置を撤回した。現行正本は§5.1。予約帯改訂時の自動検証・独立レビュー・確認用ビルドの結果を§14.3に保持する。後続P2の検索セル名消失修正と修正後gateの成功記録は§14.4、利用者の実機確認は未実施。§12/§13やP2修正前の成功結果を修正後gateへ流用しない。
+
+### 14.1 観測された失敗と根因
+
+期待する不変条件は、同じ共有設定状態なら、未読・途中・満タンと本・動画・音声・画像・その他を混在させても、全セルの帯・下端ラベルのgeometryが揃うこと。以前の予約方式では、layoutへ設定boolを渡すべきところで `fraction.is_some()` を渡し、有効な位置があるセルだけが帯を予約していた。そのため記録の有無で下端ラベルの高さが変わった。予約自体を取り除くことで回避するのではなく、設定を配置の唯一の入力に戻して全セルで同じ量を予約する。
+
+§13の方式は、glyphと中央アイコンを避け続けるため、動画ではバーが画像上部まで移動し得る。画像幅への追従も縦長/横長でバー幅を変え、一覧で割合を比較する用途に適さなかった。固定下端帯を予約すれば、文字・中央アイコンのobstacle追跡や空き領域探索が不要になる。この簡素化を採用し、上移動・縮小・代替位置探索は撤去する。
+
+### 14.2 変更範囲と受け入れ条件
+
+- 共有設定ONで全セルに `cell.shrink(4)` の全幅・高さ9 logical pt・下端 `inner.max.y` の帯を予約する。位置なしのセルは空きを残し、有効な比率のあるセルだけtrack/fillを描く。
+- 左右の下端ラベル、SearchContainerの件数、CollectionPlaceholderの単行captionを一律13pt上げる。SearchContainerの代表画像なし・未ロードの多行階層パスだけ上端を元位置に保ち、下端を13pt縮め、既存階層layoutで親階層から省略して末端名を優先する。代表画像ありは背景/パス全体の13pt移動を維持する。右下gapは3pt、左下gapは7pt。OFFは予約なしの従来位置へ戻す。長さの取得完了や位置の更新ではlayoutが変わらない。
+- 写真のfit、中央の再生/音楽アイコン、cell高、並び順、位置保存・再開、watched、長さworker、DB・設定の形式は維持する。極小セルは既存の低優先badge省略とcell clipを使い、バーの位置・厚さを固定する。新しいstate/config/worker/DBを追加しない。
+- 採用fillはLight `#26437A` / Dark `#8EB0EA`。従来の不透明灰色track/boundaryを保ち、選択stroke RGB(60, 120, 220)と緑Folder badgeから区別する。色の実測値は下記に記録する。
+- 旧 `thick_resume_meter_comparison_{light,dark,light_high_dpi,dark_high_dpi}.png` と比較fixtureを廃止し、固定予約帯の `reserved_resume_meter_{light,dark,light_high_dpi,dark_high_dpi}.png` 4画像へ置き換える。旧案の比較と数値は§13の履歴に残す。
+
+### 14.3 固定予約帯改訂時の検証記録 (後続P2修正前)
+
+**過去検証: この節の階層caption全体を13pt移動して省略する方式と、そのソースに対する成功記録は§14.4のP2修正前の結果。現行仕様は§5.1、修正後gateは§14.4へ記録する。数値・ログ・ビルド時刻は履歴として保持し、後続修正に流用しない。**
+
+実装担当からの実測・修正記録:
+
+| 項目 | 値 / 判断 |
+|---|---|
+| raw帯 | cell左右4pt内側、高さ9 logical pt、下端はcell下端から4pt |
+| 下端ラベル予約 | 13 logical pt。右下gap 3pt、左下gap 7pt |
+| 100/125/150/200%の描画厚さ | 9/11/13/18 physical pixels、9/8.8/8.667/9 logical pt |
+| pixel整列 | 左端ceil、右端/下端floor。上端は丸めた下端から整数pixel厚さを戻すため、元の矩形の上端に対する完全な内側丸めではない |
+| 採用fill Light / Dark | `#26437A` / `#8EB0EA` |
+| fill/trackのコントラスト比 Light / Dark | 7.91 / 6.26 |
+| fill/選択strokeのコントラスト比 Light / Dark | 2.27 / 1.94 |
+
+captionの13pt移動後を計測すると、高さ94ptのSearchContainerの深い階層パスで固定アイコンへ2.2pt、高さ48ptのCollectionPlaceholderのファイル名で固定アイコンへ10.5ptの交差を確認した。ON時の固定位置のink判定で、cell・帯・固定アイコンへ収まらない低優先captionを省略して解消した。代替位置探索やアイコン移動は行わない。cellへの収まりとviewport clipを分離し、実描画回帰で一部だけ見えるcaptionが残ることも確認した。SearchContainerの代表画像ありではON時にラベル背景を元の上部アイコンより先へ描き、背景が主アイコンを覆うケースを解消した。
+
+後続の独立レビューの目視で、位置記録のあるVideoだけ再生アイコンを通常ラベルの後に描いたため、ファイル名を覆う退行を確認した。バーと固定予約後のラベルは交差しないため、通常セルをサムネイル/内容→バー→媒体アイコン/切り取りマーク→通常ラベル→枠/checkの順へ修正した。ONでバーがある場合の主マークの遅延先はバー直後・ラベル前に限定し、極小セルでバーが主マークを隠さないことと、主マークがラベルを覆わない従来の優先関係を両立する。OFF/位置なしの元の順序、SearchContainer / CollectionPlaceholderの内容内caption規則、SearchContainerのON時ラベル背景→元の上部アイコンの順序は保持した。
+
+検証担当は親の実装担当。文書担当は文書の整合確認だけを行い、自動gateとbuildを重複実行しない。以下は当時の最終ソースの結果。旧案の成功結果は流用しない。
+
+| 検証 | 状態 / 結果 |
+|---|---|
+| `cargo test -p mimageviewer --lib thumbnail_resume_meter -- --nocapture` | exit 0、9 passed。固定帯・全セル予約・ON/OFF・位置なし/途中/満タン・caption・描画順・scroll clip |
+| `cargo test -p mimageviewer --lib thumb_overlay_layout` | exit 0、24 passed。32/48/100/140/240pt、端数原点、100/125/150/200% DPIの実glyph検査は上記9テストにも含む |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib resume_meter_snapshot` | exit 0、14 passed。本/媒体10画像とreserved 4画像のみ更新、全14画像目視済み |
+| `cargo test -p mimageviewer --lib resume_meter` | exit 0、61 passed。更新後snapshotの通常比較を含む |
+| `cargo test -p mimageviewer --lib media_duration` | exit 0、18 passed |
+| `cargo fmt` / `cargo fmt --check` / `cargo check -p mimageviewer --bin mimageviewer-core` | すべてexit 0 |
+| `cargo test --test ui_snapshot` | exit 0、76 passed。integration期待画像は変更不要 |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyphsなし |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | exit 0、11,410 passed / 58 ignored / 0 failed。filtered-out=0の57集計を合算し、限定再実行1集計は重複計上しない。本体lib 10,315 passed / 52 ignored、793.80s |
+| 独立completion review | `gpt-6.1-sol` / `xhigh`、修正後ソースと全14 PNGで残存P1/P2なし。ON記録あり/なしVideoの帯より上の画素差はLight/Darkとも0 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit 0。normal feature set / dev-runtime、runtime=4 / PE=3検査成功。core 7m59s、Remote service 0.38s、EPUB PDF worker 0.37s |
+| 利用者の実機確認 | 未実施 |
+
+絞り込み検証は `CARGO_BUILD_JOBS=1` / `RUST_TEST_THREADS=4`。今回のログは `target/meter-reserved-*.log`。最終geometryは `meter-reserved-measure-final.log`、更新後の通常snapshot比較は `meter-reserved-resume_meter.log`。初回のfixtureの型指定と、切り取り色を未変換で比較したテストの診断を修正して再実行した。描画順・captionの修正後の最終ソースで上記のexit 0を確認した。
+
+製品側の変更は `src/thumb_overlay_layout.rs`（設定で全セルの帯を予約、左右の下端レーン）、`src/ui_main.rs`（両入口で設定boolを渡す）、`src/app/grid_paint.rs`（固定帯・描画順・特殊caption・headless検査）、`src/os_theme.rs`（配色）、`src/ui_helpers.rs`（既存階層pathレイアウト関数のcrate内公開だけ）。文書は本計画、`docs/spec.md`、`docs/display-pipeline.md`、`docs/next-release-backlog.md`、`htdocs/mimageviewer/manual/grid.html`。本4・媒体6・固定帯比較4のPNGは `tests/snapshots/`。UI同期I/Oや保持stateを追加せず、DB・位置保存・再開・watched・長さworker・設定の形式は変更していない。
+
+端数原点の140×140ptセル（min=20.3,20.7）の描画rectも記録する。公称内幅は132pt、pixel整列で左右だけを丸める。ラベルrectと実glyphは全DPIで非交差。
+
+| DPI | バー x範囲 (pt) | バー y範囲 (pt) | 物理厚さ |
+|---|---|---|---:|
+| 100% | 25.000〜156.000 | 147.000〜156.000 | 9px |
+| 125% | 24.800〜156.000 | 147.200〜156.000 | 11px |
+| 150% | 24.667〜156.000 | 148.000〜156.667 | 13px |
+| 200% | 24.500〜156.000 | 147.500〜156.500 | 18px |
+
+実機では本/動画/音声/画像と未読・位置なし・途中・満タンを横に並べ、ONで全セルの下端ラベルと帯の高さが揃い、OFFで全セルの下端ラベルが一緒に従来位置へ戻ることを確認する。Light/Dark・白/黒表紙・100/150/200% DPI、長さバッジON/OFF、選択/チェック/切り取り、小セル、検索・コレクションのcaptionも確認する。今回の確認用coreは `target/dev-runtime/mimageviewer-core.exe` に配置済み（2026-10-06 09:53:37）。今回のログは `target/meter-reserved-build.log`。通常coreは実際の `%APPDATA%\mimageviewer` を使うため、インストール済み/トレイ常駐のmIVを閉じてから利用者が起動する。製品バイナリ起動・commitは行わない。
+
+### 14.4 後続P2: 通常サイズのSearchContainerで末端名が消える問題
+
+2026-10-06: 後続レビューで、共有設定ONの180×94ptという通常サイズのSearchContainerの代表画像なし・未ロード経路でも、名前が丸ごと消えるP2を確認した。§14.3のcaption交差検査は、階層パス領域全体を13pt上へ移した結果、固定アイコン下にあった領域の上端まで持ち上げ、実際のinkがアイコンへ交差すると階層パス全体を省略していた。交差しないことだけを検証しても、利用者がセルを識別する末端名の維持を確認できていなかった。
+
+現行の修正は、代表画像なし・未ロードの階層パスだけ上端を固定アイコン下の元位置に保ち、下端を13pt縮める。アイコンも帯も移動せず、縮めた矩形へ既存の `layout_path_hierarchy` を再適用し、入りきらない親階層から省略して末端の本/フォルダ名を優先する。通常サイズのセルでは末端名の全消去を許さない。SearchContainerの件数とCollectionPlaceholderの単行captionの13pt移動・低優先省略、ON時のラベル背景→元の上部アイコン、OFF時の元配置/描画順、cellとviewport clipの判定分離は維持する。新しい配置探索・主アイコン移動・state・worker・DBは追加しない。
+
+独立レビュアーは、この上端保持/下端縮小を代表画像ありにも広げると、180×94ptでパス領域が2.68ptになり、パスが既存の件数表示へ寄る副作用を確認した。P2の根因は代表画像なし・未ロードの経路に限られるため、代表画像ありの背景/パスは、もともと小さい固定種別アイコンより下にある元の全体13pt移動へ戻し、領域の高さを維持する。修正範囲を根因の経路へ限定することに独立レビュアーと合意した。
+
+修正後の回帰では、180×94ptの通常セルと深い階層パスで、ON/OFF・代表画像あり/なし・Light/Dark・100/125/150/200% DPIに対して末端名が表示され、親階層から省略されることを検査する。固定アイコン・帯との非交差、極小セルの低優先省略、部分可視のcaption維持と既存の描画順も確認する。§14.3の9テスト/14PNG・全体gate・確認用buildの成功結果はP2修正前の履歴として保持し、今回の修正の成功証跡へ流用しない。
+
+修正後の焦点gateは成功。検証担当は親の実装担当、条件は `CARGO_BUILD_JOBS=1` / `RUST_TEST_THREADS=4`。全GridItem種別を含む通常サイズの15ケースと長い検索末端名の計16ケースを、Light/Dark・100/125/150/200% DPI・サムネイル読込前後・OFF/ON位置なし/ON位置ありで検査する。名前を元から出さない画像/仮想ページでは評価、スタックでは枚数の存在を必須にする。全体gate・確認用buildも完了した。
+
+180×94pt、cell原点(20,20)、100% DPIの実inkは、代表画像なしの `book` が y=57.8〜64.8pt、固定アイコンが31.0〜50.0pt、帯が101.0〜110.0pt。代表画像ありの `book` は72.2〜76.2pt、件数は77.0〜87.0ptで、固定アイコン・帯と交差しない。
+
+| 検証 | 状態 / 結果 |
+|---|---|
+| `cargo test -p mimageviewer --lib thumbnail_resume_meter -- --nocapture` | exit 0、10 passed。末端名必須・全種別・非交差・部分可視・極小セル・描画順 |
+| `cargo test -p mimageviewer --lib grid_paint` | exit 0、33 passed |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib reserved_resume_meter_snapshot` | exit 0、4 passed。reserved 4PNGのみ更新し、Light/Dark・100/150%で目視確認 |
+| `cargo test -p mimageviewer --lib resume_meter` | exit 0、62 passed。更新後の通常snapshot比較を含む |
+| `cargo test -p mimageviewer --lib thumb_overlay_layout` | exit 0、24 passed |
+| `cargo fmt` / `cargo fmt --check` / `cargo check -p mimageviewer --bin mimageviewer-core` | すべてexit 0 |
+| `cargo test --test ui_snapshot` | exit 0、76 passed |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyphsなし |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | exit 0、11,411 passed / 58 ignored / 0 failed。filtered-out=0の57集計を合算し、限定子再実行2集計は重複計上しない。本体lib 10,316 passed / 52 ignored、688.40s |
+| 独立completion review | `gpt-6.1-sol` / `xhigh`、修正ソース・10テストのログ・更新4PNGを確認し、P2解消、残存P1/P2なし。4PNGの検索セル内でON位置あり/なしの画素差は0 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit 0。normal feature set / dev-runtime、runtime=4 / PE=3検査成功。core 57.68s、Remote service 0.35s、EPUB PDF worker 0.34s |
+| 利用者の実機確認 | 未実施 |
+
+今回の証跡は `target/meter-path-label-*.log`。coreは `target/dev-runtime/mimageviewer-core.exe` に配置済み（2026-10-06 10:35:53）。最初の検証で代表画像ありの文字サイズ変更を既存テストが検出したため、根因のないloaded経路を元の配置へ戻し、再検証した。最終ソースで上表の成功結果を確認した。HEADは `570587339` / `next-file-ops`、commit・製品バイナリ起動なし。今回追加の変更は `src/app/grid_paint.rs`、本計画・display-pipeline・specとreserved 4PNG。前段の未コミット差分は保持した。
+
+利用者の実機確認では180×94pt程度の検索セルをLight/Darkと100/150/200% DPIで並べ、代表画像なし/読込前でも末端名が残ること、記録あり/なしで帯・アイコン・文字の位置が一致すること、設定OFFで元の配置になることを確認する。確認用coreは通常の `%APPDATA%\mimageviewer` を使い実データを更新し得るため、インストール済み/トレイ常駐のmIVを閉じてから利用者が起動する。

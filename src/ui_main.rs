@@ -4639,6 +4639,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 false,
                 VideoThumbnailIndicator::PlayIcon,
                 is_cut,
+                None,
             );
         });
     }
@@ -18732,7 +18733,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                 });
                                 let media_duration = self.thumbnail_media_duration_text(idx);
-                                let mut book_resume_meter = self.thumbnail_resume_meter(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -18763,7 +18763,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
-                                    book_resume_meter.is_some(),
+                                    self.settings.thumb_show_resume_meter,
                                 );
 
                                 primary_click_hit_cell |=
@@ -18793,9 +18793,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
                                 // A click may toggle the check state during interaction. Re-layout only
                                 // that changed cell so the new check and its reserved area agree in this frame.
-                                let current_meter = self.thumbnail_resume_meter(idx);
-                                if self.checked.contains(&idx) != is_checked || current_meter != book_resume_meter {
-                                    book_resume_meter = current_meter;
+                                if self.checked.contains(&idx) != is_checked {
                                     overlay_layout = crate::app::layout_cell_overlays(
                                         ui.painter(),
                                         cell_rect,
@@ -18810,10 +18808,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
-                                        book_resume_meter.is_some(),
+                                        self.settings.thumb_show_resume_meter,
                                     );
                                 }
 
+                                let book_resume_meter = self.thumbnail_resume_meter(idx);
                                 let rot = self.get_rotation(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
@@ -18855,8 +18854,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
                                     is_cut,
+                                    book_resume_meter,
                                 );
-                                crate::app::paint_thumbnail_resume_meter(ui, cell_rect, &overlay_layout, book_resume_meter, is_cut);
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {
