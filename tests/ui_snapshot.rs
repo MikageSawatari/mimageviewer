@@ -27,6 +27,52 @@
 
 use egui_kittest::{Harness, kittest::Queryable};
 
+const STARTUP_DIALOG_CASES: &[(&str, &[&str])] = &[
+    ("first_setup", &["開始"]),
+    ("boot_incompatible", &["設定の復元を開く", "アプリを終了"]),
+    ("boot_unreadable", &["設定の復元を開く", "アプリを終了"]),
+    ("whats_new", &["すべての変更を見る", "閉じる"]),
+    (
+        "update_notice",
+        &[
+            "リリースページを開く",
+            "このバージョンの通知をオフ",
+            "閉じる",
+        ],
+    ),
+    ("update_current", &["リリースページを開く", "閉じる"]),
+    ("update_error", &["リリースページを開く", "閉じる"]),
+    (
+        "network_data_dir",
+        &["閉じる", "この保存先では今後表示しない"],
+    ),
+    ("restore_result", &["アプリを終了して再起動を促す"]),
+    ("restore_success", &["アプリを終了"]),
+    ("restore_recoverable", &["閉じる"]),
+    (
+        "restore_remote",
+        &["リモート設定readerを再接続", "アプリを終了"],
+    ),
+    ("restore_list", &["設定を完全リセット…"]),
+    ("restore_confirm", &["復元して終了", "キャンセル"]),
+    ("restore_reset", &["リセットして終了", "キャンセル"]),
+    ("pdf_notice", &["閉じる"]),
+    ("susie_notice", &["閉じる"]),
+    ("trt_notice", &["ワーカーを再起動", "閉じる"]),
+    ("mouse_migration", &["標準にする", "従来どおり"]),
+    (
+        "rename_recovery",
+        &["再読み込み", "壊れた記録を退避して再開", "閉じる"],
+    ),
+    ("rename_quarantining", &["キャンセル"]),
+    ("archive_scanning", &["キャンセル"]),
+    ("archive_confirm", &["変換して開く", "キャンセル"]),
+    ("archive_empty", &["変換して開く", "キャンセル"]),
+    ("archive_sibling", &["ZIP ファイルに変換", "キャンセル"]),
+    ("archive_converting", &["キャンセル"]),
+    ("archive_error", &["閉じる"]),
+];
+
 #[test]
 fn startup_dialogs_small_viewport() {
     use egui_kittest::kittest::NodeT;
@@ -35,55 +81,10 @@ fn startup_dialogs_small_viewport() {
         watched: Vec<egui::Id>,
         clicked: std::collections::HashSet<egui::Id>,
     }
-    let cases: &[(&str, &[&str])] = &[
-        ("first_setup", &["開始"]),
-        ("boot_incompatible", &["設定の復元を開く", "アプリを終了"]),
-        ("boot_unreadable", &["設定の復元を開く", "アプリを終了"]),
-        ("whats_new", &["すべての変更を見る", "閉じる"]),
-        (
-            "update_notice",
-            &[
-                "リリースページを開く",
-                "このバージョンの通知をオフ",
-                "閉じる",
-            ],
-        ),
-        ("update_current", &["リリースページを開く", "閉じる"]),
-        ("update_error", &["リリースページを開く", "閉じる"]),
-        (
-            "network_data_dir",
-            &["閉じる", "この保存先では今後表示しない"],
-        ),
-        ("restore_result", &["アプリを終了して再起動を促す"]),
-        ("restore_success", &["アプリを終了"]),
-        ("restore_recoverable", &["閉じる"]),
-        (
-            "restore_remote",
-            &["リモート設定readerを再接続", "アプリを終了"],
-        ),
-        ("restore_list", &["設定を完全リセット…"]),
-        ("restore_confirm", &["復元して終了", "キャンセル"]),
-        ("restore_reset", &["リセットして終了", "キャンセル"]),
-        ("pdf_notice", &["閉じる"]),
-        ("susie_notice", &["閉じる"]),
-        ("trt_notice", &["ワーカーを再起動", "閉じる"]),
-        ("mouse_migration", &["標準にする", "従来どおり"]),
-        (
-            "rename_recovery",
-            &["再読み込み", "壊れた記録を退避して再開", "閉じる"],
-        ),
-        ("rename_quarantining", &["キャンセル"]),
-        ("archive_scanning", &["キャンセル"]),
-        ("archive_confirm", &["変換して開く", "キャンセル"]),
-        ("archive_empty", &["変換して開く", "キャンセル"]),
-        ("archive_sibling", &["ZIP ファイルに変換", "キャンセル"]),
-        ("archive_converting", &["キャンセル"]),
-        ("archive_error", &["閉じる"]),
-    ];
     let mut results = egui_kittest::SnapshotResults::new();
     for (width, height) in [(1093, 614), (1366, 728)] {
         for scale in [1.0_f32, 2.0] {
-            for &(kind, buttons) in cases {
+            for &(kind, buttons) in STARTUP_DIALOG_CASES {
                 let size = egui::vec2(width as f32, height as f32);
                 let mut fonts_ready = false;
                 let mut harness = Harness::builder().with_size(size).build_state(
@@ -194,6 +195,84 @@ fn startup_dialogs_small_viewport() {
                         harness.state().clicked.contains(&id),
                         !disabled,
                         "{kind} scale {scale} {button}: click"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn startup_dialogs_refit_after_viewport_resize() {
+    use egui_kittest::kittest::NodeT;
+    for scale in [1.0, 2.0] {
+        for &(kind, buttons) in STARTUP_DIALOG_CASES {
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1920.0, 1440.0))
+                .build_state(
+                    move |ctx, state: &mut (Vec<egui::Id>, Vec<egui::Response>)| {
+                        if !fonts_ready {
+                            install_app_fonts(ctx);
+                            mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
+                                    ui, kind,
+                                );
+                            });
+                        // Capture the current pass rather than read_response after
+                        // Context::run, which can prefer discarded-pass widgets.
+                        state.1 = state
+                            .0
+                            .iter()
+                            .map(|id| ctx.read_response(*id).unwrap())
+                            .collect();
+                    },
+                    (Vec::new(), Vec::new()),
+                );
+            harness.run_steps(12);
+            let mut labels = buttons.to_vec();
+            if kind == "first_setup" {
+                labels.push("初回設定");
+            }
+            if harness.query_by_label("Close window").is_some() {
+                labels.push("Close window");
+            }
+            let ids: Vec<_> = labels
+                .iter()
+                .map(|label| {
+                    let node = harness.get_by_label(*label);
+                    unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) }
+                })
+                .collect();
+            harness.state_mut().0 = ids;
+            for size in [
+                egui::vec2(1093.0, 614.0),
+                egui::vec2(1920.0, 1440.0),
+                egui::vec2(1093.0, 614.0),
+            ] {
+                // Match egui-winit: resized RawInput is already in zoomed points.
+                harness.set_size(size / scale);
+                // Some fixtures animate spinners, so cannot run to idle.
+                // At most two native frames, never twelve settling frames.
+                harness.run_steps(2);
+                let viewport = harness.ctx.content_rect();
+                assert!((viewport.size() * scale - size).length() < 1.0);
+                for (label, response) in labels.iter().zip(&harness.state().1) {
+                    assert!(
+                        viewport.contains_rect(response.rect),
+                        "{kind} scale {scale}: {label} {:?} in {viewport:?}",
+                        response.rect
+                    );
+                    assert!(
+                        response.interact_rect.contains_rect(response.rect),
+                        "{kind} scale {scale}: {label} clipped"
                     );
                 }
             }

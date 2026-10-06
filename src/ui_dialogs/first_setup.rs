@@ -55,7 +55,7 @@ pub fn draw_first_setup_dialog(
     ctx: &egui::Context,
     settings: &mut crate::settings::Settings,
 ) -> egui::ModalResponse<egui::Response> {
-    egui::Modal::new(egui::Id::new("first_setup_modal")).show(ctx, |ui| {
+    super::show_startup_modal(ctx, egui::Id::new("first_setup_modal"), |ui| {
         ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
         ui.heading("初回設定");
         ui.add_space(8.0);
@@ -164,7 +164,100 @@ pub fn draw_first_setup_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+
+    #[test]
+    fn first_setup_refits_after_viewport_shrinks() {
+        #[derive(Default)]
+        struct State {
+            settings: crate::settings::Settings,
+            confirmed: bool,
+            watched: Vec<egui::Id>,
+            responses: Vec<egui::Response>,
+        }
+        for scale in [1.0, 2.0] {
+            for max_passes in [1, 2] {
+                let mut fonts_ready = false;
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(1920.0, 1440.0))
+                    .build_state(
+                        move |ctx, state: &mut State| {
+                            ctx.options_mut(|o| o.max_passes = max_passes.try_into().unwrap());
+                            crate::settings::apply_ui_scale_factor(ctx, scale);
+                            if !fonts_ready {
+                                crate::ui_fonts::configure_fonts(ctx);
+                                fonts_ready = true;
+                                ctx.request_repaint();
+                                return;
+                            }
+                            let response = draw_first_setup_dialog(ctx, &mut state.settings);
+                            state.confirmed |= first_setup_should_confirm(&response, false, false);
+                            // Read inside the final pass: outside Context::run,
+                            // read_response can prefer the discarded pass's widgets.
+                            state.responses = state
+                                .watched
+                                .iter()
+                                .map(|id| ctx.read_response(*id).unwrap())
+                                .collect();
+                        },
+                        State::default(),
+                    );
+                harness.run();
+                harness.state_mut().watched = ["初回設定", "開始"]
+                    .map(|label| {
+                        let node = harness.get_by_label(label);
+                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) }
+                    })
+                    .to_vec();
+                for size in [
+                    egui::vec2(1093.0, 614.0),
+                    egui::vec2(1920.0, 1440.0),
+                    egui::vec2(1093.0, 614.0),
+                ] {
+                    // Harness set_size takes current egui points. winit divides
+                    // native client pixels by effective ppp before RawInput.
+                    harness.set_size(size / scale);
+                    harness.step();
+                    if max_passes == 1 {
+                        // With the pass budget exhausted, only scheduled repaints
+                        // may settle the new placement. Never force settling frames.
+                        harness.run();
+                    }
+                    let viewport = harness.ctx.content_rect();
+                    assert!(
+                        (viewport.size() * scale - size).length() < 1.0,
+                        "scale {scale}: {viewport:?}, native {size:?}"
+                    );
+                    for response in &harness.state().responses {
+                        assert!(
+                            viewport.contains_rect(response.rect),
+                            "scale {scale}, passes {max_passes}: {:?} in {viewport:?}",
+                            response.rect
+                        );
+                        assert!(response.interact_rect.contains_rect(response.rect));
+                    }
+                    harness.run();
+                }
+                let pos = harness.state().responses[1].rect.center();
+                harness.hover_at(pos);
+                harness.run();
+                assert!(harness.state().responses[1].hovered());
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                harness.run();
+                assert!(harness.state().confirmed, "scale {scale}: footer click");
+            }
+        }
+    }
 
     #[test]
     fn first_setup_start_button_is_visible_and_clickable_on_small_viewports() {

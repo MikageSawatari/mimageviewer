@@ -651,12 +651,16 @@ impl App {
             _ => None,
         };
         if let Some(message) = message {
-            egui::Modal::new(egui::Id::new("settings_family_operation_modal")).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(message);
-                });
-            });
+            super::show_startup_modal(
+                ctx,
+                egui::Id::new("settings_family_operation_modal"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(message);
+                    });
+                },
+            );
         }
     }
 
@@ -742,7 +746,7 @@ impl App {
         // 機能しなかった。Modal なら backdrop が背景クリックを全部吸う + 背景フォーカスを
         // 完全に奪う。
         let response =
-            egui::Modal::new(egui::Id::new("settings_restore_result_modal")).show(ctx, |ui| {
+            super::show_startup_modal(ctx, egui::Id::new("settings_restore_result_modal"), |ui| {
                 draw_settings_restore_result_content(
                     ui,
                     title,
@@ -2109,7 +2113,7 @@ pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context, fixture:
         "設定の復元に失敗しました。".to_owned(),
         "読み込みエラーの詳細。".repeat(240),
     ];
-    egui::Modal::new(egui::Id::new("settings_restore_result_modal")).show(ctx, |ui| {
+    super::show_startup_modal(ctx, egui::Id::new("settings_restore_result_modal"), |ui| {
         let kind = match fixture {
             "restore_success" => ResultKind::Success,
             "restore_recoverable" | "restore_remote" => ResultKind::FailedRecoverable,
