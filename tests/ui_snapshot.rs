@@ -28,6 +28,72 @@
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn startup_dialogs_small_viewport() {
+    let mut results = egui_kittest::SnapshotResults::new();
+    for (width, height) in [(1093, 614), (1366, 728)] {
+        for (kind, button) in [
+            ("first_setup", "開始"),
+            ("boot_incompatible", "設定の復元を開く"),
+            ("boot_unreadable", "アプリを終了"),
+            ("whats_new", "閉じる"),
+            ("update_notice", "閉じる"),
+            ("network_data_dir", "閉じる"),
+            ("restore_result", "アプリを終了して再起動を促す"),
+            ("restore_list", "設定を完全リセット…"),
+            ("pdf_notice", "閉じる"),
+            ("susie_notice", "閉じる"),
+            ("trt_notice", "閉じる"),
+        ] {
+            let size = egui::vec2(width as f32, height as f32);
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+                mimageviewer::os_theme::apply_resolved(
+                    ctx,
+                    mimageviewer::os_theme::ResolvedTheme::Light,
+                );
+                if !fonts_ready {
+                    install_app_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(ui, kind);
+                    });
+            });
+            harness.run();
+            // Window/Area sizing can settle on a deferred repaint; run() only
+            // waits for immediate repaint requests. Capture a visible stable frame.
+            harness.run_steps(3);
+            let button_rect = harness.get_by_label(button).rect();
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(button_rect),
+                "{kind} {size:?}: {button_rect:?}"
+            );
+            // AccessKit can report an off-clip widget. A real pointer hover must
+            // also reach the action; viewport geometry alone is insufficient.
+            use egui_kittest::kittest::NodeT;
+            let node_id = harness.get_by_label(button).accesskit_node().id().0;
+            // This is egui's original high-entropy widget id, recovered from AccessKit.
+            let widget_id = unsafe { egui::Id::from_high_entropy_bits(node_id) };
+            harness.get_by_label(button).hover();
+            harness.run();
+            let response = harness.ctx.read_response(widget_id).unwrap();
+            assert!(
+                response.hovered(),
+                "{kind} {size:?}: action is clipped/covered"
+            );
+            assert!(response.interact_rect.contains_rect(response.rect));
+            harness.hover_at(egui::Pos2::ZERO);
+            harness.run();
+            results.add(harness.try_snapshot(&format!("startup_{kind}_{width}x{height}")));
+        }
+    }
+}
+
+#[test]
 fn raw_license_information_light() {
     snapshot_with_theme_contrast_and_size(
         "raw_license_information_light",

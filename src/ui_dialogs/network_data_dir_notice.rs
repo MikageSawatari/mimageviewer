@@ -18,40 +18,42 @@ pub fn render_network_data_dir_notice_content(
 ) -> NetworkDataDirNoticeResponse {
     let mut response = NetworkDataDirNoticeResponse::default();
 
-    ui.label("mImageViewer が使うデータの保存先がネットワーク上にあります。");
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(data_dir.display().to_string())
-            .monospace()
-            .strong(),
-    );
-    ui.add_space(8.0);
-    ui.label(
-        "この置き方はサポートしていません。サムネイルや検索用の索引などをこの場所に保存すると、\
+    super::startup_dialog_scroll_body(ui, "network_data_dir_body", 320.0, |ui| {
+        ui.label("mImageViewer が使うデータの保存先がネットワーク上にあります。");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(data_dir.display().to_string())
+                .monospace()
+                .strong(),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            "この置き方はサポートしていません。サムネイルや検索用の索引などをこの場所に保存すると、\
          起動や表示が遅くなったり、終了後の再起動で応答しなくなったりすることがあります。",
-    );
-    ui.add_space(8.0);
-    ui.colored_label(
-        ui.visuals().warn_fg_color,
-        "同じ保存先を複数の PC から使わないでください。データが壊れることがあり、\
+        );
+        ui.add_space(8.0);
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "同じ保存先を複数の PC から使わないでください。データが壊れることがあり、\
          mImageViewer 側では防げません。",
-    );
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("おすすめ").strong());
-    ui.add_space(2.0);
-    ui.label(
-        "mImageViewer 本体を、この PC のディスクに置いてください。\
+        );
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("おすすめ").strong());
+        ui.add_space(2.0);
+        ui.label(
+            "mImageViewer 本体を、この PC のディスクに置いてください。\
          画像はネットワーク上のままで構いません。",
-    );
-    ui.add_space(8.0);
-    ui.label(
-        "本体をネットワーク上に置いたままにしたい場合は、\
+        );
+        ui.add_space(8.0);
+        ui.label(
+            "本体をネットワーク上に置いたままにしたい場合は、\
          mImageViewer が使うデータだけをこの PC に置く方法もあります。",
-    );
-    ui.add_space(4.0);
-    if ui.link("詳しい手順をマニュアルで見る").clicked() {
-        response.open_manual = true;
-    }
+        );
+        ui.add_space(4.0);
+        if ui.link("詳しい手順をマニュアルで見る").clicked() {
+            response.open_manual = true;
+        }
+    });
     ui.add_space(10.0);
     ui.separator();
     ui.add_space(4.0);
@@ -86,18 +88,7 @@ impl App {
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let mut response = NetworkDataDirNoticeResponse::default();
-        egui::Window::new("データの保存先について")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(dialog_pos)
-            .min_width(460.0)
-            .show(ctx, |ui| {
-                ui.set_max_width(560.0);
-                response = render_network_data_dir_notice_content(ui, &data_dir);
-            });
+        let response = draw_network_data_dir_notice_dialog(ctx, &mut open, &data_dir);
 
         if response.open_manual {
             let url =
@@ -113,4 +104,26 @@ impl App {
             self.network_data_dir_notice = None;
         }
     }
+}
+
+pub(super) fn draw_network_data_dir_notice_dialog(
+    ctx: &egui::Context,
+    open: &mut bool,
+    data_dir: &Path,
+) -> NetworkDataDirNoticeResponse {
+    let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+    let mut response = NetworkDataDirNoticeResponse::default();
+    egui::Window::new("データの保存先について")
+        .open(open)
+        .collapsible(false)
+        .resizable(true)
+        .default_pos(dialog_pos)
+        .min_width(460.0)
+        .default_height(430.0)
+        .show(ctx, |ui| {
+            ui.set_max_width(560.0);
+            response = render_network_data_dir_notice_content(ui, data_dir);
+        });
+
+    response
 }

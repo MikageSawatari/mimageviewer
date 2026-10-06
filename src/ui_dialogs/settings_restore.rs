@@ -439,6 +439,7 @@ impl App {
             .enabled(!preferences_transfer_open)
             .default_pos(dialog_pos)
             .default_width(860.0)
+            .default_height(540.0)
             .show(ctx, |ui| {
                 draw_body(self, ui);
             });
@@ -757,9 +758,6 @@ impl App {
         ) {
             return;
         }
-        let mut closing = false;
-        let mut retry_remote = false;
-        let mut exit_for_remote = false;
         let remote_resume_error = match &self.settings_restore_state.family_operation {
             SettingsFamilyOperationState::RemoteUnavailable { error, .. } => Some(error.clone()),
             _ => None,
@@ -781,51 +779,16 @@ impl App {
         // 完全に奪う。
         let response =
             egui::Modal::new(egui::Id::new("settings_restore_result_modal")).show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.heading(title);
-                ui.add_space(8.0);
-                for line in lines {
-                    if kind != ResultKind::Success {
-                        ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
-                    } else {
-                        ui.label(line);
-                    }
-                }
-                if let Some(error) = remote_resume_error.as_deref() {
-                    ui.add_space(6.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xc0, 0x40, 0x40),
-                        format!(
-                            "リモートのお気に入り検索用readerを再接続できませんでした: {error}"
-                        ),
-                    );
-                    ui.label(
-                        "通常の設定アクセスは再開済みです。再試行するか、アプリを終了してください。",
-                    );
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if remote_resume_error.is_some() {
-                        if ui.button("リモート設定readerを再接続").clicked() {
-                            retry_remote = true;
-                        }
-                        if ui.button("アプリを終了").clicked() {
-                            exit_for_remote = true;
-                        }
-                    } else {
-                        let button_label = match kind {
-                            ResultKind::Success => "アプリを終了",
-                            ResultKind::FailedRecoverable => "閉じる",
-                            ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
-                        };
-                        if ui.button(button_label).clicked() {
-                            closing = true;
-                        }
-                    }
-                });
+                draw_settings_restore_result_content(
+                    ui,
+                    title,
+                    &lines,
+                    kind,
+                    remote_resume_error.as_deref(),
+                )
             });
+
+        let (mut closing, retry_remote, exit_for_remote) = response.inner;
 
         // Recoverable のみ backdrop クリック / Esc を「閉じる」として受け付ける。
         // Terminal は backdrop / Esc も無効 (= ボタンクリックでしか抜けられない)。
@@ -1029,11 +992,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
-    ui.label(
-        "現在の設定または過去のバックアップから設定を復元できます。\n\
-         復元すると現在の設定は上書きされ、アプリは自動で終了します。",
-    );
-    ui.add_space(8.0);
+    draw_restore_intro(ui);
 
     if app.settings_boot_problem_source.is_none() {
         draw_preferences_transfer_entry(app, ui);
@@ -1041,113 +1000,13 @@ fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
     }
 
-    // 一覧テーブル。
-    let now = SystemTime::now();
-    egui::ScrollArea::both()
-        .max_height(360.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            egui::Grid::new("settings_restore_grid")
-                .num_columns(9)
-                .striped(true)
-                .spacing(egui::vec2(12.0, 4.0))
-                .show(ui, |ui| {
-                    // ヘッダ
-                    ui.strong("世代");
-                    ui.strong("保存した版");
-                    ui.strong("互換性");
-                    ui.strong("日時");
-                    ui.strong("サイズ");
-                    ui.strong("お気に入り");
-                    ui.strong("タグ");
-                    ui.strong("動画再開");
-                    ui.strong("操作");
-                    ui.end_row();
-
-                    for backup in &app.settings_restore_state.backups {
-                        // 世代
-                        ui.label(backup.source.label());
-                        ui.label(
-                            backup
-                                .content_app_version
-                                .as_deref()
-                                .unwrap_or("不明"),
-                        );
-                        let boot_incompatible_current = matches!(
-                            app.settings_boot_problem_source,
-                            Some(crate::settings_db::BootSource::IncompatibleSettings)
-                        )
-                            && backup.source.is_current();
-                        let newer = boot_incompatible_current
-                            || backup.compatibility == BackupCompatibility::NewerVersion;
-                        if newer {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(0xc0, 0x40, 0x40),
-                                "利用不可（新しい版）",
-                            );
-                        } else {
-                            match backup.compatibility {
-                                BackupCompatibility::RestoreCandidate => {
-                                    ui.label("復元候補");
-                                }
-                                BackupCompatibility::Unknown => {
-                                    ui.weak("要確認");
-                                }
-                                BackupCompatibility::NewerVersion => unreachable!(),
-                            }
-                        }
-                        // 日時 (= mtime の相対表現)
-                        let when = backup
-                            .mtime
-                            .map(|t| format_relative_time(t, now))
-                            .unwrap_or_else(|| "—".to_string());
-                        ui.label(when);
-                        // サイズ
-                        ui.label(format_bytes(backup.size));
-                        // 件数
-                        ui.label(backup.favorites.to_string());
-                        ui.label(backup.tags.to_string());
-                        ui.label(backup.video_resume.to_string());
-                        // 操作 (現在の設定行はボタンなし)
-                        match &backup.source {
-                            BackupSource::Current => {
-                                ui.weak("(現在使用中)");
-                            }
-                            BackupSource::Bak(_) | BackupSource::PreUpgrade(_) => {
-                                if ui
-                                    .add_enabled(!newer, egui::Button::new("この時点に戻す…"))
-                                    .on_disabled_hover_text(
-                                        "このバックアップは現在のアプリより新しい版で保存されています。",
-                                    )
-                                    .clicked()
-                                {
-                                    app.settings_restore_state.pending =
-                                        Some(PendingAction::Restore(backup.source.clone()));
-                                }
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
-
-    if let Some(err) = first_partial_error(&app.settings_restore_state.backups) {
-        ui.add_space(8.0);
-        ui.colored_label(
-            egui::Color32::from_rgb(0xc0, 0x40, 0x40),
-            format!("一部の世代は読み取りに問題があります: {err}"),
-        );
+    if let Some(pending) = draw_restore_backup_controls(
+        ui,
+        &app.settings_restore_state.backups,
+        app.settings_boot_problem_source,
+    ) {
+        app.settings_restore_state.pending = Some(pending);
     }
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("使えるバックアップが無い、または初期状態に戻したい場合:");
-        if ui.button("設定を完全リセット…").clicked() {
-            app.settings_restore_state.pending = Some(PendingAction::FullReset);
-        }
-    });
 }
 
 fn draw_preferences_transfer_entry(app: &mut App, ui: &mut egui::Ui) {
@@ -2278,5 +2137,297 @@ mod tests {
             });
         harness.run();
         harness.snapshot("settings_restore_operation_diff_preview");
+    }
+}
+
+pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context) {
+    let lines = vec![
+        "設定の復元に失敗しました。".to_owned(),
+        "読み込みエラーの詳細。".repeat(240),
+    ];
+    egui::Modal::new(egui::Id::new("settings_restore_result_modal")).show(ctx, |ui| {
+        draw_settings_restore_result_content(ui, "エラー", &lines, ResultKind::FailedTerminal, None)
+    });
+}
+
+pub(super) fn draw_restore_list_snapshot_fixture(ctx: &egui::Context) {
+    let backups = restore_backup_snapshot_fixture();
+    egui::Window::new("設定の復元")
+        .open(&mut true)
+        .resizable(true)
+        .collapsible(false)
+        .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+        .default_width(860.0)
+        .default_height(540.0)
+        .show(ctx, |ui| {
+            let mut tab = SettingsRestoreTab::Restore;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut tab, SettingsRestoreTab::Restore, "設定の復元");
+            });
+            ui.separator();
+            ui.add_space(6.0);
+            draw_restore_intro(ui);
+            draw_restore_backup_controls(
+                ui,
+                &backups,
+                Some(crate::settings_db::BootSource::FailedFallbackDefault),
+            );
+        });
+}
+
+fn draw_settings_restore_result_content(
+    ui: &mut egui::Ui,
+    title: &str,
+    lines: &[String],
+    kind: ResultKind,
+    remote_resume_error: Option<&str>,
+) -> (bool, bool, bool) {
+    let mut closing = false;
+    let mut retry_remote = false;
+    let mut exit_for_remote = false;
+    ui.set_width(560.0_f32.min((ui.ctx().content_rect().width() - 48.0).max(1.0)));
+    ui.heading(title);
+    ui.add_space(8.0);
+    super::startup_dialog_scroll_body(ui, "settings_restore_result_body", 300.0, |ui| {
+        for line in lines {
+            if kind != ResultKind::Success {
+                ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
+            } else {
+                ui.label(line);
+            }
+        }
+        if let Some(error) = remote_resume_error {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(0xc0, 0x40, 0x40),
+                format!("リモートのお気に入り検索用readerを再接続できませんでした: {error}"),
+            );
+            ui.label("通常の設定アクセスは再開済みです。再試行するか、アプリを終了してください。");
+        }
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if remote_resume_error.is_some() {
+            if ui.button("リモート設定readerを再接続").clicked() {
+                retry_remote = true;
+            }
+            if ui.button("アプリを終了").clicked() {
+                exit_for_remote = true;
+            }
+        } else {
+            let button_label = match kind {
+                ResultKind::Success => "アプリを終了",
+                ResultKind::FailedRecoverable => "閉じる",
+                ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
+            };
+            if ui.button(button_label).clicked() {
+                closing = true;
+            }
+        }
+    });
+    (closing, retry_remote, exit_for_remote)
+}
+
+fn draw_restore_backup_controls(
+    ui: &mut egui::Ui,
+    backups: &[BackupSummary],
+    boot_source: Option<crate::settings_db::BootSource>,
+) -> Option<PendingAction> {
+    let mut pending = None;
+    let error_width = (ui.available_width()
+        - super::non_overlapping_dialog_scroll_style(ui.spacing().scroll).allocated_width())
+    .max(1.0);
+    super::startup_dialog_scroll_body_with_axes(
+        ui,
+        "restore_backups_body",
+        360.0,
+        [true, true],
+        |ui| {
+            let now = SystemTime::now();
+            egui::Grid::new("settings_restore_grid")
+                .num_columns(9)
+                .striped(true)
+                .spacing(egui::vec2(12.0, 4.0))
+                .show(ui, |ui| {
+                    // ヘッダ
+                    ui.strong("世代");
+                    ui.strong("保存した版");
+                    ui.strong("互換性");
+                    ui.strong("日時");
+                    ui.strong("サイズ");
+                    ui.strong("お気に入り");
+                    ui.strong("タグ");
+                    ui.strong("動画再開");
+                    ui.strong("操作");
+                    ui.end_row();
+
+                    for backup in backups {
+                        // 世代
+                        ui.label(backup.source.label());
+                        ui.label(
+                            backup
+                                .content_app_version
+                                .as_deref()
+                                .unwrap_or("不明"),
+                        );
+                        let boot_incompatible_current = matches!(
+                            boot_source,
+                            Some(crate::settings_db::BootSource::IncompatibleSettings)
+                        )
+                            && backup.source.is_current();
+                        let newer = boot_incompatible_current
+                            || backup.compatibility == BackupCompatibility::NewerVersion;
+                        if newer {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xc0, 0x40, 0x40),
+                                "利用不可（新しい版）",
+                            );
+                        } else {
+                            match backup.compatibility {
+                                BackupCompatibility::RestoreCandidate => {
+                                    ui.label("復元候補");
+                                }
+                                BackupCompatibility::Unknown => {
+                                    ui.weak("要確認");
+                                }
+                                BackupCompatibility::NewerVersion => unreachable!(),
+                            }
+                        }
+                        // 日時 (= mtime の相対表現)
+                        let when = backup
+                            .mtime
+                            .map(|t| format_relative_time(t, now))
+                            .unwrap_or_else(|| "—".to_string());
+                        ui.label(when);
+                        // サイズ
+                        ui.label(format_bytes(backup.size));
+                        // 件数
+                        ui.label(backup.favorites.to_string());
+                        ui.label(backup.tags.to_string());
+                        ui.label(backup.video_resume.to_string());
+                        // 操作 (現在の設定行はボタンなし)
+                        match &backup.source {
+                            BackupSource::Current => {
+                                ui.weak("(現在使用中)");
+                            }
+                            BackupSource::Bak(_) | BackupSource::PreUpgrade(_) => {
+                                if ui
+                                    .add_enabled(!newer, egui::Button::new("この時点に戻す…"))
+                                    .on_disabled_hover_text(
+                                        "このバックアップは現在のアプリより新しい版で保存されています。",
+                                    )
+                                    .clicked()
+                                {
+                                    pending =
+                                        Some(PendingAction::Restore(backup.source.clone()));
+                                }
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            if let Some(err) = first_partial_error(backups) {
+                ui.add_space(8.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(error_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(error_width);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xc0, 0x40, 0x40),
+                            format!("一部の世代は読み取りに問題があります: {err}"),
+                        );
+                    },
+                );
+            }
+        },
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("使えるバックアップが無い、または初期状態に戻したい場合:");
+        if ui.button("設定を完全リセット…").clicked() {
+            pending = Some(PendingAction::FullReset);
+        }
+    });
+    pending
+}
+
+fn draw_restore_intro(ui: &mut egui::Ui) {
+    ui.label(
+        "現在の設定または過去のバックアップから設定を復元できます。\n\
+         復元すると現在の設定は上書きされ、アプリは自動で終了します。",
+    );
+    ui.add_space(8.0);
+}
+
+fn restore_backup_snapshot_fixture() -> Vec<BackupSummary> {
+    (1..=10)
+        .map(|index| BackupSummary {
+            source: BackupSource::Bak(index),
+            mtime: None,
+            size: 4096,
+            favorites: 3,
+            tags: 8,
+            video_resume: 2,
+            vst3_plugins: 0,
+            content_app_version: Some("4.3.0".into()),
+            compatibility: BackupCompatibility::RestoreCandidate,
+            partial_error: (index == 1).then(|| "読み込みに失敗しました。詳細。".repeat(160)),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod small_screen_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    #[test]
+    fn startup_restore_table_preserves_vertical_and_horizontal_drag() {
+        for delta in [egui::vec2(0.0, 100.0), egui::vec2(100.0, 0.0)] {
+            let backups = restore_backup_snapshot_fixture();
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build(move |ctx| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::Window::new("設定の復元")
+                        .fixed_size(egui::vec2(500.0, 420.0))
+                        .default_pos(egui::pos2(60.0, 40.0))
+                        .show(ctx, |ui| {
+                            draw_restore_backup_controls(ui, &backups, None);
+                        });
+                });
+            harness.run();
+            let before = harness.get_by_label("世代").rect().min;
+            let start = egui::pos2(350.0, 220.0);
+            harness.hover_at(start);
+            harness.event(egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(1);
+            harness.event(egui::Event::PointerMoved(start - delta));
+            harness.run_steps(2);
+            let after = harness.get_by_label("世代").rect().min;
+            let movement = before - after;
+            assert!(
+                movement.dot(delta.normalized()) > 50.0,
+                "{delta:?}: {before:?} -> {after:?}"
+            );
+        }
     }
 }

@@ -16,47 +16,15 @@ impl App {
         }
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let mut close = false;
-        let mut open_changelog = false;
+        let close;
+        let open_changelog;
         // &'static 参照の Vec なので clone は安価 (借用衝突回避のためローカルへ)。
         // highlights_to_show は「またぎ累積」のため昇順で返すが、表示は更新履歴と揃えて
         // **新しいバージョンを上**にする (実機フィードバック 2026-06-20)。
         let mut entries = self.whats_new_entries.clone();
         entries.reverse();
 
-        egui::Window::new("重要な変更点")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(dialog_pos)
-            .min_width(440.0)
-            .default_height(400.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.label("mImageViewer が新しくなりました。主な変更点です。");
-                ui.add_space(6.0);
-                ui.scope(|ui| {
-                    ui.spacing_mut().scroll =
-                        super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
-                    egui::ScrollArea::vertical()
-                        .id_salt("whats_new_scroll")
-                        .max_height(320.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            crate::version_highlights::render(ui, &entries);
-                        });
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("すべての変更を見る").clicked() {
-                        open_changelog = true;
-                    }
-                    if ui.button("閉じる").clicked() {
-                        close = true;
-                    }
-                });
-            });
+        (close, open_changelog) = draw_whats_new_dialog(ctx, &mut open, &entries);
 
         if open_changelog {
             let url = crate::ui_helpers::manual_url("changelog.html", None);
@@ -66,4 +34,39 @@ impl App {
             self.show_whats_new = false;
         }
     }
+}
+
+pub(super) fn draw_whats_new_dialog(
+    ctx: &egui::Context,
+    open: &mut bool,
+    entries: &[&crate::version_highlights::VersionHighlights],
+) -> (bool, bool) {
+    let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+    let mut close = false;
+    let mut open_changelog = false;
+    egui::Window::new("重要な変更点")
+        .open(open)
+        .collapsible(false)
+        .resizable(true)
+        .default_pos(dialog_pos)
+        .min_width(440.0)
+        .default_height(400.0)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.label("mImageViewer が新しくなりました。主な変更点です。");
+            ui.add_space(6.0);
+            super::startup_dialog_scroll_body(ui, "whats_new_scroll", 320.0, |ui| {
+                crate::version_highlights::render(ui, &entries);
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("すべての変更を見る").clicked() {
+                    open_changelog = true;
+                }
+                if ui.button("閉じる").clicked() {
+                    close = true;
+                }
+            });
+        });
+    (close, open_changelog)
 }
