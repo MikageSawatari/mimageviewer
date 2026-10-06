@@ -439,7 +439,7 @@ impl App {
             .enabled(!preferences_transfer_open)
             .default_pos(dialog_pos)
             .default_width(860.0)
-            .default_height(540.0)
+            .default_height((ctx.content_rect().height() - 80.0).max(1.0))
             .show(ctx, |ui| {
                 draw_body(self, ui);
             });
@@ -472,45 +472,9 @@ impl App {
         let mut cancel = false;
         let mut execute = false;
 
-        let (title, body_top, body_warning, action_label) = match &pending {
-            PendingAction::Restore(source) => (
-                "設定を復元",
-                format!("「{}」の内容で現在の設定を上書きします。", source.label()),
-                "現在の設定一式は別名でバックアップしてから書き換えます。\n\
-                 復元完了後、アプリを自動で終了します。次回起動時に内容が反映されます。",
-                "復元して終了",
-            ),
-            PendingAction::FullReset => (
-                "設定を完全リセット",
-                "settings.db / bak1〜bak10 を含む設定ファイル一式を削除します。".to_string(),
-                "現在の設定一式は別名でバックアップしてから削除します。\n\
-                 完了後、アプリを自動で終了します。次回起動時は初期状態になります。",
-                "リセットして終了",
-            ),
-        };
-
-        egui::Window::new(title)
-            .open(&mut confirm_open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(body_top);
-                ui.add_space(4.0);
-                for line in body_warning.lines() {
-                    ui.label(line);
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button(action_label).clicked() {
-                        execute = true;
-                    }
-                    if ui.button("キャンセル").clicked() || escape_pressed {
-                        cancel = true;
-                    }
-                });
-            });
+        let action = draw_restore_confirm_dialog(ctx, &pending, &mut confirm_open);
+        execute |= action.0;
+        cancel |= action.1 || escape_pressed;
 
         if !confirm_open {
             cancel = true;
@@ -2140,13 +2104,37 @@ mod tests {
     }
 }
 
-pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context) {
+pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context, fixture: &str) {
     let lines = vec![
         "設定の復元に失敗しました。".to_owned(),
         "読み込みエラーの詳細。".repeat(240),
     ];
     egui::Modal::new(egui::Id::new("settings_restore_result_modal")).show(ctx, |ui| {
-        draw_settings_restore_result_content(ui, "エラー", &lines, ResultKind::FailedTerminal, None)
+        let kind = match fixture {
+            "restore_success" => ResultKind::Success,
+            "restore_recoverable" | "restore_remote" => ResultKind::FailedRecoverable,
+            _ => ResultKind::FailedTerminal,
+        };
+        let remote_error = "リモート再接続エラーの詳細。".repeat(120);
+        let success_lines = vec![
+            "設定の復元が完了しました。".to_owned(),
+            "退避ファイル: 設定バックアップ。".repeat(100),
+        ];
+        draw_settings_restore_result_content(
+            ui,
+            if kind == ResultKind::Success {
+                "復元完了"
+            } else {
+                "エラー"
+            },
+            if kind == ResultKind::Success {
+                &success_lines
+            } else {
+                &lines
+            },
+            kind,
+            (fixture == "restore_remote").then_some(remote_error.as_str()),
+        )
     });
 }
 
@@ -2158,7 +2146,7 @@ pub(super) fn draw_restore_list_snapshot_fixture(ctx: &egui::Context) {
         .collapsible(false)
         .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
         .default_width(860.0)
-        .default_height(540.0)
+        .default_height((ctx.content_rect().height() - 80.0).max(1.0))
         .show(ctx, |ui| {
             let mut tab = SettingsRestoreTab::Restore;
             ui.horizontal(|ui| {
@@ -2188,7 +2176,17 @@ fn draw_settings_restore_result_content(
     ui.set_width(560.0_f32.min((ui.ctx().content_rect().width() - 48.0).max(1.0)));
     ui.heading(title);
     ui.add_space(8.0);
-    super::startup_dialog_scroll_body(ui, "settings_restore_result_body", 300.0, |ui| {
+    let labels: &[&str] = if remote_resume_error.is_some() {
+        &["リモート設定readerを再接続", "アプリを終了"]
+    } else {
+        match kind {
+            ResultKind::Success => &["アプリを終了"],
+            ResultKind::FailedRecoverable => &["閉じる"],
+            ResultKind::FailedTerminal => &["アプリを終了して再起動を促す"],
+        }
+    };
+    let footer = super::startup_dialog_footer_height(ui, labels, 18.0);
+    super::startup_dialog_scroll_body(ui, "settings_restore_result_body", footer, |ui| {
         for line in lines {
             if kind != ResultKind::Success {
                 ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
@@ -2208,7 +2206,7 @@ fn draw_settings_restore_result_content(
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if remote_resume_error.is_some() {
             if ui.button("リモート設定readerを再接続").clicked() {
                 retry_remote = true;
@@ -2242,7 +2240,12 @@ fn draw_restore_backup_controls(
     super::startup_dialog_scroll_body_with_axes(
         ui,
         "restore_backups_body",
-        360.0,
+        super::startup_dialog_captioned_footer_height(
+            ui,
+            "使えるバックアップが無い、または初期状態に戻したい場合:",
+            &["設定を完全リセット…"],
+            22.0,
+        ),
         [true, true],
         |ui| {
             let now = SystemTime::now();
@@ -2389,6 +2392,44 @@ mod small_screen_tests {
     use egui_kittest::{Harness, kittest::Queryable};
 
     #[test]
+    fn startup_restore_footer_wraps_inside_narrow_window() {
+        use egui_kittest::kittest::NodeT;
+        for scale in [1.0, 2.0] {
+            let backups = restore_backup_snapshot_fixture();
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build(move |ctx| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    crate::settings::apply_ui_scale_factor(ctx, scale);
+                    egui::Window::new("設定の復元")
+                        .fixed_size(egui::vec2(200.0, ctx.content_rect().height() - 80.0))
+                        .default_pos(egui::pos2(60.0, 40.0))
+                        .show(ctx, |ui| {
+                            draw_restore_backup_controls(ui, &backups, None);
+                        });
+                });
+            harness.run_steps(12);
+            let node = harness.get_by_label("設定を完全リセット…");
+            let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+            let response = harness.ctx.read_response(id).unwrap();
+            assert!(harness.ctx.content_rect().contains_rect(response.rect));
+            assert!(
+                response.interact_rect.contains_rect(response.rect),
+                "scale {scale}: {response:?}"
+            );
+            harness.hover_at(response.rect.center());
+            harness.run_steps(3);
+            assert!(harness.ctx.read_response(id).unwrap().hovered());
+        }
+    }
+
+    #[test]
     fn startup_restore_table_preserves_vertical_and_horizontal_drag() {
         for delta in [egui::vec2(0.0, 100.0), egui::vec2(100.0, 0.0)] {
             let backups = restore_backup_snapshot_fixture();
@@ -2430,4 +2471,70 @@ mod small_screen_tests {
             );
         }
     }
+}
+
+fn draw_restore_confirm_dialog(
+    ctx: &egui::Context,
+    pending: &PendingAction,
+    confirm_open: &mut bool,
+) -> (bool, bool) {
+    let mut execute = false;
+    let mut cancel = false;
+    let (title, body_top, body_warning, action_label) = match pending {
+        PendingAction::Restore(source) => (
+            "設定を復元",
+            format!("「{}」の内容で現在の設定を上書きします。", source.label()),
+            "現在の設定一式は別名でバックアップしてから書き換えます。\n\
+                 復元完了後、アプリを自動で終了します。次回起動時に内容が反映されます。",
+            "復元して終了",
+        ),
+        PendingAction::FullReset => (
+            "設定を完全リセット",
+            "settings.db / bak1〜bak10 を含む設定ファイル一式を削除します。".to_string(),
+            "現在の設定一式は別名でバックアップしてから削除します。\n\
+                 完了後、アプリを自動で終了します。次回起動時は初期状態になります。",
+            "リセットして終了",
+        ),
+    };
+
+    egui::Window::new(title)
+        .open(confirm_open)
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+        .default_height((ctx.content_rect().height() - 80.0).max(1.0))
+        .show(ctx, |ui| {
+            ui.set_width(460.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
+            let footer =
+                super::startup_dialog_footer_height(ui, &[action_label, "キャンセル"], 18.0);
+            super::startup_dialog_scroll_body(ui, "settings_restore_confirm_body", footer, |ui| {
+                ui.label(body_top);
+                ui.add_space(4.0);
+                for line in body_warning.lines() {
+                    ui.label(line);
+                }
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(action_label).clicked() {
+                    execute = true;
+                }
+                if ui.button("キャンセル").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    (execute, cancel)
+}
+
+pub(super) fn draw_restore_confirm_snapshot_fixture(ctx: &egui::Context, reset: bool) {
+    let pending = if reset {
+        PendingAction::FullReset
+    } else {
+        PendingAction::Restore(BackupSource::Bak(1))
+    };
+    draw_restore_confirm_dialog(ctx, &pending, &mut true);
 }

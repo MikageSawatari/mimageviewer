@@ -20409,33 +20409,7 @@ impl App {
         }
 
         let mut open = true;
-        let mut choice = None;
-        egui::Window::new("マウス戻る/進むボタン")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.label("マウスの戻る/進むボタンの標準動作を選んでください。");
-                ui.add_space(6.0);
-                ui.label("標準では、ブラウザやエクスプローラーに近いフォルダ履歴の戻る/進むとして使います。");
-                ui.label("従来どおり、ツリー順の前/次フォルダ移動として使うこともできます。");
-                ui.add_space(6.0);
-                ui.small("後で 環境設定 > マウスボタン から変更できます。");
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("標準にする").clicked() {
-                        choice = Some(
-                            crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext,
-                        );
-                    }
-                    if ui.button("従来どおり").clicked() {
-                        choice =
-                            Some(crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext);
-                    }
-                });
-            });
+        let mut choice = crate::ui_dialogs::draw_mouse_nav_migration_dialog(ctx, &mut open);
 
         if choice.is_none() && !open {
             choice = Some(crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext);

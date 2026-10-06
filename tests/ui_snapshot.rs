@@ -29,66 +29,174 @@ use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
 fn startup_dialogs_small_viewport() {
+    use egui_kittest::kittest::NodeT;
+    #[derive(Default)]
+    struct Actions {
+        watched: Vec<egui::Id>,
+        clicked: std::collections::HashSet<egui::Id>,
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("first_setup", &["開始"]),
+        ("boot_incompatible", &["設定の復元を開く", "アプリを終了"]),
+        ("boot_unreadable", &["設定の復元を開く", "アプリを終了"]),
+        ("whats_new", &["すべての変更を見る", "閉じる"]),
+        (
+            "update_notice",
+            &[
+                "リリースページを開く",
+                "このバージョンの通知をオフ",
+                "閉じる",
+            ],
+        ),
+        ("update_current", &["リリースページを開く", "閉じる"]),
+        ("update_error", &["リリースページを開く", "閉じる"]),
+        (
+            "network_data_dir",
+            &["閉じる", "この保存先では今後表示しない"],
+        ),
+        ("restore_result", &["アプリを終了して再起動を促す"]),
+        ("restore_success", &["アプリを終了"]),
+        ("restore_recoverable", &["閉じる"]),
+        (
+            "restore_remote",
+            &["リモート設定readerを再接続", "アプリを終了"],
+        ),
+        ("restore_list", &["設定を完全リセット…"]),
+        ("restore_confirm", &["復元して終了", "キャンセル"]),
+        ("restore_reset", &["リセットして終了", "キャンセル"]),
+        ("pdf_notice", &["閉じる"]),
+        ("susie_notice", &["閉じる"]),
+        ("trt_notice", &["ワーカーを再起動", "閉じる"]),
+        ("mouse_migration", &["標準にする", "従来どおり"]),
+        (
+            "rename_recovery",
+            &["再読み込み", "壊れた記録を退避して再開", "閉じる"],
+        ),
+        ("rename_quarantining", &["キャンセル"]),
+        ("archive_scanning", &["キャンセル"]),
+        ("archive_confirm", &["変換して開く", "キャンセル"]),
+        ("archive_empty", &["変換して開く", "キャンセル"]),
+        ("archive_sibling", &["ZIP ファイルに変換", "キャンセル"]),
+        ("archive_converting", &["キャンセル"]),
+        ("archive_error", &["閉じる"]),
+    ];
     let mut results = egui_kittest::SnapshotResults::new();
     for (width, height) in [(1093, 614), (1366, 728)] {
-        for (kind, button) in [
-            ("first_setup", "開始"),
-            ("boot_incompatible", "設定の復元を開く"),
-            ("boot_unreadable", "アプリを終了"),
-            ("whats_new", "閉じる"),
-            ("update_notice", "閉じる"),
-            ("network_data_dir", "閉じる"),
-            ("restore_result", "アプリを終了して再起動を促す"),
-            ("restore_list", "設定を完全リセット…"),
-            ("pdf_notice", "閉じる"),
-            ("susie_notice", "閉じる"),
-            ("trt_notice", "閉じる"),
-        ] {
-            let size = egui::vec2(width as f32, height as f32);
-            let mut fonts_ready = false;
-            let mut harness = Harness::builder().with_size(size).build(move |ctx| {
-                mimageviewer::os_theme::apply_resolved(
-                    ctx,
-                    mimageviewer::os_theme::ResolvedTheme::Light,
+        for scale in [1.0_f32, 2.0] {
+            for &(kind, buttons) in cases {
+                let size = egui::vec2(width as f32, height as f32);
+                let mut fonts_ready = false;
+                let mut harness = Harness::builder().with_size(size).build_state(
+                    move |ctx, actions: &mut Actions| {
+                        mimageviewer::os_theme::apply_resolved(
+                            ctx,
+                            mimageviewer::os_theme::ResolvedTheme::Light,
+                        );
+                        if !fonts_ready {
+                            install_app_fonts(ctx);
+                            mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
+                                    ui, kind,
+                                );
+                            });
+                        for &id in &actions.watched {
+                            if ctx.read_response(id).is_some_and(|r| r.clicked()) {
+                                actions.clicked.insert(id);
+                            }
+                        }
+                    },
+                    Actions::default(),
                 );
-                if !fonts_ready {
-                    install_app_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
+                // Scanning/quarantine spinners intentionally repaint continuously.
+                // Fixed steps also settle Area sizing without relying on immediate repaint.
+                harness.run_steps(12);
+                let viewport = harness.ctx.content_rect();
+                assert!(
+                    (viewport.size() * scale - size).length() < 1.0,
+                    "{kind}: wrong scale/viewport {viewport:?}"
+                );
+                let mut labels = buttons.to_vec();
+                if harness.query_by_label("Close window").is_some() {
+                    labels.push("Close window");
                 }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(ui, kind);
-                    });
-            });
-            harness.run();
-            // Window/Area sizing can settle on a deferred repaint; run() only
-            // waits for immediate repaint requests. Capture a visible stable frame.
-            harness.run_steps(3);
-            let button_rect = harness.get_by_label(button).rect();
-            assert!(
-                egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(button_rect),
-                "{kind} {size:?}: {button_rect:?}"
-            );
-            // AccessKit can report an off-clip widget. A real pointer hover must
-            // also reach the action; viewport geometry alone is insufficient.
-            use egui_kittest::kittest::NodeT;
-            let node_id = harness.get_by_label(button).accesskit_node().id().0;
-            // This is egui's original high-entropy widget id, recovered from AccessKit.
-            let widget_id = unsafe { egui::Id::from_high_entropy_bits(node_id) };
-            harness.get_by_label(button).hover();
-            harness.run();
-            let response = harness.ctx.read_response(widget_id).unwrap();
-            assert!(
-                response.hovered(),
-                "{kind} {size:?}: action is clipped/covered"
-            );
-            assert!(response.interact_rect.contains_rect(response.rect));
-            harness.hover_at(egui::Pos2::ZERO);
-            harness.run();
-            results.add(harness.try_snapshot(&format!("startup_{kind}_{width}x{height}")));
+                let mut ids = Vec::new();
+                for button in labels {
+                    let node = harness.get_by_label(button);
+                    let rect = node.rect();
+                    assert!(
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect),
+                        "{kind} {size:?} scale {scale} {button}: {rect:?}"
+                    );
+                    // AccessKit stores egui's original high-entropy widget id.
+                    let id =
+                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+                    let disabled = kind == "archive_empty" && button == "変換して開く";
+                    let response = harness.ctx.read_response(id).unwrap();
+                    assert!(
+                        viewport.contains_rect(response.rect),
+                        "{kind} {button}: logical viewport"
+                    );
+                    assert_eq!(response.enabled(), !disabled);
+                    // AccessKit bounds are physical pixels; raw egui events use
+                    // logical points. Node::hover/click does not convert at zoom2.
+                    harness.hover_at(response.rect.center());
+                    harness.run_steps(3);
+                    let response = harness.ctx.read_response(id).unwrap();
+                    assert!(
+                        response.contains_pointer(),
+                        "{kind} scale {scale} {button}: clipped/covered"
+                    );
+                    assert!(
+                        response.interact_rect.contains_rect(response.rect),
+                        "{kind} {button}: partial clip"
+                    );
+                    if !disabled {
+                        assert!(response.hovered());
+                    }
+                    ids.push((button, id, disabled));
+                }
+                harness.hover_at(egui::Pos2::ZERO);
+                harness.run_steps(3);
+                // Geometry and pointer assertions cover every case. Keep PNGs
+                // only for four representative views and two settled highlights.
+                let snapshot = ((width, height) == (1093, 614)
+                    && matches!(kind, "first_setup" | "archive_confirm"))
+                    || (kind == "whats_new" && scale == 1.0);
+                if snapshot {
+                    let suffix = if scale == 1.0 { "" } else { "_ui200" };
+                    results.add(
+                        harness.try_snapshot(&format!("startup_{kind}_{width}x{height}{suffix}")),
+                    );
+                }
+                // Activate each action with mouse events and latch the release frame.
+                // Pure fixtures discard action results: no save, worker, URL, restore or exit.
+                harness.state_mut().watched = ids.iter().map(|(_, id, _)| *id).collect();
+                for (button, id, disabled) in ids {
+                    let pos = harness.ctx.read_response(id).unwrap().rect.center();
+                    harness.hover_at(pos);
+                    for pressed in [true, false] {
+                        harness.event(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                    harness.run_steps(3);
+                    assert_eq!(
+                        harness.state().clicked.contains(&id),
+                        !disabled,
+                        "{kind} scale {scale} {button}: click"
+                    );
+                }
+            }
         }
     }
 }

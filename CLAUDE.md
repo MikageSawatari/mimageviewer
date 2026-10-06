@@ -493,8 +493,12 @@ C:\home\mimageviewer_vendor_backup\
   本文の高さを制限し、見出しと操作ボタンは縦 `ScrollArea` の外へ置く。
   自動サイズの `Modal` ではスクロールの親領域も明示確保する。リサイズ可能な `Window` は
   `available_height()` の制約も尊重し、初期本文が不必要に狭くならない `default_height()` を指定する。
+  本文の上限は実際の枠/見出し/折り返し操作行から計算し、余った高さを使う。一律の大きな控除や
+  固定本文高は使わない。縦auto_shrinkで短文は自然高に縮め、長文の表示面積も回帰検査する。
   長いパス・エラー文・版またぎ告知もテストし、1093×614 / 1366×728 の snapshot と
-  ボタン矩形/クリック到達性の回帰検査を残す。初回設定の Enter 確定は IME helper を使い、
+  UI倍率100%/200%で、固定操作行の全ボタン（再接続等の別状態も含む）とタイトル×の
+  矩形/クリック到達性の回帰検査を残す。起動時書庫変換の列挙/確認/変換/エラーも対象。
+  初回設定の Enter 確定は IME helper を使い、
   選択肢/リンクにフォーカスがある場合はその widget 操作を優先する。Esc で初回設定を省略しない。
 - **折り返し本文と floating scrollbar**: 長文を折り返すダイアログでは、floating scrollbar の
   `floating_allocated_width` を少なくとも `bar_inner_margin + bar_width` 確保する。共通 style は

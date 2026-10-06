@@ -50,12 +50,14 @@ pub(super) fn draw_whats_new_dialog(
         .resizable(true)
         .default_pos(dialog_pos)
         .min_width(440.0)
-        .default_height(400.0)
+        .default_height((ctx.content_rect().height() - 80.0).max(1.0))
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.label("mImageViewer が新しくなりました。主な変更点です。");
             ui.add_space(6.0);
-            super::startup_dialog_scroll_body(ui, "whats_new_scroll", 320.0, |ui| {
+            let footer =
+                super::startup_dialog_footer_height(ui, &["すべての変更を見る", "閉じる"], 4.0);
+            super::startup_dialog_scroll_body(ui, "whats_new_scroll", footer, |ui| {
                 crate::version_highlights::render(ui, &entries);
             });
             ui.add_space(4.0);

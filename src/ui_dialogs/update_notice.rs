@@ -67,9 +67,13 @@ pub(super) fn draw_update_notice_dialog(
             .resizable(true)
             .default_pos(dialog_pos)
             .min_width(420.0)
-            .default_height(360.0)
+            .default_height((ctx.content_rect().height() - 80.0).max(1.0))
             .show(ctx, |ui| {
-                super::startup_dialog_scroll_body(ui, "update_notice_body", 360.0, |ui| {
+                let mut labels = vec!["リリースページを開く"];
+                if info.is_some_and(|info| info.is_newer) { labels.push("このバージョンの通知をオフ"); }
+                labels.push("閉じる");
+                let footer = super::startup_dialog_footer_height(ui, &labels, 18.0);
+                super::startup_dialog_scroll_body(ui, "update_notice_body", footer, |ui| {
                 ui.add_space(4.0);
                 // 直近 manual チェックがエラーなら最上部にバナーで表示。
                 // (既知の update_info は維持されるので、その下に通常表示が続く)

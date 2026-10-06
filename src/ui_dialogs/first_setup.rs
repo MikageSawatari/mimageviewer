@@ -61,7 +61,8 @@ pub fn draw_first_setup_dialog(
         ui.add_space(8.0);
         ui.label("使い始める前に、表示とAI処理の基本設定を選んでください。");
 
-        super::startup_dialog_scroll_body(ui, "first_setup_options", 700.0, |ui| {
+        let footer = super::startup_dialog_footer_height(ui, &["開始"], 26.0);
+        super::startup_dialog_scroll_body(ui, "first_setup_options", footer, |ui| {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);

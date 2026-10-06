@@ -18,7 +18,9 @@ pub fn render_network_data_dir_notice_content(
 ) -> NetworkDataDirNoticeResponse {
     let mut response = NetworkDataDirNoticeResponse::default();
 
-    super::startup_dialog_scroll_body(ui, "network_data_dir_body", 320.0, |ui| {
+    let footer =
+        super::startup_dialog_footer_height(ui, &["閉じる", "この保存先では今後表示しない"], 20.0);
+    super::startup_dialog_scroll_body(ui, "network_data_dir_body", footer, |ui| {
         ui.label("mImageViewer が使うデータの保存先がネットワーク上にあります。");
         ui.add_space(4.0);
         ui.label(
@@ -112,16 +114,18 @@ pub(super) fn draw_network_data_dir_notice_dialog(
     data_dir: &Path,
 ) -> NetworkDataDirNoticeResponse {
     let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+    let width = 560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0));
     let mut response = NetworkDataDirNoticeResponse::default();
     egui::Window::new("データの保存先について")
         .open(open)
         .collapsible(false)
         .resizable(true)
         .default_pos(dialog_pos)
-        .min_width(460.0)
-        .default_height(430.0)
+        .min_width(460.0_f32.min(width))
+        .default_width(width)
+        .default_height((ctx.content_rect().height() - 80.0).max(1.0))
         .show(ctx, |ui| {
-            ui.set_max_width(560.0);
+            ui.set_max_width(width);
             response = render_network_data_dir_notice_content(ui, data_dir);
         });
 

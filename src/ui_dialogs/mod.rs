@@ -75,39 +75,126 @@ fn non_overlapping_dialog_scroll_style(
     scroll
 }
 
-/// Startup dialogs must leave room for their fixed heading and action row even on a
-/// short viewport. The 128-point allowance includes window chrome, initial offset,
-/// frame margins and the bottom screen margin (also conservative for centered Modals).
-/// Allocate the parent explicitly: a ScrollArea in an auto-sized Area otherwise
-/// inherits the previous frame's content height and may collapse instead of scrolling.
+/// Measure the fixed action row using the same font/padding as ordinary buttons.
+/// `spacing` includes the caller's explicit gaps and separator height.
+fn startup_dialog_footer_height(ui: &eframe::egui::Ui, labels: &[&str], spacing: f32) -> f32 {
+    startup_dialog_button_rows_height(ui, labels)
+        + spacing
+        + 3.0 * ui.spacing().item_spacing.y
+        + 2.0
+}
+
+fn startup_dialog_button_rows_height(ui: &eframe::egui::Ui, labels: &[&str]) -> f32 {
+    use eframe::egui;
+    let mut height = 0.0_f32;
+    let mut row_height = 0.0_f32;
+    let mut row_width = 0.0_f32;
+    for &label in labels {
+        let size = egui::WidgetText::from(label)
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Wrap),
+                (ui.available_width() - 2.0 * ui.spacing().button_padding.x).max(1.0),
+                egui::TextStyle::Button,
+            )
+            .size()
+            + 2.0 * ui.spacing().button_padding;
+        if row_width > 0.0
+            && row_width + ui.spacing().item_spacing.x + size.x > ui.available_width()
+        {
+            height += row_height + ui.spacing().item_spacing.y;
+            row_width = 0.0;
+            row_height = 0.0;
+        }
+        if row_width > 0.0 {
+            row_width += ui.spacing().item_spacing.x;
+        }
+        row_width += size.x;
+        row_height = row_height.max(size.y.max(ui.spacing().interact_size.y));
+    }
+    height + row_height
+}
+
+/// A caption uses Body text without button padding. Reserve its wrapped height
+/// separately unless the entire caption and action row fit on one line.
+fn startup_dialog_captioned_footer_height(
+    ui: &eframe::egui::Ui,
+    caption: &str,
+    labels: &[&str],
+    spacing: f32,
+) -> f32 {
+    use eframe::egui;
+    let caption_size = egui::WidgetText::from(caption)
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            ui.available_width().max(1.0),
+            egui::TextStyle::Body,
+        )
+        .size();
+    let buttons_width: f32 = labels
+        .iter()
+        .map(|label| {
+            egui::WidgetText::from(*label)
+                .into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::TextStyle::Button,
+                )
+                .size()
+                .x
+                + 2.0 * ui.spacing().button_padding.x
+                + ui.spacing().item_spacing.x
+        })
+        .sum();
+    let buttons_height = startup_dialog_button_rows_height(ui, labels);
+    let rows_height = if caption_size.x + buttons_width <= ui.available_width() {
+        caption_size.y.max(buttons_height)
+    } else {
+        caption_size.y + ui.spacing().item_spacing.y + buttons_height
+    };
+    rows_height + spacing + 3.0 * ui.spacing().item_spacing.y + 2.0
+}
+
+/// Give overflowing content the available screen, and let short content shrink.
+/// The explicit child max_rect prevents auto-sized Areas inheriting a tiny body.
 fn startup_dialog_scroll_body<R>(
     ui: &mut eframe::egui::Ui,
     id: &str,
-    preferred_height: f32,
+    footer_height: f32,
     body: impl FnOnce(&mut eframe::egui::Ui) -> R,
-) -> R {
-    startup_dialog_scroll_body_with_axes(ui, id, preferred_height, [false, true], body)
+) -> eframe::egui::scroll_area::ScrollAreaOutput<R> {
+    startup_dialog_scroll_body_with_axes(ui, id, footer_height, [false, true], body)
 }
 
 fn startup_dialog_scroll_body_with_axes<R>(
     ui: &mut eframe::egui::Ui,
     id: &str,
-    preferred_height: f32,
+    footer_height: f32,
     axes: [bool; 2],
     body: impl FnOnce(&mut eframe::egui::Ui) -> R,
-) -> R {
+) -> eframe::egui::scroll_area::ScrollAreaOutput<R> {
     use eframe::egui;
+    let viewport = ui.ctx().content_rect();
+    let frame_margin = ui
+        .stack()
+        .iter()
+        .find(|stack| stack.kind() == Some(egui::UiKind::Frame))
+        .map_or(egui::epaint::MarginF32::ZERO, |stack| {
+            stack.frame().total_margin()
+        });
     let header_height = ui.cursor().top() - ui.min_rect().top();
-    // Allow two wrapped action rows plus separators and spacing below the body.
-    let footer_height = 2.0 * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y) + 24.0;
-    let mut height = preferred_height
-        .min(ui.ctx().content_rect().height() - 128.0 - header_height - footer_height)
-        .max(1.0);
+    let mut height =
+        viewport.height() - 32.0 - frame_margin.sum().y - header_height - footer_height;
     if ui.stack().contained_in(egui::UiKind::Window) {
-        // A Window's Resize owner is authoritative; preserve user height changes.
-        // Only auto-sized Modal/Area needs the explicit viewport budget alone.
-        height = height.min((ui.available_height() - footer_height).max(1.0));
+        // A positioned/resized Window has an authoritative content rectangle.
+        // Absolute cursor coordinates are inappropriate for centered Modals.
+        height = height
+            .min(viewport.bottom() - 16.0 - frame_margin.bottom - ui.cursor().top() - footer_height)
+            .min(ui.available_height() - footer_height);
     }
+    let height = height.max(1.0);
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), height),
         egui::Layout::top_down(egui::Align::Min),
@@ -116,11 +203,9 @@ fn startup_dialog_scroll_body_with_axes<R>(
             let scroll = egui::ScrollArea::new(axes)
                 .id_salt(id)
                 .max_height(height)
-                .min_scrolled_height(height.min(64.0))
-                .auto_shrink([false, false])
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, true])
                 .show(ui, body);
-            // ScrollArea consumes smooth deltas, but raw deltas/events must also
-            // stay here instead of reaching a background list handler.
             if ui.rect_contains_pointer(scroll.inner_rect) {
                 ui.ctx().input_mut(|input| {
                     input.raw_scroll_delta = egui::Vec2::ZERO;
@@ -130,7 +215,7 @@ fn startup_dialog_scroll_body_with_axes<R>(
                         .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
                 });
             }
-            scroll.inner
+            scroll
         },
     )
     .inner
@@ -156,12 +241,14 @@ fn draw_startup_worker_notice(
             content.min.y + 56.0,
         ))
         .default_width(width)
-        .default_height(380.0)
+        .default_height((ctx.content_rect().height() - 80.0).max(1.0))
         .resizable(resizable)
         .collapsible(false)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            startup_dialog_scroll_body(ui, id, 280.0, |ui| {
+            let labels = retry_label.map_or_else(|| vec!["閉じる"], |retry| vec![retry, "閉じる"]);
+            let footer = startup_dialog_footer_height(ui, &labels, 6.0);
+            startup_dialog_scroll_body(ui, id, footer, |ui| {
                 ui.label(body);
             });
             ui.separator();
@@ -195,19 +282,19 @@ pub fn draw_startup_dialog_snapshot_fixture(ui: &mut eframe::egui::Ui, kind: &st
             entries.reverse();
             whats_new::draw_whats_new_dialog(ctx, &mut open, &entries);
         }
-        "update_notice" => {
+        "update_notice" | "update_current" | "update_error" => {
             let info = crate::update_check::UpdateInfo {
                 latest_tag: "v99.0.0".to_owned(),
                 latest_version: semver::Version::new(99, 0, 0),
                 release_url: String::new(),
                 body: "## 更新内容\n- 表示の改善\n".repeat(40),
-                is_newer: true,
+                is_newer: kind != "update_current",
             };
             update_notice::draw_update_notice_dialog(
                 ctx,
                 &mut open,
-                Some(&info),
-                Some(&"接続エラーの詳細。".repeat(100)),
+                (kind != "update_error").then_some(&info),
+                (kind != "update_current").then_some(&"接続エラーの詳細。".repeat(100)),
             );
         }
         "network_data_dir" => {
@@ -215,8 +302,26 @@ pub fn draw_startup_dialog_snapshot_fixture(ui: &mut eframe::egui::Ui, kind: &st
                 std::path::PathBuf::from(format!(r"\\server\share\{}", "長い保存先\\".repeat(40)));
             network_data_dir_notice::draw_network_data_dir_notice_dialog(ctx, &mut open, &path);
         }
-        "restore_result" => settings_restore::draw_restore_result_snapshot_fixture(ctx),
+        "restore_result" | "restore_success" | "restore_recoverable" | "restore_remote" => {
+            settings_restore::draw_restore_result_snapshot_fixture(ctx, kind)
+        }
         "restore_list" => settings_restore::draw_restore_list_snapshot_fixture(ctx),
+        "restore_confirm" | "restore_reset" => {
+            settings_restore::draw_restore_confirm_snapshot_fixture(ctx, kind == "restore_reset")
+        }
+        "mouse_migration" => {
+            draw_mouse_nav_migration_dialog(ctx, &mut open);
+        }
+        "rename_recovery" | "rename_quarantining" => {
+            rename_migration_recovery::draw_rename_recovery_dialog(
+                ctx,
+                kind == "rename_quarantining",
+            );
+        }
+        "archive_confirm" | "archive_empty" | "archive_sibling" | "archive_scanning"
+        | "archive_converting" | "archive_error" => {
+            archive_convert::draw_archive_startup_snapshot_fixture(ctx, kind)
+        }
         "pdf_notice" | "susie_notice" | "trt_notice" => {
             let (title, width, retry) = match kind {
                 "pdf_notice" => ("PDF の準備を開始できませんでした", 420.0, None),
@@ -242,6 +347,150 @@ mod tests {
     use super::non_overlapping_dialog_scroll_style;
 
     #[test]
+    fn startup_dialog_body_grows_for_overflow_and_shrinks_to_content() {
+        use eframe::egui;
+        use egui_kittest::Harness;
+        for size in [egui::vec2(1093.0, 614.0), egui::vec2(1920.0, 1440.0)] {
+            for scale in [1.0, 2.0] {
+                for long in [false, true] {
+                    let mut harness = Harness::builder().with_size(size).build_state(
+                        move |ctx, rects: &mut Option<(f32, f32, egui::Rect)>| {
+                            crate::settings::apply_ui_scale_factor(ctx, scale);
+                            egui::Modal::new(egui::Id::new("body_sizing")).show(ctx, |ui| {
+                                ui.set_width(480.0_f32.min(ctx.content_rect().width() - 48.0));
+                                ui.heading("Heading");
+                                ui.add_space(8.0);
+                                ui.label("Choose the initial settings.");
+                                let footer =
+                                    super::startup_dialog_footer_height(ui, &["Start"], 26.0);
+                                let body = super::startup_dialog_scroll_body(
+                                    ui,
+                                    "sizing_body",
+                                    footer,
+                                    |ui| {
+                                        ui.label(if long {
+                                            "Long message\n".repeat(120)
+                                        } else {
+                                            "Short message".to_owned()
+                                        });
+                                    },
+                                );
+                                // ScrollAreaOutput.inner_rect precedes auto_shrink.
+                                // Measure the actual allocation before drawing the footer.
+                                let body_height = ui.cursor().top()
+                                    - body.inner_rect.top()
+                                    - ui.spacing().item_spacing.y;
+                                ui.add_space(14.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                let button = ui.button("Start");
+                                *rects = Some((body_height, body.content_size.y, button.rect));
+                            });
+                        },
+                        None,
+                    );
+                    harness.run_steps(12);
+                    let (body_height, content_height, button) = harness.state().unwrap();
+                    let viewport = harness.ctx.content_rect();
+                    assert!(viewport.contains_rect(button));
+                    if long {
+                        assert!(content_height > body_height);
+                        // A one-line viewport passed button-only geometry tests.
+                        assert!(
+                            body_height >= viewport.height() * 0.45,
+                            "{size:?} scale {scale}: body {body_height}, viewport {viewport:?}"
+                        );
+                    } else {
+                        assert!(
+                            (body_height - content_height).abs() < 1.0,
+                            "{size:?} scale {scale}: short body {body_height}, content {content_height}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_dialog_short_window_keeps_natural_height() {
+        use eframe::egui;
+        use egui_kittest::Harness;
+        for size in [egui::vec2(1093.0, 614.0), egui::vec2(1920.0, 1440.0)] {
+            for scale in [1.0, 2.0] {
+                let mut harness = Harness::builder().with_size(size).build_state(
+                    move |ctx, height: &mut Option<f32>| {
+                        crate::settings::apply_ui_scale_factor(ctx, scale);
+                        let response = egui::Window::new("Short startup notice")
+                            .default_width(460.0)
+                            .default_height(ctx.content_rect().height() - 80.0)
+                            .default_pos(egui::pos2(60.0, 40.0))
+                            .show(ctx, |ui| {
+                                let footer =
+                                    super::startup_dialog_footer_height(ui, &["Close"], 0.0);
+                                super::startup_dialog_scroll_body(
+                                    ui,
+                                    "short_window_body",
+                                    footer,
+                                    |ui| {
+                                        ui.label("Short message");
+                                    },
+                                );
+                                ui.button("Close");
+                            })
+                            .unwrap();
+                        *height = Some(response.response.rect.height());
+                    },
+                    None,
+                );
+                harness.run_steps(12);
+                assert!(
+                    harness.state().unwrap() < 110.0,
+                    "{size:?} scale {scale}: {:?}",
+                    harness.state()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_dialog_wrapped_button_remains_inside_narrow_window() {
+        use eframe::egui;
+        use egui_kittest::Harness;
+        for scale in [1.0, 2.0] {
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_state(
+                    move |ctx, rects: &mut Option<(egui::Rect, egui::Rect)>| {
+                        crate::settings::apply_ui_scale_factor(ctx, scale);
+                        egui::Window::new("Narrow startup notice")
+                            .fixed_size(egui::vec2(200.0, ctx.content_rect().height() - 80.0))
+                            .default_pos(egui::pos2(60.0, 40.0))
+                            .show(ctx, |ui| {
+                                let label = "Confirm these initial settings and continue opening the selected archive";
+                                let footer = super::startup_dialog_footer_height(ui, &[label], 0.0);
+                                super::startup_dialog_scroll_body(ui, "wrapped_action_body", footer, |ui| {
+                                    ui.label("Long message\n".repeat(80));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    let button = ui.button(label);
+                                    assert!(button.rect.height() > ui.spacing().interact_size.y);
+                                    *rects = Some((button.rect, button.interact_rect));
+                                });
+                            });
+                    },
+                    None,
+                );
+            harness.run_steps(12);
+            let (rect, interact_rect) = harness.state().unwrap();
+            assert!(harness.ctx.content_rect().contains_rect(rect));
+            assert!(
+                interact_rect.contains_rect(rect),
+                "scale {scale}: {rect:?} / {interact_rect:?}"
+            );
+        }
+    }
+
+    #[test]
     fn startup_dialog_body_respects_window_height() {
         use eframe::egui;
         use egui_kittest::Harness;
@@ -256,9 +505,16 @@ mod tests {
                             .default_pos(egui::pos2(60.0, 40.0))
                             .show(ctx, |ui| {
                                 ui.heading("Heading");
-                                super::startup_dialog_scroll_body(ui, "resize_body", 360.0, |ui| {
-                                    ui.label("Long message\n".repeat(80));
-                                });
+                                let footer =
+                                    super::startup_dialog_footer_height(ui, &["Close"], 0.0);
+                                super::startup_dialog_scroll_body(
+                                    ui,
+                                    "resize_body",
+                                    footer,
+                                    |ui| {
+                                        ui.label("Long message\n".repeat(80));
+                                    },
+                                );
                                 let footer = ui.button("Close");
                                 *rects = Some((footer.rect, footer.interact_rect));
                             });
@@ -290,7 +546,7 @@ mod tests {
                     });
                     egui::CentralPanel::default().show(ctx, |ui| {
                         ui.heading("Heading");
-                        super::startup_dialog_scroll_body(ui, "wheel_body", 280.0, |ui| {
+                        super::startup_dialog_scroll_body(ui, "wheel_body", 32.0, |ui| {
                             state.0 = ui.cursor().top();
                             ui.label("Long message\n".repeat(80));
                         });
@@ -338,4 +594,44 @@ mod tests {
         let scroll = eframe::egui::style::ScrollStyle::solid();
         assert_eq!(non_overlapping_dialog_scroll_style(scroll), scroll);
     }
+}
+
+pub(crate) fn draw_mouse_nav_migration_dialog(
+    ctx: &eframe::egui::Context,
+    open: &mut bool,
+) -> Option<crate::ring_shortcut::MouseBackForwardActionId> {
+    use eframe::egui;
+    let mut choice = None;
+    egui::Window::new("マウス戻る/進むボタン")
+            .collapsible(false)
+            .resizable(false)
+            .open(open)
+            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+            .default_height((ctx.content_rect().height() - 80.0).max(1.0))
+            .show(ctx, |ui| {
+                ui.set_width(420.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
+                let footer = startup_dialog_footer_height(ui, &["標準にする", "従来どおり"], 12.0);
+                startup_dialog_scroll_body(ui, "mouse_nav_migration_body", footer, |ui| {
+                ui.label("マウスの戻る/進むボタンの標準動作を選んでください。");
+                ui.add_space(6.0);
+                ui.label("標準では、ブラウザやエクスプローラーに近いフォルダ履歴の戻る/進むとして使います。");
+                ui.label("従来どおり、ツリー順の前/次フォルダ移動として使うこともできます。");
+                ui.add_space(6.0);
+                ui.small("後で 環境設定 > マウスボタン から変更できます。");
+                });
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("標準にする").clicked() {
+                        choice = Some(
+                            crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext,
+                        );
+                    }
+                    if ui.button("従来どおり").clicked() {
+                        choice =
+                            Some(crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext);
+                    }
+                });
+            });
+
+    choice
 }

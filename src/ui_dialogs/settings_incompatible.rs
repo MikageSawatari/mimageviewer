@@ -89,7 +89,9 @@ fn draw_settings_boot_problem_dialog(
         ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
         ui.heading(copy.heading);
         ui.add_space(8.0);
-        super::startup_dialog_scroll_body(ui, "settings_boot_problem_body", 220.0, |ui| {
+        let footer =
+            super::startup_dialog_footer_height(ui, &["設定の復元を開く", "アプリを終了"], 24.0);
+        super::startup_dialog_scroll_body(ui, "settings_boot_problem_body", footer, |ui| {
             ui.label(copy.lead);
             ui.label("設定ファイルとバックアップは変更せず、この起動中の設定保存を停止しました。");
             ui.add_space(8.0);
