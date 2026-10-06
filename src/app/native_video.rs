@@ -3482,7 +3482,7 @@ impl App {
                         ));
                         return;
                     }
-                    self.close_fullscreen();
+                    self.close_fullscreen_to_page_list();
                     return;
                 }
                 crate::video::NativeVideoOutputEvent::Window(event) => {
@@ -3509,7 +3509,7 @@ impl App {
                         ));
                         return;
                     }
-                    self.close_fullscreen();
+                    self.close_fullscreen_to_page_list();
                     return;
                 }
                 crate::video::NativeVideoOutputEvent::PlacementReady {

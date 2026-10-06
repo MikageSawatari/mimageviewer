@@ -1847,6 +1847,10 @@ pub(crate) enum NativeUiCommandForTest {
 
 #[cfg(all(windows, test))]
 impl NativeUiProbeForTest {
+    pub(crate) fn send_event(&self, event: NativeVideoOutputEvent) {
+        self.event_tx.send(0, event);
+    }
+
     pub(crate) fn send_overlay_command(&self, command: native_presenter::NativeOverlayCommand) {
         send_native_overlay_command(&self.event_tx, 0, 0, command);
     }

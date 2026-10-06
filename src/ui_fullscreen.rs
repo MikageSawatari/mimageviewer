@@ -47377,7 +47377,7 @@ impl App {
         let escape_for_tile = false;
 
         if close_video {
-            self.close_fullscreen();
+            self.close_fullscreen_to_page_list();
             return;
         }
         if shift_enter {

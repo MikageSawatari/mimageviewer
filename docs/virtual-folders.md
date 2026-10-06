@@ -297,7 +297,9 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
   F12 linked の表示先切替と independent viewer は main の復元先を変更しない。
   ZIP は現在の実効 prefix と cursor を対で保存する。変換書庫は元 source を保存し、cache ZIP の
   hydration は `InternalHydration(Box<StartupListIntent>)` として、同じ request が元の意図を
-  所有する。materialization は内側の RestoreList を投影し、同期列挙でも保存 prefix の行を
+  所有する。Collection の Ctrl+↑↓ も Folder／ZIP／prepared PDF の hydration 自体では通知せず、
+  physical-child の採用後に元の意図を一度通知する。sidecar 待ちは同じ既存 continuation が受け取る。
+  materialization は内側の RestoreList を投影し、同期列挙でも保存 prefix の行を
   最初から作る。hydration 自体は記録せず、override と surface 採用後に既存列挙 request へ
   元の意図を渡すか、同期採用の tail で一度記録する。`InternalInstall` だけで prefix を落とす
   経路や、root の行を作ってから階層を作り直す経路は使わない。EPUB、password、sidecar 等の

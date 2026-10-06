@@ -5,9 +5,12 @@
 Phase 2 は red 再現から着手し、遅延 close 完了経路へ達する案について一度停止した。
 その後、利用者・設計担当・独立 reviewer が、適格な既存一覧への表示要求を受理した時点で
 記録する簡素化案に合意し、実装を再開した（§10）。terminal event/effect は変更しない。
-Phase 2 の実装・自動検証・確認 binary のビルドは完了（未コミット）。独立実装レビューは
-未解消 blocker なし。製品は起動しておらず、利用者の実機確認と設計担当の検収は未実施。
-最終結果は §10.4 に集約する。
+初回実装は `83d2ac3c1`。独立実装レビュー `target/r1335i-review.txt` の P2 3件
+（Collection の採用通知、動画リングの一覧復帰受理、全体 gate の完了証拠）への対応は完了。
+初回の結果は §10.4、今回の修正・再監査と最終 gate は §10.5 に記録する。
+追加監査で見つかった close 呼出し3箇所も設計担当・独立 reviewer の合意後に適用し、
+今回の追補検証は §10.6 に記録する。
+製品は起動しておらず、利用者の実機確認と設計担当の検収は未実施。
 
 ## 1. 対象と観測の区別
 
@@ -464,9 +467,13 @@ Backspace と、上表の実 request→adoption→page の handler tests で検�
 同じにする巻き戻し実装が通らないようにする。
 
 2026-10-06 現在、`src/app/tests/startup_restore.rs` には上記の handler／状態／exit-restart
-回帰を 52 test case として実装した。元の direct-ZIP red は `src/app/tests.rs` に保持し、
+回帰を初回 52 test case として実装し、P2 対応で Collection sidecar ON/OFF の実 OuterGrid 経路と
+動画リングの実 handler → exit/restart の2件を追加した。追加 caller 合意後は native／egui の3入力、
+parked 除外、通常親戻りの5件を追加して、同ファイルは59 test case となった。
+元の direct-ZIP red は `src/app/tests.rs` に保持し、
 settings／DB／transfer、ZIP tree、変換／EPUB、headless multiwindow にも対応する回帰を置く。
-実行結果は §10.4 に集約する。独立 completion review は、Folder carrier／Rating の実行分岐による
+初回結果は §10.4、P2 対応の結果は §10.5、追加 caller は §10.6 に集約する。
+初回の bounded completion review は、Folder carrier／Rating の実行分岐による
 分類／password owner のサイズ修正まで確認し、未解消 blocker なし（`target/1335-implementation-review.txt`）。
 自動 gate の実行所有は implementer で、reviewer は実アプリを起動していない。
 
@@ -496,7 +503,8 @@ Phase 2 は repository の bounded Sol handoff 方針に従い、root implemente
   本 plan、必要時 detached §11、manual の startup 説明: 実装時に意味と所有境界を追記。
 
 Phase 2 の検証担当は root implementer。narrow filtered lib tests → owner 横断回帰 →
-利用者指定の full lib、normal／portable／portable+test-script check、fmt、必要な glyph check を
+利用者指定の full lib と `scripts/test-full.ps1`（workspace／統合／doc／補助 bin／vendor）、
+normal／portable／portable+test-script check、fmt、必要な glyph check を
 集約し、重い Cargo command を並行実行しない。成功後 `scripts/build-dev.ps1` で未起動の
 確認 binary を用意する。現在の依頼は check／build までで、実アプリを起動・操作しない。
 将来の実アプリ suite はシナリオ・時間・desktop/input・disposable data を提示した明示了承後のみ。
@@ -676,3 +684,159 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 更新後の最初の起動だけは、決定 B に従い旧設定の復元先を引き継ぐ。上記は親一覧を新たに
 明示するところから確認する。起動引数なしで再起動し、トレイ退避を実終了と取り違えない。
+
+### 10.5 独立実装レビュー P2 対応（2026-10-06）
+
+基準は `83d2ac3c1`、指摘は `target/r1335i-review.txt`。初回の full lib 成功は有効な
+証拠として保持するが、workspace／統合／doc／補助 bin／vendor を含む `test-full.ps1` の
+完了を代替しない。今回の差分は未コミット、製品・確認 binary は起動しない。
+
+- Collection `OuterGrid` の同期 ZIP load はまだ `Root` の間に採用を通知していた。
+  sidecar OFF ではその通知が適格性 projection に拒否され、後の `PhysicalSource` 採用後に
+  通知がなかった。Folder／ZIP／prepared PDF の内部 loader には既存の
+  `InternalHydration(original)` を渡し、物理子採用後の一箇所で元の intent を通知する。
+  sidecar ON は既存 Live continuation にその intent を渡し、後段の完了が確定する。
+  conversion／PDF failure の非同期 owner は元の intent を保持し、別の完了状態は追加しない。
+- 動画リング `CloseFullscreen` は明示的な現在一覧への復帰なので、既存
+  `close_fullscreen_to_page_list` に接続する。gamepad B と Image ring の通常 close は
+  親 navigation へ進む分岐を保ち、途中の本一覧を記録しない。
+- 再監査は `target/1335-close-caller-audit-2.txt`。基準差分の製品 raw close 49箇所を
+  semantic／navigation／内部処理／failure／independent に分類した。動画キー入力の
+  `VideoCloseFullscreen` と source-swap 待ちの native close 入力2箇所にも迂回があった。
+  具体的な helper 接続案は `target/1335-extra-close-callers-proposal.patch`、独立構造レビューは
+  `target/1335-p2-extra-caller-review.txt`。native 2箇所は既存 §11 の FsBackToList 限定合意を
+  越えるので、設計担当との追加合意前には変更しなかった。その後の合意・適用は §10.6。
+  terminal effect consumer、世代 gate、
+  parked 除外、presentation／viewport の処理は変更対象にしない。
+
+追加回帰は実際の Collection Ctrl+↓ → `OuterGrid` → ZIP の sidecar ON/OFF 対比と、
+動画 direct → 実 ring handler の close → exit/restart。Collection は通常フレームと同じ
+ナビゲーションロック解除を通してから cursor を変更し、原設定を一時 profile に保存して
+再起動まで検査する。Grid ring の無操作、親戻りの既存回帰も保持する。
+
+#### P2 対応の検証
+
+元の実装に対し、Collection の OFF ケースは親一覧対 ZIP の target mismatch で red
+（0 passed / 1 failed、Cargo exit 101、`target/1335-2-collection-red-target.log`）。
+動画リングも以前の親一覧対現在の動画フォルダで red
+（0 passed / 1 failed、Cargo exit 101、`target/1335-2-ring-red.log`）。
+Collection の最初の ON 試行は対象指摘へ届く前に cursor で失敗したため、通常フレームの
+lock 解除と startup sidecar 完了待ちを fixture に補い、保存直後のメモリ／DB cursor も検査した。
+その fixture 不備のログを製品側の red と混同しない。
+
+| 確認（`83d2ac3c1` + P2 対応の未コミット差分） | 結果・ログ |
+| --- | --- |
+| §1.335 filtered lib | 61 passed / 0 failed。`target/1335-2-narrow.log` |
+| Collection navigation / gamepad input tests | 37 / 38 passed。`target/1335-2-{collection,gamepad}.log` |
+| settings / settings DB / transfer tests | 277 passed + 12 ignored / 129 passed / 16 passed。`target/1335-2-{settings,settings-db,transfer}.log` |
+| normal / portable / portable+test-script core check | いずれも exit 0。`target/1335-2-{normal,portable,portable-test-script}.log` |
+| fmt / diff check / glyph lint | exit 0、危険な UI glyph 0。`target/1335-2-{fmt,diff,glyph}.log` |
+| 全体 gate 用 release core / remote / EPUB worker | 3本とも exit 0。core は同一 TurboJPEG ソースの worktree 内コピーと `--jobs 1` を使用。`target/1335-2-release-core-isolated-serial.log`、`target/1335-2-release-{remote,epub}.log` |
+| `test-full.ps1 -SuppressCrashDialogs` | exit 0、1177.38秒。workspace 11794 passed / 0 failed / 58 ignored（full lib 10712 passed / 52 ignored を含む）、vendor egui / egui-wgpu / eframe は 25 / 9 / 18 passed。`target/1335-2-full-final.log` |
+| `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、91.45秒。normal feature set の core／remote／EPUB worker を配置、runtime=4 / pe=3 の検査成功。製品は起動していない。`target/1335-2-build-dev.log` |
+
+今回の Cargo exit は stderr を PowerShell 内でリダイレクトせず、外側の subprocess が直接捕捉する。
+実行 command／feature／profile／所要時間／終了値は `target/1335-2-gates.json` に集約する。
+全体 gate の前提である release core／remote／EPUB worker は欠落していたので、CLAUDE.md の
+3 command で先に build した。最初の core は TurboJPEG の CMake/MSBuild 24ジョブ build で
+exit 101 となり、worktree 内の同一ソースコピーも24ジョブでは同じ失敗だった。
+コピー先を単一ジョブで native build すると成功し、同じ Cargo path override と `--jobs 1` で
+release core が成功した。コピーの関連ソース325ファイルと Cargo.lock の一致を
+`target/1335-2-dependency-copy-check.json` に記録した。設定ファイルや lock を書き換えず、
+通常データを借りず、製品を起動していない。これは build 環境への対応で、製品の保存失敗に
+retry／journal／recovery を追加するものではない。
+
+全体 gate の初回はテスト実行前の workspace compile で Windows os error 1455
+（ページング容量不足による rlib mmap 失敗、後続の compiler 診断）になり、exit 101。
+`target/1335-2-full.log` を保持する。テスト失敗や未実行 vendor の成功として扱わない。
+同じ `test-full.ps1 -SuppressCrashDialogs` を子プロセス限定の `CARGO_BUILD_JOBS=2` で
+再実行し、コンパイルを通過した。対象／feature／test profile／テスト thread 設定を省略・変更せず、
+ビルド並列度だけを抑えた。条件は `target/1335-2-full-conditions.json`。
+
+この再実行の full lib は 10712 passed / 52 ignored（826.13秒）、workspace の他ターゲットも
+Susie 以外は成功した。Susie 統合だけは3件が前提条件で失敗した。worktree の
+`testdata/susie-plugins/extracted` には README しかなく、retro-images の実サンプルもなかった。
+テストが文書化している `MIV_TESTDATA` に既存の `C:\home\mimageviewer\testdata` を指定し、
+実プラグイン9個をロードした Susie 統合8件が成功（`target/1335-2-susie-fixtures.log`）。
+通常のアプリ profile は使わず、サンプル／プラグインを読み取るだけで、期待値や skip 条件は変更していない。
+同じ全体 script をこの条件で再実行し、workspace／統合／doc／補助 bin／vendor を含む
+全体 gate が exit 0 で完了した。実行条件は `target/1335-2-full-conditions.json`、
+Cargo suite ごとの集計は `target/1335-2-full-suites.json`。子テスト harness の結果を二重計上せず、
+workspace と vendor の合計は 11846 passed / 0 failed / 58 ignored。
+最終 gate 後、normal profile の確認 binary を build した。常駐製品を停止せず、
+既に完了した native build の待機を省略しただけで、portable／test-script feature は付けていない。
+
+指摘2件の差分に対する独立レビューは `target/1335-p2-implementation-review.txt`、未解決の指摘なし。
+この時点では追加 close 呼出し3箇所の案は独立構造レビュー済みだが、設計担当の追加合意は未取得。
+当時の detached §11 は FsBackToList caller に限定されるため、この区切りでは native の変更や
+§11 の承認記録を追加しなかった。後続の設計担当合意と適用は §10.6 に記録する。
+利用者の実機確認と設計担当の検収は未実施。
+
+#### 今回の手動確認
+
+§10.4 の起動 command と通常 profile の注意事項に従い、起動場所を「前回終了した場所」にする。
+更新後初回の旧値移行を経た後、物理親一覧を明示してから確認する。終了はトレイ退避と区別し、
+再起動時にファイル引数を付けない。
+
+1. Collection に登録したフォルダから Ctrl+↓ で ZIP のページ一覧を開き、ページを選択して
+   実終了・再起動する。同じ ZIP 一覧と選択ページへ戻る。sidecar 読込 OFF／ON の両方で確認する。
+2. 別フォルダの動画を直接表示し、動画リングの閉じる操作で一覧へ戻して実終了・再起動する。
+   その動画フォルダの一覧へ戻る。gamepad B の親へ戻る動作も従来どおりか確認する。
+
+### 10.6 追加動画 close caller の合意・適用（2026-10-06）
+
+設計担当（ClaudeCode）は `target/1335-extra-close-callers-proposal.patch` に合意した。
+独立 reviewer の構造同意は `target/1335-p2-extra-caller-review.txt` に保持する。
+native source-swap 待ちの `Window(CloseRequested { generation })` と
+`CloseFullscreen { generation }`、egui `handle_video_input` の受理済み `close_video` は、
+動画リングと同じ「動画をその一覧へ戻す」semantic action である。
+この3 caller の raw close だけを `close_fullscreen_to_page_list` へ置き換えた。
+
+native の既存 committed generation gate と parked 除外、egui keymap consume、
+terminal event/effect consumer、presentation transition、viewport／predicate は変更しない。
+当初の FsBackToList 限定記録を detached §11 で今回の native／egui caller 名へ更新し、
+受理要求の所有境界へ接続する構造的修正である理由と双方合意を明記した。
+新たな保存失敗 retry／journal／recovery は追加しない。決定 A/B と released `last_folder` の
+初回移行、他の起動設定および legacy consumer は今回も変更しない。
+
+headless 回帰は `section1335_extra_video` の5件。直前の明示一覧 A から別動画フォルダ B を
+PageContinuation として採用して直接表示し、実 native source-swap poll の2イベントまたは
+実 egui keymap入力で close し、保存・再起動後の B 一覧と動画名 cursor を検査する。
+native の2種類は pending output の committed generation を5、fs_cache 側を0とし、
+generation 4の拒否後に5の受理を対比する。parked の両イベントでは owner 不一致と一致後の
+既存除外を確認し、main record と実表示は変えず pending の退役だけを維持する。
+通常 close の親 navigation も保存・再起動まで追加確認する。
+
+イベント注入は既存 `NativeUiProbeForTest` の test-only `send_event` 一箇所を使い、
+production と同じ event bus を通す。実 decoder や native window は作らず、拒否後の poll は
+既存 navigation debounce の fixture を保持する。製品の時間窓・状態・入力条件は追加しない。
+修正前の red は2 passed / 3 failed、3件とも A 対 B の target mismatch
+（`target/1335-2-extra-close-red.log`）。parked と通常親戻りは修正前から成功している。
+
+追補の独立実装レビューは `target/1335-p2-extra-implementation-review.txt`、修正要求なし。
+最新 source freeze は `target/1335-2-extra-source-snapshot.json`。full lib・確認 build の最終結果は
+親担当の gate とし、source review を実機検収と取り違えない。
+
+| 確認（§10.5 + 合意済み3 caller と headless 回帰） | 結果・ログ |
+| --- | --- |
+| `cargo test -p mimageviewer --lib section1335 -- --test-threads=1` | 66 passed / 0 failed。`target/1335-2-extra-narrow.log` |
+| normal / portable / portable+test-script core check | いずれも exit 0。`target/1335-2-extra-{normal,portable,portable-test-script}.log` |
+| fmt / diff check / glyph lint | exit 0、危険な UI glyph 0。`target/1335-2-extra-{fmt,diff,glyph}.log` |
+| `cargo test -p mimageviewer --lib -- --test-threads=1` | exit 0、10717 passed / 0 failed / 52 ignored。テスト1683.97秒、command 全体1686.49秒。`target/1335-2-extra-full-lib.log` |
+| `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、122.43秒。normal feature set の core／remote／EPUB worker を更新し、runtime=4 / pe=3 の検査成功。`target/1335-2-extra-build-dev.log`。製品・確認 binary は未起動 |
+| 最終文書を含む diff check／source 一致 | exit 0。`target/1335-2-extra-final-diff.log`、`target/1335-2-extra-source-validation.json`。Rust source、HEAD、Cargo.lock は検証対象と一致 |
+
+今回の gate は利用者指定の full lib を再実行して完了した。先行する `test-full.ps1` は1177.38秒かかり、
+安価な確認ではないため、今回の3 caller 差分で workspace／vendor を再実行したとは扱わない。
+§10.5 の全体 gate は同節の差分の証拠として保持し、今回の full lib の結果を別に記録する。
+ビルド並列度は子プロセス限定 `CARGO_BUILD_JOBS=2`、full lib の fixture は文書化済みの
+`MIV_TESTDATA=C:/home/mimageviewer/testdata`、test thread は1で、normal feature set を使う。
+最新の全体実行・終了値・所要時間は同じ `target/1335-2-gates.json` へ追記する。
+指定された追補 gate と normal 確認 build は完了。コミットせず、製品・確認 binary は起動していない。
+利用者の実機確認と設計担当の検収は未実施。
+
+利用者の追補確認では、起動場所を「前回終了した場所」にして以前の物理親一覧を明示した後、
+別フォルダの動画を直接表示する。動画窓の ×、動画を閉じて一覧へ戻る操作、同操作へ割り当てた
+キーのそれぞれで一覧へ戻し、実終了・引数なし再起動でその動画フォルダと選択動画へ戻ることを
+確認する。動画の前後切替直後にも同じ操作を確認し、通常の親戻りは親一覧へ戻ることを確認する。
+確認 binary と通常 profile の注意事項・起動 command は §10.4 に示す。実機確認は未実施。

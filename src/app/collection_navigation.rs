@@ -3604,7 +3604,9 @@ impl App {
                             path,
                             Some(scan),
                             owner,
-                            restore_intent.clone(),
+                            super::StartupListIntent::InternalHydration(Box::new(
+                                restore_intent.clone(),
+                            )),
                         ) {
                             FolderOpenOutcome::Loaded
                         } else {
@@ -3618,7 +3620,9 @@ impl App {
                     self.load_zip_as_folder_prepared(
                         ready.target.source_path.clone(),
                         enumeration,
-                        restore_intent.clone(),
+                        super::StartupListIntent::InternalHydration(Box::new(
+                            restore_intent.clone(),
+                        )),
                     );
                     FolderOpenOutcome::Loaded
                 }
@@ -3629,7 +3633,14 @@ impl App {
                         .map(super::OpenRequestOwner::CollectionGridPhysical);
                     if let Some(owner) = owner {
                         // The completed typed handle keeps direction and pages together.
-                        self.load_pdf_as_folder_prepared(path, pages, owner, restore_intent.clone())
+                        self.load_pdf_as_folder_prepared(
+                            path,
+                            pages,
+                            owner,
+                            super::StartupListIntent::InternalHydration(Box::new(
+                                restore_intent.clone(),
+                            )),
+                        )
                     } else {
                         FolderOpenOutcome::Ignored
                     }
@@ -3668,6 +3679,8 @@ impl App {
             };
             if matches!(outcome, FolderOpenOutcome::Loaded) {
                 self.commit_collection_grid_source_open(anchor, ready.target.source_path);
+                // The physical child, rather than its internally hydrated rows, owns adoption.
+                self.finish_main_list_open(restore_intent.clone());
             }
             let deferred_pdf = ready.target.resolved_kind == CollectionResolvedKind::Pdf
                 && matches!(

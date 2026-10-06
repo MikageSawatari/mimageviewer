@@ -6412,7 +6412,7 @@ impl App {
                 ctx.request_repaint();
             }
             RingShortcutContext::VideoFullscreen => {
-                self.close_fullscreen();
+                self.close_fullscreen_to_page_list();
                 ctx.request_repaint();
             }
             RingShortcutContext::Grid => {}

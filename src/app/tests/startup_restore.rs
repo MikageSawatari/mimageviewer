@@ -75,11 +75,29 @@ fn open_zip(app: &mut App, path: &Path, direct: bool) {
 
 fn restart_previous(env: &mut phase_c_support::AppTestEnv) {
     env.on_exit_inner();
+    restart_previous_from_saved_settings(env);
+}
+
+fn restart_previous_from_saved_settings(env: &mut phase_c_support::AppTestEnv) {
     // Keep AppTestEnv's data-dir guard alive across App::drop and replacement.
     let saved = crate::settings::Settings::load();
     env.app = App::new_from_settings(saved);
     env.open_default_startup_target();
     settle_book(env);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while env.sidecar_restore_active() {
+        env.poll_sidecar_restore(&ctx);
+        env.poll_zip_enumerate();
+        env.poll_fs_nav_lock(&ctx);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup sidecar restoration did not settle"
+        );
+        std::thread::yield_now();
+    }
+    settle_book(env);
+    env.poll_fs_nav_lock(&ctx);
 }
 
 fn book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
@@ -2515,4 +2533,426 @@ fn section1335_rating_folder_auto_request_records_the_actual_settled_physical_li
     let adopted = env.settings.startup_list_restore.clone();
     env.on_exit_inner();
     assert_eq!(env.settings.startup_list_restore, adopted);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_collection_ctrl_down_zip_adoption_restores_with_sidecars_on_and_off() {
+    use crate::app::top_level_grid_view::{CollectionGridLoadState, CollectionGridPosition};
+    use crate::collection_store::{
+        CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+    };
+
+    for sidecars in [false, true] {
+        let (mut env, parent, book) = book_env();
+        env.settings.sidecar_backup_enabled = sidecars;
+        env.settings.tag_sidecar_backup_enabled = sidecars;
+        let first = env.tmp.path().join("collection-first");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("first.png"), png_bytes()).unwrap();
+        let runtime = CollectionStoreRuntime::start_at(env.tmp.path().join("collection.db"))
+            .expect("isolated collection runtime");
+        let client = runtime.client();
+        env.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(env.collection_store_client_for_read(), Ok(Some(_))) {
+            env.poll_collection_ui(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "collection actor not ready"
+            );
+            std::thread::yield_now();
+        }
+        let created = client
+            .create_collection("Startup outer navigation".into())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &first,
+                        CollectionResolvedKind::Folder,
+                    )
+                    .unwrap(),
+                    CollectionRegistration::from_trusted_path(&book, CollectionResolvedKind::Zip)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        env.open_collection_grid(created.collection_id(), None);
+        while !env
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| {
+                matches!(session.load, CollectionGridLoadState::Ready(_))
+                    && session.installed_items_generation == Some(env.items_generation)
+            })
+        {
+            env.poll_collection_ui(&ctx);
+            env.poll_collection_grid(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "collection root not ready"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(env.items.len(), 2);
+        env.selected = Some(
+            env.items
+                .iter()
+                .position(|item| item.container_path() == Some(first.as_path()))
+                .unwrap(),
+        );
+        assert_physical(&env, &parent, None);
+
+        // Use the actual grid Ctrl+Down handler, including its Collection OuterGrid request.
+        ctx.begin_pass(egui::RawInput {
+            modifiers: egui::Modifiers::CTRL,
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        });
+        assert!(env.handle_keyboard(&ctx).is_none());
+        let _ = ctx.end_pass();
+        assert!(env.top_level_grid_view.collection_navigation_pending());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            env.poll_collection_ui(&ctx);
+            env.poll_collection_grid(&ctx);
+            env.poll_collection_navigation(&ctx);
+            env.poll_sidecar_restore(&ctx);
+            // App::update performs this frame poll after an adopted grid releases its holdover.
+            env.poll_fs_nav_lock(&ctx);
+            let adopted = env
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(&session.position, CollectionGridPosition::PhysicalSource { path, .. }
+                    if path == &book)
+                });
+            if adopted
+                && !env.top_level_grid_view.collection_navigation_pending()
+                && !env.sidecar_restore_active()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Collection ZIP navigation did not settle"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(env.current_folder.as_ref(), Some(&book));
+        assert!(env.zip_nav.is_some());
+        assert!(env.fullscreen_idx.is_none());
+        assert!(env.fs_nav_locked_gen.is_none());
+        assert_physical(&env, &book, Some(""));
+        env.selected = Some(
+            env.items
+                .iter()
+                .position(|item| item.name() == "b.png")
+                .unwrap(),
+        );
+        assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
+        env.on_exit_inner();
+        assert_eq!(
+            restore_cursor(&env).unwrap().name,
+            "b.png",
+            "the departing Collection physical list must persist its current selection"
+        );
+        let saved = crate::settings::Settings::load();
+        assert!(matches!(
+            saved.startup_list_restore,
+            Some(StartupListRestore::V1 { cursor: Some(ListCursorHint { ref name, .. }), .. })
+                if name == "b.png"
+        ));
+        restart_previous_from_saved_settings(&mut env);
+        assert_physical(&env, &book, Some(""));
+        assert_eq!(restore_cursor(&env).unwrap().name, "b.png");
+        assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
+        assert!(env.fullscreen_idx.is_none());
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_video_ring_close_accepts_current_folder_list_for_exit_and_restart() {
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+
+    let (mut env, parent, _) = book_env();
+    let media_folder = env.tmp.path().join("ring-direct-video");
+    std::fs::create_dir_all(&media_folder).unwrap();
+    let path = media_folder.join("clip.mp4");
+    std::fs::write(&path, b"headless media fixture").unwrap();
+    assert!(env.load_folder_with_scan_owned(
+        media_folder.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        StartupListIntent::PageContinuation,
+    ));
+    let index = env
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Video(_)))
+        .unwrap();
+    // Supply the existing disconnected media harness; the ring handler owns the close.
+    env.fs_cache.insert(
+        index,
+        FsCacheEntry::Video {
+            player: Box::new(crate::video::VideoPlayer::disconnected_for_test(path, 12.0)),
+            load_seq: 0,
+        },
+    );
+    env.fullscreen_idx = Some(index);
+    env.selected = Some(index);
+    env.viewer_presentation = ViewerPresentation::Fullscreen;
+    let before = env.settings.startup_list_restore.clone();
+    assert_physical(&env, &parent, None);
+    let ctx = egui::Context::default();
+
+    // CloseFullscreen has no grid-context acceptance; an unrelated route must not commit.
+    assert!(
+        env.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::CloseFullscreen,
+            "section1335",
+        )
+        .is_none()
+    );
+    assert_eq!(env.fullscreen_idx, Some(index));
+    assert_eq!(env.settings.startup_list_restore, before);
+
+    assert!(
+        env.apply_ring_action(
+            &ctx,
+            RingShortcutContext::VideoFullscreen,
+            RingActionId::CloseFullscreen,
+            "section1335",
+        )
+        .is_none()
+    );
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.current_folder.as_ref(), Some(&media_folder));
+    assert_physical(&env, &media_folder, None);
+    assert_eq!(restore_cursor(&env).unwrap().name, "clip.mp4");
+    restart_previous(&mut env);
+    assert_physical(&env, &media_folder, None);
+    assert_eq!(env.current_folder.as_ref(), Some(&media_folder));
+    assert_eq!(env.items[env.selected.unwrap()].name(), "clip.mp4");
+    assert_eq!(restore_cursor(&env).unwrap().name, "clip.mp4");
+    assert!(env.fullscreen_idx.is_none());
+}
+
+#[cfg(windows)]
+fn extra_video_close_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf, usize) {
+    let (mut env, parent, _) = book_env();
+    let media_folder = env.tmp.path().join("extra-direct-video");
+    std::fs::create_dir_all(&media_folder).unwrap();
+    let path = media_folder.join("clip.mp4");
+    std::fs::write(&path, b"headless media fixture").unwrap();
+    assert!(env.load_folder_with_scan_owned(
+        media_folder.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        StartupListIntent::PageContinuation,
+    ));
+    let index = env
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Video(_)))
+        .unwrap();
+    env.fs_cache.insert(
+        index,
+        FsCacheEntry::Video {
+            player: Box::new(crate::video::VideoPlayer::disconnected_for_test(path, 12.0)),
+            load_seq: 0,
+        },
+    );
+    env.fullscreen_idx = Some(index);
+    env.selected = Some(index);
+    env.viewer_presentation = ViewerPresentation::Fullscreen;
+    assert_physical(&env, &parent, None);
+    (env, parent, media_folder, index)
+}
+
+#[cfg(windows)]
+fn install_extra_video_source_swap(
+    app: &mut App,
+    index: usize,
+    parked_live_window_id: Option<u64>,
+) -> crate::video::NativeUiProbeForTest {
+    let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&index).unwrap() else {
+        unreachable!()
+    };
+    let probe = player.install_native_ui_probe_for_test();
+    let native_output = player.take_native_output().unwrap();
+    native_output.bump_committed_generation(5);
+    let GridItem::Video(path) = &app.items[index] else {
+        unreachable!()
+    };
+    let now = std::time::Instant::now();
+    app.native_video_source_swap_pending = Some(native_video::NativeVideoSourceSwapPending {
+        from_idx: index,
+        target_idx: index,
+        target_path: path.clone(),
+        native_output,
+        autoplay_override: None,
+        ignore_resume: false,
+        show_preparing_overlay: false,
+        reason: "navigation",
+        // Hold the existing debounce seam open so rejected events can be polled without
+        // opening a real decoder. Accepted closes return before this seam is consulted.
+        requested_at: now + std::time::Duration::from_secs(60),
+        deadline: now + std::time::Duration::from_secs(120),
+        input_seq: app.input_seq,
+        history_trigger: HistoryTrigger::UserChosen,
+        cursor_state: app.fullscreen_cursor_state(),
+        parked_live_window_id,
+        audio_mode_after_swap: false,
+    });
+    probe
+}
+
+#[cfg(windows)]
+fn extra_video_close_event(
+    window_close: bool,
+    generation: u64,
+) -> crate::video::NativeVideoOutputEvent {
+    if window_close {
+        crate::video::NativeVideoOutputEvent::Window(
+            crate::video::native_window::NativeVideoWindowEvent::CloseRequested { generation },
+        )
+    } else {
+        crate::video::NativeVideoOutputEvent::CloseFullscreen { generation }
+    }
+}
+
+#[cfg(windows)]
+fn assert_extra_video_close_restarts_list(
+    env: &mut phase_c_support::AppTestEnv,
+    media_folder: &Path,
+) {
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.current_folder.as_deref(), Some(media_folder));
+    assert_physical(env, media_folder, None);
+    assert_eq!(restore_cursor(env).unwrap().name, "clip.mp4");
+    restart_previous(env);
+    assert_physical(env, media_folder, None);
+    assert_eq!(env.current_folder.as_deref(), Some(media_folder));
+    assert_eq!(env.items[env.selected.unwrap()].name(), "clip.mp4");
+    assert_eq!(restore_cursor(env).unwrap().name, "clip.mp4");
+    assert!(env.fullscreen_idx.is_none());
+}
+
+#[cfg(windows)]
+fn exercise_extra_native_video_close(window_close: bool) {
+    let (mut env, parent, media_folder, index) = extra_video_close_env();
+    let before = env.settings.startup_list_restore.clone();
+    let probe = install_extra_video_source_swap(&mut env, index, None);
+    let ctx = egui::Context::default();
+    // fs_cache no longer owns the output, so the pending output must supply generation 5.
+    assert_eq!(env.native_video_committed_generation_for(index), 0);
+    probe.send_event(extra_video_close_event(window_close, 4));
+    env.poll_native_video_source_swap_pending(&ctx);
+    assert_eq!(env.fullscreen_idx, Some(index));
+    assert!(env.native_video_source_swap_pending.is_some());
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert_physical(&env, &parent, None);
+
+    probe.send_event(extra_video_close_event(window_close, 5));
+    env.poll_native_video_source_swap_pending(&ctx);
+    assert!(env.native_video_source_swap_pending.is_none());
+    assert_extra_video_close_restarts_list(&mut env, &media_folder);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_extra_video_native_window_close_rejects_stale_then_restores_folder_list() {
+    exercise_extra_native_video_close(true);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_extra_video_native_close_fullscreen_rejects_stale_then_restores_folder_list() {
+    exercise_extra_native_video_close(false);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_extra_video_parked_native_closes_preserve_main_list_restore() {
+    for window_close in [true, false] {
+        let (mut env, parent, _, index) = extra_video_close_env();
+        let before = env.settings.startup_list_restore.clone();
+        let probe = install_extra_video_source_swap(&mut env, index, Some(1335));
+        let ctx = egui::Context::default();
+        probe.send_event(extra_video_close_event(window_close, 5));
+        env.poll_native_video_source_swap_pending(&ctx);
+        assert!(env.native_video_source_swap_pending.is_some());
+        assert_eq!(env.fullscreen_idx, Some(index));
+        assert_eq!(env.settings.startup_list_restore, before);
+
+        env.native_video_parked_live_input_window_id = Some(1335);
+        env.poll_native_video_source_swap_pending(&ctx);
+        assert!(env.native_video_source_swap_pending.is_none());
+        assert_eq!(env.fullscreen_idx, Some(index));
+        assert_eq!(env.settings.startup_list_restore, before);
+        assert_physical(&env, &parent, None);
+        env.native_video_parked_live_input_window_id = None;
+        restart_previous(&mut env);
+        assert_physical(&env, &parent, None);
+        assert_eq!(env.current_folder.as_ref(), Some(&parent));
+        assert!(env.fullscreen_idx.is_none());
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_extra_video_egui_close_key_restores_folder_list() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let (mut env, _, media_folder, index) = extra_video_close_env();
+    env.keymap = crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoCloseFullscreen = F6\n");
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::F6)],
+        ..Default::default()
+    });
+    let _ = env.keyboard_owner_for_pass(&ctx);
+    env.handle_video_input(&ctx, index, None);
+    let _ = ctx.end_pass();
+    assert_extra_video_close_restarts_list(&mut env, &media_folder);
+}
+
+#[test]
+fn section1335_extra_video_normal_parent_return_still_restores_parent_list() {
+    let (mut env, parent, book) = book_env();
+    open_zip(&mut env, &book, true);
+    let before = env.settings.startup_list_restore.clone();
+    env.handle_fullscreen_close_request();
+    assert!(env.pending_return_to_parent);
+    assert!(env.fullscreen_idx.is_some());
+    assert_eq!(env.settings.startup_list_restore, before);
+    let nav = env.take_pending_return_to_parent_nav().unwrap();
+    assert!(env.apply_fullscreen_close_nav_immediate(nav));
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert_physical(&env, &parent, None);
+    restart_previous(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert_physical(&env, &parent, None);
+    assert!(env.fullscreen_idx.is_none());
 }
