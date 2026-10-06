@@ -19,6 +19,11 @@ pub(crate) enum StartupListIntent {
         target: StartupListTarget,
         cursor: Option<ListCursorHint>,
     },
+    /// Resume an already explicit live list without adopting a new restore record.
+    ResumeList {
+        target: StartupListTarget,
+        cursor: Option<ListCursorHint>,
+    },
 }
 
 impl StartupListIntent {
@@ -322,6 +327,52 @@ impl App {
         self.close_fullscreen();
     }
 
+    /// Tray's existing media/session gate calls this only for main still fullscreen.
+    /// Automatic closing must not expose a book list that was never explicitly opened.
+    pub(crate) fn close_main_still_fullscreen_for_tray(&mut self) {
+        let parent_restore = self
+            .current_folder
+            .as_deref()
+            .filter(|path| crate::folder_tree::is_open_as_container(path))
+            .and_then(|_| self.restorable_current_main_list())
+            .and_then(|current| {
+                let StartupListTarget::PhysicalList { logical_path, .. } = current else {
+                    return None;
+                };
+                let parent = logical_path.parent()?;
+                let StartupListRestore::V1 { target, cursor } =
+                    self.settings.startup_list_restore.as_ref()?;
+                let StartupListTarget::PhysicalList {
+                    logical_path: saved_path,
+                    zip_prefix: None,
+                } = target
+                else {
+                    return None;
+                };
+                crate::folder_tree::path_eq(parent, saved_path)
+                    .then(|| (target.clone(), cursor.clone()))
+            });
+        if let Some((target, cursor)) = parent_restore
+            && let Some(crate::ui_main::AddressBarNav::Direct(path, _)) =
+                self.resolve_return_to_parent_nav()
+            && same_list_target(
+                &target,
+                &StartupListTarget::PhysicalList {
+                    logical_path: path.clone(),
+                    zip_prefix: None,
+                },
+            )
+        {
+            self.finish_fullscreen_navigation_for_true_close();
+            self.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+                path,
+                StartupListIntent::ResumeList { target, cursor },
+            ));
+            return;
+        }
+        self.close_fullscreen();
+    }
+
     pub(crate) fn finish_main_list_open(&mut self, intent: StartupListIntent) {
         if matches!(
             intent,
@@ -336,6 +387,17 @@ impl App {
         let Some(target) = self.restorable_current_main_list() else {
             return;
         };
+        if let StartupListIntent::ResumeList {
+            target: requested,
+            cursor,
+        } = &intent
+            && same_list_target(requested, &target)
+            && let Some(cursor) = cursor
+        {
+            self.select_after_load = Some(cursor.name.clone());
+            self.scroll_selected_to_rows_above = cursor.rows_above;
+            self.try_select_after_load();
+        }
         if !matches!(
             intent,
             StartupListIntent::ExplicitList | StartupListIntent::RestoreList { .. }

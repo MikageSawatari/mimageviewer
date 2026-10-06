@@ -426,7 +426,7 @@ impl App {
                  fullscreen={:?} fs_video={} native_pending={}",
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
-            self.close_fullscreen();
+            self.close_main_still_fullscreen_for_tray();
         } else if fs_cache_has_video
             || native_video_pending
             || self.viewer_session_is_detached_or_switching()

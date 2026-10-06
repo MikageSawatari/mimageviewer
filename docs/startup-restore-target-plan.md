@@ -10,7 +10,9 @@ Phase 2 は red 再現から着手し、遅延 close 完了経路へ達する案
 初回の結果は §10.4、今回の修正・再監査と最終 gate は §10.5 に記録する。
 追加監査で見つかった close 呼出し3箇所も設計担当・独立 reviewer の合意後に適用し、
 今回の追補検証は §10.6 に記録する。
-製品は起動しておらず、利用者の実機確認と設計担当の検収は未実施。
+ここまでの実装は `cd4c68c96` でコミットされ、独立レビュー承認済み。
+利用者の実機確認で見つかった tray 格納時の関連ケースについて、option B の決定に沿った
+追補を §10.7 に記録する。今回の追補では製品を起動しない。
 
 ## 1. 対象と観測の区別
 
@@ -270,7 +272,9 @@ prefix は §5.3.1 の手順で、その同じ復元 request の最終階層を�
 Desktop / Specific / Drives / ReadingHistory は今の mode routing、fallback と cursor 条件を維持。
 command-line / SendTo / activation / Remote IPC の明示 open をこの default restore で
 上書きしない。明示 open の再生・auto fullscreen・password 等の既存仕様を変更しない。
-トレイ hide は新 record を保存するだけで読書表示を閉じたり target を再生成しない。
+トレイ hide は明示一覧の target を採用し直さない。main の静止画読書を閉じる既存経路では、
+直接読書で保存 target がその本の親一覧なら親へ戻す（利用者決定 option B、§10.7）。
+明示済み本一覧はそのまま、動画と detached／switching の表示は維持する。
 トレイ restore は生きている session を戻し、startup restore を呼ばない。
 
 #### 5.3.1 ZIP prefix 復元の順序と Backspace の契約（P2 対応）
@@ -449,7 +453,7 @@ A/B の製品判断は解決済み。改訂設計の独立承認は `23d885e11`�
 | 全 FolderOpenScanPurpose と画像フォルダ分類 | PaneNavigation／JumpToPhysicalFolder は selection 完了後の適格一覧を commit。GridFolderCandidate は mixed／image-book と auto 設定の組合せ、scan 中設定変更、main／independent lease を確認。DetachedFolder／DetachedImage は main 不変、RequiredFullscreenTarget は direct、CurrentViewOrderRefresh は preserve。purpose を default false で同一扱いしない |
 | folder Back/Forward / A/B / same-path / no active slot | 採用した一覧だけを記録。失敗／置換／取消で target 不変。A/B histories と slot ownership は既存契約を維持 |
 | 現在一覧の reload / sort / filter / pin / preferences / PDF placeholder verification / sidecar | PreservePresentation と新 ExplicitList を同じ物理 source で対比。reload は一覧未表示の book を新 target にしない。reload 中は cursor を保持し、完了して同じ保存済み明示一覧を表示した場合は通常の exit／tray／departure で最新 cursor を捕捉する。別の direct book との対比も置く。cursor と target の世代を混ぜず、元 request の後段 page／verification で2回 commit しない |
-| tray hide/restore→quit | hide による target 変更なし。読書／再生表示を保持して restore。session を restart restore で再構築しない |
+| tray hide/restore→quit | target 変更なし。直接 ZIP の main still は保存済み親一覧へ戻り、cursor 設定 ON/OFF と非ゼロ行位置を保持。本一覧を通常／Backspace で明示済みならそこへ戻る。hidden quit→次回起動と読書再開を確認。動画／detached／switching は session を保持し、restore は startup restore で再構築しない（§10.7） |
 | Previous 以外 | Desktop/Specific の成功・失敗→Desktop→legacy fallback、Drive、ReadingHistory すべて現状の target/cursor/auto fullscreen を確認 |
 | command-line / SendTo / activation / Remote fallback | 明示 file/book/folder open 優先を維持。default restore が結果を上書きしない。同名 path、Ignore/Refused、解決失敗も既存意味 |
 | migration・settings | legacy None/path/Drive/book/cursor、欠落新 key、new record 優先、repeated load、Preferences OK、roundtrip/JSON/backup/transfer exclusion。削除・移動済み path の祖先 fallback で cursor を捨てる |
@@ -840,3 +844,73 @@ production と同じ event bus を通す。実 decoder や native window は作�
 キーのそれぞれで一覧へ戻し、実終了・引数なし再起動でその動画フォルダと選択動画へ戻ることを
 確認する。動画の前後切替直後にも同じ操作を確認し、通常の親戻りは親一覧へ戻ることを確認する。
 確認 binary と通常 profile の注意事項・起動 command は §10.4 に示す。実機確認は未実施。
+
+### 10.7 tray 格納時の直接読書からの親戻り（2026-10-06、option B）
+
+`cd4c68c96` の実機確認で、main で ZIP を直接ページ表示したまま × で tray へ格納すると、
+`release_media_session_for_tray` の raw close が未明示の本一覧を露出することが分かった。
+利用者は、保存済みの明示一覧がその本の親一覧なら、格納時に通常 close と同じ親戻りを使う
+option B を決定した。読書位置は既存 `book_open_resume` の保存を利用する。
+
+既存の plain main still 判定を通った caller だけを owner 側の helper へ接続する。
+mounted `current_folder` は runtime の本判定、適格な実一覧の `effective_folder` は変換前を含む
+論理 source として使い分ける。保存 target がその論理親の prefix なし PhysicalList に一致し、
+通常の `resolve_return_to_parent_nav` も同じ Direct 親を返す場合に限り、既存
+`apply_fullscreen_close_nav_immediate` へ渡す。単なる saved/current の不一致では判断しない。
+検索由来の古い無関係な record や、Collection／Smart 等の合成親へは新しい復帰を加えない。
+
+自動復帰は明示一覧要求ではないので `ExplicitList` として採用し直さない。
+既存 request の最終表示意図 `ResumeList { target, cursor }` で保存済み親 cursor を運び、
+採用完了時に一致する実一覧へ適用する。これは生きた一覧への復帰なので起動時の
+`restore_last_cursor` 設定に依存しない。record reducer の adoption は発行しない。
+通常の name／rows を持つ record は維持し、欠けた cursor の後続精緻化は §5.3 の既存契約どおり。
+新しい pending field、保存後の rollback、hidden を条件にした cursor 捕捉の例外は追加しない。
+
+通常 close 全体を無条件で流用すると、auto-open ON で明示済み本一覧まで親へ戻すため採用しない。
+実行する親 navigation は既存経路を再利用し、受理した親戻りの直前には通常 close と同じ
+`finish_fullscreen_navigation_for_true_close` で未完の移動を終端化する。required-page scan 待ちと
+FolderItems の表示継続 owner が重なると、親 load の scan cancel だけでは nav lock と panel が
+残る red を確認したためである。callee／viewport／predicate の変更や新しい cancel 機構は加えない。
+tray restore で startup restore を再実行しない。
+動画、detached／switching の保持判定、viewport、terminal effect、presentation transition、
+明示済み本一覧、他の起動設定、released `last_folder` の移行は変更しない。
+detached predicates／viewport は未変更なので detached §11 の変更範囲は増やさない。
+境界の独立前提監査は `target/1335-tray-design-audit.txt` に記録する。
+
+headless handler 回帰は実 ROOT Close event → `maybe_intercept_close` → hide と、
+既存の `sync_after_restore` を通す。native HWND／製品は起動せず disposable AppTestEnv を使う。
+直接 ZIP の親選択・非ゼロ行位置・record 保持は cursor 設定 ON/OFF を対比し、
+hidden 中の終了と次回起動、２ページ目からの再読書、通常に開いた本一覧と実 Backspace 後の
+本一覧、動画 player identity／再生意図、detached／switching を検査する。
+追加境界として変換書庫の元親、無関係な保存先、Smart の合成親、移動待ち中の × 後の
+scan／nav lock／holdover／panel 終端を確認する。
+
+独立実装レビューは `target/1335-tray-implementation-review.txt` で承認、未解決指摘なし。
+fixture routing の不備を修正した後の有効 red は4 passed / 1 failed（本一覧対親一覧）。
+移動継続の境界 red は8 passed / 1 failed（nav lock 残存）。それぞれ
+`target/1335-3-tray-red-fixed.log`、`target/1335-3-tray-boundary-fixed.log` に保持する。
+初回 fixture 不備と panel enum の compile 不備は製品 red として扱わない。
+
+| 最終確認（`cd4c68c96` + §10.7 の未コミット差分） | 結果・ログ |
+| --- | --- |
+| `cargo test -p mimageviewer --lib section1335 -- --test-threads=1` | 74 passed / 0 failed（tray handler 9件を含む）。`target/1335-3-narrow.log` |
+| normal / portable / portable+test-script core check | いずれも exit 0。`target/1335-3-{normal,portable,portable-test-script}-final.log` |
+| fmt / diff check / glyph lint | exit 0、危険な UI glyph 0。`target/1335-3-{fmt,diff-final,glyph-final}.log` |
+| `cargo test -p mimageviewer --lib` | exit 0、10725 passed / 0 failed / 52 ignored。テスト791.83秒、command 全体794.17秒。`target/1335-3-full-lib.log` |
+| `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、231.77秒。normal feature set の core／remote／EPUB worker を更新、runtime=4 / pe=3 検査成功。`target/1335-3-build-dev.log`。未起動 |
+
+ソースを固定して親担当が gate を実行し、`target/1335-3-source-snapshot.json` と照合する。
+全 command／終了値／所要時間の台帳は `target/1335-3-gates.json`。
+子プロセス限定 `CARGO_BUILD_JOBS=2`、normal feature set、full lib は default test threads と
+文書化済み `MIV_TESTDATA=C:/home/mimageviewer/testdata` を使う。workspace／vendor 全体の
+`test-full.ps1` を今回の差分で再実行したとは扱わず、先行の証拠は §10.5 の対象に保持する。
+normal 確認 build まで完了。最終文書を含む diff は `target/1335-3-final-diff.log`、
+検証済み Rust source／HEAD／Cargo.lock の照合は `target/1335-3-source-validation.json` に保持する。
+今回の修正は未コミット、製品・確認 binary は未起動。利用者の追補実機確認と最終検収は未実施。
+
+利用者の確認は、まず「前回終了した場所」と tray 常駐を ON にして物理親一覧を明示する。
+ZIP を直接表示して２ページ目で ×→tray 復帰すると親一覧へ戻り、開き直すと２ページ目。
+Backspace で本一覧を明示して再読書した場合は ×→復帰で本一覧になる。
+直接読書から hidden のまま tray メニューで終了し、引数なし再起動すると親一覧へ戻る。
+動画と F12 別ウィンドウは格納／復帰で session を保持する。
+起動 command と通常 `%APPDATA%\mimageviewer` の実データ利用に関する注意は §10.4 に示す。

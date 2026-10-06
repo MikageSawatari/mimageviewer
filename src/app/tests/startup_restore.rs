@@ -1092,10 +1092,8 @@ fn section1335_tray_persistence_and_restore_keep_reading_session_and_parent_list
     env.viewer_presentation = ViewerPresentation::Fullscreen;
     let before = env.settings.startup_list_restore.clone();
     let generation = env.items_generation;
-    assert_eq!(env.prepare_media_session_for_tray_residency(), 1);
-    env.persist_window_state_and_flush(PersistScope::ProcessKeepsRunning);
+    close_root_to_tray(&mut env);
     assert_eq!(env.settings.startup_list_restore, before);
-    env.window_visible = false;
     env.sync_after_restore(&egui::Context::default());
     assert!(env.window_visible);
     assert_eq!(env.items_generation, generation);
@@ -1116,6 +1114,256 @@ fn section1335_tray_persistence_and_restore_keep_reading_session_and_parent_list
     assert_physical(&env, &parent, None);
     env.on_exit_inner();
     assert_eq!(env.settings.startup_list_restore, before);
+}
+
+#[cfg(windows)]
+fn close_root_to_tray(app: &mut App) {
+    // Exercise the actual window-X handler without a native window or tray thread.
+    assert!(app.main_hwnd.is_none());
+    assert!(app.window_visible);
+    app.settings.minimize_to_tray_on_close = true;
+    app.tray_controller = Some(crate::tray::TrayController::controller_for_test());
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    raw.viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    let output = ctx.run(raw, |ctx| assert!(app.maybe_intercept_close(ctx)));
+    assert!(!app.window_visible);
+    assert!(
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+    );
+}
+
+#[cfg(windows)]
+fn direct_tray_book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
+    let (mut env, parent, book) = book_env();
+    for index in 0..12 {
+        write_zip(&parent.join(format!("before-{index:02}.zip")), &["a.png"]);
+    }
+    env.settings.sort_order = crate::settings::SortOrder::FileName;
+    env.settings.video_in_window_mode = false;
+    env.settings.detached_viewer_open_images_in_window = false;
+    env.settings.book_open_resume = crate::settings::ResumeMode::Resume;
+    env.load_folder(parent.clone());
+    let index = env
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::ZipFile(path) if path == &book))
+        .unwrap();
+    assert_eq!(index, 12);
+    env.last_grid_cols = 3;
+    env.last_cell_h = 40.0;
+    env.scroll_offset_y = 80.0;
+    env.selected = Some(index);
+    // Accepted grid input owns the departing cursor capture and direct page open.
+    let nav = env
+        .handle_gamepad_grid_accept(&egui::Context::default())
+        .expect("accepted main grid book yields its owned direct open");
+    assert!(env.apply_fullscreen_close_nav_immediate(nav));
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_some());
+    assert_eq!(
+        restore_cursor(&env),
+        Some(&ListCursorHint {
+            name: "book.zip".into(),
+            rows_above: Some(2),
+        })
+    );
+    env.open_fullscreen(1, HistoryTrigger::UserChosen);
+    assert_eq!(env.fullscreen_idx, Some(1));
+    assert_physical(&env, &parent, None);
+    (env, parent, book)
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_direct_book_hide_restore_returns_parent_and_preserves_record_and_resume() {
+    for restore_last_cursor in [true, false] {
+        let (mut env, parent, book) = direct_tray_book_env();
+        // This setting controls next-start behavior, not the live parent-return cursor.
+        env.settings.restore_last_cursor = restore_last_cursor;
+        let before = env.settings.startup_list_restore.clone();
+        close_root_to_tray(&mut env);
+        settle_book(&mut env);
+        assert!(env.fullscreen_idx.is_none());
+        assert_eq!(env.current_folder.as_ref(), Some(&parent));
+        assert_eq!(env.settings.startup_list_restore, before);
+        assert_eq!(
+            crate::settings::Settings::load().startup_list_restore,
+            before
+        );
+        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        let generation = env.items_generation;
+        env.sync_after_restore(&egui::Context::default());
+        assert!(env.window_visible);
+        assert_eq!(env.items_generation, generation);
+        assert_eq!(env.current_folder.as_ref(), Some(&parent));
+        assert!(env.fullscreen_idx.is_none());
+        assert_eq!(env.settings.startup_list_restore, before);
+        assert_eq!(env.items[env.selected.unwrap()].name(), "book.zip");
+        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        // Returning to the parent must not reset the independently saved reading position.
+        open_zip(&mut env, &book, true);
+        assert_eq!(env.fullscreen_idx, Some(1));
+        assert_eq!(env.settings.startup_list_restore, before);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_direct_book_quit_while_hidden_restarts_at_preserved_parent_list() {
+    let (mut env, parent, book) = direct_tray_book_env();
+    let before = env.settings.startup_list_restore.clone();
+    close_root_to_tray(&mut env);
+    assert!(!env.window_visible);
+    env.on_exit_inner();
+    assert_eq!(
+        crate::settings::Settings::load().startup_list_restore,
+        before
+    );
+    restart_previous_from_saved_settings(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "book.zip");
+    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    open_zip(&mut env, &book, true);
+    assert_eq!(env.fullscreen_idx, Some(1));
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_direct_book_close_retires_pending_required_page_navigation() {
+    let (mut env, parent, _) = direct_tray_book_env();
+    let before = env.settings.startup_list_restore.clone();
+    let ctx = egui::Context::default();
+    env.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+    env.fs_info_panel.locked = true;
+    let page = env.fullscreen_idx.unwrap();
+    env.begin_fs_folder_navigation_sequence(&ctx, page);
+    let folder = env.tmp.path().join("required-during-tray-close");
+    std::fs::create_dir_all(&folder).unwrap();
+    let image = folder.join("requested.png");
+    std::fs::write(&image, png_bytes()).unwrap();
+    env.open_required_fullscreen_location(
+        &ctx,
+        folder,
+        crate::snapshot::SnapshotTarget::Fs(image),
+        HistoryTrigger::UserChosen,
+    );
+    assert!(env.folder_pane_open_pending.is_some());
+    assert!(env.fullscreen_idx.is_some());
+    assert!(
+        env.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some()
+    );
+    close_root_to_tray(&mut env);
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert!(env.fullscreen_idx.is_none());
+    assert!(env.folder_pane_open_pending.is_none());
+    assert!(env.fs_nav_locked_gen.is_none());
+    assert!(!env.fs_info_panel.locked);
+    assert!(
+        env.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_none()
+    );
+    assert_eq!(env.settings.startup_list_restore, before);
+    env.sync_after_restore(&egui::Context::default());
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert!(env.fullscreen_idx.is_none());
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_explicit_book_list_hide_restore_keeps_normally_opened_and_backspace_lists() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for backspace in [false, true] {
+        let (mut env, _, book) = book_env();
+        env.settings.video_in_window_mode = false;
+        env.settings.detached_viewer_open_images_in_window = false;
+        open_zip(&mut env, &book, backspace);
+        if backspace {
+            env.open_fullscreen(1, HistoryTrigger::UserChosen);
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput {
+                events: vec![fullscreen_fixed_key_event(egui::Key::Backspace)],
+                ..Default::default()
+            });
+            assert!(env.handle_fullscreen_root_key_input(&ctx));
+            let _ = ctx.end_pass();
+        }
+        assert!(env.fullscreen_idx.is_none());
+        assert_physical(&env, &book, Some(""));
+        env.selected = Some(1);
+        env.capture_main_list_restore_cursor();
+        let before = env.settings.startup_list_restore.clone();
+        close_root_to_tray(&mut env);
+        env.sync_after_restore(&egui::Context::default());
+        assert!(env.window_visible);
+        assert!(env.fullscreen_idx.is_none());
+        assert_eq!(env.current_folder.as_ref(), Some(&book));
+        assert_eq!(env.settings.startup_list_restore, before);
+        // A book whose list was shown explicitly keeps that list even if reading resumes.
+        env.open_fullscreen(1, HistoryTrigger::UserChosen);
+        close_root_to_tray(&mut env);
+        env.sync_after_restore(&egui::Context::default());
+        assert!(env.window_visible);
+        assert!(env.fullscreen_idx.is_none());
+        assert_eq!(env.current_folder.as_ref(), Some(&book));
+        assert_physical(&env, &book, Some(""));
+        assert_eq!(env.settings.startup_list_restore, before);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_detached_and_switching_book_hide_restore_keep_session_and_parent_record() {
+    for switching in [false, true] {
+        let (mut env, parent, book) = book_env();
+        env.settings.detached_viewer_open_images_in_window = false;
+        open_zip(&mut env, &book, true);
+        if switching {
+            begin_test_video_presentation_transition(
+                &mut env,
+                ViewerPresentation::DetachedWindow,
+                false,
+            );
+            assert!(env.video_presentation_transition.is_transitioning());
+        } else {
+            env.toggle_detached_viewer_mode();
+            assert!(env.viewer_session_is_detached());
+        }
+        assert!(env.viewer_session_is_detached_or_switching());
+        let before = env.settings.startup_list_restore.clone();
+        let page = env.fullscreen_idx;
+        let presentation = env.viewer_presentation;
+        let generation = env.items_generation;
+        close_root_to_tray(&mut env);
+        env.sync_after_restore(&egui::Context::default());
+        assert!(env.window_visible);
+        assert_eq!(env.current_folder.as_ref(), Some(&book));
+        assert_eq!(env.fullscreen_idx, page);
+        assert_eq!(env.viewer_presentation, presentation);
+        assert_eq!(env.items_generation, generation);
+        assert_eq!(
+            env.video_presentation_transition.is_transitioning(),
+            switching
+        );
+        assert_eq!(env.settings.startup_list_restore, before);
+        assert_physical(&env, &parent, None);
+    }
 }
 
 #[test]
@@ -2955,4 +3203,154 @@ fn section1335_extra_video_normal_parent_return_still_restores_parent_list() {
     assert_eq!(env.current_folder.as_ref(), Some(&parent));
     assert_physical(&env, &parent, None);
     assert!(env.fullscreen_idx.is_none());
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_converted_book_returns_logical_source_parent_and_preserves_reading_resume() {
+    let (mut env, parent, _) = book_env();
+    let source = parent.join("converted.7z");
+    let cache_folder = env.tmp.path().join("conversion-cache");
+    std::fs::create_dir_all(&cache_folder).unwrap();
+    let cached = cache_folder.join("cached.zip");
+    std::fs::write(&source, b"converted source fixture").unwrap();
+    write_zip(&cached, &["a.png", "b.png"]);
+    let metadata = std::fs::metadata(&source).unwrap();
+    env.archive_cache_db
+        .as_ref()
+        .unwrap()
+        .record(
+            &source,
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+            ArchiveFormat::SevenZ,
+            &cached,
+            0,
+            2,
+            false,
+        )
+        .unwrap();
+    env.load_folder(parent.clone());
+    env.selected = env
+        .items
+        .iter()
+        .position(|item| item.name() == "converted.7z");
+    assert!(env.selected.is_some());
+    env.capture_main_list_restore_cursor();
+    let before = env.settings.startup_list_restore.clone();
+    assert!(matches!(
+        env.load_folder_or_convert_archive_with_auto_fullscreen(source.clone(), true),
+        FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+    ));
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&cached));
+    assert_eq!(env.archive_source_override.as_ref(), Some(&source));
+    assert!(env.fullscreen_idx.is_some());
+    env.open_fullscreen(1, HistoryTrigger::UserChosen);
+    assert_eq!(env.settings.startup_list_restore, before);
+    close_root_to_tray(&mut env);
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert_ne!(env.current_folder.as_ref(), Some(&cache_folder));
+    assert!(env.archive_source_override.is_none());
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.settings.startup_list_restore, before);
+    env.sync_after_restore(&egui::Context::default());
+    assert!(env.window_visible);
+    assert_eq!(env.current_folder.as_ref(), Some(&parent));
+    assert_eq!(env.items[env.selected.unwrap()].name(), "converted.7z");
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert!(matches!(
+        env.load_folder_or_convert_archive_with_auto_fullscreen(source.clone(), true),
+        FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+    ));
+    settle_book(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&cached));
+    assert_eq!(env.archive_source_override.as_ref(), Some(&source));
+    assert_eq!(env.fullscreen_idx, Some(1));
+    assert_eq!(env.settings.startup_list_restore, before);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_direct_book_with_unrelated_saved_parent_keeps_book_list_and_record() {
+    let (mut env, parent, book) = book_env();
+    let unrelated = env.tmp.path().join("unrelated-parent");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    env.load_folder(unrelated.clone());
+    let before = env.settings.startup_list_restore.clone();
+    open_zip(&mut env, &book, true);
+    assert_physical(&env, &unrelated, None);
+    assert_ne!(parent, unrelated);
+    let generation = env.items_generation;
+    close_root_to_tray(&mut env);
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.items_generation, generation);
+    assert_eq!(env.settings.startup_list_restore, before);
+    env.sync_after_restore(&egui::Context::default());
+    assert!(env.window_visible);
+    assert_eq!(env.current_folder.as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.settings.startup_list_restore, before);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1335_tray_smart_book_with_matching_physical_parent_keeps_book_list_and_synthetic_owner() {
+    let (mut env, parent, book) = book_env();
+    env.selected = env
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::ZipFile(path) if path == &book));
+    env.capture_main_list_restore_cursor();
+    let before = env.settings.startup_list_restore.clone();
+    let mut definition = crate::settings::SmartFolderDefinition::new("Tray synthetic parent");
+    definition.rules.push(crate::settings::SmartFolderRule::new(
+        parent.clone(),
+        true,
+        Default::default(),
+    ));
+    let id = definition.id;
+    env.settings.smart_folders = vec![definition];
+    env.open_smart_folder(id, false);
+    wait_smart(&mut env);
+    assert!(env.items_are_smart_folder_view);
+    let kind = env.smart_physical_target_kind(&book).unwrap();
+    assert!(
+        env.begin_smart_physical_navigation(
+            book.clone(),
+            kind,
+            true,
+            None,
+            None,
+            StartupListIntent::PageContinuation,
+        )
+        .is_ok()
+    );
+    wait_smart(&mut env);
+    assert_eq!(env.effective_folder().as_ref(), Some(&book));
+    if env.fullscreen_idx.is_none() {
+        env.open_fullscreen(0, HistoryTrigger::UserChosen);
+    }
+    assert_physical(&env, &parent, None);
+    let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
+    assert!(matches!(
+        env.resolve_return_to_parent_nav(),
+        Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == synthetic
+    ));
+    close_root_to_tray(&mut env);
+    assert_eq!(env.effective_folder().as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert!(env.top_level_grid_view.smart_folder().is_some());
+    env.sync_after_restore(&egui::Context::default());
+    assert!(env.window_visible);
+    assert_eq!(env.effective_folder().as_ref(), Some(&book));
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.settings.startup_list_restore, before);
+    assert!(matches!(
+        env.resolve_return_to_parent_nav(),
+        Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == synthetic
+    ));
 }

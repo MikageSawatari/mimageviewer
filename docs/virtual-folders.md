@@ -305,6 +305,10 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
   経路や、root の行を作ってから階層を作り直す経路は使わない。EPUB、password、sidecar 等の
   continuation も同じ意図を保持する。
   旧値は初回だけそのまま移行し、現在の auto-open 設定で過去の一覧を推測しない。
+  tray 格納で main の静止画読書を閉じる場合も、本一覧を明示しておらず保存先がその親一覧なら、
+  既存の親戻りを使って親一覧へ戻す。これは自動復帰なので一覧 record を採用し直さず、
+  親の cursor と読書位置を保持する。明示済み本一覧、動画、detached／switching は従来どおり。
+  tray 復帰そのものは起動復元を実行しない。
   所有契約と完了した自動検証、利用者の実機確認手順は [起動復元の所有設計](startup-restore-target-plan.md) を参照。
 - **起動時復元のルーティング**: `App::update` 初回フレームは `load_folder` ではなく
   `load_folder_or_convert_archive` を通す。元アーカイブパスを渡すとキャッシュ参照 →
