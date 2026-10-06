@@ -1839,6 +1839,162 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 }
 
+pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    page_clipboard_capture_controls(ui, state, true);
+}
+
+// Preserve the already-approved S1 snapshots; S3 has separate snapshots of the
+// complete production page, including the new HTML monitoring control.
+pub(super) fn page_clipboard_capture_s1_snapshot(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    page_clipboard_capture_controls(ui, state, false);
+}
+
+fn page_clipboard_capture_controls(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    html_control: bool,
+) {
+    anchored(ui, state, "clipboard-capture/image", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.clipboard_capture_image_enabled,
+            "画像がコピーされたら自動で保存する",
+        );
+        if html_control {
+            anchored(ui, state, "clipboard-capture/html", |ui, state| {
+                ui.checkbox(
+                    &mut state.settings.clipboard_capture_html_enabled,
+                    "ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする",
+                );
+            });
+        }
+        ui.label(egui::RichText::new(
+            "監視は mImageViewer の起動中だけ動きます。タスクトレイ常駐と組み合わせて使えます。",
+        ).weak());
+        if state.clipboard_capture_startup_failed {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "この環境ではクリップボードの監視を開始できませんでした",
+            );
+        }
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "clipboard-capture/folder", |ui, state| {
+        ui.label("保存先フォルダ");
+        let pending = state.clipboard_capture_folder_task.is_some();
+        let mut choose = false;
+        let mut open = false;
+        ui.add_enabled_ui(!pending, |ui| {
+            let edit_width = ui.available_width();
+            let hint = state
+                .clipboard_capture_default_output_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "確認中".to_owned());
+            let mut output = crate::ime_focus::show_singleline(
+                ui,
+                &mut state.clipboard_capture_output_dir_input,
+                None,
+                |edit| edit.desired_width(edit_width).hint_text(hint),
+            );
+            let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                ui,
+                &mut output,
+                &mut state.clipboard_capture_output_dir_input,
+            );
+            if output.response.changed() || menu_changed {
+                let path = state.clipboard_capture_output_dir_input.trim();
+                state.settings.clipboard_capture_output_dir =
+                    (!path.is_empty()).then(|| PathBuf::from(path));
+                state.clipboard_capture_folder_message = None;
+            }
+            ui.horizontal_wrapped(|ui| {
+                choose = ui.button("変更…").clicked();
+                if ui.button("既定に戻す").clicked() {
+                    state.clipboard_capture_output_dir_input.clear();
+                    state.settings.clipboard_capture_output_dir = None;
+                    state.clipboard_capture_folder_message = None;
+                }
+                open = ui
+                    .add_enabled(
+                        state.settings.clipboard_capture_output_dir.is_some()
+                            || state.clipboard_capture_default_output_dir.is_some(),
+                        egui::Button::new("フォルダを開く"),
+                    )
+                    .clicked();
+            });
+        });
+        let effective = state
+            .settings
+            .clipboard_capture_output_dir
+            .clone()
+            .or_else(|| state.clipboard_capture_default_output_dir.clone());
+        let effective_label = effective
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "確認中".to_owned());
+        ui.label(egui::RichText::new(format!("実際の保存先: {effective_label}")).weak());
+        ui.label(
+            egui::RichText::new(
+                "月ごとのフォルダに保存します。フォルダは最初に保存するときに作成します。",
+            )
+            .weak(),
+        );
+        if choose || open {
+            state.clipboard_capture_folder_message = None;
+            let (tx, rx) = mpsc::channel();
+            let ctx = ui.ctx().clone();
+            let spawn = std::thread::Builder::new()
+                .name("clipboard-capture-folder".into())
+                .spawn(move || {
+                    let result = if choose {
+                        let mut picker = rfd::FileDialog::new();
+                        if let Some(path) = &effective {
+                            picker = picker.set_directory(path);
+                        }
+                        Ok(ClipboardCaptureFolderResult::Selected(picker.pick_folder()))
+                    } else if let Some(effective) = effective {
+                        if !effective.is_dir() {
+                            Err(
+                                "保存先フォルダはまだありません。最初に保存するときに作成します。"
+                                    .into(),
+                            )
+                        } else {
+                            #[cfg(windows)]
+                            {
+                                std::process::Command::new("explorer.exe")
+                                    .arg(&effective)
+                                    .spawn()
+                                    .map(|_| ClipboardCaptureFolderResult::Opened)
+                                    .map_err(|error| format!("フォルダを開けませんでした: {error}"))
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                Ok(ClipboardCaptureFolderResult::Opened)
+                            }
+                        }
+                    } else {
+                        Err("保存先フォルダを確認中です。".into())
+                    };
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                });
+            match spawn {
+                Ok(_) => state.clipboard_capture_folder_task = Some(rx),
+                Err(error) => {
+                    state.clipboard_capture_folder_message =
+                        Some(format!("フォルダ操作を開始できませんでした: {error}"))
+                }
+            }
+        }
+        if pending {
+            ui.spinner();
+        }
+        if let Some(message) = &state.clipboard_capture_folder_message {
+            ui.label(egui::RichText::new(message).color(ui.visuals().warn_fg_color));
+        }
+    });
+}
+
 pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label("Ctrl+S で保存するキャプチャの形式と保存先を設定します。");
     ui.add_space(8.0);

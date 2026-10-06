@@ -105,6 +105,9 @@ Import-UiSmokeButtonHelperTypes $helperRoot
 if (-not ('Miv.UiSmoke.ButtonHelperDraft.ButtonHelperRunnerApi' -as [type])) {
     throw 'runner helper types were not loaded'
 }
+if (-not ('Miv.UiSmoke.ButtonHelperDraft.ClipboardKeyHelperHandle' -as [type])) {
+    throw 'clipboard key helper types were not loaded'
+}
 
 $environmentNames = @(
     'MIV_UI_SMOKE_BUTTON_PIPE',
@@ -193,7 +196,9 @@ foreach ($requiredText in @(
     'MIV_UI_SMOKE_BUTTON_SESSION',
     'MIV_UI_SMOKE_BUTTON_SERVER_PID',
     'SafeToTerminateApp',
-    'button_helper_release_state'
+    'button_helper_release_state',
+    "'NativeTopPanoramaClick', 'ClipboardCapture'",
+    'ClipboardKeyHelperHandle]::Start'
 )) {
     if (-not $combinedSource.Contains($requiredText)) {
         throw "runner is missing required button integration text: $requiredText"

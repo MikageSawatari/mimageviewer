@@ -856,6 +856,77 @@ fn snapshot_file_organize_modal(
     harness.snapshot(name);
 }
 
+#[test]
+fn preferences_clipboard_capture_light() {
+    snapshot_with_theme(
+        "preferences_clipboard_capture_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| mimageviewer::draw_clipboard_capture_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn clipboard_html_settings_light() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_settings_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(720.0, 400.0),
+        |ui| mimageviewer::draw_clipboard_capture_html_settings_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn clipboard_html_settings_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(720.0, 400.0),
+        |ui| mimageviewer::draw_clipboard_capture_html_settings_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn clipboard_html_selection_fetching_light() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_selection_fetching_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(760.0, 500.0),
+        |ui| mimageviewer::draw_capture_selection_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn clipboard_html_selection_saving_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "clipboard_html_selection_saving_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(760.0, 500.0),
+        |ui| mimageviewer::draw_capture_selection_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_clipboard_capture_pending_default_light() {
+    snapshot_with_theme(
+        "preferences_clipboard_capture_pending_default_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_clipboard_capture_settings_pending_snapshot_fixture,
+    );
+}
+
+#[test]
+fn preferences_clipboard_capture_failed_dark() {
+    snapshot_with_theme(
+        "preferences_clipboard_capture_failed_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| mimageviewer::draw_clipboard_capture_settings_snapshot_fixture(ui, true),
+    );
+}
+
 /// テスト用に本体と同じフォント fallback を `ctx` に登録する。
 /// これをしないと `豆腐` 文字だらけのスナップショットになり、ラベル・見出しや
 /// 絵文字混じりテキストの実際のレイアウトを検証できない。

@@ -20,6 +20,90 @@
 | S2 | 静止画の列の押下・ドラッグ・release | egui pointer timeline、描画ownerの名前付き矩形、frame acknowledgment |
 | S3 | 動画canvasのzoomとstrip/panel/modalとの入力優先順位 | 実OSマウス入力、exact native target/矩形、実配送と処理の観測 |
 | AudioTracks | 再生中・一時停止中の音声切り替え、保存・F12・音声モード HUD | native Response の有効性と入力前の同一性、desired/applied と pump 周波数 |
+| ClipboardCapture | 実クリップボードの手動貼り付け、監視の除外、Excel 2 段書き込み、S1 PNG 保存 | 実 OS Ctrl+V、loopback HTTP、取り込み reader 開封・通知処理完了・小窓表示の診断、worker のファイル検査 |
+
+### ClipboardCapture (§14、2026-10-06)
+
+`scripts/ui-smoke/clipboard-capture.rhai` は `portable,test-script` の実アプリで、Windows
+クリップボードを上書きする。実行は毎回 [実アプリ検証の実行確認](interactive-release-verification.md)
+に従い、前面ウィンドウ・キーボード・クリップボードの使用を含む明示了承後だけ行う。
+今回の実装作業では実行せず、シナリオの登録・コンパイルと非対話の fixture／書き手テストを検証する。
+所要時間は既存診断ビルドの再利用時に約 2〜3 分、初回ビルドは別途 5〜15 分を見込む。
+
+実行前に、通常版・確認用ビルド・portable を含むすべての mIV を終了する（トレイ常駐も）。
+ClipboardCapture は場所を問わず `mimageviewer.exe` / `mimageviewer-core.exe` を検査し、
+別インスタンスが動作中ならビルド・アプリ起動・証跡ディレクトリ作成前に中止する。
+既存インスタンスを自動終了しない。他シナリオの受付条件は変更しない。
+
+上記の終了確認と了承後の実行コマンド:
+
+```powershell
+.\scripts\ui-smoke.ps1 -Scenario ClipboardCapture -InteractiveApproved
+# 同一 source の診断ビルドを準備済みの場合のみ -SkipBuild を追加
+```
+
+runner の了承 guard はビルド・ディレクトリ作成・アプリ起動に先行する。固定の
+`target/portable-smoke/mimageviewer.exe` と sibling `data`、既存の marker・manifest・入力 desktop
+事前検査を維持する。fixture generator は隔離 data の `clipboard-capture/manual/seed.png` を起動前に
+用意し、今のフォルダを空にしない。Shell コピー元は sibling `source`、監視保存先は sibling `captures`。
+通常設定や既存クリップボードの内容を fixture にコピーしない。成功時のクリップボードは disposable PNG
+になる。失敗時は模擬 Office データや停止済み fixture server を参照する HTML が残り得るため、
+通常の貼り付けを再開する前に、無害なテキストを一度コピーする。runner の失敗表示もこの手順を案内する。
+以前の内容は復元しないため、了承時にこの上書きを明示する。
+
+追加 API の `clipboard_fixture` は Rhai worker で CF_HTML（SourceURL 付き）、PNG と CF_DIB、CF_DIB
+単体、CF_HDROP、Office 形式の組（Embed Source／Object Descriptor／XML Spreadsheet + DIB + HTML）、
+文章だけの HTML + Unicode テキストを設定する。worker が 127.0.0.1 のランダムポートでページ・PNG を
+提供し、SourceURL と画像参照は同じ origin を使う。HTTP server は script engine の fixture 所有者が
+停止・join する。本番の取得先規則に例外を加えない。UI thread は設定操作と診断の公開を担当し、
+クリップボード書き込み・HTTP・ファイル読取・待機を行わない。
+
+`clipboard_paste` は選択済みの exact root HWND／backend／foreground／process／入力 desktop と
+利用者の modifier・V の解放を検査し、既存 `button-helper` package の runner 所有
+`ClipboardKeyHelperHandle` へ、認証済み current-SID local pipe で Down を要求する。
+外部 helper だけが実 OS `SendInput` で Ctrl と V を押す。製品の
+`GetAsyncKeyState` の Ctrl+V consumer 受付カウンタが進むまで保持する。固定 down/up timeline や
+synthetic egui key event を配送の証拠にしない。成功後も release を UI pass が観測できるまで待ち、
+途中失敗・timeout・App 異常終了・pipe 切断では外部 helper が自身の Down 挿入分だけを解放する。
+cleanup の desktop 検査も維持する。runner は helper の cleanup／read・reply task の停止／join と
+キー解放の確認後にだけ exact App を終了できる。解放不明・未 join の場合は既存の
+`SafeToTerminateApp` interlock を閉じ、App の失敗を cleanup の成功で上書きしない。
+別 HWND の前面への強制移動は行わない。
+
+シナリオは監視 OFF で HTML の選択ダイアログ・現在フォルダへの保存、PNG の現在フォルダへの保存、
+CF_HDROP の既存 Shell 貼り付けを確認する。選択保存には実ボタンの `click_widget` を使う。
+監視 ON（画像・HTML）では listener 登録完了を待ち、文章のみの HTML と Office 形式の通知処理完了
+sequence を待ってから、小窓への show 要求・保存要求・累積表示回数・現在の可視性・保存ファイルを検査する。
+Office 形式は取り込み reader の OpenClipboard 試行回数が一度も増えないことも検査する。
+fixture writer、従来 Shell 貼り付け、既存の切り取り表示（cut_clipboard）の監視による開封は
+この reader カウンタには含めない。非開封の保証範囲は取り込み reader に限り、mIV 全体の
+非開封は保証しない。リリース済みの cut_clipboard 監視には変更を加えない。
+診断カウンタ・通知処理完了の投影は `test-script` のみで、本番の処理を変更しない。
+
+`clipboard_excel_write(20)` は監視 ON のまま Open → Set → Close、25 ms 後に再び
+Open → Set → Close を 20 回行う。2 回目の Open には retry を入れず、busy ならその回を失敗にする。
+合格は busy が 1 回も無い 20 回だけとする。失敗時は `GetOpenClipboardWindow` で開いている側を診断として残す。
+この照会は失敗の後で行うので、返る相手は失敗させた本人とは限らない (mIV が閉じた直後に別の読み手が開いた場合)。
+そのため mIV 以外のプロセス (2026-10-06 の実測では explorer.exe の CLIPBRDWNDCLASS、20 回に 1 回程度) が
+返ったときも合格扱いにせず、「判定保留」(環境失敗、exit 2) として再実行する。mIV 自身または特定できない場合は失敗。
+この試験は cut_clipboard 監視を含む mIV 全体を相手にし、書き手への干渉を検出する。
+fake writer テストで Close が 25 ms 待機より前にあること、2 回目の busy を再試行しないこと、
+Set 失敗時も開いた Clipboard を閉じることを検査する。最後に S1 の PNG をコピーし、監視保存先の
+月別フォルダに元 PNG と同じ内容が 1 件だけ保存されることを確認する。
+除外確認は固定 sleep 後の見た目だけで成功にしない。
+
+非対話の追加検証は `scripts/test-ui-smoke-approval.ps1`（未了承 guard）、
+`scripts/test-ui-smoke-clipboard-guard.ps1`（別 mIV の起動前拒否・失敗時の案内、プロセス列挙は fake）、
+`scripts/test-ui-smoke-button-runner.ps1`（helper 登録・終了順・環境復元）、
+`scripts/test-ui-smoke-button-helper.ps1 -ClipboardOnly`（fake key owner 7 件、OS 入力なし）、
+`python -B scripts/ui-smoke/test_clipboard_capture_fixture.py`（PNG 構成・同一内容・非空先拒否）を使う。
+Rust fixture test は本番の CF_HTML 解析・DIB decoding、分割 TCP request の loopback HTTP と server join、
+確定 PNG のみのファイル検査を確認する。
+
+既存 run directory の manifest／SHA256 証跡へ scenario、settings override、fixture generator、
+fixture API source、Shell コピー元、手動・監視の保存ファイル、各 checkpoint screenshot と app log を保存する。
+compile test は実 API を登録した Engine で実シナリオをコンパイルするが、Clipboard／OS 入力を実行しない。
+通常の `test-full.ps1` や build gate に live smoke を追加しない。実アプリ結果は次の了承済み検証枠まで未検証。
 
 ### AudioTracks の入力対象契約 (§1.319)
 

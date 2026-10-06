@@ -13,8 +13,8 @@
 //!
 //! 解決策: generic pending work は scheduler、tray lifecycle と media clock はトレイスレッドが担う。
 //!
-//! - **開く (左クリック / メニュー)**: `ShowWindow(hwnd, SW_SHOW)` + `SetForegroundWindow`
-//!   をトレイスレッドから直接呼ぶ。ウィンドウが可視になれば winit/eframe は `update` を
+//! - **開く (左クリック / メニュー)**: 共通 helper で非表示・最小化から復元して前面化する。
+//!   トレイスレッドから直接呼ぶ。ウィンドウが可視になれば winit/eframe は `update` を
 //!   再開する。同時に App 側の事後処理 (throttle/pause 解除、ログ、ツールチップ) のために
 //!   イベントも送信する。
 //! - **一時停止**: `Arc<ActivityGate>` と `Arc<GlobalIoSemaphore>` をトレイスレッドに
@@ -392,7 +392,7 @@ fn run_tray_thread(
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_SHOW,
+        DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
         SW_SHOWNOACTIVATE, TranslateMessage, WM_CLOSE, WM_PAINT,
     };
 
@@ -440,14 +440,6 @@ fn run_tray_thread(
     // HWND は Send/Sync ではないので、`main_hwnd: isize` をキャプチャして呼び出し時に
     // `make_hwnd` で再構成する。Arc<...> は Send+Sync なのでそのままキャプチャして良い。
     //
-    // 黒い矩形フラッシュの対策:
-    // 1. `ShowWindow(SW_RESTORE)` を呼ばない (SW_RESTORE は minimize-from-restore の
-    //    アニメーションをトリガして、元フレームがない状態で一瞬黒枠が見える)。
-    //    保存していた WINDOWPLACEMENT で showCmd も適切に復元されるので不要。
-    // 2. `SetWindowPlacement` は `ShowWindow(SW_SHOW)` より**前**に呼ぶ。後から呼ぶと
-    //    表示済みウィンドウが移動/リサイズされて視覚的なジャンプになる。
-    //    `SetWindowPlacement` の wp.showCmd が SW_SHOWNORMAL なら、この呼び出しで
-    //    ウィンドウは同時に可視化されるため、別途 `ShowWindow` 呼出は不要。
     let hwnd_raw = main_hwnd;
     let do_show_window = {
         let ctx = egui_ctx.clone();
@@ -456,42 +448,12 @@ fn run_tray_thread(
         let event_tx = event_tx.clone();
         let placement_slot = Arc::clone(&placement_slot);
         move || {
-            let hwnd = make_hwnd(hwnd_raw);
-
-            // 保存していた配置があれば先に復元 (位置・サイズ + showCmd)。
-            // このパスで SetWindowPlacement が showCmd=SW_SHOWNORMAL を含むので
-            // 追加の ShowWindow は不要。
-            // ⚠ ロックを握ったまま `SetWindowPlacement` を呼ばないこと。あの API は
-            // カーネルコールバックでこのスレッドのウィンドウプロシージャを呼び戻し、
-            // トレイイベントのハンドラ (= このクロージャ) に再入する。`std::sync::Mutex`
-            // は再入不可なので、そこで自己デッドロックし、以降トレイのクリックも
-            // 右クリックメニューも一切反応しなくなる (2026-07-30 実害。メインウィンドウは
-            // トレイへ格納済みなので復帰手段が無くなる)。
-            // 取り出しだけロック内で行い、guard を落としてから Win32 を呼ぶ。
-            let saved = placement_slot.lock().unwrap().take();
-            let used_placement = if let Some(p) = saved {
-                restore_window_placement(hwnd_raw, &p);
-                true
-            } else {
-                false
-            };
-            if !used_placement {
-                unsafe {
-                    let _ = crate::presentation_observer::show_window(
-                        hwnd,
-                        SW_SHOW,
-                        crate::presentation_observer::WindowRole::Main,
-                        "tray::open",
-                    );
-                }
-            }
-            unsafe {
-                let _ = crate::presentation_observer::set_foreground_window(
-                    hwnd,
-                    crate::presentation_observer::WindowRole::Main,
-                    "tray::open",
-                );
-            }
+            let activation = crate::window_activation::activate_main_window(
+                hwnd_raw,
+                &placement_slot,
+                &ctx,
+                "tray::open",
+            );
             if let Some(sem) = &io_sem {
                 sem.set_throttled(false);
             }
@@ -500,9 +462,7 @@ fn run_tray_thread(
             // ドロップしてよい。状態変更はクロージャ内で既に適用済み。
             let _ = event_tx.try_send(TrayEvent::OpenRequested);
             ctx.request_repaint();
-            crate::logger::log(format!(
-                "tray: Open → placement_restored={used_placement} + SetForegroundWindow"
-            ));
+            crate::logger::log(format!("tray: Open → activation={activation:?}"));
         }
     };
 

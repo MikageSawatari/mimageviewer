@@ -7,7 +7,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/</loc>
-    <lastmod>2026-10-04</lastmod>
+    <lastmod>2026-10-06</lastmod>
     <priority>1.0</priority>
   </url>
   <url>
@@ -51,6 +51,11 @@
     <priority>0.5</priority>
   </url>
   <url>
+    <loc>https://mikage.to/mimageviewer/manual/clipboard-capture.html</loc>
+    <lastmod>2026-10-06</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
     <loc>https://mikage.to/mimageviewer/manual/collections.html</loc>
     <lastmod>2026-10-01</lastmod>
     <priority>0.5</priority>
@@ -62,7 +67,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/effetune.html</loc>
-    <lastmod>2026-10-04</lastmod>
+    <lastmod>2026-10-05</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -737,7 +742,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/faq.html</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-06</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -762,12 +767,12 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/grid.html</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-04</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/index.html</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-06</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -802,12 +807,12 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/settings.html</loc>
-    <lastmod>2026-10-04</lastmod>
+    <lastmod>2026-10-06</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/shortcuts.html</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-06</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -867,7 +872,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tut-color-search.html</loc>
-    <lastmod>2026-07-27</lastmod>
+    <lastmod>2026-10-04</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -907,7 +912,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tut-file-ops.html</loc>
-    <lastmod>2026-09-05</lastmod>
+    <lastmod>2026-10-04</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -922,7 +927,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tut-grid-power.html</loc>
-    <lastmod>2026-09-26</lastmod>
+    <lastmod>2026-10-04</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -947,7 +952,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tut-reading.html</loc>
-    <lastmod>2026-08-13</lastmod>
+    <lastmod>2026-10-04</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -1002,32 +1007,32 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/video.html</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-04</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/migrate-honeyview.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.7</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/migrate-leeyes.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.7</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/migrate-mangameeya.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.7</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/migrate-massigra.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.7</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/migrate-photos.html</loc>
-    <lastmod>2026-09-27</lastmod>
+    <lastmod>2026-10-01</lastmod>
     <priority>0.7</priority>
   </url>
   <url>
@@ -1042,7 +1047,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/privacy.html</loc>
-    <lastmod>2026-10-01</lastmod>
+    <lastmod>2026-10-06</lastmod>
     <priority>0.5</priority>
   </url>
 </urlset>

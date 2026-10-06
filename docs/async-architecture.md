@@ -7,8 +7,54 @@
 
 ## 1. ワーカー一覧
 
+クリップボードの既定保存先は、App 起動後に `clipboard-capture-destination` thread が
+process ごとに一度だけ Shell で解決し、共有 owner に結果を公開する。監視・設定画面・場所▼は
+同じ結果を参照し、UI はメモリ上の解決済み値だけを読む。未解決の間は設定に「確認中」を表示し、
+場所▼の項目は出さない。保存 worker だけ Condvar で待ち、世代変更・stop の通知で旧要求の待機を解除する。
+旧要求を破棄したら後続の明示保存先要求を処理し、待機後にも保存世代を再確認する。
+起動時の一時ファイル掃除は保存先が解決済みの場合だけ行い、未解決なら見送る。再試行は行わない。
+Shell 呼出中の終了は待たない。
+
+取り込み reader は最後の通知から 300 ms 新しい通知がなくなるまで、既存の wake channel で待つ。
+待機中の通知は最新の要求・通知時刻・設定スナップショットに合流し、stop・設定世代の変更で待機を解除する。
+この待機は相手アプリの複数回の書き込みを妨げないためのもので、受理の根拠は引き続き 3 sequence と世代の一致に置く。
+開く前に既知の形式 ID の availability を確認し、除外形式・自身の印・ファイル類・既知の Office 形式・
+有効設定と種別ごとの基準 sequence を満たす画像・HTML がない内容を読み捨てる。
+候補でも要求・形式確認前・形式確認後の sequence が一致する場合だけ開く。不一致は開かずに既存の読み直し判定へ渡す。
+通知のない読み直しは sequence の観測時刻から 300 ms 待ち、最新通知優先・同じスナップショット・1 回の上限を維持する。
+除外した観測も同じ sequence 照合を通し、受理した場合だけ重複ハッシュを消す。
+履歴フラグの値と PowerPoint prefix は開いた後の判定に残す。詳細は設計書 §5.2 の 2a / 2b。
+
+小窓 thread は前面化せず、typed event と repaint (非表示メインには `WM_PAINT` の post) だけを
+App へ渡す。クリック送信時に通知を応答待ちへ移し、同じ通知の「開く」は一度だけ受け付ける。
+App は受付判定後だけ前面化し、拒否時は小窓の文面を差し替える。
+小窓の受付拒否にメインのトーストや表示切り替え、後で開く保留処理は使わない。
+
+HTML 監視では、reader が Clipboard を閉じた後に CF_HTML を解析し、検出時の
+`SelectionSnapshot` を最新 1 件として小窓へ渡す。小窓は「画像を選んで保存」の typed event だけを
+App へ送る。App は一覧・modal・Remote・移動準備の受付判定後に前面化して開き、拒否は小窓へ返す。
+選択ダイアログが開いている間は新たな HTML 検出を無視し、Clipboard を読み直さない。
+
+手動 Ctrl+V は UI 上では `IsClipboardFormatAvailable` による形式分岐だけを行う。
+短命の `clipboard-capture-manual` worker が生データ取得・解析・画像の直接保存を担当し、
+HTML の場合は準備済み snapshot を App の同じダイアログ受付へ返す。監視の抑止は適用しない。
+
+HTML の取得・保存は App 所有 `CaptureFetchService` の固定 4 worker が共通 queue の
+`Startup` / `Start` / `Fetch` / `Save` job を処理する。session ごとに Agent・resolver・接続プールと
+開始時に解決した不変のページ区分を閉じ込め、各 redirect 段で宛先・参照元・残り期限を検査する。
+取得原本・サムネイル準備・一時ファイル I/O は worker 上で行い、UI は bounded channel を poll し、
+1 frame 最大 2 枚だけ texture 化する。保存も同じ worker pool で行い、専用の追加保存 thread は作らない。
+`Fetching` → `Saving` の modal が並行する opens / navigation / close を止め、完了はトーストへ返す。
+最小サイズは live Settings の変更だけを UI で行い、既存の設定保存経路へ委譲する。
+session 取消で通知・未開始仕事を失効させ、最後の fetch / save owner が解放された後に
+短命 cleanup worker が `data-dir/tmp/clipboard-capture/<session id>` を削除する。
+残った一時ルートはサービスの初期化 job で背景削除する。静止時に polling repaint を追加しない。
+
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
+| HTML 画像の取得・選択保存 | `std::thread` (`clipboard-fetch-0`〜`3`) + bounded result channel、session 最終解放後の短命 `clipboard-fetch-cleanup` | App 所有サービスごとに固定 4 worker | 起動時の一時ルート清掃、ページ区分と session 固有 Agent の準備、上限付き取得・ヘッダ寸法検査・原本ハッシュ・縮小画像準備、選択済み原本の背景保存を共通 queue で処理する。ダイアログごとに原本予算 2 GiB、画像ごとに実読取 64 MiB。保存 worker は自動 intent だけ月別保存先の背景解決を待ち、手動 intent は現在の実フォルダ直下へ保存する。最後の fetch / save owner 解放後に一時フォルダを背景削除する |
+| 手動クリップボード取り込み | `std::thread` (`clipboard-capture-manual`) | process ごとに最大 1 要求 | Ctrl+V の画像 / HTML 分岐から短命 worker を起動し、生データ取得後に Clipboard を閉じてから解析・画像保存を行う。HTML snapshot と画像保存の完了・失敗は typed event と repaint で App へ返す。監視の設定世代・除外・重複抑止を参照しない |
+| クリップボード画像・HTML の自動監視 | message-only window STA (`clipboard-capture-listener`) + reader STA (`clipboard-capture-reader`) + bounded 保存 worker (`clipboard-capture-save`) + Win32 / GDI (`clipboard-capture-popup`) | App / process ごとに各 1 | 最初に監視を有効にしたときに非同期起動し、両 OFF でも App 終了まで保持。起動時の読取はしない。通知ごとに不変 `Arc` スナップショットと request serial / sequence / 通知時刻を latest slot へ置く。reader は要求・直前・直後の sequence と現在世代の一致だけを受理し、不一致なら最新要求優先、なければ同じスナップショットで 1 回だけ再読取。開く前の 300 ms の合流待ちと形式 availability の除外判定は上記のとおり。clipboard を開いている間は上限付き生バイトのコピーだけを行い、閉じてから分類・デコード・ハッシュ計算を行う。保存 queue は 1 件に制限し、保存開始前に世代を確認する。開始済みの保存は完了まで行い、古い世代の小窓は表示しない。設定変更で小窓を隠す。UI は typed event と repaint だけを受ける。終了時は listener へ shutdown を post できた場合だけ join し、外部呼出中の reader / 保存 worker は待たない。切り取り監視とは独立。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |
 | 旧 runtime / EffeTune 世代清掃 | `std::thread` (`runtime-cleanup`、短命) | 起動ごとに最大1本、portable／App単体testでは生成しない | core のstartup完了かつ初回egui frame後、UIはdata-dirと固定bundle pathを渡すだけ。workerが他SemVer版／inactive世代をcanonical confinement・全tree reparse検査後にbest-effort削除する。workerでprocess画像を一度だけ列挙し、候補内の実行中画像／同版別coreによる旧世代を保守的に保持する。全cooperative lockを削除しないruntime/.locksの永久fileに置く。候補の使用中lockをexclusiveで一度だけ非blocking取得し、版の抽出／公開lockも削除完了まで保持する。coreはexe所属版のshared leaseをrun入口から保持し、世代解決とpinはegui構築前／既存retry workerで実行。旧publisher互換lockも外側publisherの後で併用する。launcherは版directory作成前にshared leaseを取り、保持したままcoreの引き渡しeventまたは終了をOS waitし、core側は待たない。未確定reader／未知layout／current異常／busyは清掃を見送る。失敗はlogのみ、次回起動へ回す。清掃のtimer・retry loop・UI通知・終了joinは無い。詳細は[配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01) |
 | 合成ビューの pin 資産更新 (§1.313) | `std::thread` + 既存 `metadata_import_refresh::run` | viewer context ごとに最新要求 1 件 | `CurrentViewRefresh::Pins` が変更コンテナ／動画集合を所有。同一 items generation の先行範囲を統合し、FS metadata・cascade DB・catalog DELETE・video pin read／seed write を既存 metadata worker 内で完了し、live cache を変更せず private map を準備する。完了は egui を起こし、mounted context／generation と cache／catalog／policy identity が一致する結果だけを既存 metadata-pin 適用へ渡す。UI terminal は DB handle を持たず準備済みメモリだけを採用する。無関係な Loaded 資産を保持し、token 交換時は変更／未完了動画の producer を再開する。置換・世代切替・retired context・App drop で cancel。同世代の metadata import が pin materialization を置き換える場合も、準備済み対象要求を確定して旧 context owner を取消してから successor worker を開始する。取消する unpin の可視 container keys は既存の無効化対象集合へ引き継ぐ。pin 以外の import や対象外 context は退役させない。詳細は [pin-reload-audit.md](pin-reload-audit.md) |
 | Windows file clipboard cut 観測 | message-only window STA (`cut-clipboard-listener`) + OLE reader STA (`cut-clipboard-reader`) | process ごとに各 1 | production install は UI を待たず `Starting` を返し、同じ backend generation の reader / listener `Ready` が揃った時だけ `Running` にする。起動中の通知・読取結果は順序を保って後から適用し、失敗時は `Disabled` へ収束する。listener は `WM_CLIPBOARDUPDATE` を sequence と単調 request serialで latest slotへ発行するだけで、OLE/clipboard I/Oを行わない。readerが `IDataObject` を自thread内で読み、path正規化と不変集合構築を完了してApp-global reducerへ返す。sequence変更時は旧表示をPendingへ失効し、競合中だけ上限付きbackoffで再取得する。SetData完了もprivate tokenで同じreducerへ入りrepaintを要求する。終了時はlistenerを解除・joinし、起動中または外部COM内で停止不能なthreadは無条件joinしない。testの既定backendはinertで、実clipboard/HWNDを作らない |

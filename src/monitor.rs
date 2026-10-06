@@ -55,6 +55,66 @@ mod ffi {
 // 公開 API
 // -----------------------------------------------------------------------
 
+/// Native popup positioning uses physical pixels and the taskbar-excluded area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalWorkArea {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+pub(crate) fn window_work_area(hwnd_raw: isize) -> Option<PhysicalWorkArea> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+            MonitorFromWindow,
+        };
+        let monitor = unsafe {
+            MonitorFromWindow(
+                HWND(hwnd_raw as *mut _),
+                if hwnd_raw == 0 {
+                    MONITOR_DEFAULTTOPRIMARY
+                } else {
+                    MONITOR_DEFAULTTONEAREST
+                },
+            )
+        };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        Some(PhysicalWorkArea {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd_raw;
+        None
+    }
+}
+
+pub(crate) fn foreground_work_area() -> Option<PhysicalWorkArea> {
+    #[cfg(windows)]
+    {
+        let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        window_work_area(hwnd.0 as isize)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// タイトルバーの中央が接続済みモニター上にあるかを確認する。
 /// モニターが切断されて座標が画面外になっている場合 false を返す。
 /// 引数は egui 論理ピクセル座標。

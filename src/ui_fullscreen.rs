@@ -28363,6 +28363,32 @@ impl App {
 
         let pdf_warm_adoption = crate::test_script::pdf_warm_adoption_checkpoint();
         crate::test_script::TestScriptSnapshot {
+            clipboard_capture: {
+                let diagnostics = crate::clipboard_capture::diagnostics::snapshot();
+                let selection = self.clipboard_capture_smoke_selection();
+                crate::test_script::ClipboardCaptureSmokeSnapshot {
+                    monitor_ready: self.clipboard_capture_service.smoke_monitor_ready(),
+                    image_enabled: self.settings.clipboard_capture_image_enabled,
+                    html_enabled: self.settings.clipboard_capture_html_enabled,
+                    dialog_open: selection.is_some(),
+                    fetch_complete: selection.as_ref().is_some_and(|s| s.0),
+                    selected_count: selection.as_ref().map_or(0, |s| s.1 as i64),
+                    dialog_destination: selection
+                        .as_ref()
+                        .map_or_else(String::new, |s| s.2.clone()),
+                    minimum_short_side_px: selection.as_ref().map_or(
+                        self.settings.clipboard_capture_min_short_side_px as i64,
+                        |s| s.3 as i64,
+                    ),
+                    popup_visible: self.clipboard_capture_service.smoke_popup_visible(),
+                    popup_shows: i64::try_from(diagnostics.popup_shows).unwrap_or(i64::MAX),
+                    popup_requests: i64::try_from(diagnostics.popup_requests).unwrap_or(i64::MAX),
+                    save_requests: i64::try_from(diagnostics.save_requests).unwrap_or(i64::MAX),
+                    open_count: i64::try_from(diagnostics.open_count).unwrap_or(i64::MAX),
+                    automatic_sequence: i64::from(diagnostics.automatic_sequence),
+                    paste_count: i64::try_from(diagnostics.paste_count).unwrap_or(i64::MAX),
+                }
+            },
             always_on_top: self.settings.always_on_top,
             window_visible: self.window_visible,
             is_fullscreen: fs_idx.is_some(),

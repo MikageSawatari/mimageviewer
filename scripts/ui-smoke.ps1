@@ -26,7 +26,7 @@ FolderHistory checks Rating and Collection folder history with real shortcut inp
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop', 'ClipboardCapture')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -40,8 +40,28 @@ if (-not $InteractiveApproved) {
         '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
     exit 2
 }
+if ($Scenario -eq 'ClipboardCapture') {
+    # Check every installation before preparation can launch anything. Another
+    # instance's image monitor could save our fixtures into its real destination.
+    try {
+        $otherMivProcesses = @(Get-Process -ErrorAction Stop | Where-Object {
+            $_.ProcessName -in @('mimageviewer', 'mimageviewer-core')
+        })
+    }
+    catch {
+        [Console]::Error.WriteLine('[ui-smoke] ClipboardCapture cannot inspect running processes. Close mIV first, including tray-resident instances, then retry. No application was started.')
+        exit 2
+    }
+    if ($otherMivProcesses.Count -gt 0) {
+        [Console]::Error.WriteLine('[ui-smoke] ClipboardCapture requires all other mIV instances to be closed first, including tray-resident instances (mimageviewer.exe / mimageviewer-core.exe, from any location). No application was started; existing instances were not stopped.')
+        exit 2
+    }
+}
 if ($Scenario -eq 'AudioTracks' -and -not $PSBoundParameters.ContainsKey('TimeoutSeconds')) {
     $TimeoutSeconds = 240
+}
+if ($Scenario -eq 'ClipboardCapture' -and -not $PSBoundParameters.ContainsKey('TimeoutSeconds')) {
+    $TimeoutSeconds = 180
 }
 
 $ErrorActionPreference = 'Stop'
@@ -422,7 +442,7 @@ function Stop-ExactUiSmokeProcess {
 }
 
 function Finalize-UiSmokeButtonHelper {
-    if ($Scenario -ne 'NativeTopPanoramaClick') { return }
+    if ($Scenario -notin @('NativeTopPanoramaClick', 'ClipboardCapture')) { return }
     if (-not (Get-Command -Name 'Resolve-UiSmokeButtonHelperFinalization' -CommandType Function -ErrorAction SilentlyContinue)) {
         if ($script:buttonHelperStarted) {
             throw 'native button helper started without its runner finalization policy'
@@ -553,6 +573,12 @@ function Save-UiSmokeEvidence {
         if ($script:fixtureDir) {
             Try-AddUiSmokeEvidenceDirectory $script:fixtureDir 'inputs/fixture' 'fixture'
         }
+        if ($Scenario -eq 'ClipboardCapture' -and $script:fixtureDir) {
+            $clipboardRoot = Split-Path -Parent $script:fixtureDir
+            Try-AddUiSmokeEvidenceDirectory (Join-Path $clipboardRoot 'source') 'inputs/clipboard-source' 'clipboard-source'
+            Try-AddUiSmokeEvidenceDirectory (Join-Path $clipboardRoot 'captures') 'outputs/clipboard-captures' 'clipboard-captures'
+            Try-AddUiSmokeEvidenceFile (Join-Path $repoRoot 'src\test_script\clipboard_capture.rs') 'inputs/clipboard-fixture-api.rs' 'clipboard-fixture-api'
+        }
         if ($script:fixtureGeneratorPath) {
             Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPath 'inputs/fixture-generator.py' 'fixture-generator'
         }
@@ -617,11 +643,11 @@ function Save-UiSmokeEvidence {
         executable_sha256 = $script:validatedExeHash
         failure = $script:failureMessage
         archive_errors = @($script:archiveErrors)
-        button_helper_required = ($Scenario -eq 'NativeTopPanoramaClick')
+        button_helper_required = ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture'))
         button_helper_pipe = $script:buttonHelperPipeName
         button_helper_session = $script:buttonHelperSession
-        button_helper_server_pid = if ($Scenario -eq 'NativeTopPanoramaClick') { $PID } else { $null }
-        button_helper_expected_app_pid = if ($Scenario -eq 'NativeTopPanoramaClick') { $script:startedPid } else { $null }
+        button_helper_server_pid = if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) { $PID } else { $null }
+        button_helper_expected_app_pid = if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) { $script:startedPid } else { $null }
         button_helper_started = $script:buttonHelperStarted
         button_helper_join_attempted = $script:buttonHelperJoinAttempted
         button_helper_joined = if ($null -ne $script:buttonHelperStatus) { [bool]$script:buttonHelperStatus.Joined } else { $null }
@@ -753,7 +779,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop', 'ClipboardCapture')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -839,6 +865,45 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'ClipboardCapture' {
+        $scenarioRoot = Join-Path $dataDir 'clipboard-capture'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\clipboard-capture.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'manual'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_clipboard_capture_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\clipboard-capture') 'clipboard-capture-fixture'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'clipboard-capture-fixture'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'clipboard-capture-fixture'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] clipboard fixture input missing: $path"
+            }
+        }
+        & python $candidateFixtureGeneratorPath $scenarioRoot
+        if ($LASTEXITCODE -ne 0) { throw '[ui-smoke] clipboard fixture generator failed' }
+        Assert-NoReparseTree $scenarioRoot 'clipboard-capture-fixture'
+        $seed = Join-Path $candidateFixtureDir 'seed.png'
+        $source = Join-Path $scenarioRoot 'source\shell-copy.png'
+        if ((Get-FileHash -LiteralPath $seed -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+            throw '[ui-smoke] clipboard source/seed bytes differ'
+        }
+        $dimensions = Get-PngDimensions $seed
+        if ($dimensions.width -ne 200 -or $dimensions.height -ne 200) {
+            throw '[ui-smoke] clipboard fixture must be 200x200'
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            auto_fullscreen_image_folders = $false
+            detached_viewer_open_images_in_window = $false
+            clipboard_capture_image_enabled = $false
+            clipboard_capture_html_enabled = $false
+            clipboard_capture_min_short_side_px = 100
+            clipboard_capture_output_dir = (Join-Path $scenarioRoot 'captures')
+        })
+    }
     'AudioTracks' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\audio-tracks'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\audio-tracks.rhai'
@@ -1626,7 +1691,7 @@ $arguments = @(
     if ($script:sharedAnalyzerPath) {
         Try-AddUiSmokeEvidenceFile $script:sharedAnalyzerPath 'inputs/shared-analyzer.py' 'shared-analyzer'
     }
-    if ($Scenario -eq 'NativeTopPanoramaClick') {
+    if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
         if (-not (Test-Path -LiteralPath $buttonHelperIntegrationPath -PathType Leaf)) {
             throw '[ui-smoke] native button helper runner integration is missing'
         }
@@ -1644,7 +1709,7 @@ $arguments = @(
         throw '[ui-smoke] scenario inputs could not be preserved before launch'
     }
 
-    if ($Scenario -in @('MultiWindowStills', 'MultiWindowRarNav')) {
+    if ($Scenario -in @('MultiWindowStills', 'MultiWindowRarNav', 'ClipboardCapture')) {
         Assert-UiSmokeInputDesktop
     }
 
@@ -1654,7 +1719,7 @@ $arguments = @(
     $script:runPhase = 'running'
     $scenarioClock = [System.Diagnostics.Stopwatch]::StartNew()
     $timeoutMilliseconds = [long]$TimeoutSeconds * 1000L
-    if ($Scenario -eq 'NativeTopPanoramaClick') {
+    if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
         $script:process = Invoke-WithUiSmokeButtonHelperEnvironment `
             $script:buttonHelperPipeName `
             $script:buttonHelperSession `
@@ -1670,7 +1735,7 @@ $arguments = @(
         $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
     }
     $script:startedPid = $script:process.Id
-    if ($Scenario -eq 'NativeTopPanoramaClick') {
+    if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
         $remainingAcceptMilliseconds = [long]$timeoutMilliseconds - $scenarioClock.ElapsedMilliseconds
         if ($remainingAcceptMilliseconds -le 0) {
             throw '[ui-smoke] scenario deadline expired before the native button helper could start'
@@ -1678,11 +1743,20 @@ $arguments = @(
         $acceptTimeoutMilliseconds = [int][Math]::Min(
             [long][int]::MaxValue,
             $remainingAcceptMilliseconds)
+        if ($Scenario -eq 'ClipboardCapture') {
+            $script:buttonHelperHandle = [Miv.UiSmoke.ButtonHelperDraft.ClipboardKeyHelperHandle]::Start(
+                $script:buttonHelperPipeName,
+                $script:buttonHelperSession,
+                [uint32]$script:startedPid,
+                $acceptTimeoutMilliseconds)
+        }
+        else {
         $script:buttonHelperHandle = [Miv.UiSmoke.ButtonHelperDraft.ButtonHelperRunnerApi]::Start(
             $script:buttonHelperPipeName,
             $script:buttonHelperSession,
             [uint32]$script:startedPid,
             $acceptTimeoutMilliseconds)
+        }
         $script:buttonHelperStarted = $true
         Write-UiSmokeEvent (
             'button helper started pipe={0} session={1} server_pid={2} expected_app_pid={3}' -f
@@ -1860,6 +1934,10 @@ catch {
 }
 finally {
     Complete-UiSmokeRun
+}
+
+if ($Scenario -eq 'ClipboardCapture' -and $script:runExitCode -ne 0) {
+    [Console]::Error.WriteLine('[ui-smoke] ClipboardCapture failed. The clipboard may contain simulated Office data or HTML referencing the stopped fixture server. Before resuming normal paste, copy harmless text once. Previous clipboard contents are not restored.')
 }
 
 if ($script:runDir) {

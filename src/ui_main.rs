@@ -11379,6 +11379,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     /// フォルダバー (アドレス行) の設定メニュー (v2.0.0 Phase 3, 実機フィードバック 2026-06-20)。
     /// アドレスバー左端の「フォルダ:」ラベル右クリック、および「設定」メニュー → ツールバー →
     /// フォルダバーの設定 から開く。入力欄と付属操作を一体で並べ替える。
+    /// Place menu entry for the clipboard capture folder. Returns true when clicked
+    /// (the caller closes the menu).
+    fn draw_clipboard_capture_location_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        destination: std::path::PathBuf,
+    ) -> bool {
+        let clicked = ui
+            .button("クリップボード取り込み")
+            .hover_tip(destination.to_string_lossy().to_string())
+            .clicked();
+        if clicked {
+            self.start_folder_pane_open(destination);
+        }
+        clicked
+    }
+
     fn draw_folder_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
         draw_sticky_settings_menu_header(ui, "フォルダバー", true);
         ui.separator();
@@ -14295,7 +14312,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             ui.set_min_width(220.0);
                             let location_entries =
                                 crate::known_folders::location_menu_entries(&self.settings);
+                            // Main-window only (not part of the shared list used by mIV Remote):
+                            // shown right below 本棚フォルダ (before 整理先 and the quick locations).
+                            let mut clipboard_capture_location =
+                                crate::known_folders::main_clipboard_capture_location(
+                                    &self.settings,
+                                );
                             for entry in location_entries {
+                                if matches!(
+                                    entry,
+                                    crate::known_folders::LocationMenuEntry::FileOrganizeDestinations { .. }
+                                        | crate::known_folders::LocationMenuEntry::Separator
+                                        | crate::known_folders::LocationMenuEntry::QuickLocation(_)
+                                        | crate::known_folders::LocationMenuEntry::DriveRoot(_)
+                                ) && let Some(destination) = clipboard_capture_location.take()
+                                    && self.draw_clipboard_capture_location_button(ui, destination)
+                                {
+                                    ui.close();
+                                }
                                 match entry {
                                     crate::known_folders::LocationMenuEntry::DriveList => {
                                         if ui.button("ドライブ一覧").clicked() {
@@ -14407,6 +14441,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         }
                                     }
                                 }
+                            }
+                            if let Some(destination) = clipboard_capture_location.take()
+                                && self.draw_clipboard_capture_location_button(ui, destination)
+                            {
+                                ui.close();
                             }
                         },
                     )

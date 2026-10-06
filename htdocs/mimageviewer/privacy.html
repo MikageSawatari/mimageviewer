@@ -119,7 +119,7 @@
       本アプリは利用者の PC 上でローカルに動作するデスクトップアプリケーションであり、
       <strong>開発者が利用者の個人情報を収集・送信・販売することは一切ありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年9月28日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月6日</p>
   </section>
 
   <section>
@@ -146,6 +146,7 @@
       <li>リモート閲覧の暗証番号（そのままではなく、元に戻せない形に変換して保存）</li>
       <li>リモート閲覧の動作記録（表示にかかった時間などの数値と、開いたページの名前）</li>
       <li>外部ツールへ渡すために一時的に書き出した画像（本アプリの終了時に削除します）</li>
+      <li>クリップボードから取り込んだ画像（取り込みフォルダまたは Ctrl+V を押したときのフォルダへ保存）。出どころの URL がわかる場合は、Windows の Mark of the Web として記録します。ページの画像を選ぶ間の一時ファイルは、取得・保存が終わった後に削除し、異常終了などで残った分は次回起動時に片付けます</li>
       <li>単体exe版・インストーラ版の起動用ファイル（<code>runtime</code> フォルダー）。起動後に古い版や音響調整の旧ファイルのバックグラウンド清掃を試みます。現在の版のファイルは残し、使用中と判断したものや保存先を確認できないものは見送ります。削除できなかったものは次回起動時に再び試します。清掃の競合を防ぐ小さな管理ファイルは削除せず残します</li>
     </ul>
     <div class="info-box">
@@ -206,6 +207,8 @@
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
+      <li><strong>クリップボード取り込み</strong>: クリップボードの取り込み監視は、環境設定のチェックを ON にしたときだけ動きます。コピーしたページの画像は、選択ダイアログを開いたときに、画像の URL へ GET を送って取得します。User-Agent は <code>mImageViewer/&lt;版&gt;</code> です。<br>
+        参照元はブラウザの既定と同じ規則（strict-origin-when-cross-origin）で送ります。同じオリジン（通信方式・ホスト名・ポート）にはページの URL、別のオリジンにはオリジンだけを送り、HTTPS から HTTP へは送りません。ページの URL から認証情報と「#」以降を除きます。Cookie やブラウザのログイン情報は使わず、送信もしません。この機能では、画像取得のための通信以外に、コピー内容や画像を送信・収集しません。<a href="manual/clipboard-capture.html">使い方を見る</a></li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
         PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像・動画・音声を送ります。
         複数の音声トラックがある動画では、トラックの番号と表示名の一覧、および選んだトラックの音声が端末へ渡ります。
@@ -220,7 +223,7 @@
     </ul>
     <p>EPUB の変換も通信を増やしません。本の外部サイトへの要求はすべて遮断し、PC 内で PDF に変換します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
-      これらの通信先（GitHub / mikage.to、リモート閲覧を使う場合の Tailscale 等）は、各社のプライバシーポリシーに従って
+      これらの通信先（GitHub / mikage.to、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
       <strong>開発者がそれらの情報を取得・利用することはありません。</strong>
     </p>
@@ -283,7 +286,7 @@
       runs locally on your PC. <strong>The developer does not collect, transmit, or sell any of
       your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: September 28, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: October 6, 2026</p>
   </section>
 
   <section>
@@ -312,6 +315,7 @@
       <li>The remote-viewing PIN (stored in a form that cannot be turned back into the PIN)</li>
       <li>Remote-viewing operation records (timings and similar numbers, plus the names of the pages you opened)</li>
       <li>Images temporarily exported for external tools (removed when the App exits)</li>
+      <li>Images captured from the clipboard (saved in the capture folder, or in the current folder when you press Ctrl+V). When the source URLs are available, the App records them as Windows Mark of the Web. Temporary files used while selecting page images are removed after fetching and saving have finished; leftovers from an interrupted run are cleaned up at the next start</li>
       <li>Startup files for the installer and single-exe editions (the <code>runtime</code> folder). After startup, the App attempts background cleanup of older versions and old audio-adjustment files. It keeps the current version and skips files identified as in use or whose storage location cannot be verified. Failed deletions are tried again at a later startup. Tiny management files used to coordinate cleanup are kept</li>
     </ul>
     <div class="info-box">
@@ -364,6 +368,8 @@
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
+      <li><strong>Clipboard capture</strong>: capture monitoring runs only when you turn on its checkboxes in Preferences. When you open the image selection dialog for a copied page, the App fetches its images by sending GET requests to the image URLs. Its User-Agent is <code>mImageViewer/&lt;version&gt;</code>.<br>
+        Referrers follow the browser's default rule (strict-origin-when-cross-origin): the page URL for the same origin (scheme, host, and port), only the origin for a different origin, and no referrer when going from HTTPS to HTTP. Credentials and the fragment after "#" are removed from the page URL. Cookies and browser login information are neither used nor sent. This feature does not send or collect clipboard contents or images beyond the requests needed to fetch the images. <a href="manual/clipboard-capture.html">Read the manual</a></li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
         starts listening inside your PC and sends images, video, and audio to a browser on your own phone or
         tablet. For videos with multiple audio tracks, the device receives a list of track numbers and display names,
@@ -377,7 +383,7 @@
     </ul>
     <p>EPUB conversion is not another network case. The App blocks every request the book makes to an external site and converts the book to PDF on your PC. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
-      These endpoints (GitHub / mikage.to, etc.) may record standard access logs (such as IP
+      These endpoints (GitHub / mikage.to, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
       use that information.</strong>
     </p>

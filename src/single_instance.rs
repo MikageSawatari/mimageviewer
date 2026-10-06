@@ -696,7 +696,7 @@ pub(crate) fn spawn_activation_listener(
         use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
         use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForMultipleObjects};
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsWindowVisible, PostMessageW, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
+            IsWindowVisible, PostMessageW, SW_SHOWNOACTIVATE, WM_CLOSE,
         };
         use windows::core::PCWSTR;
 
@@ -755,38 +755,12 @@ pub(crate) fn spawn_activation_listener(
                         crate::logger::log(
                             "single_instance: activate event signaled — restoring window",
                         );
-                        // placement_slot に hide 時の WINDOWPLACEMENT があれば先に復元し、
-                        // DPI 丸めによるサイズ / 位置のズレを回避する (トレイ Open と同じ挙動)。
-                        // ⚠ ロックを握ったまま `SetWindowPlacement` を呼ばないこと。対象 HWND は
-                        // UI スレッド所有なので、この呼び出しは UI スレッドがメッセージを
-                        // 処理するまで戻らない。その間に UI スレッドがトレイ格納で同じ
-                        // `placement_slot` を書きに来ると相互待ちになる
-                        // (`tray_integration.rs` の hide 経路)。トレイスレッド側は同じ形で
-                        // 自己デッドロックしていた (2026-07-30 実害)。
-                        // 取り出しだけロック内で行い、guard を落としてから Win32 を呼ぶ。
-                        let saved = placement_slot.lock().unwrap().take();
-                        let used_placement = if let Some(p) = saved {
-                            crate::tray::restore_window_placement(hwnd_raw, &p);
-                            true
-                        } else {
-                            false
-                        };
-                        unsafe {
-                            if !used_placement {
-                                let _ = crate::presentation_observer::show_window(
-                                    hwnd,
-                                    SW_SHOW,
-                                    crate::presentation_observer::WindowRole::Main,
-                                    "single_instance::activate",
-                                );
-                            }
-                            let _ = crate::presentation_observer::set_foreground_window(
-                                hwnd,
-                                crate::presentation_observer::WindowRole::Main,
-                                "single_instance::activate",
-                            );
-                        }
-                        egui_ctx.request_repaint();
+                        crate::window_activation::activate_main_window(
+                            hwnd_raw,
+                            &placement_slot,
+                            &egui_ctx,
+                            "single_instance::activate",
+                        );
                     } else if r.0 == WAIT_OBJECT_0.0 + 1 && handles.shutdown != 0 {
                         crate::logger::log(
                             "single_instance: shutdown event signaled — requesting clean exit",
