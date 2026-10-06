@@ -529,6 +529,7 @@ preferences_policy! {
         show_location_reading_history => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_bookshelf => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_location_file_organize_destinations => "場所▼の表示状態。他の show_location_* と同じく転送対象外";
         show_location_desktop => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_pictures => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_downloads => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";

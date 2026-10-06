@@ -60,7 +60,7 @@ pub fn draw_preferences_transfer_explanation_snapshot_fixture(ui: &mut egui::Ui,
 
 #[doc(hidden)]
 pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::Ui) {
-    let mut destinations = vec![
+    let destinations = vec![
         crate::settings::FileOrganizeDestination {
             name: "保管".into(),
             path: PathBuf::from(r"D:\写真\保管"),
@@ -70,7 +70,9 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
             path: PathBuf::from(r"\\server\写真\非常に長いフォルダ名\要確認"),
         },
     ];
-    pages::draw_file_organize_destinations_settings(ui, &mut destinations);
+    let mut settings = Settings::default();
+    settings.file_organize_destinations = destinations;
+    pages::draw_file_organize_destinations_settings(ui, &mut settings);
 }
 
 #[doc(hidden)]
@@ -4032,6 +4034,7 @@ mod tests {
                 .is_empty()
         );
         let mut state = preferences_state_for_test(&app.settings);
+        state.settings.show_location_file_organize_destinations = false;
         state
             .settings
             .file_organize_destinations
@@ -4067,14 +4070,23 @@ mod tests {
         prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
         app.install_preferences_settings(state.settings);
         assert_eq!(app.settings.file_organize_destinations, expected);
+        assert!(!app.settings.show_location_file_organize_destinations);
         assert_eq!(app.settings.favorites[0].id, favorite_id);
         assert_eq!(app.settings.toolbar_section_order, toolbar);
         assert!(app.settings.save_checked());
         let persisted = db.load_into_settings().unwrap();
         let mut reopened = preferences_state_for_test(&persisted);
+        assert!(!reopened.settings.show_location_file_organize_destinations);
+        reopened.settings.show_location_file_organize_destinations = true;
         assert_eq!(reopened.settings.file_organize_destinations, expected);
         reopened.settings.file_organize_destinations.clear();
         drop(reopened); // 本番 Cancel と同じく draft を捨てるだけ。
+        assert!(!app.settings.show_location_file_organize_destinations);
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .show_location_file_organize_destinations
+        );
         assert_eq!(app.settings.file_organize_destinations, expected);
         assert_eq!(
             db.load_into_settings().unwrap().file_organize_destinations,

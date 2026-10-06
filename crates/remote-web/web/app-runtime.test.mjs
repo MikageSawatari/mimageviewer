@@ -224,6 +224,7 @@ const {
   remoteBookBookmarkDisplayPage,
   remoteBookBookmarkTargetEntryIndex,
   rootOpenReturnHash,
+  renderPlacesTab,
   resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
@@ -245,6 +246,35 @@ const {
   viewerMenuDefinitions,
   viewerImageUpdateContextExitReason,
 } = await import("./app.js");
+
+test("organize destinations render in server order and use the usual folder route", () => {
+  const content = new FakeElement();
+  const navigations = [];
+  const entries = [
+    { kind: "folder", name: "未接続", path: "Z:/missing" },
+    { kind: "folder", name: "保管", path: "C:/archive" },
+  ];
+  renderPlacesTab(content, { places: [
+    { kind: "bookshelf", name: "本棚フォルダ" },
+    { kind: "file_organize_destinations", name: "整理先", entries },
+    { kind: "separator" },
+    { kind: "folder", entry: { name: "ピクチャ", path: "C:/Pictures" } },
+  ] }, (hash, options) => navigations.push({ hash, options }));
+  const list = content.children[0];
+  assert.equal(list.children[1].children[0].textContent, "整理先");
+  const buttons = list.children[1].children.slice(1);
+  assert.deepEqual(buttons.map((button) => button.title), entries.map((entry) => entry.path));
+  assert.deepEqual(buttons.map((button) => button.children[1].textContent), ["未接続", "保管"]);
+  buttons[0].dispatchEvent({ type: "click" });
+  buttons[1].dispatchEvent({ type: "click" });
+  list.children[3].dispatchEvent({ type: "click" });
+  assert.deepEqual(navigations, ["Z:/missing", "C:/archive", "C:/Pictures"].map((path) => ({
+    hash: `#folder/${encodeURIComponent(path)}`, options: { returnHash: "#home/places" },
+  })));
+  const hidden = new FakeElement();
+  renderPlacesTab(hidden, { places: [] });
+  assert.equal(hidden.children[0].children.some((child) => child.className === "organize-destinations"), false);
+});
 
 test("saved collection sort display distinguishes manual, standard, and shuffle", () => {
   assert.equal(persistentCollectionSortState({ kind: "manual" }).selected, "manual");
