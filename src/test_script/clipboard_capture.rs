@@ -543,42 +543,33 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                     last_holder_pid: None,
                 };
                 // Other desktop readers (observed: explorer.exe CLIPBRDWNDCLASS) also open
-                // the clipboard on each update, as they would against real Excel. A round
-                // blocked by another identified process is redone, at most
-                // FOREIGN_BUSY_LIMIT times in total; a round blocked by mIV itself, or by
-                // an unidentified holder, fails at once.
-                const FOREIGN_BUSY_LIMIT: i64 = 10;
+                // the clipboard on each update, as they would against real Excel. The holder
+                // is looked up after the failed open, so it may be a later opener than the one
+                // that blocked us; a busy round is therefore never excused. Only 20 clean
+                // rounds pass. A foreign holder makes the run inconclusive (environment
+                // failure, rerun); mIV itself or an unidentified holder fails the script.
                 let own_pid = std::process::id();
-                let mut foreign_busy = 0_i64;
-                let mut round = 1;
-                while round <= repetitions {
-                    // A busy open caused by mIV is the regression under test: report it as
-                    // a script failure, not as an environment problem.
+                for round in 1..=repetitions {
                     writer.last_holder_pid = None;
                     if let Err(e) = two_phase_write(&mut writer, &content) {
-                        let foreign = writer.last_holder_pid.is_some_and(|pid| pid != own_pid);
-                        if !foreign || foreign_busy >= FOREIGN_BUSY_LIMIT {
-                            return Err(rhai_error(format!(
-                                "round {round}/{repetitions} (foreign retries {foreign_busy}): {e}"
-                            )));
-                        }
-                        foreign_busy += 1;
-                        crate::logger::log(format!(
-                            "[test-script] Excel two-phase round {round} redone: {e}"
-                        ));
-                        writer
-                            .delay(Duration::from_millis(100))
-                            .map_err(rhai_error)?;
-                        continue;
+                        let message = format!("round {round}/{repetitions}: {e}");
+                        return Err(match writer.last_holder_pid {
+                            Some(pid) if pid != own_pid => native_mouse_environment_error(
+                                &excel_bridge,
+                                format!(
+                                    "Excel two-phase result inconclusive (another process held the \
+                                     clipboard; mIV interference cannot be excluded, rerun): {message}"
+                                ),
+                            ),
+                            _ => rhai_error(message),
+                        });
                     }
-                    round += 1;
                     writer
                         .delay(Duration::from_millis(100))
                         .map_err(rhai_error)?;
                 }
                 let mut result = Map::new();
                 result.insert("successful_second_opens".into(), repetitions.into());
-                result.insert("foreign_busy_retries".into(), foreign_busy.into());
                 result.insert(
                     "sequence".into(),
                     i64::from(unsafe {

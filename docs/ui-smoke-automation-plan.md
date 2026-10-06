@@ -82,10 +82,10 @@ fixture writer、従来 Shell 貼り付け、既存の切り取り表示（cut_c
 
 `clipboard_excel_write(20)` は監視 ON のまま Open → Set → Close、25 ms 後に再び
 Open → Set → Close を 20 回行う。2 回目の Open には retry を入れず、busy ならその回を失敗にする。
-失敗時は `GetOpenClipboardWindow` で開いている側を調べ、mIV 自身または特定できない場合は run を失敗にする。
-mIV 以外の特定できたプロセス (2026-10-06 の実測では explorer.exe の CLIPBRDWNDCLASS) が開いていた回は
-数えずにやり直し、やり直しは run 全体で 10 回までとする。実 Excel も同じ相手と競合するため、
-これは mIV の干渉ではない。やり直し回数は結果の `foreign_busy_retries` に残す。
+合格は busy が 1 回も無い 20 回だけとする。失敗時は `GetOpenClipboardWindow` で開いている側を診断として残す。
+この照会は失敗の後で行うので、返る相手は失敗させた本人とは限らない (mIV が閉じた直後に別の読み手が開いた場合)。
+そのため mIV 以外のプロセス (2026-10-06 の実測では explorer.exe の CLIPBRDWNDCLASS、20 回に 1 回程度) が
+返ったときも合格扱いにせず、「判定保留」(環境失敗、exit 2) として再実行する。mIV 自身または特定できない場合は失敗。
 この試験は cut_clipboard 監視を含む mIV 全体を相手にし、書き手への干渉を検出する。
 fake writer テストで Close が 25 ms 待機より前にあること、2 回目の busy を再試行しないこと、
 Set 失敗時も開いた Clipboard を閉じることを検査する。最後に S1 の PNG をコピーし、監視保存先の
