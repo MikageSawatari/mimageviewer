@@ -4204,6 +4204,21 @@ struct PreparedZipGrid {
     has_foreign_archives: bool,
 }
 
+/// Geometry of the single UI pane, usable only by the context/generation that laid it out.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum GridAspectLayout {
+    #[default]
+    UnlaidOut,
+    Thumbnail {
+        context_id: ViewerContextId,
+        items_generation: u64,
+        cols: usize,
+        cell_width: f32,
+        cell_height: f32,
+    },
+    Details,
+}
+
 /// The shared item installer is entered by ordinary navigation, a Rating list adoption, or
 /// one fully prepared Smart physical-open request. This is distinct from `OpenRequestOwner`:
 /// admission is cheap and
@@ -14157,6 +14172,7 @@ pub struct App {
     pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
     pub(crate) last_cell_h: f32,
+    pub(crate) grid_aspect_layout: GridAspectLayout,
     /// 直近フレームのグリッド列数。行高・ビューポート高と同じ「最後に描いた形」の一部で、
     /// 終了時にカーソルが上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
     pub(crate) last_grid_cols: usize,
@@ -18510,6 +18526,7 @@ impl App {
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
+            grid_aspect_layout: GridAspectLayout::UnlaidOut,
             last_grid_cols: 4,
             scroll_selected_to_rows_above: None,
             last_details_name_width: 140.0,
@@ -20511,28 +20528,56 @@ impl App {
     /// セル比率変更時に「画面先頭に最も近い行」を維持するよう `scroll_offset_y` を補正する。
     /// auto/manual どちらの切替経路からも呼ぶ。
     ///
-    /// **重要**: 呼び出し直後に `last_cell_h` を即更新する (= 同フレーム内の二重呼出しを
-    /// no-op にする)。これが無いと、UI 経路 (Manual→Auto クリック) と内部経路
-    /// (maybe_apply の Switch) が同フレームで両方呼ばれたときに、後者が旧 last_cell_h を
-    /// 基準に anchor_row を再計算してスクロール位置がずれる。
+    /// 同じcontext・items世代・列数の実描画だけを再anchorする。適用した高さを即記録し、
+    /// 同フレーム内の二重呼び出しをno-opにする。予測用last_cell_hだけでは所有を判定しない。
     ///
     /// 設計: [docs/auto-thumb-aspect-plan.md §6](../docs/auto-thumb-aspect-plan.md)
     pub(crate) fn fixup_scroll_for_aspect_change(
         &mut self,
         new_aspect: crate::settings::ThumbAspect,
     ) {
-        let old_cell_h = self.last_cell_h.max(1.0);
-        let new_cell_h = (self.last_cell_size * new_aspect.height_ratio())
+        let context_id = self.projected_viewer_context_id();
+        // Compatibility dimensions also predict thumbnail display size before first paint.
+        // They do not prove that this list owns a laid-out scroll anchor.
+        self.last_cell_h = (self.last_cell_size * new_aspect.height_ratio())
             .round()
             .max(1.0);
-        if (new_cell_h - old_cell_h).abs() < 0.5 {
-            return;
+        if let GridAspectLayout::Thumbnail {
+            context_id: owner,
+            items_generation,
+            cols,
+            cell_width,
+            cell_height,
+        } = &mut self.grid_aspect_layout
+            && *owner == context_id
+            && *items_generation == self.items_generation
+            && *cols == self.settings.grid_cols.max(1)
+            && self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
+        {
+            let new_cell_h = (*cell_width * new_aspect.height_ratio()).round().max(1.0);
+            if (new_cell_h - *cell_height).abs() >= 0.5 {
+                let anchor_row = (self.scroll_offset_y / cell_height.max(1.0)).floor();
+                self.scroll_offset_y = anchor_row * new_cell_h;
+                // Consume the new height so a second fixup in this frame is a no-op.
+                *cell_height = new_cell_h;
+            }
+            self.last_cell_h = new_cell_h;
         }
-        let anchor_row = (self.scroll_offset_y / old_cell_h).floor();
-        self.scroll_offset_y = anchor_row * new_cell_h;
-        // 二重呼び出し対策: last_cell_h を即更新。次の描画フレームでも ui_main.rs が
-        // 再度 compute_cell_size → last_cell_h 更新するので冪等。
-        self.last_cell_h = new_cell_h;
+    }
+
+    pub(crate) fn record_thumbnail_aspect_layout(
+        &mut self,
+        cols: usize,
+        cell_width: f32,
+        cell_height: f32,
+    ) {
+        self.grid_aspect_layout = GridAspectLayout::Thumbnail {
+            context_id: self.projected_viewer_context_id(),
+            items_generation: self.items_generation,
+            cols,
+            cell_width,
+            cell_height,
+        };
     }
 
     /// items と thumbnails を常にセットで push するヘルパー (docs §10.4.2)。
@@ -28361,6 +28406,7 @@ impl App {
         &mut self,
         keep: SearchMode,
     ) -> Option<top_level_grid_view::TopLevelGridRestore> {
+        self.save_leaving_rating_grid_position();
         self.capture_main_list_restore_cursor();
         let current_restore = self.current_top_level_restore_snapshot();
         let mut transferred = self.dismiss_snapshot_without_restore();
@@ -32148,7 +32194,6 @@ impl App {
     }
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
-        self.rating_view_rows_stars = Some(result.stars);
         self.rating_view_rows = result.rows;
         self.rating_view_skipped = result.skipped;
         if let Some(prepared) = result.prepared {
@@ -32353,6 +32398,9 @@ impl App {
         previous_selected_key: Option<String>,
         retained_details_rated_at_sort: Option<bool>,
     ) {
+        // Both prepared and legacy installs publish the star identity of the visible rows.
+        // A search may change the surface while these rows are still interactive.
+        self.rating_view_rows_stars = Some(self.rating_view_stars);
         self.items_are_rating_view = true;
         if let Some(ascending) = retained_details_rated_at_sort {
             // generic な一覧差し替えは一度 view flag を落として通常ビュー退出を確定する。
@@ -35735,7 +35783,7 @@ impl App {
         );
     }
 
-    fn save_leaving_rating_grid_position(&mut self) {
+    pub(crate) fn save_leaving_rating_grid_position(&mut self) {
         // ZIP pending UI has already saved and cleared the source grid without clearing
         // its view flags. Its empty interim display must not overwrite that position.
         if self.navigation_scope.is_detached_physical()

@@ -2237,6 +2237,42 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 主要2経路修正・自動検証完了、残件あり (2026-10-07)
 
+- 保存/描画ownerの追補 (2026-10-07、`68a3200f7`後の調査):
+  - saved Rating位置の優先により、Aを保存→B選択→検索結果B→検索closeで古いAに戻る
+    経路を確認。検索entryと結果採用、Rating→Collectionのaccepted openで、旧itemsを
+    消す前に既存Rating保存helperを呼ぶ。検索結果到着前の選択変更も採用境界で捕捉する。
+    Rating保存の優先順位、Collection自身のanchor、StartupListIntentは変更しない。
+    prepared/legacy共通採用で表示rowsの★段stampも確定し、検索surfaceへ変更後も
+    結果到着まで操作できる旧Rating rowsの保存先を特定する。
+    stamp公開は共通採用ownerへ一本化する。検索結果待ちの★3→★5で、worker結果到着時に
+    新★段stampを先に公開すると旧itemsを★5へ誤保存するため、その早期更新を削除した。
+  - 共通aspect fixupが別一覧の`last_cell_h`を使えることを確認。単一描画paneの
+    `GridAspectLayout`にcontext・世代・列数・実寸法を記録し、一致したThumbnailだけ
+    再anchorする。新installやDetailsには借用できる旧寸法がない。適用時に記録高を
+    進め、二重補正を防ぐ。待機・追加repaint・再ensure-visibleは加えない。
+  - 実機warmログの直接原因は未断定。通常SLIはseed前にoffsetを0にし、Rating位置は
+    seed後に復元するため、旧fixupの`floor(0 / old_h)`だけでは0→120→220行の跳躍を
+    説明できない。Collection install直後の即時判定も、presentation公開前は母数0で
+    切替を通らない。共通seed ownerの境界回帰とRating実catalogのHold往復を分けて検証する。
+  - 詳細: [auto-thumb-aspect-plan.md §5.3/§6](auto-thumb-aspect-plan.md)。縦長Auto fixtureの
+    実アプリ確認はcoordinatorへ引き継ぎ、今回も製品バイナリは起動しない。
+  - valid red: `68a3200f7`の製品コード + 新回帰4件はbuild成功後に0成功/4失敗、exit 1。
+    検索往復、検索結果採用前の選択変更、Collection退出で古いAへ戻り、24 cache samplesによる
+    即時Switchでは新世代の初描画前にoffsetが旧寸法で変わった。証跡 `target/1328-red-4.txt`。
+    warm SwitchはCollection sessionを束縛しない共通seed ownerの境界検査であり、実機再現とは
+    区別する。実catalogを保存したRating toolbar往復/BSでは3:4復元後に24 seedがHoldとなり、
+    異なる2:3の移動元gridでも選択行が可視・offset一致を維持した。
+    検索待ち中の★段切替回帰は追補の暫定修正上で1失敗/exit 1を確認し、早期stamp更新削除で
+    修正する。この追加redはpristine `68a3200f7`での4件とは区別して同証跡に記録した。
+  - 修正後: 対象29成功/0失敗、全lib(pipeなし)は10,925成功/0失敗/52 ignored、実exit 0 (906秒)。
+    同一覧補正の二重呼び出し、context/世代/列数/Details不一致、legacy stamp、検索3種、
+    Collectionの直接open/履歴adoption、検索待ち中の★段切替を含む。test-script 123件、fixture Python 5件、fmt、
+    glyph 0件、PowerShell AST、通常/portable core checkも成功。7ファイルの局所差分でCRLF維持。
+    portable/test-script buildも成功 (23分22秒、runtime=4/PE=17)。SkipBuild再準備の
+    source fingerprint/binary hash検査も成功。suiteは起動せず、coordinator再実行待ち。
+    dev-runtimeもPreserveRuntimeで成功 (14分05秒、runtime=4/PE=3)。core/remote/EPUBを
+    再構築した。製品起動・プロセス終了・commitは行っていない。文案は `target/1328-msg-4.txt`。
+
 - Auto比率の追加調査・修正 (2026-10-07、以下の旧経過を更新):
   - 実機の入力はtoolbar ←。画像のみフォルダを本として開く設定はOFF、サムネ比率はAuto。
     実ログをread-onlyで確認し、★3一覧の各復帰でseed後に1:1→3:4へ切り替わることを確認した。
@@ -2271,9 +2307,8 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
     | Drive | 通常はiconだがpin代表画像はAuto sampleになり得る。cache対象外・専用installで比率/位置を組として保存しない。Driveの復帰owner整備が必要で今回未修正 |
     | A/B | 通常一覧は既存path cache、★一覧は今回のcontext位置owner |
 
-    - 追加の退出残件: Rating→Collectionの専用empty installはSLIを通らず、最新Rating位置の
-      capture接続が無い。Collectionの既存挙動を変更しない制約のため今回未修正。
-      Ratingの物理コンテナopen/★段変更/明示退出/Driveと区別し、この経路の復帰は保証しない。
+    - 上記の追補でRating→Collectionと検索の軽量退出も同じ保存helperへ接続した。
+      検索/Snapshot等が自身の比率・位置を組として保存しない残件は別件として維持する。
 
   - valid red: 修正前 `ce12c2fb7` の製品コード + 新回帰3件はbuild成功後に0成功/3失敗、exit 1。
     下方の120フォルダ一覧から開いて第4画像を選び、toolbar ←相当handler、→後の←、Backspaceの

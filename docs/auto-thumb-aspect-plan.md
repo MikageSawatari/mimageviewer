@@ -542,9 +542,16 @@ opened-row anchor不足と合わせて別の復帰owner整備が必要。今回�
 Driveもcache対象外で専用installを使う。通常はiconだがpin代表画像はAuto sampleになり得るため、
 比率/位置を組として保存するDrive復帰ownerの整備を別件に残す。A/Bの通常一覧はpath cache、
 Ratingは上記のcontext位置ownerで扱う。
-また、RatingからCollectionへ直接移る専用empty installはSLI保存を通らないため、
-この退出で最新Rating位置を捕捉する接続は残る。Collection側のentry anchor/比率の挙動は
-今回変更しない。上記のRating位置保証は物理コンテナopen・★段変更・明示退出/Driveの経路に限る。
+2026-10-07追補: SLIを通らない検索entry、検索結果の最初の採用、Rating→Collectionの
+accepted openでも、旧itemsを置き換える前に同じRating保存helperを呼ぶ。検索entry後も
+旧一覧は結果到着まで操作できるため、entry時だけでなく結果採用時にも最新位置を捕捉する。
+採用後はRating flagが落ち、後続の検索結果更新は保存しない。復帰のsaved-key優先順位は
+維持する。Collection側のentry anchor/比率の挙動は変更しない。
+prepared/legacy共通のRating採用ownerが表示rowsの★段stampを確定し、検索surfaceへ
+変わってもまだ表示中の旧Rating rowsの★段を保存helperが識別できるようにする。
+★段stampの公開はこの共通採用ownerだけが行う。worker結果の到着時には新★段へ
+上書きせず、旧itemsの保存完了まで旧★段を保持する。検索結果待ちの★3から★5へ
+移る場合も、待機中の最新選択/offsetは★3へ保存され、★5の位置へ混入しない。
 
 ### 5.4 描画側の置き換え
 
@@ -564,26 +571,28 @@ rg 'settings\.thumb_aspect[^_]' src/
 画面外に飛ぶ。手動切替でも今ガクッと飛んでいるはず (= 既存バグ)。
 **今回の修正でついでに直す**。
 
-`App` には既に **`last_cell_size`** (= cell_w) と **`last_cell_h`** が
-あり、前フレーム描画時の値が入っている ([src/app.rs:1724-1726](../src/app.rs))。
-新セルの cols は変わらないので、`old_cell_h / new_cell_h = old_ratio /
-new_ratio` の関係で `scroll_offset_y` を比例補正できる:
+2026-10-07追補: `last_cell_size` / `last_cell_h` は描画の予測値にも使われ、一覧を
+置換しても前一覧の値が残る。これだけで補正すると、新一覧のoffsetを別一覧の行高で
+解釈してしまう。`App.grid_aspect_layout` を `UnlaidOut` / `Thumbnail` / `Details` の
+typedな描画記録とし、Thumbnailはcontext ID・items generation・列数・実セル幅/高を持つ。
+単一UI paneの記録であり、context bundleに転送する状態や新しいpending stateではない。
 
-```rust
-/// 比率変更時のスクロール補正だけを行う pure helper。
-/// auto / manual どちらの経路からも呼ぶ (state 書き換えは呼び出し側)。
-fn fixup_scroll_for_aspect_change(&mut self, new_aspect: ThumbAspect) {
-    let old_cell_h = self.last_cell_h.max(1.0);
-    let new_cell_h = (self.last_cell_size * new_aspect.height_ratio()).round().max(1.0);
-    if (new_cell_h - old_cell_h).abs() < 0.5 {
-        return; // 変化なし
-    }
-    // 画面先頭の row index を維持
-    let anchor_row = (self.scroll_offset_y / old_cell_h).floor();
-    self.scroll_offset_y = anchor_row * new_cell_h;
-    // (描画ループ側の clamp に任せる)
-}
-```
+thumbnail描画は寸法の変化有無にかかわらず毎回この記録を公開し、details描画はDetailsへ
+置き換える。fixupは同じcontext・世代・列数で、現在もThumbnailの場合だけ先頭行を
+`floor(offset / old_h) * new_h` へ補正する。補正後の記録高を即更新して同フレームの
+二重呼び出しを冪等にする。新一覧・別context・列数変更・Detailsには再anchorする
+自分自身のthumbnail layoutがないためoffsetを動かさず、既存の初回layout/clampと
+opened-pathのensure-visibleに任せる。互換の`last_cell_h`予測更新は続ける。
+
+新しい世代のinstallが旧描画記録を自然に不一致にするので、各installへのreset追加、
+待機・repaint・再ensure-visibleは不要。同世代のsmart appendや通常の比率変更は
+自分の描画記録で補正する。cache復元は比率の復元であり、描画記録を公開しない。
+
+実機のwarmログは、SLIのoffset reset後・Rating位置復元前のseedで切り替わる。
+offset 0への旧fixupだけでは観測された連続跳躍を説明できず、直接原因は断定しない。
+Collection installerの即時seedも、presentation/世代の公開前は母数0で切替判定を通らない。
+回帰は共通seed ownerで実cache entryによる即時Switchを起こす境界検査と、Ratingの
+実catalogを使ったsaved 3:4→Holdの往復検査を分けて行う。
 
 呼び出し経路:
 

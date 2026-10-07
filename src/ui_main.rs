@@ -16424,6 +16424,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.last_cell_size = content_w;
             self.last_cell_h = Self::DETAILS_ROW_H;
         }
+        self.grid_aspect_layout = crate::app::GridAspectLayout::Details;
 
         let mut nav: Option<AddressBarNav> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
@@ -18504,6 +18505,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // 行高・ビューポート高と同じく「最後に描いた形」。終了時にカーソルが
                 // 上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
                 self.last_grid_cols = cols;
+                self.record_thumbnail_aspect_layout(cols, cell_w, cell_h);
 
                 if scroll_to {
                     self.apply_scroll_to_selected(cols, cell_h);

@@ -21968,7 +21968,7 @@ mod phase_c_folder_nav_history_tests {
         rating_1328_folder_or_pdf_return(true, false, false);
     }
 
-    fn rating_1328_tall_folder_return(backspace: bool, roundtrip: bool) {
+    fn rating_1328_tall_folder_return(backspace: bool, roundtrip: bool, warm: bool) {
         use crate::settings::ThumbAspect;
         use std::sync::atomic::Ordering;
 
@@ -22052,6 +22052,46 @@ mod phase_c_folder_nav_history_tests {
         assert!(visible(&app));
         let saved_offset = app.scroll_offset_y;
         assert!(saved_offset > 0.0);
+        if warm {
+            let catalog = app.current_color_catalog.as_ref().unwrap();
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(96, 128))
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .unwrap();
+            for (index, item) in app.items.iter().enumerate().take(24) {
+                let (mtime, size) = app.image_metas[index].unwrap();
+                let request = crate::app::make_load_request(
+                    item,
+                    index,
+                    mtime,
+                    size,
+                    false,
+                    app.pdf_current_password.as_deref(),
+                    Some(app.settings.folder_thumb_sort),
+                    app.settings.folder_thumb_depth,
+                    &app.folder_pin_map,
+                    &app.converted_archive_cache_paths,
+                    app.archive_source_override.as_deref(),
+                    app.current_folder.as_deref(),
+                    app.folder_thumb_pin_db.as_deref(),
+                    app.video_pin_db.as_ref(),
+                    app.use_full_path_cache_keys(),
+                )
+                .unwrap();
+                let key = crate::thumb_loader::cache_key_for_request(&request).unwrap();
+                catalog
+                    .save(
+                        &key,
+                        request.mtime,
+                        request.file_size,
+                        96,
+                        128,
+                        Some((96, 128)),
+                        encoded.get_ref(),
+                    )
+                    .unwrap();
+            }
+        }
         let nav = app.grid_physical_navigation(104, opened.clone(), false);
         assert!(app.apply_fullscreen_close_nav_immediate(nav));
         finish_staged_physical_history_for_test(&mut app);
@@ -22060,6 +22100,10 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(app.effective_folder(), Some(opened.clone()));
             app.selected = Some(3);
             app.scroll_to_selected = true;
+            if warm {
+                // The departing image grid has a different shape from the Rating grid.
+                app.auto_aspect.current = Some(ThumbAspect::Portrait2x3);
+            }
             draw(&mut app, &ctx);
             assert!(visible(&app));
             if backspace {
@@ -22072,6 +22116,15 @@ mod phase_c_folder_nav_history_tests {
             assert!(app.items_are_rating_view);
             assert_eq!(app.selected, Some(104));
             assert_eq!(app.items[104].container_path(), Some(opened.as_path()));
+            if warm {
+                assert_eq!(app.auto_aspect.samples.len(), 24, "real catalog warm seed");
+                assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+                assert_eq!(
+                    app.auto_aspect.switches_done, 0,
+                    "saved aspect must seed Hold"
+                );
+                assert_eq!(app.scroll_offset_y, saved_offset);
+            }
             draw(&mut app, &ctx);
             assert!(
                 visible(&app),
@@ -22104,17 +22157,27 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn section1328_rating_tall_folder_toolbar_back_stays_visible_after_aspect_settles() {
-        rating_1328_tall_folder_return(false, false);
+        rating_1328_tall_folder_return(false, false, false);
     }
 
     #[test]
     fn section1328_rating_tall_folder_forward_back_stays_visible_after_aspect_settles() {
-        rating_1328_tall_folder_return(false, true);
+        rating_1328_tall_folder_return(false, true, false);
     }
 
     #[test]
     fn section1328_rating_tall_folder_backspace_control_stays_visible_after_aspect_settles() {
-        rating_1328_tall_folder_return(true, false);
+        rating_1328_tall_folder_return(true, false, false);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_warm_catalog_toolbar_round_trip_keeps_position() {
+        rating_1328_tall_folder_return(false, true, true);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_warm_catalog_backspace_control_keeps_position() {
+        rating_1328_tall_folder_return(true, false, true);
     }
 
     #[test]
@@ -22149,6 +22212,146 @@ mod phase_c_folder_nav_history_tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn section1328_followup4_pending_search_star_change_keeps_departing_star_owner() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        let _ = rating_1328_install_rows(&mut app);
+        let five = app.tmp.path().join("five.jpg");
+        std::fs::write(&five, b"image").unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(
+                &crate::adjustment_db::normalize_path(&five),
+                5,
+                Some(
+                    &crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                        .with_source_path(&five),
+                ),
+            )
+            .unwrap();
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.open_global_search();
+        // These are still the adopted star-3 rows, although the surface is now Search.
+        app.selected = Some(4);
+        app.scroll_offset_y = 725.0;
+        let expected = app.rating_path_key(4).unwrap();
+        app.enter_rating_view(5);
+        finish_rating_navigation_for_test(&mut app);
+        assert!(!app.global_search.active);
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.rating_view_rows_stars, Some(5));
+        let departed = app.top_level_grid_view.rating_grid_position(3).unwrap();
+        assert_eq!(departed.selected_key, Some(expected.clone()));
+        assert_eq!(departed.scroll_offset_y, 725.0);
+        assert!(
+            app.top_level_grid_view.rating_grid_position(5).is_none(),
+            "new star list must not capture the departing star's items"
+        );
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+        assert_eq!(app.scroll_offset_y, 725.0);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_search_round_trip_keeps_latest_selection() {
+        use crate::app::SearchMode;
+        for mode in [
+            SearchMode::Global,
+            SearchMode::Favsearch,
+            SearchMode::TagView,
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+            app.rating_view_rows = rating_1328_install_rows(&mut app);
+            app.rating_view_stars = 3;
+            app.install_rating_view_rows();
+            app.selected = Some(0);
+            let saved_key = app.rating_path_key(0).unwrap();
+            app.save_leaving_rating_grid_position();
+            app.enter_rating_view(3);
+            finish_rating_navigation_for_test(&mut app);
+            assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(saved_key));
+            app.selected = Some(4);
+            app.scroll_offset_y = 500.0;
+            let expected = app.rating_path_key(4).unwrap();
+            let results = app.items.clone();
+            match mode {
+                SearchMode::Global => app.open_global_search(),
+                SearchMode::Favsearch => app.open_favsearch(),
+                SearchMode::TagView => app.open_tag_view(),
+                _ => unreachable!(),
+            }
+            app.replace_search_view_items(results, vec![None; 6]);
+            assert_eq!(app.selected, Some(4));
+            match mode {
+                SearchMode::Global => app.close_global_search(),
+                SearchMode::Favsearch => app.close_favsearch(),
+                SearchMode::TagView => app.close_tag_view(),
+                _ => unreachable!(),
+            }
+            finish_rating_navigation_for_test(&mut app);
+            assert!(app.items_are_rating_view);
+            assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+            assert_eq!(app.scroll_offset_y, 500.0);
+        }
+    }
+
+    #[test]
+    fn section1328_followup4_rating_selection_before_search_adoption_is_saved() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.rating_view_stars = 3;
+        app.install_rating_view_rows();
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.open_global_search();
+        // Until the first result arrives, the old Rating grid remains interactive.
+        app.selected = Some(4);
+        app.scroll_offset_y = 600.0;
+        let expected = app.rating_path_key(4).unwrap();
+        let results = app.items.clone();
+        app.replace_search_view_items(results, vec![None; 6]);
+        app.close_global_search();
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+        assert_eq!(app.scroll_offset_y, 600.0);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_collection_exit_captures_latest_position() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.rating_view_stars = 3;
+        app.install_rating_view_rows();
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.selected = Some(4);
+        app.scroll_offset_y = 700.0;
+        let expected = app.rating_path_key(4).unwrap();
+        app.open_collection_grid_after_context_change(
+            crate::collection_store::CollectionId::new(),
+            None,
+            Some(super::top_level_grid_view::TopLevelGridRestore::Rating { stars: 3 }),
+        );
+        assert!(!app.items_are_rating_view);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+        assert_eq!(app.scroll_offset_y, 700.0);
     }
 
     #[test]
