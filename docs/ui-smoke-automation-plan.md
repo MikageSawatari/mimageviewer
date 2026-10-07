@@ -475,11 +475,20 @@ prepare・App・runnerの終了値は分ける。cleanupとarchiveに例外が�
 ### §1.328: rating-folder-back の採取用Suite (2026-10-07、実行は引き継ぎ待ち)
 
 `scripts/ui-smoke.ps1 -Suite RatingFolderBack` (`-Scenario` の別名) は、隔離 data に
-12 フォルダ × 8 PNG と 3 ZIP × 8 PNG を作り、15 コンテナすべてを ★3 にする。
-900×650、3列の一覧で `12-folder` / `23-book.zip` を下方までスクロールして選ぶ。
-全PNGは96×128 (3:4)で、`thumb_aspect_auto=true`。初回★一覧と各復帰で、実描画世代の
-Auto 3:4と15代表すべてのsample到着を観測してから採取する。固定時間待ちや戻り行の
-再選択でsettle後の可視性を補正しない。旧8×8・Auto OFFのfixtureでは比率再切替を検査できなかった。
+12 フォルダ × 8 PNG、3 ZIP × 8 PNG、585 直接画像を作り、計600行すべてを ★3 にする。
+900×1000、10列で `0310-folder` / `0311-book.zip` (index309/310、row30/31) を選ぶ。
+直接画像は96×128 (3:4)、フォルダ/ZIP内は96×144 (2:3)、`thumb_aspect_auto=true`。
+★一覧sortも`Normal(FileName)`に明示し、★時刻順のtie-breakへ依存しない。
+初回★一覧と各復帰ではAuto 3:4と31以上の実sampleを待つ。15コンテナの2:3代表が
+すべて混ざっても中央値を保つためであり、待機中に位置を補正する処理は加えない。
+子一覧は2:3・8sample・第4画像の採用を確認する。実描画のviewportが6〜8行 (約70セル)、
+選択rowが25〜35、viewport以後も10行以上残ることを検査し、末尾clampで偶然可視になる
+小一覧を除く。旧15行・3列・両側3:4のfixtureは今回の実機条件を検査できなかった。
+固定時間待ちや戻り行の再選択でsettle後の可視性を補正しない。
+共通表示は10列、お気に入り表示の記憶をONにし、対象folder/ZIPだけUUID付きお気に入りと
+6列の保存表示状態を隔離`adjustment.db`へ登録する。子の実描画が6列になったことを確認し、
+復帰先は10列を要求する。列数をscenarioから書き換えず、通常のfavorite overlay所有者を通す。
+生成済みDB/overrideがある場合は変更前に拒否し、fixture用の新規領域だけを使う。
 場所▼ → レーティング → ★★★ の実 widget をクリックし、実セルのdouble-clickで開く。
 第4画像もセルのclickで選ぶ。これらとツールバー←／→はfocus不要のROOT pointer経路を使う。
 rating/history の直接 action や既存 `open_rating_one` helper は使わない。
@@ -531,7 +540,7 @@ coordinatorからbackground launchによるWindows foreground lockの報告が�
 戻る前に対象コンテナの `page-04.png` 選択を確認する。撮影名も短いASCII別名へ変更し、
 ZIP名の「.」と48文字制限の違反を避ける。非対話の契約テストで未採用snapshotの拒否と
 22ケースの撮影名／予算を確認する。修正版の実アプリ結果はcoordinatorの再実行待ち。
-起動前の変数生成もheadlessで評価し、15行／8画像と library／★一覧の別パスを確認した。
+起動前の変数生成もheadlessで評価する。600行の件数・順序・中間の対象名と、8画像／library／★一覧の別パスを確認する。
 Rhaiの `replace` は文字列を変更して値を返さないので、★一覧パスはlibraryのコピーから作る。
 
 ## S1: 窓snapshotとtargetの所有

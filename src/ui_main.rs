@@ -18494,7 +18494,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if (cell_w - self.last_cell_size).abs() > 0.5
                     || (cell_h - self.last_cell_h).abs() > 0.5
                 {
+                    let before = self.scroll_offset_y;
                     self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
+                    self.log_rating_grid_scroll("layout-row-snap", before, self.scroll_offset_y,
+                        (cols, cell_w, cell_h, ui.available_height().max(0.0)));
                     clear_grid_touch_scroll_remainder(ctx);
                     self.last_cell_size = cell_w;
                     self.last_cell_h = cell_h;
@@ -18522,9 +18525,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // リング / ジェスチャが積んだ要求は次フレームで処理する。
                 let pending_scroll =
                     take_grid_scroll_for_current_layout(&mut self.pending_grid_scroll);
+                let before_clamp = self.scroll_offset_y;
                 self.scroll_offset_y =
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
+                if scroll_to || (before_clamp - self.scroll_offset_y).abs() > 0.5 {
+                    self.log_rating_grid_scroll(
+                        &format!("layout-clamp intent={pending_scroll:?} max={max_offset:.1}"),
+                        before_clamp, self.scroll_offset_y, (cols, cell_w, cell_h, viewport_h));
+                }
 
+                let before_touch = self.scroll_offset_y;
                 let scroll_state = grid_touch_scroll_state(
                     ctx,
                     self.scroll_offset_y,
@@ -18789,6 +18799,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ctx.request_repaint();
                 }
                 let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
+                if (before_touch - display_scroll_offset_y).abs() > 0.5 {
+                    self.log_rating_grid_scroll(
+                        &format!("touch phase={touch_scroll_phase:?} remainder={fractional_drag_y:.1}"),
+                        before_touch, display_scroll_offset_y, (cols, cell_w, cell_h, viewport_h));
+                }
 
                 let mut nav: Option<AddressBarNav> = None;
                 let primary_click_pos = (!suppress_primary_pointer)
@@ -18807,6 +18822,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 // egui にスクロールを管理させず、自前の offset を毎フレーム注入する。
                 // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
+                let egui_before = self.items_are_rating_view.then(||
+                    egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("scroll_area"))));
+                let input_before = self.items_are_rating_view.then(|| ctx.input(|input| (
+                    input.raw_scroll_delta, input.smooth_scroll_delta,
+                    input.pointer.latest_pos(), input.pointer.primary_down(),
+                    input.pointer.delta(), input.pointer.velocity())));
                 let scroll_output = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(display_scroll_offset_y)
@@ -18819,6 +18840,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
+                        if self.items_are_rating_view
+                            && (scroll_to || (viewport.min.y - display_scroll_offset_y).abs() > 0.5)
+                        {
+                            let rect = self.selected.and_then(|selected| self.visible_indices.iter()
+                                .position(|index| *index == selected)).map(|position|
+                                egui::Rect::from_min_size(content_rect.min + egui::vec2(
+                                    (position % cols) as f32 * cell_w, (position / cols) as f32 * cell_h),
+                                    egui::vec2(cell_w, cell_h)));
+                            crate::logger::log(format!(
+                                "[grid-scroll] source=egui-viewport gen={} injected={display_scroll_offset_y:.1} \
+                                 viewport={viewport:?} clip={:?} selected={:?} row_screen={rect:?}",
+                                self.items_generation, ui.clip_rect(), self.selected));
+                        }
 
                         // Reveal a virtualized diagnostic pointer target through the existing
                         // ScrollArea/readback owner. Selection and activation remain cell clicks.
@@ -19135,6 +19169,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // ただし行スナップによる端数差分で毎フレーム振動するのを防ぐため、
                 // 1 行分 (cell_h) 以上ずれた場合のみ同期する。
                 let egui_offset = scroll_output.state.offset.y;
+                if self.items_are_rating_view
+                    && (scroll_to || (egui_offset - display_scroll_offset_y).abs() > 0.5)
+                {
+                    crate::logger::log(format!(
+                        "[grid-scroll] source=egui-state gen={} injected={display_scroll_offset_y:.1} \
+                         returned={egui_offset:.1} content={:?} inner={:?} wheel={:?} \
+                         input_before={input_before:?} prior_state={egui_before:?} state={:?}",
+                        self.items_generation, scroll_output.content_size, scroll_output.inner_rect,
+                        ctx.input(|input| (input.raw_scroll_delta, input.smooth_scroll_delta)),
+                        scroll_output.state));
+                }
                 if should_sync_grid_scrollbar(
                     touch_derived_pointer_activity,
                     fractional_drag_y,
@@ -19142,7 +19187,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.scroll_offset_y,
                     cell_h,
                 ) {
+                    let before = self.scroll_offset_y;
                     self.scroll_offset_y = (egui_offset / cell_h).round() * cell_h;
+                    self.log_rating_grid_scroll("egui-readback", before, self.scroll_offset_y,
+                        (cols, cell_w, cell_h, self.last_viewport_h));
                 }
 
                 // 右上フィードバックトースト (Q / Ctrl+Backspace / F7〜F10 / レーティング等)

@@ -5920,6 +5920,12 @@ mod tests {
                 .unwrap()
         };
         assert!(ready(settled.clone()));
+        let mut large = settled.clone();
+        large.item_names = vec!["row".into(); 600];
+        large.grid_observation.aspect_sample_count = 31;
+        assert!(ready(large.clone()));
+        large.grid_observation.aspect_sample_count = 30;
+        assert!(!ready(large));
         for variation in 0..4 {
             let mut incomplete = settled.clone();
             match variation {
@@ -5929,6 +5935,91 @@ mod tests {
                 _ => incomplete.grid_observation.aspect_auto = false,
             }
             assert!(!ready(incomplete));
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_entry_generates_six_hundred_ordered_names_and_eight_pages() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let entry = script
+            .split("// Scenario entry:")
+            .nth(1)
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1;
+        let prefix = entry.split("wait_until(").next().unwrap();
+        let mut scope = rhai::Scope::new();
+        engine.eval_with_scope::<()>(&mut scope, prefix).unwrap();
+        let names = scope.get_value::<rhai::Array>("rating_names").unwrap();
+        let pages = scope.get_value::<rhai::Array>("pages").unwrap();
+        assert_eq!(names.len(), 600);
+        for (index, expected) in [
+            (0, "0001-image.png"),
+            (298, "0299-folder"),
+            (309, "0310-folder"),
+            (310, "0311-book.zip"),
+            (599, "0600-image.png"),
+        ] {
+            assert_eq!(names[index].clone().cast::<String>(), expected);
+        }
+        assert_eq!(pages.len(), 8);
+        assert_eq!(pages[3].clone().cast::<String>(), "page-04.png");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_mid_list_geometry_executes_with_ten_columns_and_seventy_cells() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut snapshot = ready_snapshot();
+        snapshot.item_names = vec!["row".into(); 600];
+        snapshot.grid_observation.columns = 10;
+        snapshot.grid_observation.cell_height = 120.0;
+        snapshot.grid_observation.viewport =
+            egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(900.0, 840.0));
+        snapshot.grid_observation.scroll_offset = 25.0 * 120.0;
+        snapshot.grid_observation.content_height = 60.0 * 120.0;
+        let check = |snapshot: TestScriptSnapshot, index: i64| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "mid_list_geometry",
+                    (snapshot.to_rhai_map(), index),
+                )
+                .unwrap()
+        };
+        assert!(check(snapshot.clone(), 309));
+        assert!(check(snapshot.clone(), 310));
+        for variation in 0..5 {
+            let mut invalid = snapshot.clone();
+            match variation {
+                0 => invalid.grid_observation.columns = 3,
+                1 => invalid.item_names.truncate(30),
+                2 => invalid.grid_observation.scroll_offset = 55.0 * 120.0,
+                3 => invalid.grid_observation.scroll_offset = 0.0,
+                _ => invalid.grid_observation.viewport.max.y = 1100.0,
+            }
+            assert!(
+                !check(invalid, 309),
+                "accepted invalid fixture geometry {variation}"
+            );
         }
     }
 

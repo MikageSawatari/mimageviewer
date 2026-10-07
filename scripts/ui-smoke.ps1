@@ -971,20 +971,17 @@ if ($script:archiveErrors.Count -gt 0) {
         }
         Assert-NoReparseTree $candidateFixtureDir 'rating-folder-back-fixture'
         if (@(Get-ChildItem -LiteralPath $candidateFixtureDir -Directory).Count -ne 12 -or
-            @(Get-ChildItem -LiteralPath $candidateFixtureDir -File -Filter '*.zip').Count -ne 3) {
-            throw '[ui-smoke] rating-folder-back fixture must have 12 folders and 3 ZIPs'
+            @(Get-ChildItem -LiteralPath $candidateFixtureDir -File -Filter '*.zip').Count -ne 3 -or
+            @(Get-ChildItem -LiteralPath $candidateFixtureDir -File -Filter '*.png').Count -ne 585 -or
+            @(Get-ChildItem -LiteralPath $candidateFixtureDir).Count -ne 600) {
+            throw '[ui-smoke] rating-folder-back fixture must have 600 rows: 585 images, 12 folders and 3 ZIPs'
         }
-        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
-            auto_fullscreen_image_folders = $false
-            auto_fullscreen_zip_pdf = $false
-            sort_order = 'FileName'
-            grid_view_mode = 'Thumbnail'
-            grid_open_selected_item_on_click = $false
-            grid_cols = 3
-            thumb_aspect_auto = $true
-            thumb_aspect = 'Square'
-            ring_shortcuts = @{ mouse_nav_prompt_done = $true }
-        })
+        # The generator owns the matching favorites/settings and UUID-keyed six-column
+        # adjustment.db rows. Do not replace its common ten-column override here.
+        if (-not (Test-Path -LiteralPath $candidateSettingsPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $dataDir 'adjustment.db') -PathType Leaf)) {
+            throw '[ui-smoke] rating-folder-back favorite settings/state seed is missing'
+        }
     }
     'FolderHistory' {
         $scenarioRoot = Join-Path $dataDir 'folder-history'
@@ -1716,7 +1713,7 @@ $arguments = @(
             (New-Object System.Text.UTF8Encoding($false)))
     }
     if ($Scenario -eq 'RatingFolderBack') {
-        $arguments = @('--window-size', '900x650') + $arguments
+        $arguments = @('--window-size', '900x1000') + $arguments
     }
     Try-AddUiSmokeEvidenceFile $scriptPath 'inputs/scenario.rhai' 'scenario-script'
     Try-AddUiSmokeEvidenceFile $settingsPath 'inputs/settings-override.json' 'settings-override'

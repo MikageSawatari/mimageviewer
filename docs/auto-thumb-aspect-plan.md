@@ -594,6 +594,39 @@ Collection installerの即時seedも、presentation/世代の公開前は母数0
 回帰は共通seed ownerで実cache entryによる即時Switchを起こす境界検査と、Ratingの
 実catalogを使ったsaved 3:4→Holdの往復検査を分けて行う。
 
+2026-10-07追加調査 (`983d68272`実機): 保存3:4の復元後にSwitchがない場合でも、
+選択は正しいまま可視範囲が中間から末尾へ移る報告が残った。
+追加のcode調査で、Rating採用時だけ宛先favorite表示の遷移を通らず、子のoverlayを使って
+初回描画した後、frame末尾のreconcileで共通表示へ戻る経路を確認した。
+共通10列・子favorite6列では、最初のensure-visibleは6列の大きいセル/行数でoffsetを計算し、
+次frameの10列ではそのpixel offsetが短いcontentの末尾へclampされる。比率Switchは不要。
+600項目・row30・Rating3:4/子2:3の回帰でこの表示設定の所有境界を検査する。
+これはコード上の再現経路であり、利用者の実設定がfavorite overlayを使うか、ログの各数値が
+この経路かは次の実機診断で確認する。実機ログだけで原因確定したとは扱わない。
+最初の`[queue] vis`は`settings.grid_cols`と互換の`last_cell_h` / `last_viewport_h`による
+先読み予測で、初描画前は旧一覧の寸法が残り得る。queue計算自体はoffsetを書き換えない。
+thumbnailの初描画ではそのframeの幅・比率・列数・viewportを公開してからensure-visibleし、
+行snapとmax-offset clampを行う。したがって初回ensureの前に、宛先の列数/表示設定を
+確定する必要がある。scroll ownerの遅延や再ensureでは設定採用の順序違反を直さない。
+main ScrollAreaは共有persistent IDを使い、offset注入はeguiの保持速度・animation targetを
+消さない。eguiの結果はhalf-row以上の差でAppへ読み戻される。またraw wheelのない後続frameにも
+private残量からsmooth deltaが届き得る。これらは移動可能な経路であり、実機原因だとは断定しない。
+通常thumbnailのscroll target発行は確認できず、test-scriptのrow revealは別の診断producer。
+旧touch glideは世代と行高で失効し、folder pane/musicのScrollAreaは別IDを持つ。
+
+`[grid-scroll]`はRatingの保存/復元、初描画予測、ensure-visible、行snap、clamp、touch、
+aspect fixup、wheel/gamepad、eguiの読み戻しをnormal loggerへ記録する。世代、保存/適用offset、
+選択index、行矩形、列数、セル幅/高、viewport高を記録し、ScrollArea直前の入力と前後のStateも
+採取する。パスや項目名は出さない。ログはこれらの境界/位置変更時のみで、待機や追加repaintを
+導入しない。State reset、ID変更、再ensure-visibleで症状を覆う変更は行わない。
+
+Rating workerは宛先favoriteの表示順を純粋に投影し、既存のnavigation requestに保持する。
+準備中の設定変更は既存のsort再準備経路で検証し、まだ表示中の子には適用しない。
+visible installの共通位置保存後、新しい可視contextで既存favorite遷移を確定してから
+seed/一覧を採用する。新規favoriteの継承値も退出元から渡す。legacy installも同じ投影を
+materializeへ使う。通常の同一覧rebuildは現在の設定を使い、表示mode等は既存installが更新する。
+これはSmart Folderの宛先投影/採用境界と同じ原則であり、新しい待機状態や非同期手順は作らない。
+
 呼び出し経路:
 
 - **自動切替** (`maybe_apply_auto_aspect` 内):

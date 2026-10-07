@@ -65,17 +65,36 @@ fn rating_root(path, names) {
     tall_aspect_settled("rating-root");
 }
 
-// All fifteen representatives are tall and in the keep range. Observe their real samples,
-// not a fixed sleep, before opening and after returning; later samples cannot change the vote.
+// 585 direct 3:4 images outweigh the fifteen 2:3 container representatives. With at least
+// 31 real samples, even all fifteen container samples cannot overturn the 3:4 median later.
 fn tall_aspect_settled(label) {
     wait_until(|s| tall_aspect_ready(s), 30000);
     log("rating-folder-back: tall aspect settled " + label + " grid=" + snapshot().grid.to_debug());
 }
 
 fn tall_aspect_ready(s) {
+    let minimum = 31;
+    if s.item_names.len < minimum { minimum = s.item_names.len; }
     s.grid.generation == s.items_generation
         && s.grid.aspect_auto && s.grid.aspect_label == "3:4"
-        && s.grid.aspect_sample_count >= s.item_names.len
+        && s.grid.aspect_sample_count >= minimum
+}
+
+// Use the painted geometry, including the clip viewport, rather than assuming window size
+// equals grid size. The fixture targets row30 in a sixty-row list, never the final screen.
+fn mid_list_geometry(s, index) {
+    if s.item_names.len != 600 || s.grid.columns != 10 || s.grid.cell_height <= 0.0 {
+        return false;
+    }
+    let row = index / s.grid.columns;
+    let visible_rows = s.grid.viewport_height / s.grid.cell_height;
+    let target_center = (row + 0.5) * s.grid.cell_height;
+    row >= 25 && row <= 35 && visible_rows >= 6.0 && visible_rows <= 8.0
+        && s.grid.scroll_offset > 0.0
+        && target_center >= s.grid.scroll_offset
+        && target_center <= s.grid.scroll_offset + s.grid.viewport_height
+        && s.grid.content_height - s.grid.scroll_offset - s.grid.viewport_height
+            >= 10.0 * s.grid.cell_height
 }
 
 fn record(label, screenshot) {
@@ -88,6 +107,12 @@ fn record(label, screenshot) {
         + " path=" + s.current_folder_path + " generation=" + s.items_generation
         + " selected_index=" + s.selected_index + " selected_name=" + name
         + " grid=" + s.grid.to_debug());
+    if s.grid.columns > 0 && s.grid.cell_height > 0.0 {
+        log("rating-folder-back: geometry " + label + " items=" + s.item_names.len
+            + " selected_row=" + s.selected_index / s.grid.columns
+            + " viewport_rows=" + s.grid.viewport_height / s.grid.cell_height
+            + " visible_cell_capacity=" + s.grid.viewport_height / s.grid.cell_height * s.grid.columns);
+    }
     // Capture every return/error; setup checkpoints are logged to stay below the 64-shot limit.
     if screenshot { capture(label); }
     s
@@ -95,7 +120,7 @@ fn record(label, screenshot) {
 
 fn case_label(target, kind, roundtrip) {
     let label = "folder-" + kind;
-    if target == "23-book.zip" { label = "zip-" + kind; }
+    if target.ends_with("-book.zip") { label = "zip-" + kind; }
     if roundtrip { label += "-roundtrip"; }
     label
 }
@@ -127,7 +152,7 @@ fn returned(label, opened_key, opened_name, opened_index, generation, rating_pat
     let s = record(label, true);
     let ok = s.selected_index == opened_index && s.grid.selected_key == opened_key
         && s.grid.selected_name == opened_name && s.grid.visible
-        && s.grid.scroll_offset > 0.0;
+        && mid_list_geometry(s, opened_index);
     log("rating-folder-back: result=" + ok + " case=" + label
         + " expected_key=" + opened_key + " expected_name=" + opened_name
         + " expected_index=" + opened_index);
@@ -136,11 +161,15 @@ fn returned(label, opened_key, opened_name, opened_index, generation, rating_pat
 
 fn fourth_page(path, pages, generation, label) {
     arrive("Folder", path, pages, generation, label);
+    wait_until(|s| s.grid.generation == s.items_generation && s.grid.aspect_auto
+        && s.grid.columns == 6 && s.grid.aspect_label == "2:3"
+        && s.grid.aspect_sample_count >= pages.len, 30000);
     click(row_widget(3));
     wait_until(|s| s.selected_index == 3 && s.grid.generation == s.items_generation
         && s.grid.selected_index == 3 && s.grid.visible, 30000);
     let s = record(label, false);
-    if s.selected_index != 3 || s.grid.selected_name != "page-04.png" || !s.grid.visible {
+    if s.selected_index != 3 || s.grid.selected_name != "page-04.png" || !s.grid.visible
+        || s.grid.columns != 6 || s.grid.aspect_label != "2:3" {
         throw "fourth page was not selected in the adopted container: " + label;
     }
 }
@@ -154,9 +183,9 @@ fn run_case(target, kind, roundtrip, library, rating_path, rating_names, pages) 
     let widget = row_widget(index);
     pointer(widget, "hover");
     let opened = record(label + "-before-open", false);
-    if opened.grid.scroll_offset <= 0.0
-        || opened.grid.content_height <= opened.grid.viewport_height {
-        throw "fixture does not exercise the selected scrolled rating row";
+    log("rating-folder-back: setup target_index=" + index + " target_row=" + index / 10);
+    if !mid_list_geometry(opened, index) {
+        throw "fixture does not exercise a mid-list rating row with ten columns and about seventy visible cells";
     }
     let path = library + "\\" + target;
     let key = path;
@@ -182,12 +211,13 @@ fn run_case(target, kind, roundtrip, library, rating_path, rating_names, pages) 
 
 // Scenario entry: helpers above are also exercised by headless contract tests.
 let rating_names = [];
-for n in 1..13 {
+for n in 1..601 {
     let number = n.to_string();
-    if n < 10 { number = "0" + number; }
-    rating_names.push(number + "-folder");
+    while number.len < 4 { number = "0" + number; }
+    if n >= 299 && n <= 310 { rating_names.push(number + "-folder"); }
+    else if n >= 311 && n <= 313 { rating_names.push(number + "-book.zip"); }
+    else { rating_names.push(number + "-image.png"); }
 }
-for n in 21..24 { rating_names.push(n.to_string() + "-book.zip"); }
 let pages = [];
 for n in 1..9 { pages.push("page-0" + n + ".png"); }
 wait_until(|s| !s.startup_open_pending && !s.is_fullscreen
@@ -202,7 +232,7 @@ let failures = 0;
 let cases = 0;
 let executed = 0;
 let skipped = 0;
-for target in ["12-folder", "23-book.zip"] {
+for target in ["0310-folder", "0311-book.zip"] {
     for kind in ["toolbar", "alt", "browser", "appcommand", "mouse", "backspace"] {
         let rounds = [false, true];
         if kind == "backspace" { rounds = [false]; }

@@ -2235,7 +2235,63 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
-### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 主要2経路修正・自動検証完了、残件あり (2026-10-07)
+### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 選択・表示設定の採用順を修正、実機再確認待ち (2026-10-07)
+
+- 600項目の実機追補 (`983d68272`後、2026-10-07):
+  - toolbar ←で開いたfolderが選択される一方、3:4復元後にSwitchなしでも画面が末尾へ
+    移るとの再報告。Rating採用が宛先favorite遷移を通らず、子の表示設定が初回描画まで
+    残るcode経路を確認した。共通10列・子favorite6列では、初回ensure-visibleが6列で
+    大きいoffsetを作り、frame末尾に10列へ戻った次描画で短い一覧の末尾へclampされる。
+    利用者の実設定がこのoverlayを使うか、各実ログ数値が同経路かは診断付きbuildで確認する。
+    遅延、追加repaint、再ensure loop、共有egui State resetは加えない。
+  - `[queue] vis`は初描画前に旧セル高/viewportを使える予測で、offsetを変更しない。
+    render_gridは現在frameの列数・セル高・viewportを公開してからensure-visibleし、行snapと
+    max-offset clampを行う。寸法計算そのものは現frameだが、設定ownerの採用が一frame遅い。
+    main ScrollAreaの共有IDで保持された速度/target、rawなしのsmooth wheel残量、egui offsetの
+    無条件差分読み戻しは移動可能な経路だが、実機の入力/Stateの証拠はまだない。
+    通常thumbnailのscroll target producerは見つからず、旧touch glideは世代照合で失効する。
+  - normal loggerの`[grid-scroll]`に保存/復元・queue予測・ensure・snap・clamp・touch・aspect・
+    wheel/gamepad・egui readbackのsourceと世代を記録。offset、選択index/行矩形、セル幅/高、
+    列数、viewport、描画owner、egui State前後と直前入力を採取する。パス/項目名は出さない。
+    次の実機runで実経路を確認する。共有StateのresetやID変更は行わない。
+  - 回帰条件を600行、10列、約70可視セル、row30のfolder選択、Rating 3:4/子2:3へ拡張。
+    実menubar/toolbar/facet/footer/folder pane/gridに加え、favoriteの6列overlayと実update末尾の
+    reconcileを通す。旧テストの復帰前の手動10列設定を除いた。`983d68272`製品コード+
+    診断ログでbuild成功後0成功/4失敗、実exit101。←/→→←/BSの3件はindex309を維持したまま
+    offset2925→9604→6318となり不可視。子の異なるカテゴリ順の1件はindex11へ並べ替わった。
+    証跡`target/1328-red-5.txt`。初期のviewport前提違反や手動列数の成功はvalid redに数えない。
+  - 修正は既存の位置保存→可視context採用→favorite表示遷移→seed/初回layoutの順へ統一。
+    prepared/legacyのRating採用が同じownerを通る。workerは復帰先favoriteのカテゴリ順を
+    pureに投影し、既存requestに保持・採用前に再検証する。準備中の子の設定は変更しない。
+    deepest stored ancestor、新規favorite継承、未保存live値、記憶OFFも既存resolverに合わせる。
+    表示mode/比率も一緒に確定し、列数だけの症状補正はしない。Collection/detached/BS入口や
+    StartupListIntentは変更しない。Smart Folderの既存投影/採用原則に沿う局所修正。
+  - RatingFolderBackも600行 (585直接画像+12folder+3ZIP)、900×1000/10列へ変更し、
+    index309/310の中間rowを使う。対象folder/ZIPはUUID付きfavorite保存表示6列、共通10列。
+    rootの31以上の3:4 sample、子の6列/8 sample/2:3/第4画像を待ち、
+    実viewportが6〜8行、viewport以後も10行以上残ることを検査する。戻りの再選択はしない。
+    focus不要のtoolbar4ケースとfocus時だけの18ケースは維持。実アプリは起動しない。
+    詳細: [auto-thumb-aspect-plan.md §6](auto-thumb-aspect-plan.md)、
+    [ui-smoke-automation-plan.md §1.328](ui-smoke-automation-plan.md)。
+  - 同型の表示設定採用調査: 通常folder/ZIP/PDF/convertedは既存のopen owner、Smart Folderは
+    destination projectionと採用境界で表示設定を確定する。Bookmarks/検索/Tag/閲覧履歴は
+    空loading installまたは独自のsnapshot復帰、Drive/サブ展開も専用ownerで、Ratingと同じ
+    prepared replayは通らない。検索/Snapshot等の比率・位置復帰の残件は下表のまま維持。
+    Collection/A/Bは既存のcontext採用を変更せず、Ratingの共通installだけ今回の対象にする。
+  - 修正後の対象35件は全成功 (exit0)。新規の6件は600行の可視往復4件、favorite投影と
+    実遷移の6条件比較、準備中の宛先カテゴリ順変更/退出元非変更を検査する。
+    全libはpipeなしで10,931成功・0失敗・52無視、911.19秒、実exit0。fmt確認とglyph0件、
+    fixture生成7件・PowerShell構文検査も成功。test-script非対話140件、通常/portable core check
+    もexit0。build結果は以下に記録する。文案は`target/1328-msg-5.txt`。
+    実アプリの起動はcoordinator/利用者へ引き継ぐ。
+  - portable test-script build: `prepare-portable-smoke.ps1 -TestScript` exit0。
+    core最適化22分42秒、PE検査runtime4/pe17成功。source fingerprintの前後一致を確認し、
+    `target/portable-smoke/mimageviewer.exe`と隔離dataを更新した。Suiteは実行していない。
+  - dev-runtime build: `build-dev.ps1 -PreserveRuntime` exit0。通常featureのcore8分06秒、
+    remote/EPUB同梱、PE検査runtime4/pe3成功。実行中coreによる拒否はなく、プロセス停止も
+    製品起動も行っていない。CRLF・bounded numstat・diff check確認済み、未commit。
+    次の確認は600行のRatingFolderBack Suiteと、利用者の★3中間folder→第4画像→toolbar ←/
+    →→←の選択・可視性。新しい`[grid-scroll]`行で実機経路を照合する。
 
 - 保存/描画ownerの追補 (2026-10-07、`68a3200f7`後の調査):
   - saved Rating位置の優先により、Aを保存→B選択→検索結果B→検索closeで古いAに戻る
@@ -2456,8 +2512,9 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
     成功の証跡は `target/1328-followup-baseline.txt`。追加報告の red / 修正完了を意味しない。
     `.\scripts\build-dev.ps1 -PreserveRuntime` も exit 0 (core / remote / EPUB PDF worker、VCRT PE: runtime=4 / pe=3)。
     製品バイナリは起動していない。コミット文案は `target/1328-msg-2.txt`、未コミット。
-- 残る検収: 追加の実フォルダ報告の再現条件と原因特定、独立レビュー、
-  利用者による実アプリのレーティング / 変換書庫 / PDF / BS 確認。
+- 残る検収: `983d68272`実機の連続跳躍が今回再現したfavorite列数の採用順と同じ経路か、
+  新しい診断ログで照合する。独立レビューと600行Suite、利用者による実アプリの
+  レーティング / 変換書庫 / PDF / BS 確認も引き継ぐ。
   閲覧履歴・サブ展開の anchor を含む構造変更はこの bounded fix では実装しない。
 - 規模 / 優先度: Small〜Medium / P2 (利用者報告あり)。
 

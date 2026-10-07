@@ -682,6 +682,7 @@ pub(crate) struct RatingNavigationTransition {
     source_slot_switch_sequence: u64,
     target_stars: u8,
     target_sort: crate::rating_view::RatingViewSort,
+    target_display_order: crate::settings::GridDisplayOrder,
     saved_folder: Option<PathBuf>,
     subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     select_opened_path: Option<PathBuf>,
@@ -20536,6 +20537,7 @@ impl App {
         &mut self,
         new_aspect: crate::settings::ThumbAspect,
     ) {
+        let before = self.scroll_offset_y;
         let context_id = self.projected_viewer_context_id();
         // Compatibility dimensions also predict thumbnail display size before first paint.
         // They do not prove that this list owns a laid-out scroll anchor.
@@ -20562,6 +20564,19 @@ impl App {
                 *cell_height = new_cell_h;
             }
             self.last_cell_h = new_cell_h;
+        }
+        if (before - self.scroll_offset_y).abs() > 0.5 {
+            self.log_rating_grid_scroll(
+                "aspect-fixup",
+                before,
+                self.scroll_offset_y,
+                (
+                    self.last_grid_cols,
+                    self.last_cell_size,
+                    self.last_cell_h,
+                    self.last_viewport_h,
+                ),
+            );
         }
     }
 
@@ -31787,6 +31802,17 @@ impl App {
             if matches_path {
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
+                self.log_rating_grid_scroll(
+                    "opened-item-select",
+                    self.scroll_offset_y,
+                    self.scroll_offset_y,
+                    (
+                        self.last_grid_cols,
+                        self.last_cell_size,
+                        self.last_cell_h,
+                        self.last_viewport_h,
+                    ),
+                );
                 return;
             }
         }
@@ -31850,8 +31876,12 @@ impl App {
             return;
         }
         let chosen_sort = self.settings.rating_view_sort.normalized_for_rating_view();
-        if chosen_sort != transition.target_sort {
+        let chosen_display_order = self.rating_view_destination_display_order();
+        if chosen_sort != transition.target_sort
+            || chosen_display_order != transition.target_display_order
+        {
             transition.target_sort = chosen_sort;
+            transition.target_display_order = chosen_display_order;
             self.start_rating_build(
                 transition.target_stars,
                 chosen_sort,
@@ -32144,6 +32174,7 @@ impl App {
             source_slot_switch_sequence: self.quick_folder_switch_sequence,
             target_stars: stars,
             target_sort: self.settings.rating_view_sort.normalized_for_rating_view(),
+            target_display_order: self.rating_view_destination_display_order(),
             saved_folder,
             subfolder_restore,
             select_opened_path,
@@ -32178,7 +32209,10 @@ impl App {
                 intent,
                 sort,
                 include_epub: !self.settings.epub_file_handling_ignores_epub(),
-                display_order: self.settings.grid_display_order.clone(),
+                display_order: navigation
+                    .as_ref()
+                    .map(|transition| transition.target_display_order.clone())
+                    .unwrap_or_else(|| self.settings.grid_display_order.clone()),
                 pin_db: self.folder_thumb_pin_db.clone(),
                 folder_thumb_sort: self.settings.folder_thumb_sort,
                 folder_thumb_depth: self.settings.folder_thumb_depth,
@@ -32313,10 +32347,11 @@ impl App {
         // ★時刻順のときはカテゴリ再配置を通さない (§1.142)。通すとフォルダ / アーカイブが
         // 時刻に関係なく先頭へ出て、「★を付けた順に一列で見る」という要求が壊れる。
         // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
+        let destination_display_order = self.rating_view_destination_display_order();
         let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
             &mut self.rating_view_rows,
             self.rating_view_sort.normalized_for_rating_view(),
-            &self.settings.grid_display_order,
+            &destination_display_order,
         );
         let video_items: Vec<(usize, PathBuf, u64)> = items
             .iter()
@@ -32422,6 +32457,7 @@ impl App {
         let position = self
             .top_level_grid_view
             .rating_grid_position(self.rating_view_stars);
+        let before_restore = self.scroll_offset_y;
         if let Some(position) = position {
             self.scroll_offset_y = position.scroll_offset_y;
         }
@@ -32449,6 +32485,20 @@ impl App {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
         }
+        self.log_rating_grid_scroll(
+            &format!(
+                "rating-position-restore saved={:?}",
+                position.map(|position| position.scroll_offset_y)
+            ),
+            before_restore,
+            self.scroll_offset_y,
+            (
+                self.last_grid_cols,
+                self.last_cell_size,
+                self.last_cell_h,
+                self.last_viewport_h,
+            ),
+        );
     }
 
     /// 閲覧履歴ビューから 1 件削除する。
@@ -35820,6 +35870,20 @@ impl App {
             selected_key: self.selected.and_then(|index| self.rating_path_key(index)),
             aspect_seed,
         };
+        self.log_rating_grid_scroll(
+            &format!(
+                "rating-position-save stars={stars} saved={:.1}",
+                position.scroll_offset_y
+            ),
+            self.scroll_offset_y,
+            self.scroll_offset_y,
+            (
+                self.last_grid_cols,
+                self.last_cell_size,
+                self.last_cell_h,
+                self.last_viewport_h,
+            ),
+        );
         self.top_level_grid_view
             .save_rating_grid_position(stars, position);
     }
@@ -36120,7 +36184,27 @@ impl App {
         // 検索前フォルダのまま保つため、検索ビューの scroll_offset_y をそのフォルダの
         // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
         self.save_leaving_folder_grid_position();
+        let rating_inherited_view = (!detached_physical
+            && matches!(&authority, VisibleInstallAuthority::Rating { .. }))
+        .then(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
         self.change_main_context_for_visible_grid(false);
+        if let Some(inherited) = rating_inherited_view {
+            // Publish the destination presentation in the new visible context, after saving
+            // the departing position and before seeding/layout. A late frame-end reconcile
+            // would let ensure-visible use the physical child's columns for the Rating root.
+            self.transition_favorite_view_for_path_with_inherited_at(
+                Some(&source_path),
+                std::time::Instant::now(),
+                Some(inherited),
+            );
+            crate::logger::log(format!(
+                "[grid-scroll] source=rating-presentation-adopt gen={} cols={} auto={} mode={:?}",
+                self.items_generation,
+                self.settings.grid_cols,
+                self.settings.thumb_aspect_auto,
+                self.settings.grid_view_mode,
+            ));
+        }
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
         // 計測する (nav cancel / items 割当 / キャッシュ clear)。UI が止まる潜在箇所を
@@ -47766,6 +47850,18 @@ impl App {
             fractional_drag_y,
         );
         let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
+        if self.items_are_rating_view
+            && !matches!(self.grid_aspect_layout,
+            GridAspectLayout::Thumbnail { context_id, items_generation, .. }
+            if context_id == self.projected_viewer_context_id() && items_generation == self.items_generation)
+        {
+            self.log_rating_grid_scroll(
+                &format!("queue-forecast vis=[{vis_first}..{strict_visible_end}) laid_out=false"),
+                self.scroll_offset_y,
+                self.scroll_offset_y,
+                (cols, self.last_cell_size, cell_h, viewport_h),
+            );
+        }
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
@@ -52531,6 +52627,17 @@ impl App {
                     scroll_delta_y,
                     cell_h,
                 );
+                self.log_rating_grid_scroll(
+                    &format!("wheel delta={scroll_delta_y:.1}"),
+                    prev_offset,
+                    self.scroll_offset_y,
+                    (
+                        self.last_grid_cols,
+                        self.last_cell_size,
+                        cell_h,
+                        self.last_viewport_h,
+                    ),
+                );
                 if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
                     self.bump_input_seq(
                         "grid_wheel",
@@ -52553,8 +52660,48 @@ impl App {
         });
     }
 
+    /// Path-free diagnostics only at Rating restore/scroll writes; geometry is supplied by its owner.
+    pub(crate) fn log_rating_grid_scroll(
+        &self,
+        source: &str,
+        before: f32,
+        after: f32,
+        geometry: (usize, f32, f32, f32),
+    ) {
+        if !self.items_are_rating_view {
+            return;
+        }
+        let (cols, cell_w, cell_h, viewport_h) = geometry;
+        let position = self.selected.and_then(|selected| {
+            self.current_grid_order()
+                .iter()
+                .position(|index| *index == selected)
+        });
+        let row_rect = position.map(|position| {
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    (position % cols.max(1)) as f32 * cell_w,
+                    (position / cols.max(1)) as f32 * cell_h,
+                ),
+                egui::vec2(cell_w, cell_h),
+            )
+        });
+        crate::logger::log(format!(
+            "[grid-scroll] source={source} gen={} stars={:?} before={before:.1} applied={after:.1} \
+             selected={:?} position={position:?} row_rect={row_rect:?} \
+             cell_w={cell_w:.1} cell_h={cell_h:.1} cols={cols} settings_cols={} viewport_h={viewport_h:.1} \
+             items={} layout={:?}",
+            self.items_generation,
+            self.rating_view_rows_stars,
+            self.selected,
+            self.settings.grid_cols,
+            self.items.len(),
+            self.grid_aspect_layout,
+        ));
+    }
     /// カーソルキー移動後、選択行がビューポートに収まるようオフセットを調整する
     pub(crate) fn apply_scroll_to_selected(&mut self, cols: usize, cell_h: f32) {
+        let before = self.scroll_offset_y;
         let sel = match self.selected {
             Some(s) => s,
             None => return,
@@ -52574,6 +52721,12 @@ impl App {
         if let Some(rows_above) = self.scroll_selected_to_rows_above.take() {
             let top_row = row.saturating_sub(rows_above as usize);
             self.scroll_offset_y = top_row as f32 * cell_h;
+            self.log_rating_grid_scroll(
+                "startup-row-anchor",
+                before,
+                self.scroll_offset_y,
+                (cols, self.last_cell_size, cell_h, self.last_viewport_h),
+            );
             return;
         }
         let vp_top = self.scroll_offset_y;
@@ -52588,6 +52741,12 @@ impl App {
             // 行境界にスナップ
             self.scroll_offset_y = (self.scroll_offset_y / cell_h).ceil() * cell_h;
         }
+        self.log_rating_grid_scroll(
+            "ensure-visible",
+            before,
+            self.scroll_offset_y,
+            (cols, self.last_cell_size, cell_h, self.last_viewport_h),
+        );
     }
 
     /// Correct the normal restore size before the optional post-visible maximize.
@@ -80256,6 +80415,47 @@ impl App {
         active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
             self.favorite_view_states.contains_key(&id)
         })
+    }
+
+    /// Project the existing favorite transition without changing the still-visible source.
+    /// Include its live, not-yet-debounced state: the real transition captures that state first.
+    fn favorite_view_state_for_path(&self, path: &Path) -> crate::settings::FavoriteViewState {
+        let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        let common = self
+            .settings
+            .favorite_view_overlay
+            .as_ref()
+            .map(|overlay| overlay.common.clone())
+            .unwrap_or_else(|| current.clone());
+        if !self.settings.remember_favorite_view_state {
+            return common;
+        }
+        let active_id = self.settings.active_favorite_view_id();
+        if let Some(owner) = self.favorite_view_owner_for_path(path)
+            && Some(owner) != self.favorite_view_context.location_favorite_id
+            && !self.favorite_view_states.contains_key(&owner)
+        {
+            return current;
+        }
+        let stored_id =
+            active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
+                self.favorite_view_states.contains_key(&id) || active_id == Some(id)
+            });
+        match stored_id {
+            Some(id) if Some(id) == active_id => current,
+            Some(id) => self
+                .favorite_view_states
+                .get(&id)
+                .cloned()
+                .unwrap_or(common),
+            None => common,
+        }
+    }
+
+    fn rating_view_destination_display_order(&self) -> crate::settings::GridDisplayOrder {
+        self.favorite_view_state_for_path(&rating_view_synthetic_path())
+            .grid_display_order
+            .normalized()
     }
 
     /// 適用中の値との差分をメモリ正本へ即時反映し、DB 書き込みだけを debounce する。
