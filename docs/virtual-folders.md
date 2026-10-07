@@ -355,6 +355,37 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 
 ### 2.1 ZIP / 直接閲覧 RAR を開く (`App::load_zip_as_folder`)
 
+#### 親一覧の位置保存と履歴復帰 (§1.328)
+
+通常 item install と ZIP の先出し表示は `folder_history` (scroll / selected) の保存処理を
+`save_leaving_folder_grid_position` に集約する。通常 install は `start_loading_items_inner` から呼び、
+ZIP / 直接閲覧 RAR / 変換キャッシュ ZIP は、列挙待ち表示のために旧 items・選択・scroll・
+`current_folder` を消す直前に同じ処理を呼ぶ。列挙完了時の空の旧一覧は保存対象外なので、
+親の位置を上書きしない。取消・失敗で親に戻る場合も既存の復元処理を使う。
+検索等の合成一覧は保存対象外という従来の境界を維持する。PDF は旧一覧を保持して採用時に
+通常 install を通るため、追加の保存は不要。
+
+これは session 内の履歴位置で、§1.335 の明示一覧の起動復元とは別の記録である。
+`StartupListIntent` の運搬・成功採用はそのまま保ち、ここから復元先の採用を通知しない。
+直接読書の `PageContinuation` でも履歴位置は保存するが、明示一覧の復元先は保持する。
+
+レーティング一覧への ← / → replay は発行時の `effective_folder()` を
+`RatingNavigationTransition.select_opened_path` に持ち、成功採用後に元コンテナの行を選んで
+既存の ensure-visible を使う。変換書庫は cache ZIP ではなく元アーカイブのパスで照合する。
+キーによる選択追従は維持し、数値 index による fallback は同じ ★一覧の再構築だけに限る。
+Backspace の既存の opened-path 指定と Collection の anchor は変更しない。
+
+Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★段別session位置へ
+選択キー・scroll・確定比率seedをまとめる。Rating installのtyped authorityから初回描画前に
+比率を復元し、replay/Backspaceで同じ座標系の位置を採用する。古いindex sampleは引き継がず、
+新rowsの統計を既存cache gateで検証する。詳細と同型調査の残件は
+[Auto比率のsession復帰契約](auto-thumb-aspect-plan.md) を参照。
+
+簡素化として、ZIP 専用の保存状態・rollback・新しい modal は追加せず、既存の保存処理と
+復帰要求の owner に揃えた。同型調査の残件 (閲覧履歴・サブ展開の復帰 anchor) は
+[backlog §1.328](next-release-backlog.md)
+に記録する。実アプリでの確認は利用者による検証待ち。
+
 ```
 1. `zip_loader::enumerate_image_entries(zip_path)`。RAR/CBR パスでは末端 dispatch により
    `rar_loader` の listing を使う

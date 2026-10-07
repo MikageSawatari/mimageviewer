@@ -7423,6 +7423,17 @@ impl App {
         self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h * 2.0).max(0.0);
         self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
         if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+            self.log_rating_grid_scroll(
+                &format!("gamepad direction={direction:.1}"),
+                prev_offset,
+                self.scroll_offset_y,
+                (
+                    self.last_grid_cols,
+                    self.last_cell_size,
+                    cell_h,
+                    self.last_viewport_h,
+                ),
+            );
             self.bump_input_seq(
                 "gamepad_grid_scroll",
                 Some(&format!("offset={:.0}", self.scroll_offset_y)),

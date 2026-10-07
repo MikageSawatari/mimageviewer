@@ -3623,7 +3623,7 @@ fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
             selection_proof: None,
         },
     )])));
-    app.reset_and_seed_auto_aspect_with_collection_seed(&map, None, Some(1));
+    app.reset_and_seed_auto_aspect_with_seed(&map, None, Some(1));
     assert!(app.auto_aspect.samples.is_empty());
 }
 
@@ -21548,6 +21548,1306 @@ mod phase_c_folder_nav_history_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("Rating navigation worker did not settle");
+    }
+
+    fn write_1328_zip(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for page in 0..4 {
+            zip.start_file(
+                format!("page-{page}.jpg"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn install_1328_parent(app: &mut App, parent: &std::path::Path, items: Vec<GridItem>) {
+        let metas = vec![None; items.len()];
+        app.start_loading_items(
+            parent.to_path_buf(),
+            items,
+            metas,
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
+    }
+
+    #[test]
+    fn section1328_normal_zip_history_back_restores_parent_selection_and_scroll() {
+        for slot in [None, Some(QuickFolderSlotId::A), Some(QuickFolderSlotId::B)] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = slot;
+            let parent = app.tmp.path().join("parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let zip = parent.join("20.zip");
+            write_1328_zip(&zip);
+            let items: Vec<_> = (0..24)
+                .map(|i| GridItem::ZipFile(parent.join(format!("{i:02}.zip"))))
+                .collect();
+            install_1328_parent(&mut app, &parent, items.clone());
+            app.selected = Some(20);
+            app.scroll_offset_y = 640.0;
+            app.record_folder_nav_transition(&zip);
+            app.load_zip_as_folder_prepared(
+                zip.clone(),
+                crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+                crate::app::StartupListIntent::ExplicitList,
+            );
+            app.selected = Some(3);
+            app.scroll_offset_y = 96.0;
+            let mut rollback = None;
+            let target = app
+                .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut rollback)
+                .unwrap();
+            assert_eq!(target, parent);
+            install_1328_parent(&mut app, &target, items);
+            assert_eq!(app.selected, Some(20), "workspace {slot:?}");
+            assert_eq!(app.scroll_offset_y, 640.0);
+            assert!(app.scroll_to_selected);
+        }
+    }
+
+    #[test]
+    fn section1328_normal_zip_backspace_control_selects_opened_zip() {
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip = parent.join("20.zip");
+        write_1328_zip(&zip);
+        let items: Vec<_> = (0..24)
+            .map(|i| GridItem::ZipFile(parent.join(format!("{i:02}.zip"))))
+            .collect();
+        install_1328_parent(&mut app, &parent, items.clone());
+        app.selected = Some(20);
+        app.scroll_offset_y = 640.0;
+        app.load_zip_as_folder_prepared(
+            zip.clone(),
+            crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        app.selected = Some(3);
+        let Some(crate::ui_main::AddressBarNav::Direct(target, restore_intent)) =
+            app.resolve_grid_parent_nav()
+        else {
+            panic!("Backspace must return to the parent folder");
+        };
+        install_1328_parent(&mut app, &target, items);
+        assert_eq!(restore_intent, crate::app::StartupListIntent::ExplicitList);
+        assert_eq!(app.selected, Some(20));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1328_converted_archive_history_back_restores_parent_position() {
+        for format in [
+            ArchiveFormat::Rar,
+            ArchiveFormat::SevenZ,
+            ArchiveFormat::Lzh,
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let parent = app.tmp.path().join("parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let source = parent.join("book.7z");
+            let backing = app.tmp.path().join("cache.zip");
+            write_1328_zip(&backing);
+            let items = vec![
+                GridItem::Folder(parent.join("first")),
+                GridItem::ConvertibleArchive {
+                    path: source.clone(),
+                    format,
+                },
+            ];
+            install_1328_parent(&mut app, &parent, items.clone());
+            app.selected = Some(1);
+            app.scroll_offset_y = 320.0;
+            app.record_folder_nav_transition(&source);
+            app.load_zip_as_folder_prepared_with_logical_source(
+                backing.clone(),
+                crate::zip_loader::enumerate_image_entries_detailed(&backing).unwrap(),
+                Some(&source),
+                crate::app::StartupListIntent::InternalHydration(Box::new(
+                    crate::app::StartupListIntent::ExplicitList,
+                )),
+            );
+            app.adopt_staged_archive_source_alias(&source, &backing);
+            app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
+            app.selected = Some(3);
+            let target = app
+                .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None)
+                .unwrap();
+            install_1328_parent(&mut app, &target, items);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(app.scroll_offset_y, 320.0);
+            assert!(app.scroll_to_selected);
+        }
+    }
+
+    #[test]
+    fn section1328_pdf_history_back_control_preserves_parent_position() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let pdf = parent.join("book.pdf");
+        let items = vec![
+            GridItem::Folder(parent.join("first")),
+            GridItem::PdfFile(pdf.clone()),
+        ];
+        install_1328_parent(&mut app, &parent, items.clone());
+        app.selected = Some(1);
+        app.scroll_offset_y = 320.0;
+        app.record_folder_nav_transition(&pdf);
+        let pages = (0..4)
+            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                page_num,
+                mtime: 1,
+                file_size: 1,
+            })
+            .collect();
+        assert!(matches!(
+            app.load_pdf_as_folder_prepared(
+                pdf,
+                pages,
+                super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        ));
+        app.selected = Some(3);
+        let target = app
+            .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None)
+            .unwrap();
+        install_1328_parent(&mut app, &target, items);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_offset_y, 320.0);
+        assert!(app.scroll_to_selected);
+    }
+
+    fn rating_1328_zip_return(backspace: bool, direction: FolderHistoryDirection, auto: bool) {
+        let mut app = setup_app();
+        app.settings.rating_view_sort =
+            crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("rated");
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut opened = PathBuf::new();
+        for i in 0..6 {
+            let path = parent.join(format!("{i:02}.zip"));
+            write_1328_zip(&path);
+            let key = crate::adjustment_db::normalize_path(&path);
+            let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+                .with_source_path(&path);
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 3, Some(&meta))
+                .unwrap();
+            if i == 4 {
+                opened = path;
+            }
+        }
+        app.current_folder = Some(parent);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.select_rating_view_row_for_opened_path(&opened);
+        if auto {
+            app.settings.thumb_aspect_auto = true;
+            app.auto_aspect.current = Some(crate::settings::ThumbAspect::Portrait3x4);
+            app.auto_aspect.samples.insert(0, 4.0 / 3.0);
+            app.scroll_offset_y = 420.0;
+        }
+        let owner = app.rating_view_physical_load_owner(&opened).unwrap();
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(!app.items_are_rating_view);
+        app.selected = Some(3); // The fourth page is unrelated to the list's fourth row.
+        if backspace {
+            app.rating_view_back();
+        } else {
+            if matches!(direction, FolderHistoryDirection::Forward) {
+                let rating = app.folder_nav_back_stack.pop().unwrap();
+                app.folder_nav_forward_stack.push(rating);
+            }
+            app.dispatch_main_folder_history_input(direction, &mut None);
+        }
+        finish_rating_navigation_for_test(&mut app);
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
+        assert!(app.scroll_to_selected);
+        if auto {
+            assert_eq!(
+                app.effective_thumb_aspect(),
+                crate::settings::ThumbAspect::Portrait3x4
+            );
+            assert_eq!(
+                app.scroll_offset_y, 420.0,
+                "ZIP's empty pending UI must not overwrite the source"
+            );
+            assert!(
+                app.auto_aspect.samples.is_empty(),
+                "rebuilt rows need fresh samples"
+            );
+        }
+    }
+
+    #[test]
+    fn section1328_rating_zip_history_back_selects_opened_zip_after_fourth_page() {
+        rating_1328_zip_return(false, FolderHistoryDirection::Back, false);
+    }
+
+    #[test]
+    fn section1328_rating_zip_history_forward_selects_opened_zip_after_fourth_page() {
+        rating_1328_zip_return(false, FolderHistoryDirection::Forward, false);
+    }
+
+    #[test]
+    fn section1328_rating_zip_backspace_control_selects_opened_zip() {
+        rating_1328_zip_return(true, FolderHistoryDirection::Back, false);
+    }
+
+    #[test]
+    fn section1328_rating_zip_pending_preserves_aspect_position_for_history_and_backspace() {
+        rating_1328_zip_return(false, FolderHistoryDirection::Back, true);
+        rating_1328_zip_return(false, FolderHistoryDirection::Forward, true);
+        rating_1328_zip_return(true, FolderHistoryDirection::Back, true);
+    }
+
+    fn rating_1328_folder_or_pdf_return(backspace: bool, replay_forward: bool, pdf: bool) {
+        for slot in [None, Some(QuickFolderSlotId::A), Some(QuickFolderSlotId::B)] {
+            let mut app = setup_app();
+            app.settings.sidecar_backup_enabled = true;
+            app.settings.tag_sidecar_backup_enabled = true;
+            app.settings.rating_view_sort =
+                crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+            app.active_quick_folder_slot = slot;
+            let parent = app.tmp.path().join("rated-folders");
+            let mut opened = PathBuf::new();
+            for i in 0..6 {
+                let path = parent.join(if pdf {
+                    format!("{i:02}.pdf")
+                } else {
+                    format!("{i:02}")
+                });
+                if pdf {
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+                } else {
+                    std::fs::create_dir_all(&path).unwrap();
+                    for page in 0..4 {
+                        image::RgbImage::new(2, 2)
+                            .save(path.join(format!("{page:02}.png")))
+                            .unwrap();
+                    }
+                }
+                let key = crate::adjustment_db::normalize_path(&path);
+                let meta = crate::rating_db::RatingMeta::new(if pdf {
+                    crate::rating_db::RatingItemKind::PdfFile
+                } else {
+                    crate::rating_db::RatingItemKind::Folder
+                })
+                .with_source_path(&path);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+                if i == 4 {
+                    opened = path;
+                }
+            }
+            app.current_folder = Some(parent);
+            app.enter_rating_view(3);
+            finish_rating_navigation_for_test(&mut app);
+            app.select_rating_view_row_for_opened_path(&opened);
+            assert_eq!(app.selected, Some(4));
+            let nav = app.grid_physical_navigation(4, opened.clone(), false);
+            assert!(app.apply_fullscreen_close_nav_immediate(nav));
+            if pdf {
+                replace_physical_history_preflight_for_test(
+                    &mut app,
+                    crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                        (0..4)
+                            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                                page_num,
+                                mtime: 1,
+                                file_size: 1,
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            finish_staged_physical_history_for_test(&mut app);
+            let ctx = egui::Context::default();
+            for _ in 0..1000 {
+                if !app.sidecar_restore_active() {
+                    break;
+                }
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!app.sidecar_restore_active());
+            assert_eq!(app.effective_folder(), Some(opened.clone()));
+            assert_eq!(app.rating_view_nav_stack, vec![opened.clone()]);
+            assert_eq!(
+                app.folder_history_back_target(),
+                Some(&FolderNavHistoryTarget::Rating { stars: 3 })
+            );
+            app.selected = Some(3);
+            if backspace {
+                app.rating_view_back();
+            } else {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+            }
+            assert_eq!(
+                app.rating_view_pending
+                    .as_ref()
+                    .unwrap()
+                    .navigation
+                    .as_ref()
+                    .unwrap()
+                    .select_opened_path,
+                Some(opened.clone())
+            );
+            finish_rating_navigation_for_test(&mut app);
+            assert!(app.items_are_rating_view);
+            assert_eq!(app.selected, Some(4));
+            assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
+            assert!(app.scroll_to_selected);
+            if replay_forward {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                if pdf {
+                    replace_physical_history_preflight_for_test(
+                    &mut app,
+                    crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                        (0..4).map(|page_num| crate::pdf_loader::PdfPageEntry {
+                            page_num, mtime: 1, file_size: 1,
+                        }).collect(),
+                    ),
+                );
+                }
+                finish_staged_physical_history_for_test(&mut app);
+                for _ in 0..1000 {
+                    if !app.sidecar_restore_active() {
+                        break;
+                    }
+                    app.poll_sidecar_restore(&ctx);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(!app.sidecar_restore_active());
+                assert_eq!(app.effective_folder(), Some(opened.clone()));
+                app.selected = Some(3);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+                finish_rating_navigation_for_test(&mut app);
+                assert!(app.items_are_rating_view);
+                assert_eq!(app.selected, Some(4));
+                assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
+                assert!(app.scroll_to_selected);
+            }
+        }
+    }
+
+    #[test]
+    fn section1328_rating_folder_history_back_selects_opened_folder() {
+        rating_1328_folder_or_pdf_return(false, false, false);
+    }
+
+    #[test]
+    fn section1328_rating_folder_forward_then_back_selects_opened_folder() {
+        rating_1328_folder_or_pdf_return(false, true, false);
+    }
+
+    #[test]
+    fn section1328_rating_folder_backspace_control_selects_opened_folder() {
+        rating_1328_folder_or_pdf_return(true, false, false);
+    }
+
+    fn rating_1328_large_folder_return(backspace: bool, roundtrip: bool, grouped_child: bool) {
+        use crate::rating_db::{RatingItemKind, RatingMeta};
+        use crate::settings::{GridDisplayOrder, GridItemDisplayKind, ThumbAspect};
+        use std::sync::atomic::Ordering;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.thumb_aspect_auto = true;
+        app.settings.grid_cols = 10;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.rating_view_sort =
+            crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+        app.settings.grid_display_order = GridDisplayOrder::from_rows([
+            GridItemDisplayKind::ALL.to_vec(),
+            vec![],
+            vec![],
+            vec![],
+        ]);
+        let library = app.tmp.path().join("large-rated-library");
+        std::fs::create_dir(&library).unwrap();
+        let mut root_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(36, 48))
+            .write_to(&mut root_png, image::ImageFormat::Png)
+            .unwrap();
+        let mut child_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(24, 36))
+            .write_to(&mut child_png, image::ImageFormat::Png)
+            .unwrap();
+        let opened = library.join("0310-folder");
+        for number in 1..=600 {
+            let (path, kind) = if (299..=310).contains(&number) {
+                let path = library.join(format!("{number:04}-folder"));
+                std::fs::create_dir(&path).unwrap();
+                for page in 1..=8 {
+                    std::fs::write(
+                        path.join(format!("page-{page:02}.png")),
+                        child_png.get_ref(),
+                    )
+                    .unwrap();
+                }
+                (path, RatingItemKind::Folder)
+            } else if (311..=313).contains(&number) {
+                let path = library.join(format!("{number:04}-book.zip"));
+                write_1328_zip(&path);
+                (path, RatingItemKind::ZipFile)
+            } else {
+                let path = library.join(format!("{number:04}-image.png"));
+                std::fs::write(&path, root_png.get_ref()).unwrap();
+                (path, RatingItemKind::Image)
+            };
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(
+                    &crate::adjustment_db::normalize_path(&path),
+                    3,
+                    Some(&RatingMeta::new(kind).with_source_path(&path)),
+                )
+                .unwrap();
+        }
+        app.settings.remember_favorite_view_state = true;
+        let favorite = crate::settings::FavoriteEntry::new("child".into(), opened.clone());
+        let mut child_view = crate::settings::FavoriteViewState::from_settings(&app.settings);
+        child_view.grid_cols = 6;
+        if grouped_child {
+            child_view.grid_display_order = GridDisplayOrder::default();
+        }
+        app.favorite_view_states.insert(favorite.id, child_view);
+        app.settings.favorites.push(favorite);
+        app.current_folder = Some(library);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.cancel_token.store(true, Ordering::Relaxed);
+        assert_eq!(app.items.len(), 600);
+        assert_eq!(app.items[309].container_path(), Some(opened.as_path()));
+        for index in 0..555 {
+            app.auto_aspect.samples.insert(index, 4.0 / 3.0);
+        }
+        app.maybe_apply_auto_aspect(true);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let mut frame = 0;
+        fn draw(app: &mut App, ctx: &egui::Context, frame: &mut u64) {
+            *frame += 1;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 1000.0),
+                    )),
+                    time: Some(*frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.render_menubar(ctx);
+                    app.render_toolbar(ctx);
+                    app.render_facet_filter_bar(ctx);
+                    app.render_selection_info_bar(ctx);
+                    app.render_folder_pane(ctx);
+                    app.render_checked_selection_overlay(ctx);
+                    assert!(app.render_grid(ctx).is_none());
+                    app.render_selection_info(ctx);
+                },
+            );
+            app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        }
+        fn visible(app: &App) -> bool {
+            let position = app
+                .visible_indices
+                .iter()
+                .position(|index| Some(*index) == app.selected)
+                .unwrap();
+            let center =
+                (position / app.last_grid_cols) as f32 * app.last_cell_h + 0.5 * app.last_cell_h;
+            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+        }
+        draw(&mut app, &ctx, &mut frame);
+        app.selected = Some(309);
+        app.scroll_offset_y = 25.0 * app.last_cell_h;
+        app.scroll_to_selected = true;
+        for _ in 0..3 {
+            draw(&mut app, &ctx, &mut frame);
+        }
+        assert!(visible(&app));
+        assert!(
+            (6.0..=8.0).contains(&(app.last_viewport_h / app.last_cell_h)),
+            "viewport={} cell={} cols={}",
+            app.last_viewport_h,
+            app.last_cell_h,
+            app.last_grid_cols
+        );
+        let saved_offset = app.scroll_offset_y;
+        let catalog = app.current_color_catalog.as_ref().unwrap();
+        for (index, item) in app.items.iter().enumerate().take(24) {
+            let (mtime, size) = app.image_metas[index].unwrap();
+            let request = crate::app::make_load_request(
+                item,
+                index,
+                mtime,
+                size,
+                false,
+                app.pdf_current_password.as_deref(),
+                Some(app.settings.folder_thumb_sort),
+                app.settings.folder_thumb_depth,
+                &app.folder_pin_map,
+                &app.converted_archive_cache_paths,
+                app.archive_source_override.as_deref(),
+                app.current_folder.as_deref(),
+                app.folder_thumb_pin_db.as_deref(),
+                app.video_pin_db.as_ref(),
+                app.use_full_path_cache_keys(),
+            )
+            .unwrap();
+            let key = crate::thumb_loader::cache_key_for_request(&request).unwrap();
+            catalog
+                .save(
+                    &key,
+                    request.mtime,
+                    request.file_size,
+                    36,
+                    48,
+                    Some((36, 48)),
+                    root_png.get_ref(),
+                )
+                .unwrap();
+        }
+        let nav = app.grid_physical_navigation(309, opened.clone(), false);
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        finish_staged_physical_history_for_test(&mut app);
+        for attempt in 0..if roundtrip { 2 } else { 1 } {
+            app.cancel_token.store(true, Ordering::Relaxed);
+            assert_eq!(app.effective_folder(), Some(opened.clone()));
+            assert_eq!(app.settings.grid_cols, 6);
+            app.selected = Some(3);
+            app.scroll_to_selected = true;
+            for index in 0..8 {
+                app.auto_aspect.samples.insert(index, 1.5);
+            }
+            app.maybe_apply_auto_aspect(true);
+            assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait2x3);
+            for _ in 0..3 {
+                draw(&mut app, &ctx, &mut frame);
+            }
+            assert!(visible(&app));
+            assert_eq!(app.last_grid_cols, 6);
+            if backspace {
+                app.rating_view_back();
+            } else {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+            }
+            finish_rating_navigation_for_test(&mut app);
+            app.cancel_token.store(true, Ordering::Relaxed);
+            assert_eq!(app.selected, Some(309));
+            assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+            assert_eq!(app.auto_aspect.samples.len(), 24);
+            for _ in 0..8 {
+                draw(&mut app, &ctx, &mut frame);
+                assert!(
+                    visible(&app),
+                    "opened folder lost visibility: cols={} cell={} offset={} viewport={} selected={:?}",
+                    app.last_grid_cols,
+                    app.last_cell_h,
+                    app.scroll_offset_y,
+                    app.last_viewport_h,
+                    app.selected
+                );
+            }
+            assert_eq!(
+                app.scroll_offset_y, saved_offset,
+                "mid-list position walked toward the end"
+            );
+            if roundtrip && attempt == 0 {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                finish_staged_physical_history_for_test(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn section1328_followup5_large_rating_folder_toolbar_back_keeps_mid_list_visible() {
+        rating_1328_large_folder_return(false, false, false);
+    }
+
+    #[test]
+    fn section1328_followup5_large_rating_folder_forward_back_keeps_mid_list_visible() {
+        rating_1328_large_folder_return(false, true, false);
+    }
+
+    #[test]
+    fn section1328_followup5_large_rating_folder_backspace_control_keeps_mid_list_visible() {
+        rating_1328_large_folder_return(true, false, false);
+    }
+
+    #[test]
+    fn section1328_followup5_rating_return_prepares_destination_grouping_before_adoption() {
+        rating_1328_large_folder_return(false, false, true);
+    }
+
+    #[test]
+    fn section1328_followup5_rating_favorite_projection_matches_real_transition() {
+        use crate::settings::{FavoriteEntry, FavoriteViewState};
+        for case in 0..6 {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.remember_favorite_view_state = true;
+            app.settings.grid_cols = 10;
+            app.settings.favorites.clear();
+            let source = app.tmp.path().join("favorite-child");
+            let target = crate::app::rating_view_synthetic_path();
+            let source_favorite = FavoriteEntry::new("source".into(), source.clone());
+            let mut source_state = FavoriteViewState::from_settings(&app.settings);
+            source_state.grid_cols = 6;
+            app.favorite_view_states
+                .insert(source_favorite.id, source_state);
+            app.settings.favorites.push(source_favorite);
+            app.transition_favorite_view_for_path(Some(&source));
+            if case == 1 || case == 2 {
+                let favorite = FavoriteEntry::new("destination".into(), target.clone());
+                if case == 1 {
+                    let mut state = FavoriteViewState::from_settings(&app.settings);
+                    state.grid_cols = 8;
+                    app.favorite_view_states.insert(favorite.id, state);
+                }
+                app.settings.favorites.push(favorite);
+            } else if case == 3 {
+                let ancestor =
+                    FavoriteEntry::new("ancestor".into(), target.parent().unwrap().to_path_buf());
+                let mut state = FavoriteViewState::from_settings(&app.settings);
+                state.grid_cols = 4;
+                app.favorite_view_states.insert(ancestor.id, state);
+                app.settings.favorites.push(ancestor);
+                let owner = FavoriteEntry::new("unsaved-owner".into(), target.clone());
+                app.favorite_view_context.location_favorite_id = Some(owner.id);
+                app.settings.favorites.push(owner);
+            } else if case == 4 {
+                let active = app.settings.active_favorite_view_id().unwrap();
+                app.settings.favorites[0].path = target.clone();
+                app.favorite_view_states.remove(&active);
+                app.settings.grid_cols = 7; // Live state is captured by the real transition.
+            } else if case == 5 {
+                app.settings.remember_favorite_view_state = false;
+            }
+            let source_before = FavoriteViewState::from_settings(&app.settings);
+            let projection = app.favorite_view_state_for_path(&target);
+            assert_eq!(
+                FavoriteViewState::from_settings(&app.settings),
+                source_before
+            );
+            assert_eq!(projection.grid_cols, [10, 8, 6, 4, 7, 10][case]);
+            app.transition_favorite_view_for_path(Some(&target));
+            assert_eq!(FavoriteViewState::from_settings(&app.settings), projection);
+        }
+    }
+
+    #[test]
+    fn section1328_followup5_pending_rating_uses_destination_order_without_changing_source() {
+        use crate::settings::{
+            FavoriteEntry, FavoriteViewState, GridDisplayOrder, GridItemDisplayKind,
+        };
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.remember_favorite_view_state = true;
+        app.settings.grid_cols = 10;
+        let common = GridDisplayOrder::from_rows([
+            GridItemDisplayKind::ALL.to_vec(),
+            vec![],
+            vec![],
+            vec![],
+        ]);
+        app.settings.grid_display_order = common.clone();
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        let _ = rating_1328_install_rows(&mut app);
+        let source = app.tmp.path().join("favorite-child");
+        let favorite = FavoriteEntry::new("child".into(), source.clone());
+        let mut state = FavoriteViewState::from_settings(&app.settings);
+        state.grid_cols = 6;
+        state.grid_display_order = GridDisplayOrder::default();
+        app.favorite_view_states.insert(favorite.id, state.clone());
+        app.settings.favorites.push(favorite);
+        app.current_folder = Some(source.clone());
+        app.transition_favorite_view_for_path(Some(&source));
+        app.enter_rating_view(3);
+        assert_eq!(FavoriteViewState::from_settings(&app.settings), state);
+        assert_eq!(app.effective_folder(), Some(source.clone()));
+        let old_sequence = app.rating_view_request_sequence;
+        assert_eq!(
+            app.rating_view_pending
+                .as_ref()
+                .unwrap()
+                .navigation
+                .as_ref()
+                .unwrap()
+                .target_display_order,
+            common
+        );
+        let changed = GridDisplayOrder::from_rows([
+            GridItemDisplayKind::ALL.iter().rev().copied().collect(),
+            vec![],
+            vec![],
+            vec![],
+        ]);
+        app.settings
+            .favorite_view_overlay
+            .as_mut()
+            .unwrap()
+            .common
+            .grid_display_order = changed.clone();
+        app.poll_staged_rating_navigation();
+        assert!(app.rating_view_request_sequence > old_sequence);
+        assert_eq!(FavoriteViewState::from_settings(&app.settings), state);
+        assert_eq!(app.effective_folder(), Some(source));
+        finish_rating_navigation_for_test(&mut app);
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.settings.grid_cols, 10);
+        assert_eq!(app.settings.grid_display_order, changed);
+    }
+
+    fn rating_1328_tall_folder_return(backspace: bool, roundtrip: bool, warm: bool) {
+        use crate::settings::ThumbAspect;
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.thumb_aspect_auto = true;
+        app.settings.grid_cols = 10;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.rating_view_sort =
+            crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+        let library = app.tmp.path().join("tall-rated-folders");
+        let mut opened = PathBuf::new();
+        for index in 0..120 {
+            let folder = library.join(format!("{index:03}-folder"));
+            std::fs::create_dir_all(&folder).unwrap();
+            for page in 0..8 {
+                image::RgbImage::new(36, 48)
+                    .save(folder.join(format!("{page:02}.png")))
+                    .unwrap();
+            }
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(
+                    &crate::adjustment_db::normalize_path(&folder),
+                    3,
+                    Some(
+                        &crate::rating_db::RatingMeta::new(
+                            crate::rating_db::RatingItemKind::Folder,
+                        )
+                        .with_source_path(&folder),
+                    ),
+                )
+                .unwrap();
+            if index == 104 {
+                opened = folder;
+            }
+        }
+        app.current_folder = Some(library);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        // Deliver deterministic representative-thumbnail samples through their state owner.
+        // Stop the fixture workers before drawing so a cold catalog on replay cannot race
+        // this delivery. No product waits or cache writes are replaced by the regression.
+        app.cancel_token.store(true, Ordering::Relaxed);
+        for index in 0..24 {
+            app.auto_aspect.samples.insert(index, 4.0 / 3.0);
+        }
+        app.maybe_apply_auto_aspect(true);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+        app.select_rating_view_row_for_opened_path(&opened);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        fn draw(app: &mut App, ctx: &egui::Context) {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 350.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.render_grid(ctx).is_none());
+                },
+            );
+        }
+        fn visible(app: &App) -> bool {
+            let row = app
+                .visible_indices
+                .iter()
+                .position(|index| Some(*index) == app.selected)
+                .unwrap()
+                / app.settings.grid_cols;
+            let center = (row as f32 + 0.5) * app.last_cell_h;
+            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+        }
+        draw(&mut app, &ctx);
+        draw(&mut app, &ctx);
+        assert_eq!(app.selected, Some(104));
+        assert!(visible(&app));
+        let saved_offset = app.scroll_offset_y;
+        assert!(saved_offset > 0.0);
+        if warm {
+            let catalog = app.current_color_catalog.as_ref().unwrap();
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(96, 128))
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .unwrap();
+            for (index, item) in app.items.iter().enumerate().take(24) {
+                let (mtime, size) = app.image_metas[index].unwrap();
+                let request = crate::app::make_load_request(
+                    item,
+                    index,
+                    mtime,
+                    size,
+                    false,
+                    app.pdf_current_password.as_deref(),
+                    Some(app.settings.folder_thumb_sort),
+                    app.settings.folder_thumb_depth,
+                    &app.folder_pin_map,
+                    &app.converted_archive_cache_paths,
+                    app.archive_source_override.as_deref(),
+                    app.current_folder.as_deref(),
+                    app.folder_thumb_pin_db.as_deref(),
+                    app.video_pin_db.as_ref(),
+                    app.use_full_path_cache_keys(),
+                )
+                .unwrap();
+                let key = crate::thumb_loader::cache_key_for_request(&request).unwrap();
+                catalog
+                    .save(
+                        &key,
+                        request.mtime,
+                        request.file_size,
+                        96,
+                        128,
+                        Some((96, 128)),
+                        encoded.get_ref(),
+                    )
+                    .unwrap();
+            }
+        }
+        let nav = app.grid_physical_navigation(104, opened.clone(), false);
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        finish_staged_physical_history_for_test(&mut app);
+        for attempt in 0..if roundtrip { 2 } else { 1 } {
+            app.cancel_token.store(true, Ordering::Relaxed);
+            assert_eq!(app.effective_folder(), Some(opened.clone()));
+            app.selected = Some(3);
+            app.scroll_to_selected = true;
+            if warm {
+                // The departing image grid has a different shape from the Rating grid.
+                app.auto_aspect.current = Some(ThumbAspect::Portrait2x3);
+            }
+            draw(&mut app, &ctx);
+            assert!(visible(&app));
+            if backspace {
+                app.rating_view_back();
+            } else {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+            }
+            finish_rating_navigation_for_test(&mut app);
+            app.cancel_token.store(true, Ordering::Relaxed);
+            assert!(app.items_are_rating_view);
+            assert_eq!(app.selected, Some(104));
+            assert_eq!(app.items[104].container_path(), Some(opened.as_path()));
+            if warm {
+                assert_eq!(app.auto_aspect.samples.len(), 24, "real catalog warm seed");
+                assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+                assert_eq!(
+                    app.auto_aspect.switches_done, 0,
+                    "saved aspect must seed Hold"
+                );
+                assert_eq!(app.scroll_offset_y, saved_offset);
+            }
+            draw(&mut app, &ctx);
+            assert!(
+                visible(&app),
+                "opened folder must be visible in the first returned frame"
+            );
+            // The late samples must not restart the departed list's aspect decision and
+            // move its selected row below the viewport after ensure-visible was consumed.
+            app.last_input_at = None;
+            for index in 0..24 {
+                app.auto_aspect.samples.insert(index, 4.0 / 3.0);
+            }
+            app.maybe_apply_auto_aspect(true);
+            draw(&mut app, &ctx);
+            draw(&mut app, &ctx);
+            assert!(
+                visible(&app),
+                "opened folder became invisible after auto aspect settled"
+            );
+            assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+            assert_eq!(
+                app.scroll_offset_y, saved_offset,
+                "position and aspect belong together"
+            );
+            if roundtrip && attempt == 0 {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                finish_staged_physical_history_for_test(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn section1328_rating_tall_folder_toolbar_back_stays_visible_after_aspect_settles() {
+        rating_1328_tall_folder_return(false, false, false);
+    }
+
+    #[test]
+    fn section1328_rating_tall_folder_forward_back_stays_visible_after_aspect_settles() {
+        rating_1328_tall_folder_return(false, true, false);
+    }
+
+    #[test]
+    fn section1328_rating_tall_folder_backspace_control_stays_visible_after_aspect_settles() {
+        rating_1328_tall_folder_return(true, false, false);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_warm_catalog_toolbar_round_trip_keeps_position() {
+        rating_1328_tall_folder_return(false, true, true);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_warm_catalog_backspace_control_keeps_position() {
+        rating_1328_tall_folder_return(true, false, true);
+    }
+
+    #[test]
+    fn section1328_rating_pdf_history_and_backspace_control_select_opened_pdf() {
+        rating_1328_folder_or_pdf_return(false, true, true);
+        rating_1328_folder_or_pdf_return(true, false, true);
+    }
+
+    fn rating_1328_install_rows(app: &mut App) -> Vec<crate::rating_view::RatingViewRow> {
+        let GridItem::Image(previous) = &app.items[0] else {
+            panic!("expected an image fixture");
+        };
+        let root = previous.parent().unwrap().to_path_buf();
+        (0..6)
+            .map(|i| {
+                let path = root.join(format!("new-{i}.jpg"));
+                std::fs::write(&path, b"image").unwrap();
+                let key = crate::adjustment_db::normalize_path(&path);
+                let meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                        .with_source_path(&path);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+                crate::rating_view::RatingViewRow {
+                    key,
+                    item: GridItem::Image(path),
+                    image_meta: None,
+                    rated_at_ms: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn section1328_followup4_pending_search_star_change_keeps_departing_star_owner() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        let _ = rating_1328_install_rows(&mut app);
+        let five = app.tmp.path().join("five.jpg");
+        std::fs::write(&five, b"image").unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(
+                &crate::adjustment_db::normalize_path(&five),
+                5,
+                Some(
+                    &crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                        .with_source_path(&five),
+                ),
+            )
+            .unwrap();
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.open_global_search();
+        // These are still the adopted star-3 rows, although the surface is now Search.
+        app.selected = Some(4);
+        app.scroll_offset_y = 725.0;
+        let expected = app.rating_path_key(4).unwrap();
+        app.enter_rating_view(5);
+        finish_rating_navigation_for_test(&mut app);
+        assert!(!app.global_search.active);
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.rating_view_rows_stars, Some(5));
+        let departed = app.top_level_grid_view.rating_grid_position(3).unwrap();
+        assert_eq!(departed.selected_key, Some(expected.clone()));
+        assert_eq!(departed.scroll_offset_y, 725.0);
+        assert!(
+            app.top_level_grid_view.rating_grid_position(5).is_none(),
+            "new star list must not capture the departing star's items"
+        );
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+        assert_eq!(app.scroll_offset_y, 725.0);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_search_round_trip_keeps_latest_selection() {
+        use crate::app::SearchMode;
+        for mode in [
+            SearchMode::Global,
+            SearchMode::Favsearch,
+            SearchMode::TagView,
+        ] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+            app.rating_view_rows = rating_1328_install_rows(&mut app);
+            app.rating_view_stars = 3;
+            app.install_rating_view_rows();
+            app.selected = Some(0);
+            let saved_key = app.rating_path_key(0).unwrap();
+            app.save_leaving_rating_grid_position();
+            app.enter_rating_view(3);
+            finish_rating_navigation_for_test(&mut app);
+            assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(saved_key));
+            app.selected = Some(4);
+            app.scroll_offset_y = 500.0;
+            let expected = app.rating_path_key(4).unwrap();
+            let results = app.items.clone();
+            match mode {
+                SearchMode::Global => app.open_global_search(),
+                SearchMode::Favsearch => app.open_favsearch(),
+                SearchMode::TagView => app.open_tag_view(),
+                _ => unreachable!(),
+            }
+            app.replace_search_view_items(results, vec![None; 6]);
+            assert_eq!(app.selected, Some(4));
+            match mode {
+                SearchMode::Global => app.close_global_search(),
+                SearchMode::Favsearch => app.close_favsearch(),
+                SearchMode::TagView => app.close_tag_view(),
+                _ => unreachable!(),
+            }
+            finish_rating_navigation_for_test(&mut app);
+            assert!(app.items_are_rating_view);
+            assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+            assert_eq!(app.scroll_offset_y, 500.0);
+        }
+    }
+
+    #[test]
+    fn section1328_followup4_rating_selection_before_search_adoption_is_saved() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.rating_view_stars = 3;
+        app.install_rating_view_rows();
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.open_global_search();
+        // Until the first result arrives, the old Rating grid remains interactive.
+        app.selected = Some(4);
+        app.scroll_offset_y = 600.0;
+        let expected = app.rating_path_key(4).unwrap();
+        let results = app.items.clone();
+        app.replace_search_view_items(results, vec![None; 6]);
+        app.close_global_search();
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+        assert_eq!(app.scroll_offset_y, 600.0);
+    }
+
+    #[test]
+    fn section1328_followup4_rating_collection_exit_captures_latest_position() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.rating_view_stars = 3;
+        app.install_rating_view_rows();
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.selected = Some(4);
+        app.scroll_offset_y = 700.0;
+        let expected = app.rating_path_key(4).unwrap();
+        app.open_collection_grid_after_context_change(
+            crate::collection_store::CollectionId::new(),
+            None,
+            Some(super::top_level_grid_view::TopLevelGridRestore::Rating { stars: 3 }),
+        );
+        assert!(!app.items_are_rating_view);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
+        assert_eq!(app.scroll_offset_y, 700.0);
+    }
+
+    #[test]
+    fn section1328_rating_install_does_not_inherit_index_from_another_surface() {
+        for previous_stars in [None, Some(1)] {
+            let mut app = setup_app();
+            if let Some(stars) = previous_stars {
+                app.items_are_rating_view = true;
+                app.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::Rating { stars },
+                );
+            }
+            app.items = (0..4)
+                .map(|i| GridItem::Image(app.tmp.path().join(format!("old-{i}.jpg"))))
+                .collect();
+            app.selected = Some(3);
+            app.rating_view_stars = 3;
+            app.rating_view_rows = rating_1328_install_rows(&mut app);
+            app.install_rating_view_rows();
+            assert_eq!(app.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn section1328_rating_same_list_rebuild_keeps_index_fallback() {
+        let mut app = setup_app();
+        app.items_are_rating_view = true;
+        app.rating_view_stars = 3;
+        app.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 });
+        app.items = vec![GridItem::Image(app.tmp.path().join("removed.jpg")); 4];
+        app.selected = Some(3);
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.install_rating_view_rows();
+        assert_eq!(app.selected, Some(3));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1328_rating_positions_keep_star_identity_and_refresh_sample_ownership() {
+        use crate::settings::ThumbAspect;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        let _rows = rating_1328_install_rows(&mut app);
+        app.settings.thumb_aspect_auto = true;
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.selected = Some(4);
+        app.scroll_offset_y = 500.0;
+        app.auto_aspect.current = Some(ThumbAspect::Portrait3x4);
+        app.auto_aspect.samples = (0..6).map(|index| (index, 4.0 / 3.0)).collect();
+        app.auto_aspect.switches_done = 2;
+        let selected_key = app.rating_path_key(4).unwrap();
+        // apply_rating_view_result replaces rows/stars before common install saves old items.
+        app.enter_rating_view(4);
+        finish_rating_navigation_for_test(&mut app);
+        let old = app.top_level_grid_view.rating_grid_position(3).unwrap();
+        assert_eq!(old.selected_key.as_deref(), Some(selected_key.as_str()));
+        assert_eq!(old.scroll_offset_y, 500.0);
+        assert_eq!(old.aspect_seed.unwrap().aspect, ThumbAspect::Portrait3x4);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Square);
+        // A duplicated context must not borrow another context's saved positions.
+        assert!(
+            app.top_level_grid_view
+                .clone()
+                .rating_grid_position(3)
+                .is_none()
+        );
+        assert!(app.start_rating_history_replay(FolderHistoryDirection::Back, 3));
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.scroll_offset_y, 500.0);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+        assert!(app.auto_aspect.samples.is_empty());
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(6));
+        assert_eq!(app.auto_aspect.switches_done, 0);
+        assert!(app.auto_aspect.streak.is_none());
+        // Newly rebuilt representatives may have changed at the same row keys. Existing
+        // cache gates must allow current statistics to replace the saved decision.
+        app.auto_aspect.samples = (0..6).map(|index| (index, 1.0)).collect();
+        app.maybe_apply_auto_aspect(true);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Square);
+        app.clear_quick_folder_slots();
+        assert!(app.top_level_grid_view.rating_grid_position(3).is_none());
+    }
+
+    #[test]
+    fn section1328_rating_manual_aspect_does_not_adopt_saved_auto_seed() {
+        let mut app = setup_app();
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.rating_view_stars = 3;
+        let selected_key = app.rating_view_rows[4].key.clone();
+        app.top_level_grid_view.save_rating_grid_position(
+            3,
+            super::top_level_grid_view::RatingGridPosition {
+                scroll_offset_y: 200.0,
+                selected_key: Some(selected_key),
+                aspect_seed: Some(crate::auto_aspect_cache::AutoAspectCacheEntry {
+                    aspect: crate::settings::ThumbAspect::Portrait3x4,
+                    sample_count: 24,
+                    eligible_total: 100,
+                    updated_at: 0,
+                }),
+            },
+        );
+        app.settings.thumb_aspect_auto = false;
+        app.settings.thumb_aspect = crate::settings::ThumbAspect::Landscape4x3;
+        app.install_rating_view_rows();
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.scroll_offset_y, 200.0);
+        assert_eq!(
+            app.effective_thumb_aspect(),
+            crate::settings::ThumbAspect::Landscape4x3
+        );
+        assert!(app.auto_aspect.current.is_none());
+    }
+
+    #[test]
+    fn section1328_zip_page_continuation_saves_history_without_adopting_startup_list() {
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip = parent.join("book.zip");
+        write_1328_zip(&zip);
+        install_1328_parent(&mut app, &parent, vec![GridItem::ZipFile(zip.clone())]);
+        app.selected = Some(0);
+        app.scroll_offset_y = 320.0;
+        app.capture_main_list_restore_cursor();
+        let startup_before = app.settings.startup_list_restore.clone();
+        app.load_zip_as_folder_prepared(
+            zip.clone(),
+            crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+            crate::app::StartupListIntent::PageContinuation,
+        );
+        assert_eq!(app.settings.startup_list_restore, startup_before);
+        assert_eq!(app.folder_history.get(&parent), Some(&(320.0, Some(0))));
     }
 
     #[test]

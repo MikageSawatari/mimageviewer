@@ -472,6 +472,96 @@ scenarioの期限はアプリ起動時のmonotonic clockから一度決め、foc
 prepare・App・runnerの終了値は分ける。cleanupとarchiveに例外があっても外側finallyで
 排他を解放する。fixtureも新しく作成できた領域だけを今回の証跡の対象にする。
 
+### §1.328: rating-folder-back の採取用Suite (2026-10-07、実行は引き継ぎ待ち)
+
+`scripts/ui-smoke.ps1 -Suite RatingFolderBack` (`-Scenario` の別名) は、隔離 data に
+12 フォルダ × 8 PNG、3 ZIP × 8 PNG、585 直接画像を作り、計600行すべてを ★3 にする。
+900×1000、10列で `0310-folder` / `0311-book.zip` (通常の表示位置309/310、row30/31) を選ぶ。
+直接画像は96×128 (3:4)、フォルダ/ZIP内は96×144 (2:3)、`thumb_aspect_auto=true`。
+★一覧sortも`Normal(FileName)`に明示し、★時刻順のtie-breakへ依存しない。
+初回★一覧と各復帰ではAuto 3:4と31以上の実sampleを待つ。15コンテナの2:3代表が
+すべて混ざっても中央値を保つためであり、待機中に位置を補正する処理は加えない。
+子一覧は2:3・8sample・第4画像の採用を確認する。実描画のviewportが6〜8行 (約70セル)、
+選択rowが25〜35、viewport以後も10行以上残ることを検査し、末尾clampで偶然可視になる
+小一覧を除く。旧15行・3列・両側3:4のfixtureは今回の実機条件を検査できなかった。
+固定時間待ちや戻り行の再選択でsettle後の可視性を補正しない。
+共通表示は10列、お気に入り表示の記憶をONにし、対象folder/ZIPだけUUID付きお気に入りと
+6列の保存表示状態を隔離`adjustment.db`へ登録する。子の実描画が6列になったことを確認し、
+復帰先は10列を要求する。列数をscenarioから書き換えず、通常のfavorite overlay所有者を通す。
+生成済みDB/overrideがある場合は変更前に拒否し、fixture用の新規領域だけを使う。
+場所▼ → レーティング → ★★★ の実 widget をクリックし、実セルのdouble-clickで開く。
+第4画像もセルのclickで選ぶ。これらとツールバー←／→はfocus不要のROOT pointer経路を使う。
+rating/history の直接 action や既存 `open_rating_one` helper は使わない。
+
+各コンテナについてツールバー←、Alt+Left、BrowserBack、WM_APPCOMMAND backward、X1、
+Backspace を独立した新規 open から試す。前5入口では同じ入口の forward → back も試す
+(最大22ケース、戻り観測32回)。ツールバーの4ケース／6戻り観測は必須。
+他の18ケースは各1秒以内に登録済みROOTのfocusを確認できた場合のみ実行し、
+未focusなら `SKIPPED no-focus` と記録する。実行／skip／失敗数を区別し、skipした入口を
+確認済みとは扱わない。不一致でも残りを採取し、最後に失敗を集約する。
+focusの強制取得や通常キーguardの迂回はしない。fixture／採用失敗は失敗のまま集計する。
+
+test-script 限定の `root_history_input` は明示選択した exact ROOT HWND の現存・focusを検証し、
+BrowserBack/Forward の WM_KEYDOWN/UP、WM_APPCOMMAND、WM_XBUTTONDOWN/UP を PostMessage する。
+前2者は既存 WH_GETMESSAGE hook、X1/X2 は winit → egui Extra1/2 から既存マウス設定へ入る。
+handler直呼び／pending count の注入はしない。物理マウスドライバー自体の試験ではない。
+複数窓への入力や OS foreground の切替は加えず、単一 ROOT の直列ケースに範囲を絞る。
+
+`snapshot().grid` は実サムネイル ScrollArea の描画時に記録した generation、frame、選択key/name/index、
+実scroll offset、選択セル矩形、clip viewport、content高／列数を返す。
+Auto有効・実効比率・実sample数も同じ描画時点の読取観測として返す。
+状態snapshotは次pass冒頭のため、scenario は generation/index の一致を待ち、
+セル中心が clip viewport 内かを visible として判定する。
+戻りの観測・assertで再選択やscroll-to-meはしない。setupのpointer対象だけ、
+`grid-key:世代:container path` を現在の一覧の一意な項目へ解決し、既存ScrollArea／offset読み戻しで
+表示する。第4画像は既存の `grid-row:世代:index:名前` を使う。別世代・欠落・重複keyは操作しない。
+可視化後の実Responseに `hover_widget`／`double_click_widget`／`click_widget` を送り、
+最初のクリックで選択、次で既存double-clickのopen ownerを通す。通常buildのproducer／履歴／
+描画は変えず、test-script限定のvirtualized widget登録／pointer種類を追加する。
+
+各ケースの before-open／第4画像／戻りを `log` に保存し、戻りとケース失敗時を `capture` する。
+32戻りと最大22ケースの失敗画面でも既存の64 checkpoint上限内に収める。runner の
+`target/ui-smoke-runs/*-RatingFolderBack-*/` に run metadata、stdout/stderr、perf／アプリログ、
+`screenshots/*.png` と screenshot manifest、fixture／script／override のコピーが残る。
+未focus時の通常見込み1〜3分、全入口実行時3〜5分。失敗時も採取を続けるため
+`-TimeoutSeconds 900` を指定する。
+起動は coordinator に引き継ぎ、実アプリでの再現／PASSはこの準備だけでは主張しない。
+
+非対話確認は `python -B scripts/ui-smoke/test_rating_folder_back_fixture.py` と
+`cargo test -p mimageviewer --lib --features test-script rating_folder_back`、`grid_observation`、
+`history_input`。portable/test-script の準備は `prepare-portable-smoke.ps1 -TestScript` で行う。
+
+初回run `20261006T190934152Z-160208-RatingFolderBack-b2cb5320` は全22ケースが
+最初のEscapeで `synthetic key target is not registered` となり、★3一覧へ未到達 (exit 1)。
+製品の選択喪失を再現した結果ではない。次のrun
+`20261006T193735951Z-178504-RatingFolderBack-9ce99859` も起動時の登録／focus待ちでtimeoutした。
+coordinatorからbackground launchによるWindows foreground lockの報告があり、
+必須経路は登録／focus待ちを除いたwidget pointer入力へ変更した。
+メニュー採用／double-click／forward／backでは一覧種別・実パス・全件数と新しい世代を待つ。
+戻る前に対象コンテナの `page-04.png` 選択を確認する。撮影名も短いASCII別名へ変更し、
+ZIP名の「.」と48文字制限の違反を避ける。非対話の契約テストで未採用snapshotの拒否と
+22ケースの撮影名／予算を確認する。修正版の実アプリ結果はcoordinatorの再実行待ち。
+
+2026-10-07追補: `item_names`は共通snapshot契約で先頭16件だけを公開する。
+600件の名前配列との完全一致待ち、prefix内の`index_of`、その長さによる件数/サンプル判定は
+大一覧に使えない。最新runのログでは★3・600件・10列へ到達済みであり、timeoutはこの待機契約の
+不一致だった。起動フォルダはload完了だけを待つcoordinatorの変更を保持し、全件数は`items_len`、
+選択key/nameと表示行は実描画の`grid`（`row_content_y / cell_height`）で確認する。
+★3の全件順序やraw indexを決め打ちせず、対象の世代/keyを実セルへ解決する。戻りはkey/name・
+可視性・実列数/geometryをassertする。16件の上限は拡大せず、全件名の毎frame公開を増やさない。
+小さい子一覧だけ8件のpage名を照合する。通常snapshot producerのprefix抽出を契約テストでも使い、
+600件/16名・未focusの採用、並び替わったkey、stale/欠落/重複、raw indexと表示行が異なる条件を検査する。
+fixtureの600件/3:4・子6列/2:3、settings overrideとfavorite保存schemaは変更不要。
+600件の実gridへ未focusでhover/double-clickするheadless回帰では、可視化animation中のACKが
+移動中のセル中心を固定し、次のpointer edgeで別行（310→320）を開くことも確認した。
+explicit test-script targetのrevealだけ`scroll_to_rect_animation(..., ScrollAnimation::none())`を使う。
+既存ScrollArea/readbackで可視化してから実Responseの座標を受け取る。通常のscroll animationや
+履歴/選択producerは変更しない。待機時間を増やして症状を隠さず、対象座標の所有境界で直す。
+実アプリは起動せず、portable test-scriptだけ再buildして引き継ぐ。利用者が確認中のdev-runtimeは
+明示指示があるまで再build/停止しない。
+起動前の変数生成もheadlessで評価する。8画像の名前とlibrary／★一覧の別パスを確認し、600件の全件名配列は生成しない。
+Rhaiの `replace` は文字列を変更して値を返さないので、★一覧パスはlibraryのコピーから作る。
+
 ## S1: 窓snapshotとtargetの所有
 
 App投影だけでなくregistryのread-only参照から、window ID・context serial・residence・

@@ -26,6 +26,10 @@ use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 mod capture;
 #[cfg(feature = "test-script")]
 mod clipboard_capture;
+#[cfg(feature = "test-script")]
+pub(crate) mod grid_observation;
+#[cfg(feature = "test-script")]
+mod history_input;
 pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -1076,6 +1080,8 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) action_wait_diagnostic: String,
     /// Raw index in `item_names`/the mounted grid, or -1 when nothing is selected.
     pub(crate) selected_index: i64,
+    #[cfg(feature = "test-script")]
+    pub(crate) grid_observation: grid_observation::GridObservation,
     pub(crate) item_names: Vec<String>,
     pub(crate) item_ratings: Vec<i64>,
     pub(crate) sort_order: String,
@@ -1203,6 +1209,8 @@ impl Default for TestScriptSnapshot {
             snapshot_frame: 0,
             action_wait_diagnostic: String::new(),
             selected_index: -1,
+            #[cfg(feature = "test-script")]
+            grid_observation: grid_observation::GridObservation::default(),
             item_names: Vec::new(),
             item_ratings: Vec::new(),
             sort_order: String::new(),
@@ -1284,6 +1292,8 @@ impl TestScriptSnapshot {
         insert!(items_len);
         insert!(snapshot_frame);
         insert!(selected_index);
+        #[cfg(feature = "test-script")]
+        map.insert("grid".into(), self.grid_observation.to_rhai_map().into());
         map.insert(
             "item_names".into(),
             self.item_names
@@ -1454,6 +1464,7 @@ enum UiCommand {
     SmokeAction(UiSmokeAction),
     ClickWidget {
         label: String,
+        kind: WidgetClickKind,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     SortPopupPointer {
@@ -1516,6 +1527,15 @@ pub(crate) fn seeded_collection_smoke_id() -> crate::collection_store::Collectio
 enum WidgetClickPhase {
     Down,
     Up,
+    DoubleDown,
+    DoubleUp,
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WidgetClickKind {
+    Single,
+    Double,
     Hover,
 }
 
@@ -1527,7 +1547,7 @@ enum SortPopupPointerKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WidgetPointerRequestKind {
-    ClickEnabled,
+    ClickEnabled(WidgetClickKind),
     SortPopup(SortPopupPointerKind),
 }
 
@@ -1554,11 +1574,104 @@ thread_local! {
         RefCell::new(WidgetClickDriver::default());
 }
 
+#[cfg(test)]
 fn request_widget_click(
     label: String,
     reply: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
-    request_widget_pointer(label, WidgetPointerRequestKind::ClickEnabled, reply)
+    request_widget_pointer(
+        label,
+        WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Single),
+        reply,
+    )
+}
+
+/// Generation-scoped pointer targets resolve only against the currently adopted list.
+/// Key targets keep the snapshot bounded and do not assume row ordering or selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GridRowPointerTarget {
+    IndexName {
+        generation: u64,
+        index: usize,
+        name: String,
+    },
+    ContainerKey {
+        generation: u64,
+        key: std::path::PathBuf,
+    },
+}
+
+impl GridRowPointerTarget {
+    fn parse(label: &str) -> Option<Self> {
+        if let Some(label) = label.strip_prefix("grid-key:") {
+            let (generation, key) = label.split_once(':')?;
+            if key.is_empty() {
+                return None;
+            }
+            return Some(Self::ContainerKey {
+                generation: generation.parse().ok()?,
+                key: key.into(),
+            });
+        }
+        let mut parts = label.strip_prefix("grid-row:")?.splitn(3, ':');
+        Some(Self::IndexName {
+            generation: parts.next()?.parse().ok()?,
+            index: parts.next()?.parse().ok()?,
+            name: parts.next()?.to_owned(),
+        })
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        generation: u64,
+        items: &[crate::grid_item::GridItem],
+    ) -> Option<usize> {
+        match self {
+            Self::IndexName {
+                generation: owner,
+                index,
+                name,
+            } => (*owner == generation
+                && items.get(*index).is_some_and(|item| item.name() == *name))
+            .then_some(*index),
+            Self::ContainerKey {
+                generation: owner,
+                key,
+            } if *owner == generation => {
+                let mut matches = items.iter().enumerate().filter(|(_, item)| {
+                    item.container_path()
+                        .is_some_and(|path| crate::folder_tree::path_eq(path, key))
+                });
+                let index = matches.next()?.0;
+                matches.next().is_none().then_some(index)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Only a current ROOT request can reveal its target. This never selects or opens an item.
+pub(crate) fn requested_grid_row(ctx: &egui::Context) -> Option<GridRowPointerTarget> {
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return None;
+    }
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        let request = driver.requested.as_ref()?;
+        if !matches!(request.kind, WidgetPointerRequestKind::ClickEnabled(_)) {
+            return None;
+        }
+        GridRowPointerTarget::parse(&request.label)
+    })
+}
+
+/// The normal snapshot deliberately contains only a bounded prefix, even for large lists.
+pub(crate) fn item_names_for_snapshot(items: &[crate::grid_item::GridItem]) -> Vec<String> {
+    items
+        .iter()
+        .take(MAX_ITEM_ROWS_IN_SNAPSHOT)
+        .map(|item| item.name().into_owned())
+        .collect()
 }
 
 fn request_widget_pointer(
@@ -1582,7 +1695,8 @@ pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) 
     WIDGET_CLICK_DRIVER.with(|driver| {
         let mut driver = driver.borrow_mut();
         if !driver.requested.as_ref().is_some_and(|request| {
-            request.label == label && request.kind == WidgetPointerRequestKind::ClickEnabled
+            request.label == label
+                && matches!(request.kind, WidgetPointerRequestKind::ClickEnabled(_))
         }) {
             return;
         }
@@ -1595,11 +1709,20 @@ pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) 
         }
         let point = response.rect.center();
         let request = driver.requested.take().expect("matching request exists");
+        let phase = match request.kind {
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Single) => {
+                WidgetClickPhase::Down
+            }
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Double) => {
+                WidgetClickPhase::DoubleDown
+            }
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Hover) => {
+                WidgetClickPhase::Hover
+            }
+            _ => unreachable!("matched enabled widget pointer request"),
+        };
         if request.reply.send(Ok(())).is_ok() {
-            driver.active = Some(WidgetClick {
-                point,
-                phase: WidgetClickPhase::Down,
-            });
+            driver.active = Some(WidgetClick { point, phase });
         }
     });
 }
@@ -1672,7 +1795,10 @@ pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
             return;
         };
         let point = click.point;
-        let pressed = matches!(click.phase, WidgetClickPhase::Down);
+        let pressed = matches!(
+            click.phase,
+            WidgetClickPhase::Down | WidgetClickPhase::DoubleDown
+        );
         input.events.push(egui::Event::PointerMoved(point));
         if !matches!(click.phase, WidgetClickPhase::Hover) {
             input.events.push(egui::Event::PointerButton {
@@ -1684,6 +1810,8 @@ pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
         }
         match click.phase {
             WidgetClickPhase::Down => click.phase = WidgetClickPhase::Up,
+            WidgetClickPhase::DoubleDown => click.phase = WidgetClickPhase::DoubleUp,
+            WidgetClickPhase::DoubleUp => click.phase = WidgetClickPhase::Down,
             WidgetClickPhase::Up | WidgetClickPhase::Hover => driver.active = None,
         }
     });
@@ -2866,6 +2994,8 @@ fn wait_interruptibly(
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
     #[cfg(feature = "test-script")]
+    history_input::register(engine, bridge.clone());
+    #[cfg(feature = "test-script")]
     clipboard_capture::register(engine, bridge.clone());
     let always_on_top_bridge = bridge.clone();
     engine.register_fn(
@@ -2941,36 +3071,43 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             }
         },
     );
-    let click_widget_bridge = bridge.clone();
-    engine.register_fn(
-        "click_widget",
-        move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let (reply, received) = mpsc::sync_channel(1);
-            click_widget_bridge
-                .send(UiCommand::ClickWidget {
-                    label: label.to_string(),
-                    reply,
-                })
-                .map_err(rhai_error)?;
-            let started = Instant::now();
-            loop {
-                click_widget_bridge.interrupt.check().map_err(rhai_error)?;
-                if started.elapsed() >= Duration::from_secs(30) {
-                    return Err(rhai_error(format!(
-                        "click_widget timed out waiting for visible widget: {label}"
-                    )));
-                }
-                match received.recv_timeout(WAIT_POLL_INTERVAL) {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(message)) => return Err(rhai_error(message)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(rhai_error("widget click acknowledgement disconnected"));
+    for (name, kind) in [
+        ("click_widget", WidgetClickKind::Single),
+        ("double_click_widget", WidgetClickKind::Double),
+        ("hover_widget", WidgetClickKind::Hover),
+    ] {
+        let click_widget_bridge = bridge.clone();
+        engine.register_fn(
+            name,
+            move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                let (reply, received) = mpsc::sync_channel(1);
+                click_widget_bridge
+                    .send(UiCommand::ClickWidget {
+                        label: label.to_string(),
+                        kind,
+                        reply,
+                    })
+                    .map_err(rhai_error)?;
+                let started = Instant::now();
+                loop {
+                    click_widget_bridge.interrupt.check().map_err(rhai_error)?;
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        return Err(rhai_error(format!(
+                            "click_widget timed out waiting for visible widget: {label}"
+                        )));
+                    }
+                    match received.recv_timeout(WAIT_POLL_INTERVAL) {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(message)) => return Err(rhai_error(message)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(rhai_error("widget click acknowledgement disconnected"));
+                        }
                     }
                 }
-            }
-        },
-    );
+            },
+        );
+    }
     for (name, kind) in [
         ("hover_sort_row", SortPopupPointerKind::Hover),
         ("click_sort_row", SortPopupPointerKind::Click),
@@ -5029,10 +5166,14 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
                     runtime.smoke_actions.push_back(action);
                 }
             }
-            UiCommand::ClickWidget { label, reply } => {
+            UiCommand::ClickWidget { label, kind, reply } => {
                 if runtime.finish.is_some() {
                     let _ = reply.send(Err("script is already finishing".to_string()));
-                } else if let Err(message) = request_widget_click(label, reply.clone()) {
+                } else if let Err(message) = request_widget_pointer(
+                    label,
+                    WidgetPointerRequestKind::ClickEnabled(kind),
+                    reply.clone(),
+                ) {
                     let _ = reply.send(Err(message));
                 } else {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -5634,6 +5775,613 @@ mod tests {
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn widget_pointer_double_click_and_hover_work_without_focus() {
+        for kind in [
+            super::WidgetClickKind::Double,
+            super::WidgetClickKind::Hover,
+        ] {
+            let (reply, received) = std::sync::mpsc::sync_channel(1);
+            super::request_widget_pointer(
+                "row".into(),
+                super::WidgetPointerRequestKind::ClickEnabled(kind),
+                reply,
+            )
+            .unwrap();
+            let ctx = egui::Context::default();
+            let render = |time, inject| {
+                let mut input = egui::RawInput {
+                    time: Some(time),
+                    focused: false,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                };
+                if inject {
+                    super::append_widget_click_events(&mut input);
+                }
+                ctx.begin_pass(input);
+                let mut result = (false, false);
+                egui::CentralPanel::default().show(&ctx, |ui| {
+                    let response = ui.button("row");
+                    super::register_clickable_widget("row", &response);
+                    result = (response.clicked(), response.double_clicked());
+                });
+                let _ = ctx.end_pass();
+                result
+            };
+            assert_eq!(render(0.0, false), (false, false));
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            if kind == super::WidgetClickKind::Double {
+                assert_eq!(render(0.01, true), (false, false));
+                assert_eq!(render(0.02, true), (true, false));
+                assert_eq!(render(0.03, true), (false, false));
+                assert_eq!(render(0.04, true), (true, true));
+            } else {
+                assert_eq!(render(0.01, true), (false, false));
+            }
+            assert!(!super::widget_click_in_progress());
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn grid_pointer_request_identifies_generation_index_and_name() {
+        let ctx = egui::Context::default();
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "grid-row:42:11:12-folder".into(),
+            super::WidgetPointerRequestKind::ClickEnabled(super::WidgetClickKind::Hover),
+            reply,
+        )
+        .unwrap();
+        assert_eq!(
+            super::requested_grid_row(&ctx),
+            Some(super::GridRowPointerTarget::IndexName {
+                generation: 42,
+                index: 11,
+                name: "12-folder".into()
+            })
+        );
+        super::WIDGET_CLICK_DRIVER.with(|driver| *driver.borrow_mut() = Default::default());
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "places-menu".into(),
+            super::WidgetPointerRequestKind::ClickEnabled(super::WidgetClickKind::Single),
+            reply,
+        )
+        .unwrap();
+        assert_eq!(super::requested_grid_row(&ctx), None);
+        super::WIDGET_CLICK_DRIVER.with(|driver| *driver.borrow_mut() = Default::default());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_adopts_large_rating_with_real_bounded_snapshot_prefix() {
+        let items: Vec<_> = (0..600)
+            .map(|index| {
+                crate::grid_item::GridItem::Image(std::path::PathBuf::from(format!(
+                    r"C:\fixture\{index:04}.png"
+                )))
+            })
+            .collect();
+        let mut snapshot = ready_snapshot();
+        snapshot.items_len = items.len() as i64;
+        snapshot.item_names = super::item_names_for_snapshot(&items);
+        snapshot.grid_surface = "Rating { stars: 3 }".into();
+        snapshot.current_folder_path = r"C:\fixture\__rating_view__".into();
+        snapshot.items_generation = 42;
+        snapshot.focused = false;
+        snapshot.target_registered = false;
+        assert_eq!(snapshot.item_names.len(), super::MAX_ITEM_ROWS_IN_SNAPSHOT);
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(
+                include_str!("../scripts/ui-smoke/rating-folder-back.rhai")
+                    .split("// Scenario entry:")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        snapshot.grid_surface.clone(),
+                        snapshot.current_folder_path.clone(),
+                        600_i64,
+                        41_i64
+                    )
+                )
+                .unwrap()
+        );
+        snapshot.item_names.reverse(); // Order and projection prefix do not define adoption.
+        assert!(
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        snapshot.grid_surface.clone(),
+                        snapshot.current_folder_path.clone(),
+                        600_i64,
+                        41_i64
+                    )
+                )
+                .unwrap()
+        );
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn rating_folder_back_key_pointer_reveals_and_double_clicks_actual_large_grid_without_focus() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.grid_cols = 10;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.settings.thumb_aspect_auto = false;
+        app.settings.thumb_aspect = crate::settings::ThumbAspect::Portrait3x4;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.grid_open_selected_item_on_click = false;
+        app.items = (0..600)
+            .map(|index| GridItem::Folder(app.tmp.path().join(format!("{index:04}-folder"))))
+            .collect();
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 600];
+        app.visible_indices = (0..600).collect();
+        app.selected = Some(0);
+        app.scroll_to_selected = false;
+        let key = app.items[310].container_path().unwrap().to_path_buf();
+        std::fs::create_dir(&key).unwrap();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let label = format!("grid-key:{}:{}", app.items_generation, key.display());
+        let mut time = 0.0;
+        let mut draw = |app: &mut crate::app::AppTestEnvForTest| {
+            time += 0.01;
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 1000.0),
+                )),
+                focused: false,
+                time: Some(time),
+                ..Default::default()
+            };
+            super::append_widget_click_events(&mut input);
+            let mut navigation = None;
+            let _ = ctx.run(input, |ctx| navigation = app.render_grid(ctx));
+            navigation
+        };
+        assert!(draw(&mut app).is_none());
+        let initial = app.test_script_snapshot(&ctx);
+        assert_eq!(initial.items_len, 600);
+        assert_eq!(initial.item_names.len(), super::MAX_ITEM_ROWS_IN_SNAPSHOT);
+        for kind in [
+            super::WidgetClickKind::Hover,
+            super::WidgetClickKind::Double,
+        ] {
+            let (reply, received) = std::sync::mpsc::sync_channel(1);
+            super::request_widget_pointer(
+                label.clone(),
+                super::WidgetPointerRequestKind::ClickEnabled(kind),
+                reply,
+            )
+            .unwrap();
+            let mut acked = false;
+            let mut navigation = None;
+            // Bound the fake-frame simulation to one second while draining reveal/readback
+            // and the normal pointer edges. This is not a real-time sleep.
+            for _ in 0..100 {
+                navigation = draw(&mut app).or(navigation);
+                if let Ok(result) = received.try_recv() {
+                    result.unwrap();
+                    acked = true;
+                }
+                if acked && !super::widget_click_in_progress() {
+                    break;
+                }
+            }
+            assert!(
+                acked,
+                "target key never reached its actual cell: offset={} geometry={:?}",
+                app.scroll_offset_y,
+                super::grid_observation::snapshot(&ctx)
+            );
+            assert!(!super::widget_click_in_progress());
+            if kind == super::WidgetClickKind::Hover {
+                assert!(navigation.is_none());
+                assert_eq!(app.selected, Some(0), "hover must not select or open");
+                assert!(app.scroll_offset_y > 20.0 * app.last_cell_h);
+            } else {
+                assert_eq!(app.selected, Some(310));
+                assert!(
+                    matches!(navigation, Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == key)
+                );
+                // Grid evidence is painted before the click handler, just like the suite's
+                // later-frame adoption barrier. Observe the next pass, without more input.
+                assert!(draw(&mut app).is_none());
+                let observed = super::grid_observation::snapshot(&ctx);
+                assert_eq!(observed.selected_name, "0310-folder");
+                assert_eq!(observed.selected_key, key.to_string_lossy());
+                assert!(observed.to_rhai_map()["visible"].clone().cast::<bool>());
+            }
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn grid_pointer_key_resolves_beyond_snapshot_prefix_and_rejects_stale_missing_duplicate() {
+        use super::GridRowPointerTarget;
+        use crate::grid_item::GridItem;
+        let mut items: Vec<_> = (0..600)
+            .map(|index| {
+                GridItem::Folder(std::path::PathBuf::from(format!(
+                    r"C:\fixture\{index:04}-folder"
+                )))
+            })
+            .collect();
+        let target = GridRowPointerTarget::parse(r"grid-key:42:C:\fixture\0310-folder").unwrap();
+        assert_eq!(target.resolve(42, &items), Some(310));
+        assert_eq!(target.resolve(41, &items), None);
+        assert_eq!(target.resolve(42, &items[..16]), None);
+        assert_eq!(GridRowPointerTarget::parse("grid-key:42:"), None);
+        items.swap(310, 590);
+        assert_eq!(target.resolve(42, &items), Some(590));
+        items.push(items[590].clone());
+        assert_eq!(target.resolve(42, &items), None);
+        let exact = GridRowPointerTarget::parse("grid-row:42:590:0310-folder").unwrap();
+        assert_eq!(exact.resolve(42, &items), Some(590));
+        assert_eq!(exact.resolve(41, &items), None);
+        assert_eq!(
+            GridRowPointerTarget::parse("grid-row:42:590:wrong")
+                .unwrap()
+                .resolve(42, &items),
+            None
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        build_engine(bridge)
+            .compile(
+                &std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("scripts/ui-smoke/rating-folder-back.rhai"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_waits_allow_unfocused_but_reject_unadopted_snapshots() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut scope = rhai::Scope::new();
+        let mut adopted = ready_snapshot();
+        adopted.grid_surface = "Folder".into();
+        adopted.current_folder_path = r"C:\fixture\12-folder".into();
+        adopted.item_names = vec!["page-04.png".into()];
+        adopted.items_len = 1;
+        adopted.items_generation = 10;
+        adopted.target_registered = false;
+        adopted.focused = false;
+        let arrival = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        "Folder".to_string(),
+                        r"C:\fixture\12-folder".to_string(),
+                        1_i64,
+                        9_i64,
+                    ),
+                )
+                .unwrap()
+        };
+        assert!(arrival(adopted.clone()));
+        for field in [
+            "startup_open_pending",
+            "is_fullscreen",
+            "popup_open",
+            "modal_open",
+            "text_input_or_pending_focus",
+            "ime_active",
+            "grid_surface",
+            "current_folder_path",
+            "items_len",
+            "items_generation",
+        ] {
+            let mut stale = adopted.clone();
+            match field {
+                "startup_open_pending" => stale.startup_open_pending = true,
+                "is_fullscreen" => stale.is_fullscreen = true,
+                "popup_open" => stale.popup_open = true,
+                "modal_open" => stale.modal_open = true,
+                "text_input_or_pending_focus" => stale.text_input_or_pending_focus = true,
+                "ime_active" => stale.ime_active = true,
+                "grid_surface" => stale.grid_surface = "Rating { stars: 3 }".into(),
+                "current_folder_path" => {
+                    stale.current_folder_path = r"C:\fixture\other-folder".into()
+                }
+                "items_len" => stale.items_len = 0,
+                "items_generation" => stale.items_generation = 9,
+                _ => unreachable!(),
+            }
+            assert!(!arrival(stale), "accepted incomplete adoption: {field}");
+        }
+        let mut unregistered = ready_snapshot();
+        unregistered.target_registered = false;
+        assert!(
+            !engine
+                .call_fn::<bool>(
+                    &mut scope,
+                    &helpers,
+                    "input_ready",
+                    (unregistered.to_rhai_map(),)
+                )
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_aspect_wait_rejects_square_incomplete_and_stale_grids() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut settled = ready_snapshot();
+        settled.item_names = vec!["row".into(); 15];
+        settled.items_len = 15;
+        settled.items_generation = 10;
+        settled.grid_observation.generation = 10;
+        settled.grid_observation.aspect_auto = true;
+        settled.grid_observation.aspect_label = "3:4".into();
+        settled.grid_observation.aspect_sample_count = 15;
+        let ready = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "tall_aspect_ready",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(ready(settled.clone()));
+        let mut large = settled.clone();
+        large.item_names = vec!["row".into(); super::MAX_ITEM_ROWS_IN_SNAPSHOT];
+        large.items_len = 600;
+        large.grid_observation.aspect_sample_count = 31;
+        assert!(ready(large.clone()));
+        large.grid_observation.aspect_sample_count = 30;
+        assert!(!ready(large));
+        for variation in 0..4 {
+            let mut incomplete = settled.clone();
+            match variation {
+                0 => incomplete.grid_observation.aspect_label = "1:1".into(),
+                1 => incomplete.grid_observation.aspect_sample_count = 14,
+                2 => incomplete.grid_observation.generation = 9,
+                _ => incomplete.grid_observation.aspect_auto = false,
+            }
+            assert!(!ready(incomplete));
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_entry_prepares_eight_pages_without_full_list_names() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let entry = script
+            .split("// Scenario entry:")
+            .nth(1)
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1;
+        let prefix = entry.split("wait_until(").next().unwrap();
+        let mut scope = rhai::Scope::new();
+        engine.eval_with_scope::<()>(&mut scope, prefix).unwrap();
+        assert!(!scope.contains("rating_names"));
+        let pages = scope.get_value::<rhai::Array>("pages").unwrap();
+        assert_eq!(pages.len(), 8);
+        assert_eq!(pages[3].clone().cast::<String>(), "page-04.png");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_mid_list_geometry_executes_with_ten_columns_and_seventy_cells() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut snapshot = ready_snapshot();
+        snapshot.item_names = vec!["row".into(); super::MAX_ITEM_ROWS_IN_SNAPSHOT];
+        snapshot.items_len = 600;
+        snapshot.grid_observation.columns = 10;
+        snapshot.grid_observation.cell_height = 120.0;
+        snapshot.grid_observation.viewport =
+            egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(900.0, 840.0));
+        snapshot.grid_observation.scroll_offset = 25.0 * 120.0;
+        snapshot.grid_observation.content_height = 60.0 * 120.0;
+        snapshot.selected_index = 587; // Raw item order need not match display position 309.
+        snapshot.grid_observation.selected_index = 587;
+        snapshot.grid_observation.row_content_y = 30.0 * 120.0;
+        snapshot.grid_observation.row_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 100.0 + 5.0 * 120.0),
+            egui::vec2(90.0, 120.0),
+        ));
+        let check = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "mid_list_geometry",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(check(snapshot.clone()));
+        snapshot.grid_observation.selected_name = "0310-folder".into();
+        snapshot.grid_observation.selected_key = r"C:\fixture\0310-folder".into();
+        let returned = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "returned_row_matches",
+                    (
+                        snapshot.to_rhai_map(),
+                        r"C:\fixture\0310-folder".to_string(),
+                        "0310-folder".to_string(),
+                    ),
+                )
+                .unwrap()
+        };
+        assert!(returned(snapshot.clone()));
+        for variation in 0..4 {
+            let mut wrong = snapshot.clone();
+            match variation {
+                0 => wrong.grid_observation.selected_key = r"C:\fixture\other".into(),
+                1 => wrong.grid_observation.selected_name = "other".into(),
+                2 => wrong.grid_observation.selected_index = 3,
+                _ => wrong.grid_observation.row_rect = None,
+            }
+            assert!(!returned(wrong));
+        }
+        snapshot.grid_observation.row_content_y = 31.0 * 120.0;
+        assert!(check(snapshot.clone()));
+        for variation in 0..7 {
+            let mut invalid = snapshot.clone();
+            match variation {
+                0 => invalid.grid_observation.columns = 3,
+                1 => invalid.items_len = 30,
+                2 => invalid.grid_observation.scroll_offset = 55.0 * 120.0,
+                3 => invalid.grid_observation.scroll_offset = 0.0,
+                4 => invalid.grid_observation.viewport.max.y = 1100.0,
+                5 => invalid.grid_observation.row_content_y = 55.0 * 120.0,
+                _ => invalid.grid_observation.row_rect = None,
+            }
+            assert!(
+                !check(invalid),
+                "accepted invalid fixture geometry {variation}"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_capture_names_and_budget_fit_the_harness() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut cases = 0;
+        let mut return_captures = 0;
+        for target in ["12-folder", "23-book.zip"] {
+            for kind in [
+                "toolbar",
+                "alt",
+                "browser",
+                "appcommand",
+                "mouse",
+                "backspace",
+            ] {
+                for roundtrip in [false, true] {
+                    if kind == "backspace" && roundtrip {
+                        continue;
+                    }
+                    cases += 1;
+                    let label = engine
+                        .call_fn::<String>(
+                            &mut rhai::Scope::new(),
+                            &helpers,
+                            "case_label",
+                            (target.to_string(), kind.to_string(), roundtrip),
+                        )
+                        .unwrap();
+                    for suffix in [
+                        "-back",
+                        "-second-back",
+                        "-before-open",
+                        "-fourth-page",
+                        "-forward-fourth-page",
+                        "-error-22",
+                    ] {
+                        let checkpoint = format!("{label}{suffix}");
+                        assert!(
+                            !checkpoint.is_empty() && checkpoint.len() <= 48,
+                            "{checkpoint}"
+                        );
+                        assert!(
+                            checkpoint
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        );
+                    }
+                    return_captures += if roundtrip { 2 } else { 1 };
+                }
+            }
+        }
+        assert_eq!((cases, return_captures), (22, 32));
+        assert!(
+            return_captures + cases <= 64,
+            "even one error capture per case must fit"
+        );
     }
 
     #[test]

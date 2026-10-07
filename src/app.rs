@@ -682,6 +682,7 @@ pub(crate) struct RatingNavigationTransition {
     source_slot_switch_sequence: u64,
     target_stars: u8,
     target_sort: crate::rating_view::RatingViewSort,
+    target_display_order: crate::settings::GridDisplayOrder,
     saved_folder: Option<PathBuf>,
     subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     select_opened_path: Option<PathBuf>,
@@ -4204,11 +4205,30 @@ struct PreparedZipGrid {
     has_foreign_archives: bool,
 }
 
-/// The shared item installer is entered by ordinary navigation or by one fully prepared Smart
-/// physical-open request. This is distinct from `OpenRequestOwner`: admission is cheap and
+/// Geometry of the single UI pane, usable only by the context/generation that laid it out.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum GridAspectLayout {
+    #[default]
+    UnlaidOut,
+    Thumbnail {
+        context_id: ViewerContextId,
+        items_generation: u64,
+        cols: usize,
+        cell_width: f32,
+        cell_height: f32,
+    },
+    Details,
+}
+
+/// The shared item installer is entered by ordinary navigation, a Rating list adoption, or
+/// one fully prepared Smart physical-open request. This is distinct from `OpenRequestOwner`:
+/// admission is cheap and
 /// cloneable, while the Smart adoption permit owns a potentially large offscreen root payload.
 enum VisibleInstallAuthority<'a> {
     Ordinary,
+    Rating {
+        stars: u8,
+    },
     StagedArchive {
         logical_source: &'a Path,
     },
@@ -14153,6 +14173,7 @@ pub struct App {
     pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
     pub(crate) last_cell_h: f32,
+    pub(crate) grid_aspect_layout: GridAspectLayout,
     /// 直近フレームのグリッド列数。行高・ビューポート高と同じ「最後に描いた形」の一部で、
     /// 終了時にカーソルが上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
     pub(crate) last_grid_cols: usize,
@@ -18506,6 +18527,7 @@ impl App {
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
+            grid_aspect_layout: GridAspectLayout::UnlaidOut,
             last_grid_cols: 4,
             scroll_selected_to_rows_above: None,
             last_details_name_width: 140.0,
@@ -20068,9 +20090,9 @@ impl App {
 
     fn restore_cached_auto_aspect(
         &mut self,
-        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+        aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
-        let cached = if let Some(entry) = collection_seed {
+        let cached = if let Some(entry) = aspect_seed {
             Some(entry)
         } else {
             match self.auto_aspect_cache_target() {
@@ -20225,15 +20247,15 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
     ) {
-        self.reset_and_seed_auto_aspect_with_collection_seed(cache_map, None, None);
+        self.reset_and_seed_auto_aspect_with_seed(cache_map, None, None);
     }
 
-    pub(crate) fn reset_and_seed_auto_aspect_with_collection_seed(
+    pub(crate) fn reset_and_seed_auto_aspect_with_seed(
         &mut self,
         cache_map: &Arc<
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
-        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+        aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         prepared_eligible_total: Option<usize>,
     ) {
         let generation = self.items_generation;
@@ -20248,7 +20270,7 @@ impl App {
         // eligible_total==0 でもキャッシュを先に復元し、実 rows が届くまでのフレームで
         // Auto 未確定時の Square を描画しない。通常の空フォルダでも、セルが無いため
         // 前回値を楽観的に保持して問題はない。
-        self.restore_cached_auto_aspect(collection_seed);
+        self.restore_cached_auto_aspect(aspect_seed);
 
         // 集計対象母数は items ベース (動画含む)。
         let eligible_total =
@@ -20507,28 +20529,70 @@ impl App {
     /// セル比率変更時に「画面先頭に最も近い行」を維持するよう `scroll_offset_y` を補正する。
     /// auto/manual どちらの切替経路からも呼ぶ。
     ///
-    /// **重要**: 呼び出し直後に `last_cell_h` を即更新する (= 同フレーム内の二重呼出しを
-    /// no-op にする)。これが無いと、UI 経路 (Manual→Auto クリック) と内部経路
-    /// (maybe_apply の Switch) が同フレームで両方呼ばれたときに、後者が旧 last_cell_h を
-    /// 基準に anchor_row を再計算してスクロール位置がずれる。
+    /// 同じcontext・items世代・列数の実描画だけを再anchorする。適用した高さを即記録し、
+    /// 同フレーム内の二重呼び出しをno-opにする。予測用last_cell_hだけでは所有を判定しない。
     ///
     /// 設計: [docs/auto-thumb-aspect-plan.md §6](../docs/auto-thumb-aspect-plan.md)
     pub(crate) fn fixup_scroll_for_aspect_change(
         &mut self,
         new_aspect: crate::settings::ThumbAspect,
     ) {
-        let old_cell_h = self.last_cell_h.max(1.0);
-        let new_cell_h = (self.last_cell_size * new_aspect.height_ratio())
+        let before = self.scroll_offset_y;
+        let context_id = self.projected_viewer_context_id();
+        // Compatibility dimensions also predict thumbnail display size before first paint.
+        // They do not prove that this list owns a laid-out scroll anchor.
+        self.last_cell_h = (self.last_cell_size * new_aspect.height_ratio())
             .round()
             .max(1.0);
-        if (new_cell_h - old_cell_h).abs() < 0.5 {
-            return;
+        if let GridAspectLayout::Thumbnail {
+            context_id: owner,
+            items_generation,
+            cols,
+            cell_width,
+            cell_height,
+        } = &mut self.grid_aspect_layout
+            && *owner == context_id
+            && *items_generation == self.items_generation
+            && *cols == self.settings.grid_cols.max(1)
+            && self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
+        {
+            let new_cell_h = (*cell_width * new_aspect.height_ratio()).round().max(1.0);
+            if (new_cell_h - *cell_height).abs() >= 0.5 {
+                let anchor_row = (self.scroll_offset_y / cell_height.max(1.0)).floor();
+                self.scroll_offset_y = anchor_row * new_cell_h;
+                // Consume the new height so a second fixup in this frame is a no-op.
+                *cell_height = new_cell_h;
+            }
+            self.last_cell_h = new_cell_h;
         }
-        let anchor_row = (self.scroll_offset_y / old_cell_h).floor();
-        self.scroll_offset_y = anchor_row * new_cell_h;
-        // 二重呼び出し対策: last_cell_h を即更新。次の描画フレームでも ui_main.rs が
-        // 再度 compute_cell_size → last_cell_h 更新するので冪等。
-        self.last_cell_h = new_cell_h;
+        if (before - self.scroll_offset_y).abs() > 0.5 {
+            self.log_rating_grid_scroll(
+                "aspect-fixup",
+                before,
+                self.scroll_offset_y,
+                (
+                    self.last_grid_cols,
+                    self.last_cell_size,
+                    self.last_cell_h,
+                    self.last_viewport_h,
+                ),
+            );
+        }
+    }
+
+    pub(crate) fn record_thumbnail_aspect_layout(
+        &mut self,
+        cols: usize,
+        cell_width: f32,
+        cell_height: f32,
+    ) {
+        self.grid_aspect_layout = GridAspectLayout::Thumbnail {
+            context_id: self.projected_viewer_context_id(),
+            items_generation: self.items_generation,
+            cols,
+            cell_width,
+            cell_height,
+        };
     }
 
     /// items と thumbnails を常にセットで push するヘルパー (docs §10.4.2)。
@@ -22189,6 +22253,7 @@ impl App {
         }
         self.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         self.folder_history.clear();
+        self.top_level_grid_view.clear_rating_grid_positions();
 
         // 「場所を忘れる」操作なので、現在表示中の一覧も同じ所有境界で先頭へ戻す。
         // current_grid_order は詳細表示の並べ替えも含む、画面上の実際の表示順。
@@ -24410,6 +24475,7 @@ impl App {
     /// ドライブ一覧本体を構築する。履歴 dispatch からも呼ぶため、ここでは履歴を記録しない。
     pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
         self.capture_main_list_restore_cursor();
+        self.save_leaving_rating_grid_position();
 
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
@@ -28355,6 +28421,7 @@ impl App {
         &mut self,
         keep: SearchMode,
     ) -> Option<top_level_grid_view::TopLevelGridRestore> {
+        self.save_leaving_rating_grid_position();
         self.capture_main_list_restore_cursor();
         let current_restore = self.current_top_level_restore_snapshot();
         let mut transferred = self.dismiss_snapshot_without_restore();
@@ -31638,6 +31705,7 @@ impl App {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
+        self.save_leaving_rating_grid_position();
         self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_view_rows.clear();
         self.rating_view_rows_stars = None;
@@ -31734,6 +31802,17 @@ impl App {
             if matches_path {
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
+                self.log_rating_grid_scroll(
+                    "opened-item-select",
+                    self.scroll_offset_y,
+                    self.scroll_offset_y,
+                    (
+                        self.last_grid_cols,
+                        self.last_cell_size,
+                        self.last_cell_h,
+                        self.last_viewport_h,
+                    ),
+                );
                 return;
             }
         }
@@ -31797,8 +31876,12 @@ impl App {
             return;
         }
         let chosen_sort = self.settings.rating_view_sort.normalized_for_rating_view();
-        if chosen_sort != transition.target_sort {
+        let chosen_display_order = self.rating_view_destination_display_order();
+        if chosen_sort != transition.target_sort
+            || chosen_display_order != transition.target_display_order
+        {
             transition.target_sort = chosen_sort;
+            transition.target_display_order = chosen_display_order;
             self.start_rating_build(
                 transition.target_stars,
                 chosen_sort,
@@ -32078,6 +32161,9 @@ impl App {
         }
         self.cancel_replaced_staged_archive_conversion();
         self.replace_history_navigation_transition(None);
+        let select_opened_path = matches!(&intent, RatingNavigationIntent::Replay { .. })
+            .then(|| self.effective_folder())
+            .flatten();
         let transition = RatingNavigationTransition {
             intent,
             history_before: self.folder_nav_history_snapshot(),
@@ -32088,9 +32174,10 @@ impl App {
             source_slot_switch_sequence: self.quick_folder_switch_sequence,
             target_stars: stars,
             target_sort: self.settings.rating_view_sort.normalized_for_rating_view(),
+            target_display_order: self.rating_view_destination_display_order(),
             saved_folder,
             subfolder_restore,
-            select_opened_path: None,
+            select_opened_path,
         };
         self.start_rating_build(
             transition.target_stars,
@@ -32122,7 +32209,10 @@ impl App {
                 intent,
                 sort,
                 include_epub: !self.settings.epub_file_handling_ignores_epub(),
-                display_order: self.settings.grid_display_order.clone(),
+                display_order: navigation
+                    .as_ref()
+                    .map(|transition| transition.target_display_order.clone())
+                    .unwrap_or_else(|| self.settings.grid_display_order.clone()),
                 pin_db: self.folder_thumb_pin_db.clone(),
                 folder_thumb_sort: self.settings.folder_thumb_sort,
                 folder_thumb_depth: self.settings.folder_thumb_depth,
@@ -32138,7 +32228,6 @@ impl App {
     }
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
-        self.rating_view_rows_stars = Some(result.stars);
         self.rating_view_rows = result.rows;
         self.rating_view_skipped = result.skipped;
         if let Some(prepared) = result.prepared {
@@ -32212,12 +32301,26 @@ impl App {
         }
     }
 
+    /// Numeric selection belongs only to rebuilding the same rating list. Keys can follow
+    /// the same item across lists, but a page index must never become a list-row index.
+    fn rating_view_rebuild_selected_index(&self) -> Option<usize> {
+        if self.items_are_rating_view
+            && matches!(self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Rating { stars }
+                    if *stars == self.rating_view_stars)
+        {
+            self.selected
+        } else {
+            None
+        }
+    }
+
     fn install_prepared_rating_view_rows(
         &mut self,
         prepared: crate::rating_view::RatingViewPreparedItems,
     ) {
-        let previous_selected = self.selected;
-        let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected_key = self.selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected = self.rating_view_rebuild_selected_index();
         let retained_details_rated_at_sort = (self.items_are_rating_view
             && self.settings.details_sort_key == crate::settings::DetailsSortKey::RatedAt)
             .then_some(self.settings.details_sort_ascending);
@@ -32236,18 +32339,19 @@ impl App {
     }
 
     fn install_rating_view_rows(&mut self) {
-        let previous_selected = self.selected;
-        let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected_key = self.selected.and_then(|idx| self.rating_path_key(idx));
+        let previous_selected = self.rating_view_rebuild_selected_index();
         let retained_details_rated_at_sort = (self.items_are_rating_view
             && self.settings.details_sort_key == crate::settings::DetailsSortKey::RatedAt)
             .then_some(self.settings.details_sort_ascending);
         // ★時刻順のときはカテゴリ再配置を通さない (§1.142)。通すとフォルダ / アーカイブが
         // 時刻に関係なく先頭へ出て、「★を付けた順に一列で見る」という要求が壊れる。
         // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
+        let destination_display_order = self.rating_view_destination_display_order();
         let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
             &mut self.rating_view_rows,
             self.rating_view_sort.normalized_for_rating_view(),
-            &self.settings.grid_display_order,
+            &destination_display_order,
         );
         let video_items: Vec<(usize, PathBuf, u64)> = items
             .iter()
@@ -32300,13 +32404,21 @@ impl App {
         {
             self.rating_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_items(
+        self.start_loading_items_inner(
             rating_view_synthetic_path(),
             items,
             image_metas,
             existing_keys,
             video_items,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Rating {
+                stars: self.rating_view_stars,
+            },
         );
         self.finish_rating_view_install(
             previous_selected,
@@ -32321,6 +32433,9 @@ impl App {
         previous_selected_key: Option<String>,
         retained_details_rated_at_sort: Option<bool>,
     ) {
+        // Both prepared and legacy installs publish the star identity of the visible rows.
+        // A search may change the surface while these rows are still interactive.
+        self.rating_view_rows_stars = Some(self.rating_view_stars);
         self.items_are_rating_view = true;
         if let Some(ascending) = retained_details_rated_at_sort {
             // generic な一覧差し替えは一度 view flag を落として通常ビュー退出を確定する。
@@ -32339,10 +32454,23 @@ impl App {
             "★".repeat(self.rating_view_stars as usize)
         );
         self.rebuild_visible_indices();
-        let selected = previous_selected_key
-            .as_deref()
+        let position = self
+            .top_level_grid_view
+            .rating_grid_position(self.rating_view_stars);
+        let before_restore = self.scroll_offset_y;
+        if let Some(position) = position {
+            self.scroll_offset_y = position.scroll_offset_y;
+        }
+        let selected = position
+            .and_then(|position| position.selected_key.as_deref())
             .and_then(|key| self.rating_view_rows.iter().position(|row| row.key == key))
             .filter(|idx| self.visible_indices.contains(idx))
+            .or_else(|| {
+                previous_selected_key
+                    .as_deref()
+                    .and_then(|key| self.rating_view_rows.iter().position(|row| row.key == key))
+                    .filter(|idx| self.visible_indices.contains(idx))
+            })
             .or_else(|| {
                 previous_selected.and_then(|idx| {
                     self.visible_indices
@@ -32357,6 +32485,20 @@ impl App {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
         }
+        self.log_rating_grid_scroll(
+            &format!(
+                "rating-position-restore saved={:?}",
+                position.map(|position| position.scroll_offset_y)
+            ),
+            before_restore,
+            self.scroll_offset_y,
+            (
+                self.last_grid_cols,
+                self.last_cell_size,
+                self.last_cell_h,
+                self.last_viewport_h,
+            ),
+        );
     }
 
     /// 閲覧履歴ビューから 1 件削除する。
@@ -32606,6 +32748,7 @@ impl App {
         // address / current_folder を zip_path にして breadcrumb と BS (parent) を正しく動かす。
         // catalog / sidecar / worker spawn などの重い設定は poll_zip_enumerate の
         // start_loading_items で行う (二重にやらない)。
+        self.save_leaving_folder_grid_position();
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
@@ -35684,8 +35827,87 @@ impl App {
             Some(pin_map),
             Some((rating_cache, tags_cache)),
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Rating {
+                stars: self.rating_view_stars,
+            },
         );
+    }
+
+    pub(crate) fn save_leaving_rating_grid_position(&mut self) {
+        // ZIP pending UI has already saved and cleared the source grid without clearing
+        // its view flags. Its empty interim display must not overwrite that position.
+        if self.navigation_scope.is_detached_physical()
+            || !self.items_are_rating_view
+            || (self.items.is_empty() && self.selected.is_none() && self.scroll_offset_y == 0.0)
+        {
+            return;
+        }
+        // The physical adoption owner may have changed the surface to Folder while the
+        // old Rating items remain visible. A Rating-to-Rating install, conversely, has
+        // already replaced rating_view_rows/stars but still owns the old surface/items.
+        let stars = match self.top_level_grid_view.surface() {
+            top_level_grid_view::TopLevelGridSurface::Rating { stars } => Some(*stars),
+            _ => self.rating_view_rows_stars,
+        };
+        let Some(stars) = stars else { return };
+        let aspect_seed = self
+            .settings
+            .thumb_aspect_auto
+            .then(|| self.auto_aspect.current)
+            .flatten()
+            .map(|aspect| crate::auto_aspect_cache::AutoAspectCacheEntry {
+                aspect,
+                sample_count: self
+                    .auto_aspect
+                    .samples
+                    .len()
+                    .max(self.auto_aspect.cached_sample_gate.unwrap_or(0)),
+                eligible_total: self.auto_aspect_eligible_total(),
+                updated_at: 0, // Runtime-only seed; no Rating entry is persisted to SQLite.
+            });
+        let position = top_level_grid_view::RatingGridPosition {
+            scroll_offset_y: self.scroll_offset_y,
+            selected_key: self.selected.and_then(|index| self.rating_path_key(index)),
+            aspect_seed,
+        };
+        self.log_rating_grid_scroll(
+            &format!(
+                "rating-position-save stars={stars} saved={:.1}",
+                position.scroll_offset_y
+            ),
+            self.scroll_offset_y,
+            self.scroll_offset_y,
+            (
+                self.last_grid_cols,
+                self.last_cell_size,
+                self.last_cell_h,
+                self.last_viewport_h,
+            ),
+        );
+        self.top_level_grid_view
+            .save_rating_grid_position(stars, position);
+    }
+
+    /// Save before the visible source rows or path are replaced (including ZIP pending UI).
+    /// This session history is separate from StartupListIntent adoption.
+    fn save_leaving_folder_grid_position(&mut self) {
+        self.save_leaving_rating_grid_position();
+        if !self.navigation_scope.is_detached_physical()
+            && let Some(cur) = self.current_folder.clone()
+        {
+            let leaving_search_view = self.items_are_global_search_view
+                || self.items_are_tag_view
+                || self.items_are_reading_history_view
+                || self.items_are_bookmark_view
+                || self.items_are_rating_view
+                || is_synthetic_view_path(&cur);
+            let has_grid_state_to_save =
+                !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
+            if !leaving_search_view && has_grid_state_to_save {
+                self.folder_history
+                    .insert(cur, (self.scroll_offset_y, self.selected));
+            }
+        }
     }
 
     fn start_loading_items_inner(
@@ -35724,7 +35946,7 @@ impl App {
         self.page_edit_snapshot = None;
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
-            VisibleInstallAuthority::Ordinary => None,
+            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::Rating { .. } => None,
             VisibleInstallAuthority::StagedArchive { logical_source } => {
                 Some((*logical_source).to_path_buf())
             }
@@ -35774,7 +35996,9 @@ impl App {
             None
         };
         let preserve_smart_folder_session = match &authority {
-            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::StagedArchive { .. } => {
+            VisibleInstallAuthority::Ordinary
+            | VisibleInstallAuthority::Rating { .. }
+            | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
                     && !smart_folder::is_smart_folder_synthetic_path(&source_path)
                     && self.preserve_smart_folder_session_for_load(&source_path)
@@ -35959,21 +36183,28 @@ impl App {
         // folder_history (スクロール位置復元用) へ保存しない。Ctrl+G は current_folder を
         // 検索前フォルダのまま保つため、検索ビューの scroll_offset_y をそのフォルダの
         // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
-        if !detached_physical && let Some(cur) = self.current_folder.clone() {
-            let leaving_search_view = self.items_are_global_search_view
-                || self.items_are_tag_view
-                || self.items_are_reading_history_view
-                || self.items_are_bookmark_view
-                || self.items_are_rating_view
-                || is_synthetic_view_path(&cur);
-            let has_grid_state_to_save =
-                !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
-            if !leaving_search_view && has_grid_state_to_save {
-                self.folder_history
-                    .insert(cur, (self.scroll_offset_y, self.selected));
-            }
-        }
+        self.save_leaving_folder_grid_position();
+        let rating_inherited_view = (!detached_physical
+            && matches!(&authority, VisibleInstallAuthority::Rating { .. }))
+        .then(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
         self.change_main_context_for_visible_grid(false);
+        if let Some(inherited) = rating_inherited_view {
+            // Publish the destination presentation in the new visible context, after saving
+            // the departing position and before seeding/layout. A late frame-end reconcile
+            // would let ensure-visible use the physical child's columns for the Rating root.
+            self.transition_favorite_view_for_path_with_inherited_at(
+                Some(&source_path),
+                std::time::Instant::now(),
+                Some(inherited),
+            );
+            crate::logger::log(format!(
+                "[grid-scroll] source=rating-presentation-adopt gen={} cols={} auto={} mode={:?}",
+                self.items_generation,
+                self.settings.grid_cols,
+                self.settings.thumb_aspect_auto,
+                self.settings.grid_view_mode,
+            ));
+        }
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
         // 計測する (nav cancel / items 割当 / キャッシュ clear)。UI が止まる潜在箇所を
@@ -36359,6 +36590,13 @@ impl App {
         // the App-global restore owner before returning to the event loop.
         let continuation = sidecar_restore::SidecarLoadContinuation {
             restore_intent: StartupListIntent::InternalInstall,
+            auto_aspect_seed: match authority {
+                VisibleInstallAuthority::Rating { stars } => self
+                    .top_level_grid_view
+                    .rating_grid_position(stars)
+                    .and_then(|position| position.aspect_seed),
+                _ => None,
+            },
             source_path,
             source_is_directory,
             prepared_subfolder,
@@ -36386,6 +36624,7 @@ impl App {
     ) {
         let sidecar_restore::SidecarLoadContinuation {
             restore_intent,
+            auto_aspect_seed,
             source_path,
             source_is_directory: _,
             mut prepared_subfolder,
@@ -36717,7 +36956,7 @@ impl App {
         // ── auto_aspect: items 世代リセット + catalog 既存比率の seed ──
         // delete_missing 完了後 / spawn_thumbnail_workers 起動前のこの位置で呼ぶ。
         // この時点で self.items / image_metas / cache_map がすべて確定済み。
-        self.reset_and_seed_auto_aspect(&cache_map);
+        self.reset_and_seed_auto_aspect_with_seed(&cache_map, auto_aspect_seed, None);
 
         // ── 進捗カウンタリセット + 共有 display_px 更新 ──
         self.cache_gen_total = 0;
@@ -52377,6 +52616,17 @@ impl App {
                     cell_h,
                 );
                 if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+                    self.log_rating_grid_scroll(
+                        &format!("wheel delta={scroll_delta_y:.1}"),
+                        prev_offset,
+                        self.scroll_offset_y,
+                        (
+                            self.last_grid_cols,
+                            self.last_cell_size,
+                            cell_h,
+                            self.last_viewport_h,
+                        ),
+                    );
                     self.bump_input_seq(
                         "grid_wheel",
                         Some(&format!("offset={:.0}", self.scroll_offset_y)),
@@ -52398,8 +52648,59 @@ impl App {
         });
     }
 
+    /// Path-free diagnostics only at Rating restore/scroll writes; geometry is supplied by its owner.
+    pub(crate) fn log_rating_grid_scroll(
+        &self,
+        source: &str,
+        before: f32,
+        after: f32,
+        geometry: (usize, f32, f32, f32),
+    ) {
+        if !self.items_are_rating_view {
+            return;
+        }
+        self.log_rating_grid_scroll_at_position(source, before, after, geometry, None);
+    }
+
+    /// Only an owner that already computed the display position supplies it. Never scan rows
+    /// merely for diagnostics, including canonical writes during wheel/touch movement.
+    fn log_rating_grid_scroll_at_position(
+        &self,
+        source: &str,
+        before: f32,
+        after: f32,
+        geometry: (usize, f32, f32, f32),
+        position: Option<usize>,
+    ) {
+        if !self.items_are_rating_view {
+            return;
+        }
+        let (cols, cell_w, cell_h, viewport_h) = geometry;
+        let row_rect = position.map(|position| {
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    (position % cols.max(1)) as f32 * cell_w,
+                    (position / cols.max(1)) as f32 * cell_h,
+                ),
+                egui::vec2(cell_w, cell_h),
+            )
+        });
+        crate::logger::log(format!(
+            "[grid-scroll] source={source} gen={} stars={:?} before={before:.1} applied={after:.1} \
+             selected={:?} position={position:?} row_rect={row_rect:?} \
+             cell_w={cell_w:.1} cell_h={cell_h:.1} cols={cols} settings_cols={} viewport_h={viewport_h:.1} \
+             items={} layout={:?}",
+            self.items_generation,
+            self.rating_view_rows_stars,
+            self.selected,
+            self.settings.grid_cols,
+            self.items.len(),
+            self.grid_aspect_layout,
+        ));
+    }
     /// カーソルキー移動後、選択行がビューポートに収まるようオフセットを調整する
     pub(crate) fn apply_scroll_to_selected(&mut self, cols: usize, cell_h: f32) {
+        let before = self.scroll_offset_y;
         let sel = match self.selected {
             Some(s) => s,
             None => return,
@@ -52419,6 +52720,13 @@ impl App {
         if let Some(rows_above) = self.scroll_selected_to_rows_above.take() {
             let top_row = row.saturating_sub(rows_above as usize);
             self.scroll_offset_y = top_row as f32 * cell_h;
+            self.log_rating_grid_scroll_at_position(
+                "startup-row-anchor",
+                before,
+                self.scroll_offset_y,
+                (cols, self.last_cell_size, cell_h, self.last_viewport_h),
+                Some(vis_pos),
+            );
             return;
         }
         let vp_top = self.scroll_offset_y;
@@ -52433,6 +52741,13 @@ impl App {
             // 行境界にスナップ
             self.scroll_offset_y = (self.scroll_offset_y / cell_h).ceil() * cell_h;
         }
+        self.log_rating_grid_scroll_at_position(
+            "ensure-visible",
+            before,
+            self.scroll_offset_y,
+            (cols, self.last_cell_size, cell_h, self.last_viewport_h),
+            Some(vis_pos),
+        );
     }
 
     /// Correct the normal restore size before the optional post-visible maximize.
@@ -80142,6 +80457,47 @@ impl App {
         active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
             self.favorite_view_states.contains_key(&id)
         })
+    }
+
+    /// Project the existing favorite transition without changing the still-visible source.
+    /// Include its live, not-yet-debounced state: the real transition captures that state first.
+    fn favorite_view_state_for_path(&self, path: &Path) -> crate::settings::FavoriteViewState {
+        let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        let common = self
+            .settings
+            .favorite_view_overlay
+            .as_ref()
+            .map(|overlay| overlay.common.clone())
+            .unwrap_or_else(|| current.clone());
+        if !self.settings.remember_favorite_view_state {
+            return common;
+        }
+        let active_id = self.settings.active_favorite_view_id();
+        if let Some(owner) = self.favorite_view_owner_for_path(path)
+            && Some(owner) != self.favorite_view_context.location_favorite_id
+            && !self.favorite_view_states.contains_key(&owner)
+        {
+            return current;
+        }
+        let stored_id =
+            active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
+                self.favorite_view_states.contains_key(&id) || active_id == Some(id)
+            });
+        match stored_id {
+            Some(id) if Some(id) == active_id => current,
+            Some(id) => self
+                .favorite_view_states
+                .get(&id)
+                .cloned()
+                .unwrap_or(common),
+            None => common,
+        }
+    }
+
+    fn rating_view_destination_display_order(&self) -> crate::settings::GridDisplayOrder {
+        self.favorite_view_state_for_path(&rating_view_synthetic_path())
+            .grid_display_order
+            .normalized()
     }
 
     /// 適用中の値との差分をメモリ正本へ即時反映し、DB 書き込みだけを debounce する。

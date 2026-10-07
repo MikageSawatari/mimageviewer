@@ -884,6 +884,23 @@ pub(crate) fn grid_wheel_scroll_offset(current: f32, scroll_delta_y: f32, row_h:
     (offset / row_h).round() * row_h
 }
 
+/// Diagnostic scroll writes use the canonical row anchor, never its display remainder.
+/// This cheap predicate runs before formatting or selected-row diagnostics.
+fn grid_scroll_diagnostic_changed(before: f32, after: f32) -> bool {
+    (before - after).abs() > 0.5
+}
+
+fn grid_touch_scroll_diagnostic_changed(
+    before: f32,
+    after: f32,
+    before_phase: GridTouchScrollPhase,
+    after_phase: GridTouchScrollPhase,
+) -> bool {
+    grid_scroll_diagnostic_changed(before, after)
+        || grid_touch_snap_needs_animation_repaint(before_phase)
+            != grid_touch_snap_needs_animation_repaint(after_phase)
+}
+
 fn should_sync_grid_scrollbar(
     touch_derived_pointer_activity: bool,
     fractional_drag_y: f32,
@@ -14058,14 +14075,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 .map(|label| format!("フォルダ履歴を戻る\n{label}"))
                                 .unwrap_or_else(|| "フォルダ履歴を戻る".to_string())
                         };
-                        if ui
+                        let back_response = ui
                             .add_enabled(
                                 back_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("←"),
                             )
-                            .hover_tip(back_hover)
-                            .clicked()
-                        {
+                            .hover_tip(back_hover);
+                        #[cfg(feature = "test-script")]
+                        crate::test_script::register_clickable_widget(
+                            "history-back",
+                            &back_response,
+                        );
+                        if back_response.clicked() {
                             result = Some(AddressBarNav::HistoryBack);
                         }
                         let forward_hover = if snapshot_active {
@@ -14078,14 +14099,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 .map(|label| format!("フォルダ履歴を進む\n{label}"))
                                 .unwrap_or_else(|| "フォルダ履歴を進む".to_string())
                         };
-                        if ui
+                        let forward_response = ui
                             .add_enabled(
                                 forward_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("→"),
                             )
-                            .hover_tip(forward_hover)
-                            .clicked()
-                        {
+                            .hover_tip(forward_hover);
+                        #[cfg(feature = "test-script")]
+                        crate::test_script::register_clickable_widget(
+                            "history-forward",
+                            &forward_response,
+                        );
+                        if forward_response.clicked() {
                             result = Some(AddressBarNav::HistoryForward);
                         }
                     }
@@ -14358,20 +14383,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         }
                                     }
                                     crate::known_folders::LocationMenuEntry::Rating { stars } => {
-                                        ui.menu_button("レーティング", |ui| {
+                                        let rating_menu = ui.menu_button("レーティング", |ui| {
                                             for stars in stars {
-                                                if ui
-                                                    .button(rating_view_menu_label(
+                                                let rating_response = ui.button(rating_view_menu_label(
                                                         stars,
                                                         rating_counts,
-                                                    ))
-                                                    .clicked()
-                                                {
+                                                    ));
+                                                #[cfg(feature = "test-script")]
+                                                if stars == 3 {
+                                                    crate::test_script::register_clickable_widget("rating-three", &rating_response);
+                                                }
+                                                if rating_response.clicked() {
                                                     self.enter_rating_view_from_menu(stars);
                                                     ui.close();
                                                 }
                                             }
                                         });
+                                        #[cfg(feature = "test-script")]
+                                        crate::test_script::register_clickable_widget("rating-menu", &rating_menu.response);
                                     }
                                     crate::known_folders::LocationMenuEntry::Bookshelf => {
                                         if ui
@@ -14476,6 +14505,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     show_sticky_context_menu(&place_response, |ui| {
                         self.draw_folder_bar_settings_menu(ui);
                     });
+                    #[cfg(feature = "test-script")]
+                    crate::test_script::register_clickable_widget("places-menu", &place_response);
                     ui.add_space(4.0);
                     ui.separator();
 
@@ -15601,6 +15632,32 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if !self.grid_item_input_allowed() {
             return None;
         }
+        #[cfg(feature = "test-script")]
+        if ctx.viewport_id() == egui::ViewportId::ROOT {
+            crate::test_script::register_clickable_widget(
+                &format!(
+                    "grid-row:{}:{}:{}",
+                    self.items_generation,
+                    idx,
+                    self.items[idx].name()
+                ),
+                &response,
+            );
+            if let Some(target) = crate::test_script::requested_grid_row(ctx)
+                && let crate::test_script::GridRowPointerTarget::ContainerKey { generation, key } =
+                    &target
+                && *generation == self.items_generation
+                && self.items[idx]
+                    .container_path()
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, key))
+                && target.resolve(self.items_generation, &self.items) == Some(idx)
+            {
+                crate::test_script::register_clickable_widget(
+                    &format!("grid-key:{generation}:{}", key.to_string_lossy()),
+                    &response,
+                );
+            }
+        }
         self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
         let (
             time_since_last_click,
@@ -16398,6 +16455,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.last_cell_size = content_w;
             self.last_cell_h = Self::DETAILS_ROW_H;
         }
+        self.grid_aspect_layout = crate::app::GridAspectLayout::Details;
 
         let mut nav: Option<AddressBarNav> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
@@ -18467,7 +18525,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if (cell_w - self.last_cell_size).abs() > 0.5
                     || (cell_h - self.last_cell_h).abs() > 0.5
                 {
+                    let before = self.scroll_offset_y;
                     self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
+                    self.log_rating_grid_scroll("layout-row-snap", before, self.scroll_offset_y,
+                        (cols, cell_w, cell_h, ui.available_height().max(0.0)));
                     clear_grid_touch_scroll_remainder(ctx);
                     self.last_cell_size = cell_w;
                     self.last_cell_h = cell_h;
@@ -18478,6 +18539,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // 行高・ビューポート高と同じく「最後に描いた形」。終了時にカーソルが
                 // 上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
                 self.last_grid_cols = cols;
+                self.record_thumbnail_aspect_layout(cols, cell_w, cell_h);
 
                 if scroll_to {
                     self.apply_scroll_to_selected(cols, cell_h);
@@ -18494,9 +18556,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // リング / ジェスチャが積んだ要求は次フレームで処理する。
                 let pending_scroll =
                     take_grid_scroll_for_current_layout(&mut self.pending_grid_scroll);
+                let before_clamp = self.scroll_offset_y;
                 self.scroll_offset_y =
                     resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
+                if scroll_to || (before_clamp - self.scroll_offset_y).abs() > 0.5 {
+                    self.log_rating_grid_scroll(
+                        &format!("layout-clamp intent={pending_scroll:?} max={max_offset:.1}"),
+                        before_clamp, self.scroll_offset_y, (cols, cell_w, cell_h, viewport_h));
+                }
 
+                let before_touch = self.scroll_offset_y;
                 let scroll_state = grid_touch_scroll_state(
                     ctx,
                     self.scroll_offset_y,
@@ -18761,6 +18830,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ctx.request_repaint();
                 }
                 let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
+                if grid_touch_scroll_diagnostic_changed(
+                    before_touch, self.scroll_offset_y, scroll_state.phase, touch_scroll_phase,
+                ) {
+                    self.log_rating_grid_scroll(
+                        &format!("touch phase={touch_scroll_phase:?} remainder={fractional_drag_y:.1}"),
+                        before_touch, self.scroll_offset_y, (cols, cell_w, cell_h, viewport_h));
+                }
 
                 let mut nav: Option<AddressBarNav> = None;
                 let primary_click_pos = (!suppress_primary_pointer)
@@ -18779,6 +18855,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 // egui にスクロールを管理させず、自前の offset を毎フレーム注入する。
                 // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
+                let egui_before = (self.items_are_rating_view && scroll_to).then(||
+                    egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("scroll_area"))));
+                let input_before = (self.items_are_rating_view && scroll_to).then(|| ctx.input(|input| (
+                    input.raw_scroll_delta, input.smooth_scroll_delta,
+                    input.pointer.latest_pos(), input.pointer.primary_down(),
+                    input.pointer.delta(), input.pointer.velocity())));
                 let scroll_output = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(display_scroll_offset_y)
@@ -18791,6 +18873,68 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
+                        // This is the one-shot ensure-visible boundary. Fractional touch
+                        // motion and persistent egui rounding differences are not log events.
+                        if self.items_are_rating_view && scroll_to {
+                            crate::logger::log(format!(
+                                "[grid-scroll] source=egui-viewport gen={} injected={display_scroll_offset_y:.1} \
+                                 viewport={viewport:?} clip={:?} selected={:?}",
+                                self.items_generation, ui.clip_rect(), self.selected));
+                        }
+
+                        // Reveal a virtualized diagnostic pointer target through the existing
+                        // ScrollArea/readback owner. Selection and activation remain cell clicks.
+                        #[cfg(feature = "test-script")]
+                        if let Some(target) = crate::test_script::requested_grid_row(ui.ctx())
+                            && let Some(index) = target.resolve(self.items_generation, &self.items)
+                            && let Some(position) = self.visible_indices.iter().position(|visible| *visible == index)
+                        {
+                            let rect = egui::Rect::from_min_size(
+                                content_rect.min + egui::vec2(
+                                    (position % cols) as f32 * cell_w,
+                                    (position / cols) as f32 * cell_h,
+                                ),
+                                egui::vec2(cell_w, cell_h),
+                            );
+                            if !ui.clip_rect().contains(rect.center()) {
+                                // The pointer ACK captures a fixed cell center. Do not ACK
+                                // while a diagnostic reveal animation is still moving that cell.
+                                // This is only the explicit test-script target, not user scrolling.
+                                ui.scroll_to_rect_animation(rect, Some(egui::Align::Center),
+                                    egui::style::ScrollAnimation::none());
+                            }
+                        }
+
+                        #[cfg(feature = "test-script")]
+                        {
+                            let position = self.selected.and_then(|index| {
+                                self.visible_indices.iter().position(|visible| *visible == index)
+                            });
+                            let item = self.selected.and_then(|index| self.items.get(index));
+                            crate::test_script::grid_observation::publish(ui.ctx(),
+                                crate::test_script::grid_observation::GridObservation {
+                                    frame: ui.ctx().cumulative_frame_nr() as i64,
+                                    generation: self.items_generation as i64,
+                                    selected_index: self.selected.map_or(-1, |index| index as i64),
+                                    selected_key: item.and_then(GridItem::container_path)
+                                        .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                                    selected_name: item.map_or_else(String::new, |item| item.name().into_owned()),
+                                    scroll_offset: viewport.min.y,
+                                    viewport: ui.clip_rect().intersect(ui.ctx().viewport_rect()),
+                                    row_rect: position.map(|position| egui::Rect::from_min_size(
+                                        content_rect.min + egui::vec2(
+                                            (position % cols) as f32 * cell_w,
+                                            (position / cols) as f32 * cell_h),
+                                        egui::vec2(cell_w, cell_h))),
+                                    row_content_y: position.map_or(-1.0, |position| (position / cols) as f32 * cell_h),
+                                    cell_height: cell_h,
+                                    columns: cols,
+                                    content_height: total_h,
+                                    aspect_label: self.effective_thumb_aspect().label().to_string(),
+                                    aspect_auto: self.settings.thumb_aspect_auto,
+                                    aspect_sample_count: self.auto_aspect.samples.len(),
+                                });
+                        }
 
                         let first_row = (viewport.min.y / cell_h) as usize;
                         let fractional_extra_row =
@@ -19056,6 +19200,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // ただし行スナップによる端数差分で毎フレーム振動するのを防ぐため、
                 // 1 行分 (cell_h) 以上ずれた場合のみ同期する。
                 let egui_offset = scroll_output.state.offset.y;
+                if self.items_are_rating_view && scroll_to
+                {
+                    crate::logger::log(format!(
+                        "[grid-scroll] source=egui-state gen={} injected={display_scroll_offset_y:.1} \
+                         returned={egui_offset:.1} content={:?} inner={:?} wheel={:?} \
+                         input_before={input_before:?} prior_state={egui_before:?} state={:?}",
+                        self.items_generation, scroll_output.content_size, scroll_output.inner_rect,
+                        ctx.input(|input| (input.raw_scroll_delta, input.smooth_scroll_delta)),
+                        scroll_output.state));
+                }
                 if should_sync_grid_scrollbar(
                     touch_derived_pointer_activity,
                     fractional_drag_y,
@@ -19063,7 +19217,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.scroll_offset_y,
                     cell_h,
                 ) {
+                    let before = self.scroll_offset_y;
                     self.scroll_offset_y = (egui_offset / cell_h).round() * cell_h;
+                    if grid_scroll_diagnostic_changed(before, self.scroll_offset_y) {
+                        self.log_rating_grid_scroll("egui-readback", before, self.scroll_offset_y,
+                            (cols, cell_w, cell_h, self.last_viewport_h));
+                    }
                 }
 
                 // 右上フィードバックトースト (Q / Ctrl+Backspace / F7〜F10 / レーティング等)
@@ -23607,6 +23766,76 @@ mod compute_cell_size_tests {
         assert!((row - row.round()).abs() < 0.0001);
         assert!(position.remainder_y >= 0.0);
         assert!(position.remainder_y < row_h);
+    }
+
+    #[test]
+    fn grid_scroll_diagnostics_ignore_stationary_twenty_pixel_touch_remainder() {
+        let ctx = egui::Context::default();
+        let phase = GridTouchScrollPhase::Contact { direction: None };
+        set_grid_touch_scroll_state(&ctx, 200.0, 100.0, 42, 20.0, phase);
+        for _ in 0..20 {
+            let state = grid_touch_scroll_state(&ctx, 200.0, 100.0, 42);
+            assert_eq!(state.remainder_y, 20.0);
+            assert!(!grid_touch_scroll_diagnostic_changed(
+                state.anchor_y,
+                200.0,
+                state.phase,
+                phase
+            ));
+        }
+        assert!(grid_touch_scroll_diagnostic_changed(
+            200.0, 300.0, phase, phase
+        ));
+    }
+
+    #[test]
+    fn grid_scroll_diagnostics_glide_reports_boundaries_without_fractional_frame_logs() {
+        let GridTouchSnapPlan::Glide(animation) = plan_grid_touch_snap(
+            200.0,
+            20.0,
+            100.0,
+            500.0,
+            Some(GridTouchScrollDirection::Increasing),
+        ) else {
+            panic!("expected glide");
+        };
+        let contact = GridTouchScrollPhase::Contact { direction: None };
+        let glide = GridTouchScrollPhase::Glide {
+            animation,
+            started_at: std::time::Instant::now(),
+        };
+        assert!(grid_touch_scroll_diagnostic_changed(
+            200.0, 200.0, contact, glide
+        ));
+        let mut before = animation.start;
+        let mut logs = 1;
+        for ms in 1..=GRID_TOUCH_SNAP_GLIDE_DURATION.as_millis() as u64 {
+            let elapsed = std::time::Duration::from_millis(ms);
+            let after = grid_touch_snap_position_at(animation, elapsed);
+            let phase = if elapsed == GRID_TOUCH_SNAP_GLIDE_DURATION {
+                contact
+            } else {
+                glide
+            };
+            logs += usize::from(grid_touch_scroll_diagnostic_changed(
+                before.anchor_y,
+                after.anchor_y,
+                glide,
+                phase,
+            ));
+            before = after;
+        }
+        assert_eq!(before, animation.target);
+        assert_eq!(
+            logs, 2,
+            "start and final anchor/end, not every animated display offset"
+        );
+        assert!(!grid_touch_scroll_diagnostic_changed(
+            before.anchor_y,
+            before.anchor_y,
+            contact,
+            contact
+        ));
     }
 
     #[test]

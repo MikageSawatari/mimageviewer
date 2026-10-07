@@ -15,8 +15,7 @@ ROWS = (
 )
 
 
-def png(rgb):
-    width = height = 8
+def png(rgb, width=8, height=8):
     raw = b"".join(b"\0" + bytes(rgb) * width for _ in range(height))
 
     def chunk(kind, payload):

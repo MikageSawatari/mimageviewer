@@ -1707,6 +1707,8 @@ impl App {
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
+        // The Rating grid can still be edited while the first search result is pending.
+        self.save_leaving_rating_grid_position();
         // 検索ビューに切り替えるのでネスト ZIP ツリーナビ状態を破棄する。
         // (zip_nav 維持の軽量経路 zip_nav_show_current_level は install_new_items を
         // 直接呼ぶのでここを通らない。)

@@ -2235,7 +2235,174 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
-### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 利用者報告、原因特定済み (2026-10-05)
+### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 選択・表示設定の採用順を修正、実機再確認待ち (2026-10-07)
+
+- `6b2c1c9d8`追補 (2026-10-07):
+  - touch診断がcanonical offsetと端数付き描画offsetを比較し、20pxの静止端数でも毎frame
+    loggerへ出力していた。canonical anchor変更/glide境界へ限定し、eguiの端数差による反復診断と
+    layout前の反復queue診断を除いた。wheel/gamepad/readbackも実位置変更だけ。診断専用のO(N)
+    選択探索は削除し、ensure ownerで既に計算した表示位置からだけ行矩形を記録する。
+  - RatingFolderBackの最新runは★3・600件・10列に到達していた。`item_names`の先頭16件上限に対し
+    600名の完全一致待ちをしていたことがtimeout原因。起動load待ちのcoordinator変更を保持し、
+    全件数は`items_len`、対象は世代+container keyで実セルへ解決する。復帰後のkey/name・可視性・
+    実表示行/列数/geometryを検査し、全件順序やraw indexに依存しない。snapshot上限は維持する。
+    fixture/overrideは600行・10列、子6列/2:3のまま。実アプリは起動せず再runへ引き継ぐ。
+    実gridの未focus pointer回帰で、reveal animation途中の座標ACKが別行（310→320）を開く
+    診断経路の問題も確認。test-script targetの可視化だけを既存ScrollAreaで即時に行い、
+    実セルのclick/double-click producerは維持する。通常scrollのanimationは変更しない。
+  - 利用者がdev-runtimeを実機確認中のため、指示どおりbuild-devは実行しない。
+    非対話検証はtest-script 143件・scroll診断2件・1.328回帰35件、計180件成功。
+    全libは10933 passed / 0 failed / 52 ignored（pipeなし、exit 0）。fixture Python 7件、
+    PowerShell AST、fmt、通常/portable core check、glyph（危険文字0件）も成功。
+    `prepare-portable-smoke.ps1 -TestScript`はexit 0、runtime 4 / PE 17の検証も成功。
+    package/isolated smoke treeの準備完了。dev-runtimeのSHA256は作業開始時と一致。
+    実アプリは未起動、修正scenarioの実runはcoordinator待ち。文案は`target/1328-msg-6.txt`。
+
+- 600項目の実機追補 (`983d68272`後、2026-10-07):
+  - toolbar ←で開いたfolderが選択される一方、3:4復元後にSwitchなしでも画面が末尾へ
+    移るとの再報告。Rating採用が宛先favorite遷移を通らず、子の表示設定が初回描画まで
+    残るcode経路を確認した。共通10列・子favorite6列では、初回ensure-visibleが6列で
+    大きいoffsetを作り、frame末尾に10列へ戻った次描画で短い一覧の末尾へclampされる。
+    利用者の実設定がこのoverlayを使うか、各実ログ数値が同経路かは診断付きbuildで確認する。
+    遅延、追加repaint、再ensure loop、共有egui State resetは加えない。
+  - `[queue] vis`は初描画前に旧セル高/viewportを使える予測で、offsetを変更しない。
+    render_gridは現在frameの列数・セル高・viewportを公開してからensure-visibleし、行snapと
+    max-offset clampを行う。寸法計算そのものは現frameだが、設定ownerの採用が一frame遅い。
+    main ScrollAreaの共有IDで保持された速度/target、rawなしのsmooth wheel残量、egui offsetの
+    無条件差分読み戻しは移動可能な経路だが、実機の入力/Stateの証拠はまだない。
+    通常thumbnailのscroll target producerは見つからず、旧touch glideは世代照合で失効する。
+  - normal loggerの`[grid-scroll]`に保存/復元・queue予測・ensure・snap・clamp・touch・aspect・
+    wheel/gamepad・egui readbackのsourceと世代を記録。offset、選択index/行矩形、セル幅/高、
+    列数、viewport、描画owner、egui State前後と直前入力を採取する。パス/項目名は出さない。
+    次の実機runで実経路を確認する。共有StateのresetやID変更は行わない。
+  - 回帰条件を600行、10列、約70可視セル、row30のfolder選択、Rating 3:4/子2:3へ拡張。
+    実menubar/toolbar/facet/footer/folder pane/gridに加え、favoriteの6列overlayと実update末尾の
+    reconcileを通す。旧テストの復帰前の手動10列設定を除いた。`983d68272`製品コード+
+    診断ログでbuild成功後0成功/4失敗、実exit101。←/→→←/BSの3件はindex309を維持したまま
+    offset2925→9604→6318となり不可視。子の異なるカテゴリ順の1件はindex11へ並べ替わった。
+    証跡`target/1328-red-5.txt`。初期のviewport前提違反や手動列数の成功はvalid redに数えない。
+  - 修正は既存の位置保存→可視context採用→favorite表示遷移→seed/初回layoutの順へ統一。
+    prepared/legacyのRating採用が同じownerを通る。workerは復帰先favoriteのカテゴリ順を
+    pureに投影し、既存requestに保持・採用前に再検証する。準備中の子の設定は変更しない。
+    deepest stored ancestor、新規favorite継承、未保存live値、記憶OFFも既存resolverに合わせる。
+    表示mode/比率も一緒に確定し、列数だけの症状補正はしない。Collection/detached/BS入口や
+    StartupListIntentは変更しない。Smart Folderの既存投影/採用原則に沿う局所修正。
+  - RatingFolderBackも600行 (585直接画像+12folder+3ZIP)、900×1000/10列へ変更し、
+    index309/310の中間rowを使う。対象folder/ZIPはUUID付きfavorite保存表示6列、共通10列。
+    rootの31以上の3:4 sample、子の6列/8 sample/2:3/第4画像を待ち、
+    実viewportが6〜8行、viewport以後も10行以上残ることを検査する。戻りの再選択はしない。
+    focus不要のtoolbar4ケースとfocus時だけの18ケースは維持。実アプリは起動しない。
+    詳細: [auto-thumb-aspect-plan.md §6](auto-thumb-aspect-plan.md)、
+    [ui-smoke-automation-plan.md §1.328](ui-smoke-automation-plan.md)。
+  - 同型の表示設定採用調査: 通常folder/ZIP/PDF/convertedは既存のopen owner、Smart Folderは
+    destination projectionと採用境界で表示設定を確定する。Bookmarks/検索/Tag/閲覧履歴は
+    空loading installまたは独自のsnapshot復帰、Drive/サブ展開も専用ownerで、Ratingと同じ
+    prepared replayは通らない。検索/Snapshot等の比率・位置復帰の残件は下表のまま維持。
+    Collection/A/Bは既存のcontext採用を変更せず、Ratingの共通installだけ今回の対象にする。
+  - 修正後の対象35件は全成功 (exit0)。新規の6件は600行の可視往復4件、favorite投影と
+    実遷移の6条件比較、準備中の宛先カテゴリ順変更/退出元非変更を検査する。
+    全libはpipeなしで10,931成功・0失敗・52無視、911.19秒、実exit0。fmt確認とglyph0件、
+    fixture生成7件・PowerShell構文検査も成功。test-script非対話140件、通常/portable core check
+    もexit0。build結果は以下に記録する。文案は`target/1328-msg-5.txt`。
+    実アプリの起動はcoordinator/利用者へ引き継ぐ。
+  - portable test-script build: `prepare-portable-smoke.ps1 -TestScript` exit0。
+    core最適化22分42秒、PE検査runtime4/pe17成功。source fingerprintの前後一致を確認し、
+    `target/portable-smoke/mimageviewer.exe`と隔離dataを更新した。Suiteは実行していない。
+  - dev-runtime build: `build-dev.ps1 -PreserveRuntime` exit0。通常featureのcore8分06秒、
+    remote/EPUB同梱、PE検査runtime4/pe3成功。実行中coreによる拒否はなく、プロセス停止も
+    製品起動も行っていない。CRLF・bounded numstat・diff check確認済み、未commit。
+    次の確認は600行のRatingFolderBack Suiteと、利用者の★3中間folder→第4画像→toolbar ←/
+    →→←の選択・可視性。新しい`[grid-scroll]`行で実機経路を照合する。
+
+- 保存/描画ownerの追補 (2026-10-07、`68a3200f7`後の調査):
+  - saved Rating位置の優先により、Aを保存→B選択→検索結果B→検索closeで古いAに戻る
+    経路を確認。検索entryと結果採用、Rating→Collectionのaccepted openで、旧itemsを
+    消す前に既存Rating保存helperを呼ぶ。検索結果到着前の選択変更も採用境界で捕捉する。
+    Rating保存の優先順位、Collection自身のanchor、StartupListIntentは変更しない。
+    prepared/legacy共通採用で表示rowsの★段stampも確定し、検索surfaceへ変更後も
+    結果到着まで操作できる旧Rating rowsの保存先を特定する。
+    stamp公開は共通採用ownerへ一本化する。検索結果待ちの★3→★5で、worker結果到着時に
+    新★段stampを先に公開すると旧itemsを★5へ誤保存するため、その早期更新を削除した。
+  - 共通aspect fixupが別一覧の`last_cell_h`を使えることを確認。単一描画paneの
+    `GridAspectLayout`にcontext・世代・列数・実寸法を記録し、一致したThumbnailだけ
+    再anchorする。新installやDetailsには借用できる旧寸法がない。適用時に記録高を
+    進め、二重補正を防ぐ。待機・追加repaint・再ensure-visibleは加えない。
+  - 実機warmログの直接原因は未断定。通常SLIはseed前にoffsetを0にし、Rating位置は
+    seed後に復元するため、旧fixupの`floor(0 / old_h)`だけでは0→120→220行の跳躍を
+    説明できない。Collection install直後の即時判定も、presentation公開前は母数0で
+    切替を通らない。共通seed ownerの境界回帰とRating実catalogのHold往復を分けて検証する。
+  - 詳細: [auto-thumb-aspect-plan.md §5.3/§6](auto-thumb-aspect-plan.md)。縦長Auto fixtureの
+    実アプリ確認はcoordinatorへ引き継ぎ、今回も製品バイナリは起動しない。
+  - valid red: `68a3200f7`の製品コード + 新回帰4件はbuild成功後に0成功/4失敗、exit 1。
+    検索往復、検索結果採用前の選択変更、Collection退出で古いAへ戻り、24 cache samplesによる
+    即時Switchでは新世代の初描画前にoffsetが旧寸法で変わった。証跡 `target/1328-red-4.txt`。
+    warm SwitchはCollection sessionを束縛しない共通seed ownerの境界検査であり、実機再現とは
+    区別する。実catalogを保存したRating toolbar往復/BSでは3:4復元後に24 seedがHoldとなり、
+    異なる2:3の移動元gridでも選択行が可視・offset一致を維持した。
+    検索待ち中の★段切替回帰は追補の暫定修正上で1失敗/exit 1を確認し、早期stamp更新削除で
+    修正する。この追加redはpristine `68a3200f7`での4件とは区別して同証跡に記録した。
+  - 修正後: 対象29成功/0失敗、全lib(pipeなし)は10,925成功/0失敗/52 ignored、実exit 0 (906秒)。
+    同一覧補正の二重呼び出し、context/世代/列数/Details不一致、legacy stamp、検索3種、
+    Collectionの直接open/履歴adoption、検索待ち中の★段切替を含む。test-script 123件、fixture Python 5件、fmt、
+    glyph 0件、PowerShell AST、通常/portable core checkも成功。7ファイルの局所差分でCRLF維持。
+    portable/test-script buildも成功 (23分22秒、runtime=4/PE=17)。SkipBuild再準備の
+    source fingerprint/binary hash検査も成功。suiteは起動せず、coordinator再実行待ち。
+    dev-runtimeもPreserveRuntimeで成功 (14分05秒、runtime=4/PE=3)。core/remote/EPUBを
+    再構築した。製品起動・プロセス終了・commitは行っていない。文案は `target/1328-msg-4.txt`。
+
+- Auto比率の追加調査・修正 (2026-10-07、以下の旧経過を更新):
+  - 実機の入力はtoolbar ←。画像のみフォルダを本として開く設定はOFF、サムネ比率はAuto。
+    実ログをread-onlyで確認し、★3一覧の各復帰でseed後に1:1→3:4へ切り替わることを確認した。
+    私的パスは記録・fixture・commit messageへ転記していない。
+  - コード上、Ratingは永続aspect cache対象外で、位置保存からも除外され、replayは
+    scroll/比率状態をresetしていた。選択pathの復元自体は既存修正で正しい。
+    十分なwarm seedの初回切替は選択復元より前なので、そのログだけでは実機症状の直接原因を
+    断定できない。一方、cold catalog + 後着sampleの描画回帰では、戻った直後は正しく選択・可視でも、
+    1:1→3:4切替の先頭行anchorで選択行が画面外へ出ることを確認した。
+  - 「見つからない項目を N 件除外しました」は、Rating workerが解決できない登録行を
+    結果から除外した件数の通知。選択を消す処理ではないが、行集合/indexが変わる可能性はあるため、
+    保存にはstable keyを使い、古いindex sampleを持ち越さない。
+  - `RatingGridPosition` に選択キー・scroll・確定aspect/sample数をまとめ、context-ownedな
+    `TopLevelGridView` の★段別mapで保持する。既存共通保存ownerを使い、ZIP列挙待ちの空一覧は
+    元位置を上書きしない。明示退出/Driveも同じhelperへ接続。別contextへのcloneでは複製しない。
+    prepared/legacy installの `VisibleInstallAuthority::Rating` →既存のsidecar hydration continuationへ
+    seedを運び、初回描画前に既存cache gateで比率を復元する。replay/Backspaceは同じ位置ownerを使い、
+    opened-path選択の優先順位を維持する。新generationのsamples/streak/切替予算は新しく作り、
+    代表画像の変更・欠落登録行・★段変更でも再評価可能にする。手動比率/Collection/detached/
+    StartupListIntentの既存挙動は維持。待機・追加repaint・再ensure-visibleは追加しない。
+  - 同型のaspect調査 (code判定):
+
+    | 一覧 | 比率・位置のowner / 残件 |
+    | --- | --- |
+    | Rating | 今回★段別session位置として一緒に保存・復元 |
+    | Smart Folder | resident prepared layoutがoffsetとAutoAspectStateを保持 (既存正常) |
+    | Bookmarks | stable synthetic pathのcacheを空installより前に復元 (既存正常) |
+    | Collection | ID別prepared aspect seedとentry anchor (変更なし) |
+    | 検索(Ctrl+S/G/★固定)・Tag | aspect cache対象外。←/→は既存仕様で拒否、BSでは結果を再構築。検索/Tagの戻りownerにlayout保持をまとめる必要があり、今回範囲外 |
+    | 検索由来Snapshot | items/selected/pixel scrollを戻すがAutoAspectStateを保存しない。同じ依存欠落だがSnapshotの保存・復元owner整備が必要で今回未修正 |
+    | 閲覧履歴・サブ展開 | aspect cache対象外。下記のopened-row anchor欠落もあり、別の復帰owner整備が残る |
+    | Drive | 通常はiconだがpin代表画像はAuto sampleになり得る。cache対象外・専用installで比率/位置を組として保存しない。Driveの復帰owner整備が必要で今回未修正 |
+    | A/B | 通常一覧は既存path cache、★一覧は今回のcontext位置owner |
+
+    - 上記の追補でRating→Collectionと検索の軽量退出も同じ保存helperへ接続した。
+      検索/Snapshot等が自身の比率・位置を組として保存しない残件は別件として維持する。
+
+  - valid red: 修正前 `ce12c2fb7` の製品コード + 新回帰3件はbuild成功後に0成功/3失敗、exit 1。
+    下方の120フォルダ一覧から開いて第4画像を選び、toolbar ←相当handler、→後の←、Backspaceの
+    全件でsettle後の不可視を確認。証跡 `target/1328-red-3.txt`。これはcold/late経路の確認で、
+    実機のwarm経路と同一原因だという証拠ではない。
+  - RatingFolderBack fixtureを96×128の縦長画像 + Auto ONへ更新。focus不要の必須toolbar経路、
+    focus時だけ実行する18キー等のケースは維持し、初回と各復帰の3:4/sample採用を観測する。
+    実アプリ/scenarioは実行せず、coordinatorへ引き継ぐ。warm実機報告の最終確認は再実行待ち。
+  - 修正後の対象検証: `cargo test -p mimageviewer --lib section1328 -- --nocapture` は
+    20成功/0失敗、exit 0。新しい描画3件に加え、ZIP空pending、★段別保存、新samplesでの再評価、
+    context cloneでの位置非継承、「場所を忘れる」、手動比率の対照を含む。
+    全libは `cargo test -p mimageviewer --lib` (pipeなし) で10,916成功/0失敗/52 ignored、
+    exit 0。test-script付き123件も成功。fixtureのPython 5件、fmt check、glyph 0件、
+    PowerShell ASTも成功。通常/portable core checkもexit 0、変更17ファイルはCRLFを維持し、
+    `git diff --check` と `git diff --numstat` で局所差分を確認。
+    `prepare-portable-smoke.ps1 -TestScript` はexit 0、runtime=4/PE=17の検査とcore/remote/EPUBの
+    manifest SHA-256照合も成功。隔離dataに配置済み。通常dev-runtimeのbuildは後続で確認する。
 
 - 出典: 利用者メール (§1.280 / §1.307 と同じ報告者、v4.3.0)。報告者の観測:
   - 通常フォルダ: ZIP を開く → ← → 一番左上の項目が選択され、一覧の先頭までスクロールする (時々違う挙動もする)。
@@ -2246,29 +2413,130 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
     レーティング一覧の件はコード調査のみ。
   - 報告者へ「今後の版で修正する。ほかの画面から開いた場合も確認する」と返信済み (2026-10-05)。
 - 望ましい動き: ← で戻ったとき、開いていた ZIP を選択し、画面内に収める (BS で戻ったときと同じ)。
-- 原因 (コード調査):
+- 原因 (コード調査、行番号は §1.335 統合後の修正前 `f18de061e` で再照合):
   - **通常フォルダ**: フォルダを離れるときの位置 (`folder_history` の scroll / selected) は `start_loading_items_inner`
-    (`src/app.rs` 34213 付近) で保存し、戻ったときに 35048 付近で復元する。ところが ZIP を開く
-    `load_zip_as_folder_with_prepared_enumeration` (30986 付近) は、その保存より前に `selected = None` /
+    (`src/app.rs` 35345、保存自体は 35616) で保存し、戻ったときに 36452 付近で復元する。ところが ZIP を開く
+    `load_zip_as_folder_with_prepared_enumeration` (32143) は、その保存より前に `selected = None` /
     `scroll_offset_y = 0` にし、`current_folder` を ZIP に書き換える。このため元フォルダの位置が保存されず、
     ← で戻ると履歴が無い扱い (先頭選択・先頭スクロール) になる。以前の保存が残っていればそれに戻るので
     「時々違う挙動」になる (推測)。BS は `select_after_load` に ZIP 名を渡すので正しく選ばれる。
-    PDF の open (`load_pdf_as_folder_with_prepared_pages`) は `start_loading_items` の保存を通るので同じ問題は無いはず。
-    変換済み書庫 (RAR / 7z / LZH) は同じ ZIP の経路なので同じ症状のはず (未確認)。
-  - **レーティング一覧**: BS (`rating_view_back`、30116 付近) は `select_opened_path` に開いていた ZIP を渡すが、
-    ← の replay (`start_rating_navigation`、30504 付近) は `None`。一覧の install (`finish_rating_view_install`、
-    30753 付近) は直前の `selected` を key → 同じ index の順で引き継ぐため、ZIP 内の 4 番目の画像の index が
+      PDF の open (`load_pdf_as_folder_with_prepared_pages`) は `start_loading_items` の保存を通るので同じ問題は無い
+      (prepared open の対照回帰で確認)。変換済み書庫 (RAR / 7z / LZH) は同じ ZIP の経路を通り、
+      元パス採用後の履歴復帰の回帰でも同じ保存欠落を確認した。外部変換ツールの実行は今回の自動テスト対象外。
+  - **レーティング一覧**: BS (`rating_view_back`、31339) は `select_opened_path` に開いていた ZIP を渡すが、
+    ← の replay (`start_rating_navigation`、31723) は `None`。一覧の install (`finish_rating_view_install`、
+    31972) は直前の `selected` を key → 同じ index の順で引き継ぐため、ZIP 内の 4 番目の画像の index が
     一覧の 4 番目の行として使われる。index での引き継ぎは同じ一覧の並べ直し用で、別の画面から戻るときに使うのが誤り。
   - **コレクション**: 戻り先に開いていた entry の anchor を持つ (§1.282) ので正しく動く。
-- 方針候補:
-  - 通常フォルダ: ZIP を開く経路でも、`current_folder` を書き換える前に元フォルダの位置を `folder_history` へ保存する
-    (保存の所有者を 1 か所にまとめられるか検討する)。
-  - レーティング一覧: ← / → の replay でも、離れる場所 (開いていた ZIP など) を `select_opened_path` に渡す。
-    `finish_rating_view_install` の index での引き継ぎは、同じ一覧の再構築に限る。
-  - 同型の確認: スマートフォルダ・検索結果・ブックマーク・閲覧履歴・サブフォルダ展開・ドライブ一覧から ZIP / PDF /
-    変換書庫 / フォルダを開いて ← で戻る場合を列挙し、選択と画面内表示を揃える。
-- 回帰確認: 通常フォルダ (一覧の下の方の ZIP、ZIP 内でページを選んだ後、変換済み書庫、PDF)、レーティング一覧、
-  コレクション、A/B クイックフォルダ、BS で戻る動きが変わらないこと。
+- 実装 (2026-10-07、Codex の source inspection / 自動テスト。実アプリ起動は未実施):
+  - 通常フォルダ: `save_leaving_folder_grid_position` に既存の位置保存を集約。
+    ZIP が旧一覧を消す直前と通常 install が同じ owner を呼ぶ。列挙完了時の空一覧は保存しない。
+    ZIP / 直接閲覧 RAR / RAR・7z・LZH の変換済み ZIP で共通。PDF の既存 install 保存は維持。
+  - レーティング一覧: ← / → replay の `select_opened_path` に発行時の `effective_folder()` を渡し、
+    成功採用後に開いていたコンテナを選択して ensure-visible。変換書庫は元 source を照合。
+    index fallback は同じ ★一覧の rebuild だけ。key による追従は維持。
+  - Backspace / Collection / detached の経路は変更しない。新規の入力操作・manual 更新は不要。
+  - 簡素化: 新しい保存 state / rollback / modal は足さず、既存 owner と採用境界へ揃えた。
+    §1.335 の `StartupListIntent` の運搬・採用は維持し、session 内履歴の保存から起動復元先を採用しない。
+- 同型調査 (コードからの判定、実アプリの観測ではない。今回と異なる原因の修正は範囲外):
+
+  | 一覧 | ZIP / PDF / 変換書庫 / フォルダを開いた後の ← | 根拠・残件 |
+  | --- | --- | --- |
+  | 通常フォルダ | ZIP・直読み RAR・変換 ZIP は今回修正。PDF・実フォルダは既存保存経路 | `start_loading_items_inner` と ZIP 即応表示の保存時点差を解消 |
+  | レーティング | 対象 container の元パスを今回 replay に追加 | prepared / 通常 install の index fallback を同じ ★一覧に限定 |
+  | スマートフォルダ | root entry の選択と退避 scroll を復元する既存経路 | `restore_smart_folder_prepared_grid` の returned-root-entry と resident session。物理子の通常 ZIP 一覧位置は共通保存の修正対象 |
+  | 検索結果 (Ctrl+S/G/T、ローカル検索、★固定) | 検索・snapshot 所有中の ← / → は既存仕様で拒否 | `history_input_nav_allowed`。検索の Backspace 帰路は今回変更しない |
+  | ブックマーク | 元の bookmark row の stable key / scroll を復元する既存経路 | `BookmarkViewReturnGridState` / `restore_bookmark_view_grid`。本のページを開く一覧で、実フォルダ行は対象外 |
+  | 閲覧履歴 | 開いた本の選択は保証しない (残件) | replay は `enter_reading_history` へ再入場し、一覧 install が先頭を選ぶ。返り先に opened-row anchor を持たない。ZIP 専用の保存欠落 / rating index 継承とは別原因。実フォルダ本も同じ |
+  | サブフォルダ展開 | 開いた項目の選択は保証しない (残件) | restore state は root / snapshot / tombstone を保持するが selection anchor / scroll を持たず、prepare 完了時に先頭を選ぶ。ZIP/PDF/変換書庫/本フォルダに共通する別の owner 設計課題 |
+  | ドライブ一覧 | ← dispatch が離れるドライブルートを origin として選ぶ既存経路 | `enter_drive_list(effective_folder())`。一覧行はドライブルートのみで、ZIP/PDF/変換書庫は直接開けない |
+  | コレクション | §1.282 の entry anchor を保持する既存経路 | 今回変更なし |
+  | A/B クイックフォルダ | 通常フォルダと同じ保存処理、各 slot の履歴 dispatch | A/B 両方を通常 ZIP 回帰に含める。slot 所有・切替仕様は変更しない |
+
+  - 検証 (2026-10-07):
+    - 修正前 `f18de061e`、fixture / §1.335 intent 引数を揃えた追加 10 件は 6 件失敗 / 4 件成功、exit 1。
+      失敗は通常 ZIP、変換 ZIP、rating ← / →、異なる一覧の index 継承、PageContinuation の位置保存。
+      Backspace 2 件・PDF・同じ ★一覧 rebuild の対照は成功。証跡: `target/1328-red.txt`。
+    - 修正後: 追加 10/10、履歴群 106/106、起動復元群 73/73 が成功。
+      `cargo test -p mimageviewer --lib` (pipe なし) は 10900 成功 / 0 失敗 / 52 ignored、exit 0。
+    - `cargo fmt --all -- --check`、normal / portable の `cargo check -p mimageviewer --bin mimageviewer-core`
+      (`portable` は `--features portable`) は exit 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0 / exit 0。
+    - `.\scripts\build-dev.ps1 -PreserveRuntime` は exit 0。normal 機能構成の core / remote service / EPUB PDF worker と
+      FFmpeg / VCRT DLL / EffeTune bundle を配置、VCRT PE 検査は runtime=4 / pe=3 で成功。
+      初回 native 構築の並列競合を避け、`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` で実行。
+      製品バイナリは起動していない。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で全ファイル EOL 差分が無いことを確認。
+- 追加調査 (2026-10-07、`d72808b03` の実機報告):
+  - 利用者は ZIP → ← の修正を確認。★3 → 実フォルダ → 画像一覧 → ← では選択を失うと報告。
+    この追加報告は未解決。製品コードの追加修正は原因・red が確認できるまで保留する。
+  - 採取用Suiteを追加: `ui-smoke.ps1 -Suite RatingFolderBack`。隔離した12フォルダ／3 ZIPの
+    ★3一覧を場所▼の実メニューから開き、下方の項目を実セルのdouble-clickで開いて第4画像をクリックする。
+    ツールバー←、Alt+Left、BrowserBack、WM_APPCOMMAND、X1、Backspaceを独立openで検査し、
+    前5入口は → then ← も検査する (22ケース／32戻り観測)。選択key/name/index、一覧identity、
+    実scroll offset／セル矩形／viewportと画面を残し、不一致でも残りを採取する。
+    test-script限定の読取観測／Windows入力APIを使い、製品の履歴ownerや選択挙動は変更しない。
+    portable/test-script版の準備後にcoordinatorへ実行を引き継ぐ。再現・PASSは実行結果待ち。
+    範囲と観測契約は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の§1.328参照。
+    非対話確認: `cargo test -p mimageviewer --lib --features test-script test_script::` は
+    118成功／0失敗、fixtureのPythonテストは5成功。normal／portable core check、fmt check、
+    glyph checkはexit 0。今回の実アプリの結果は未採取で、前回のfull libと混同しない。
+    `prepare-portable-smoke.ps1 -TestScript` はexit 0。隔離markerとcore／remote／EPUB workerの
+    manifest SHA256一致を確認。実アプリ／scenarioは起動していない。
+    coordinatorの初回run `20261006T190934152Z-160208-RatingFolderBack-b2cb5320` は
+    入力対象の登録待ちがなく、全22ケースが最初のEscapeで失敗 (exit 1、★3一覧へ未到達)。
+    scenarioで登録・focus・ROOTと各遷移の一覧種別／パス／項目名／世代の採用を待ち、
+    第4画像選択を確認してから戻るよう修正。撮影名の「.」／長さと64枚上限も修正。
+    製品の履歴／選択ownerは変更せず、選択喪失の再現結果は修正版の再実行待ち。
+    修正版の非対話確認: test-script 120成功／0失敗 (採用条件・撮影契約の追加2件を含む)、
+    fixture 5成功。normal／portable core check、fmt／glyph／PowerShell ASTは成功。
+    起動前のRhai変数生成もheadlessで実行し、libraryを保持した★一覧パス、15行／8画像を確認。
+    Rhaiの `replace` は値を返さないため、libraryのコピーへ適用する。実アプリは起動していない。
+    修正版の `prepare-portable-smoke.ps1 -TestScript` はexit 0 (VCRT runtime=4 / pe=17)。
+    隔離marker、core／remote／EPUB workerのmanifest SHA256一致、CRLFと局所差分を確認。
+    2回目run `20261006T193735951Z-178504-RatingFolderBack-9ce99859` は
+    background launchのforeground lockで `target_registered=false focused=false` のまま
+    起動時待ちがtimeout。これも選択喪失の再現ではない。必須toolbar経路はfocus不要の
+    widget pointerへ変更し、画面外セルは世代／index／名前を照合して既存scroll ownerで表示、
+    実double-clickでopenする。戻りの選択／scrollには介入しない。
+    toolbarの4ケース／6戻り観測は必須。他の18ケースは1秒以内のfocus確認ができなければ
+    `SKIPPED no-focus` とし、実行／skip／失敗数を区別する。キーguardやfocus取得処理は変更しない。
+    今回の実アプリ実行はcoordinatorへ引き継ぎ、原因確認・製品の追加修正は引き続き保留。
+    無人実行向け変更の非対話確認: test-script 122成功／0失敗 (未focusのdouble-click／hoverと
+    行identityの追加2件を含む)、fixture 5成功。normal／portable core check、fmt／glyph／
+    PowerShell AST、起動前Rhai変数生成も成功。
+    実Rhaiのケースループもwidget setupをmockしてheadless評価し、未focus時はtoolbar 4実行／
+    18 skip／0失敗になることを確認。これは実アプリの選択復元の証拠ではない。
+    今回の `prepare-portable-smoke.ps1 -TestScript` もexit 0 (core 22分48秒、VCRT runtime=4 / pe=17)。
+    新しいsource fingerprint、隔離marker、core／remote／EPUB workerのmanifest SHA256一致を確認。
+    全変更ファイルはCRLF、numstatは局所差分。実アプリは起動せず、未コミットで引き継ぐ。
+  - コードの追跡: Folder の double-click / Enter は `grid_physical_navigation` → `RatingSource` →
+    `start_rating_physical_open`。採用時に `commit_rating_physical_load_owner` が履歴の ★3 と
+    `rating_view_nav_stack` の opened path を記録し、通常 install がその path を `current_folder` に採用する。
+    `folder_history` は画像一覧の位置用で、rating synthetic 一覧には保存しない。
+    ← / → replay は発行前の `effective_folder()` を `select_opened_path` に運び、
+    `finish_rating_view_install` と publication 後に `select_rating_view_row_for_opened_path` で照合する。
+    Folder も `container_path()` の照合対象。Backspace は既存の nav stack の path を渡す。
+  - 追加した handler / state 回帰 4 件は `d72808b03` の製品コードで全件成功 (valid red 未取得)。
+    フォルダ → ←、→後の←、Backspace の対照、PDF → ← / →後の← / Backspace の対照。
+    各ケースは通常 / A / B の履歴と sidecar 有効で実行し、opened path の運搬・履歴 owner・
+    4 枚目を選択した後の一覧行の選択 / ensure-visible を確認。
+    PDF は prepared pages の採用を検証し、外部 decoder 実行は対象外。
+  - 実フォルダの同型経路を再照合: 通常 / A / B は同じ `start_loading_items_inner` の位置保存、
+    smart root は returned root entry、collection は既存 entry anchor、bookmark の本フォルダは
+    stable row key の帰路を使う。検索 / snapshot 所有中の ← は拒否される。
+    閲覧履歴・サブ展開は上表の別原因の anchor 未保持が残る。これらの owner は変更していない。
+  - 利用者セッションの既存ログを読み取り、rating synthetic 一覧から実フォルダへの直接 activation と
+    rating 一覧の再 install を確認した。選択値の記録は無く、このログだけでは喪失箇所を確定できない。
+    実データの書換え・製品バイナリ起動は行わない。実操作 / grid・詳細表示 / 選択と scroll の差を追加確認中。
+  - 追加調査時の検証: §1.328 は 14/14 (追加 4 件を含む)、full lib は pipe なしで
+    10904 成功 / 0 失敗 / 52 ignored、exit 0。fmt、normal / portable core check、glyph (危険 glyph 0)
+    は全て exit 0。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で局所差分を確認。
+    成功の証跡は `target/1328-followup-baseline.txt`。追加報告の red / 修正完了を意味しない。
+    `.\scripts\build-dev.ps1 -PreserveRuntime` も exit 0 (core / remote / EPUB PDF worker、VCRT PE: runtime=4 / pe=3)。
+    製品バイナリは起動していない。コミット文案は `target/1328-msg-2.txt`、未コミット。
+- 残る検収: `983d68272`実機の連続跳躍が今回再現したfavorite列数の採用順と同じ経路か、
+  新しい診断ログで照合する。独立レビューと600行Suite、利用者による実アプリの
+  レーティング / 変換書庫 / PDF / BS 確認も引き継ぐ。
+  閲覧履歴・サブ展開の anchor を含む構造変更はこの bounded fix では実装しない。
 - 規模 / 優先度: Small〜Medium / P2 (利用者報告あり)。
 
 ### 1.318 起動時の索引走査を HDD ごとに 1 本ずつ順に回す (D2) — 実測から保留 (2026-10-03)

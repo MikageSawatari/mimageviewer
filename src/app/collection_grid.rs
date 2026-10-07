@@ -1773,6 +1773,7 @@ impl App {
         restore: Option<CollectionGridRestore>,
         return_to: Option<TopLevelGridRestore>,
     ) {
+        self.save_leaving_rating_grid_position();
         let perf_start = crate::perf::is_enabled().then(Instant::now);
         let restoring = restore.is_some();
         let retaining_binding = self.collection_root_installed_binding_matches(collection_id);
@@ -2064,6 +2065,7 @@ impl App {
             crate::logger::log(format!("collection history adoption blocked: {reason}"));
             return false;
         }
+        self.save_leaving_rating_grid_position();
         let watch = self
             .collection_store_client_for_read()
             .ok()
@@ -3411,7 +3413,7 @@ impl App {
         let cache_map = Arc::new(std::sync::RwLock::new(folder_pin_cache));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = None;
-        self.reset_and_seed_auto_aspect_with_collection_seed(
+        self.reset_and_seed_auto_aspect_with_seed(
             &cache_map,
             collection_seed,
             Some(auto_aspect_eligible_total),
@@ -5184,6 +5186,211 @@ mod tests {
             app.conceal_pages.contains(&0),
             "paint path must apply the saved conceal edit"
         );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn section1328_followup4_aspect_fixup_uses_only_its_own_layout() {
+        use crate::settings::{GridViewMode, ThumbAspect};
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.grid_cols = 4;
+        app.settings.thumb_aspect_auto = false;
+        app.settings.thumb_aspect = ThumbAspect::Square;
+        app.install_new_items(
+            (0..120)
+                .map(|i| GridItem::Image(temp.path().join(format!("image-{i}.png"))))
+                .collect(),
+            vec![None; 120],
+        );
+        app.rebuild_visible_indices();
+        app.selected = Some(104);
+        app.scroll_to_selected = true;
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let draw = |app: &mut App| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 350.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.render_grid(ctx).is_none());
+                },
+            );
+        };
+        draw(&mut app);
+        draw(&mut app);
+        let expected = (app.scroll_offset_y / app.last_cell_h).floor()
+            * (app.last_cell_size * ThumbAspect::Portrait3x4.height_ratio()).round();
+        app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
+        assert_eq!(app.scroll_offset_y, expected);
+        app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
+        assert_eq!(
+            app.scroll_offset_y, expected,
+            "same-frame double fixup is idempotent"
+        );
+        app.settings.grid_cols += 1;
+        app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
+        assert_eq!(
+            app.scroll_offset_y, expected,
+            "different columns do not own the old rows"
+        );
+        app.settings.grid_cols -= 1;
+        let owner = app.projected_viewer_context_id();
+        if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
+            &mut app.grid_aspect_layout
+        {
+            *context_id = super::super::ViewerContextId::for_test(u64::MAX);
+        }
+        app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
+        assert_eq!(
+            app.scroll_offset_y, expected,
+            "another context does not own this anchor"
+        );
+        if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
+            &mut app.grid_aspect_layout
+        {
+            *context_id = owner;
+        }
+        app.bump_items_generation();
+        app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
+        assert_eq!(
+            app.scroll_offset_y, expected,
+            "different generation has not been laid out"
+        );
+        app.settings.grid_view_mode = GridViewMode::Details;
+        draw(&mut app);
+        let details_offset = app.scroll_offset_y;
+        app.settings.grid_view_mode = GridViewMode::Thumbnail;
+        app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
+        assert_eq!(
+            app.scroll_offset_y, details_offset,
+            "Details is not thumbnail geometry"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn section1328_followup4_warm_install_does_not_reanchor_previous_grid() {
+        use crate::settings::ThumbAspect;
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.grid_cols = 4;
+        app.settings.thumb_aspect_auto = false;
+        app.settings.thumb_aspect = ThumbAspect::Portrait2x3;
+        app.install_new_items(
+            (0..120)
+                .map(|i| GridItem::Image(temp.path().join(format!("old-{i}.png"))))
+                .collect(),
+            vec![None; 120],
+        );
+        app.rebuild_visible_indices();
+        app.selected = Some(104);
+        app.scroll_to_selected = true;
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let draw = |app: &mut App| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 350.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.render_grid(ctx).is_none());
+                },
+            );
+        };
+        draw(&mut app);
+        draw(&mut app);
+        let offset = app.scroll_offset_y;
+        assert!(offset > 0.0);
+        let old_generation = app.items_generation;
+        app.settings.grid_cols = 10;
+        app.settings.thumb_aspect_auto = true;
+        let items: Vec<_> = (0..120)
+            .map(|i| GridItem::Image(temp.path().join(format!("new-{i}.png"))))
+            .collect();
+        let mut warm = std::collections::HashMap::new();
+        for (index, item) in items.iter().enumerate().take(24) {
+            let request = crate::app::make_load_request(
+                item,
+                index,
+                1,
+                5,
+                false,
+                None,
+                None,
+                0,
+                &Default::default(),
+                &Default::default(),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            warm.insert(
+                crate::thumb_loader::cache_key_for_request(&request)
+                    .unwrap()
+                    .into_owned(),
+                crate::catalog::CacheEntry {
+                    mtime: 1,
+                    file_size: 5,
+                    jpeg_data: Vec::new(),
+                    source_dims: Some((96, 128)),
+                    layout_dims: None,
+                    folder_provenance: None,
+                    selection_proof: None,
+                },
+            );
+        }
+        // Exercise the shared seed/fixup owner with a new, unpainted item generation.
+        // No Collection session is bound: its denominator is published after installation.
+        // Catalog entries must actually cause an immediate switch, not a mocked fixup.
+        app.install_collection_grid_items_with_thumbnail_sources(
+            items,
+            vec![Some((1, 5)); 120],
+            Some(104),
+            Default::default(),
+            Arc::new(Default::default()),
+            Default::default(),
+            warm,
+            None,
+            120,
+            None,
+        );
+        app.cancel_token.store(true, Ordering::Relaxed);
+        assert_ne!(app.items_generation, old_generation);
+        assert_eq!(app.auto_aspect.samples.len(), 24);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+        assert_eq!(
+            app.auto_aspect.switches_done, 1,
+            "warm seed must actually switch"
+        );
+        assert!(app.scroll_to_selected);
+        assert_eq!(
+            app.scroll_offset_y, offset,
+            "unpainted list borrowed the prior grid's row height"
+        );
+        draw(&mut app);
+        draw(&mut app);
+        assert_eq!(app.selected, Some(104));
+        let center = (104 / 10) as f32 * app.last_cell_h + app.last_cell_h / 2.0;
+        assert!(
+            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+        );
+        let settled = app.scroll_offset_y;
+        app.maybe_apply_auto_aspect(true);
+        draw(&mut app);
+        assert_eq!(app.scroll_offset_y, settled);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -7077,6 +7284,56 @@ mod tests {
             TopLevelGridSurface::Collection(_)
         ));
         assert_eq!(app.items.len(), 1);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1328_followup4_rating_history_collection_adoption_saves_latest_position() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("page.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        poll_until(&mut app, "new Collection was not cataloged", |app| {
+            app.collection_catalog_revision(snapshot.collection_id()) == Some(snapshot.revision())
+        });
+        app.items = (0..6)
+            .map(|i| GridItem::Folder(temp.path().join(format!("rated-{i}"))))
+            .collect();
+        app.items_are_rating_view = true;
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Rating { stars: 3 });
+        app.selected = Some(0);
+        app.save_leaving_rating_grid_position();
+        app.selected = Some(4);
+        app.scroll_offset_y = 700.0;
+        let selected_key = app.rating_path_key(4).unwrap();
+        let restore = CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: snapshot.collection_id(),
+            },
+            revision_at_open: snapshot.revision(),
+            viewport_anchor: None,
+        };
+        let mut pending = app
+            .start_collection_history_prepare(restore.clone())
+            .unwrap();
+        let install = loop {
+            match app.poll_collection_history_prepare(&mut pending) {
+                CollectionHistoryPreparePoll::Pending => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                CollectionHistoryPreparePoll::Ready(install) => break install,
+                CollectionHistoryPreparePoll::Failed(message) => panic!("{message}"),
+            }
+        };
+        assert!(app.adopt_collection_history_root(restore, install, None));
+        assert!(!app.items_are_rating_view);
+        let saved = app.top_level_grid_view.rating_grid_position(3).unwrap();
+        assert_eq!(saved.selected_key, Some(selected_key));
+        assert_eq!(saved.scroll_offset_y, 700.0);
         app.shutdown_collection_runtime_for_exit();
     }
 
