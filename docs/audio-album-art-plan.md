@@ -1,8 +1,8 @@
 # MP3 埋め込みアルバムアートの一覧表示計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の設計のみ。
-改訂: 独立設計レビュー R1 の REVISE 指摘 6 件への対応。
-**未実装・利用者質問は未回答・独立レビュー R1 は REVISE・改訂版の再レビュー待ち・実アプリ未起動。**
+改訂: 2026-10-08 / 独立設計レビュー R2 の REVISE 指摘 2 件への対応 (R1 の対応は保持)。
+**未実装・利用者質問は未回答・独立レビュー R2 は REVISE・改訂版の再レビュー待ち・実アプリ未起動。**
 以下の「提案」は実装担当の推奨であり、利用者の決定済み事項とは区別する。
 
 ## 1. 決定済みの範囲と守る契約
@@ -179,6 +179,10 @@ no_art bool を足す代わりに、排他的 payload を
   DOM の寿命より長く必要な NoArt / Failed だけを一覧 owner に保持する (R1-5)。
 - **Remote の更新 timer / 自動再検証を追加する**: 不採用案。更新保証を明示 refresh に限定して
   epoch を変える Q7 を推奨し、期限や再試行 owner を増やさない (R1-6)。
+- **album-art 専用の接続 LRU**: R2-1 で撤回。要求単位の接続と短い DB phase に限定し、
+  idle worker ごとの解放 command / ACK / 再開状態を作らない。共通 catalog の削除境界は §5.4。
+- **cache 削除で全 viewer / Remote を閉じる**: 不採用。表示・再生・navigation を維持し、
+  catalog の受付と接続だけを共通 owner で退役させる。UI の modal 化や worker join は不要。
 - **まれな DB 失敗を retry で救う**: 自動 retry は不採用案。ログ・通知・次回再生成の Q5 を利用者に相談する。
 
 detached 述語・viewport routing・registry は変更しない。既存 bundle のサムネ状態として
@@ -212,7 +216,9 @@ audio_art_absence の CREATE / migration を追加せず、delete_missing に ab
 呼出境界はローカル `spawn_thumbnail_workers → process_load_request の Audio 専用 dispatch`
 または Remote `pipe heavy handler → ThumbnailEngine の Audio 専用 dispatch` とする。
 worker が source 親の catalog handle を開き、既存の一般 schema 確立を済ませた後に
-album-art の追加 schema を確立し、その handle を worker 所有 LRU に保持する。
+album-art の追加 schema を確立する。R2-1 により **worker 所有 LRU は設けない**。
+接続は要求内の DB phase に閉じ込め、lookup の値を所有 bytes / stamp として返して接続を閉じる。
+抽出・decode 中には保持せず、保存 / prune では §5.4 の有効な受付証明を検査して worker が開き直す。
 UI の catalog handle / mutex を追加 DDL のために借用せず、準備完了を待つのも worker だけとする。
 UI に schema 準備待ちを追加しない。必要な schema が作れなければ art cache だけ使用せず、
 source 取得へ進む (Q5)。
@@ -222,7 +228,7 @@ positive / absence の SELECT・保存・scope prune もこの worker 境界内�
 では audioart namespace を SQL で除外する。先に全 BLOB を読んでから UI で filter しない。
 既存の一般一括読込・掃除の呼出回数を増やさず、Audio の worker 専用 load_one / scoped query
 だけが art 行を読む。UI の aspect / preview は worker の結果を受け、同期の Audio cache seed を
-追加しない。cache 管理の全件削除は既存の明示操作を保ち、新しい Audio 分の SQL は worker に置く。
+追加しない。cache 管理の全件・期限削除は既存の明示操作を保ち、接続・書込境界は §5.4 へ揃える。
 旧 DB への初回 open / 再 open / 旧 read-only reader との共存で既存行不変をテストする。
 read-only handle は追加 table 不在を cache miss と扱い、CREATE / migration を行わない。
 
@@ -245,8 +251,8 @@ algorithm version は前面表紙選定・対応形式・
 保存先は常に **元 MP3 の実親に対応する catalog**。通常一覧でも完全な source identity の key を使い、
 検索・rating・history・smart・collection と Remote で同じ行を参照する。
 合成一覧の synthetic current_folder の DB に MP3 行をコピーして保存しない。
-worker が有界な親 catalog handle LRU (推奨 8 親、worker 所有) を使って lookup する。
-既に開いた worker 所有の同じ親 handle は再利用できる。UI の一括 matching map は art 行を持たず、
+worker は要求内の一つの DB phase でだけ同じ source 親 handle を再利用し、phase 終了で閉じる。
+別 MP3 / 別要求へ接続を持ち越さない。UI の一括 matching map は art 行を持たず、
 「通常一覧なら UI が Audio cache を事前ロードする」という経路は作らない。
 異なる親の同名 song.mp3 と、親 hash が共有される別 drive の同名 path を key で分離する。
 logical / canonical path の使い分けは Remote path_guard と既存 catalog 対応に揃える。
@@ -265,14 +271,16 @@ prefix を含む key は version をまたいで **その直接の source 親だ
 削除はその範囲内で physical inventory に存在しない basename の exact key に限る。
 inventory は source 親に属する完走した物理 scan snapshot を、facet 適用前に worker へ渡す。
 source 親・完走・取消 / 一覧世代を確認できない snapshot では prune しない。
-既存 Audio worker のその scope の初回準備にまとめ、専用掃除 thread / 毎 MP3 の再走査を作らない。
+既存の一覧準備から scope ごとに一件の maintenance job を heavy queue へ渡し、
+§5.4 の有効な受付証明で worker が実行する。専用掃除 thread / 毎 MP3 の再走査を作らない。
 合成一覧はその表示行だけを完全 inventory とみなさず、source 親の complete snapshot がなければ
 掃除を見送る。再生成可能な古い行は次の適格な物理一覧準備か明示 cache 管理まで残してよい。
 取消・古い一覧の maintenance は保存と同様に実行 / commit しない。
 facet / 検索で隠れた行を物理的な missing としない。
 
 ファイル・フォルダ単位の明示 cache 削除も exact key / source scope に限定し、
-共有 DB のファイル自体を消して別 drive の art を巻き込まない。全 cache の明示削除は従来どおり。
+共有 DB のファイル自体を消して別 drive の art を巻き込まない。
+全件・期限削除の選定規則は保ち、実行は §5.4 の共通境界に置く。
 smart/collection prepare、rename/move の cache consumer もこの境界を共有する。
 rename/move 後は新 key で再生成し、
 旧行は上記の scoped prune へ任せる。利用者のタグ・★・collection migration には変更を入れない。
@@ -317,6 +325,81 @@ Remote が小さい画素を要求しても、大きい既存 catalog row を縮
 保存は設定された thumb_px で生成し、HTTP 出力だけ要求寸法へ縮小する。
 アートなしは target_px に依存しないため absence key にサイズを含めない。
 
+### 5.4 全件・期限削除と接続 / 書込の境界 (R2-1)
+
+`src/app.rs:35623` の evict_all_catalog_cache は App の LRU だけを clear する。
+`src/ui_dialogs/cache_manager.rs:120,224` の削除入口はこれを呼ぶが、
+`src/app.rs:46530` の thumbnail worker は空 queue で Condvar 待機し、終了しない。
+`src/catalog.rs:1659,1672` の delete_old_cache / delete_all_cache は remove_file の成功だけを数える。
+したがって「App の LRU を解放すれば全接続が閉じる」という前提を置かない。
+Remote の既存 `generate_catalog_resolved` (`src/remote_ipc/thumbnail.rs:336`) も実行中は
+CatalogDb を保持する。これは通常の所有権の問題であり、Q5 のまれな DB 障害には含めない。
+
+**アートの常駐接続をなくすだけで終わらず、同じ DB を開く共通 catalog に削除境界を置く。**
+本体 process / cache_dir に一つの `CatalogAccess` (仮称) を共有し、App と全 viewer context、
+通常 / 合成一覧の prepare・thumbnail・writeback、Remote engine、cache-maint に同じ owner を渡す。
+remote-web は DB を開かず、この owner は本体内だけに置く。別 IPC command は追加しない。
+実装では CatalogDb の全 open variant (通常・folder selection・read-only) と全 SQL caller を棚卸しし、
+この経路を通らない接続を残さない。別 cache_dir の owner は共有せず、設定・タグ等の DB は対象外。
+
+owner が持つのは型付きの `Accepting(epoch) / Deleting(epoch, operation)` と DB phase の lease 数、
+登録済み接続の weak registry (登録 / maintenance 時に dead entry を除去)。
+App に deleting bool / audio pending bool を足さない。
+MP3 要求にはこの owner が発行する `Admitted(epoch) / DisplayOnly(epoch)` の受付証明を一つ持たせる。
+一覧 / session の取消世代とは役割が異なり、source stamp・HTTP artEpoch・永続 key には含めない。
+Audio の SQL phase は受付証明を検査して lease を取得し、open / schema / SELECT / transaction / close を
+worker 内で完了する。Connection / statement / transaction を phase 外へ貸し出さない。
+close と rollback を含む handle 解放の後でだけ lease を返す。owner の状態 mutex は短い memory 更新
+だけに使い、I/O / decode / connection mutex の取得中には保持しない。
+一般媒体の既存 SQL も lease で drain 対象に含めるが、既存 UI 同期経路の全面移設をこの文で
+暗黙に要求しない。新しい Audio の SQL / close は UI に到達させない。
+
+削除の順序は次の一経路へ集約する。
+
+1. **受付失効**: 既存 spawn_cache_maintenance の削除受付で、worker 起動前に memory 上の epoch を
+   進めて Deleting にし、既存 App LRU の warm hit を失効させる。現行の UI 入口の
+   evict_all_catalog_cache → spawn の順序を変更し、接続の close / LRU の実解放は worker の退役後に
+   行う。UI は要求提出だけで SQL・drain・join をせず、新しい SQLite close を増やさない。
+2. **drain / retire**: 既存 cache-maint worker が Condvar で active DB phase の完了を待ち、
+   登録された対象 catalog 接続を worker 上で閉じる。長い source 抽出・decode は lease を保持しない。
+   既存 worker が持つ Arc が生きていても Connection は残さない。CatalogDb 内は
+   `Open { connection, epoch } / Retired` の一つの状態にし、Retired handle は再 open しない。
+   App の current_color_catalog、parked context、prepare 結果、virtual writeback、既存 regular / heavy
+   worker、Remote の実行中 handle も登録対象。idle worker を起こして ACK を集める方式は使わない。
+3. **選定 / 削除**: open / SQL の新規受付を閉じたまま、現行と同じ cache_dir / 日数・DB mtime の
+   条件で選定し、全件または期限対象の DB を remove_file する。DeleteOld は選定直前の mtime を使い、
+   対象外の DB ファイル・行は保持する。DB に成功・absence が同居するのでどちらも削除対象に含まれる。
+   全件・期限削除は cache_dir 全体を短期間この境界に置き、DB ごとの並行削除状態は作らない。
+   フォルダ / ファイル削除は同じ接続・書込境界の中で §5.2 の exact key / source scope を使う。
+4. **再受付**: 削除完了後に新 epoch の Accepting を公開し、既存 pending / completion 経路で結果を
+   返す。UI は退役済みの App LRU を memory 上で clear する。App の古い handle は warm hit にせず、
+   次の適格な worker lookup が新 handle を得る。
+   拒否された古い要求を自動 retry せず、既存の明示 reload / refresh と次の新要求を使う。
+   エラー / worker spawn 失敗 / unwind でも maintenance token の drop で受付を再開し、失敗を既存結果へ
+   返す。削除完了を偽装する通知や追加 retry / 復旧 journal は作らない。
+
+**削除をまたぐ書込**: 受付失効前に lease を得た transaction は完了まで drain してから削除する。
+開始済み SQLite transaction を途中で強制停止しない。まだ書込 lease を得ていない旧 epoch の
+要求は保存・schema 作成・prune を行わず、削除後に DB を再作成しない。lookup を終えて抽出中の
+ローカル / Remote MP3 も同じである。結果は有効な表示 context / session に返せるが、DB へ書き戻せない。
+削除中に届く MP3 は DisplayOnly として source から生成し、永続化をせず終了する。新しい epoch で
+削除完了後に受け付けた要求だけが、CacheDecision に従って DB を再作成・保存できる。
+Remote Flight の key に受付証明 (epoch と Admitted / DisplayOnly の区別) も含め、
+削除後の新要求を旧要求や削除中の DisplayOnly Flight に合流させない。
+
+この境界は既存一般媒体の SQL にも届く。Retired handle の SELECT は cache miss、書込は無効な
+世代として扱い、古い Arc から接続を復活させない。UI の既存 catalog 経路は Deleting 中に待たず、
+保持中の表示を使って必要な lookup を worker に渡す。一般 worker の catalog-only 要求は、
+実行中に古い handle が Retired になった場合も含め、worker 側の Condvar で再受付を待ち、
+open_existing_read_only による一回の lookup を現在の読取 lease で行う。期限外の DB が残れば
+その cache を使い、実際に削除済みの DB は通常の cache miss とする。古い要求の書込許可は更新しない。
+これは待機中の同じ lookup の継続であり、新しい抽出要求の自動 retry や再試行 loop ではない。
+source 読込に勝手に格上げしたり媒体を表示不可にしたりしない。
+待機中は DB phase lease を持たず、取消で抜けられる。画像 / ZIP / PDF / RAW・詳細 hover・再生の
+既存機能を落とさず、共有境界を独立した挙動維持 chunk として設計再レビューしてから実装する。
+削除失敗は実際の残存件数とエラーを既存結果へ反映し、成功件数だけから全削除成功と推測しない。
+この通常の同期境界を Q5 に押し込まず、外部ロック等のまれな I/O 障害に限って Q5 を適用する。
+
 ## 6. Audio セルを表示する全 surface
 
 | 一覧 / producer | 実装で揃える点 |
@@ -360,7 +443,8 @@ MP3 は Audio のまま、source_address は None。動画 sidecar 専用の sou
 ThumbnailEngine は image/video/container の dispatch に MP3 AudioAlbumArt を追加し、
 §3〜5 の本体共通生成関数へ渡す。catalog、選定、limits、CacheDecision、WebP を PC と共有する。
 NoArt は既存 ThumbnailErrorCode::NoThumbnail、他の失敗は既存 error code に写像する。
-absence cache hit も同じ終端応答。HTTP の 422 は再試行なし、画像 bytes は従来の image/webp。
+absence cache hit も同じ終端応答。HTTP の 422 は再試行なしだが、終端種別は §7.2 の
+error 識別子で判別する。画像 bytes は従来の image/webp。
 
 現コードの ThumbnailEngine::handle は session_cancel を受け取らず、
 generate_catalog_resolved 内の token は常に false。新抽出では pipe heavy handler に既にある
@@ -390,7 +474,8 @@ terminalByAddress は正規化した MP3 logical address に `NoArt | Failed` �
 画像 bytes / 成功 cache / DOM reference は保持せず、同じ MP3 の重複 bookmark は同じ結果を参照する。
 容量は現一覧に含まれる unique MP3 address 数を上限とし、LRU eviction で終端を忘れない。
 
-初回要求は既存の有界 retry / limiter を使う。NoThumbnail / 422 は NoArt、source error・
+初回要求は既存の有界 retry / limiter を使う。**NoArt は HTTP 422 かつ JSON の
+`error: no_thumbnail` の応答だけ**とする (R2-2)。source error・
 応答画像の decode 失敗・通信 retry の打切りは Failed として一覧 owner に記録してから DOM へ投影する。
 fetch の意図的な abort と auth / session 失効は terminalByAddress に記録しない。
 結果は同じ session・一覧世代に属し、その address が現一覧に残る場合だけ受理する。
@@ -407,8 +492,13 @@ refresh 後の旧応答は新しい map に記録しない。複数の過去一�
 
 HTTP の NoThumbnail 応答には識別可能な `error: no_thumbnail` を付ける提案。
 IPC enum の追加は不要で、http.rs の error mapping と app.js の表示 / telemetry を揃える。
+`http.rs:4297` では GenerationFailed / NoThumbnail が両方 422 なので、status 単独では判別しない。
+HTTP mapping は NoThumbnail のみ no_thumbnail とし、GenerationFailed は既存 miv_thumbnail_error の
+まま Failed にする。他の 422 (識別子不明・JSON 不正を含む) も Failed として終端化し、
+正常な無画像の map 値 / telemetry に混ぜない。永続 absence に保存するのも本体 NoArt だけである。
 通常の無画像を client image_load_error として大量記録しない。既存 retry は network/busy のみで、
-NoThumbnail / 422 は終端とし、no-store を維持する。auth / session 失効は既存の通信・ログアウト動作を維持する。
+どちらの 422 も再試行せず終端とし、no-store を維持する。
+auth / session 失効は既存の通信・ログアウト動作を維持する。
 
 Remote の通常・検索 / tag・rating・history・smart・永続 collection・bookmark で
 RemoteEntryKind::Audio の MP3 を同じタイルに渡す。catalog / UI の一覧ごとに別フラグを足さない。
@@ -449,6 +539,9 @@ wire に内部状態を追加する必要が出た場合は実装前に全 reade
 
 ## 8. 利用者への質問 (回答前に決定として扱わない)
 
+R2 では質問の追加・変更はない。Q1 / Q5 の「改訂」と Q7 の「新規」は R1 時点の履歴。
+今回の 2 件は技術的な所有境界・結果分類の修正として扱い、Q5 の対象はまれな DB 障害に限る。
+
 | ID | 質問と推奨回答 |
 | --- | --- |
 | Q1 (改訂) | MP3 から・初回から Remote 対応は決定済み。未決の画像形式は JPEG / PNG を必須、追加形式は既存 decoder で安全に扱える静止画に限定し、外部 cover.jpg・手動指定・再生画面への表示は後回しでよいか。**推奨: はい**。FLAC/M4A 等は MP3 の次の拡張として扱う |
@@ -462,7 +555,8 @@ wire に内部状態を追加する必要が出た場合は実装前に全 reade
 ## 9. 実装順序・受入条件・検証所有
 
 1. coordinator が Q1〜Q7 の回答を記録し、別 context の Sol / xhigh に改訂設計の再レビューを依頼する。
-   R1 の 6 件の変更境界、extraction の有界性、terminal 契約、親 catalog、Remote session Flight を重点とする。
+   R2 の catalog maintenance 境界・422 分類と、R1 の 6 件の変更境界を重点とする。
+   extraction の有界性、terminal 契約、親 catalog、Remote session Flight も維持する。
 2. 合意後の最初の作業は §3 の synthetic ID3 fixture と同梱 FFmpeg adapter 検証。
    front / back の選定 metadata、open-only、取消 / 上限が成立しなければ設計を戻す。
 3. 型付き結果契約と NoArt の共通 consumer を挙動不変の chunk で整え、source catalog の
@@ -478,10 +572,13 @@ wire に内部状態を追加する必要が出た場合は実装前に全 reade
 | source stamp (R1-3) | bookmark 登録日時≠原本 mtime、同一 MP3 の異なる日時の複数 bookmark、history の未知 stamp 0 / 表示 meta None でも worker stat で Loaded / NoArt になる。stat 失敗で stamp 0 の cache 行を書かず、読込中の実 stamp 変更は公開・保存しない |
 | catalog | 旧 v2 DB の画像 / ZIP / PDF / video_meta 行不変、追加 table 不在の read-only miss、positive↔negative、mtime だけ / size だけの変更、同名別親、Auto / Off / Always、SourceOnly、prune / rename / clear、small Remote が large row を上書きしない |
 | prune 所有 (R1-4) | 同一 DB を共有する C:\Music / D:\Music を交互に物理一覧で開いて両方の positive / negative を保持。片親で消えた MP3 だけを両 table から scoped prune、別 drive / 子親 / facet 非表示は保持。一般 delete_missing も art 行を消さず、合成一覧・未完走 scan・旧世代は prune しない |
+| cache 削除 (R2-1) | Windows の disposable cache_dir でローカル / Remote の MP3 閲覧後、queue が空の worker と保持 Arc を残して DeleteAll が positive / negative の DB を消す。DeleteOld は古い DB だけ消し、期限外を保持。旧 epoch の保存待ち・prune / lookup 中・実行中 transaction を同期 fixture で削除の前後へ動かし、handle 解放前に remove_file せず、旧要求が削除後に DB を再作成しない。削除中の DisplayOnly は表示を完了し永続化 0、新 epoch の次要求は必要時だけ再生成。通常 / parked / prepare / writeback / read-only / Remote の全 open variant、catalog-only の待機 / cancel、spawn 失敗時の再受付も検証し、製品 binary は起動しない |
+| cache 削除中の機能維持 | 期限外 DB の catalog-only 要求が Retired を受けても、一回の背景 read-only lookup で既存画像を返し、旧書込許可は復活しない。Remote は同じ address / target でも Admitted と DisplayOnly の Flight を混ぜない。UI の drain / join / 新しい SQLite close は 0、source 表示・再生・別 context の texture は維持 |
 | cross-context | A / B の同じ・異なる MP3、片方の switch / close / cancel / reload で sibling texture / queue / NoArt 不変、park / restore / fork。製品起動を要さない fake worker / state tests |
 | UI | 全 surface の MP3 Loaded / NoArt / Failed、詳細 hover・preview・選択バー、切り取り、暗 / 明 theme、duration / resume / badge、Auto aspect の終端。headless snapshots を追加する |
 | Remote | endpoint の認証 / path guard、MP3 WebP / NoThumbnail、PC 未訪問の cache miss、全 Audio 一覧、422 非 retry、terminal tracker、stale DOM、virtualization、session cancel / next owner / 同一 session Flight、版 handshake・round-trip。Rust handler と Node runtime tests |
 | Remote 終端 owner (R1-5) | Cache Off / Auto absence 未保存で NoArt / Failed を受信後、DOM eviction→再訪しても同じ一覧世代の HTTP / core 抽出は 0 回。重複 address・sort / resize でも保持、refresh / 別一覧で破棄。旧世代完了は新 map に入らず、意図的 abort / session 失効は結果を汚染しない |
+| Remote 422 分類 (R2-2) | Rust HTTP mapping と Node runtime で 422 + no_thumbnail → NoArt、422 + miv_thumbnail_error (GenerationFailed) → Failed、他の 422 / JSON 不正 → Failed。全部 retry 0・tracker settled、DOM 再訪の再要求 0。NoArt だけを absence に保存し、生成障害は normal-no-art telemetry と区別 |
 | Remote 更新 (R1-6/Q7) | fake HTTP cache で 60 秒超の force-cache 再利用を再現し、refresh 前の自動更新を要求しない。stamp が変わった外部交換・削除・追加後、明示 refresh が新 artEpoch URL で core へ到達し、新画像 / NoArt になる。同 stamp は Q6 の限界として別検証 |
 | playback 回帰 | cover-only MP3 は audio-only のまま、cover + 実映像は実映像を選ぶ。decoder の既存テストを保持し、ジャケット取得が player / 音声出力を作らないことを検証 |
 
@@ -489,7 +586,7 @@ wire に内部状態を追加する必要が出た場合は実装前に全 reade
 実装時に既存不具合も直す場合は、その違反境界の failing regression を修正前に実行し有効な red を残す。
 targeted → full lib `cargo test -p mimageviewer --lib` (pipe なし・実 exit code)、
 `cargo fmt`、normal / portable の core check、`python scripts/check_ui_glyphs.py` を行う。
-共有 ThumbMsg 変更では [build/test policy](development-build-and-test.md) の full gate も必要。
+共有 ThumbMsg / catalog maintenance 境界の変更では [build/test policy](development-build-and-test.md) の full gate も必要。
 Remote IPC / Web tests を省かず、CI 依存・timeout は十分な時間を確保する。
 
 実装後は build-dev.ps1 で通常 core の確認 binary を用意し、Remote も同時 build する。
@@ -509,10 +606,10 @@ spec、マニュアル、製品ページを co-update する。privacy の cache
 「安心して使えます」も照合し、新しい外部通信は増えないこと、既存認証済み Remote への
 ジャケット配信が画像配信の記述に含まれることを確認する。
 
-coordinator への引き継ぎ: Q1〜Q7 の回答、R1 対応箇所の再レビュー、入力有界化の技術ゲート、
+coordinator への引き継ぎ: Q1〜Q7 の回答、R2 の共有削除境界 / 422 分類の再レビュー、入力有界化の技術ゲート、
 全 producer / consumer を含む実装 brief と file ownership、統合 IPC 番号の決定が次の作業。
-commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-design-r2-msg.txt` に置く。
-初版の `target/D-design-msg.txt` は変更しない。
+commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-r3-msg.txt` に置く。
+過去の `target/D-design-msg.txt` / `target/D-design-r2-msg.txt` は変更しない。
 
 ## 11. 独立設計レビュー R1 への対応記録
 
@@ -527,3 +624,14 @@ commit は行わない。HEAD 上の follow-up 用英語メッセージは `targ
 | R1-4 | catalog.rs:39,963 を確認。§5.2 で DB hash 維持、drive を含む親 scope prefix の key と complete inventory による worker prune を定義。一般 delete_missing から art を除外し、§9 に別 drive の positive / negative 保持を追加 |
 | R1-5 | app.js:8947,9741,9766 の binding 初期化・DOM eviction を確認。§7.2 に一覧世代 / address の NoArt・Failed owner と破棄条件を定義。§9 に Cache Off / Auto と再マウントの無再要求テストを追加 |
 | R1-6 | http.rs:3601 / app.js:9126,1893 と Fetch Standard を確認。§7.2 の 60 秒保証を撤回し、明示 refresh と artEpoch 更新を提案。新規 Q7 と §9 の外部交換・削除・追加テストで契約を一致させた |
+
+## 12. 独立設計レビュー R2 への対応記録
+
+2 件ともコードで確認して採用した。異論はない。R1 の直接指摘については R2 で解消方針の
+確認を受けたが、全体判定は REVISE であり、今回の改訂版の合格を主張しない。
+質問は Q1〜Q7 のまま未回答。追加・変更はない。
+
+| 指摘 | 確認したコードと解消内容 |
+| --- | --- |
+| R2-1 | app.rs:35623,46530 / catalog.rs:1659,1672 / cache_maintenance.rs:530,542 / remote_ipc/thumbnail.rs:336 を確認。§5.1 / §5.2 の worker LRU を撤回し、§5.4 で短命接続・全 owner の受付失効 / drain / retire / 削除 / 再受付を定義。古い epoch の書込・prune・DB 再作成を禁止。§4.3 に簡素化、§9 に全件 / 期限削除の回帰条件を記録。通常の所有権を Q5 に分類しない |
+| R2-2 | http.rs:4297 の GenerationFailed / NoThumbnail = 422 を確認。§7.1 / §7.2 で no_thumbnail 識別子だけを NoArt、その他の 422 を Failed と定義し、両方とも非 retry。§9 に HTTP mapping / Node terminal owner / absence / telemetry の回帰条件を追加 |
