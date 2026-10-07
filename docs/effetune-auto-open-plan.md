@@ -1,6 +1,6 @@
 # §1.337 動画再生時の EffeTune 自動表示 設計案
 
-2026-10-08、ライン C。**R3: 設計指摘反映・再レビュー待ち、未実装**。
+2026-10-08、ライン C。**R3設計指摘反映・再レビュー待ち、利用者仕様決定済み、未実装**。
 正本: [バックログ](next-release-backlog.md) §1.337、
 [EffeTune 統合](effetune-integration-plan.md) §0・§4・§10.1・§14、
 [動画アーキテクチャ](video-architecture.md) と [detached 憲法](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要)。
@@ -83,7 +83,7 @@
 
 ## 適格性・非同期表示の境界
 
-| 条件 | 提案する扱い |
+| 条件 | 決定した仕様 |
 | --- | --- |
 | 実ファイル動画の新しいローカル再生成功 | 設定 ON、表示可能な通常窓、EffeTune 利用可能なら候補 |
 | 音声ファイル、動画→音声モード、RemoteHeadless／配信処理 | 対象外。音声ファイルへ拡張しない |
@@ -108,7 +108,7 @@ poll時・ロード完了時・再配送時の現在revisionで置換しない�
 | 起動設定とPreferences OK等の全settings確定／復元経路 | 自動設定ONをprojectionへ公開。OFF受理と同境界でblockedとrevisionを更新し、load完了pollより後回しにしない。draft変更／Cancelは影響なし |
 | `hide_to_tray` | `window_visible=false`の確定と同境界、`SW_HIDE`やsurface非表示の**前**にblockedとrevisionを公開 |
 | tray復元／その他のmain可視性変更 | 既存native observerにWM_SHOWWINDOW／WM_WINDOWPOSCHANGEDの可視性観測を追加する案。現在のOS可視性を確認してprojectionを更新し、tray threadの復元でApp同期を先行させない。hide→showの往復でも古いrevisionは戻さない |
-| 全viewerのpresentation ownerによる全画面入退 | 非適格化を同じ遷移境界で公開。C337-2の採用範囲に従い、context mount／swapで別窓の全画面情報を失わない |
+| 全viewerのpresentation ownerによる全画面入退 | 非適格化を同じ遷移境界で公開。決定済みC337-2の全ローカル閲覧窓を対象とし、context mount／swapで別窓の全画面情報を失わない |
 | 最小化／復元 | 既存native observerのWM_SIZE境界でMinimized bitを公開。SIZE_MINIMIZEDでは既存note_minimizedに合わせてrevisionも必ず増やし、下流WndProc／worker通知より前に確定する。復元では現在のIsIconic(main)を確認してbit解除とrevision増分を確定する。keep_visible_when_minimizedによらず自動開始は抑止 |
 | Remote取得／所有／drain／Local復帰 | transition_lifecycleと同じSessionStateMachineロック内でRemoteBlocked bitをphase.blocks_local_control()から公開。BeginAcquireで既存取得連番が進む境界ではrevisionも必ず増やし、解除でも増やす。set_gui_gateの登録／切離しも同ロック内で自動projectionを同期・失効させ、通知／UI次frameへ公開を遅らせない |
 
@@ -134,7 +134,8 @@ host-control workerはロード完了時・hidden attach前後に照合し、hos
 workerの一度の確認、minimize sequenceのtray代用、UI次frameだけの取消し、時間窓では済ませない。
 
 **前面化に関する注意:** 自動開始は明示ボタンクリックと異なり、ロード完了時の foreground 権限を
-保証できない。推奨は自動表示だけ**非アクティブ表示**とし、foreground 許可／activate を要求しない。
+保証できない。C337-1の決定 (利用者2026-10-08) により自動表示だけ**非アクティブ表示**とし、
+foreground 許可／activate を要求しない。
 既存の manual show と非アクティブ復帰を区別して host に伝える必要があり、bridge／C++ の変更が
 見込まれる。TOPMOST・owner 変更・フォーカス奪還 retry は追加しない (既存 owner=0 を維持)。
 
@@ -150,22 +151,23 @@ permitへの引継ぎ項目を増やすため不採用。同じprojectionへ5要
 再生や窓移動のモーダル化は通常操作を止めるため不採用。ロード・attach・表示 IPC は既存 worker、
 UI は成功事実と gate の軽量更新だけにする。DSP 経路の起動後常時接続／保存契約は維持する。
 
-## 利用者が決める質問 (回答まで実装しない)
+## 利用者決定 (2026-10-08)
 
-- **C337-1:** 自動表示は非アクティブ表示でよいか。**推奨: はい**。前面権限を要求せずキー操作を奪わない。
-- **C337-2:** 通常の F12 別窓／複数窓の動画も対象とし、いずれかローカル閲覧窓が全画面なら
-  自動表示を抑止する案でよいか。**推奨: はい**。メインの `fullscreen_idx` の有無だけでは
-  通常窓と全画面を区別できない。決定後、presentation owner の既存事実を使う。
-- **C337-3:** ON の場合、未起動の EffeTune を開始して終了まで DSP を経由させてよいか。
-  **推奨: はい**。既存手動開始と同じ。ロード待ちで再生を止める新処理は追加しない。
-- **C337-4:** 成功した手動 open はこの起動の自動表示機会も消費するか。
-  **推奨: はい**。利用者が手動で閉じた窓を初回動画で開き直さない。
-  R2補足: 自動設定を途中でONにしても継続再生／normalize内部再開では開かない。
-  自動要求後のOFF／tray等で取消された場合もその起動の自動機会は消費済みとし、手動操作は残す。
+- **C337-1 決定 (利用者 2026-10-08):** 推奨案を採用。自動表示は非アクティブ表示とし、
+  foreground許可／activateを要求せずキー操作を奪わない。
+- **C337-2 決定 (利用者 2026-10-08):** 推奨案を採用。通常のF12別窓／複数窓の動画も対象。
+  いずれかローカル閲覧窓が全画面なら自動表示を抑止し、presentation ownerの既存事実を使う。
+- **C337-3 決定 (利用者 2026-10-08):** 推奨案を採用。設定ONなら未起動のEffeTuneを開始し、
+  既存手動開始と同じく終了までDSPを経由する。ロード待ちで再生を止める新処理は追加しない。
+- **C337-4 決定 (利用者 2026-10-08):** R2補足を含む推奨案を採用。成功した手動openは
+  この起動の自動表示機会も消費し、手動で閉じた窓を初回動画で開き直さない。
+  途中で自動設定をONにしても継続再生／normalize内部再開では開かない。
+  自動要求後のOFF／tray等で取消された場合も消費済みとし、手動操作は残す。
 
 **R2で新規の利用者質問はない。** C337-1〜3は維持、C337-4は既存の一度だけ／遅延表示なしの提案を
 設定切替と内部再開にも明示した。由来所有と取消し公開境界は技術設計の修正で、利用者へ選択を委ねない。
 **R3で新規・変更の利用者質問はない。** 最小化／Remote往復の検出は「遅延表示なし」を成立させる技術補完。
+2026-10-08時点で未回答の利用者質問はない。仕様回答はR3技術設計の再レビュー承認とは別であり、今回は未実装。
 
 ## 実装前後のレビュー・受け入れ
 
