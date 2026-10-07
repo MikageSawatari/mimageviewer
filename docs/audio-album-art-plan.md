@@ -1,7 +1,8 @@
 # MP3 埋め込みアルバムアートの一覧表示計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の設計のみ。
-**未実装・利用者質問は未回答・独立レビュー未実施・実アプリ未起動。**
+改訂: 独立設計レビュー R1 の REVISE 指摘 6 件への対応。
+**未実装・利用者質問は未回答・独立レビュー R1 は REVISE・改訂版の再レビュー待ち・実アプリ未起動。**
 以下の「提案」は実装担当の推奨であり、利用者の決定済み事項とは区別する。
 
 ## 1. 決定済みの範囲と守る契約
@@ -57,7 +58,7 @@ KeyAction / 固定キーの仕様変更はない。実装で操作を追加す�
 **既存 FFmpeg の libavformat で APIC → attached picture を得る案を推奨**する。
 ID3v2.2 PIC / v2.3・v2.4 APIC のパーサを自作せず、unsynchronization、extended header、
 description の文字コードを FFmpeg に任せる。JPEG / PNG を初期の必須対応素材とする。
-他の形式を既存 image decoder が安全に読める場合の採用範囲は Q1 に含める。
+MP3 から始めることは既決事項。画像形式・一覧外への拡張に関する未決範囲だけを Q1 に残す。
 
 公式 [AVStream の契約](https://ffmpeg.org/doxygen/trunk/structAVStream.html) は
 ATTACHED_PIC の packet を demuxer が所有すると定義している。
@@ -65,7 +66,8 @@ ATTACHED_PIC の packet を demuxer が所有すると定義している。
 APIC の picture type を stream の comment、description を title に公開する。
 これは upstream の照合資料であり、同梱 n7.1 系への適用は fixture で検証する。
 
-1. worker で MP3 拡張子 (大小文字を区別しない) と実ファイルを確認し、fresh stat を取得する。
+1. worker で MP3 拡張子 (大小文字を区別しない) と実ファイルを確認し、fresh stat から
+   source stamp を確立する (§5.3)。一覧の表示・ソート日時や LoadRequest.mtime を使わない。
 2. worker 専用の input を開く。再生中の input、VideoPlayer、codec decoder を借用しない。
    `best(Video)` は使わず ATTACHED_PIC の stream だけを列挙する。
 3. front-cover 相当 (`Cover (front)` / ID3 type 3) を優先し、同順位は元の stream 順で安定化する。
@@ -76,7 +78,8 @@ APIC の picture type を stream の comment、description を title に公開�
 5. JPEG は既存 byte decode の縮小経路、PNG は image の Limits を使い、既存縮小・WebP encode
    に渡す。ファイル MIME、説明文字列だけで decoder を決めず、実データも検査する。
    GIF 等を許可するなら静止画一枚だけで、アニメーション timer は作らない。
-6. fresh stat を再取得し、要求時 stamp と一致する場合だけ結果を公開・保存する。
+6. fresh stat を再取得し、この worker が最初に確立した source stamp と一致する場合だけ
+   結果を公開・保存する。cache hit の公開前にも同じ検査を行う。
 
 URL 型 APIC (`-->`) を解決したり、説明にあるパス・URL を開いたりしない。
 MP3 を書き換えない。EXIF orientation は既存画像 decode と揃えるが、音声パスの回転・補正・
@@ -113,7 +116,12 @@ FFmpeg の packet 再生 / HW decode への fallback、第二の parser を自�
 一覧種別ごとのフラグではなく共通 `audio_art_request_for(item)` (仮称) が適格性と key を決める。
 通常・合成一覧・復帰・streaming 追加・clone/fork の初期状態も同じ helper へ揃える。
 
-ローカルは既存 heavy I/O queue / GlobalIoSemaphore / ActivityGate に乗せる案とする。
+ローカルは既存 heavy I/O queue / GlobalIoSemaphore に乗せる案とする。
+**ActivityGate は使わない**。`src/activity_gate.rs:13,103` の wait_until_idle は
+indexer 用の無操作待ち・pause 待ちであり、現在の thumbnail worker はこれを待たない
+(`src/app.rs:46599,46628`)。可視・hover は即時に enqueue し、画面外の先読みは既存の
+prefetch idle 制御で投入前に抑える。MP3 を取り出した heavy worker 内で idle / pause を
+待たせず、同じ queue の Folder / ZIP まで停止させない。新たな通常操作の待機は設けない。
 `GridItem::is_heavy_io` の Audio 分岐を MP3 のみに拡張し、全 enqueue・prune・品質更新 caller
 で同じ判定を使う。現在は Audio が false なのでコメント・対応テストも更新する。
 可視・詳細 hover を優先し、既存 keep / prefetch idle 制御を保持する。
@@ -165,6 +173,12 @@ no_art bool を足す代わりに、排他的 payload を
   設定を設けるなら既存の一覧再読込へ揃え、表示中の全 context を専用 rebuild で同期しない。
 - **再生中の demux から取る**: 不採用。再生開始前の一覧・Remote に使えず、seek / close と画像寿命が絡む。
 - **全キャッシュを削除して新 schema にする**: 不採用。既存 DB は出荷済みで他媒体の行を失う。
+- **indexer の ActivityGate 待機を共用する**: 不採用。heavy worker を待機で占有しないよう、
+  既存の enqueue 前の prefetch idle 制御に揃える (R1-2)。
+- **Remote の全成功画像を新 RAM cache に保存する**: 不採用。既存 HTTP cache を使い、
+  DOM の寿命より長く必要な NoArt / Failed だけを一覧 owner に保持する (R1-5)。
+- **Remote の更新 timer / 自動再検証を追加する**: 不採用案。更新保証を明示 refresh に限定して
+  epoch を変える Q7 を推奨し、期限や再試行 owner を増やさない (R1-6)。
 - **まれな DB 失敗を retry で救う**: 自動 retry は不採用案。ログ・通知・次回再生成の Q5 を利用者に相談する。
 
 detached 述語・viewport routing・registry は変更しない。既存 bundle のサムネ状態として
@@ -188,8 +202,27 @@ CREATE TABLE IF NOT EXISTS audio_art_absence (
 ```
 
 catalog 自体と成功行は v4.4.0 以前から出荷済み。新機能が未出荷だからといって既存 DB を
-作り直してよいとは扱わない。既存 CATALOG_VERSION=2 は保持し、追加 schema の確立を
-worker の既存 init_schema に置く。必要な schema が作れなければ art cache だけ使用しない。
+作り直してよいとは扱わない。既存 CATALOG_VERSION=2 は保持する。
+**既存 init_schema は worker 専用ではない**。通常一覧の `src/app.rs:36864` の
+get_or_open_catalog → `src/catalog.rs:408` の init_schema と、`src/app.rs:36938` の
+delete_missing は UI から同期到達する (R1-1)。したがって共通 init_schema に
+audio_art_absence の CREATE / migration を追加せず、delete_missing に absence の SQL を足さない。
+
+新設する `ensure_audio_art_schema` (仮称) は **AudioAlbumArt worker の入口だけ**から呼ぶ。
+呼出境界はローカル `spawn_thumbnail_workers → process_load_request の Audio 専用 dispatch`
+または Remote `pipe heavy handler → ThumbnailEngine の Audio 専用 dispatch` とする。
+worker が source 親の catalog handle を開き、既存の一般 schema 確立を済ませた後に
+album-art の追加 schema を確立し、その handle を worker 所有 LRU に保持する。
+UI の catalog handle / mutex を追加 DDL のために借用せず、準備完了を待つのも worker だけとする。
+UI に schema 準備待ちを追加しない。必要な schema が作れなければ art cache だけ使用せず、
+source 取得へ進む (Q5)。
+positive / absence の SELECT・保存・scope prune もこの worker 境界内に限定する。
+
+成功行を既存 thumbnails に置くため、既存の UI 向け load_all / load_source_dims 等の一括 SELECT
+では audioart namespace を SQL で除外する。先に全 BLOB を読んでから UI で filter しない。
+既存の一般一括読込・掃除の呼出回数を増やさず、Audio の worker 専用 load_one / scoped query
+だけが art 行を読む。UI の aspect / preview は worker の結果を受け、同期の Audio cache seed を
+追加しない。cache 管理の全件削除は既存の明示操作を保ち、新しい Audio 分の SQL は worker に置く。
 旧 DB への初回 open / 再 open / 旧 read-only reader との共存で既存行不変をテストする。
 read-only handle は追加 table 不在を cache miss と扱い、CREATE / migration を行わない。
 
@@ -199,38 +232,82 @@ cache miss は「未調査」であり、no-art と推測しない。
 
 ### 5.2 key と親 catalog
 
-全 caller 共通の builder が `audioart:v1:<normalized full logical MP3 path>` を作る。
-path の正規化は既存 path key helper の大小文字・区切り規則を再利用し、ドライブは保持する。
-キー文字列を切り分けてパスを復元しない。algorithm version は前面表紙選定・対応形式・
+R1-4 に合わせ、未実装の key 案を **親の所有 scope が prefix で限定できる形式**へ改訂する。
+全 caller 共通の builder が `audioart:<scope_hash>:v1:<normalized basename>` を作る。
+scope_hash は `SHA-256(normalize_keep_drive(logical source parent))` であり、
+source 親の完全な identity (ドライブ・大小文字・区切りの既存規則) を保持する。
+catalog DB 自体の hash 規約は変更しない。型付き `AudioArtCatalogScope` (仮称) が
+元の source 親と `audioart:<scope_hash>:` prefix を一緒に持ち、正規化済み basename から
+成功・absence の同じ key を作る。キー文字列を切り分けてパスを復元しない。
+algorithm version は前面表紙選定・対応形式・
 上限を変更したときに進め、旧 negative の意味を持ち越さない。
 
-保存先は常に **元 MP3 の実親に対応する catalog**。通常一覧でも full-path key を使い、
+保存先は常に **元 MP3 の実親に対応する catalog**。通常一覧でも完全な source identity の key を使い、
 検索・rating・history・smart・collection と Remote で同じ行を参照する。
 合成一覧の synthetic current_folder の DB に MP3 行をコピーして保存しない。
 worker が有界な親 catalog handle LRU (推奨 8 親、worker 所有) を使って lookup する。
-通常一覧では既に開いた同じ親 catalog / matching map を再利用できる。
+既に開いた worker 所有の同じ親 handle は再利用できる。UI の一括 matching map は art 行を持たず、
+「通常一覧なら UI が Audio cache を事前ロードする」という経路は作らない。
 異なる親の同名 song.mp3 と、親 hash が共有される別 drive の同名 path を key で分離する。
 logical / canonical path の使い分けは Remote path_guard と既存 catalog 対応に揃える。
 
-`delete_missing`、`folder_thumb_existing_keys_for`、smart/collection の cache prepare、
-ファイル・フォルダ・全件の cache 削除、rename/move の cache 移行を横断して更新する。
-source 親の物理一覧に存在する MP3 の art key を掃除の existing 集合に含める。
-facet / 検索で隠れた行を物理的な missing としない。absence も同じ物理 inventory で掃除する。
-親以外の合成一覧から source 親を prune しない。rename/move 後は新 key で再生成し、
-旧行は通常の cache 掃除へ任せる。利用者のタグ・★・collection migration には変更を入れない。
+`src/catalog.rs:39` は通常の親 path から drive を除いて DB を決めるため、C:\Music と D:\Music は
+同じ DB を共有する。`delete_missing` (`src/catalog.rs:963`) は全 thumbnails 行を現在の
+existing 集合だけで削除するので、art key を集合へ追加するだけでは別 drive の行を消す。
+**既存の一般 delete_missing は audioart namespace の全行を対象外にする**。
+同じ除外を一般の一括読込 / cleanup caller へ揃え、absence table を一般掃除に加えない。
+`folder_thumb_existing_keys_for` は一般媒体用のままとし、art の保存先や scope を決める owner にしない。
+
+新しい `prune_audio_art_scope(scope, complete_inventory, cancel)` (仮称) は worker 上で、
+scope が持つ `audioart:<scope_hash>:` の prefix 範囲だけを positive / absence 両方から読む。
+prefix を含む key は version をまたいで **その直接の source 親だけ**を所有するため、
+親 path 以下の部分文字列検索・DB 全件列挙・別 drive / 子親の巻き込みは行わない。
+削除はその範囲内で physical inventory に存在しない basename の exact key に限る。
+inventory は source 親に属する完走した物理 scan snapshot を、facet 適用前に worker へ渡す。
+source 親・完走・取消 / 一覧世代を確認できない snapshot では prune しない。
+既存 Audio worker のその scope の初回準備にまとめ、専用掃除 thread / 毎 MP3 の再走査を作らない。
+合成一覧はその表示行だけを完全 inventory とみなさず、source 親の complete snapshot がなければ
+掃除を見送る。再生成可能な古い行は次の適格な物理一覧準備か明示 cache 管理まで残してよい。
+取消・古い一覧の maintenance は保存と同様に実行 / commit しない。
+facet / 検索で隠れた行を物理的な missing としない。
+
+ファイル・フォルダ単位の明示 cache 削除も exact key / source scope に限定し、
+共有 DB のファイル自体を消して別 drive の art を巻き込まない。全 cache の明示削除は従来どおり。
+smart/collection prepare、rename/move の cache consumer もこの境界を共有する。
+rename/move 後は新 key で再生成し、
+旧行は上記の scoped prune へ任せる。利用者のタグ・★・collection migration には変更を入れない。
 
 ### 5.3 stamp・方針・再生成
 
-lookup は path key / algorithm version / **MP3 自体の mtime 秒 + file size の完全一致**を条件とする。
-image bytes の長さや親フォルダ mtime を stamp にしない。stamp 未取得を 0 として保存しない。
-worker は読込前と公開前・保存前に fresh stat を照合し、ロック / transaction 内で stat しない。
+**表示・ソート metadata と source stamp を分離する (R1-3)。**
+`src/bookmark_browser.rs:564` の image_meta は MP3 mtime を bookmark.created_at_ms の秒へ
+置換し、`src/app.rs:48125,90062` はそれを要求 mtime に渡す。
+`reading_history_meta_for_entry` (`src/app.rs:89660`) は未取得 mtime / size を 0 にする。
+これらの値を要求時の「原本 stamp」と扱う前提を撤回する。
+
+AudioAlbumArt の要求は source path / scope / policy / context 相関を持ち、stamp の正本は
+**worker 開始後の実ファイル stat だけ**とする。共通 LoadRequest に残る mtime / file_size は
+Audio dispatch の cache lookup / freshness 判定へ渡さず、新たな stamp Option や別 bool で補わない。
+Audio 専用 dispatch は一般画像の caller-stamp cache lookup より前に分岐する。
+enqueue も Audio を `image_metas == None` による skip より先に扱い、未知の表示 meta の MP3 も
+要求できるようにする。bookmark の登録日時 / history の表示値・ソート順は変更しない。
+
+worker が最初の stat 成功時に known `AudioArtSourceStamp { mtime_secs, file_size }` (仮称) を作り、
+lookup / decode / 保存 / 公開をこの一つの stamp に揃える。stat 失敗は一覧内 Failed で止め、
+0 を代入した cache lookup / 書込をしない。同じ MP3 の別 bookmark は source key と stamp が同じで、
+bookmark の時刻・ID は cache identity に入らない。
+lookup は scope key / algorithm version / **MP3 自体の mtime 秒 + file size の完全一致**を条件とする。
+image bytes の長さ・親フォルダ mtime・登録日時を stamp にしない。
+worker は読込前と公開前・保存前に最初の fresh stat と再取得値を照合し、
+ロック / transaction 内で stat しない。
 mtime の大小から新旧を推測しない。遅い旧 worker が上書きしても異なる stamp なら次回 miss になる。
 同時編集が同じ秒・同じ size の場合はこの規約だけでは検出できないため、その限界を Q6 に残す。
 
 成功・absence の永続化とも既存 CacheDecision に従う提案。
 Off は永続書込なし、Always は確定結果を書込、Auto は元 MP3 size と抽出・decode・縮小時間で
 判定する。元の無画像結果でも調査時間を測る。Auto で保存しない場合も NoArt は
-一覧世代内に残るため idle loop は生まれない。RAM cache を増やすために専用の全件 map を作らない。
+一覧世代内に残るため idle loop は生まれない。本体は既存 ThumbnailState を終端 owner とする。
+Remote の DOM 外の終端 owner は §7.2 で定義し、永続 cache の保存有無に依存させない。
 CacheOnly miss は「未調査」のまま source を開かず、absence は捏造しない。
 SourceOnly の明示再生成は成功・absence を両方迂回する。
 
@@ -247,10 +324,10 @@ Remote が小さい画素を要求しても、大きい既存 catalog row を縮
 | 通常物理フォルダ / filter・facet / reload | folder_scan → install_new_items_inner → make_load_request。MP3 のみ Pending、source 親 catalog に一致させる |
 | 検索 (名前・メタ・タグ、結果 / drill-down) | Audio が実項目として materialize される各経路と streaming append の初期状態を共通化。SearchContainer の画像代表探索は拡張しない |
 | レーティング一覧 / ★固定 | rating / tag view の Audio、snapshot 退避復元・sort・追加も同じ状態契約。複数親の同名 MP3 を誤用しない |
-| 閲覧履歴 | ReadingHistoryKind::Audio の materialize / restore と同じ path key。履歴にない image を page として追加しない |
+| 閲覧履歴 | ReadingHistoryKind::Audio の materialize / restore と同じ source key。履歴の未取得 mtime / size の 0 は worker source stamp へ使わない。履歴にない image を page として追加しない |
 | スマートフォルダ root / scoped 子 | SmartFolderEntryKind::Audio → GridItem::Audio、prepare / root 退避復元でも source catalog に一致。sort-only rebuild で取得済み終端を失わない |
 | 名前付きコレクション root / 物理子 | CollectionResolvedKind::Audio / duplicate reference を保ち、欠落 placeholder は要求しない。UUID / manual order を cache key に使わない |
-| ブックマークの集約一覧 | bookmark_browser が Audio を materialize するため対象に含める。同じ MP3 の複数時刻は同じジャケット、既存 bookmark ID / jump は保持 |
+| ブックマークの集約一覧 | bookmark_browser が Audio を materialize するため対象に含める。登録日時の display meta は保持し、worker が別途 source stamp を確立。同じ MP3 の複数時刻は同じジャケット、既存 bookmark ID / jump は保持 |
 | サブフォルダ展開 | 現在 Audio を除外している。今回も列挙仕様を変えず、Audio を追加しない |
 | Drive / 本棚 / folder representative | 音声から自動代表を選ぶ機能には広げない。Audio セルとして出た対象だけ共通経路を使う |
 
@@ -304,19 +381,59 @@ createGridTile に MP3 の img と音楽アイコン fallback を両方置き、
 virtualization / request limiter / binding generation を使う。他の Audio は固定アイコンのまま。
 成功時だけアイコンを隠し、NoThumbnail / source error ではアイコンを残して tracker を settled にする。
 NoThumbnail は「対象ファイルが missing」の 404 と区別し、tile の open を disabled にしない。
-再マウント・画面 idle で terminal tile を同じ binding に自動再要求しない。
+
+**終端 owner は DOM ではなく、採用済み一覧の世代に置く (R1-5)。** 現行の
+`app.js:8947` の image._thumbnailSettled は binding 作成時にリセットされ、
+VirtualGrid は `app.js:9741,9766` でセルを破棄・再作成する。既存 binding だけでは不十分。
+新しい `AudioArtListState { generation, artEpoch, terminalByAddress }` (仮称) を一覧 owner に置き、
+terminalByAddress は正規化した MP3 logical address に `NoArt | Failed` だけを保持する。
+画像 bytes / 成功 cache / DOM reference は保持せず、同じ MP3 の重複 bookmark は同じ結果を参照する。
+容量は現一覧に含まれる unique MP3 address 数を上限とし、LRU eviction で終端を忘れない。
+
+初回要求は既存の有界 retry / limiter を使う。NoThumbnail / 422 は NoArt、source error・
+応答画像の decode 失敗・通信 retry の打切りは Failed として一覧 owner に記録してから DOM へ投影する。
+fetch の意図的な abort と auth / session 失効は terminalByAddress に記録しない。
+結果は同じ session・一覧世代に属し、その address が現一覧に残る場合だけ受理する。
+DOM が既に消えていても確定応答を受理できれば一覧 owner に残し、旧 binding への描画だけ拒否する。
+abort で結果を受け取れなかった要求を「無画像」と推測することはない。
+
+再マウント時は fetch 前に terminalByAddress を参照し、終端なら音楽アイコンと tracker settled を
+復元して HTTP / core 抽出を開始しない。Cache Off / Auto の absence 未保存でも同じである。
+scroll eviction、同じ一覧 payload の sort / resize / 表示形式切替では owner を保持する。
+cleanupScreen / VirtualGrid.destroy による DOM 破棄と、一覧 payload の廃棄を区別する。
+一覧を再取得して採用した時、明示 refresh、session 切替、別一覧への移動では旧 owner を捨てる。
+同じ一覧の単なる render を新しい一覧世代として扱わず、streaming append は同じ世代へ追加する。
+refresh 後の旧応答は新しい map に記録しない。複数の過去一覧を保持する cache は作らない。
 
 HTTP の NoThumbnail 応答には識別可能な `error: no_thumbnail` を付ける提案。
 IPC enum の追加は不要で、http.rs の error mapping と app.js の表示 / telemetry を揃える。
 通常の無画像を client image_load_error として大量記録しない。既存 retry は network/busy のみで、
-NoThumbnail / 422 は終端とする。auth / session 失効は既存の通信・ログアウト動作を維持する。
+NoThumbnail / 422 は終端とし、no-store を維持する。auth / session 失効は既存の通信・ログアウト動作を維持する。
 
 Remote の通常・検索 / tag・rating・history・smart・永続 collection・bookmark で
 RemoteEntryKind::Audio の MP3 を同じタイルに渡す。catalog / UI の一覧ごとに別フラグを足さない。
 原本と同じ logical address を保ち、remote-web が album-art の寸法から kind=image と推測しない。
-成功画像の HTTP private max-age=60 と `remoteSessionCacheEpoch` の既存規約を維持する。
-明示 refresh では新しい epoch / binding にして source stamp を再確認し、NoThumbnail は
-no-store とする。外部タグ編集後の HTTP cache の最大 60 秒の遅延は明記して検証する。
+
+**「外部編集後、最大 60 秒で更新」の保証を撤回する (R1-6)。** 成功応答は
+`http.rs:3601` の private, max-age=60 だが、取得側は `app.js:9126` の force-cache。
+[Fetch Standard の cache mode](https://fetch.spec.whatwg.org/#concept-request-cache-mode) は
+force-cache で期限切れの一致応答も使うと定める。さらに `app.js:1893` の
+remoteSessionCacheEpoch は session identity 変更時の更新であり、一覧再描画で変わる前提は成立しない。
+
+**更新保証は明示 refresh に限定する提案 (新規 Q7)。** 通常の取得は既存 force-cache と
+max-age=60 を保持し、timer / polling / 自動再検証は追加しない。既存 remoteSessionCacheEpoch は
+session 用のままとし、新しい MP3 一覧 payload の採用時に非秘密の artEpoch nonce を作る。
+`/api/thumb` の MP3 URL に artEpoch を追加し、同じ payload の再描画では変えない。
+これは HTTP cache の URL 区別だけであり、IPC の address / catalog key には含めない。
+一覧再取得の採用では generation と artEpoch を同時更新し、terminalByAddress も空にする。
+明示 refresh の確実な既存操作は **ブラウザのページ再読込**。一覧内の refresh 操作がある経路も
+再取得・採用へ揃えるが、新しい refresh ボタンが既にあるとは扱わない。
+新 URL が旧 HTTP cache を迂回し、core worker が §5.3 の実 source stamp を再確認する。
+
+受入条件は、外部でジャケットを交換・削除・追加して stamp が変わった MP3 が、明示 refresh 後に
+新画像または NoArt へ更新されること。refresh 前は 60 秒を超えて旧表示が残り得ると説明する。
+同じ秒・同じ size の編集では refresh だけで永続 cache を迂回できず、Q6 の削除 / SourceOnly が必要。
+Q7 が否なら MP3 の再検証方針と終端結果の再調査契約を再設計し、保証だけを先に記載しない。
 
 ### 7.3 IPC 版
 
@@ -334,17 +451,18 @@ wire に内部状態を追加する必要が出た場合は実装前に全 reade
 
 | ID | 質問と推奨回答 |
 | --- | --- |
-| Q1 | 初回は MP3 の埋め込み画像だけで、FLAC/M4A・外部 cover.jpg・再生画面は後回しでよいか。**推奨: はい。必須対応は JPEG / PNG、追加形式は既存 decoder で安全に扱える静止画に限定** |
+| Q1 (改訂) | MP3 から・初回から Remote 対応は決定済み。未決の画像形式は JPEG / PNG を必須、追加形式は既存 decoder で安全に扱える静止画に限定し、外部 cover.jpg・手動指定・再生画面への表示は後回しでよいか。**推奨: はい**。FLAC/M4A 等は MP3 の次の拡張として扱う |
 | Q2 | 前面表紙がない、または前面表紙が壊れているとき、他の埋め込み画像を表示するか。**推奨: 前面表紙を元順で全部試し、その後は残りを元順で試して最初の使える画像。候補ゼロなら音楽アイコン** |
 | Q3 | 自動表示を既定とし、画像がある Audio は隅に小さな音楽印を付け、Auto 比率にもジャケット寸法を使ってよいか。**推奨: はい。新設定は追加せず、詳細左端の種別アイコンは保持**。音楽印の位置は既存 badge / 長さ / 再生位置と競合させない |
 | Q4 | §3.2 の巨大タグ / 候補 / decode 上限を超えるものは、音楽アイコンとログで扱ってよいか。**推奨: はい**。全画像対応なら memory と実装検証費用が増える。10 秒 timeout は永続 no-art にせず次の明示 reload で再調査 |
-| Q5 | まれな album-art cache DB の作成・書込失敗は、画像表示を継続し、ログと一度の通知、次回読込で再生成するだけでよいか。**推奨: はい**。自動 retry / 復旧 journal は作らない。album-art の追加部分だけを対象とし、既存画像 cache や設定・タグ・collection を削除しない |
+| Q5 (改訂) | まれな album-art cache DB の schema 確立・読込・書込失敗は、source からの画像表示を継続し、ログと一度の通知、次回読込で再生成するだけでよいか。**推奨: はい**。自動 retry / 復旧 journal は作らない。album-art の追加部分だけを対象とし、既存画像 cache や設定・タグ・collection を削除しない |
 | Q6 | mtime 秒 + size が同じになる外部タグ編集は、自動検出を保証せず、既存の cache 削除 / 明示再生成で直す扱いでよいか。**推奨: はい**。より強い保証なら subsecond stamp または content hash の追加形式・移行が必要。普通の reload だけでは同じ stamp の永続行を再利用し得る |
+| Q7 (新規・R1-6) | Remote の外部編集・ジャケット削除 / 追加の反映保証は、ブラウザ再読込などの明示 refresh に限定してよいか (同 stamp は Q6 の例外)。**推奨: はい**。新しい一覧採用時の artEpoch で HTTP cache と終端結果を更新し、「最大 60 秒」保証や自動 polling は設けない |
 
 ## 9. 実装順序・受入条件・検証所有
 
-1. coordinator が質問の回答を記録し、別 context の Sol / xhigh に本設計の独立レビューを依頼する。
-   extraction の有界性、terminal 契約、親 catalog、Remote session Flight を重点とする。
+1. coordinator が Q1〜Q7 の回答を記録し、別 context の Sol / xhigh に改訂設計の再レビューを依頼する。
+   R1 の 6 件の変更境界、extraction の有界性、terminal 契約、親 catalog、Remote session Flight を重点とする。
 2. 合意後の最初の作業は §3 の synthetic ID3 fixture と同梱 FFmpeg adapter 検証。
    front / back の選定 metadata、open-only、取消 / 上限が成立しなければ設計を戻す。
 3. 型付き結果契約と NoArt の共通 consumer を挙動不変の chunk で整え、source catalog の
@@ -356,10 +474,15 @@ wire に内部状態を追加する必要が出た場合は実装前に全 reade
 | --- | --- |
 | extraction | ID3v2.3 JPEG (要望素材相当の synthetic)、v2.4 PNG、v2.2 PIC、front/back 逆順、複数 front、壊れた front と正常な別画像、タグなし、URL APIC、unsynchronization、extended header、切れた tag、巨大 tag・dimensions・候補過多、期限 / cancel |
 | state / routing | 対応 MP3 だけ要求が作られる、NoArt と非 MP3 で requested=0 / repaint=0 / upgrade=0、cancel 後に NoArt を保存しない、timeout で再投入しない、late message / upload backlog / Finalized の既存挙動、Loaded eviction と再表示 |
-| catalog | 旧 v2 DB の画像 / ZIP / PDF / video_meta 行不変、追加 table 不在の read-only miss、positive↔negative、mtime だけ / size だけの変更、unknown stamp、同名別親・別 drive、Auto / Off / Always、SourceOnly、prune / rename / clear、small Remote が large row を上書きしない |
+| worker 境界 (R1-1/2) | 通常 / 合成一覧の UI 呼出を計測し、追加 schema / art SELECT / absence / scoped prune が UI に 0 回、UI bulk query が art BLOB を読まない。ActivityGate pause / 連続入力中でも可視・hover を gate 待機させず、同じ heavy queue の Folder / ZIP も進む |
+| source stamp (R1-3) | bookmark 登録日時≠原本 mtime、同一 MP3 の異なる日時の複数 bookmark、history の未知 stamp 0 / 表示 meta None でも worker stat で Loaded / NoArt になる。stat 失敗で stamp 0 の cache 行を書かず、読込中の実 stamp 変更は公開・保存しない |
+| catalog | 旧 v2 DB の画像 / ZIP / PDF / video_meta 行不変、追加 table 不在の read-only miss、positive↔negative、mtime だけ / size だけの変更、同名別親、Auto / Off / Always、SourceOnly、prune / rename / clear、small Remote が large row を上書きしない |
+| prune 所有 (R1-4) | 同一 DB を共有する C:\Music / D:\Music を交互に物理一覧で開いて両方の positive / negative を保持。片親で消えた MP3 だけを両 table から scoped prune、別 drive / 子親 / facet 非表示は保持。一般 delete_missing も art 行を消さず、合成一覧・未完走 scan・旧世代は prune しない |
 | cross-context | A / B の同じ・異なる MP3、片方の switch / close / cancel / reload で sibling texture / queue / NoArt 不変、park / restore / fork。製品起動を要さない fake worker / state tests |
 | UI | 全 surface の MP3 Loaded / NoArt / Failed、詳細 hover・preview・選択バー、切り取り、暗 / 明 theme、duration / resume / badge、Auto aspect の終端。headless snapshots を追加する |
 | Remote | endpoint の認証 / path guard、MP3 WebP / NoThumbnail、PC 未訪問の cache miss、全 Audio 一覧、422 非 retry、terminal tracker、stale DOM、virtualization、session cancel / next owner / 同一 session Flight、版 handshake・round-trip。Rust handler と Node runtime tests |
+| Remote 終端 owner (R1-5) | Cache Off / Auto absence 未保存で NoArt / Failed を受信後、DOM eviction→再訪しても同じ一覧世代の HTTP / core 抽出は 0 回。重複 address・sort / resize でも保持、refresh / 別一覧で破棄。旧世代完了は新 map に入らず、意図的 abort / session 失効は結果を汚染しない |
+| Remote 更新 (R1-6/Q7) | fake HTTP cache で 60 秒超の force-cache 再利用を再現し、refresh 前の自動更新を要求しない。stamp が変わった外部交換・削除・追加後、明示 refresh が新 artEpoch URL で core へ到達し、新画像 / NoArt になる。同 stamp は Q6 の限界として別検証 |
 | playback 回帰 | cover-only MP3 は audio-only のまま、cover + 実映像は実映像を選ぶ。decoder の既存テストを保持し、ジャケット取得が player / 音声出力を作らないことを検証 |
 
 既存固定アイコン仕様を変える feature なので、今回の設計作業に bug-fix red はない。
@@ -377,7 +500,8 @@ art なしで idle CPU / repaint、再生中の一覧・F12・Remote の取得 /
 
 ## 10. 文書更新と今回の引き継ぎ
 
-今回更新するのは本計画と docs/README.md の索引だけ。backlog の利用者決定や
+初版では本計画と docs/README.md の索引を追加した。今回の follow-up は本計画だけを改訂する。
+backlog の利用者決定や
 未実装のマニュアル・製品紹介は完成形に書き換えない。
 実装時に catalog-design、display-pipeline、async-architecture、architecture-overview、
 music-integration-plan D2 / §3.2 (過去の決定は履歴として保存)、web-remote-plan §13.5 と新仕様、
@@ -385,6 +509,21 @@ spec、マニュアル、製品ページを co-update する。privacy の cache
 「安心して使えます」も照合し、新しい外部通信は増えないこと、既存認証済み Remote への
 ジャケット配信が画像配信の記述に含まれることを確認する。
 
-coordinator への引き継ぎ: Q1〜Q6 の回答、独立設計レビュー、入力有界化の技術ゲート、
+coordinator への引き継ぎ: Q1〜Q7 の回答、R1 対応箇所の再レビュー、入力有界化の技術ゲート、
 全 producer / consumer を含む実装 brief と file ownership、統合 IPC 番号の決定が次の作業。
-commit は行わない。英語メッセージは `target/D-design-msg.txt` に置く。
+commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-design-r2-msg.txt` に置く。
+初版の `target/D-design-msg.txt` は変更しない。
+
+## 11. 独立設計レビュー R1 への対応記録
+
+6 件ともコードで再確認して採用した。指摘への異論はない。独立レビューの合格を主張せず、
+改訂した所有境界・更新契約は再レビュー待ち、Q1〜Q7 は利用者回答待ちとする。
+
+| 指摘 | 確認したコードと解消内容 |
+| --- | --- |
+| R1-1 | app.rs:36864,36938 / catalog.rs:408 の同期経路を確認。§5.1 で共通 init_schema / delete_missing への追加を禁止し、追加 schema・art 読込・掃除を worker の専用 dispatch に限定、UI bulk query は art を SQL で除外 |
+| R1-2 | activity_gate.rs:13,103 と app.rs:46599,46628 を確認。§4.1 / §4.3 で ActivityGate 不使用、可視・hover は待機せず、先読みは既存の投入前 idle 制御のみ |
+| R1-3 | bookmark_browser.rs:564 / app.rs:48125,90062,89660 を確認。§3.1 / §5.3 / §6 で表示日時を保持しつつ worker fresh stat を唯一の source stamp とし、未知表示 meta でも Audio 要求可能。§9 に bookmark・history 回帰条件を追加 |
+| R1-4 | catalog.rs:39,963 を確認。§5.2 で DB hash 維持、drive を含む親 scope prefix の key と complete inventory による worker prune を定義。一般 delete_missing から art を除外し、§9 に別 drive の positive / negative 保持を追加 |
+| R1-5 | app.js:8947,9741,9766 の binding 初期化・DOM eviction を確認。§7.2 に一覧世代 / address の NoArt・Failed owner と破棄条件を定義。§9 に Cache Off / Auto と再マウントの無再要求テストを追加 |
+| R1-6 | http.rs:3601 / app.js:9126,1893 と Fetch Standard を確認。§7.2 の 60 秒保証を撤回し、明示 refresh と artEpoch 更新を提案。新規 Q7 と §9 の外部交換・削除・追加テストで契約を一致させた |
