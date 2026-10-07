@@ -122,6 +122,15 @@ winit はこのメッセージを受け取り、推奨矩形に従ってウィ�
 - 通常経路でも無害な no-op になるため、副作用なし。
 - Win+Shift+Arrow による位置ずれ（移動時のバグ）は別問題で、この対策では解消しない。
 
+- 2026-10-06追加: creatorで最初のegui入力/paint前に、root HWNDが属するモニターの `rcWork`
+  (タスクバー除外) と実際の outer/client 差を使って、SetWindowPosでclientサイズとouter位置を
+  制限する。表示/フォーカス/最大化は変更せず、WM_SIZEでeframe surfaceも更新する。
+  既定1280×800や保存サイズが小画面を超えることを窓のgeometry ownerで防ぎ、各dialogへ
+  nativeモニター座標の責務を分散させない。native最小clientサイズも利用可能領域を上限とする。
+  HWNDのnative DPIとUI倍率を分け、viewport commandへ変換する。通常サイズが収まる大画面は
+  変更せず、visible commit後の一度だけの最大化を維持する。元の希望サイズは保持し、初回updateの
+  viewport再適用でも同じclampを使う。eframeのfirst paint/showとviewport command適用順は変えない。
+
 #### 案 G: outer ではなく inner_size を保存する（採用済み, v0.9）
 - 旧挙動は `last_outer_rect` の `width()/height()` を `settings.window_size` に保存し、
   次回起動時に `ViewportBuilder::with_inner_size(size)` で適用していた。タイトルバー +

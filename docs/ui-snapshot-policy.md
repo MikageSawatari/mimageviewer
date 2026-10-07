@@ -102,6 +102,12 @@ PNGは初回設定/書庫変換確認の1093×614・100%/200%の代表4枚と、
 対象と除外を [起動時画面の監査](startup-dialog-small-screen.md) に列挙する。
 長いエラー文・ネットワークパス・全バージョンの累積告知を含める。
 初回設定のクリック到達性と IME-safe Enter / Esc は `--lib first_setup` の回帰テストで検査する。
+表示後の縮小/拡大は、同じContextを1920×1440→1093×614→1920×1440→1093×614と変更し、
+全27状態の固定操作とタイトル×を最大2frame後に検査する。初回設定は本体フォントで見出しも
+検査し、最終layout pass内でResponseを採取する。Context::run終了後のread_responseはdiscard
+されたpassのwidgetを優先し得るため、過去passの矩形を現在の描画として検査しない。
+通常の2passでは縮小したframe内に収まり、pass予算1の検査は強制frameを足さずrepaint scheduler
+だけで再配置/hover/clickへ到達することを確認する。追加PNGは作らず代表6枚の比較を維持する。
 実アプリや認定端末での観測とは区別する。ダイアログの設計要件は CLAUDE.md の
 「ダイアログ (egui::Window)」節を参照。
 

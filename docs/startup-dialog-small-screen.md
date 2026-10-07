@@ -52,6 +52,60 @@ Esc/背景クリックでセットアップを省略しない。選択肢・既�
 
 ## 自動検証とスナップショット
 
+### Sandbox での縮小後表示に対する追加修正 (`next-first-setup-fit2`)
+
+利用者のサブPC Windows Sandbox の報告と `target/smallwin/` の画像では、旧版の初期窓は
+モニター作業領域の下端を超え、前回修正版も表示後に SetWindowPos で縮小すると初回設定の
+見出しと開始が切れた。前回の静的な小画面 harness と、製品での観測は別の証拠である。
+
+egui 0.33 の Area は前フレームの寸法で中央位置を決めてから本文を描く。本文の上限を
+現在の content_rect から計算しても、そのフレームの描画位置は古い寸法に基づく。
+Area::end は新しい寸法を保存するだけで、通常の寸法変更には再配置を要求しない。
+この追加修正ではPNGの更新・追加・削除は0。安定した小画面のレイアウトは同じで、
+retained-contextの縮小/拡大/再縮小をgeometry/操作到達性の検査に追加する。
+起動時 Modal の共通描画 owner が測定前後の寸法を比較し、変化したときだけ
+request_discard で同一フレームを再レイアウトする。pass予算を使い切った場合だけ同じ寸法変更を
+通常のrepaint schedulerへ渡す。Area ID、フォーカス、本文の
+スクロール状態を作り直さず、静的な小画面と縮小・拡大の両方を扱う。
+Window は既存 Resize owner と共通本文の上限計算を維持する。
+
+可視領域の不足は root の初期 geometry で直す。ダイアログだけをモニターに clamp すると、
+画面外のメインUIと normal restore 矩形を残し、各画面へ native 座標の責務が広がる。
+creatorで最初のegui入力/paintより前に、実 HWND の作業領域・DPI・装飾幅を使って
+SetWindowPosでclientサイズとouter位置を収める。表示/非表示/フォーカス/最大化は変更しない。
+WM_SIZEはwinitのResumed中にbufferされ、AboutToWaitのBootstrap paintより先にeframeの
+surfaceサイズを更新する。egui入力も実client寸法を読む。元の希望通常サイズを保持し、
+初回updateのviewport再適用でも同じ作業領域計算を使う。
+作業領域が既定の最小 client サイズより小さい場合は native の最小値も
+収まる値へ制限する。大画面で収まるサイズ/位置は維持し、UI倍率とは独立して計算する。
+既存の first paint/show 後の viewport command 適用、および visible commit 後に一度だけ
+最大化する順序は変更しない。異常なSTARTUPINFO/外部ownerによるcreatorより前のearly showは
+従来の§1.327契約と同様に対象外。native補正の実適用結果はログへ記録する。
+
+長い処理の状態や専用の resize pending を追加する案は採用しない。本文/操作行は既存の
+描画を維持し、寸法を所有する描画経路と、窓の初期 geometry owner でそれぞれ閉じる。
+ユーザーが起動完了後に意図的に画面外へ移動する一般的な窓配置を継続的に強制補正はしない。
+
+Sandbox スクリプトは core プロセスの可視・非ownedトップレベル窓を列挙し、非空タイトルを
+持つ process main window、なければ最大面積の窓を選ぶ。起動待ち後に再選択し、縮小から
+5秒後に撮影する。本セッションの権限制限で外部原本を書けないため、修正版は
+`target/auto-smallwin.ps1` に引き渡す。スクリプト/製品の実行はしていない。
+
+追加のfull gateで、既存の `rename_migration_waits_for_book_bookmark_service_fifo` が
+fixture生成直後のidle assertionで失敗した。constructorはedit-previewのPruneと
+book-resumeのread_allを非同期投入し、busy判定は両方を含むため、直後のidleは時間依存だった。
+対象のbookmark/local-adjust pending fieldを検査する2件だけ、対象外の起動workerを外す
+専用fixtureへ変更した。共有fixtureと製品のwriter/busy判定、各testのbusy assertionsは維持する。
+今回のcreator/update/modalはこのfixture経路で呼ばれない。独立reviewerが原因とdrop境界を確認した。
+
+追加修正の最終検証 (2026-10-07): normal/portable check、全ui_snapshot 97件、
+fmt/diff check、glyph lint、full lib 10810件 (52 ignored) と `test-full.ps1` が成功。
+full gateの初回並列compileはWindowsのpaging file/mmap 1455で失敗したため、
+以後はコマンドprocessだけ `CARGO_BUILD_JOBS=1` にして実行した。
+`build-dev.ps1` と `prepare-portable-smoke.ps1` も成功。通常profile coreとcompanion、
+fresh dataのportable-smokeを用意したが、製品は起動していない。コミットせず、
+検証結果・外部スクリプトの反映方法・実機確認手順を `target/fs2-msg.txt` に記録した。
+
 `tests/ui_snapshot.rs::startup_dialogs_small_viewport` は本体と共有する純粋な描画関数を呼ぶ。
 App/設定DB/worker/ネットワークは起動しない。実アプリを起動した証拠とは区別する。
 native ppp=1の固定画面に、本体の `settings::apply_ui_scale_factor(ctx, 2.0)` を適用する。

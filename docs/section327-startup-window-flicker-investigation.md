@@ -587,13 +587,19 @@ native経路へ揃える修正であり、あらゆるSTARTUPINFO／外部owner�
 - `src/lib.rs`: root NativeOptionsは常にmaximized=false。saved normal size／position、最小値、
   monitor無効時のWindows既定配置は維持。RememberLast／Normal／Maximizedはpost-visibleの
   希望として解決する。`--window-size` はnormalを優先し、従来の位置(60,40)を維持する。
+  2026-10-06の小画面修正で、creatorが実root HWNDを使い、最初のegui入力/paintより前に
+  normal clientサイズとouter位置をモニター作業領域へ収める。SetWindowPosはNOACTIVATE/
+  NOZORDERのみでshow/hide/MAXを行わない。WM_SIZEはwinitのResumed中にbufferされ、
+  AboutToWaitのBootstrap paintより先にsurfaceを更新する。primaryモニターの推測は使わない。
 - `src/startup_window_geometry.rs`: NormalSizePending→AwaitingVisibleMaximize→MaximizeQueued
   →Completeが起動geometryを所有する。normal起動はsize補正後にComplete。
   旧pending_initial_size／created_maximizedを置き換え、並行するpending boolを足さない。
 - App::update入口でnormal InnerSize補正を送り、startup overlayのearly returnでも保留しない。
   UI scale→viewport pointsの既存変換を維持する。native適用は既存のeframe順序どおり
   **paint／visible commit後**。次のApp updateでMAXを送るので、size補正はmaximizeより先に
-  適用される。show前の最終寸法保証ではなく、unmaximize時の旧InnerSize再送もない。
+  適用される。creatorで作業領域へ収めた後も元の希望サイズをDPI確定後に再評価し、同じclampを
+  適用する。作業領域が小さければnative最小client寸法も下げ、補正を打ち消さない。
+  show前に最大化client寸法へ揃える保証ではなく、unmaximize時の旧InnerSize再送もない。
 - App::update末尾（tray／close処理後）で、eframe receipt、App.window_visible、live HWNDの
   IsWindowVisible／IsIconic、viewport.minimizedを確認してMAXを発行する。直後にtrayへ
   隠した／最小化した時は希望を保持し、既存の復帰後に発行する。外部activationだけをreceiptの

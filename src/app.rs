@@ -52752,10 +52752,51 @@ impl App {
 
     /// Correct the normal restore size before the optional post-visible maximize.
     /// Run even while the startup overlay owns the rest of the update.
-    fn apply_deferred_initial_size(&mut self, ctx: &egui::Context) {
-        let Some([w, h]) = self.startup_window_geometry.take_normal_size() else {
+    fn apply_deferred_initial_size(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(mut size) = self.startup_window_geometry.take_normal_size() else {
             return;
         };
+        // main_hwnd is captured later in update. The Frame already owns the root
+        // handle here, before startup-overlay early returns. Keep this a one-shot
+        // correction of normal restore geometry, independent of post-show MAX.
+        #[cfg(windows)]
+        {
+            use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = frame.window_handle()
+                && let RawWindowHandle::Win32(handle) = handle.as_raw()
+                && let Some(bounds) = crate::monitor::startup_window_bounds(handle.hwnd.get())
+            {
+                let placement = crate::startup_window_geometry::fit_startup_window(
+                    size,
+                    crate::MIN_INNER_SIZE,
+                    bounds,
+                );
+                size = [placement.size.x, placement.size.y];
+                let zoom =
+                    crate::settings::normalize_ui_scale_factor(self.settings.ui_scale_factor);
+                // Native min size must not undo fitting on a small/high-DPI work area.
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                    placement.min_size / zoom,
+                ));
+                let old_position = bounds.outer_rect.min.to_vec2() / bounds.native_pixels_per_point;
+                if (old_position - placement.position.to_vec2()).length() > 0.01 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        (placement.position.to_vec2() / zoom).to_pos2(),
+                    ));
+                }
+                crate::logger::log(format!(
+                    "[viewport] startup work area fit: native_ppp={} work={:?} normal={}x{} pos={:?}",
+                    bounds.native_pixels_per_point,
+                    bounds.work_area,
+                    size[0],
+                    size[1],
+                    placement.position,
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = frame;
+        let [w, h] = size;
         let viewport_size = egui::vec2(
             crate::settings::window_geometry_to_viewport_points(w, self.settings.ui_scale_factor),
             crate::settings::window_geometry_to_viewport_points(h, self.settings.ui_scale_factor),
@@ -89232,7 +89273,7 @@ impl eframe::App for App {
         );
         self.startup_window_geometry
             .begin_frame(ctx.cumulative_frame_nr());
-        self.apply_deferred_initial_size(ctx);
+        self.apply_deferred_initial_size(ctx, frame);
         crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(ctx);
         crate::rating_db::RATING_WRITES.register_repaint_context(ctx);
         crate::tags_db::TAG_WRITES.register_repaint_context(ctx);
