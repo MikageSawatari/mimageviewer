@@ -3,6 +3,7 @@
 現行の配置方針は、共有設定ONで全セルに固定下端帯を予約し、下端ラベルを一律13 logical pt上へ移す方式 (§5.1 / §14)。代表画像なし・未ロードの検索セルの多行階層パスは上端を元位置に保ち、下端だけ13pt縮めて末端名を優先する。代表画像ありは背景/パスの全体を13pt移動する方式を維持する (§14.4)。帯はセルの左右4pt内側の幅・高さ9 logical ptで、位置記録の有無や媒体種別によって位置・厚さを変えない。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を維持する。§10〜§13と§14.3の実装・検証記録は各修正時点の履歴として保持し、後続修正の成功証跡には流用しない。
 
 作成・改訂: 2026-10-04。コード調査基準: `next-file-ops` / `e804db069`。
+2026-10-07追記: §1.350のRAR/CBR/7z/CB7/LZH/LHAセル対応は§15。初版の除外契約を§2で更新した。本件は独立レビュー・実機確認前であり、それ以前の検証・レビュー記録は当時の履歴として保持する。
 状態: **固定下端予約帯への改訂は検証・確認用ビルド済み。後続P2の検索セル名消失も修正済み (§14.4)、修正後gate・独立レビュー・確認用ビルドは完了。利用者の実機確認待ち。§12/§13と§14.3の成功記録は各修正時点の結果。** 保存・watched・常に左→右の仕様は維持する。独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。commit・アプリ起動は行っていない。
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
 
@@ -88,7 +89,7 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 
 見開きは記録されるanchorで数える。2–3ページでanchor=2なら2/N。最終見開きでもanchor=N−1なら(N−1)/N、anchor=Nなら100%。相手ページを推測して+1しない。添えた表紙・白slot・Splitの左右半面を増分として数えない。1ページ本の有効記録は1/1。
 
-| 一覧セル/閲覧種別 | 初版の扱い |
+| 一覧セル/閲覧種別 | 現行の扱い（§1.350の対象拡張を含む） |
 | --- | --- |
 | 通常一覧のFolder | 対象。本扱いON/OFFを問わない。画像だけでも、動画・子フォルダ・非画像が混ざっていても、記録時HUDの読めるページだけで数える |
 | 製本フォルダのFolder | 同じmap参照で対象。製本の実際の読み順で記録する。追加・並べ替え後も再記録までは保存値を表示 |
@@ -96,9 +97,9 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 | ZIPのroot / 単一wrapper root | 現状記録する範囲を維持。rootにZipDirが混じっていても、記録時に送り得るZipImageだけで数える |
 | 入れ子ZIP内側 | 現状 `record_book_resume` が記録しないため対象外。その閲覧で外側rootの過去記録を消す処理も足さない |
 | Stackセル / Image / ZipImage / PdfPage / ZipDir個別セル | メーターを描かない。flat stack閲覧が従来記録する値はHUDの読み順で補助値も記録でき、後の通常Folderセルに表示される。stack専用keyを新設しない |
-| ConvertibleArchive (直接閲覧RARを含む) | 初版の対象セルに含めない。変換cache ZIPと元書庫のkeyを解く処理も作らない。既存の位置記録・復元は維持 |
+| ConvertibleArchive (直接閲覧RARを含む) | 既存の非同期`converted_archive_cache_paths`で解決済みの`Direct` / `CachedZip`の実読込元を使って同じmapを参照。Pending / Unavailable / 未登録では描かない。元書庫への推測fallbackやセル描画中のI/Oを追加しない。保存・復元keyは維持（§15） |
 | PdfFile扱いのEPUB | resume保存keyと当該cell pathが一致して行があれば同じmap参照で表示。変換generation/内容を解き直さず、異なるkeyを推測で結ばない |
-| 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFileセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
+| 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFile/ConvertibleArchiveセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
 
 行無し、追加列が1つでもNULL、total==0、不正値 (ordinal<=0 / ordinal>total) ではtrackも含め描かない。0%への代用やclampはしない。既に保存された有効値は、内容の変更・外部削除・password状態・認識規則変更等と再照合しない。通常の一覧更新によりcellが消えると描画も消えるだけで、本ごとの監視は不要。
 
@@ -714,3 +715,58 @@ captionの13pt移動後を計測すると、高さ94ptのSearchContainerの深�
 今回の証跡は `target/meter-path-label-*.log`。coreは `target/dev-runtime/mimageviewer-core.exe` に配置済み（2026-10-06 10:35:53）。最初の検証で代表画像ありの文字サイズ変更を既存テストが検出したため、根因のないloaded経路を元の配置へ戻し、再検証した。最終ソースで上表の成功結果を確認した。HEADは `570587339` / `next-file-ops`、commit・製品バイナリ起動なし。今回追加の変更は `src/app/grid_paint.rs`、本計画・display-pipeline・specとreserved 4PNG。前段の未コミット差分は保持した。
 
 利用者の実機確認では180×94pt程度の検索セルをLight/Darkと100/150/200% DPIで並べ、代表画像なし/読込前でも末端名が残ること、記録あり/なしで帯・アイコン・文字の位置が一致すること、設定OFFで元の配置になることを確認する。確認用coreは通常の `%APPDATA%\mimageviewer` を使い実データを更新し得るため、インストール済み/トレイ常駐のmIVを閉じてから利用者が起動する。
+
+## 15. §1.350 変換対象書庫の一覧セル（2026-10-07、ラインA）
+
+利用者とmIVスレ>>529の報告では、v4.4.0のRARサムネイルにバーが出ない。
+コード上の根因は`thumbnail_book_resume_meter`の対象kindから`ConvertibleArchive`を除いていたこと。
+保存失敗の観測とは扱わない。初版の対象外という§2と既存テストの仕様を今回拡張する。
+
+セルの元pathを`path_key::normalize_keep_drive`で既存`converted_archive_cache_paths`へ照合し、
+`ConvertedArchiveSourceState::load_path`が返す実読込元を既存`BookResumeMeters::get`へ渡す。
+Directは解決済みの元RAR/CBR（分割RARなら先頭part）、CachedZipは変換結果のZIP。
+二つのDB保存keyを統合・移行せず、未登録 / Pending / Unavailable / 解決先の行無しは非表示。
+元書庫の行へのfallback、セル描画中のstat・書庫検査・DB照会、保存/復元方式の変更はない。
+
+前提のコード照合: `resolve_converted_archive_candidate_with`は分割先頭partを解決して
+cache DBのstamp/実体照合をworkerで行い、直読みなら解決済みRAR pathを返す。
+`poll_converted_archive_cache_paths`は既存世代/cancel検査でmapを採用し、変更時にrepaintする。
+`initialize_converted_archive_cache_paths`は一覧再読込時にmapを初期化する。
+この既存鮮度契約を使い、本件専用worker・監視・pending・第二のalias mapを作らない。
+メーターの配置・共有ON/OFF・合成root/詳細/Remote非対象も維持する。
+
+簡素化: 解決済みread sourceと既存全行mapを接続するだけにし、
+保存key移行や元書庫/変換結果の二重記録による状態の組み合わせを増やさない。
+既存barの純粋描画とsnapshotをそのまま使うので、期待PNGの更新は不要。
+
+回帰は既存tile-kindテストのConvertibleArchive非表示期待を解決済みDirectの表示へ更新し、
+元pathとcache pathへ異なる値を記録した6拡張子、未解決/失効状態、一覧再初期化、設定OFF、
+解決先の行無し、分割RARのDirect/CachedZipを追加した。fake pathへのmap参照で検査し、
+実RAR展開/外部変換の実行結果とは区別する。
+修正前コードで関連41件は38成功・3失敗、実exit101（`target/A-1350-red.log`）。
+初回の依存build失敗と追加testのborrow errorはvalid redに含めない。
+修正後の結果は下表。検証担当はラインAの実装担当、HEADは
+`d29bcfbec9e1bb0213ae1c4de37e5fa149fec18e` / `next-nav`に本節の未コミット差分を加えた状態。
+依存buildは`CARGO_BUILD_JOBS=1`、testは`RUST_TEST_THREADS=4`。
+独立レビュー・実機確認はcoordinatorへ引き継ぎ、本節の結果で代替しない。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib book_resume_meter_` | exit 0、41 passed / 0 failed、4.14s。`target/A-1350-green.log` |
+| `cargo test -p mimageviewer --lib`（pipeなし） | exit 0、10,938 passed / 52 ignored / 0 failed、1046.83s。`target/A-1350-full-lib.log` |
+| `cargo fmt` / `cargo fmt --check` | exit 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、15m20s。`target/A-1350-check-normal.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | exit 0、1m02s。`target/A-1350-check-portable.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyphsなし |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、normal feature set。core 33m24s / Remote 3m07s / EPUB worker 2m15s、runtime=4 / PE=3検査成功。`target/A-1350-build-dev.log` |
+| 独立レビュー / 利用者の実機確認 | 未実施 |
+
+確認用coreは`target/dev-runtime/mimageviewer-core.exe`（2026-10-07 22:48:22）へ配置済み。
+通常の`%APPDATA%\mimageviewer`を使い、実設定/データを更新し得る。
+共有mutexのためインストール済み/トレイ常駐のmIVを閉じ、利用者が
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。
+
+利用者の実機確認候補: 直読みRAR/CBRと変換済みRAR/CBR/7z/CB7/LZH/LHAを途中まで読み、
+親一覧のバーが記録位置を示すこと、分割RARの後続partが同じ本の位置を示すこと、
+未変換/変換結果失効でバーを作らないこと、一覧再読込・設定ON/OFF、既存ZIP/PDF/フォルダの対照。
+実アプリはこの実装担当が起動しない。

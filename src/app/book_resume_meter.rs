@@ -238,6 +238,10 @@ impl App {
             crate::grid_item::GridItem::Folder(path)
             | crate::grid_item::GridItem::ZipFile(path)
             | crate::grid_item::GridItem::PdfFile(path) => path,
+            crate::grid_item::GridItem::ConvertibleArchive { path, .. } => self
+                .converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(path))?
+                .load_path()?,
             _ => return None,
         };
         self.book_resume_meters.get(path)

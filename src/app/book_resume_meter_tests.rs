@@ -410,10 +410,14 @@ fn book_resume_meter_scope_removal_respects_boundaries_and_tile_kind() {
             },
         ],
     );
+    app.converted_archive_cache_paths.insert(
+        crate::path_key::normalize_keep_drive(&sibling),
+        super::ConvertedArchiveSourceState::Direct(sibling.clone()),
+    );
     for idx in 0..app.items.len() {
         assert_eq!(
             app.thumbnail_book_resume_meter(idx),
-            if idx < 3 { value } else { None }
+            if idx < 3 || idx == 8 { value } else { None }
         );
     }
     app.settings.thumb_show_resume_meter = false;
@@ -523,4 +527,100 @@ fn book_resume_meter_purge_retry_waits_for_unprocessed_record() {
     assert_eq!(stored_row(&dir, &sibling), Some((1, Some(2), Some(4))));
     assert_eq!(app.book_resume_meters.get(&deleted), None);
     assert_eq!(app.book_resume_meters.get(&sibling), meter(2, 4));
+}
+
+#[test]
+fn book_resume_meter_converted_archives_use_only_resolved_read_source() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::archive_converter::ArchiveFormat;
+
+    let mut app = setup_app();
+    settle(&mut app);
+    let direct_value = meter(2, 5);
+    let cached_value = meter(4, 5);
+    for ext in ["rar", "cbr", "7z", "cb7", "lzh", "lha"] {
+        let source = app.tmp.path().join(format!("book.{ext}"));
+        let cache = app.tmp.path().join(format!("cache-{ext}.zip"));
+        app.persist_book_resume(source.clone(), 1, direct_value);
+        app.persist_book_resume(cache.clone(), 3, cached_value);
+        set_pages(
+            &mut app,
+            vec![GridItem::ConvertibleArchive {
+                path: source.clone(),
+                format: ArchiveFormat::from_extension(ext).unwrap(),
+            }],
+        );
+        let key = crate::path_key::normalize_keep_drive(&source);
+        app.converted_archive_cache_paths.clear();
+        assert_eq!(app.thumbnail_book_resume_meter(0), None, "unresolved {ext}");
+        for state in [Source::Pending, Source::Unavailable] {
+            app.converted_archive_cache_paths.insert(key.clone(), state);
+            assert_eq!(app.thumbnail_book_resume_meter(0), None, "invalid {ext}");
+        }
+        app.converted_archive_cache_paths
+            .insert(key.clone(), Source::CachedZip(cache.clone()));
+        assert_eq!(
+            app.thumbnail_book_resume_meter(0),
+            cached_value,
+            "cached {ext}"
+        );
+        assert_eq!(
+            app.thumbnail_resume_meter(0),
+            cached_value.map(ReadingMeterValue::fraction)
+        );
+        app.settings.thumb_show_resume_meter = false;
+        assert_eq!(app.thumbnail_book_resume_meter(0), None);
+        app.settings.thumb_show_resume_meter = true;
+        // A cache invalidation / list reload must never fall back to the source row.
+        app.initialize_converted_archive_cache_paths();
+        assert_eq!(app.thumbnail_book_resume_meter(0), None, "reloaded {ext}");
+        if matches!(ext, "rar" | "cbr") {
+            app.converted_archive_cache_paths
+                .insert(key, Source::Direct(source));
+            assert_eq!(
+                app.thumbnail_book_resume_meter(0),
+                direct_value,
+                "direct {ext}"
+            );
+        }
+    }
+}
+
+#[test]
+fn book_resume_meter_split_rar_uses_first_volume_for_direct_and_cached_reads() {
+    use super::ConvertedArchiveSourceState as Source;
+    let mut app = setup_app();
+    settle(&mut app);
+    let first = app.tmp.path().join("book.part1.rar");
+    let next = app.tmp.path().join("book.part2.rar");
+    let cache = app.tmp.path().join("converted.zip");
+    let value = meter(3, 5);
+    app.persist_book_resume(first.clone(), 2, value);
+    app.persist_book_resume(next.clone(), 0, meter(1, 5));
+    app.persist_book_resume(cache.clone(), 3, meter(4, 5));
+    set_pages(
+        &mut app,
+        vec![GridItem::ConvertibleArchive {
+            path: next.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }],
+    );
+    let key = crate::path_key::normalize_keep_drive(&next);
+    app.converted_archive_cache_paths
+        .insert(key.clone(), Source::Direct(first));
+    assert_eq!(app.thumbnail_book_resume_meter(0), value);
+    app.converted_archive_cache_paths
+        .insert(key.clone(), Source::CachedZip(cache));
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(4, 5));
+    let other = app.tmp.path().join("other.zip");
+    app.converted_archive_cache_paths
+        .insert(key.clone(), Source::CachedZip(other));
+    assert_eq!(
+        app.thumbnail_book_resume_meter(0),
+        None,
+        "no row for resolved source"
+    );
+    app.converted_archive_cache_paths
+        .insert(key, Source::Unavailable);
+    assert_eq!(app.thumbnail_book_resume_meter(0), None);
 }
