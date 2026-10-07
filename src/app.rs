@@ -37357,6 +37357,19 @@ impl App {
         }
     }
 
+    /// Cache maintenance changed the shared ZIP store, not the source archives or pins.
+    /// Discard pre-delete replies and recheck cached sources through the existing worker.
+    fn invalidate_converted_archive_cached_sources(&mut self) {
+        if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
+            pending.cancel();
+        }
+        for state in self.converted_archive_cache_paths.values_mut() {
+            if matches!(state, ConvertedArchiveSourceState::CachedZip(_)) {
+                *state = ConvertedArchiveSourceState::Pending;
+            }
+        }
+    }
+
     /// 現在 range の変換アーカイブについて、有効な変換キャッシュ ZIP を
     /// `make_load_request` から同期参照できる map にまとめる。
     ///
@@ -46131,6 +46144,14 @@ impl App {
             }
         };
         self.archive_cache_maint_pending = None;
+        if matches!(
+            &msg,
+            crate::cache_maintenance::ArchiveMaintResult::DeletedSelected { .. }
+                | crate::cache_maintenance::ArchiveMaintResult::DeletedMissing { .. }
+                | crate::cache_maintenance::ArchiveMaintResult::DeletedAll { .. }
+        ) {
+            self.invalidate_converted_archive_cached_sources();
+        }
         match msg {
             crate::cache_maintenance::ArchiveMaintResult::Rows {
                 entries,

@@ -1,6 +1,7 @@
 # 表示するファイル種類 — §1.345 / 履歴再入場のfacet退避 — §1.339
 
-作成: 2026-10-07、ラインA。状態: **設計案、未実装、利用者の回答と設計担当・独立レビュー待ち**。
+作成: 2026-10-07、改訂: 2026-10-08（独立レビューr3）、ラインA。
+状態: **設計案、未実装、残る利用者質問と設計担当・独立レビュー待ち**。
 本書の新しい型・APIは提案であり、現行コードに存在するという主張ではない。
 実アプリは起動していない。§1.339の観測者は利用者、原因の根拠は下記のコード調査。
 
@@ -35,6 +36,10 @@
 | Ctrl+上下は独立したDFS/stop predicateを持つ | `src/folder_tree.rs::FolderTreeOptions` / `folder_should_stop_with_options`、`docs/async-architecture.md`§3.1.5 |
 | コレクションには表示行と登録entryの別identityがある。exportもprepareを再利用する | `src/collection_store/prepare.rs::prepare_collection_snapshot` / `prepare_collection_export`、`collection_grid.rs::prepare_collection_grid_install` |
 | 設定転送はSettingsの全fieldを明示分類する | `src/settings_transfer.rs::preferences_policy!` / `exhaustive_policy` |
+| resumeの現行検証はraw indexの範囲/ページkindだけで、ページidentityを照合しない | `app.rs::resume_page_for_container` / `is_readable_page_idx`。PNGを除外してindexを詰めると別JPEGへ誤着地し得る |
+| facet scope/stackはApp-global、main grid用。context bundleにもA/B slot別stashにもない | `app.rs::rebuild_visible_indices_preserving_facet_scope` / detached分岐、`viewer_context_registry.rs::swap_viewer_context_bundle` |
+| 内部書庫も実directoryも同じZipDir。is_archiveはsuffix推定で採否の根拠にできない | `zip_tree.rs::build` / `segment_is_archive`、`zip_loader.rs::enumerate_recursive` |
+| collection並べ替えは全entryを保持し、DBはID subsetを拒否する。既存subset merge ownerはない | `ui_dialogs/collections.rs::open_collection_reorder` / `start_collection_reorder_save`、`collection_store/db.rs::reorder_manual` |
 
 「同名除去と同じ層」は既存一関数への一行追加という意味ではない。
 必要なのは**一つのポリシーownerをすべてのproducerから呼ぶこと**であり、
@@ -51,7 +56,7 @@ worker/options/requestの既存snapshotに渡す。AppとRemoteで同じ実装�
 後で対応形式が増えても初期状態で表示できるようにする。UIは「表示する」のcheckboxで見せる。
 category候補は画像 / RAW / 動画 / 音声 / ZIP・CBZ / PDF / EPUB / RAR・CBR / 7z・CB7 / LZH・LHA。
 拡張子はdotなしASCII小文字へ正規化し、重複を除く。別名拡張子は分類では同群、
-個別除外では実際のextensionを使う。folder/driveは常に通行可能な構造として保持する案（Q2）。
+個別除外では実際のextensionを使う。folder/driveは通行可能な構造として保持する既定（D2）。
 形式一覧は既存recognizerを使い、未対応形式を本設定で新たに読めるようにはしない。
 
 pure API案:
@@ -65,15 +70,43 @@ FileTypeVisibility::allows(&ListingCandidateType) -> bool
 `ListingCandidateType`はGridItemを新設するための型ではなく、生成前の識別情報。
 元RARをcache ZIPと分類したり、EPUBをPDFと分類したりしない。
 ZIP/RARの内部画像はmember名の拡張子、PDF/EPUBページは「描画された画像」ではなく
-論理元文書のPDF/EPUB categoryを使う案（Q3）。ZipDirは通路として保持し、内部にある
-archive member本体は実memberの形式で判定する。仮想prefixを実ファイルextensionと誤認しない。
+論理元文書のPDF/EPUB categoryを使う案（Q3）。実directoryは通路として保持するが、
+内部書庫も現行ではZipDirであり、別のarchive member本体rowは存在しない。
+内部書庫の選別には次の来歴を運ぶ設計が必要で、is_archive/suffixは採否に使わない。
+
+### 3.1 内部書庫の来歴（r3追加、Q16）
+
+推奨は`zip_loader::enumerate_recursive`の実file entryを開く境界で、
+`ArchiveContainerOrigin`（提案）を`ZipEnumeration`の列挙結果へ付けること。
+外側からの実entry locator列（各central-directory indexと実member名）、形式、
+navigation prefix、各画像のcontainer ancestryを同じ列挙ownerが生成する。
+画像パスをsplitしただけでは実directoryか書庫かを判別できない。
+空の書庫を表示する新機能は追加せず、既存画像列に対応する境界の来歴を保存する。
+
+`ZipTree::build`は画像とoriginを一緒に受け取り、純粋な表示projectionは
+実書庫境界だけをFileTypeVisibilityへ通し、除外書庫の配下画像・代表・件数を除く。
+例えば実directory `notes.zip/cover.jpg`は残し、実file `book.zip`の中の画像はZIP除外で消す。
+同名directoryと実書庫が同じnavigation prefixへaliasする場合も、leafのlocator ancestryで
+書庫側だけを除く。実directoryの来歴があるnodeは通路として残し、実書庫だけのnodeは
+その除外と共に消す。prefix単位の一括除去はしない。
+既存entry_name/永続keyは変えず、index列は列挙snapshot内の識別にだけ使う。
+Remoteの逐次candidate列挙にも実entry descentの同じownerを接続する。
+
+非ZIP書庫を展開した変換ZIPでは、元の書庫境界が実directoryへ変わるため、
+変換workerから同じoriginのmanifestをcacheへ出力し、cache列挙workerが読み合わせる必要がある。
+旧cacheにmanifestがなければsuffixから捏造しない。再変換するか、内部書庫の形式除外を
+明示的に対象外にするかはQ16で相談する。前者を推奨し、未知来歴のまま「全対応」とは出荷しない。
+来歴をpaintで再走査する案と、全ZipDirを常に残す案は、誤除外/適用漏れになるため不採用。
+
+### 3.2 共通の投影順序
+
 missing collection/bookmark参照はlast-known kindと論理元pathで判定し、
 型を推定できない参照は保持する案。選別にstatを足さない。
 
 生成順は、対応形式認識・OS/system/AppleDouble除去 → **本ポリシー** →
 同名優先・重複除去 → 本判定/stack/集約/ソート/代表選定 → aligned install →
 現在地のfacet/名前/評価絞り込み。新設定とfacetはANDであり、facetから除外項目を復活させない。
-例: 動画を除外したら同名JPEGを動画の存在で消さず、ZIPを除外したら同名RARをZIPの存在で消さない（Q4）。
+例: 動画を除外したら同名JPEGを動画の存在で消さず、ZIPを除外したら同名RARをZIPの存在で消さない（D4）。
 同名判定用にdirectoryの全候補が必要でも、勝者候補集合は本ポリシー通過後にする。
 
 ## 4. 全producerの接続表
@@ -85,13 +118,14 @@ producer側で同じ入力列を保ったまま結果を組み立てる。instal
 | 一覧producer | 共通ownerを通す位置・注意 |
 | --- | --- |
 | 通常folder / 製本folder / 本棚 | `folder_scan.rs::scan_directory_entries`のrecognition後、`materialize_local_folder_listing_with_order`の同名処理前。manifestページは元ページ形式で判定し、製本データを編集しない |
-| ZIP/CBZ内部 | `zip_loader.rs`の画像entry認識後、`zip_tree.rs::materialize_level`がページ/代表/ZipDirを作る前。生treeを設定別に破壊せず、同じpolicyで表示projectionを作る |
+| ZIP/CBZ内部 | `zip_loader.rs::enumerate_recursive`の列挙来歴を§3.1どおりZipTreeへ渡し、`materialize_level`のページ/代表/ZipDir投影前に判定。生treeを設定別に破壊しない |
 | PDF/EPUB内部 | `app.rs`のPDF prepared enumerationからページitemsを作る前。logical pathの文書categoryを使う。PDF page_num、EPUB generation/leaseは維持 |
-| converted archive / direct RAR | 外側tileは元形式。`ConvertedArchiveSourceState::load_path`と`archive_source_override`はI/O用identityで、表示分類の元形式を保持。内部は上のZIP tree経路へ統合 |
+| converted archive / direct RAR | 外側tileは元形式。load_path/overrideはI/O用identity。内部は§3.1のconverter origin manifest / direct RAR列挙来歴を同じtree投影へ渡す。元形式を保持しcache ZIPと誤分類しない |
 | rating list ★1〜5 | `rating_view.rs::prepare_rating_view` / `sort_and_materialize_rows`のrows→items前。source/meta/★時刻を同時に投影し、rating.db行は残す |
 | 検索 Ctrl+S / Ctrl+G / Ctrl+F | `app.rs::apply_favsearch_results`、`global_search_ui.rs`のstream結果→flat/SearchContainer集約前。除外hitをhit_count・代表に含めない。Ctrl+Fは生成済み基礎一覧を対象にするので新しい別判定を足さない |
 | tag view | `tag_view.rs`のDB結果→行、`app.rs::apply_tag_view_result`の集約前。タグ索引/DBは削除しない |
 | collection root / physical child | `collection_grid.rs::prepare_collection_grid_install`でsource resolution後、表示binding/thumbnail source/reader order前。`collection_store/prepare.rs`のexport用full snapshotに表示除外を入れない。子はfolder/virtual共通経路 |
+| collection手動並べ替え画面 | `ui_dialogs/collections.rs::open_collection_reorder`の全登録snapshotを保持し、§5.4の新しい表示projection/全ID merge adapterで同ownerを通す。DBへsubsetを送らない |
 | bookmarks（全体と本内） | `bookmark_browser.rs::sort_and_materialize_rows` / `app.rs::install_bookmark_view_rows`、本内bookmark項目構築時。ZIP内画像はmember、文書ページはlogical documentで判定。bookmark ID/positionは保持 |
 | reading history | `app.rs::install_reading_history_entries`から`reading_history_load_inputs`へ渡す前。元書庫・元EPUB・video/audio形式で判定し、DB履歴/進捗を消さない |
 | smart folder root / scoped child | `app/smart_folder.rs`のdirectory candidate正規化前、`scan_smart_folder`と`build_remote_smart_folder_entries`で同policy。保存済みSmart ruleは次層でAND。childは通常/virtual producer |
@@ -136,8 +170,8 @@ skip_limitを使い切った通常gridの既存fallbackと、fullscreenの境界
 Folder構造は保持するので実子folderがあれば従来どおり非本。全画像除外は非本。
 通常openの`scanned_folder_is_image_book`、page-count worker、sub展開の畳み込み、
 Remote読順を同じ投影と述語に揃える。`image_page_recognition_fingerprint`もpolicy値を含める。
-既存resume raw index/keyはこの設計で移行しない。画像ページ列が変わる場合は、現行復元検証で
-有効なものだけ採用し、保存済みmeter比率は次の読書記録まで維持する。
+保存済みmeter比率は次の読書記録まで維持する。位置復元は現行kind検証だけでは安全にできない。
+読順への投影と永続identityの案を§5.5/Q15へ分離し、未決のまま実装しない。
 非表示pageを必須targetとしたbookmark/検索復元は先頭へのsilent fallbackをせず、理由を通知する案（Q3）。
 
 ### 5.3 件数・badge・facet・metadata
@@ -145,7 +179,7 @@ Remote読順を同じ投影と述語に揃える。`image_page_recognition_finge
 一覧件数、表示/選択/check、検索hit_count、stack count、Smart結果数、
 本としての有効ページ数は通過後の同じ列を参照する。総登録数はcollection/bookmark等のDB全件数として
 区別し、「表示X / 登録Y」などで隠した登録が消えたと誤認させない。
-folderの`OmittedFolderEntryCounts`に種類設定の内訳を追加する案（Q8）。
+folderの`OmittedFolderEntryCounts`に種類設定の内訳を追加する既定（D8）。
 いまあるhidden/same_name/unsupportedと二重計上しない。badge描画でFSを再計数しない。
 facetの候補・値別件数は基礎一覧の通過後だけを母集団にする。
 
@@ -153,8 +187,46 @@ facetの候補・値別件数は基礎一覧の通過後だけを母集団にす
 reading_history、sidecar、編集・pin、索引のingest/export/backup/rename migrationを変更しない。
 media用JSON/TXT/XMP、`mimageviewer.dat`、manifest等は一覧対象形式とは別の補助入力として
 従来どおり読む。隠したファイルのtagを消したり、metadata cleanupのmissing根拠にしたりしない。
-collection手動並べ替えはvisible subsetのstable IDだけを並べ替え、隠れたentryを削除しない。
-既存full-entry順へのmerge ownerを使う（実装前にhidden-entryの保持をテストする）。
+collection手動並べ替えは§5.4の全登録順を保持し、隠れたentryを削除しない。
+
+### 5.4 collection並べ替えの全登録順と表示projection（r3追加）
+
+現行は全entryを画面stateに保持して全IDを保存する。subset保存はDBがInvalidOrderとして拒否し、
+以前記載した「既存merge owner」は存在しない。**新しい純粋merge adapterを設計する**。
+snapshotの全順序Fとrevisionを編集stateの正本に残し、表示index Vを同じFileTypeVisibilityで作る。
+選択/dragはstable IDでVに限る。移動結果の可視ID列V'はVと同じID集合であることを検証する。
+Fのうち可視IDが占めたslotだけを左からV'で置換し、非表示IDのslot/相対順を保つ。
+例: F=[A.jpg,H.png,B.jpg,J.png,C.jpg]、PNG除外でCを先頭へ移動すると
+全保存順=[C.jpg,H.png,A.jpg,J.png,B.jpg]。DBへこの全ID列と元revisionを送り、
+既存exact-set/revision検証を残す。並べ替え中はモーダル化して設定変更を許可しない案とし、
+policy変更やrefresh後に古いVを新snapshotへmergeしない。rename/delete/conflictは既存refreshを使う。
+新しいDB API、隠れたID専用保存先、部分保存やrollbackは作らない。
+編集画面だけ全登録表示を維持する簡素化も検討したが、全一覧への適用から例外になるため
+既定案にはしない。mergeの非表示slot固定は利用者の操作結果に影響するのでQ17に残す。
+
+### 5.5 ページidentityによる復元と旧raw記録（r3追加、Q15）
+
+現行resume_page_for_containerはidxが画像kindなら採用するだけ。
+`1.jpg / 2.png / 3.jpg`のraw index=1を保存後、PNGを除外して同じ1へ戻すと3.jpgに誤着地する。
+「現行検証で有効なものだけ採用」という以前の記載は撤回する。
+
+推奨は読書記録ownerでraw indexと一緒にoptionalな論理PageIdentityを保存すること。
+通常画像は既存path key、書庫は論理元container＋完全entry_name、PDF/EPUBは論理元文書＋page_num、
+製本は既存page identityを使う。変換ZIPの物理cache pathを新たな論理identityにしない。
+現在の読順projectionはPageIdentity→表示indexの対応を準備workerで作る。
+復元は保存identityが同じ列にある場合だけそのindexを使い、除外済みなら理由を通知する。
+同じindexの別画像や最も近い画像を代用しない。保存container keyと従来raw列は残し、
+新optional列の追加/default/旧版との互換をbook_resume_dbの設計・移行テストに含める。
+sort/page追加・削除にもidentity照合を使うが、内容変更後も同一ページと保証する設計には広げない。
+
+identityのない旧記録から過去ページを確実に復元することはできない。
+種類除外が読書ページ列に適用されるsessionでは旧raw indexを自動採用せず、通知して利用者の選択から
+再記録する案を推奨する（除外設定を戻した従来列では現行raw復元を維持）。
+例えばPNG除外後は「以前の位置を特定できません」を出し、3.jpgへ勝手に移動しない。
+一時的な旧記録復元の制約と追加の永続列の費用をQ15で判断してもらう。
+全候補の旧順序を再現してraw→identityを推定する案も検討したが、過去のsort/同名候補集合が
+保存されておらず、除外により新しく露出した同名JPEGもあるため、確実な移行としては採らない。
+閲覧履歴・bookmarkの明示targetは各既存identityを同じ投影で照合する。§1.328のanchor問題とは分離する。
 
 ## 6. 永続化とUI案
 
@@ -165,7 +237,7 @@ settings.dbの既存Settings carrierへ追加し、旧fieldの意味・既存fac
 schema/tableを別途新設する理由はない。enum未知値を空集合へ黙って変換しない。
 
 `settings_transfer.rs::preferences_policy!`の**export対象**へ「表示するファイル種類」として
-明示分類する案（Q9）。パス・ユーザーデータを含まない全体環境設定なので別PCへ転送可能。
+明示分類する既定（D9）。パス・ユーザーデータを含まない全体環境設定なので別PCへ転送可能。
 validated parse、default/roundtrip、全field分類、import失敗で元値不変、
 preferences OK/Cancel、backup/recoveryの境界を検査する。
 favorite_view_overlay、A/B記憶、起動一覧recordには追加しない。
@@ -178,7 +250,7 @@ toolbar quick導線は同じ設定を開く任意登録ボタンと適用中の�
 「全部表示」操作も採用するなら同じ永続設定の変更として扱い、元状態stashを作らない。
 新キー操作を付ける場合は`KeyAction`とkeymap helper一式、既定割当なし。raw keyイベントを追加しない。
 
-Remoteは同じ設定を本体から読む。端末側に設定編集APIを増やさない案。
+Remoteは同じ設定を本体から読む。端末側に設定編集UI/APIを増やさない既定（D1）。
 各既存prepared/read cache identityにpolicy値を含め、次のlist/read要求で最新設定と照合する。
 payload説明を増やすなら`crates/remote-ipc`のprotocol更新を同時に行う。
 
@@ -206,23 +278,39 @@ detached述語/viewport変更に達した場合はrework§2の合意と§11記�
 rare cache/DB failureの多段回復は追加しない。現行ログ/通知/次回再生成の範囲で扱い、
 利用者の設定や登録データを落とす割り切りはしない。
 
-## 8. 利用者への質問（未回答）
+## 8. 決定した設計既定と、残る利用者質問（r3）
 
-| ID | 質問 | 推奨回答と影響 |
+### 8.1 決定した設計既定（利用者が上書き可能）
+
+2026-10-08の利用者指示により、以下は回答待ちではなく設計既定として決定する。
+独立レビュー助言を採用した設計上の既定であり、過去に利用者が個別回答したという記録ではない。
+
+| ID（旧質問） | 決定した既定 |
+| --- | --- |
+| D1（Q1） | Remoteの設定編集UI/APIは追加せず、本体で共通設定を変更する |
+| D2（Q2） | 実フォルダ・ドライブは通路として保持し、ファイル形式だけを除外する。内部書庫のZipDirは§3.1で区別 |
+| D4（Q4） | 同名優先は表示対象候補だけで判定する。動画除外なら同名JPEGが残る |
+| D8（Q8） | 種類設定による非表示を件数内訳に追加し、登録数と表示数を区別する |
+| D9（Q9） | settings_transferの環境設定export/import対象に分類する |
+| D14（Q14） | 履歴再入場も通常openと同じく、live親条件を退避して子では条件なし。地点別filter記憶の要望がある場合のみ再相談 |
+
+### 8.2 残る利用者質問（未回答、具体例と推奨）
+
+**変更**は今回具体化した既存質問、**新規**はr3指摘に伴う追加質問。IDは以前の議論と対応させる。
+
+| ID / 状態 | 質問・具体例 | 推奨回答と費用/影響 |
 | --- | --- | --- |
-| Q1 | Remote端末にも、この本体共通設定を編集するUI/APIを追加しますか？ | 今回は追加しない。全一覧・Remoteへ同じ設定を適用すること自体は決定済み。本体の環境設定で変更する |
-| Q2 | フォルダ/ドライブ自体も種類設定で隠しますか？ | いいえ。移動する通路を残し、ファイル形式だけを対象にする |
-| Q3 | 本の内部にも適用し、除外したページへの明示openは理由を出して拒否しますか？ | はい。ZIP画像はmember形式、PDF/EPUBページは元文書形式。本の直接path指定でも生成するページ一覧には適用する。外部からの単体画像/動画/音声openは維持し、その兄弟一覧には適用する。アクセス権限の代わりにはしない |
-| Q4 | 同名優先は表示対象候補だけで判定しますか？ | はい。動画を隠すと同名画像を、ZIPを隠すと同名RARを表示できる。現在の通常利用との違いは設定を使った場合だけ |
-| Q5 | 除外形式をpinしたfolder代表はどうしますか？ | pin登録を保存したまま、表示は自動代表/アイコン。video sidecar等の補助画像は除外しない |
-| Q6 | Ctrl+上下は表示対象mediaがないfolderをskipしますか？ | はい。従来skip_limit/fallbackは維持。直接クリックでは空folderにも入れる |
-| Q7 | 動画等を非表示にした混在folderも「画像だけの本」と判定しますか？ | はい。表示mediaが非空で全画像、子コンテナなしという共通判定。自動open・page count・sub展開・Remoteを揃える |
-| Q8 | 隠した件数を既存「表示していない項目」の内訳に含めますか？ | はい。「ファイル種類の設定」を別理由として数える。登録数と表示数も区別 |
-| Q9 | この設定を環境設定の書き出し/取り込み対象にしますか？ | はい。既定全表示、新fieldのみ。facet・favorite・A/Bへコピーしない |
-| Q10 | 切替導線は環境設定＋任意toolbar設定ボタンでよいですか？ | はい。独立した一時解除toggleは作らない。必要なら同じ設定を全表示へ戻す操作を用意 |
-| Q11 | 適用時に検索/sub展開/snapshotを閉じて元場所を再読込してよいですか？ | はいを推奨。専用のlive再構築を減らせるが一時結果が閉じる。これが不便なら既存各producerの再実行を設計する |
-| Q12 | 開いている読書・再生sessionは保持し、次の一覧生成から適用してよいですか？ | はいを推奨。全window即時適用による本/動画中断を避ける。即時適用が必要なら費用と中断動作を再相談 |
-| Q13 | 分類単位と細かい除外は§3のcategory＋拡張子でよいですか？ | はい。画像とRAW、PDFとEPUB、ZIPとRAR/7z/LZHを分け、必要な拡張子だけの除外も可能にする。未対応形式の対応追加にはしない |
+| Q3 / 変更 | 本内部にも適用し、PNG除外後のZIP内2.pngのbookmark openや、PDF除外中のPDF直接openは理由を出して拒否しますか？ | はい。ZIPはmember、文書ページは元形式で判定。単体画像/動画/音声の外部openは維持し、兄弟一覧に適用。隠れた明示targetを別ページで代用しない |
+| Q5 / 変更 | RAWをfolder代表へpinした後RAWを除外した場合、pinを残してJPEGの自動代表へ表示を替えますか？ | はい。候補なしならアイコン。動画のsidecar JPEGは補助資源として使い続ける |
+| Q6 / 変更 | 動画だけのfolderで動画を除外したとき、Ctrl+上下はそのfolderをskipしますか？ | はい。従来skip_limit/fallbackを維持し、直接クリックでは空folderにも入れる |
+| Q7 / 変更 | JPEG＋MP4のfolderで動画を除外すると、JPEGだけの本として自動open/畳み込みしてよいですか？ | はい。非空の表示mediaが全画像で子コンテナなし。全画像除外なら非本。通常/Remote/page countを揃える |
+| Q10 / 継続 | 設定をすぐ変える導線は、環境設定＋任意toolbarボタンでよいですか？ 例: RAW除外を解除するには同じ設定を開く | はい。独立した一時解除toggle/stashは作らない。「全表示」も同じ永続設定を変更 |
+| Q11 / 変更 | PNG除外を確定した際、検索結果やサブ展開を閉じて元folderへ戻してよいですか？ | はいを推奨。一時結果が閉じる代わりに既存reloadを使える。不便なら各producerの再実行を設計 |
+| Q12 / 変更 | 動画再生中に動画を除外しても再生は継続し、閉じて一覧を作る時から除外してよいですか？ | はいを推奨。開いている本の読順もsession終了まで保持。全windowへの即時適用なら中断動作と所有変更を再相談 |
+| Q13 / 継続 | 画像/RAW等のcategoryと個別拡張子の両方を選べるUIでよいですか？ 例: RAW全体でなくCR2だけ除外 | はい。PDF/EPUB、ZIP/RAR/7z/LZHも分ける。細かい設定を持つ分UI項目が増える |
+| Q15 / 新規 | 2.png保存後にPNGを除外して3.jpgへ誤復元しないため、今後はページidentityも保存し、identityのない旧記録は種類除外を適用する読書sessionで自動復元を見送ってよいですか？ | はいを推奨（§5.5）。旧記録は通知後に再選択・再記録が必要。追加optional永続列と移行/旧版互換テストが必要。raw-onlyで投影後indexを採用する案は推奨しない |
+| Q16 / 新規 | ZIP内book.zipを除外しnotes.zipという実folderは残すため、列挙来歴を追加し、旧変換cacheの来歴が必要なときは再変換を求めてよいですか？ | はいを推奨（§3.1）。旧cacheの再変換に時間がかかる。内部書庫を今回対象外にするならその例外を明記して設計を縮小 |
+| Q17 / 新規 | PNG除外中のcollection並べ替えで、非表示entryの元slotを固定して可視entryだけ入れ替えてよいですか？ 例: A,H,B,J,C→C,H,A,J,B（H/JがPNG） | はいを推奨（§5.4）。全ID保存・revision検証を維持。編集画面だけ全登録を見せる簡素化案は全一覧適用の例外になる |
 
 ## 9. §1.339 — 履歴再入場のfacet退避を採用境界へ集約する
 
@@ -257,9 +345,18 @@ reload、fullscreen→同じ本のページ一覧、ZIP内部の同scope移動�
 ### 9.2 単一の状態ownerと要求
 
 提案: 現行`facet_filter_scope`と`facet_filter_suppression_stack`の責任を
-`FacetNavigationState`へ集約する。active値の永続carrierは既存`settings.facet_filter`を保持し、
+**App-globalのmain grid専用**`FacetNavigationState`へ集約する。
+scope/stackは現行でもApp全体が所有し、ViewerContextBundleに含まれない。
+A/Bにもslot別facet stashはない。以前の「既存context runtime内に閉じる」前提は撤回する。
+active値の永続carrierは既存`settings.facet_filter`を保持し、
 ownerはその値を受け渡す唯一のmutation APIを持つ。別active filter copyを作らない。
 新しい`pending_facet_*` / bool / sentinelをAppへ足さない。
+
+この修正では所有範囲を変更しない。既存のdetached physical/independent collection等の
+global filter除外を維持し、viewer contextのfork/mount/swap/closeではownerを動かさない。
+`rebuild_visible_indices_preserving_facet_scope`とbundle交換の契約を維持する。
+context別facetを作るなら共有Settings carrierの分離も必要になり、本件とは別の設計となる。
+今回その拡張は採らず、detached viewport/述語の修正も予定しない。
 
 scopeはtypedな論理現在地（通常path、ZIP本+内部book prefix、Rating stars、
 Collection ID+entry、Smart ID+position、検索等の一時origin）から投影する。
@@ -290,7 +387,9 @@ sourceが存在する場合に親filterを退避する。検索の一時surface/
 
 採用時の順序:
 
-1. 既存ownerがsource context / items generation / slot / request / history headの妥当性と
+1. main gridのnavigation採用であることを既存navigation scope/ownerで確定する。
+   detached/parkedの一時mountやread-only context交換は対象外とする。
+   既存ownerがsource location / items generation / slot / request / history headの妥当性と
    読込payloadの採用可能性を検証する。失敗があり得る作業を先に済ませる。
 2. 既存の可視採用transactionでsource grid位置を保存し、facet reducerを適用する。
    `place_keys`は現在の場所依存条件として既存どおり除去、name-query runtimeも値と同期する。
@@ -310,11 +409,11 @@ filter UI編集もowner経由でruntime同期する。settings保存時期は現
 | --- | --- |
 | 通常folder/drive root → child、本tile → ZIP/PDF/EPUB/RAR/cache ZIP | 初回openと再入場が同じrouteを採用。direct/warm/coldの違いでscopeが先行しない |
 | Rating/Collection/Smart/Tag/Search/History/Bookmarks/Sub展開から本open | typed origin/親chainでentryを確定。物理path親子関係を要求しない |
-| toolbar/キー/マウスの←→、BS、アドレス、A/B | 既存routerを保ち、成功した同scope採用を一つのreducerへ送る。A/Bのstashは他slotと混ぜない |
+| toolbar/キー/マウスの←→、BS、アドレス、A/B | mainの既存routerを保ち、成功した採用を同じmain ownerへ送る。A/Bは採用されたmain場所のrouteとして扱い、slot別stashやfilter値コピーは新設しない |
 | 本内ZIP階層/入れ子/単一wrapper collapse、fullscreen→ページ一覧 | prefix scopeを使い、同じscopeでは何もしない。退出したbook分だけ復元 |
 | reload/notify/ソート/同場所再install | route不変なので二重stashを作らない |
 | conversion/password/sidecar待ち、cancel/error/superseded、close | 未採用要求のdiscardだけ。既存モーダル/取消ownerを維持。成功までactive値とstashに触れない |
-| F12/複数viewer | 既存context runtimeのfacet所有範囲に閉じる。main historyやsibling contextを変更しない。capture/restore bundleの持ち運びを監査し、detached経路を触るならrework合意を先に取る |
+| F12/複数viewer | facetはmain専用App-globalのまま。fork/mount/swap/closeはscope/stack/Settings.facet_filterを変更せず、detachedのglobal filter除外を維持。bundleへfacetを追加しない |
 
 簡素化の検討: 履歴の→を禁止する、facetを常時解除する、ZIPを開くたび全stashをclearする案は
 既存機能を削るため不採用。全場所のfilter snapshot永続化も要求外で、親編集との古い値競合を増やすので不採用。
@@ -322,24 +421,24 @@ filter UI編集もowner経由でruntime同期する。settings保存時期は現
 新ownerは既存runtime fieldsを置換するもので、追加の並行状態ではない。
 §1.345とは設定・owner・受入テストを分離し、1.339単独の差分として先に実装できる。
 
-### 9.4 利用者への追加質問（未回答）
+### 9.4 履歴再入場の設計既定（D14、旧Q14）
 
-Q14: 履歴で本へ入り直したときは、親のその時点の条件を退避し、本内は条件なしから始める
-現行open仕様に揃えてよいですか？ **推奨: はい**。子ごとの過去filter記憶は追加しない。
-回答で履歴地点ごとのfilter記憶が必要になった場合は別仕様として再設計する。
+通常openと同じくlive親条件を退避し、子は条件なしから開始することを決定した既定とする。
+子/履歴地点別の過去filter記憶は追加しない。利用者がその追加を要望した場合にだけ再相談する。
 
 ## 10. 受入条件・実装順・引継ぎ
 
-§1.339を独立chunkにし、Q14の判断と設計owner/独立reviewerの構造合意後に実装する。
+§1.339を独立chunkにし、D14とmain専用所有の設計owner/独立reviewerの構造合意後に実装する。
 まずreported routeを本番history handlerでredにし、zip内jpgが空にならないこと、
 戻ると★3のzip条件が復元すること、繰り返してもstash深さが増えないことを検査する。
 source suffixへのguardだけでは通らない同じZIPへの別親provenanceの対照を入れる。
 drive/UNC root、末尾区切り、cross-drive、back再入場、PDF/EPUB/convertedのlogical alias、
 ZIP nested prefix、folder reload、親条件編集、name-query/placeKeys、取消/失敗/stale、
-A/Bとsibling context不変を純粋reducer＋採用handlerで検査する。
+A/Bのmain採用と、detached/parked mount・swap・closeでmain ownerが不変であることを
+純粋reducer＋採用handlerで検査する。slot別stashが既存だという前提のtestは作らない。
 §1.328選択・可視性、起動復元、rating sort、search退出の既存回帰を併用する。
 
-§1.345はQ1〜13の判断後、分類/Settings転送 → folder/virtualと派生predicate →
+§1.345は§8.2の残る質問の判断後、分類/Settings転送 → folder/virtualと派生predicate →
 aggregate producer → Remoteとcache/reloadの順でcoherent chunkに分ける。
 部分producerだけを公開して「app全体対応」としない。未接続があれば内部実装段階のまま引き継ぐ。
 必要なテスト:
@@ -349,8 +448,19 @@ aggregate producer → Remoteとcache/reloadの順でcoherent chunkに分ける�
 - image+video非表示の本判定、全部画像除外、子folder、Ctrl+上下skip/fallback、folder pin/auto/catalog再利用。
 - Settings旧値/default/roundtrip/export-import/Cancel、policy変更後のstale完了・reload・snapshot復帰。
 - data rowsとsidecar/tag/collection順が不変、local/Remoteの表示列・読順・count一致、Remote prepared cache更新。
+- 2.png保存→PNG除外で3.jpgへ誤復元しないこと、identity/旧raw/除外target/設定復帰、永続列の互換。
+- 同suffix実directoryと実書庫、同prefix alias、複数段のcontainer ancestry、旧変換cache manifest欠落。
+- collection全ID集合、非表示slot/相対順、可視drag後の全ID保存、設定変更・revision conflictで旧投影を保存しないこと。
 - headless UI snapshot（prefs・適用中表示・件数）、full lib、fmt、通常/portable core check、glyph。
 
 実機確認はcoordinatorが具体的なシナリオ・時間・入力/使い捨てdataの範囲を提示し、
 利用者の明示承認を得る検証枠へ回す。製品バイナリをこのworktreeの実装担当は起動しない。
 本書には独立review済みの主張を含めない。実装担当のコード前提照合は独立reviewの代わりではない。
+
+## 11. r3指摘への対応記録（2026-10-08）
+
+利用者が提示した独立レビューの4設計指摘は全てコードと一致し、採用した。反対意見はない。
+raw-kind検証では投影後identityを守れない点を§5.5/Q15へ、facetのApp-global/main専用所有を§9へ、
+ZipDirに来歴がない点を§3.1/Q16へ、collection subset merge ownerが存在しない点を§5.4/Q17へ訂正した。
+Q1/Q2/Q4/Q8/Q9/Q14は上書き可能な決定した設計既定へ移した。
+残る質問は§8.2。今回も設計のみであり、§1.339/§1.345のコードや永続列を実装していない。

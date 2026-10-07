@@ -770,3 +770,38 @@ cache DBのstamp/実体照合をworkerで行い、直読みなら解決済みRAR
 親一覧のバーが記録位置を示すこと、分割RARの後続partが同じ本の位置を示すこと、
 未変換/変換結果失効でバーを作らないこと、一覧再読込・設定ON/OFF、既存ZIP/PDF/フォルダの対照。
 実アプリはこの実装担当が起動しない。
+
+## 16. §1.350 独立レビューr3 — cache削除完了の失効（2026-10-08）
+
+利用者提示の独立レビューP2をコードで照合し、採用した。反対意見はない。
+`poll_archive_cache_maint_pending`はDeletedSelected / DeletedMissing / DeletedAllで管理画面の
+行を再読込するだけだった。一方、read source workerはPendingだけを再投入するため、
+削除済みZIPをCachedZipとして保持していた。描画でexists/DBを追加する修正は採らない。
+
+完了pollから既存read source ownerの`invalidate_converted_archive_cached_sources`へ接続する。
+削除前のbatchはcancel/receiver破棄し、CachedZipだけをPendingへ戻す。
+既存rangeとprefetch admissionで再判定し、cacheが消えていればUnavailableへ移る。
+削除結果は件数のみなので全CachedZipを再検証する。新しい削除key記憶やalias/pending fieldを
+増やすよりこの既存ownerの鮮度境界を使う。Direct / Unavailable / pin rootの来歴、
+BookResumeMeters、DB保存・復元key、既に表示したtextureは変更しない。Rows/Errorは失効しない。
+
+追加回帰は実ArchiveCacheDbへcacheを記録し、実spawn_archive削除worker→完了pollを通す。
+選択 / 元ファイル消失 / 全削除の全経路でバーが消え、非同期再判定でUnavailableになること、
+削除前のqueued replyを採用しないこと、Directと保存recordが残ることを検査する。
+管理画面Rows/Errorは失効させない対照も追加した。
+修正前の実選択削除経路は1件失敗・exit101（`target/A-r3-red.log`）。
+修正後gateは下表。HEAD `c0ce50272fcfea5e9aa406ef59899479bd45756f`へ今回の未コミット差分を
+加えた状態で実装担当が実行し、CARGO_BUILD_JOBS=1 / RUST_TEST_THREADS=4を使用した。
+独立再レビュー・製品の実機確認は未実施。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib book_resume_meter_` | exit 0、43 passed / 0 failed、6.03s。`target/A-r3-meter.log` |
+| `cargo test -p mimageviewer --lib archive_pin_root` | exit 0、8 passed / 0 failed、1.30s。`target/A-r3-pin.log` |
+| `cargo test -p mimageviewer --lib incremental_archive_result` | exit 0、2 passed / 0 failed、0.43s。`target/A-r3-batch.log` |
+| `cargo fmt` / `cargo fmt --check` | exit 0 |
+| 通常core check / portable core check | 両方exit 0、18.79s / 19.30s。`target/A-r3-check-normal.log` / `target/A-r3-check-portable.log` |
+
+利用者指示に従い、今回はfocused test・fmt・通常/portable core checkだけを実行する。
+全lib・glyph・build-devは再実行せず、製品バイナリを起動しない。
+§15の2026-10-07確認用バイナリには、このr3失効修正は含まれない。

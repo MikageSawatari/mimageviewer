@@ -318,6 +318,12 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 その結果は同 generation なら採用し、現 batch 終了後に新 range の `Pending` key だけを次 batch へ渡す。
 終端 key は再投入しない。
 
+変換cache管理のDeletedSelected / DeletedMissing / DeletedAll完了は、読込元ownerへ
+変異通知を渡す。旧batchのreceiverを破棄/cancelし、CachedZipだけをPendingへ戻して
+既存range/admission経路で非同期再判定する。Direct / Unavailable、pin rootの来歴、
+保存済み読書位置mapは変更しない。削除結果は件数だけなので全CachedZipを再検証するが、
+source一覧や読込済み画像を一括resetしない。Rows / Errorは変異通知にしない。
+
 pin root の cascade 結果は `converted_archive_pin_root_states` に root 単位で保持する。root が batch
 候補になるのは、同 generation / 同 `folder_thumb_depth` で未走査か、記録済み archive key にまだ
 `Pending` がある場合だけ。cascade 後に desired scope から外れて archive 判定を skip した場合は、
