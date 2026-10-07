@@ -1,10 +1,10 @@
 # 音声サムネイル: 同名 sidecar・MP3 埋め込み画像の計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の設計のみ。
-改訂: 2026-10-08 / 利用者による Q1 訂正を反映 (R6)。動画と同じ同名 sidecar を採用する。
+改訂: 2026-10-08 / R7。永続コレクションの snapshot / navigation replacement に sidecar 出所を渡す契約を補う。
 **未実装・Q1 訂正と Q2〜Q7 は決定済み・利用者への未決質問なし・実アプリ未起動。**
 利用者から伝達されたレビュー履歴: 前版は **ACCEPT**、R4 の改訂は **ACCEPT WITH CHANGES**。
-R6 の同名 sidecar への訂正はこの判定の対象外であり、変更境界の設計レビューは未実施。
+R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。R7 はその対応で、再レビュー待ち。
 以下の「提案」は実装担当の推奨であり、利用者の決定済み事項とは区別する。
 
 ## 1. 決定済みの範囲と守る契約
@@ -615,6 +615,45 @@ NoArt は既存 ThumbnailErrorCode::NoThumbnail、他の失敗は既存 error co
 absence cache hit も同じ終端応答。HTTP の 422 は再試行なしだが、終端種別は §7.2 の
 error 識別子で判別する。画像 bytes は従来の image/webp。
 
+#### 永続コレクションの出所伝達 (R7)
+
+通常の RemoteEntry とは別に、永続コレクションは `wire_entry` が
+`PersistentCollectionEntryState::Available { thumbnail_address: None, .. }` を作る
+(`persistent_collections.rs:1530,1566`)。RemoteThumbnailSources の媒体拡張だけでは届かないため、
+**snapshot と navigation replacement の共通 facts 準備に discovery と出所付与を接続する。**
+
+- `view_facts` (`persistent_collections.rs:310`) で、prepared entries のうち現在の原本 / Remote
+  policy 検査を通る Available Video / Audio の実 path を共通 discovery に渡す。
+  RemoteThumbnailSources の入力を path / kind と継続判定から受け取れる形へ一般化し、
+  通常 RemoteEntry と永続コレクションで同じ §3.3 の discovery / 候補選定を使う。
+  ダミー RemoteEntry の作成、永続コレクション専用の再探索や source map owner は追加しない。
+- discovery は既存 IPC worker の一覧準備中に一回だけ行う。両設定の現在値、Video 優先・
+  Audio と共有する 64 親上限、request lease / cancellation / deadline を渡す。
+  現行 `for_remote_entries` の無条件 `|| true` を永続コレクションへ流用しない。
+  取消 / 期限切れは既存の interrupted 応答とし、途中の source snapshot を公開しない。
+  scan error / 上限外は §3.3 の source なし fallback とし、サムネイル endpoint では再探索しない。
+- `stream_bounded_wire_entries` の producer で既存 `wire_entry_with_epub_policy` による分類を終え、
+  **Available Video / Audio にだけ** `source_address` の結果を `Available.thumbnail_address` へ付与する。
+  元 address / kind、entry_id / source_identity、手動順序と明示画像行は保持する。
+  Missing / AccessError / Unsupported / BlockedByRemotePolicy はそのままにし、画像で Available に戻さない。
+  sidecar がない / 設定 OFF なら None。path guard は §7.1 の共通契約を保つ。
+- 出所付与は retained bytes の計算と `token_digest` の wire entry 消費 **より前**に完了する
+  (`persistent_collections.rs:350`)。thumbnail_address も既存 frame 上限と view token に含め、
+  `wire_snapshot` の出力後に追加しない。出所 address の変更は新 facts の token に反映される。
+  `PersistentCollectionViewFacts.entries` が出所付き entry の唯一の保持先となり、
+  snapshot と `bounded_landed_response` の replacement は同じ `wire_snapshot` からこれをコピーする。
+- `navigation_cache_candidate` / `navigation_view_facts` の既存 facts 再利用を保つ。
+  `PersistentCollectionViewKey` に両 sidecar 設定値を含め、OFF 等への変更で旧出所を再利用しない。
+  順序用 prepared snapshot の再利用は残し、新 facts を準備して必要な replacement へ渡す。
+  同じ owner / revision / key の navigation では再走査せず、明示 refresh は従来どおり新 facts と
+  source snapshot を作る。外部追加 / 交換 / 削除は §7.2 の refresh / artEpoch 契約に従う。
+  別の source cache、定期探索、追加 generation は作らず状態の組合せを増やさない。
+- 既存 wire の optional `Available.thumbnail_address` を使い、新 field は不要。
+  Web の `normalizePersistentCollectionEntry` (`app.js:4921`) が通常 tile へ出所を渡し、
+  `thumbnailRequestQueryForEntry` (`app.js:7307`) が thumbnail_source_path を作る。
+  元 Audio の open / navigation / resume 対象は変えず、画像をページ / navigation 対象に追加しない。
+  IPC 版更新と音声表示マークは本計画の既存方針を維持する。
+
 現コードの ThumbnailEngine::handle は session_cancel を受け取らず、
 generate_catalog_resolved 内の token は常に false。新抽出では pipe heavy handler に既にある
 RemoteOperationCancellation を helper へ渡すことを必須とし、session release / takeover / shutdown
@@ -748,6 +787,7 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
 
 1. coordinator は Q1 訂正と Q2〜Q7 の決定を引き継ぎ、R6 の共通 sidecar source・一覧省略・
    既存 setting の互換・画像 stamp / cache・Remote path guard を重点として変更境界をレビューする。
+   R7 の永続コレクション snapshot / navigation replacement の出所伝達も再レビューし、
    R2 の catalog maintenance 境界・422 分類と、R1 の 6 件の変更境界を実装 brief に含める。
    extraction の有界性、terminal 契約、親 catalog、Remote session Flight も維持する。
 2. 合意後の最初の作業は §3 の synthetic ID3 fixture と同梱 FFmpeg adapter 検証。
@@ -776,6 +816,7 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
 | sidecar discovery / 行省略 | song.mp3 + song.jpg / 非 MP3、同 stem の複数 Audio / Video、大小文字、同名別親 / 別 drive、複数画像候補が video と同じ順、RAW / Susie / codec 条件。両設定の 4 組合せで source 選択と画像行省略を照合。物理 / smart は省略、aggregate の明示画像結果は保持。64 親の共有・取消・上限外・video の既存候補保持、サブ展開で Audio も画像省略も増やさない |
 | sidecar invalidation / cache | 埋め込み absence hit の後に画像を追加しても先に sidecar を表示。Audio stamp 不変で画像のみ交換 / 削除 / rename、読込途中の画像 stamp 変更、hidden sidecar の scan signature 変更、両 setting の既存 reload。画像 cache と embedded positive / negative を混ぜず、SourceOnly / Off / Auto / Always / 全件・期限削除を共通 cache 境界で処理。picker / user DB / metadata transfer 変更なし、既存動画 pin と Shell 挙動を保持 |
 | Remote sidecar / indicator | 元 Audio address + thumbnail_source_path、非 MP3 の画像、source None の MP3、OFF と古い source hint、same canonical parent / stem / File / 認識画像の guard、PC と同じ候補の検証、相違 source の Flight 分離。refresh 後の追加 / 交換 / 削除、全 Audio 一覧、全 payload の presentation round-trip、live 設定→新一覧、3 択 tile snapshots / fallback / handshake |
+| Remote 永続コレクション (R7) | FLAC + 同名 JPEG と MP3 + 同名画像を snapshot / navigation replacement の両方で Available.thumbnail_address へ渡し、Web 正規化→thumbnail_source_path→WebP を検証。元 Audio address / kind / entry identity / 手動順序 / resume、明示画像行を保持。同名別親は混ぜず、Missing / Blocked 等には付与しない。sidecar なしは MP3 埋め込み / 非 MP3 NoThumbnail。両設定の 4 組合せと変更後の facts 再構築 / replacement、同 key navigation の再走査 0、refresh 後の画像追加 / 交換 / 削除を検証。Video と共有する 64 親上限、取消 / deadline 時の未公開、出所付与後の frame byte 上限・view token 変化を Rust handler / wire と Node runtime で検証 |
 | released setting compatibility | video_thumb_use_sidecar_image / skip_image_if_video_exists の旧 true / false と key 不在、field 名不変、既定 true、settings DB と transfer の既存 bool / plain 分類の round-trip。OFF を音声だけ true に戻さない、preferences の label / 検索 / 説明 / snapshot、manual の二設定の組合せを更新 |
 | audio indicator | key 不在・default・Unknown sanitize、settings DB round-trip、transfer plain 分類・未知値 issue、動画値との独立性。headless snapshots: 3 択 × sidecar / embedded / fallback、cut・明暗・小セル・duration / resume / badge、hover / details、環境設定で動画との隣接と検索 anchor |
 | Remote 更新 (R1-6/Q7) | fake HTTP cache で 60 秒超の force-cache 再利用を再現し、refresh 前の自動更新を要求しない。stamp が変わった外部交換・削除・追加後、明示 refresh が新 artEpoch URL で core へ到達し、新画像 / NoArt になる。同 stamp は Q6 の限界として別検証 |
@@ -807,10 +848,10 @@ video_pins.db、rename / metadata transfer の user-data 形式、keymap に音�
 「安心して使えます」も照合し、新しい外部通信は増えないこと、既存認証済み Remote への
 ジャケット配信が画像配信の記述に含まれることを確認する。
 
-coordinator への引き継ぎ: Q1 訂正と既決 Q2〜Q7、R6 の共通 sidecar 境界のレビュー、
+coordinator への引き継ぎ: Q1 訂正と既決 Q2〜Q7、R7 の永続コレクション出所伝達の再レビュー、
 入力有界化の技術ゲート、
 全 producer / consumer を含む実装 brief と file ownership、統合 IPC 番号の決定が次の作業。
-commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-r6-msg.txt` に置く。
+commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-r7-msg.txt` に置く。
 過去の target/D-*-msg.txt は変更しない。
 
 ## 11. 独立設計レビュー R1 への対応記録
@@ -855,3 +896,14 @@ R4 / R5 の手動画像指定案は coordinator が Q1 の「動画と同じ」�
 
 未決の利用者質問はない。今回も文書のみで、製品コード・IPC 定数・出荷済み DB は変更せず、
 commit・製品 binary 起動なし。製品テスト実行数は 0。
+
+## 14. 独立設計再レビュー R7 への対応記録 (2026-10-08)
+
+4fe5979e0 の再レビューの P2 をコードで確認し採用した。異論はない。判定 REVISE を記録し、
+今回の文書修正は再レビュー待ちとする。追加の利用者質問はなく、既決仕様は変更しない。
+
+| 指摘 | 確認したコードと解消内容 |
+| --- | --- |
+| R7-P2 永続コレクションの出所伝達 | persistent_collections.rs:1566 が thumbnail_address: None を作り、mod.rs:153 の populate_remote_entries は通常 RemoteEntry のみが対象であることを確認。snapshot (503,538) と navigate (635) は view_facts / navigation_view_facts を使い、wire_snapshot (1449) が facts.entries をコピーする。§7.1 に共通 discovery→Available.thumbnail_address の付与を byte 計算 / token 確定前に行う契約と、設定を含む既存 facts reuse key・取消 / deadline・refresh の所有境界を追記。app.js:4921,7307 は既存 optional 出所を tile / query に渡せるため wire field の追加は不要。§9 に両経路の FLAC / MP3、設定・再利用・frame 上限・token・Web 伝達の回帰条件を追加 |
+
+文書のみの修正。製品コードの実装・commit・製品 binary 起動なし、製品テスト実行数は 0。
