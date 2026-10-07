@@ -85,7 +85,7 @@ fn draw_settings_boot_problem_dialog(
 ) -> (bool, bool) {
     let mut open_restore = false;
     let mut quit = false;
-    egui::Modal::new(egui::Id::new("settings_boot_problem_modal")).show(ctx, |ui| {
+    super::show_startup_modal(ctx, egui::Id::new("settings_boot_problem_modal"), |ui| {
         ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
         ui.heading(copy.heading);
         ui.add_space(8.0);

@@ -69721,9 +69721,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         ));
     }
 
+    fn setup_rename_pending_field_app() -> AppTestEnv {
+        let mut app = setup_app();
+        // The constructor queues unrelated edit-preview Prune and book-resume
+        // read_all commands. Their completion is asynchronous: isolate these
+        // pending-field tests from startup owners instead of assuming they are idle.
+        // Drop them while the fixture still owns its temporary DB and override guard.
+        app.edit_preview_cache = None;
+        app.book_resume_writer = None;
+        app
+    }
+
     #[test]
     fn rename_migration_waits_for_book_bookmark_service_fifo() {
-        let mut app = setup_app();
+        let mut app = setup_rename_pending_field_app();
         assert!(!app.rename_migration_writers_busy());
 
         app.book_bookmark_pending_requests.insert(42);
@@ -69744,7 +69755,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     /// ミラーが書かれるため (2026-08-31 Codex P1)。
     #[test]
     fn rename_migration_waits_for_the_local_adjust_write_worker() {
-        let mut app = setup_app();
+        let mut app = setup_rename_pending_field_app();
         assert!(!app.rename_migration_writers_busy());
 
         // 積んだが完了を回収していない状態。

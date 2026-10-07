@@ -76,6 +76,28 @@ fn non_overlapping_dialog_scroll_style(
     scroll
 }
 
+/// Center startup modals using the measured size from this frame, not a stale
+/// Area size from before a viewport/font/content change. egui's Area publishes
+/// its new size at the end but does not schedule another positioning pass.
+/// Discard only that outdated layout; retain widget IDs, focus and scroll state.
+fn show_startup_modal<R>(
+    ctx: &eframe::egui::Context,
+    id: eframe::egui::Id,
+    content: impl FnOnce(&mut eframe::egui::Ui) -> R,
+) -> eframe::egui::ModalResponse<R> {
+    let previous = ctx.memory(|memory| memory.area_rect(id));
+    let response = eframe::egui::Modal::new(id).show(ctx, content);
+    if previous.is_some_and(|rect| (rect.size() - response.response.rect.size()).length() > 0.5) {
+        ctx.request_discard("startup modal measured size changed; recenter Area");
+        if !ctx.will_discard() {
+            // Another widget can have consumed the frame's pass budget. Publish
+            // the same geometry invalidation to the ordinary repaint scheduler.
+            ctx.request_repaint();
+        }
+    }
+    response
+}
+
 /// Measure the fixed action row using the same font/padding as ordinary buttons.
 /// `spacing` includes the caller's explicit gaps and separator height.
 fn startup_dialog_footer_height(ui: &eframe::egui::Ui, labels: &[&str], spacing: f32) -> f32 {

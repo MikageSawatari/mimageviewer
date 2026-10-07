@@ -1665,6 +1665,15 @@ pub fn run() -> eframe::Result {
                 miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::Creator);
             emit_startup("creator_enter", None);
             #[cfg(windows)]
+            {
+                use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle()
+                    && let RawWindowHandle::Win32(handle) = handle.as_raw()
+                {
+                    startup_window_geometry::fit_created_startup_window(handle.hwnd.get(), size);
+                }
+            }
+            #[cfg(windows)]
             startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
             #[cfg(windows)]
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
