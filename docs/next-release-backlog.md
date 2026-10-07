@@ -32,6 +32,15 @@
 
 ## 1. 優先候補
 
+### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)
+
+- 報告: v4.4.0 の読書位置バーが RAR の一覧サムネイルに出ない。利用者の手元でも再現。次のバージョンでの対応を目標にする。
+- 原因: `thumbnail_book_resume_meter` は `Folder` / `ZipFile` / `PdfFile` だけを対象にし、RAR/CBR/7z/LZH の一覧セル `ConvertibleArchive` を除外している。`docs/book-resume-meter-plan.md` §2 でも初版の対象外と明記され、既存テストも非表示を期待している。単なる保存失敗ではない。
+- 保存キー: 直読みRARは `current_folder` が元書庫なので元RARのキーへ記録する。変換が必要なRAR/7z/LZHは `current_folder` がキャッシュZIP、`archive_source_override` が元書庫なので、位置はキャッシュZIPのキーへ記録する。元書庫キーだけを一律に参照しても直らない。
+- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` が解決した実読込元を使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・無効なキャッシュでは表示を捏造しない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。分割RARの後続パートは、既存の読込元解決に従い先頭パートと同じ本を参照する。読書位置の保存・復元キー自体は変更しない。
+- 回帰: 直読みRAR/CBR、変換RAR/CBR・7z/CB7・LZH/LHA、分割RAR、未変換/キャッシュ失効、一覧からの再読込、既存ZIP/PDF/フォルダのバーを確認する。既存の「ConvertibleArchiveは非表示」というテストを新仕様へ更新する。
+- 規模 / 優先度: Small〜Medium / P2 (次版目標)。
+
 ### 1.349 ファイル整理先を、リングショートカット・マウスジェスチャ・マウスの進む／戻る／ホイールクリックに割り当てる — 利用者要望 (2026-10-07)
 
 - 出典: 利用者 (2026-10-07、v4.4.0 公開後)。「今後追加したい」。
@@ -2736,28 +2745,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 - **§1.310 の修正で逃げ道が 1 つ減った (2026-09-30、利用者判断で許容)**: これまでは準備完了待ちで止まった状態からSpace で 0 秒へ再生し直せた。これは `toggle_play` が demux の入力終端フラグを「再生終了」と取り違えていた副作用で、§1.310 で再生し直しの判定を engine の `Eof` に改めたため、この状態では Space で戻れなくなる (独立レビュー指摘、`tail-audio.mkv` で映像終端後へ seek)。シークバーで手前へ seek し直す・次の項目へ移る経路は残るとコード上は判断 (実行時は未確認)。
   - 構造の所見 (§1.310 実装担当の調査、2026-09-30): seek 後に「このストリームからはもう出力が来ない」ことを示す経路が無い。映像 EOF は decoder が engine へ知らせずに消費し ([decoder.rs](../src/video/decoder.rs) の video EOF 処理)、target より前のフレームは捨てて最後のフレームを残さない。音声 EOF も drain するだけで完了を知らせない。readiness は `FirstFrameReady` / `BufferReady` だけを待ち、「出し切った」という結果を持たない。直すには seek 世代ごとの lane 結果 (待ち / 出力あり / 出し切り)、最後のフレームの提示、音声の出し切りと残る側の clock 選択、`Buffering` から `Eof` への解決、キューが詰まっても出し切りを確定できる進行保証が要り、demux・decoder・audio pump・presentation・pacing の所有をまたぐ。短い尻尾だけを先に直す部分修正も可能だが、長い尻尾は残る。利用者判断で v4.3.0 では行わず、次の版以降でまとめて設計する。
 - 規模 / 優先度: Medium-Large / P3。
-
-### 1.310 動画末尾付近の一時停止から再開すると先頭へ戻る — 修正済み (2026-09-30) — v4.3.0 で出荷、残り: 修正後の利用者実機確認
-
-- 観測者: **利用者 (user)**。v430-integration build、F12 別ウィンドウで
-  `C:\home\mimageviewer\testdata\audio-tracks\multi.mkv` (6 秒) を繰り返し pause / resume。
-  pause 中の音声トラック切り替えに依存せず、時々 0 秒から再生し直される。
-  v4.1.0 / v4.2.0 にも同条件があり、今回の退行ではない。
-- 利用者セッションの `%APPDATA%\mimageviewer\logs\mimageviewer.log` / `perf_events.jsonl`:
-  pause PTS 2.9 (154.569 s) → resume 時 UI thread が `seek_override_set target=0.0` (154.965 s)。
-  pause PTS 3.8 (161.215 s) → resume 時 seek 0 (161.633 s)。それ以前の PTS 2.4 は正常再開。
-  これらは利用者による実機観測であり、修正後の agent 実機検証ではない。
-- 原因 (コード確認): demux が入力を先読みし終えた flag と、出力の drain 後の engine `Eof` を
-  `toggle_play` が同一視。`!clock.is_playing() && clock.is_eof_reached()` は、入力終端後に pause
-  しただけでも成立し、誤って replay seek 0 を発行していた。`set_playing(true)` の replay 強制
-  dispatch も同じ誤判定で、DSP 再取得を Exact(0) に向け得た。
-- **修正済み**: 両 replay 判定は既存 `is_at_eof()` (engine published EOF) へ統一。
-  clock の入力終端は `demux_exhausted` / `is_demux_exhausted()` へ改名し、正当な drain、ready、
-  quiet、seek 終端回収の意味は維持。真の末尾からの replay、loop、次 item、音声モードの終端、
-  decoder 再生成なしの EOF 後 seek を保持。detached 固有経路の変更なし。
-- 回帰検証: 6 秒 stream の入力終端→2.9 / 3.8 秒で pause→resume (両 player command、映像 / 音声)、
-  実 `multi.mkv` demux 先読み、真の EOF からの replay 1 回、DSP 再取得位置を自動テストに追加。
-  製品起動 / UI smoke は行わず、修正後の利用者実機確認は未実施。
 
 ### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27) — content identity の隔離は修正済み (2026-10-01)
 
