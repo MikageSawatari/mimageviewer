@@ -1,6 +1,6 @@
 # §1.337 動画再生時の EffeTune 自動表示 設計案
 
-2026-10-07、ライン C。**設計レビュー待ち・未実装**。
+2026-10-07、ライン C。**R2: 設計指摘反映・再レビュー待ち、未実装**。
 正本: [バックログ](next-release-backlog.md) §1.337、
 [EffeTune 統合](effetune-integration-plan.md) §0・§4・§10.1・§14、
 [動画アーキテクチャ](video-architecture.md) と [detached 憲法](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要)。
@@ -20,18 +20,26 @@
   `DspBridge::show_slot_gui_checked` は `AllowSetForegroundWindow(host_pid)` を呼ぶ。
   既存表示をそのまま呼ぶだけでは、今回の全画面制約と前面化方針を満たせない。
   以上はソース調査。Visualizer の画面保持・Windows の実際のフォーカス挙動は未確認。
+- R2コード照合: normalizeは `start_normalize_scan_inner` (src/app/native_video.rs:7850) で
+  `set_playing(false)`、仮測定 (:7992)／完了 (:8061)／失敗 (:8111) で `set_playing(true)` を使う。
+  取消しowner復帰 (:7609)、scan開始失敗、deferred scanを開始しない場合にも内部再開がある。
+  `handle_native_video_toggle_play_command` (:7100) はユーザーplayをnormalizeへ委譲して早期returnする。
+  **Playingへの遷移やset_playing呼出しだけでは再生開始の由来を判別できない**。
+- trayは `hide_to_tray` (src/tray_integration.rs:278) で `window_visible=false` → `SW_HIDE`、
+  復帰はtray threadのOS表示後に `sync_after_restore` (:355) でAppへ反映する。
+  EffeTune observer (src/effetune/window.rs:188) の連番は `WM_SIZE/SIZE_MINIMIZED` でのみ進む。
+  現在のGuiGateに自動設定ON／tray可視性のprojectionはなく、これらの往復は最小化連番で検出できない。
 
 ## 発火点と一度だけの所有者
 
 **自動表示を決める場所は `App::poll_video` の再生結果集約後の 1 か所**にする。
 各 open、キー／HUD の play、fast-swap、resume、EOF 連続再生には表示処理を足さない。
 
-1. Engine の唯一の Playing 確定境界から、source／viewer identity を持つ
-   **論理的な再生開始の成功事実**を VideoPlayer 経由で既存 poll に渡す設計を提案する。
-   新規 source の初回と利用者の停止／pause 後の play を対象とし、seek・buffering 復帰・
-   DSP handoff・音声トラック切替・周回による Playing 再入場は別の再生開始として数えない。
-   単なる state の毎フレーム比較だと、全画面から出た継続再生を初回と誤認するため採らない。
-   通知は source の既存寿命に従い、未採用の cache／破棄済み source の成功は表示へ流さない。
+1. 下記の**型付き再生開始由来をEngineActorが所有**し、唯一のPlaying確定境界で
+   未確定の論理startを成功にする。VideoPlayer経由でsource／viewer identity付きの成功をpollへ渡す。
+   start IDはseek epochと別で、内部再開・buffering・DSP handoff・トラック切替・周回では増やさない。
+   単なるstateの毎frame比較では、全画面解除やnormalize再開を初回と誤認するため採らない。
+   未採用cache／破棄済みsourceの成功は表示へ流さない。通知は下記条件で**一度だけ消費**する。
 2. controller が持つ起動セッション内の単一 `AutoOpenSession` (Armed / Spent) で決定する。
    viewer ごとの「表示済み」や settings 内の「今回済み」は作らない。複数窓の成功も 1 回に集約する。
    設定 OFF や不適格な成功はその場で棄却し、復帰時の待ち行列に残さない。
@@ -40,6 +48,32 @@
    ロード完了表示意図に合流する。手動表示意図を自動意図で上書きしない。
    Unavailable／Failed では自動ロード再試行をせず既存の理由表示を維持する。
    自動試行の失敗／途中取消でも Spent のまま。窓を閉じた後や次動画で開き直さない。
+
+### 再生開始の由来と成功通知の消費 (R2追加)
+
+- 所有者はplayerごとの既存transport ownerである `EngineActor`。その中に単一の型付き
+  `PlaybackStart` (None / AwaitingSuccess{id, origin} / SuccessReady{id, origin} / Established{id, origin})
+  を置く案とする。AppやNormalizeScanStateに自動表示用pending／再開判定boolを分散しない。
+  originはNewSource／UserPlay／ContinuousAdvance。新規autoplay open、ユーザーのpause・EOF後のplay、
+  別sourceへの連続進行でのみ新しいstartを作る。paused openは成功待ちを作らず、後のUserPlayで作る。
+- 起動・キー・HUD・cached player再利用・EOF入口でtransport要求に**明示的な由来**を渡す。
+  一般の `set_playing(true)` をUserPlayとみなす既定／fallbackは作らず、同型call siteを全て分類する。
+  ユーザーplayをnormalize scanへ委譲する前にも同じstartを登録し、scan後の再開はそのstartを継続する。
+  実際の表示処理は入口で呼ばない。ユーザーpause／close／source置換は未消費のstartを終了／破棄する。
+- normalizeのpauseと全復帰経路 (仮測定、完了、失敗、取消し、supersede、worker開始失敗、
+  deferred scan不開始) は **InternalContinuation::Normalize** として既存startを保持する。
+  seek、DSP取得、音声トラック切替、loopも内部継続として扱う。内部pauseはユーザーpauseに読み替えない。
+  初回playがscan待ちならAwaitingSuccessが維持され、初めてPlayingになったときだけ成功を生成する。
+  既に成功済みの継続再生を測定した場合はEstablishedのままなので、復帰しても成功を再生成しない。
+- `SuccessReady` はpollで取り出すと**適格性に関係なくEstablishedへ遷移**する。
+  設定OFF／全画面／tray／最小化／Remote／対象外／Spentでもdrainして棄却する。
+  設定ON時だけ成功を読む早期returnは不可。判定時に現在source・viewer bindingが一致し、
+  close／置換／ユーザーpauseを経ていないことを確認する。通知を次の復帰まで保持しない。
+  成功事実にはPlaying確定時の自動表示projection (下記) のrevision／allowedも添付する。
+  transport ownerへ注入したread-only共有値を同境界で読むだけで、GUI操作や追加lockは行わない。
+  poll時も同revisionで適格な場合だけ採用し、OFF中の成功を未drainのままONにした場合や
+  成功→抑止往復→pollの場合も棄却する。候補条件はopen要求時でなく再生成功時に採取する。
+  「OFFで動画成功→ONへ変更→同じ再生中にnormalize」は成功済みstartの内部継続なので発火しない。
 
 ## 適格性・非同期表示の境界
 
@@ -56,12 +90,32 @@
 seek、設定を ON にしただけでは再生開始通知を生成しない。これは遅延 popup ではない。
 再生と関係ない他窓の cache を走査して候補にしない。
 
-ロード中／hidden attach 中／host 配送後に全画面・最小化・Remoteへ入った場合も、
-**未表示の自動意図を取消し、解除時に復活させない**。ShowIntent を Manual / AutoVideo の
-型付き意図にまとめ、既存 permit の検査に AutoVideo の表示条件と無効化世代を加える案を提案する。
-全画面を一瞬往復しても古い auto permit が通らないよう、表示遷移の既存所有境界で世代を公開し、
-host GUI thread が表示直前にも照合する。worker の一度の確認や時間窓だけでは済ませない。
-既に表示済みの手動窓を全画面開始で新しく hide する機能には拡張しない。
+ロード中／hidden attach中／host配送後に**設定OFF・tray格納・全画面・最小化・Remote**へ入った場合は、
+未表示のAutoVideoだけを取消し、解除／ON／復元で復活させない。試行済みのAutoOpenSessionはSpentを維持する。
+`ShowIntent::Manual(ShowPermit)` / `AutoVideo(AutoPermit)` にまとめ、同じLoading／host queueに流す。
+AutoPermitは既存最小化／Remote連番に加えて、下記の自動表示projectionのrevisionを採取する。
+
+| 正本の変更境界 | AutoVideo限定の公開契約 |
+| --- | --- |
+| 起動設定とPreferences OK等の全settings確定／復元経路 | 自動設定ONをprojectionへ公開。OFF受理と同境界でblockedとrevisionを更新し、load完了pollより後回しにしない。draft変更／Cancelは影響なし |
+| `hide_to_tray` | `window_visible=false`の確定と同境界、`SW_HIDE`やsurface非表示の**前**にblockedとrevisionを公開 |
+| tray復元／その他のmain可視性変更 | 既存native observerにWM_SHOWWINDOW／WM_WINDOWPOSCHANGEDの可視性観測を追加する案。現在のOS可視性を確認してprojectionを更新し、tray threadの復元でApp同期を先行させない。hide→showの往復でも古いrevisionは戻さない |
+| 全viewerのpresentation ownerによる全画面入退 | 非適格化を同じ遷移境界で公開。C337-2の採用範囲に従い、context mount／swapで別窓の全画面情報を失わない |
+| 最小化／Remote | 既存native最小化連番／SessionStateMachineの取得連番・phaseを従来境界で公開・検査 |
+
+projectionの唯一の公開先はcontrollerの既存GuiGate。自動設定／root可視性／全画面から導く
+`AutoPresentation`を、SettingOff／RootHidden／Fullscreenの抑止bitと単調revisionを含む
+**一つのatomic値**でhostと成功通知producerに共有する案とする。各正本ownerは自分のbitだけを
+CASで更新し、別ownerの抑止を古い全体snapshotで消さない。allowedは抑止bitが全て0から導く。
+複数atomicの別読みによる整合窓を作らず、Rust／C++のmapping versionも揃えて検査する。
+bit変更とrevision増分は同じCASで確定し、再適格化しても過去値に戻さない。復帰は新しい自動要求を作らない。
+host-control workerはロード完了時・hidden attach前後に照合し、host GUI threadは**表示直前**にも
+一致・allowed・現在の `IsWindowVisible(main)`／`IsIconic(main)`／HWND生存を検査する。
+取消ACKはrequested-visibleを作らない。Cancelledでロード／attach済みbridgeを作り直さない。
+既存permitの最小化往復・Remote往復検査も維持する。検査後の抑止は新規popupの取消しではなく、
+既に表示済みの窓の従来lifecycleに従う。表示済み窓やManualへの新たなhide理由を追加しない。
+とくにtray格納による**既存表示済みEffeTune窓の保持**、最小化表示設定、Remote復帰の契約は変えない。
+workerの一度の確認、minimize sequenceのtray代用、UI次frameだけの取消し、時間窓では済ませない。
 
 **前面化に関する注意:** 自動開始は明示ボタンクリックと異なり、ロード完了時の foreground 権限を
 保証できない。推奨は自動表示だけ**非アクティブ表示**とし、foreground 許可／activate を要求しない。
@@ -71,7 +125,10 @@ host GUI thread が表示直前にも照合する。worker の一度の確認や
 ## 状態の組合せを減らす検討
 
 起動直後に窓を開く案は再生成功の要望を満たさないため不採用。毎再生時の open、復帰待ち popup、
-自動 retry を持たず、起動内の 1 owner と既存 Loading／show 意図だけに揃える。
+自動retryを持たず、起動内の1 ownerと既存Loading／show意図へ揃える。
+由来をnormalizeごとのpendingへコピーする案より、transport ownerの単一startを内部継続で保持する案を採用。
+自動表示の設定／tray／全画面を既存窓のhide reasonへ足す案は、表示済み窓の挙動を変えるため不採用。
+AutoVideo permitの失効projectionに限り集約し、取消し後のロードrollback・再attach・resume待ちを持たない。
 再生や窓移動のモーダル化は通常操作を止めるため不採用。ロード・attach・表示 IPC は既存 worker、
 UI は成功事実と gate の軽量更新だけにする。DSP 経路の起動後常時接続／保存契約は維持する。
 
@@ -85,16 +142,31 @@ UI は成功事実と gate の軽量更新だけにする。DSP 経路の起動�
   **推奨: はい**。既存手動開始と同じ。ロード待ちで再生を止める新処理は追加しない。
 - **C337-4:** 成功した手動 open はこの起動の自動表示機会も消費するか。
   **推奨: はい**。利用者が手動で閉じた窓を初回動画で開き直さない。
-  自動設定を途中で ON にした場合も、継続再生へ即表示せず次の再生開始だけを候補にする。
+  R2補足: 自動設定を途中でONにしても継続再生／normalize内部再開では開かない。
+  自動要求後のOFF／tray等で取消された場合もその起動の自動機会は消費済みとし、手動操作は残す。
+
+**R2で新規の利用者質問はない。** C337-1〜3は維持、C337-4は既存の一度だけ／遅延表示なしの提案を
+設定切替と内部再開にも明示した。由来所有と取消し公開境界は技術設計の修正で、利用者へ選択を委ねない。
 
 ## 実装前後のレビュー・受け入れ
 
-成功通知の logical start と seek／handoff の区別、全 viewer producer／close／swap／cancel、
-Manual / AutoVideo の優先、fullscreen の世代公開と host 最終検査を**実装前に独立レビュー**する。
+成功通知のlogical startとnormalize／seek／handoffの区別、全transport呼出しの由来分類、
+全viewer producer／close／swap／cancel、Manual / AutoVideoの優先、設定／tray／fullscreenの公開境界と
+host最終検査を**実装前に独立レビュー**する。
 detached／presentation 経路に入る変更は設計 lead と独立 reviewer が構造的修正として合意し、
 detached-rework-plan.md §11 に記録する。現時点ではその合意はない。
 非起動の state／fake host テストは open失敗→成功、paused open→play、各抑止開始→復帰→
 次開始、ロード中の抑止往復、手動意図優先、二窓同時、設定OFF→ON、portable欠落を対象とする。
+R2追加回帰: OFFで成功した継続動画→ON→normalize (仮測定／完了／失敗／取消し／開始失敗／不開始)
+では0回、paused open／ユーザーplay→初回normalize→初めてPlayingでは適格時1回。
+seek／DSP／loopの内部継続では追加0回。source置換／ユーザーpauseで旧成功を破棄、OFFでの通知drainを検証。
+成功通知未drainでOFF→ON／各抑止往復した場合も0回、複数ownerのbit更新で別抑止が消えないことを検証。
+設定OFF／tray格納をload中・hidden attach中・host配送後の各段階で入れ、OFF→ON／hide→showの
+抑止往復もCancelled、表示希望なし、Spent維持、後からpopupなしをfake hostで検証する。
+Preferences Cancelは失効なし、既存表示済み窓とManualは自動専用projectionでhideされないことも確認する。
 実装時は既存 settings.db へ既定 false の加算設定と serde default を追加し、旧データを保持。
 環境設定「動画・音声 → 動画 → 音響調整」、spec、EffeTune正本、manual/effetune.html、製品ページを更新する。
 bridge変更時の最終確認は release launcher/core build が必要。今回は製品を起動せず、実機挙動は検証しない。
+
+R1レビューのP2「normalize内部再開の由来」とP2「要求後のtray／設定OFF取消し」を
+コード照合して採用した。上記は対応案であり、R2の独立レビュー承認はまだない。
