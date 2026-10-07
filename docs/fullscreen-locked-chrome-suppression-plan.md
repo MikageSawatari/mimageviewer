@@ -370,7 +370,9 @@ owner を特定できない経路、behavior 削除が必要な経路が残れ�
 4. **Q4【改訂】: 抑制が有効になったとき、右 panel の既存の明示 open も閉じるか。**
    **推奨は lock の表示理由だけを外し、明示 open は維持する案へ変更。** F11入場、fullscreen中の対象設定ON、
    F12 migration、初回openのすべてで同じ純resolverを使い、抑制開始用のtransient resetを作らない。
-   tag picker / TextEdit / dragなどの保護操作が終了しても、明示openは既存close / target-changeまで残る。
+   tag picker / TextEdit / dragなどの保護操作が終了しても、それだけでは明示openを閉じない。
+   raw lock ON では対象変更後も明示 open を保持するため、抑制中に開いたpanelもページ送りだけでは閉じない。
+   ×などの明示closeで閉じる（raw lockは保持）。raw lock OFFなら、対象変更時の既存closeが働く。
    このため、lockと明示openの両方で開いていたpanelは、抑制開始だけでは消えない。×は§5.1で使える。
    別案は「既存明示openも閉じ、開始後の再openは許可」。その場合はF11だけに入口を限定せず、
    設定ON・migration・初回openと、保護例外の終了後まで一つのcontext-owned open ownerで扱う必要がある。
@@ -388,7 +390,8 @@ owner を特定できない経路、behavior 削除が必要な経路が残れ�
    通常F11の再生成まで継続させるなら、chrome snapshotを超える入力・capture・focusの所有移譲設計が必要。
    操作中のF11を無効にする案を、継続の代わりに勝手に採らない。
 
-Q1・Q2・Q3・Q5・Q6は既存の質問。Q4は範囲・推奨を改訂、Q7だけ新規追加。
+Q1・Q2・Q3・Q5・Q6は既存の質問。R2でQ4の範囲・推奨を改訂し、Q7を新規追加した。
+R3ではQ4の明示openの終了条件だけを説明修正。新規質問はない。
 Q4とQ7は表示理由・操作保証の利用者仕様の質問であり、未回答のまま実装を開始しない。
 上記の回答と structural agreement を coordinator がまとめてから、bounded 実装 handoff を作る。
 
