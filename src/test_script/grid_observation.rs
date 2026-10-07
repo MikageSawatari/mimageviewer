@@ -16,6 +16,9 @@ pub(crate) struct GridObservation {
     pub(crate) cell_height: f32,
     pub(crate) columns: usize,
     pub(crate) content_height: f32,
+    pub(crate) aspect_label: String,
+    pub(crate) aspect_auto: bool,
+    pub(crate) aspect_sample_count: usize,
 }
 
 impl Default for GridObservation {
@@ -33,6 +36,9 @@ impl Default for GridObservation {
             cell_height: 0.0,
             columns: 0,
             content_height: 0.0,
+            aspect_label: String::new(),
+            aspect_auto: false,
+            aspect_sample_count: 0,
         }
     }
 }
@@ -64,6 +70,12 @@ impl GridObservation {
         insert!(selected_index);
         insert!(selected_key);
         insert!(selected_name);
+        insert!(aspect_label);
+        insert!(aspect_auto);
+        map.insert(
+            "aspect_sample_count".into(),
+            (self.aspect_sample_count as i64).into(),
+        );
         map.insert("scroll_offset".into(), (self.scroll_offset as f64).into());
         map.insert("row_content_y".into(), (self.row_content_y as f64).into());
         map.insert("cell_height".into(), (self.cell_height as f64).into());

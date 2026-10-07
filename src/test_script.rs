@@ -5891,6 +5891,49 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn rating_folder_back_aspect_wait_rejects_square_incomplete_and_stale_grids() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut settled = ready_snapshot();
+        settled.item_names = vec!["row".into(); 15];
+        settled.items_generation = 10;
+        settled.grid_observation.generation = 10;
+        settled.grid_observation.aspect_auto = true;
+        settled.grid_observation.aspect_label = "3:4".into();
+        settled.grid_observation.aspect_sample_count = 15;
+        let ready = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "tall_aspect_ready",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(ready(settled.clone()));
+        for variation in 0..4 {
+            let mut incomplete = settled.clone();
+            match variation {
+                0 => incomplete.grid_observation.aspect_label = "1:1".into(),
+                1 => incomplete.grid_observation.aspect_sample_count = 14,
+                2 => incomplete.grid_observation.generation = 9,
+                _ => incomplete.grid_observation.aspect_auto = false,
+            }
+            assert!(!ready(incomplete));
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn rating_folder_back_capture_names_and_budget_fit_the_harness() {
         let script = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

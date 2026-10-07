@@ -3623,7 +3623,7 @@ fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
             selection_proof: None,
         },
     )])));
-    app.reset_and_seed_auto_aspect_with_collection_seed(&map, None, Some(1));
+    app.reset_and_seed_auto_aspect_with_seed(&map, None, Some(1));
     assert!(app.auto_aspect.samples.is_empty());
 }
 
@@ -21729,7 +21729,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.scroll_to_selected);
     }
 
-    fn rating_1328_zip_return(backspace: bool, direction: FolderHistoryDirection) {
+    fn rating_1328_zip_return(backspace: bool, direction: FolderHistoryDirection, auto: bool) {
         let mut app = setup_app();
         app.settings.rating_view_sort =
             crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
@@ -21756,6 +21756,12 @@ mod phase_c_folder_nav_history_tests {
         app.enter_rating_view(3);
         finish_rating_navigation_for_test(&mut app);
         app.select_rating_view_row_for_opened_path(&opened);
+        if auto {
+            app.settings.thumb_aspect_auto = true;
+            app.auto_aspect.current = Some(crate::settings::ThumbAspect::Portrait3x4);
+            app.auto_aspect.samples.insert(0, 4.0 / 3.0);
+            app.scroll_offset_y = 420.0;
+        }
         let owner = app.rating_view_physical_load_owner(&opened).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         finish_staged_physical_history_for_test(&mut app);
@@ -21775,21 +21781,42 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.selected, Some(4));
         assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
         assert!(app.scroll_to_selected);
+        if auto {
+            assert_eq!(
+                app.effective_thumb_aspect(),
+                crate::settings::ThumbAspect::Portrait3x4
+            );
+            assert_eq!(
+                app.scroll_offset_y, 420.0,
+                "ZIP's empty pending UI must not overwrite the source"
+            );
+            assert!(
+                app.auto_aspect.samples.is_empty(),
+                "rebuilt rows need fresh samples"
+            );
+        }
     }
 
     #[test]
     fn section1328_rating_zip_history_back_selects_opened_zip_after_fourth_page() {
-        rating_1328_zip_return(false, FolderHistoryDirection::Back);
+        rating_1328_zip_return(false, FolderHistoryDirection::Back, false);
     }
 
     #[test]
     fn section1328_rating_zip_history_forward_selects_opened_zip_after_fourth_page() {
-        rating_1328_zip_return(false, FolderHistoryDirection::Forward);
+        rating_1328_zip_return(false, FolderHistoryDirection::Forward, false);
     }
 
     #[test]
     fn section1328_rating_zip_backspace_control_selects_opened_zip() {
-        rating_1328_zip_return(true, FolderHistoryDirection::Back);
+        rating_1328_zip_return(true, FolderHistoryDirection::Back, false);
+    }
+
+    #[test]
+    fn section1328_rating_zip_pending_preserves_aspect_position_for_history_and_backspace() {
+        rating_1328_zip_return(false, FolderHistoryDirection::Back, true);
+        rating_1328_zip_return(false, FolderHistoryDirection::Forward, true);
+        rating_1328_zip_return(true, FolderHistoryDirection::Back, true);
     }
 
     fn rating_1328_folder_or_pdf_return(backspace: bool, replay_forward: bool, pdf: bool) {
@@ -21941,6 +21968,155 @@ mod phase_c_folder_nav_history_tests {
         rating_1328_folder_or_pdf_return(true, false, false);
     }
 
+    fn rating_1328_tall_folder_return(backspace: bool, roundtrip: bool) {
+        use crate::settings::ThumbAspect;
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.thumb_aspect_auto = true;
+        app.settings.grid_cols = 10;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.rating_view_sort =
+            crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+        let library = app.tmp.path().join("tall-rated-folders");
+        let mut opened = PathBuf::new();
+        for index in 0..120 {
+            let folder = library.join(format!("{index:03}-folder"));
+            std::fs::create_dir_all(&folder).unwrap();
+            for page in 0..8 {
+                image::RgbImage::new(36, 48)
+                    .save(folder.join(format!("{page:02}.png")))
+                    .unwrap();
+            }
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(
+                    &crate::adjustment_db::normalize_path(&folder),
+                    3,
+                    Some(
+                        &crate::rating_db::RatingMeta::new(
+                            crate::rating_db::RatingItemKind::Folder,
+                        )
+                        .with_source_path(&folder),
+                    ),
+                )
+                .unwrap();
+            if index == 104 {
+                opened = folder;
+            }
+        }
+        app.current_folder = Some(library);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        // Deliver deterministic representative-thumbnail samples through their state owner.
+        // Stop the fixture workers before drawing so a cold catalog on replay cannot race
+        // this delivery. No product waits or cache writes are replaced by the regression.
+        app.cancel_token.store(true, Ordering::Relaxed);
+        for index in 0..24 {
+            app.auto_aspect.samples.insert(index, 4.0 / 3.0);
+        }
+        app.maybe_apply_auto_aspect(true);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+        app.select_rating_view_row_for_opened_path(&opened);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        fn draw(app: &mut App, ctx: &egui::Context) {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 350.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.render_grid(ctx).is_none());
+                },
+            );
+        }
+        fn visible(app: &App) -> bool {
+            let row = app
+                .visible_indices
+                .iter()
+                .position(|index| Some(*index) == app.selected)
+                .unwrap()
+                / app.settings.grid_cols;
+            let center = (row as f32 + 0.5) * app.last_cell_h;
+            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+        }
+        draw(&mut app, &ctx);
+        draw(&mut app, &ctx);
+        assert_eq!(app.selected, Some(104));
+        assert!(visible(&app));
+        let saved_offset = app.scroll_offset_y;
+        assert!(saved_offset > 0.0);
+        let nav = app.grid_physical_navigation(104, opened.clone(), false);
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        finish_staged_physical_history_for_test(&mut app);
+        for attempt in 0..if roundtrip { 2 } else { 1 } {
+            app.cancel_token.store(true, Ordering::Relaxed);
+            assert_eq!(app.effective_folder(), Some(opened.clone()));
+            app.selected = Some(3);
+            app.scroll_to_selected = true;
+            draw(&mut app, &ctx);
+            assert!(visible(&app));
+            if backspace {
+                app.rating_view_back();
+            } else {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+            }
+            finish_rating_navigation_for_test(&mut app);
+            app.cancel_token.store(true, Ordering::Relaxed);
+            assert!(app.items_are_rating_view);
+            assert_eq!(app.selected, Some(104));
+            assert_eq!(app.items[104].container_path(), Some(opened.as_path()));
+            draw(&mut app, &ctx);
+            assert!(
+                visible(&app),
+                "opened folder must be visible in the first returned frame"
+            );
+            // The late samples must not restart the departed list's aspect decision and
+            // move its selected row below the viewport after ensure-visible was consumed.
+            app.last_input_at = None;
+            for index in 0..24 {
+                app.auto_aspect.samples.insert(index, 4.0 / 3.0);
+            }
+            app.maybe_apply_auto_aspect(true);
+            draw(&mut app, &ctx);
+            draw(&mut app, &ctx);
+            assert!(
+                visible(&app),
+                "opened folder became invisible after auto aspect settled"
+            );
+            assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+            assert_eq!(
+                app.scroll_offset_y, saved_offset,
+                "position and aspect belong together"
+            );
+            if roundtrip && attempt == 0 {
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                finish_staged_physical_history_for_test(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn section1328_rating_tall_folder_toolbar_back_stays_visible_after_aspect_settles() {
+        rating_1328_tall_folder_return(false, false);
+    }
+
+    #[test]
+    fn section1328_rating_tall_folder_forward_back_stays_visible_after_aspect_settles() {
+        rating_1328_tall_folder_return(false, true);
+    }
+
+    #[test]
+    fn section1328_rating_tall_folder_backspace_control_stays_visible_after_aspect_settles() {
+        rating_1328_tall_folder_return(true, false);
+    }
+
     #[test]
     fn section1328_rating_pdf_history_and_backspace_control_select_opened_pdf() {
         rating_1328_folder_or_pdf_return(false, true, true);
@@ -22009,6 +22185,88 @@ mod phase_c_folder_nav_history_tests {
         app.install_rating_view_rows();
         assert_eq!(app.selected, Some(3));
         assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1328_rating_positions_keep_star_identity_and_refresh_sample_ownership() {
+        use crate::settings::ThumbAspect;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        let _rows = rating_1328_install_rows(&mut app);
+        app.settings.thumb_aspect_auto = true;
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.selected = Some(4);
+        app.scroll_offset_y = 500.0;
+        app.auto_aspect.current = Some(ThumbAspect::Portrait3x4);
+        app.auto_aspect.samples = (0..6).map(|index| (index, 4.0 / 3.0)).collect();
+        app.auto_aspect.switches_done = 2;
+        let selected_key = app.rating_path_key(4).unwrap();
+        // apply_rating_view_result replaces rows/stars before common install saves old items.
+        app.enter_rating_view(4);
+        finish_rating_navigation_for_test(&mut app);
+        let old = app.top_level_grid_view.rating_grid_position(3).unwrap();
+        assert_eq!(old.selected_key.as_deref(), Some(selected_key.as_str()));
+        assert_eq!(old.scroll_offset_y, 500.0);
+        assert_eq!(old.aspect_seed.unwrap().aspect, ThumbAspect::Portrait3x4);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Square);
+        // A duplicated context must not borrow another context's saved positions.
+        assert!(
+            app.top_level_grid_view
+                .clone()
+                .rating_grid_position(3)
+                .is_none()
+        );
+        assert!(app.start_rating_history_replay(FolderHistoryDirection::Back, 3));
+        finish_rating_navigation_for_test(&mut app);
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.scroll_offset_y, 500.0);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
+        assert!(app.auto_aspect.samples.is_empty());
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(6));
+        assert_eq!(app.auto_aspect.switches_done, 0);
+        assert!(app.auto_aspect.streak.is_none());
+        // Newly rebuilt representatives may have changed at the same row keys. Existing
+        // cache gates must allow current statistics to replace the saved decision.
+        app.auto_aspect.samples = (0..6).map(|index| (index, 1.0)).collect();
+        app.maybe_apply_auto_aspect(true);
+        assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Square);
+        app.clear_quick_folder_slots();
+        assert!(app.top_level_grid_view.rating_grid_position(3).is_none());
+    }
+
+    #[test]
+    fn section1328_rating_manual_aspect_does_not_adopt_saved_auto_seed() {
+        let mut app = setup_app();
+        app.items = vec![GridItem::Image(app.tmp.path().join("fixture.jpg"))];
+        app.rating_view_rows = rating_1328_install_rows(&mut app);
+        app.rating_view_stars = 3;
+        let selected_key = app.rating_view_rows[4].key.clone();
+        app.top_level_grid_view.save_rating_grid_position(
+            3,
+            super::top_level_grid_view::RatingGridPosition {
+                scroll_offset_y: 200.0,
+                selected_key: Some(selected_key),
+                aspect_seed: Some(crate::auto_aspect_cache::AutoAspectCacheEntry {
+                    aspect: crate::settings::ThumbAspect::Portrait3x4,
+                    sample_count: 24,
+                    eligible_total: 100,
+                    updated_at: 0,
+                }),
+            },
+        );
+        app.settings.thumb_aspect_auto = false;
+        app.settings.thumb_aspect = crate::settings::ThumbAspect::Landscape4x3;
+        app.install_rating_view_rows();
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.scroll_offset_y, 200.0);
+        assert_eq!(
+            app.effective_thumb_aspect(),
+            crate::settings::ThumbAspect::Landscape4x3
+        );
+        assert!(app.auto_aspect.current.is_none());
     }
 
     #[test]

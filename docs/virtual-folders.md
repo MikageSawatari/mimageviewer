@@ -375,6 +375,12 @@ ZIP / 直接閲覧 RAR / 変換キャッシュ ZIP は、列挙待ち表示の�
 キーによる選択追従は維持し、数値 index による fallback は同じ ★一覧の再構築だけに限る。
 Backspace の既存の opened-path 指定と Collection の anchor は変更しない。
 
+Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★段別session位置へ
+選択キー・scroll・確定比率seedをまとめる。Rating installのtyped authorityから初回描画前に
+比率を復元し、replay/Backspaceで同じ座標系の位置を採用する。古いindex sampleは引き継がず、
+新rowsの統計を既存cache gateで検証する。詳細と同型調査の残件は
+[Auto比率のsession復帰契約](auto-thumb-aspect-plan.md) を参照。
+
 簡素化として、ZIP 専用の保存状態・rollback・新しい modal は追加せず、既存の保存処理と
 復帰要求の owner に揃えた。同型調査の残件 (閲覧履歴・サブ展開の復帰 anchor) は
 [backlog §1.328](next-release-backlog.md)

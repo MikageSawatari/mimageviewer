@@ -3411,7 +3411,7 @@ impl App {
         let cache_map = Arc::new(std::sync::RwLock::new(folder_pin_cache));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = None;
-        self.reset_and_seed_auto_aspect_with_collection_seed(
+        self.reset_and_seed_auto_aspect_with_seed(
             &cache_map,
             collection_seed,
             Some(auto_aspect_eligible_total),

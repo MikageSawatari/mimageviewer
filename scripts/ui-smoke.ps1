@@ -981,7 +981,7 @@ if ($script:archiveErrors.Count -gt 0) {
             grid_view_mode = 'Thumbnail'
             grid_open_selected_item_on_click = $false
             grid_cols = 3
-            thumb_aspect_auto = $false
+            thumb_aspect_auto = $true
             thumb_aspect = 'Square'
             ring_shortcuts = @{ mouse_nav_prompt_done = $true }
         })

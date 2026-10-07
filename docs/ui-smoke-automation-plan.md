@@ -477,6 +477,9 @@ prepare・App・runnerの終了値は分ける。cleanupとarchiveに例外が�
 `scripts/ui-smoke.ps1 -Suite RatingFolderBack` (`-Scenario` の別名) は、隔離 data に
 12 フォルダ × 8 PNG と 3 ZIP × 8 PNG を作り、15 コンテナすべてを ★3 にする。
 900×650、3列の一覧で `12-folder` / `23-book.zip` を下方までスクロールして選ぶ。
+全PNGは96×128 (3:4)で、`thumb_aspect_auto=true`。初回★一覧と各復帰で、実描画世代の
+Auto 3:4と15代表すべてのsample到着を観測してから採取する。固定時間待ちや戻り行の
+再選択でsettle後の可視性を補正しない。旧8×8・Auto OFFのfixtureでは比率再切替を検査できなかった。
 場所▼ → レーティング → ★★★ の実 widget をクリックし、実セルのdouble-clickで開く。
 第4画像もセルのclickで選ぶ。これらとツールバー←／→はfocus不要のROOT pointer経路を使う。
 rating/history の直接 action や既存 `open_rating_one` helper は使わない。
@@ -496,8 +499,10 @@ handler直呼び／pending count の注入はしない。物理マウスドラ�
 複数窓への入力や OS foreground の切替は加えず、単一 ROOT の直列ケースに範囲を絞る。
 
 `snapshot().grid` は実サムネイル ScrollArea の描画時に記録した generation、frame、選択key/name/index、
-実scroll offset、選択セル矩形、clip viewport、content高／列数を返す。状態snapshotは次pass冒頭なので、
-scenario は generation/index の一致を待ち、セル中心が clip viewport 内かを visible として判定する。
+実scroll offset、選択セル矩形、clip viewport、content高／列数を返す。
+Auto有効・実効比率・実sample数も同じ描画時点の読取観測として返す。
+状態snapshotは次pass冒頭のため、scenario は generation/index の一致を待ち、
+セル中心が clip viewport 内かを visible として判定する。
 戻りの観測・assertで再選択やscroll-to-meはしない。setupのpointer対象だけ、
 `grid-row:世代:index:名前` が現在の項目と一致するとき既存ScrollArea／offset読み戻しで表示する。
 可視化後の実Responseに `hover_widget`／`double_click_widget`／`click_widget` を送り、

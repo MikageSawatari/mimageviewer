@@ -500,6 +500,52 @@ DB アクセスは行わない。
 現在フォルダ削除は該当 `folder_key`、古いキャッシュ削除は `updated_at` が指定日数より
 古い行、全削除は全行を削除する。
 
+#### レーティング一覧のsession位置と比率 (§1.328、2026-10-07)
+
+★一覧は内容依存のため、引き続き永続path cacheの対象にしない。一方、同じsession内の
+履歴復帰では、選択キー・pixel scroll・その座標を決めた確定比率を一緒に保持する。
+`TopLevelGridView` の★段別 `RatingGridPosition` (最大5件) が単一ownerで、既存の
+`ViewerContextBundle` の交換に伴って移動する。別contextへのcloneでは持ち出さず、
+「場所を忘れる」で消す。起動復元の `StartupListIntent` の運搬・採用とは独立する。
+
+保存は既存の `save_leaving_folder_grid_position` から同じRating保存helperへ接続する。
+Folder/PDFの採用とZIPの先出し表示が同じhelperを使い、ZIP列挙待ちの空の旧一覧で
+保存済み位置を上書きしない。★段変更では旧surfaceの★数、物理採用でsurfaceが先に
+Folderへ変わった場合は旧itemsのrows stampを使う。選択キーは置換前itemsから取り、
+新しく準備されたrows/indexを移動元として使わない。SLIを通らない明示Rating退出と
+ドライブ一覧への移動も、sourceを消す前に同じhelperを呼ぶ。
+
+prepared/legacy Rating installは `VisibleInstallAuthority::Rating { stars }` を渡す。
+その★段の確定比率とsample数だけを `SidecarLoadContinuation.auto_aspect_seed` に運び、
+`reset_and_seed_auto_aspect_with_seed` がreset後・catalog seed前に既存cacheと同じ
+`current` / `cached_sample_gate` を復元する。初回描画前に比率が揃い、install後に同じownerの
+scroll/選択キーを復元する。replay/Backspaceのopened-path選択は引き続き最後に優先する。
+Auto OFFではseedを使わず、利用者の手動比率を優先する。
+
+Smart Folderは元items/thumbs自体を戻すため `AutoAspectState` 全体を保持するが、Ratingは
+rowsを毎回再構築する。Ratingでは古いindex sample・streak・切替予算を復元しない。
+同じ行キーでも代表画像・pin・内容が変わり得るため、新世代の実測で前回比率を検証する。
+membership減少時のsample gateのclipも既存判定を使う。全stateのremapや新しい再試行・
+modalを追加する案は採らず、既存seed/ゲートと成功採用ownerへまとめて簡素化した。
+
+修正前の描画回帰では、cold catalogの復帰で一度可視化した下方の選択行が、後着sampleの
+Square→3:4切替と先頭行anchorによって画面外へ出た。toolbar ←相当のhandler、→後の←、
+Backspaceで3件ともvalid red。実機ログの十分なwarm seedによる初回切替は選択復元より前なので、
+そのログだけで実機報告の直接原因まで断定しない。縦長fixtureの実アプリ確認は別途必要。
+
+同型調査の範囲: bookmarksはstable synthetic pathの永続cache、Smart Folderはresident layout、
+CollectionはID別prepared seedを既に所有する。検索結果(Ctrl+S/G/★固定)とTagはcache対象外で、
+履歴←/→を拒否し、Backspaceでは結果を再構築する。検索由来Snapshotはpixel scroll/itemsを
+戻すが比率を保存しない。これらにはRatingの★段別ownerを流用せず、検索/Snapshotの
+戻りownerへlayoutをまとめる設計が残る。閲覧履歴・サブ展開もcache対象外で、既存の
+opened-row anchor不足と合わせて別の復帰owner整備が必要。今回その動作は変更しない。
+Driveもcache対象外で専用installを使う。通常はiconだがpin代表画像はAuto sampleになり得るため、
+比率/位置を組として保存するDrive復帰ownerの整備を別件に残す。A/Bの通常一覧はpath cache、
+Ratingは上記のcontext位置ownerで扱う。
+また、RatingからCollectionへ直接移る専用empty installはSLI保存を通らないため、
+この退出で最新Rating位置を捕捉する接続は残る。Collection側のentry anchor/比率の挙動は
+今回変更しない。上記のRating位置保証は物理コンテナopen・★段変更・明示退出/Driveの経路に限る。
+
 ### 5.4 描画側の置き換え
 
 `ui_main.rs:2005-2006` を含む全 `self.settings.thumb_aspect.height_ratio()`

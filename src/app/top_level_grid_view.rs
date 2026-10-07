@@ -363,6 +363,15 @@ pub(crate) struct RatingPhysicalRestore {
     pub(crate) subfolder_restore: Option<SubfolderExpansionRestoreState>,
 }
 
+/// Session-only Rating position. Pixel offsets and their aspect dependency travel together.
+/// Rating rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
+#[derive(Clone, Debug)]
+pub(crate) struct RatingGridPosition {
+    pub(crate) scroll_offset_y: f32,
+    pub(crate) selected_key: Option<String>,
+    pub(crate) aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CollectionGridIdentity {
     pub(crate) collection_id: crate::collection_store::CollectionId,
@@ -1312,6 +1321,8 @@ pub(crate) struct TopLevelGridView {
     surface: TopLevelGridSurface,
     return_to: Option<TopLevelGridRestore>,
     generation: u64,
+    /// At most five star lists, owned by this viewer context's navigation session.
+    rating_grid_positions: std::collections::HashMap<u8, RatingGridPosition>,
     /// The completed smart-folder result has exactly the same lifetime as this surface plus
     /// descendants opened from it. `begin` is an explicit top-level transition and always drops
     /// the old session; `replace_surface` preserves it only while the same smart-folder surface
@@ -1345,6 +1356,8 @@ impl Clone for TopLevelGridView {
             surface: self.surface.clone(),
             return_to: self.return_to.clone(),
             generation: self.generation,
+            // A duplicated viewer does not inherit another context's navigation positions.
+            rating_grid_positions: Default::default(),
             // Context duplication may copy the visible grid identity for an independent viewer,
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
@@ -1390,6 +1403,7 @@ impl Default for TopLevelGridView {
             surface: TopLevelGridSurface::Folder,
             return_to: None,
             generation: 0,
+            rating_grid_positions: Default::default(),
             smart_folder_session: None,
             collection_session: None,
             collection_navigation_pending: None,
@@ -1403,6 +1417,19 @@ impl Default for TopLevelGridView {
 }
 
 impl TopLevelGridView {
+    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: RatingGridPosition) {
+        self.rating_grid_positions
+            .insert(stars.clamp(1, 5), position);
+    }
+
+    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&RatingGridPosition> {
+        self.rating_grid_positions.get(&stars)
+    }
+
+    pub(crate) fn clear_rating_grid_positions(&mut self) {
+        self.rating_grid_positions.clear();
+    }
+
     pub(crate) fn surface(&self) -> &TopLevelGridSurface {
         &self.surface
     }

@@ -89,6 +89,9 @@ impl SidecarProbeReuseCache {
 
 pub(super) struct SidecarLoadContinuation {
     pub(super) restore_intent: super::StartupListIntent,
+    /// Initial geometry seed captured from the accepted list's session position.
+    /// Travels with this exact hydration continuation; StartupListIntent remains independent.
+    pub(super) auto_aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     pub(super) source_path: PathBuf,
     /// Captured from the same metadata read that initialized folder-watch state. Extensions are
     /// not source kinds: a real directory may legitimately be named `photos.zip`.
@@ -741,6 +744,7 @@ impl App {
                 tag_item_keys: Vec::new(),
                 source_path: folder.clone(),
                 continuation: ContinuationOwner::Live(SidecarLoadContinuation {
+                    auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
                     prepared_subfolder: None,
@@ -2655,6 +2659,7 @@ mod tests {
         let (thumb_tx, _thumb_rx) = mpsc::channel::<ThumbMsg>();
         let started_at = std::time::Instant::now();
         let continuation = SidecarLoadContinuation {
+            auto_aspect_seed: None,
             source_path: folder.clone(),
             source_is_directory: true,
             prepared_subfolder: None,
@@ -2740,6 +2745,7 @@ mod tests {
         assert!(
             app.begin_sidecar_restore(
                 SidecarLoadContinuation {
+                    auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
                     prepared_subfolder: None,
@@ -3252,6 +3258,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ThumbMsg>();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut owner = ContinuationOwner::Live(SidecarLoadContinuation {
+            auto_aspect_seed: None,
             source_path: PathBuf::from("C:/book"),
             source_is_directory: true,
             prepared_subfolder: None,

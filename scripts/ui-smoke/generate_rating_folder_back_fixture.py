@@ -27,13 +27,17 @@ def seed(fixture: Path, data_dir: Path):
         folder = fixture / f"{number:02}-folder"
         folder.mkdir()
         for page in range(1, 9):
-            (folder / f"page-{page:02}.png").write_bytes(png((number * 17, page * 29, 110)))
+            (folder / f"page-{page:02}.png").write_bytes(
+                png((number * 17, page * 29, 110), width=96, height=128)
+            )
         rated.append(folder)
     for number in range(21, 24):
         book = fixture / f"{number:02}-book.zip"
         with zipfile.ZipFile(book, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for page in range(1, 9):
-                archive.writestr(f"page-{page:02}.png", png((70, page * 29, number * 10)))
+                archive.writestr(
+                    f"page-{page:02}.png", png((70, page * 29, number * 10), width=96, height=128)
+                )
         rated.append(book)
     with closing(sqlite3.connect(data_dir / "rating.db")) as db, db:
         db.execute("CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL)")

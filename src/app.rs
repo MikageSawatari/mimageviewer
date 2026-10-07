@@ -4204,11 +4204,15 @@ struct PreparedZipGrid {
     has_foreign_archives: bool,
 }
 
-/// The shared item installer is entered by ordinary navigation or by one fully prepared Smart
-/// physical-open request. This is distinct from `OpenRequestOwner`: admission is cheap and
+/// The shared item installer is entered by ordinary navigation, a Rating list adoption, or
+/// one fully prepared Smart physical-open request. This is distinct from `OpenRequestOwner`:
+/// admission is cheap and
 /// cloneable, while the Smart adoption permit owns a potentially large offscreen root payload.
 enum VisibleInstallAuthority<'a> {
     Ordinary,
+    Rating {
+        stars: u8,
+    },
     StagedArchive {
         logical_source: &'a Path,
     },
@@ -20068,9 +20072,9 @@ impl App {
 
     fn restore_cached_auto_aspect(
         &mut self,
-        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+        aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
-        let cached = if let Some(entry) = collection_seed {
+        let cached = if let Some(entry) = aspect_seed {
             Some(entry)
         } else {
             match self.auto_aspect_cache_target() {
@@ -20225,15 +20229,15 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
     ) {
-        self.reset_and_seed_auto_aspect_with_collection_seed(cache_map, None, None);
+        self.reset_and_seed_auto_aspect_with_seed(cache_map, None, None);
     }
 
-    pub(crate) fn reset_and_seed_auto_aspect_with_collection_seed(
+    pub(crate) fn reset_and_seed_auto_aspect_with_seed(
         &mut self,
         cache_map: &Arc<
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
-        collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+        aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         prepared_eligible_total: Option<usize>,
     ) {
         let generation = self.items_generation;
@@ -20248,7 +20252,7 @@ impl App {
         // eligible_total==0 でもキャッシュを先に復元し、実 rows が届くまでのフレームで
         // Auto 未確定時の Square を描画しない。通常の空フォルダでも、セルが無いため
         // 前回値を楽観的に保持して問題はない。
-        self.restore_cached_auto_aspect(collection_seed);
+        self.restore_cached_auto_aspect(aspect_seed);
 
         // 集計対象母数は items ベース (動画含む)。
         let eligible_total =
@@ -22189,6 +22193,7 @@ impl App {
         }
         self.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         self.folder_history.clear();
+        self.top_level_grid_view.clear_rating_grid_positions();
 
         // 「場所を忘れる」操作なので、現在表示中の一覧も同じ所有境界で先頭へ戻す。
         // current_grid_order は詳細表示の並べ替えも含む、画面上の実際の表示順。
@@ -24410,6 +24415,7 @@ impl App {
     /// ドライブ一覧本体を構築する。履歴 dispatch からも呼ぶため、ここでは履歴を記録しない。
     pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
         self.capture_main_list_restore_cursor();
+        self.save_leaving_rating_grid_position();
 
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
@@ -31638,6 +31644,7 @@ impl App {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
+        self.save_leaving_rating_grid_position();
         self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_view_rows.clear();
         self.rating_view_rows_stars = None;
@@ -32317,13 +32324,21 @@ impl App {
         {
             self.rating_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_items(
+        self.start_loading_items_inner(
             rating_view_synthetic_path(),
             items,
             image_metas,
             existing_keys,
             video_items,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Rating {
+                stars: self.rating_view_stars,
+            },
         );
         self.finish_rating_view_install(
             previous_selected,
@@ -32356,10 +32371,22 @@ impl App {
             "★".repeat(self.rating_view_stars as usize)
         );
         self.rebuild_visible_indices();
-        let selected = previous_selected_key
-            .as_deref()
+        let position = self
+            .top_level_grid_view
+            .rating_grid_position(self.rating_view_stars);
+        if let Some(position) = position {
+            self.scroll_offset_y = position.scroll_offset_y;
+        }
+        let selected = position
+            .and_then(|position| position.selected_key.as_deref())
             .and_then(|key| self.rating_view_rows.iter().position(|row| row.key == key))
             .filter(|idx| self.visible_indices.contains(idx))
+            .or_else(|| {
+                previous_selected_key
+                    .as_deref()
+                    .and_then(|key| self.rating_view_rows.iter().position(|row| row.key == key))
+                    .filter(|idx| self.visible_indices.contains(idx))
+            })
             .or_else(|| {
                 previous_selected.and_then(|idx| {
                     self.visible_indices
@@ -35702,13 +35729,57 @@ impl App {
             Some(pin_map),
             Some((rating_cache, tags_cache)),
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Rating {
+                stars: self.rating_view_stars,
+            },
         );
+    }
+
+    fn save_leaving_rating_grid_position(&mut self) {
+        // ZIP pending UI has already saved and cleared the source grid without clearing
+        // its view flags. Its empty interim display must not overwrite that position.
+        if self.navigation_scope.is_detached_physical()
+            || !self.items_are_rating_view
+            || (self.items.is_empty() && self.selected.is_none() && self.scroll_offset_y == 0.0)
+        {
+            return;
+        }
+        // The physical adoption owner may have changed the surface to Folder while the
+        // old Rating items remain visible. A Rating-to-Rating install, conversely, has
+        // already replaced rating_view_rows/stars but still owns the old surface/items.
+        let stars = match self.top_level_grid_view.surface() {
+            top_level_grid_view::TopLevelGridSurface::Rating { stars } => Some(*stars),
+            _ => self.rating_view_rows_stars,
+        };
+        let Some(stars) = stars else { return };
+        let aspect_seed = self
+            .settings
+            .thumb_aspect_auto
+            .then(|| self.auto_aspect.current)
+            .flatten()
+            .map(|aspect| crate::auto_aspect_cache::AutoAspectCacheEntry {
+                aspect,
+                sample_count: self
+                    .auto_aspect
+                    .samples
+                    .len()
+                    .max(self.auto_aspect.cached_sample_gate.unwrap_or(0)),
+                eligible_total: self.auto_aspect_eligible_total(),
+                updated_at: 0, // Runtime-only seed; no Rating entry is persisted to SQLite.
+            });
+        let position = top_level_grid_view::RatingGridPosition {
+            scroll_offset_y: self.scroll_offset_y,
+            selected_key: self.selected.and_then(|index| self.rating_path_key(index)),
+            aspect_seed,
+        };
+        self.top_level_grid_view
+            .save_rating_grid_position(stars, position);
     }
 
     /// Save before the visible source rows or path are replaced (including ZIP pending UI).
     /// This session history is separate from StartupListIntent adoption.
     fn save_leaving_folder_grid_position(&mut self) {
+        self.save_leaving_rating_grid_position();
         if !self.navigation_scope.is_detached_physical()
             && let Some(cur) = self.current_folder.clone()
         {
@@ -35763,7 +35834,7 @@ impl App {
         self.page_edit_snapshot = None;
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
-            VisibleInstallAuthority::Ordinary => None,
+            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::Rating { .. } => None,
             VisibleInstallAuthority::StagedArchive { logical_source } => {
                 Some((*logical_source).to_path_buf())
             }
@@ -35813,7 +35884,9 @@ impl App {
             None
         };
         let preserve_smart_folder_session = match &authority {
-            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::StagedArchive { .. } => {
+            VisibleInstallAuthority::Ordinary
+            | VisibleInstallAuthority::Rating { .. }
+            | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
                     && !smart_folder::is_smart_folder_synthetic_path(&source_path)
                     && self.preserve_smart_folder_session_for_load(&source_path)
@@ -36385,6 +36458,13 @@ impl App {
         // the App-global restore owner before returning to the event loop.
         let continuation = sidecar_restore::SidecarLoadContinuation {
             restore_intent: StartupListIntent::InternalInstall,
+            auto_aspect_seed: match authority {
+                VisibleInstallAuthority::Rating { stars } => self
+                    .top_level_grid_view
+                    .rating_grid_position(stars)
+                    .and_then(|position| position.aspect_seed),
+                _ => None,
+            },
             source_path,
             source_is_directory,
             prepared_subfolder,
@@ -36412,6 +36492,7 @@ impl App {
     ) {
         let sidecar_restore::SidecarLoadContinuation {
             restore_intent,
+            auto_aspect_seed,
             source_path,
             source_is_directory: _,
             mut prepared_subfolder,
@@ -36743,7 +36824,7 @@ impl App {
         // ── auto_aspect: items 世代リセット + catalog 既存比率の seed ──
         // delete_missing 完了後 / spawn_thumbnail_workers 起動前のこの位置で呼ぶ。
         // この時点で self.items / image_metas / cache_map がすべて確定済み。
-        self.reset_and_seed_auto_aspect(&cache_map);
+        self.reset_and_seed_auto_aspect_with_seed(&cache_map, auto_aspect_seed, None);
 
         // ── 進捗カウンタリセット + 共有 display_px 更新 ──
         self.cache_gen_total = 0;

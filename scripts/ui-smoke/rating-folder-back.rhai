@@ -62,6 +62,20 @@ fn rating_root(path, names) {
     let generation = snapshot().items_generation;
     click("rating-three");
     arrive("Rating { stars: 3 }", path, names, generation, "rating-root");
+    tall_aspect_settled("rating-root");
+}
+
+// All fifteen representatives are tall and in the keep range. Observe their real samples,
+// not a fixed sleep, before opening and after returning; later samples cannot change the vote.
+fn tall_aspect_settled(label) {
+    wait_until(|s| tall_aspect_ready(s), 30000);
+    log("rating-folder-back: tall aspect settled " + label + " grid=" + snapshot().grid.to_debug());
+}
+
+fn tall_aspect_ready(s) {
+    s.grid.generation == s.items_generation
+        && s.grid.aspect_auto && s.grid.aspect_label == "3:4"
+        && s.grid.aspect_sample_count >= s.item_names.len
 }
 
 fn record(label, screenshot) {
@@ -108,6 +122,7 @@ fn depart(kind, forward) {
 
 fn returned(label, opened_key, opened_name, opened_index, generation, rating_path, rating_names) {
     arrive("Rating { stars: 3 }", rating_path, rating_names, generation, label);
+    tall_aspect_settled(label);
     // Assert the same observation that was logged, rather than a later capture-time state.
     let s = record(label, true);
     let ok = s.selected_index == opened_index && s.grid.selected_key == opened_key

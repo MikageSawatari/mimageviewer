@@ -1,6 +1,7 @@
 """Noninteractive checks for the isolated rating-folder-back fixture."""
 
 import sqlite3
+import struct
 import shutil
 import unittest
 import uuid
@@ -37,10 +38,13 @@ class RatingFolderBackFixtureTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in folder.iterdir()), pages)
             for page in folder.iterdir():
                 self.assertTrue(page.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(struct.unpack(">II", page.read_bytes()[16:24]), (96, 128))
         for book in archives:
             with zipfile.ZipFile(book) as archive:
                 self.assertEqual(archive.namelist(), pages)
                 self.assertIsNone(archive.testzip())
+                for page in pages:
+                    self.assertEqual(struct.unpack(">II", archive.read(page)[16:24]), (96, 128))
         with closing(sqlite3.connect(self.data / "rating.db")) as db:
             rows = db.execute("SELECT path, stars FROM ratings ORDER BY path").fetchall()
         expected = sorted(str(path).lower().replace("\\", "/") for path in folders + archives)

@@ -2237,6 +2237,61 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 主要2経路修正・自動検証完了、残件あり (2026-10-07)
 
+- Auto比率の追加調査・修正 (2026-10-07、以下の旧経過を更新):
+  - 実機の入力はtoolbar ←。画像のみフォルダを本として開く設定はOFF、サムネ比率はAuto。
+    実ログをread-onlyで確認し、★3一覧の各復帰でseed後に1:1→3:4へ切り替わることを確認した。
+    私的パスは記録・fixture・commit messageへ転記していない。
+  - コード上、Ratingは永続aspect cache対象外で、位置保存からも除外され、replayは
+    scroll/比率状態をresetしていた。選択pathの復元自体は既存修正で正しい。
+    十分なwarm seedの初回切替は選択復元より前なので、そのログだけでは実機症状の直接原因を
+    断定できない。一方、cold catalog + 後着sampleの描画回帰では、戻った直後は正しく選択・可視でも、
+    1:1→3:4切替の先頭行anchorで選択行が画面外へ出ることを確認した。
+  - 「見つからない項目を N 件除外しました」は、Rating workerが解決できない登録行を
+    結果から除外した件数の通知。選択を消す処理ではないが、行集合/indexが変わる可能性はあるため、
+    保存にはstable keyを使い、古いindex sampleを持ち越さない。
+  - `RatingGridPosition` に選択キー・scroll・確定aspect/sample数をまとめ、context-ownedな
+    `TopLevelGridView` の★段別mapで保持する。既存共通保存ownerを使い、ZIP列挙待ちの空一覧は
+    元位置を上書きしない。明示退出/Driveも同じhelperへ接続。別contextへのcloneでは複製しない。
+    prepared/legacy installの `VisibleInstallAuthority::Rating` →既存のsidecar hydration continuationへ
+    seedを運び、初回描画前に既存cache gateで比率を復元する。replay/Backspaceは同じ位置ownerを使い、
+    opened-path選択の優先順位を維持する。新generationのsamples/streak/切替予算は新しく作り、
+    代表画像の変更・欠落登録行・★段変更でも再評価可能にする。手動比率/Collection/detached/
+    StartupListIntentの既存挙動は維持。待機・追加repaint・再ensure-visibleは追加しない。
+  - 同型のaspect調査 (code判定):
+
+    | 一覧 | 比率・位置のowner / 残件 |
+    | --- | --- |
+    | Rating | 今回★段別session位置として一緒に保存・復元 |
+    | Smart Folder | resident prepared layoutがoffsetとAutoAspectStateを保持 (既存正常) |
+    | Bookmarks | stable synthetic pathのcacheを空installより前に復元 (既存正常) |
+    | Collection | ID別prepared aspect seedとentry anchor (変更なし) |
+    | 検索(Ctrl+S/G/★固定)・Tag | aspect cache対象外。←/→は既存仕様で拒否、BSでは結果を再構築。検索/Tagの戻りownerにlayout保持をまとめる必要があり、今回範囲外 |
+    | 検索由来Snapshot | items/selected/pixel scrollを戻すがAutoAspectStateを保存しない。同じ依存欠落だがSnapshotの保存・復元owner整備が必要で今回未修正 |
+    | 閲覧履歴・サブ展開 | aspect cache対象外。下記のopened-row anchor欠落もあり、別の復帰owner整備が残る |
+    | Drive | 通常はiconだがpin代表画像はAuto sampleになり得る。cache対象外・専用installで比率/位置を組として保存しない。Driveの復帰owner整備が必要で今回未修正 |
+    | A/B | 通常一覧は既存path cache、★一覧は今回のcontext位置owner |
+
+    - 追加の退出残件: Rating→Collectionの専用empty installはSLIを通らず、最新Rating位置の
+      capture接続が無い。Collectionの既存挙動を変更しない制約のため今回未修正。
+      Ratingの物理コンテナopen/★段変更/明示退出/Driveと区別し、この経路の復帰は保証しない。
+
+  - valid red: 修正前 `ce12c2fb7` の製品コード + 新回帰3件はbuild成功後に0成功/3失敗、exit 1。
+    下方の120フォルダ一覧から開いて第4画像を選び、toolbar ←相当handler、→後の←、Backspaceの
+    全件でsettle後の不可視を確認。証跡 `target/1328-red-3.txt`。これはcold/late経路の確認で、
+    実機のwarm経路と同一原因だという証拠ではない。
+  - RatingFolderBack fixtureを96×128の縦長画像 + Auto ONへ更新。focus不要の必須toolbar経路、
+    focus時だけ実行する18キー等のケースは維持し、初回と各復帰の3:4/sample採用を観測する。
+    実アプリ/scenarioは実行せず、coordinatorへ引き継ぐ。warm実機報告の最終確認は再実行待ち。
+  - 修正後の対象検証: `cargo test -p mimageviewer --lib section1328 -- --nocapture` は
+    20成功/0失敗、exit 0。新しい描画3件に加え、ZIP空pending、★段別保存、新samplesでの再評価、
+    context cloneでの位置非継承、「場所を忘れる」、手動比率の対照を含む。
+    全libは `cargo test -p mimageviewer --lib` (pipeなし) で10,916成功/0失敗/52 ignored、
+    exit 0。test-script付き123件も成功。fixtureのPython 5件、fmt check、glyph 0件、
+    PowerShell ASTも成功。通常/portable core checkもexit 0、変更17ファイルはCRLFを維持し、
+    `git diff --check` と `git diff --numstat` で局所差分を確認。
+    `prepare-portable-smoke.ps1 -TestScript` はexit 0、runtime=4/PE=17の検査とcore/remote/EPUBの
+    manifest SHA-256照合も成功。隔離dataに配置済み。通常dev-runtimeのbuildは後続で確認する。
+
 - 出典: 利用者メール (§1.280 / §1.307 と同じ報告者、v4.3.0)。報告者の観測:
   - 通常フォルダ: ZIP を開く → ← → 一番左上の項目が選択され、一覧の先頭までスクロールする (時々違う挙動もする)。
   - レーティング一覧: ZIP を開く → ZIP 内で 4 番目の項目を選ぶ → ← → 一覧の 4 番目の項目が選択され、そこまでスクロールする。

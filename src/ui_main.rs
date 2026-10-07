@@ -18863,6 +18863,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     cell_height: cell_h,
                                     columns: cols,
                                     content_height: total_h,
+                                    aspect_label: self.effective_thumb_aspect().label().to_string(),
+                                    aspect_auto: self.settings.thumb_aspect_auto,
+                                    aspect_sample_count: self.auto_aspect.samples.len(),
                                 });
                         }
 
