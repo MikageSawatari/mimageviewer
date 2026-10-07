@@ -1,10 +1,14 @@
 # 音声サムネイル: 同名 sidecar・MP3 埋め込み画像の計画 (§1.347)
 
-作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の設計のみ。
-改訂: 2026-10-08 / R7。永続コレクションの snapshot / navigation replacement に sidecar 出所を渡す契約を補う。
-**未実装・Q1 訂正と Q2〜Q7 は決定済み・利用者への未決質問なし・実アプリ未起動。**
+作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の §1.347。
+改訂: 2026-10-08 / coordinator が FFmpeg gate 失敗を受領。§3 を Rust の有界 APIC 抽出へ再設計。
+**未実装・抽出再設計はレビュー待ち・他の受入済み仕様と Q1 訂正 / Q2〜Q7 は保持・実アプリ未起動。**
 利用者から伝達されたレビュー履歴: 前版は **ACCEPT**、R4 の改訂は **ACCEPT WITH CHANGES**。
-R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。R7 はその対応で、再レビュー待ち。
+R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。
+R7 対応後の独立レビュー受入・全利用者質問決定済みは、2026-10-08 の実装依頼で伝達された。
+旧方式の停止は設計レビューの不合格ではなく、§15 の FFmpeg 実証ゲート不成立による。
+**coordinator 指示 (2026-10-08): album-art 経路から FFmpeg を完全に外す。**
+今回は代替 crate の評価と有界 parser の設計だけであり、新方式のゲート成立・製品実装は未実施。
 以下の「提案」は実装担当の推奨であり、利用者の決定済み事項とは区別する。
 
 ## 1. 決定済みの範囲と守る契約
@@ -55,8 +59,8 @@ FLAC/M4A 等の **自動埋め込み抽出**、folder.jpg / cover.jpg の汎用�
 | Audio は固定アイコンで、要求が作られない | `src/grid_item.rs` の Audio、`src/app/grid_paint.rs` の Audio 描画、`src/app.rs::make_load_request` の末尾 `_ => None`。画像 decode に MP3 をそのまま渡しても解決しない |
 | Pending にすると再描画し続け得る | `src/app.rs::install_new_items_inner` は Audio を Failed に初期化する理由として Pending / prefetch / repaint を明記している。単に初期化を Pending へ変える修正は不可 |
 | 再生はジャケットを video に数えない | `src/video/decoder.rs` の `is_real_video_stream` は ATTACHED_PIC を除外し、best(Video) が cover の場合も実映像を再探索する。この述語を変更しない |
-| 専用 ID3 依存は現在ない | root `Cargo.toml` に id3 / lofty はなく、ffmpeg-the-third 3、image、turbojpeg、WebP がある。FFmpeg 案なら追加依存不要 |
-| 添付 packet の ABI は利用できる | `vendor/ffmpeg/include/libavformat/avformat.h` に AVStream.attached_pic と ATTACHED_PIC がある。`vendor/ffmpeg/VERSION` は n7.1.5-16-g9a4bb2c579 |
+| 専用 ID3 依存は現在ない | root Cargo.toml / Cargo.lock / offline metadata に id3 / lofty はない。既存 flate2 1.1.9 は rust_backend + miniz_oxide 0.8.9 (§3.1)。新案はこれと既存画像 helper を使用し、通常依存を追加しない |
+| 添付 packet の ABI は利用できるが抽出には使わない | 同梱 n7.1.5-16-g9a4bb2c579 の open-only は圧縮 APIC で約229 MiB の追加 private commit (§15)。再生の ATTACHED_PIC 除外は保持し、album-art から FFmpeg init / input / FFI も呼ばない |
 | 成功画像は既存 catalog に入るが、空結果の型はない | `src/catalog.rs` の CATALOG_VERSION=2、thumbnails の必須 WebP BLOB / width / height と mtime / file_size。空 BLOB や 0 寸法を no-art の sentinel にすると既存 reader と衝突する |
 | 合成一覧にも Audio がある | folder_scan、tag view からの materialize、smart_folder、reading history、rating、collection prepare の Audio 分岐。サブ展開だけは `src/app/subfolder_expansion.rs` の collect 後 retain で Audio を除外している |
 | 詳細 hover は既存サムネ状態を使う | `src/ui_main.rs::render_details_thumbnail_tooltip` は Loaded texture を描き、Failed は「表示できません」、その他は「読み込み中...」+ repaint。no-art の終端を追加しないと hover も止まらない |
@@ -67,67 +71,182 @@ FLAC/M4A 等の **自動埋め込み抽出**、folder.jpg / cover.jpg の汎用�
 | 表示設定には既存の 3 択 pattern がある | `src/settings.rs:617,4437,7368,9805` の VideoThumbnailIndicator、`src/settings_transfer.rs:269` の plain 分類、`src/ui_dialogs/preferences/pages.rs:1621`。現在 Remote はこの動画設定を反映せず、音声設定の配信は追加が必要 |
 | 無画像応答は既に wire にある | ThumbnailErrorCode::NoThumbnail、HTTP の 422、command-core.mjs の非 retry 判定を再利用できる。現在 HTTP error 名は miv_thumbnail_error にまとめられる |
 
-バックログの主前提に矛盾はない。FFmpeg が同梱版で APIC 種別をどの metadata として
-公開するか、Rust wrapper から packet を借用する具体 API、巨大タグでの割当上限は
-この設計だけでは実証していない。§3 の fixture / adapter 検証を実装最初のゲートにする。
+バックログの表示・所有境界の主前提は保持する。FFmpeg の有界抽出という前提は §15 で不成立。
+新しい §3 の parser は未実装であり、割当前制限・取消の実証を次の実装依頼の最初のゲートにする。
 
 ## 3. 抽出・表紙選択・入力上限
 
-### 3.1 推奨する抽出経路
+### 3.1 代替依存の評価と推奨 (2026-10-08、提案)
 
-新しい `src/audio_album_art.rs` (仮称) に、MP3 の埋め込み画像を取得する本体共通関数を置く。
-**既存 FFmpeg の libavformat で APIC → attached picture を得る案を推奨**する。
-ID3v2.2 PIC / v2.3・v2.4 APIC のパーサを自作せず、unsynchronization、extended header、
-description の文字コードを FFmpeg に任せる。JPEG / PNG を初期の必須対応素材とする。
-自動抽出が MP3 から始まることは既決事項。同名 sidecar は §3.3 の既存画像経路で先に処理し、
-MP3 parser を通さない。埋め込み JPEG / PNG の必須対応・上限と、sidecar の既存画像形式を分ける。
+**推奨: APIC / PIC 読取だけの小さい safe Rust parser と既存 flate2 の Rust backend。**
+新しい `src/audio_album_art.rs` (仮称) に本体共通関数を置き、Remote からもこれを呼ぶ。
+FFmpeg の open / stream-info / packet / init / allocator / FFI は album-art 経路に入れず、
+失敗時にも再生 decoder や別 parser へ fallback しない。同名 sidecar は §3.3 の既存画像経路を先に使う。
 
-公式 [AVStream の契約](https://ffmpeg.org/doxygen/trunk/structAVStream.html) は
-ATTACHED_PIC の packet を demuxer が所有すると定義している。
-公式 [ID3 実装](https://ffmpeg.org/doxygen/trunk/id3v2_8c_source.html) は
-APIC の picture type を stream の comment、description を title に公開する。
-これは upstream の照合資料であり、同梱 n7.1 系への適用は fixture で検証する。
+#### 版・保守・調査の限界
 
-1. worker で MP3 拡張子 (大小文字を区別しない) と実ファイルを確認し、fresh stat から
-   source stamp を確立する (§5.3)。一覧の表示・ソート日時や LoadRequest.mtime を使わない。
-2. worker 専用の input を開く。再生中の input、VideoPlayer、codec decoder を借用しない。
-   `best(Video)` は使わず ATTACHED_PIC の stream だけを列挙する。
-3. front-cover 相当 (`Cover (front)` / ID3 type 3) を優先し、同順位は元の stream 順で安定化する。
-   非表紙候補を後段に置き、候補を一枚ずつ検査・decode する (Q2)。
-4. attached_pic の data / size を検査する。input の生存中だけ借用し、null / 負の size / 上限超過
-   を拒否する。所有境界を越える必要があるときだけ上限内の bytes をコピーする。
-   借用 packet を unref / 改変しない。unsafe はこの adapter 内に閉じ込める。
-5. JPEG は既存 byte decode の縮小経路、PNG は image の Limits を使い、既存縮小・WebP encode
-   に渡す。ファイル MIME、説明文字列だけで decoder を決めず、実データも検査する。
-   GIF 等を許可するなら静止画一枚だけで、アニメーション timer は作らない。
-6. fresh stat を再取得し、この worker が最初に確立した source stamp と一致する場合だけ
-   結果を公開・保存する。cache hit の公開前にも同じ検査を行う。
+2026-10-08 のローカル Cargo registry (source / index) に id3 / lofty はない。
+`cargo metadata --no-deps --format-version 1 --offline --locked` は成功したが、未登録 crate の最新版照会にはならない。
+crates.io API への直接接続は WinError 10061 で失敗した。公式 docs.rs の公開版を下表に記す。
+**crates.io 上の最新版・yank・checksum は未確認**。採用候補を変える場合は接続可能な環境で
+registry API / index を取得し、固定版の Cargo.toml・LICENSE・実装を照合する。
+`latest` の source cache は版が混在する (id3 tag.rs は 1.17.0、lofty の一部 API は 0.25.3)。
+これらを 1.17.2 / 0.25.4 の inflate 実装を監査済みという証拠にしない。
 
-URL 型 APIC (`-->`) を解決したり、説明にあるパス・URL を開いたりしない。
-MP3 を書き換えない。EXIF orientation は既存画像 decode と揃えるが、音声パスの回転・補正・
-AI・注釈・トリムをジャケットに適用しない。source_dims はジャケットの画素寸法であり、
-音声の詳細メタデータ `video_meta.width/height` は引き続き NULL とする。
+| 候補 | 公式公開情報・保守 | MIT 製品 / Windows への影響 | 割当前制限の評価 |
+| --- | --- | --- | --- |
+| id3 | [公開 crate](https://docs.rs/crate/id3/latest) / [API](https://docs.rs/id3/latest/id3/) は **1.17.2 (2026-09-22)**。2026 年にも複数更新。v2.2 / 2.3 / 2.4、unsync / compression を扱う ID3 専用 reader / writer | [確認できた 1.17.0 source の license 表示](https://docs.rs/id3/latest/src/id3/stream/tag.rs.html) は **MIT**。1.17.2 の manifest / LICENSE 本文は取得できず採用前再確認。bitflags / byteorder / flate2 が通常依存、tokio は optional。Rust 経路なら追加 native DLL は不要と見込むが crt-static build は未実証 | 入力 header の外側 preflight は可能。公開 Tag 読取 API に picture 数 / 展開出力 / inflate 途中取消の hook を確認できない。確認できた tag.rs は frame を decode してから Tag に保持する。呼出後に pictures().take(16) では割当前制限にならない |
+| lofty | [公開 crate](https://docs.rs/crate/lofty/latest) は **0.25.4 (2026-09-20)**。同月複数更新。多形式の metadata reader / writer | [0.25.4 manifest](https://docs.rs/crate/lofty/latest/source/Cargo.toml) は **MIT OR Apache-2.0**、edition 2024 / rust-version 1.89。既定 id3v2_compression_support は flate2 ^1.1.10 で現 lock 1.1.9 の更新を伴う。lofty_attr 等も追加。Rust backend を選べば native zlib / DLL は不要と見込むが未ビルド | [GlobalOptions::allocation_limit](https://docs.rs/lofty/latest/lofty/config/struct.GlobalOptions.html) は **現在の thread の単一 tag item** の制限で有用。ただし全 picture 数 / 合計保持 / inflate 途中の cancel hook は確認できない。read_cover_art(false) は抽出要件を満たさず、read_properties(false) だけでもこれらは解決しない |
+| APIC 専用 reader | 自分で維持する範囲は header / frame walk / PIC・APIC envelope / unsync のみ。zlib と画像 codec は既存実装を使う | product と同じ MIT。**通常依存・lock・CRT・配布 DLL の追加なし**。既存 flate2 / miniz_oxide の license notice を照合する | 画像を確保する前に candidate 数・image 長を検査し、固定出力 buffer の inflate 各呼出に cancel / deadline を置ける。証明とテストの所有者が一つ (§3.2) |
 
-### 3.2 巨大タグ・壊れた画像で worker を占有しない
+lofty の options は FFmpeg の process 共通 allocator とは違い **thread-local**。
+採用するなら再使用 worker で設定の復元も必要だが、その仕組みだけで picture-count 制限にはならない。
+両 crate の現行圧縮実装を「無制限」と断定しない。固定版 source 全体を未取得であり、
+**公開 API で要求全体の制限を証明できず、17 枚目の画像確保前に止める契約を持てない**ことが不採用理由。
+外側で frame を全走査し、圧縮・unsync を復号して単一候補を合成 tag として渡す案は、
+必要な自作部分がほぼ同じになり、汎用 parser と二重に検証する面が増える。fork / upstream patch も初版では推奨しない。
+汎用タグ編集・非 MP3 抽出を加えない今回の範囲では、APIC 専用 reader の方が制限を保ちやすい。
 
-利用者が採用した初期値 (2026-10-08、Q4): ID3 領域合計 32 MiB、候補 16 枚、候補 bytes 16 MiB、
-一枚 40 MP / decode 割当 160 MiB、抽出開始から 10 秒。
-候補ごとに bytes / 寸法の上限を先に検査し、
-全候補を RGBA 展開してから選ばない。画像ヘッダの dimensions と checked arithmetic で
-overflow / allocation bomb を防ぎ、decode 側にも allocation limit を設定する。
+license の配布条件: mIV は root LICENSE の **MIT** (root manifest の license=None とは区別)。
+id3 採用ならその著作権・MIT 本文、lofty 採用なら選んだ MIT 本文と各通常依存の著作権・license を
+配布 notice に含める。Apache-2.0 を選ぶ場合は LICENSE と upstream NOTICE があるか確認し必要な notice を保持する。
+MIT 製品の license 自体を変える設計ではない。新案は他 crate の parser source をコピーせず仕様から記述する。
+既存 flate2 1.1.9 = MIT OR Apache-2.0、miniz_oxide 0.8.9 = MIT OR Zlib OR Apache-2.0 は
+ローカル Cargo manifest / metadata で確認し、選択する MIT 本文・著作権とその依存の notice を配布物で照合する。
+notice の完全性を今回の調査だけで保証せず、配布資料への不足追記は実装時の co-update に含める。
 
-**既存 `input_with_interrupt` を呼ぶだけでは読込・割当の上限が保証できない。**
-details probe では open と stream-info を一括取得するが、ジャケットだけのために音声を probe / decode
-する必要はない。推奨 adapter は `avformat_open_input` の段階で MP3 の添付 stream を取得し、
-`avformat_find_stream_info` / packet 全尺ループを使わない。File + bounded AVIO の read / seek
-に取消・期限・累積読込予算を置き、タグ header のサイズも割当前に検査する。
-複数 ID3 header / skip / seek を含む malformed fixture で上限の有効性を検証する。
-単一 header の事前検査だけを「全入力が有界」の根拠にしない。
+`cargo metadata --offline --locked --format-version 1` と
+`cargo tree -i flate2 -e features --offline --locked` は成功。
+現 graph は flate2 1.1.9 の default / rust_backend / miniz_oxide / any_impl で、native zlib feature はない。
+調査 facts は `target/id3-redesign-evidence/metadata-facts.json`。
+`.cargo/config.toml` の Windows MSVC +crt-static を変えず、ビルドの実証は実装後の normal / portable check に残す。
 
-これは技術ゲートであり、同梱 FFmpeg の open-only / allocation を有界化できない場合は
-実装を進めず設計担当へ戻す。代案は保守された ID3 crate の直接 APIC 読込。
-その場合は依存追加・license・tag limits を設計変更として再レビューする。
-FFmpeg の packet 再生 / HW decode への fallback、第二の parser を自動併用する案は採用しない。
+### 3.2 有界 APIC reader と新しい技術ゲート
+
+利用者採用の Q4 は保持: **ID3 領域合計 32 MiB、候補 16 枚、画像 bytes 16 MiB、
+一枚 40 MP / decode 割当 160 MiB、抽出開始から 10 秒**。
+下記は、その上限を割当前に検査する具体化の提案。製品 reader / 新 harness はまだ書いていない。
+
+#### header → frame walk → APIC の最小経路
+
+1. worker が MP3 実ファイルと fresh source stamp を確立する (§5.3)。一覧の日時を使わない。
+   File の read / seek、走査・unsync・inflate に同じ request token / 開始期限を渡す。
+   10 秒は協調的な期限であり、阻害不能な OS read / stat / 一回の画像 decode の強制終了保証にはしない。
+   UI は join せず、期限後の結果は Failed、取消は Canceled として §4 の既存終端へ返す。
+2. 最初の 10-byte ID3 header を stack buffer で読む。syncsafe の各上位 bit、version / flags、
+   checked offset + length と file 範囲を確認し、**宣言 tag が 32 MiB 超なら payload 読込・heap 確保前に拒否**。
+   連続した先頭 ID3 tag は seek で header だけを preflight し、header / body / footer を含む
+   物理 ID3 領域合計にも 32 MiB を適用する。小 tag の連続で予算を迂回しない。
+   v2.4 は末尾 10-byte `3DI` footer がある場合だけ対応 header の offset を逆算し検証する。
+   先頭領域との重複は一度だけ数え、末尾単独 tag も同じ合計予算で扱う。音声全尺を探索せず、
+   SEEK frame / 任意位置の magic 検索・音声 packet の解析はしない。tag の元順は file offset 順。
+   先頭は無タグ・末尾も該当なしなら NoArt。header の列を無制限 Vec に保持せず offset で再走査する。
+3. preflight 後、**合計値以下の固定容量 raw tag 領域を一つだけ**確保し、小 chunk で読む。
+   再読 header に同じ境界検査を適用し、合計値 / source stamp が変われば公開しない。
+   読込と解釈の双方に同じ上限を再検査し、Q6 の同 stamp 編集の検出保証は増やさない。
+   read_to_end、ファイル全体の mmap / read、入力長に合わせた無制限 Vec growth は使わない。
+4. v2.2 の 6-byte PIC frame (24-bit BE size)、v2.3 の 10-byte APIC frame (32-bit BE size)、
+   v2.4 の 10-byte APIC frame (syncsafe size) を各 version 専用 helper で歩く。
+   frame の header / body が tag 範囲内、size > 0、offset が単調増加であることを checked arithmetic で検査。
+   padding / extended header / footer の境界を分け、v2.3 の extended size は 4-byte size 自身を含まず、
+   v2.4 は含む。未知の正常な frame は size で skip し、非 APIC は decode / inflate / 文字列化しない。
+   不明 format flags / 暗号化 frame は安全に skip し、境界自体が壊れた tag は salvage 検索せず拒否する。
+   v2.2 の仕様未定義の tag 全体 compression は対応外 (NoArt + log)、v2.3 / 2.4 の zlib APIC は対応する。
+5. v2.2 / 2.3 の tag unsync は frame walk **前**に body を in-place で詰める。
+   v2.4 は raw frame 長で範囲を切り、その frame の unsync を一回だけ解く。
+   tag 全体 flag と frame flag の両方が立っても二重処理しない。unsync は出力を増やさない。
+   frame format の group / compression / DLI の補助 field を version に従って読み、復号順は
+   unsync → format fields → zlib → APIC envelope。frame walk 時に一度だけ in-place unsync を行い、
+   descriptor は復号済み範囲を参照する。type 調査と実 decode の再 inflate で unsync を繰り返さない。
+   暗号解読・説明文字列の Unicode 変換は作らない。
+6. 全 tag を走査し、PIC / APIC の **物理出現数**を数える (URL / 不正・対応外候補も含む)。
+   **17 枚目で候補 descriptor / 画像 bytes / inflater の追加確保前に要求を NoArt + log で終える**。
+   最初の 16 枚だけを採用して不完全な front 優先にしない。descriptor は最大 16 個の固定容量で、
+   raw 領域内の復号済み offset / length・version / format fields / 元順だけを保持し、
+   画像 bytes や全 frame object を複製しない。
+7. 各 descriptor の APIC prefix から picture type を得る。v2.2 は 3-byte format、v2.3 / 2.4 は
+   MIME の終端、type、description の終端を検査する。Latin1 / UTF8 は 1-byte 終端、
+   UTF16 / UTF16BE は encoding の version と 2-byte alignment / BOM の必要条件を守る。
+   説明は読み飛ばし、String 化しない。URL 型 `-->` は開かず skip。壊れた prefix は候補不適格。
+   圧縮候補の type 調査も固定 scratch で必要 prefix だけ inflate する (§下段)。
+8. type=3 の前面表紙を元順で全部試し、次に残る候補を元順で試す (Q2)。同じ description の
+   APIC を Tag の重複排除規則で失わない。候補を一枚ずつ完全性検査・画像 decode し、最初の有効画像を返す。
+   圧縮候補は prefix 調査と実 decode 時に最大二回 inflate するが、同時に一個の inflater / image だけを持つ。
+   JPEG / PNG は必須対応。MIME だけを信用せず signature / dimensions / checked 画素数 / codec Limits を確認し、
+   既存縮小・WebP encode に渡す。EXIF orientation は既存 byte decode と同じ、音声の補正 / AI / 回転を適用しない。
+9. 保存・公開前 (cache hit も同様) に source を fresh stat し、stamp と context 世代が一致した場合だけ採用。
+   MP3 を書き換えない。source_dims はジャケット画素寸法、audio の video_meta.width/height は NULL のまま。
+
+仕様照合: [ID3v2.2](https://id3.org/id3v2-00)、[v2.3 structure / APIC](https://id3.org/id3v2.3.0)、
+[v2.4 structure](https://id3.org/id3v2.4.0-structure)、[v2.4 APIC](https://id3.org/id3v2.4.0-frames)。
+version の size / unsync / prefix 順を一つの「寛容」helper にまとめず、fixture で各仕様を固定する。
+
+#### 圧縮 frame: 宣言値と実出力の二重制限
+
+v2.3 compressed frame の 4-byte BE decompressed-size、v2.4 の compression に必須の
+syncsafe data-length-indicator (DLI) を **inflate 前**に検査する。欠落 / 不正 / overflow は候補不適格。
+DLI は画像だけでなく encoding / MIME / type / description を含む **APIC body** の長さである。
+そのため DLI > 16 MiB を一律拒否すると、16 MiB 以下の画像と説明を持つ frame も拒否してしまう。
+
+- APIC body の宣言展開長には既存 tag budget と同じ **32 MiB** の hard cap を置き、それを超えたら
+  inflater 作成前に拒否する。宣言長そのものを Vec capacity / zlib 出力確保量にしない。
+- 既存 `flate2::Decompress::new(true)` と `decompress(input_slice, output_slice, ...)` を使う。
+  input / output を各 **64 KiB 以下**に分け、呼出前後に token / deadline / total_in / total_out を検査する。
+  whole-frame read_to_end / uncompress / 宣言長の一括 buffer は使わない。decompress_vec の自動成長にも頼らない。
+- prefix は固定 scratch で流して捨てる。終端が見つかった時点で prefix の論理長を宣言展開長から引き、
+  **宣言画像長 > 16 MiB を、画像用 buffer の確保と残りの inflate の前に拒否**する。
+  prefix 自体も total_out <= 宣言長 <= 32 MiB と期限で止め、長い description を heap に保持しない。
+  §15 の 24 MiB bomb は prefix 調査までで拒否され、24 MiB の展開 buffer / image copy を作らない。
+- 画像用 buffer は検査済みの宣言画像長だけを固定容量で確保し、実 image bytes も 16 MiB 以下に制限する。
+  残量までの出力 slice と境界検出用一 byte の scratch を使い、偽の小さい DLI でも grow せず拒否する。
+  上限外の一 byte は境界検出用 scratch だけへ出し、image buffer に入れず拒否する。
+  完了時には **StreamEnd / 宣言長との一致 / zlib checksum /
+  frame input 消費**を確認。truncated・dictionary 要求・連結 member / trailing junk は不正候補とする。
+  input / output が進まない状態も失敗として停止し、retry loop にしない。
+- 非圧縮候補も同じ prefix 解釈後に **実画像長 <= 16 MiB** を検査し、raw 領域を借用する。
+  v2.4 の非圧縮 DLI も復号後の body 長と一致させる。unsync の escape bytes を画像長に数えない。
+
+これにより「tag の物理長32 / frame の物理範囲 / APIC 論理出力32 / image16」の異なる長さを区別する。
+新しい利用者設定・別の decode policy は増やさず、Q4 の **画像** 16 MiB を保つ。
+制限・不正 frame は候補 skip、使える候補が無ければ NoArt + log。
+全要求の tag / candidate 数超過は直ちに NoArt、timeout は Failed、取消は Canceled で永続 absence にしない。
+
+一要求の抽出領域は raw <=32 MiB + image <=16 MiB + 固定 scratch と inflater 内部領域。
+flate2 / miniz の内部領域も allocator 計測で確認し、宣言値に比例した隠れた割当を許さない。
+候補間では image / inflater を解放し、decode 後は raw / inflate 領域を WebP encode 前に解放できる境界にする。
+画像 codec の 160 MiB は抽出領域と別予算であり、**全要求160 MiB以下とは主張しない**。
+最大同時一時領域は抽出48 MiB + codec160 MiB + 固定領域・既存縮小/encode buffer の重なりを
+実装時に積算し、§4.1 の共通 semaphore で Local / Remote 全 context に適用する。
+10 秒期限は全候補・prefix 再 inflate を通して一つ。候補ごとにリセットしない。
+
+#### 新 gate harness の説明・成立条件 (未実装 / 未実行)
+
+次の実装依頼の **最初のゲート**は、製品共通にする safe Rust reader / bounded inflater を
+そのまま dependency-only test harness から呼び、画像 decode / DB / UI より前の境界を実証すること。
+別の簡略 parser を harness にだけ書いて通過扱いにしない。ffmpeg crate / DLL の初期化はゼロ。
+既存 `audio_album_art_gate.c` / `check_audio_album_art_gate.py` は **旧方式の FAIL 再現資料**として保持する。
+新方式の合否には使わず、旧 exit 1 を成功へ書き換えない。fixture の bytes / SHA を再利用する。
+新 harness の出力は `target/audio-art-rust-gate/` とし、source / fixture / dependency / compiler の版・SHA、
+実 exit code、requested allocation / peak live heap / private commit 差、読込 / inflate byte 数、
+cancel / deadline 検査回数を保存する。private commit だけで割当前制限を証明しない。
+
+| 新 gate / 回帰 | 必須証拠 |
+| --- | --- |
+| header / frame | 32 MiB 境界と +1、連続 tag、末尾 v2.4 footer、重複・破損 footer、巨大 header で payload read / heap=0。v2.2/3/4 size endian / syncsafe、高 bit、不正 flags、extended header、padding、cut / overflow / zero length、unknown frame skip |
+| 候補 / 選択 | 16 / 17 枚、17 枚目の画像 / inflater 確保=0、同じ description の複数 front、逆順、壊れた front→次の front→他候補、URL、encoding 0/1/2/3 と UTF16 alignment / terminator / BOM、先頭・末尾 tag の順 |
+| 圧縮 / unsync | v2.3 decompressed-size / v2.4 DLI、group flags、圧縮 + unsync の組合せ、tag + frame unsync を一回だけ適用、FF 00 / FF E0 / FF 00 00 と chunk 境界。DLI 超過 / 欠落 / 小さすぎ・大きすぎ / CRC不正 / truncated / dictionary / multi-member / junk / no-progress を拒否 |
+| 割当前制限 | 既存 24 MiB bomb に加え、宣言32MiB超の少量圧縮入力、宣言画像16MiB超、偽小 DLI で実出力過多、長い description と小画像、非圧縮16MiB境界。allocation instrumentation で tag / image の最大要求量と同時保持を確認し、image / whole expanded-frame 超過 allocation=0 |
+| cancel / 時間 | open前、header / tag read / unsync / frame walk / prefix / image inflate 中の fake token / fake clock 検査、16候補で期限がリセットされない。小chunk一回分で協調停止し、NoArt保存=0、旧結果採用=0。実時刻でも10秒期限を検証し、OS call の例外を記録 |
+| fuzz / regression | header/frame の純関数と capped inflate の二つの fuzz target。小さい注入 Limits で全分岐を短時間に探索し、実32/16MiB fixtureも回帰に残す。panic / OOB / overflow / 超過割当 / 無進捗loop=0、出力は入力領域か検査済み所有画像だけ。クラッシュ corpus を lib regression に固定 |
+
+fuzz driver (cargo-fuzz / libFuzzer 等) は開発専用で製品依存に入れない。Windows native の deterministic
+regression / allocation gate と、対応する toolchain での sanitizer fuzz を分けて結果を明記する。
+新 gate 不成立ならここで停止し、FFmpeg / 別 crate / 制限緩和を実装者判断で代用しない。
+
+状態の簡素化として、汎用 Tag object、全画像展開、二つの parser の fallback、別 reader worker、
+inflate の resume / retry / recovery state を作らない。一要求の local 変数と最大16 descriptor だけで
+同期的に (既存 worker 内で) 完了させ、既存 typed result / context cancel owner へ返す。
+一覧の可視 thumbnail を modal にすると通常操作を止めるため採用しない。既存 worker と取消だけを使う。
 
 ### 3.3 動画と同じ同名 sidecar (Q1 訂正、2026-10-08)
 
@@ -779,7 +898,10 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
 
 ## 8. 利用者への質問と決定状況
 
-**未決の利用者質問はない。** Q1 は 2026-10-08 の訂正を正本とし、Q2〜Q7 は既決事項のまま (§1)。
+**利用者仕様の未決質問はない。** Q1 は 2026-10-08 の訂正を正本とし、Q2〜Q7 は既決事項のまま (§1)。
+coordinator は旧ゲート失敗を受領し、FFmpeg を抽出経路から除く再設計を依頼した (2026-10-08)。
+§3 の APIC 専用 reader は技術提案として設計担当・独立レビューへ引き継ぐ。追加の利用者仕様質問はない。
+旧 TG1 の二択は撤回し、失敗履歴は §15、再生への別観測は §16。
 初版は同名画像 → 前面表紙優先の MP3 埋め込み → アイコン。手動画像指定の質問・操作・DB 設計は撤回した。
 「動画と同じ」は二つの既存設定に従う sidecar 採用・画像行省略を意味し、利用者の OFF 設定を引き継ぐ。
 
@@ -790,8 +912,9 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
    R7 の永続コレクション snapshot / navigation replacement の出所伝達も再レビューし、
    R2 の catalog maintenance 境界・422 分類と、R1 の 6 件の変更境界を実装 brief に含める。
    extraction の有界性、terminal 契約、親 catalog、Remote session Flight も維持する。
-2. 合意後の最初の作業は §3 の synthetic ID3 fixture と同梱 FFmpeg adapter 検証。
-   front / back の選定 metadata、open-only、取消 / 上限が成立しなければ設計を戻す。
+2. 抽出再設計の合意後、最初に §3.2 の共通 Rust reader / bounded inflate gate を実装・検証する。
+   header / frame / image の割当前制限・取消・fuzz / 回帰が成立しなければ停止して設計を戻す。
+   旧 FFmpeg harness の成功ケースを新 reader の証明として流用しない。
 3. 型付き結果契約と NoArt の共通 consumer を挙動不変の chunk で整え、source catalog の
    追加 schema / helper、共通 sidecar source / discovery、Audio 要求 / 全 surface の UI、
    表示マーク設定 / transfer / snapshots、Remote を同じ feature の完了範囲にする。
@@ -800,7 +923,7 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
 
 | 層 | 必須の受入テスト (今は未実行) |
 | --- | --- |
-| extraction | ID3v2.3 JPEG (要望素材相当の synthetic)、v2.4 PNG、v2.2 PIC、front/back 逆順、複数 front、壊れた front と正常な別画像、タグなし、URL APIC、unsynchronization、extended header、切れた tag、巨大 tag・dimensions・候補過多、期限 / cancel |
+| extraction | §3.2 の新 Rust gate 全件・allocation 計測・fuzz corpus に加え、JPEG / PNG の実 byte decode、dimensions / 40 MP / 160 MiB Limits、front 優先・不正候補 fallback、取消 / timeout の終端・保存禁止。album-art から FFmpeg input / init を呼ばない |
 | state / routing | 実 Audio の sidecar / MP3 要求が作られる、sidecar のない非 MP3 / NoArt で requested=0 / repaint=0 / upgrade=0、cancel 後に NoArt を保存しない、timeout で再投入しない、late message / upload backlog / Finalized の既存挙動、Loaded eviction と再表示 |
 | worker 境界 (R1-1/2) | 通常 / 合成一覧の UI 呼出を計測し、追加 schema / art SELECT / absence / scoped prune が UI に 0 回、UI bulk query が art BLOB を読まない。ActivityGate pause / 連続入力中でも可視・hover を gate 待機させず、同じ heavy queue の Folder / ZIP も進む |
 | source stamp (R1-3) | bookmark 登録日時≠原本 mtime、同一 MP3 の異なる日時の複数 bookmark、history の未知 stamp 0 / 表示 meta None でも worker stat で Loaded / NoArt になる。stat 失敗で stamp 0 の cache 行を書かず、読込中の実 stamp 変更は公開・保存しない |
@@ -826,11 +949,13 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
 実装時に既存不具合も直す場合は、その違反境界の failing regression を修正前に実行し有効な red を残す。
 targeted → full lib `cargo test -p mimageviewer --lib` (pipe なし・実 exit code)、
 `cargo fmt`、normal / portable の core check、`python scripts/check_ui_glyphs.py` を行う。
-共有 ThumbMsg / catalog maintenance 境界の変更では [build/test policy](development-build-and-test.md) の full gate も必要。
+共有 ThumbMsg / catalog maintenance 境界も [build/test policy](development-build-and-test.md) に従うが、
+2026-10-08 の実装依頼の **test-full / build-dist 禁止**を優先する。full lib と core / Remote / UI の指定 gate を実行する。
 Remote IPC / Web tests を省かず、CI 依存・timeout は十分な時間を確保する。
 
 実装後は build-dev.ps1 で通常 core の確認 binary を用意し、Remote も同時 build する。
-この設計のみの作業では build / test / binary 起動は不要で、実行済み件数は 0。
+R7 までの設計のみの作業では build / test / binary 起動は不要で、実行済み件数は 0。
+実装着手時は §15 の依存 gate 11 件 (10 成功・1 失敗) の段階で停止した。製品の build / test は未実行。
 利用者による実機確認の候補は、多数 MP3 の scroll / 再訪・タグ編集後の更新、全一覧と詳細 hover、
 art なしで idle CPU / repaint、再生中の一覧・F12・Remote の取得 / 切断、スマートフォン表示。
 エージェントは製品 binary を起動しない。具体的な確認枠と利用者の明示承認は実装後に調整する。
@@ -848,10 +973,11 @@ video_pins.db、rename / metadata transfer の user-data 形式、keymap に音�
 「安心して使えます」も照合し、新しい外部通信は増えないこと、既存認証済み Remote への
 ジャケット配信が画像配信の記述に含まれることを確認する。
 
-coordinator への引き継ぎ: Q1 訂正と既決 Q2〜Q7、R7 の永続コレクション出所伝達の再レビュー、
-入力有界化の技術ゲート、
-全 producer / consumer を含む実装 brief と file ownership、統合 IPC 番号の決定が次の作業。
-commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-r7-msg.txt` に置く。
+coordinator への引き継ぎ: 受入済み R7 と Q1 訂正・既決 Q2〜Q7 は保持する。§3 の
+依存比較 / 有界 APIC 専用 reader と新 gate を独立レビューし、その合意と新 gate の成立まで
+Remote / sidecar / 設定を含む製品実装へ進まない。§16 の再生時割当は別 backlog 候補として判断する。
+今回の変更は抽出設計・索引・旧 harness の説明だけ。commit は行わない。
+今回の英語メッセージは `target/D-1347-redesign-msg.txt` に置く。
 過去の target/D-*-msg.txt は変更しない。
 
 ## 11. 独立設計レビュー R1 への対応記録
@@ -900,10 +1026,127 @@ commit・製品 binary 起動なし。製品テスト実行数は 0。
 ## 14. 独立設計再レビュー R7 への対応記録 (2026-10-08)
 
 4fe5979e0 の再レビューの P2 をコードで確認し採用した。異論はない。判定 REVISE を記録し、
-今回の文書修正は再レビュー待ちとする。追加の利用者質問はなく、既決仕様は変更しない。
+R7 文書修正時点は再レビュー待ちだった。その後の受入は冒頭の利用者伝達記録を参照。
+R7 では追加の利用者質問はなく、既決仕様は変更していない。
 
 | 指摘 | 確認したコードと解消内容 |
 | --- | --- |
 | R7-P2 永続コレクションの出所伝達 | persistent_collections.rs:1566 が thumbnail_address: None を作り、mod.rs:153 の populate_remote_entries は通常 RemoteEntry のみが対象であることを確認。snapshot (503,538) と navigate (635) は view_facts / navigation_view_facts を使い、wire_snapshot (1449) が facts.entries をコピーする。§7.1 に共通 discovery→Available.thumbnail_address の付与を byte 計算 / token 確定前に行う契約と、設定を含む既存 facts reuse key・取消 / deadline・refresh の所有境界を追記。app.js:4921,7307 は既存 optional 出所を tile / query に渡せるため wire field の追加は不要。§9 に両経路の FLAC / MP3、設定・再利用・frame 上限・token・Web 伝達の回帰条件を追加 |
 
 文書のみの修正。製品コードの実装・commit・製品 binary 起動なし、製品テスト実行数は 0。
+
+## 15. 実装着手時の FFmpeg 技術ゲート (2026-10-08、FAIL / 停止)
+
+利用者の実装依頼どおり、他の製品コードを変更する前に **当時の** §3.1 / §3.2 の FFmpeg 依存実証を行った。
+この節は失敗履歴。coordinator は証拠を受領し、現在の抽出方式は §3 へ再設計した。
+**11 件中 10 成功・1 失敗、gate runner の実 exit code は 1。割当ゲートは不成立。**
+この結果を以て機能実装を停止し、代替 parser / 子プロセス / 制限の緩和へは進んでいない。
+
+### 実証した境界
+
+- [依存専用 C harness](../scripts/audio_album_art_gate.c) を、この worktree の FFmpeg headers / import
+  library で MSVC x64 compile し、vendor/ffmpeg/bin の DLL をロードした。
+  実行版は `n7.1.5-16-g9a4bb2c579-20260816`。製品 executable の起動ではない。
+- File + custom AVIO read / seek に取消・deadline と累積 callback read 上限 (32 MiB + 64 KiB) を置き、
+  連続した **全 ID3 header** の宣言サイズ合計を open 前に 32 MiB 以下と検査する。
+  seek はファイル範囲内に限定。AVFormatContext の interrupt callback と max_streams=17 も設定する。
+  事前 header 検査の read と AVIO の累積 read は別計測で、報告の bytes_read は後者。
+- `avformat_open_input` を MP3 demuxer 指定で一回呼び、attached picture の size / comment を借用して検査する。
+  `avformat_find_stream_info`、packet ループ、audio / video decoder、画像 decode は呼ばない。
+  共有 libavutil の allocator 上限は変更しない。user settings / DB / 実 MP3 にはアクセスしない。
+- 素材は Python / Pillow で生成する 1x1 JPEG / PNG、synthetic MP3 frame、ID3 APIC / PIC のみ。
+  [再現 runner](../scripts/check_audio_album_art_gate.py) が harness を compile し、ケースごとに独立 child で実行する。
+  child timeout は 20 秒で実験を停止するための上限であり、製品の 10 秒保証の代用ではない。
+
+| 確認 | 結果 / 保証できる範囲 |
+| --- | --- |
+| v2.3 JPEG / v2.4 PNG / v2.2 PIC | 3 件成功。open-only で attached packet と front metadata を取得 |
+| back → front-a → front-b / 無タグ | 2 件成功。複数 attached stream と二つの front metadata、無画像 0 stream を確認。画像 decode / 選択全体の製品実装試験ではない |
+| open 前 cancel / deadline、read 中 cancel、累積 read 制限 | 4 件成功。前者は open 0 回、後者は callback が停止して open 失敗。FFmpeg 内の全 CPU / 割当箇所へ取消が届く保証とはしない |
+| 連続 ID3 の合計上限 | 1 件成功。各 17 MiB の二つの tag は一つ目を検査した後、FFmpeg open 前に拒否 |
+| 圧縮 APIC の割当上限 | **1 件失敗**。以下の入力は header / read 上限を通るが、open 内の割当と画像 packet が予算を超える |
+
+### 失敗の証拠と原因
+
+v2.4 の compressed + data-length-indicator flag を持つ APIC に、1x1 PNG と padding を合わせた
+24 MiB の展開データを入れた。圧縮済み ID3 は **24,597 bytes** で 32 MiB 未満。
+データ長と frame 長は v2.4 の syncsafe 形式で生成し、巨大 RGBA decode を使わず再現する。
+
+- callback read は **42,037 bytes**、open は ret=0、**32 ms** で成功した。
+- returned attached packet は **25,165,806 bytes** (約24 MiB) で、候補 16 MiB の上限を超えた。
+- Windows `GetProcessMemoryInfo` の PeakPagefileUsage の open 前後差は
+  **239,661,056 bytes (約228.56 MiB)**。
+  これは private commit の peak 差分であり、RSS / GPU / 画像 decoder の計測ではない。
+  画像 decode を始める前に、160 MiB を超える追加割当を観測した。
+- 圧縮 frame のサイズ情報に基づく libavformat 内の展開 buffer 確保は、AVIO callback の
+  物理 read budget / seek guard や attached_pic の事後 size 検査では拒否できない。
+  ID3 合計 32 MiB だけを割当前に検査する構成は、展開後の割当上限の証明にならない。
+  max_streams も既に読んだ ID3 frame の展開・候補確保の上限にはならない。
+
+上流 n7.1.5 の [id3v2_parse / read_apic](https://github.com/FFmpeg/FFmpeg/blob/n7.1.5/libavformat/id3v2.c)
+では compressed data length による展開 buffer 確保と、その後の APIC buffer 確保が parser 内にある。
+これはコード照合の補助資料であり、同梱 +16 版の挙動の根拠は上記の **実 DLL の計測**。
+ローカルの `vendor/ffmpeg/include/libavutil/mem.h:588` の av_max_alloc は一 block の共通 allocator
+上限を変える API で、要求 / context ごとの budget ではない。動画 / 音声の再生と共有する allocator を
+抽出中だけ変える案は accepted design の既存再生維持・worker 所有境界を満たす根拠にならないため採用しない。
+
+### 再現・引き継ぎ
+
+repository root から `python scripts/check_audio_album_art_gate.py` を実行する。
+Windows x64 MSVC build tools と Python Pillow が必要。出力はこの worktree の
+`target/audio-art-gate/` のみ。fixture、build log、各 stderr、DLL SHA-256 と HEAD / harness SHA-256 を含む
+[results.json](../target/audio-art-gate/results.json) を保持する。正常系 10 件成功・圧縮 allocation 1 件失敗、
+exit 1 が当時の再現結果。ゲート失敗を green として扱わず、割当の事後検査だけで実装を再開しない。
+再設計時の script 冒頭説明の変更により現 source SHA は当時計測版と異なるが、実行 logic は不変。
+results.json の元 SHA / DLL・fixture・計測結果は更新せず、旧再現資料と新 Rust gate を区別する。
+
+**当時の技術相談 TG1 (現在は撤回):** FFmpeg adapter の追加有界化か、ID3 crate への変更かを相談した。
+2026-10-08 に coordinator が失敗証拠を受領し、FFmpeg を album-art から完全に除外する再設計を指示。
+§3 の代替評価・APIC 専用 reader 提案へ置き換えた。旧ゲートの計測・exit 1 はそのまま保持する。
+利用者の Q1〜Q7 と Remote / sidecar / 表示マーク仕様は変更していない。
+
+製品実装・IPC 更新・settings / catalog schema 更新・manual の完成扱いは行っていない。
+Rust / Web の focused / full lib / normal・portable core / ui_snapshot / build-dev は、ゲート成立後の工程のため未実行。
+製品確認 binary は作らず、製品の手動確認を利用者へ依頼しない。commit・製品 binary 起動なし。
+
+当時の付随検証: `cargo fmt --all -- --check` は exit 0、`python scripts/check_ui_glyphs.py` は
+危険 glyph 0 / exit 0。gate runner の `py_compile`、ローカルリンク 13 件、変更 5 ファイルの
+UTF-8 / CRLF、`git diff --check` も成功。既存製品の不具合修正ではないため bug-fix red はなく、
+gate の allocation 失敗を成立した技術試験として保存する (機能の合格・実装済みとはしない)。
+
+## 16. 別観測: 再生時の圧縮 ID3 割当 (2026-10-08、修正せず coordinator 判断)
+
+**backlog 候補 (未採番・未決定): 「MP3 再生準備 / 音声解析の ID3 展開割当を調査」**。
+§15 の synthetic MP3 / 実 FFmpeg DLL で open-only が **239,661,056 bytes (228.56 MiB)** の
+追加 peak private commit を発生させた。画像 decode なし、圧縮 ID3 は24,597 bytes、
+attached packet は25,165,806 bytes。元証拠は target/audio-art-gate/results.json / fixture / DLL SHA。
+
+| 既存経路のコード照合 | 観測から言えること / 限界 |
+| --- | --- |
+| src/video/decoder.rs:2334 → video/avio_progress.rs:476,499 | 再生 demux は input_with_progress から avformat_open_input、次に avformat_find_stream_info。同じ libavformat の ID3 open を通り、今回の要求単位 tag / 展開上限はない。custom AVIO は進捗用で、内部展開割当の cap ではない |
+| src/video/avio_progress.rs:364,370 | custom AVIO 不可 / 無効時は ffmpeg::format::input の fallback。Rust wrapper も format open を行うため、APIC 除外で open 内の割当を回避する構造ではない |
+| src/app.rs:68819,68843 (build_audio_player_for_open)、68325,68391 (動画) / src/video/decoder.rs:2376 | audio-only MP3 も headless VideoPlayer::open_with_output_consumer から同じ decoder を使う。ATTACHED_PIC の映像除外は **open 後**であり、cover を HW decode しない保護であって ID3 展開防止ではない |
+| src/app/native_video.rs:13787,13915,14970 | 動画→音声モードへの単なる入場は presenter を hide して **既存 player / decode を継続**し、新 MP3 を開き直す操作ではない。一方 source swap / 次の MP3 を開く場合は build_video_player_for_open を通って同じ open が走る |
+| src/audio_decode.rs:189,196,682 | 音声解析の open_audio_decode と別 decode 経路も ffmpeg::format::input。共通 player の open だけでなく波形等の別 input open も調査対象候補 |
+
+従って既存 MP3 再生 / 解析にも同種の追加割当が起きる可能性がある。
+**製品の各経路で229 MiBを計測したという主張ではない**。製品 binary は起動しておらず、
+wrapper・probe・同時 open 数による実際の peak / 取消挙動は未計測。
+coordinator が backlog 化・優先度・専用調査を判断する。今回は再生の open、attached-picture 除外、
+動画→音声モード、波形、decode、共通 allocator に変更を加えない。
+
+## 17. 今回の変更規模と残る技術確認
+
+通常依存・product code・IPC・DB・settings の変更は **0**。文書の抽出節と gate 説明、
+README 索引、旧 harness の冒頭説明だけを改訂し、旧 gate の executable logic / evidence を保持した。
+APIC 専用 reader の見積は core **約400〜650行**、synthetic regression / allocation harness / fuzz driver は
+**約700〜1,000行** (実装前の概算、既存画像 decode helper と Remote / UI / catalog 本体の実装量は別)。
+FFmpeg adapter を置き換える範囲だけが増減し、受入済み feature の完了範囲は縮小しない。
+
+残件は設計担当の技術判断と新 reader gate。crate を採用する変更へ戻る場合は、固定版の
+registry / checksum / license 本文 / inflate source / build を取得して証明し直す。
+利用者仕様の追加質問はない。今回の再設計を独立レビュー受入済みとは扱わない。
+
+今回の文書確認: UTF-8 / CRLF 5 ファイル、ローカルリンク13件、旧 Python runner の executable AST 不変、
+py_compile、UI glyph lint (危険 glyph 0)、git diff --check が成功。offline metadata / tree は実 exit 0。
+新 parser / gate と製品テストは実行0件、旧FFmpegゲートも再実行せず既存証拠を保持した。
