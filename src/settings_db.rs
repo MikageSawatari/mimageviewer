@@ -7265,6 +7265,51 @@ mod tests {
     }
 
     #[test]
+    fn chrome_suppression_settings_kv_roundtrip_and_missing_released_key_keep_raw_locks() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.fullscreen_top_bar_locked = true;
+        settings.set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        settings.video_top_bar_locked = true;
+        settings.set_video_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        settings.fullscreen_chrome_suppression = crate::settings::FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_chrome_suppression,
+            settings.fullscreen_chrome_suppression
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'fullscreen_chrome_suppression'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_chrome_suppression,
+            crate::settings::FullscreenChromeSuppression::default()
+        );
+        assert!(loaded.fullscreen_top_bar_locked && loaded.video_top_bar_locked);
+        assert_eq!(
+            loaded.still_bottom_lock(),
+            crate::settings::BottomBarLock::BarAndStrip
+        );
+        assert_eq!(
+            loaded.video_bottom_lock(),
+            crate::settings::BottomBarLock::BarAndStrip
+        );
+    }
+
+    #[test]
     fn place_details_are_persisted_without_unknown_variants() {
         let dir = TempDir::new().unwrap();
         let mut settings = Settings::default();

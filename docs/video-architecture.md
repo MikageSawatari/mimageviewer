@@ -2948,6 +2948,18 @@ XButton の context-owned hold を tickし、Phase 3 で `tick_native_video_loop
 UP terminal がrepeatより先に確定し、repeatは既存 `next_repaint` deadlineへ合流する。順序は P2/P3を
 入れ替えると serial guardが直近 seekを検出できないため固定。
 
+### F11の固定表示抑制とnative chrome snapshot (§1.344)
+
+`NativeChromeSnapshot` はraw bar / context info state / 抑制対象を一体で運び、従来のbar・side-panel別更新を置換する。
+初期configとcandidateはraw policyとtarget host identityを受け取る。`NativeChromeState` はそのcoreのplacement・
+既存generation・window lease / host incarnation / HWNDに対応付けたapplied factを保持し、更新時に実効値を解く。
+保留commandのraw policyは適用先のplacementで再計算し、host factだけexact identity / generationで照合する。
+不一致factやabsenceで現target factを消さず、abortは旧coreとともに旧factを保持・復元する。
+draw / DComp media予約 / HUD regionは同じ実効値を使い、鍵はraw。右×は明示closeとして既存App ownerへ返す。
+同coreのseek / strip dragとpopupは可視性入力に含め、通常F11のcore再生成では移譲しない。
+stripのhideは既存Hidden / Suspendedのpresent契約に従い、worker / decoderのterminal closeへ変換しない。
+[設計](fullscreen-locked-chrome-suppression-plan.md) §4.1・5・6を参照。
+
 ## 配布要件
 
 - FFmpeg LGPL shared build (`avcodec` / `avformat` / `avutil` / `avfilter` / `swscale` /

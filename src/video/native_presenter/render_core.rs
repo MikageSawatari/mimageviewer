@@ -849,6 +849,7 @@ fn draw_native_seek_strip_lock_button(
     painter: &egui::Painter,
     lock_rect: egui::Rect,
     strip_locked: bool,
+    lock_suppressed: bool,
     stamp: crate::video::seek_strip::SeekStripRenderStamp,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
@@ -865,11 +866,14 @@ fn draw_native_seek_strip_lock_button(
         response.hovered(),
         strip_locked,
     );
-    let response = response.hover_tip_dark(if strip_locked {
-        "ストリップ固定を解除"
-    } else {
-        "ストリップを固定表示"
-    });
+    let response = response.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+        if strip_locked {
+            "ストリップ固定を解除"
+        } else {
+            "ストリップを固定表示"
+        },
+        lock_suppressed,
+    ));
     if response.clicked() {
         commands.push(NativeOverlayCommand::ToggleSeekStripLock {
             expected: Some(stamp),
@@ -1044,6 +1048,7 @@ fn draw_native_seek_strip(
     wheel_enabled: bool,
     strip: &NativeOverlaySeekStrip,
     strip_locked: bool,
+    lock_suppressed: bool,
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
     drag_origin: &mut Option<crate::video::seek_strip::SeekStripDragOrigin>,
@@ -1392,6 +1397,7 @@ fn draw_native_seek_strip(
                 &painter,
                 lock_rect,
                 strip_locked,
+                lock_suppressed,
                 strip.stamp,
                 commands,
             );
@@ -2264,8 +2270,8 @@ pub struct NativeRenderConfig {
     pub anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
     pub anime4k_status: NativeVideoAnime4kStatus,
     /// 生成時点の上下バー固定状態。presenter はこれを最初の transform から使う
-    /// (後から `SetBarLockState` が届くまで固定なしで描かない)。
-    pub bar_lock: crate::video::NativeBarLockState,
+    /// (後から `SetChromeSnapshot` が届くまで固定なしで描かない)。
+    pub(crate) chrome: crate::video::NativeChromeState,
     /// Opaque sRGB-byte canvas color used outside decoded video pixels.
     pub video_canvas_color: [u8; 3],
     pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
@@ -2343,9 +2349,7 @@ pub struct NativeRenderCore {
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
     video_compact: bool,
-    video_top_bar_locked: bool,
-    video_bottom_lock: BottomBarLock,
-    fullscreen_fixed_bar_gap_px: u32,
+    chrome: crate::video::NativeChromeState,
     /// 右情報パネルが場所を占めているか (= 固定中かつ描ける)。overlay 内部の状態でも
     /// 変わるので、`reconcile_info_panel_reservation` が突き合わせて覚える。
     video_info_panel_reserved: bool,
@@ -2851,6 +2855,10 @@ struct NativeEguiOverlay {
     jump_panel_visible: bool,
     /// App settings から同期される、上部バーと動画下部の固定状態。
     top_bar_locked: bool,
+    chrome_projection: (
+        crate::ui_helpers::ViewerChromeSurface,
+        crate::settings::FullscreenChromeSuppression,
+    ),
     bottom_lock: BottomBarLock,
     /// 固定バーと映像のあいだに置く隙間 (px)。overlay が「映像の場所」を
     /// 自分で求める (`video_content_rect_points`) ために持つ。
@@ -4609,6 +4617,7 @@ pub enum NativeOverlayCommand {
         expected: Option<crate::video::seek_strip::SeekStripRenderStamp>,
     },
     ToggleClickInfoOpen,
+    CloseInfoPanel,
     /// 右情報パネルの固定を切り替える (静止画の鍵ボタンと同じ状態を触る)。
     ToggleInfoPanelLock,
     OpenTouchInfoPanel,
@@ -4972,8 +4981,9 @@ impl NativeRenderCore {
         let health = Arc::clone(&config.health);
         let window_epoch = config.window_epoch;
         // 上限クランプは `NativeBarLockState::clamped` が所有する
-        // (`set_overlay_bar_lock_state` と同じ規則を初期値にも通す)。
-        let initial_bar_lock = config.bar_lock.clamped();
+        // (`set_overlay_chrome_snapshot` と同じ規則を初期値にも通す)。
+        let mut initial_chrome = config.chrome;
+        initial_chrome.policy.bars = initial_chrome.policy.bars.clamped();
         let _attach_operation = health.begin_render_operation(
             crate::video::native_window_health::NativeRenderOperation::Attach,
             window_epoch,
@@ -5179,7 +5189,7 @@ impl NativeRenderCore {
                         Ok(mut overlay) => {
                             // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
                             // 1 回「固定なし」で描かれてから固定表示へ動く。
-                            overlay.set_bar_lock_state(initial_bar_lock);
+                            overlay.set_chrome_state(initial_chrome);
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -5248,7 +5258,7 @@ impl NativeRenderCore {
                         Ok(mut overlay) => {
                             // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
                             // 1 回「固定なし」で描かれてから固定表示へ動く。
-                            overlay.set_bar_lock_state(initial_bar_lock);
+                            overlay.set_chrome_state(initial_chrome);
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -5432,10 +5442,8 @@ impl NativeRenderCore {
                     .is_some(),
                 last_pixel_probe: None,
                 video_compact: false,
-                video_top_bar_locked: initial_bar_lock.top_locked,
+                chrome: initial_chrome,
                 video_info_panel_reserved: false,
-                video_bottom_lock: initial_bar_lock.bottom_lock,
-                fullscreen_fixed_bar_gap_px: initial_bar_lock.fixed_bar_gap_px,
                 sar_num: 1,
                 sar_den: 1,
                 orientation: VideoOrientation::IDENTITY,
@@ -7995,56 +8003,23 @@ impl NativeRenderCore {
         }
     }
 
-    pub(crate) fn set_overlay_side_panel_state(
+    pub(crate) fn set_overlay_chrome_snapshot(
         &mut self,
-        mode: FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
+        snapshot: crate::video::NativeChromeSnapshot,
     ) -> Result<(), String> {
+        let old = self.chrome;
+        self.chrome.apply(snapshot);
+        if old == self.chrome {
+            return Ok(());
+        }
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_side_panel_state(mode, info_panel_open, info_panel_locked);
+            overlay.set_chrome_state(self.chrome);
         }
-        // 固定を切り替えた瞬間に映像を寄せる。次のファイル移動まで待たせない
-        // (実機報告 2026-09-02: ロックしても映像が左に寄らず、前後移動で直った)。
-        self.reconcile_info_panel_reservation()
-    }
-
-    pub(crate) fn set_overlay_bar_lock_state(
-        &mut self,
-        state: crate::video::NativeBarLockState,
-    ) -> Result<(), String> {
-        let requested = state.clamped();
-        // ストリップの高さは overlay が持つので、presenter 側の field 比較では拾えない。
-        // 「映像がいくつ譲っているか」を前後で見て、高さプリセットの変更でも transform を
-        // 引き直す (`set_overlay_seek_strip` と同じ形)。
-        let strip_points_before = self.egui_overlay.as_ref().map_or(0.0, |overlay| {
-            let overlay_size = egui::vec2(
-                self.width as f32 / overlay.pixels_per_point,
-                self.height as f32 / overlay.pixels_per_point,
-            );
-            overlay.seek_strip_visible_points(overlay_size)
-        });
-        let mut layout_changed = self.video_top_bar_locked != requested.top_locked
-            || self.video_bottom_lock != requested.bottom_lock
-            || self.fullscreen_fixed_bar_gap_px != requested.fixed_bar_gap_px;
-        self.video_top_bar_locked = requested.top_locked;
-        self.video_bottom_lock = requested.bottom_lock;
-        self.fullscreen_fixed_bar_gap_px = requested.fixed_bar_gap_px;
-        if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_bar_lock_state(requested);
-        }
-        let strip_points_after = self.egui_overlay.as_ref().map_or(0.0, |overlay| {
-            let overlay_size = egui::vec2(
-                self.width as f32 / overlay.pixels_per_point,
-                self.height as f32 / overlay.pixels_per_point,
-            );
-            overlay.seek_strip_visible_points(overlay_size)
-        });
-        layout_changed |= strip_points_before != strip_points_after;
-        if layout_changed {
-            self.update_video_visual_transform(self.width, self.height)?;
-        }
-        Ok(())
+        self.video_info_panel_reserved = self
+            .egui_overlay
+            .as_ref()
+            .is_some_and(NativeEguiOverlay::right_panel_reserves_space);
+        self.update_video_visual_transform(self.width, self.height)
     }
 
     /// Source swap で presenter-local な panel/touch session を閉じる。
@@ -8095,7 +8070,8 @@ impl NativeRenderCore {
             .egui_overlay
             .as_ref()
             .is_some_and(|overlay| overlay.seek_strip_reserves_space());
-        let layout_changed = was_reserved != is_reserved && self.video_bottom_lock.strip_locked();
+        let layout_changed =
+            was_reserved != is_reserved && self.chrome.resolved().bottom_lock.strip_locked();
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
         }
@@ -8484,8 +8460,8 @@ impl NativeRenderCore {
                 .as_ref()
                 .map(|overlay| overlay.pixels_per_point)
                 .unwrap_or(1.0),
-            top_bar_locked: self.video_top_bar_locked,
-            bottom_lock: self.video_bottom_lock,
+            top_bar_locked: self.chrome.resolved().top_locked,
+            bottom_lock: self.chrome.resolved().bottom_lock,
             bottom_bar_height,
             // 高さの正本は overlay が持つ (設定から `set_bar_lock_state` で届く)。
             // presenter 側に写しを置くと、どちらが本当か決められない値が 2 つになる。
@@ -8496,7 +8472,7 @@ impl NativeRenderCore {
                 );
                 overlay.seek_strip_visible_points(overlay_size)
             }),
-            fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
+            fixed_bar_gap_px: self.chrome.policy.bars.fixed_bar_gap_px,
             info_panel_reserved: self.video_info_panel_reserved,
         }
     }
@@ -9207,6 +9183,10 @@ impl NativeEguiOverlay {
             right_panel_visible: false,
             jump_panel_visible: false,
             top_bar_locked: false,
+            chrome_projection: (
+                crate::ui_helpers::ViewerChromeSurface::MainEmbedded,
+                crate::settings::FullscreenChromeSuppression::default(),
+            ),
             bottom_lock: BottomBarLock::None,
             fixed_bar_gap_px: 0,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
@@ -10287,6 +10267,31 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn resolved_chrome(&self) -> crate::ui_helpers::ResolvedViewerChrome {
+        crate::ui_helpers::ResolvedViewerChrome::resolve(
+            self.chrome_projection.0,
+            self.chrome_projection.1,
+            self.top_bar_locked,
+            self.bottom_lock,
+            self.info_panel_locked,
+            false,
+        )
+    }
+
+    fn set_chrome_state(&mut self, state: crate::video::NativeChromeState) {
+        let projection = (state.surface(), state.policy.suppression);
+        if self.chrome_projection != projection {
+            self.chrome_projection = projection;
+            self.dirty = true;
+        }
+        self.set_side_panel_state(
+            state.policy.side_panel_mode,
+            state.policy.info_open,
+            state.policy.info_locked,
+        );
+        self.set_bar_lock_state(state.policy.bars);
+    }
+
     fn set_side_panel_state(
         &mut self,
         mode: FsSidePanelMode,
@@ -10364,8 +10369,8 @@ impl NativeEguiOverlay {
             span,
             aspect,
             strip_policy_visibility.thumbnail_strip_visible_for_preview_policy,
-            self.top_bar_locked,
-            self.bottom_lock,
+            self.resolved_chrome().top_locked,
+            self.resolved_chrome().bottom_lock,
             self.fixed_bar_gap_px,
             self.seek_strip_reserves_space(),
         )
@@ -10399,8 +10404,8 @@ impl NativeEguiOverlay {
         let layout = VideoVisualLayout {
             compact: false,
             pixels_per_point: 1.0,
-            top_bar_locked: self.top_bar_locked,
-            bottom_lock: self.bottom_lock,
+            top_bar_locked: self.resolved_chrome().top_locked,
+            bottom_lock: self.resolved_chrome().bottom_lock,
             bottom_bar_height: geometry.normal_bar_height,
             seek_strip_visible_points: if self.seek_strip_reserves_space() {
                 geometry.strip_layout.rect.height()
@@ -11722,7 +11727,13 @@ impl NativeEguiOverlay {
 
     fn hud_visible(&self) -> bool {
         // メニューはボタンの上に出るので、HUD が引っ込むとメニューごと消える。
-        if self.seek_strip_menu_open || self.audio_track_menu_open {
+        if native_bottom_chrome_interaction_visible(
+            self.seek_strip_menu_open,
+            self.audio_track_menu_open,
+            self.video_speed_popup_open,
+            self.seek_row_gesture.is_some(),
+            self.seek_strip_drag_origin.is_some(),
+        ) {
             return true;
         }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
@@ -11731,7 +11742,7 @@ impl NativeEguiOverlay {
             overlay_height_points,
             self.external_drag_in_progress,
             self.native_touch.chrome_latched(),
-            self.bottom_lock.bar_locked(),
+            self.resolved_chrome().bottom_lock.bar_locked(),
         )
     }
 
@@ -11742,7 +11753,7 @@ impl NativeEguiOverlay {
                 self.top_bar_visible,
                 self.external_drag_in_progress,
                 self.native_touch.chrome_latched(),
-                self.top_bar_locked,
+                self.resolved_chrome().top_locked,
             )
     }
 
@@ -11853,7 +11864,7 @@ impl NativeEguiOverlay {
             pointer_in_hover_rect: self.right_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
             info_panel_open: self.info_panel_open,
-            info_panel_locked: self.info_panel_locked,
+            info_panel_locked: self.resolved_chrome().info_locked,
         })
     }
 
@@ -12190,6 +12201,8 @@ impl NativeEguiOverlay {
         let touch_first_run_help_visible = self.native_touch.first_run_help_visible();
         let side_panel_mode = self.side_panel_mode;
         let top_bar_locked = self.top_bar_locked;
+        let resolved_chrome = self.resolved_chrome();
+        let effective_info_panel_locked = resolved_chrome.info_locked;
         let bottom_lock = self.bottom_lock;
         let seek_hover_preview_mode = self.seek_hover_preview_mode;
         let seek_preview_size = self.seek_preview_size;
@@ -12627,6 +12640,7 @@ impl NativeEguiOverlay {
                     audio_only,
                     side_panel_mode,
                     top_bar_locked,
+                    top_bar_locked && !resolved_chrome.top_locked,
                     hud_dimmed,
                     &mut commands,
                     #[cfg(feature = "test-script")]
@@ -12700,6 +12714,7 @@ impl NativeEguiOverlay {
                     &mut commands,
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                     self.info_panel_locked,
+                    effective_info_panel_locked,
                 );
             }
             if jump_panel_visible {
@@ -12909,6 +12924,7 @@ impl NativeEguiOverlay {
                             && !seek_strip_menu_open,
                         strip,
                         bottom_lock.strip_locked(),
+                        bottom_lock.strip_locked() && !resolved_chrome.bottom_lock.strip_locked(),
                         &seek_strip_texture_ids,
                         seek_strip_wave_texture_id,
                         &mut seek_strip_drag_origin,
@@ -14211,11 +14227,11 @@ impl NativeEguiOverlay {
                             seek_lock_rect,
                             "native_seek_bar_lock",
                             bottom_lock.bar_locked(),
-                            if bottom_lock.bar_locked() {
+                            &crate::ui_helpers::chrome_lock_hint(if bottom_lock.bar_locked() {
                                 "シークバー固定を解除"
                             } else {
                                 "シークバーを固定表示"
-                            },
+                            }, bottom_lock.bar_locked() && !resolved_chrome.bottom_lock.bar_locked()),
                             crate::video::NativeVideoBar::Seek,
                             &mut commands,
                         );
@@ -14804,6 +14820,40 @@ fn choose_overlay_surface_format(
         .first()
         .copied()
         .ok_or_else(|| "wgpu DComp overlay surface has no formats".to_string())
+}
+
+fn native_bottom_chrome_interaction_visible(
+    strip_menu: bool,
+    audio_menu: bool,
+    speed_menu: bool,
+    seek_owner: bool,
+    strip_owner: bool,
+) -> bool {
+    strip_menu || audio_menu || speed_menu || seek_owner || strip_owner
+}
+
+#[cfg(test)]
+mod chrome_suppression_interaction_tests {
+    use super::native_bottom_chrome_interaction_visible;
+
+    #[test]
+    fn chrome_suppression_same_core_drag_and_speed_popup_survive_hover_loss() {
+        for owners in [
+            (false, true, false),
+            (false, false, true),
+            (true, false, false),
+        ] {
+            assert!(
+                native_bottom_chrome_interaction_visible(
+                    false, false, owners.0, owners.1, owners.2
+                ),
+                "a live owner must prevent hidden-HUD gesture cleanup after same-core resize"
+            );
+        }
+        assert!(!native_bottom_chrome_interaction_visible(
+            false, false, false, false, false
+        ));
+    }
 }
 
 pub(crate) fn effective_overlay_pixels_per_point(os_ppp: f32, ui_scale: f32) -> f32 {
@@ -15818,6 +15868,7 @@ mod tests {
                         true,
                         strip,
                         false,
+                        false,
                         texture_ids,
                         wave_texture_id,
                         &mut drag_origin,
@@ -16177,6 +16228,7 @@ mod tests {
                         presenter_hover_positions[frame],
                         true,
                         &strip,
+                        false,
                         false,
                         &std::collections::HashMap::new(),
                         None,
@@ -17010,6 +17062,7 @@ mod tests {
                         true,
                         &strip,
                         false,
+                        false,
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
@@ -17120,6 +17173,7 @@ mod tests {
                         true,
                         strip,
                         false,
+                        false,
                         &std::collections::HashMap::new(),
                         None,
                         &mut drag_origin,
@@ -17152,6 +17206,7 @@ mod tests {
                 None,
                 true,
                 &strip,
+                false,
                 false,
                 &std::collections::HashMap::new(),
                 None,
@@ -17197,6 +17252,7 @@ mod tests {
                     true,
                     &strip,
                     false,
+                    false,
                     &std::collections::HashMap::new(),
                     None,
                     &mut drag_origin,
@@ -17232,6 +17288,7 @@ mod tests {
                     Some(release),
                     true,
                     &strip,
+                    false,
                     false,
                     &std::collections::HashMap::new(),
                     None,
@@ -17718,6 +17775,7 @@ mod tests {
                         &painter,
                         egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(28.0, 28.0)),
                         false,
+                        false,
                         test_seek_strip_stamp(),
                         &mut commands,
                     );
@@ -17805,6 +17863,7 @@ mod tests {
                         Some(pointer),
                         true,
                         &strip,
+                        false,
                         false,
                         &std::collections::HashMap::new(),
                         None,
@@ -17918,6 +17977,7 @@ mod tests {
                             Some(pointer),
                             true,
                             &strip,
+                            false,
                             false,
                             &std::collections::HashMap::new(),
                             None,
@@ -19186,6 +19246,7 @@ mod tests {
                         None,
                         true,
                         &strip,
+                        false,
                         false,
                         &std::collections::HashMap::new(),
                         None,

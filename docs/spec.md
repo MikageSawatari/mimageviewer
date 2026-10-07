@@ -1364,6 +1364,19 @@ MIDI 半音スペクトラム (`SpectrumAnalyzer`) の 3 ワーカーを持つ�
 
 ---
 
+### F11中の固定表示の一時抑制 (§1.344)
+
+環境設定「表示 → 閲覧表示」の `fullscreen_chrome_suppression` は、上部バー・下部バーとストリップ・
+右情報パネル・ナビゲータの対象集合（空集合はOFF、既定OFF）。静止画・本・動画・音楽で共通。
+現在の表示先がF11全画面の間だけ実効lockを解除し、保存lockとcontext-local右lockは書き換えない。
+F12通常窓、main embedded、別contextは対象外。F12窓をF11拡大した場合はそのhostだけが対象。
+draw / media予約 / hitは同じ実効値を使用。一時表示はoverlayで、端hover・touch・popup・同coreのdragを維持。
+右の明示openは抑制開始や保護操作の終了でresetしない。raw lock ONならページ送りでも保持し、×の明示closeは
+open / hover / pickerを閉じるだけでraw lockを変更しない。鍵はraw値を表示・変更し、F11退出後は最新値を使う。
+音楽の常時上下UIは維持。ナビゲータは既存hold（既定Alt）と操作ownerで呼び出す。
+通常native F11のcore再生成ではdrag / popupを新coreへ移譲しない。詳細は
+[受理済み設計](fullscreen-locked-chrome-suppression-plan.md) §4〜6・§9。
+
 ## 5. グリッド表示対象
 
 サムネイルグリッドには以下を表示する。それ以外のファイルは無視する。

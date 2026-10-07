@@ -2620,9 +2620,6 @@ impl App {
 
                 // 動画ループモード変更を検出してフルスクリーン中の player に反映する
                 let old_loop_mode = self.settings.video_loop_mode;
-                let old_video_seek_preview_size = self.settings.video_seek_preview_size;
-                let old_video_seek_preview_size_values =
-                    self.settings.video_seek_preview_size_values;
 
                 // AI バックエンド設定変更を検出してホットリロードトリガに使う
                 let old_ai_backend = self.settings.ai_backend.clone();
@@ -2850,26 +2847,8 @@ impl App {
                     self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
                 }
                 creative_lut_transaction.commit();
-
-                // Settings are global; every live native presenter receives the new display
-                // size through the same snapshot used at presenter creation.
                 #[cfg(windows)]
-                if old_video_seek_preview_size != self.settings.video_seek_preview_size
-                    || old_video_seek_preview_size_values
-                        != self.settings.video_seek_preview_size_values
-                {
-                    let state = self.native_bar_lock_state();
-                    for (_, entry) in &self.fs_cache {
-                        if let crate::fs_animation::FsCacheEntry::Video { player, .. } = entry {
-                            player.set_native_bar_lock_state(state);
-                        }
-                    }
-                }
-                #[cfg(not(windows))]
-                let _ = (
-                    old_video_seek_preview_size,
-                    old_video_seek_preview_size_values,
-                );
+                self.sync_all_native_chrome_policy();
 
                 if let Some(service) = &self.edit_preview_cache {
                     if !self.settings.edit_preview_cache_enabled {

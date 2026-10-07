@@ -2,15 +2,15 @@
 
 作成: 2026-10-07 / ライン E / `next-viewer` / 調査基点 `d29bcfbec`。  
 改訂: 2026-10-07 R2 / コード照合基点 `ff538c48c`（初版の上に置く文書改訂）。
-状態: **設計のみ。Q1〜Q7は2026-10-08に推奨どおり利用者決定済み。実装未着手。
-独立レビュー・ClaudeCode の構造合意の確認と実装 handoff は coordinator が確定する。**
+状態: **Q1〜Q7は2026-10-08に推奨どおり利用者決定済み。利用者の実装指示で独立設計レビューの承認と
+ClaudeCode・独立reviewerの構造合意を確認し、§1.344を実装。実装検証・実機確認の状況は§12へ記録する。**
 
 ## 1. 依頼と確定済みの境界
 
 [次版バックログ](next-release-backlog.md) §1.344
 の「次の版の決定 (利用者 2026-10-07)」と今回の作業指示を正本にする。
 E は §1.344 → §1.342 → §1.341 → §1.340 の順で、できた分を出荷する。
-今回は §1.344 の設計だけで、後続の表示方式・アニメーション・タイル一覧は扱わない。
+本書の設計と今回の実装は §1.344 に限定し、後続の表示方式・アニメーション・タイル一覧は扱わない。
 
 - ウィンドウ表示のロックを保ち、**描画対象の窓が F11 全画面の間だけ**固定による常時表示を抑制する。
 - 保存済み HUD / strip のロックを F11 入退場で書き換えない。右情報パネルの context-local なロックも維持する。
@@ -414,8 +414,8 @@ owner を特定できない経路、behavior 削除が必要な経路が残れ�
 
 Q1・Q2・Q3・Q5・Q6は既存の質問。R2でQ4の範囲・推奨を改訂し、Q7を新規追加した。
 R3ではQ4の明示openの終了条件だけを説明修正。新規質問はない。
-Q4とQ7を含めて未回答の質問はない。上記の利用者決定と structural agreement を coordinator がまとめてから、
-bounded 実装 handoff を作る。
+Q4とQ7を含めて未回答の質問はない。利用者の2026-10-08実装指示により、上記の決定と structural agreement を
+前提とするbounded handoffを受領した。
 
 ## 10. 実装・文書・検証の handoff
 
@@ -434,7 +434,7 @@ bounded 実装 handoff を作る。
    `htdocs/mimageviewer/manual/` と製品ページ。§11 は実際の合意・変更範囲を記録する。
    通信・Remote protocol は変えない。Remote / headless を PC の F11 snapshot の consumer にしない。
 
-### 必要な自動回帰（実装時。今回は未実行）
+### 必要な自動回帰（実装時）
 
 | 層 | 観点 |
 | --- | --- |
@@ -475,8 +475,9 @@ native / 実機確認は利用者が行い、installed / tray 常駐を先に閉
 静止画・ZIP/PDF・動画場面/波形・F12窓・別窓不変・navigation待ち、右panelの×、設定ONとF12 migration、
 同coreのresize中drag / popupと通常F11の再生成境界、Q4 / Q7で決定した挙動を含める。
 
-今回の証拠: source inspection と文書設計のみ。自動テスト0件、build未実行、製品起動なし。
-初版は独立レビューREVISE、本改訂の独立再レビュー・実機確認は未実施。
+設計時の証拠: source inspection と文書設計のみ。設計段階では自動テスト0件、build未実行、製品起動なし。
+初版は独立レビューREVISE。R2の5件とR3のQ4説明を補完し、利用者の実装指示で独立設計レビュー承認を確認した。
+実装の独立レビュー・実機確認とは区別し、今回の実装検証は§12へ記録する。
 本 worktree で commit / `.git` 書込は行わない。初版メッセージは `target/E-1344-design-msg.txt`、
 HEAD上の追補コミットメッセージ案は `target/E-design-r2-msg.txt` に置く。
 
@@ -493,3 +494,86 @@ HEAD上の追補コミットメッセージ案は `target/E-design-r2-msg.txt` �
 | 3 P2: 右panelの× | `ui_metadata_panel.rs` の2159行付近、`overlay_draw.rs` の5943行付近、`ui_music_panels.rs` の758行付近とApp close handlerを読んだ。§5.1で鍵raw / close effective、mode条件維持、closeのraw不変、明示closeの配送と三媒体回帰を追加 |
 | 4 P2: 抑制開始の別入口 | `ui_helpers.rs::visible`、`app.rs::apply_detached_viewer_borderless_target` / target-change、native snapshot同期を読んだ。Q4を全入口・保護例外終了を含む一問へ改訂し、reset不要のlock-forceのみ案を推奨。別案はtyped open ownerの再設計が前提と明記 |
 | 5 P3: detached §11範囲 | `app.rs` の60410 / 79095行付近を読んだ。§8の記録案にapplied / migration / 設定入口、target lease payload、Q4別案のtarget-changeとQ5の音楽consumerを追加。既存transition owner / phase / effectを変更しない境界も明記 |
+
+## 12. §1.344 実装記録（2026-10-08）
+
+対象は `next-viewer` のHEAD `05766be6d`に対する未commit差分。検証はWindows / normal feature setを基準とし、portable core checkを別途行う。
+
+### 実装と所有境界
+
+- `settings::FullscreenChromeSuppression` の対象集合を追加。空集合がOFFで、別のenable flagは持たない。
+  Settings / `settings_kv` / preferences draft / export-importを既存の経路へ接続し、DDL・schema・Remote IPCは変更しない。
+  旧DBの欠落keyはOFFとし、保存済み上下lock / strip選択を維持する。
+- `ui_helpers::{ViewerChromeSurface, ResolvedViewerChrome}` を純投影として共有。
+  eguiはprojected contextの既存window bindingとmatched active hostのapplied状態、nativeはcoreのplacementから解く。
+  通常content・navigation continuation / gap / holdover・上HUD / 下HUD / strip・右panel・navigatorで同じ実効値を使う。
+  描画された一時表示だけをhit / sink / edge exclusionへ接続し、固定gapとmedia予約を抑制する。
+- nativeのbar / side-panel別commandを `NativeChromeSnapshot` に集約。raw policyは既存source epochで扱い、
+  host factはwindow lease / incarnation / HWND / 既存native generationで照合する。
+  candidateの初期化、保留command、commitと両abortは§4.1どおり適用先で解く。
+  設定OKとF12 F11のapplied境界は各contextのcache playerおよび既存source-swap待機出力へ同期する。
+  placement reducer / phase / effect条件を変更せず、新しい待機・世代・rollback stateを追加していない。
+- 同coreのnative下HUD可視性へ既存seek gesture / strip drag / speed popup ownerを接続。
+  非表示cleanupに入る前に操作を維持し、release / cancel / 不可用modeへの既存終端は維持する。
+  通常F11のcore再生成では旧coreを成功時に終了し、新coreへの操作移譲は追加しない（Q7）。
+- 鍵の表示・toggleはraw、抑制中の説明をtooltipへ追加。右×はeffective lockで判定し、
+  nativeもtoggleではなく明示closeを配送する。既存close ownerはopen / hover / pickerだけを閉じ、raw lockを保持する。
+  Q4のopen / target-change ownerは変更しない。音楽の右panelも同じ契約で、常時上下UIは変更しない。
+- 状態削減の検討は§7を踏襲。entry reset / saved lock backup / effective値の永続cache / core間操作移譲を設けず、
+  typed raw snapshot・readonly projection・既存interaction ownerだけを使用した。
+  実際のdetached / viewport範囲は [detached計画§11](detached-rework-plan.md#11-リワーク外からの変更記録)へ記録した。
+
+### 実行証拠
+
+| 検証 | 結果 |
+| --- | --- |
+| bug red | `chrome_suppression_same_core_drag_and_speed_popup_survive_hover_loss`: 1件FAIL。既存HUDのmenuだけを見る判定では、同core resize後のhover喪失でspeed popup / seek / strip ownerが可視性を維持しないことを確認。型エラーや新設定の未実装をred証拠にしていない |
+| 焦点 `chrome_suppression` | 13件PASS。純resolver・旧JSON・DB欠落keyと保存・context分離と最新raw復帰・gap geometry・三媒体の×・command busのlatest / commit / abort・exact host fact・同core操作 |
+| `settings_transfer::tests` | 16件PASS。新設定の分類・export/import・draft、旧V1の欠落key保持、strict composite、除外値保持を含む |
+| `native_bar_lock_reaches_the_presenter_at_birth` | 5件PASS。初期configのraw伝達・factory側のclamp・context / canvas既存回帰 |
+| snapshot追加 / 更新 | 新設定light / dark / narrow darkの3枚を生成（3件PASS）、閲覧表示ページの既存snapshotを1枚更新（1件PASS）。4枚を目視確認し、checkbox・説明の折返しと狭幅の非重複を確認 |
+| 検索索引 | 14件PASS。初回full libの唯一の失敗は、共通描画helper内のラベルをページ本体だけで検査したため。表示と索引のlabelを共有し、既存helper項目と同じ呼出し照合へ修正して再検証 |
+| full lib | 最終10,949件PASS / 0件FAIL / 52件ignored（exit 0、1043.75秒）。初回の1件FAIL（exit 101）は上記検索索引の照合を修正後に全件再実行。`target/E-full-lib-first.log`に初回、`target/E-full-lib.log`に最終結果を保存 |
+| `ui_snapshot` 全件比較 | 106件PASS / 0件FAIL（exit 0、22.16秒）。`UPDATE_SNAPSHOTS`を無効にして比較 |
+| `cargo fmt` / `cargo fmt --check` | fmt実行、ラベル共有後の最終checkも成功（exit 0） |
+| normal / portable core check | 両方成功（exit 0）。normal 3分13秒、portable 1分01秒。native依存を含むため `CARGO_BUILD_JOBS=1`で実行 |
+| UI glyph lint | 0件（exit 0）。ラベル共有後の最終gateも成功 |
+| `scripts/build-dev.ps1` | 成功（exit 0）。`-PreserveRuntime -WaitForOtherBuildsMinutes 0` / `CARGO_BUILD_JOBS=1`、normal feature set / dev-runtime profile。core 32分43秒、remote service 3分27秒、EPUB worker 2分00秒。DLL・EffeTune bundleを配置し、PE gate `runtime=4 pe=3`も成功。起動なし |
+
+広いlibテストはpipeなしで実行し、ログへ直接保存後に `$LASTEXITCODE` をそのまま返す。
+`target/E-full-lib.log` と各 `target/E-*.log` がこのworktreeの実行ログ。
+新しい設定UIを生成する対象と、全件の比較実行を分け、無関係なgoldenを一括更新していない。
+初回normal checkはTurboJPEGのCMake / MSBuild `--parallel 24`で停止（exit 101）。製品の型検査失敗ではなく、
+native依存を直列で準備してnormal / portableを再実行した。`target/E-check-normal-first.log`へ初回証拠を保存。
+検証用profileのTurboJPEGも `cargo build -p turbojpeg-sys --profile dev-runtime` / jobs=1で事前buildし、exit 0。
+source / Cargo manifest / 個人のCargo設定を変更するbuild回避策は追加していない。
+既存CRLFを維持し、最終 `git diff --numstat` / `git diff --check` を確認（EOL全体差分なし、check成功）。
+
+### 引き継ぎ
+
+利用者質問はすべて決定済みで、追加質問はない。実装の独立レビューと利用者の実機確認は未実施。
+今回の利用者指示に従い `test-full.ps1` / `build-dist.ps1` は実行せず、製品バイナリは一切起動しない。
+検証binaryの用意後、利用者がinstalled / tray常駐を閉じ、次のコマンドで起動する。
+通常 `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+実機では§10の観点を次の通常操作で確認する。まだ実行済みではない。
+
+1. 「表示 → 閲覧表示」で初期OFFを確認。window表示で上下バー / strip / 右panel / navigatorを固定し、
+   抑制対象を選択してF11に入る。明示open / popup / drag等の表示理由がなければ、上下はポインタを端から離すと隠れ、端hover / touchで呼び出せる。
+   navigatorは既存hold（既定Alt）で呼び出す。fullscreen中の対象ONも同じ効果になり、F11を戻すと最新rawに従う。
+2. 静止画・ZIP/PDFのページ列、動画の場面 / 波形で、固定予約がなくなり、一時表示の描画rectだけが操作可能なことを確認。
+   短い窓・100% / 150%のUI倍率、連続ページ送りやCtrl+↑↓のnavigation待ちでも予約が戻らず、非表示部分が入力を奪わない。
+3. 右をクリック表示にし、raw lock ON / F11抑制中に明示openする。ページ送り後も残り、×一回でopen / hover / pickerが閉じる。
+   鍵はONを保持し、F11退出で固定表示へ戻る。抑制開始だけでは既存明示openを閉じないことも確認。音楽でも右は同じ、常時上下UIは残る。
+4. F12通常窓Aでは固定を維持し、AだけF11拡大すると抑制され、main / 別窓Bのlock・表示・予約は変わらない。
+   F12切替 / 解除と動画→音声も試し、その時の表示先から解く。native動画のAでseek / strip dragやspeed popup中にF11を押し、
+   旧下端のポインタ位置が新下端帯外でも操作を維持する。release / cancel / popup close後は通常の自動表示へ戻る。
+   通常native F11のcore再生成では新coreへ操作を移譲せず、成功時に旧操作が終了する（Q7）。
+5. 抑制中の鍵tooltipとraw状態を確認し、鍵を変更してF11を戻す。入場時の値ではなく変更後の値が使われ、
+   strip表示選択とscene / waveform sessionが隠すだけで閉じられないことを確認する。
+coordinatorは実装diffとこの証拠を独立reviewerへ渡し、実機結果とともに受理・統合を判断する。
+commit / `.git`書込は行わず、英語メッセージを `target/E-1344-msg.txt` に置く。

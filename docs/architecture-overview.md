@@ -63,6 +63,11 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 **鉄則**: 上位レイヤーから下位レイヤーへの呼び出しは OK。逆方向（ワーカーが UI を直接触るなど）は禁止。
 ワーカーから UI への通知は必ず mpsc チャネルで行う。
 
+F11中の固定chrome一時抑制は `ui_helpers::{ViewerChromeSurface, ResolvedViewerChrome}` の純投影で解く。
+保存ロックはSettings / viewer contextが所有し、eguiの正確なwindow bindingとnative coreのplacement・既存host identityが
+実際の表示先を所有する。nativeのraw policyとhost factを一つのsnapshotで運び、適用先でdraw / layout / hitを揃える。
+独自のplacement遷移・世代・復元stateは設けない。詳細は [決定仕様](fullscreen-locked-chrome-suppression-plan.md)。
+
 ---
 
 ## 2. モジュールマップ
