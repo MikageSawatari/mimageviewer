@@ -12,6 +12,25 @@
 
 ---
 
+## v4.4.0 (2026-10-07)
+
+- **対象**: master `7f922b612` (配布ビルド後の追加コミットは docs / htdocs のみ。コードは配布ビルドと同一)。
+- **依存**: PDFium を `chromium/8076` から **`chromium/8086` へ更新** (利用者が更新後の確認ビルドで PDF 表示を確認)。
+  FFmpeg は `setup-ffmpeg.sh check` が `n7.1.5-12` を「新版」と出すが、同梱の `n7.1.5-16` の方が新しく更新なし (従来と同じ誤検知)。
+  LibRaw 0.22.2 は最新。対応ソース tarball は SHA-256 照合済みで htdocs に配置 (mikage.to への公開は利用者)。
+- **自動テスト**: `build-dist.ps1 -SkipVst3Bridge` の全体テストで **12,116 passed / 0 failed / 58 ignored** (63 suites)。
+  VST3 host は現ソースの identity (`b981fb61…`) と一致を確認して再利用。全 PE / VC runtime gate 通過。
+  開発中の lib 全体実行で、負荷時だけ落ちて単独再実行で通る 2 件を観測 (`indexer_manager::…supervisor_watcher…`、
+  `similar_index::…cannot_reuse_old_marker`)。配布ビルドの全体テストでは発生せず。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa` で確認 (Taku Sano 名義、RFC3161)。
+- **portable smoke**: `D:\` に展開して起動。応答・`data\` 生成・APPDATA 非接触・終了を確認 (ClaudeCode が実施、
+  利用者の実アプリ試験許可の範囲)。EffeTune は portable 非同梱のため BundleMissing (仕様)。
+- **実機 (利用者)**: §1.335、§1.328 (ZIP と ★3 一覧 → フォルダの ← 復帰)、最終確認ビルドで PDF と通常操作。
+  初回設定の小画面: サブ PC の Windows Sandbox 1093×614 で、修正版は見出しと「開始」が表示、v4.3.0 は表示されない。
+- **ui-smoke**: RatingFolderBack (600 行・10 列) のツールバー 6 ケース PASS。キー系は前面を取れず SKIPPED。
+- **panic.log**: 52 件 15 種すべて disposition あり (`check-panic-log.ps1` exit 0)。CI は最終 push 時に確認する。
+- **見送り**: 案A 段2 (初期フォルダの UI スレッド外化) はリリース後。§1.339 (★一覧の絞り込みが → で ZIP に残る) は次版。
+
 ## v4.2.0 (2026-09-29)
 
 - **依存**: PDFium `chromium/8066` (最新)。FFmpeg は `setup-ffmpeg.sh check` が `n7.1.5-12` を「新版」と出すが、
