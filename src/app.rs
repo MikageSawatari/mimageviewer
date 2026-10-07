@@ -6018,6 +6018,14 @@ pub(crate) enum ConvertedArchiveSourceState {
 }
 
 impl ConvertedArchiveSourceState {
+    fn invalidate_cached_paths(paths: &mut HashMap<String, Self>) {
+        for state in paths.values_mut() {
+            if matches!(state, Self::CachedZip(_)) {
+                *state = Self::Pending;
+            }
+        }
+    }
+
     pub(crate) fn load_path(&self) -> Option<&Path> {
         match self {
             Self::Direct(path) | Self::CachedZip(path) => Some(path),
@@ -36326,6 +36334,11 @@ impl App {
             }
             self.converted_archive_cache_paths =
                 std::mem::take(&mut metadata.converted_archive_cache_paths);
+            // Prepared/reused metadata can outlive a cache deletion. Publish only sources
+            // revalidated by this installed list's existing asynchronous source owner.
+            ConvertedArchiveSourceState::invalidate_cached_paths(
+                &mut self.converted_archive_cache_paths,
+            );
             self.folder_pin_map = std::mem::take(&mut metadata.folder_pin_map);
         }
         // 準備 worker が sparse metadata を完成させているため、未登録キーの同期 DB
@@ -37360,13 +37373,25 @@ impl App {
     /// Cache maintenance changed the shared ZIP store, not the source archives or pins.
     /// Discard pre-delete replies and recheck cached sources through the existing worker.
     fn invalidate_converted_archive_cached_sources(&mut self) {
-        if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
+        Self::invalidate_converted_archive_source_owner(
+            &mut self.converted_archive_cache_paths,
+            &mut self.converted_archive_cache_paths_pending,
+            &mut self.top_level_grid_view,
+        );
+        self.invalidate_converted_archive_sources_in_parked_contexts();
+    }
+
+    fn invalidate_converted_archive_source_owner(
+        paths: &mut HashMap<String, ConvertedArchiveSourceState>,
+        pending: &mut Option<ConvertedArchiveCachePathsPending>,
+        grid: &mut top_level_grid_view::TopLevelGridView,
+    ) {
+        if let Some(pending) = pending.take() {
             pending.cancel();
         }
-        for state in self.converted_archive_cache_paths.values_mut() {
-            if matches!(state, ConvertedArchiveSourceState::CachedZip(_)) {
-                *state = ConvertedArchiveSourceState::Pending;
-            }
+        ConvertedArchiveSourceState::invalidate_cached_paths(paths);
+        if let Some(session) = grid.smart_folder_session_mut() {
+            session.invalidate_cached_sources();
         }
     }
 

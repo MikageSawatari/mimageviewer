@@ -324,6 +324,14 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 保存済み読書位置mapは変更しない。削除結果は件数だけなので全CachedZipを再検証するが、
 source一覧や読込済み画像を一括resetしない。Rows / Errorは変異通知にしない。
 
+同じ変異通知をmounted ownerだけでなく、全AtRest / Retiring bundleと各Smart sessionの
+Visible / Offscreen親payloadにも届ける。parked contextをmountせず、各ownerの解決batchだけを
+cancel/破棄する。history/A-Bの地点record自体はmapを持たず、Smartの親payload復元か通常再列挙へ戻る。
+共有sort metadataや進行中prepareの古いmapは、prepared aggregateの採用/評価条件での行追加の境界でCachedZipを
+Pendingにして既存workerへ渡す。初回/再prepareでもキャッシュ解決を非同期に確かめるため、
+新しいepochや巨大metadataのclone、sort/読書sessionの中断を足さない。
+復帰・context swapというread-only操作を共有ストアの変異通知にしない。
+
 pin root の cascade 結果は `converted_archive_pin_root_states` に root 単位で保持する。root が batch
 候補になるのは、同 generation / 同 `folder_thumb_depth` で未走査か、記録済み archive key にまだ
 `Pending` がある場合だけ。cascade 後に desired scope から外れて archive 判定を skip した場合は、

@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-08 §1.350 r4 共有変換cache削除のsource-owner失効**
+
+利用者の独立レビュー指摘を受け、削除完了時の失効をmounted mapから全AtRest/Retiring
+bundleとSmart sessionの退避親payloadにも届ける。registryでは既存slot所有者へ同じ
+source map/解決batch失効helperを呼ぶだけで、parked contextをmountしない。
+共有ZIPストアの変異時だけCachedZipをPendingへ戻し、旧source batchをcancel/破棄する。
+read-only mount/swap/open/close、detached述語/viewport/native窓制御は変更しない。
+items、pin来歴、Direct、読込済み画像、読書保存keyを一括resetしない。
+Codex実装担当の判断は共有ストアの失効を各payload ownerへ届ける所有境界の修正であり、
+detachedの症状guardではない。設計担当の検収・独立再レビューは未実施で、合意済みとは記録しない。
+根因・経路監査・自動検証は[読書位置plan §17](book-resume-meter-plan.md#17-r4--退避した解決元ownerへのキャッシュ失効2026-10-08)を参照。
+
 **2026-10-06 §1.241 plan A Phase A 起動診断・Indexer単一採用**
 
 設計 `docs/startup-diagnostics-plan.md` は f2fcef6b2 の独立レビューで ready（指摘なし）となり、

@@ -805,3 +805,64 @@ BookResumeMeters、DB保存・復元key、既に表示したtextureは変更し�
 利用者指示に従い、今回はfocused test・fmt・通常/portable core checkだけを実行する。
 全lib・glyph・build-devは再実行せず、製品バイナリを起動しない。
 §15の2026-10-07確認用バイナリには、このr3失効修正は含まれない。
+
+## 17. r4 — 退避した解決元ownerへのキャッシュ失効（2026-10-08）
+
+指摘の根因は一致した。r3はmounted mapのみ失効させ、SmartFolderPreparedGridの親mapや
+parked ViewerContextBundleを残したため、親→子→cache削除→BSで古いCachedZipが戻る。
+ただし「Smart合成rootに古いバーが復活する」という表現には反対する。
+thumbnail_book_resume_meterはSmartFolderPosition::Rootを対象外としており、この仕様は維持する。
+退避mapはサムネイルの解決元としても使うため、失効漏れ自体は実在し、修正対象である。
+
+削除完了から一つのsource-owner失効helperへ渡し、mountedと全AtRest/Retiring bundleの
+map/解決batch/Smart session親payloadを同型で失効させる。Visible親のmapとOffscreen親の
+prepared aggregateのCachedZipだけをPendingにする。contextをmountしない。
+Direct/Unavailable、pin来歴、BookResumeMeters、保存/復元key、items/画像/viewportを維持する。
+共有sort用ReusedSmartFolderMetadataや進行中prepare結果のmapも、prepared aggregateの
+採用境界でCachedZipをPendingへ戻して既存の非同期解決workerへ接続する。
+prepare結果を終端解決の正本としないため、cache削除より前に作られた結果を後から採用しても
+削除済みZIPを再公開しない。paintのI/O、専用worker/pending/epochは追加しない。
+
+| 退避・復元経路の照合 | 対応 |
+| --- | --- |
+| Smart親→子→BS、履歴←/→のresident親復帰 | Smart sessionのVisible/Offscreen payloadへ削除時に失効。共通restoreでそのmapを戻す |
+| Smartのsort-only再prepare・no-resident履歴準備、進行中prepare・評価条件による行追加 | aggregate採用/merge時にCachedZip再判定。共有metadataをclone/resetせず再利用 |
+| 通常folder/Rating/Collectionの履歴←/→、A/Bの地点復帰 | FolderNavHistoryTarget/QuickFolderWorkspaceは地点と履歴だけでmapを保持しない。既存load/initializeでPendingから再解決 |
+| detachedのpark/mount/fork/drop | source mapとbatchをbundleが所有。AtRest/Retiringにも変異時だけ失効を渡す。forkの空初期化、swap/dropは変更しない |
+| Rows/Error・read-only親復帰/履歴/context切替 | 共有ストアへの変異通知を出さず、Directや別contextの読書表示をresetしない |
+
+簡素化: 退避root全体のreloadやmetadata再読込、contextごとの別epochを検討した。
+前者は大規模Smartの移動済みgrid・選択/scroll再利用を失い、後者は新しい状態組み合わせが増える。
+既存payload所有者への同じ失効と、既存aggregate採用/非同期解決へ集約する案を採用した。
+初回/再prepareのCachedZipも既存range workerで確認する。UIでDB/ファイルを調べない。
+detached述語/viewport/窓の切替処理は変更しない。共有ストア変異のbundle所有境界だけを扱う。
+
+回帰は実Smart scan/prepare→実child採用→実cache削除worker/完了poll→BSのparent handler→
+移動した親grid復元→実解決workerの経路で、CachedZip復活を検査する（初期化の直接呼出しなし）。
+合成rootのバーは非表示のまま、sourceがPending→Unavailableになることを検査する。
+さらに実sort-only prepare/adoptionで削除前の共有metadataを再利用してもCachedZipが復活しないことを検査する。
+もう一件は実削除完了からparked source batchのcancel/旧reply破棄、Direct維持、
+mounted context/generationとparked pan不変を確認する。
+有効red: 修正前の実往復でCachedZipが復元され、Pending期待と不一致。0 passed / 1 failed、
+実exit 101、0.32s（target/A-r4-red.log）。初回fixtureのrootバー表示期待で止まった実行は
+仕様照合の誤りであり、有効redには数えない。
+
+最終差分の検証（HEAD d098693403fdacf85b8c68093b5876ab40a1645c＋未コミットr4差分、
+CARGO_BUILD_JOBS=1 / RUST_TEST_THREADS=4）。各filterは重複を含むため合算件数とは扱わない。
+独立再レビューと実機確認は未実施。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib book_resume_meter_` | exit 0、45 passed / 0 failed、5.30s。target/A-r4-meter.log |
+| `cargo test -p mimageviewer --lib smart_folder_transition_tests` | exit 0、103 passed / 0 failed、36.49s。target/A-r4-smart.log |
+| `cargo test -p mimageviewer --lib rating_smart_` | exit 0、10 passed / 0 failed、2.19s。target/A-r4-rating-smart.log |
+| `cargo test -p mimageviewer --lib archive_pin_root` | exit 0、8 passed / 0 failed、1.69s。target/A-r4-pin.log |
+| `cargo test -p mimageviewer --lib incremental_archive_result` | exit 0、2 passed / 0 failed、0.34s。target/A-r4-batch.log |
+| `cargo fmt` / `cargo fmt --check` | exit 0 |
+| 通常core check / portable core check | 両方exit 0、14.39s / 14.06s。target/A-r4-check-normal.log / target/A-r4-check-portable.log |
+
+利用者の指定範囲に従い、全lib/full gate・glyph・確認用buildは再実行しない。
+製品バイナリを起動せず、Git commitは作らない。英語messageはtarget/A-r4-msg.txt。
+§15の確認用バイナリにはr3/r4の失効修正が含まれない。
+coordinatorはsource-ownerの退避/採用境界とPageIdentity契約を独立再レビューへ渡し、
+[残る利用者質問](file-type-visibility-plan.md#82-残る利用者質問未回答具体例と推奨)への判断を集める。

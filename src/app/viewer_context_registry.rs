@@ -3529,6 +3529,21 @@ impl App {
         self.viewer_contexts.table.ids()
     }
 
+    /// A deletion mutates the shared archive ZIP store. Apply the same source-owner transition
+    /// to parked/retiring payloads without mounting them or resetting their viewer state.
+    pub(in crate::app) fn invalidate_converted_archive_sources_in_parked_contexts(&mut self) {
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            Self::invalidate_converted_archive_source_owner(
+                &mut bundle.converted_archive_cache_paths,
+                &mut bundle.converted_archive_cache_paths_pending,
+                &mut bundle.top_level_grid_view,
+            );
+        }
+    }
+
     pub(crate) fn invalidate_removed_epub_generations(
         &mut self,
         removed: &[crate::epub_cache::GenerationRow],

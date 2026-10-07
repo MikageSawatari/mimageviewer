@@ -1,6 +1,6 @@
 # 表示するファイル種類 — §1.345 / 履歴再入場のfacet退避 — §1.339
 
-作成: 2026-10-07、改訂: 2026-10-08（独立レビューr3）、ラインA。
+作成: 2026-10-07、改訂: 2026-10-08（独立レビューr4）、ラインA。
 状態: **設計案、未実装、残る利用者質問と設計担当・独立レビュー待ち**。
 本書の新しい型・APIは提案であり、現行コードに存在するという主張ではない。
 実アプリは起動していない。§1.339の観測者は利用者、原因の根拠は下記のコード調査。
@@ -70,7 +70,7 @@ FileTypeVisibility::allows(&ListingCandidateType) -> bool
 `ListingCandidateType`はGridItemを新設するための型ではなく、生成前の識別情報。
 元RARをcache ZIPと分類したり、EPUBをPDFと分類したりしない。
 ZIP/RARの内部画像はmember名の拡張子、PDF/EPUBページは「描画された画像」ではなく
-論理元文書のPDF/EPUB categoryを使う案（Q3）。実directoryは通路として保持するが、
+論理元文書のPDF/EPUB categoryを使う案（Q3a）。実directoryは通路として保持するが、
 内部書庫も現行ではZipDirであり、別のarchive member本体rowは存在しない。
 内部書庫の選別には次の来歴を運ぶ設計が必要で、is_archive/suffixは採否に使わない。
 
@@ -172,7 +172,7 @@ Folder構造は保持するので実子folderがあれば従来どおり非本�
 Remote読順を同じ投影と述語に揃える。`image_page_recognition_fingerprint`もpolicy値を含める。
 保存済みmeter比率は次の読書記録まで維持する。位置復元は現行kind検証だけでは安全にできない。
 読順への投影と永続identityの案を§5.5/Q15へ分離し、未決のまま実装しない。
-非表示pageを必須targetとしたbookmark/検索復元は先頭へのsilent fallbackをせず、理由を通知する案（Q3）。
+非表示pageを必須targetとしたbookmark/検索復元は先頭へのsilent fallbackをせず、理由を通知する案（Q3b）。
 
 ### 5.3 件数・badge・facet・metadata
 
@@ -219,6 +219,37 @@ policy変更やrefresh後に古いVを新snapshotへmergeしない。rename/dele
 新optional列の追加/default/旧版との互換をbook_resume_dbの設計・移行テストに含める。
 sort/page追加・削除にもidentity照合を使うが、内容変更後も同一ページと保証する設計には広げない。
 
+#### 5.5.1 raw-only更新によるidentity失効（r4追加）
+
+現行BookResumeDb::setは`INSERT(path,page) ... ON CONFLICT ... UPDATE SET page`だけを
+書き、BookResumeWriterの既存upsertもpageとmeterだけを書く。旧版が追加列を知らないまま
+既存行を更新すると、以前のPageIdentityは残る。「identityが存在する」だけでは最新記録といえない。
+raw値の一致や保存時rawの併記だけでも、同じindexが別のページを指す場合を検出できない。
+
+設計既定はDB自身で失効を保証すること。identity列の追加と同じmigrationで
+`AFTER UPDATE OF page ON book_resume` triggerを作り、NEW.pathのidentityをNULLにする。
+`OLD.page != NEW.page`の条件は付けず、同じraw値を再保存した場合も必ず失効させる。
+旧版のpage-only upsertはこのtriggerを残して実行するので、旧版コードの変更は要らない。
+新規INSERT/REPLACEのraw-only行はidentity列のNULL defaultで未同定になる。
+read側はNULLを§5.5の旧raw記録と同じ扱いにし、古いidentityを復活・推測しない。
+path key、page列、meter列の意味は変えず、triggerはidentity列だけを変更する。
+
+新版writerは同じ専用workerの**一つのtransaction**内で、まず従来のraw/meter upsertを実行して
+identityを失効させ、次に`UPDATE ... SET page_identity=? WHERE path=?`で同じ読書イベントの
+identityだけを保存する（後段はpage列を書かない）。旧版・raw-only APIもこの失効契約を通す。
+rawとidentityを同じupsertに書く案はAFTER triggerで新版identityまで消すため採らない。
+readerはcommit済みの対だけを読む。trigger/列のmigrationは一括transactionにし、writerの全
+page更新入口を照合する。新しいtimestamp、世代counter、旧版検出・再試行stateは増やさない。
+既存のバックアップや削除・全消去は行と一緒にidentityを扱う。旧DBを戻した場合もmissing列の
+migration後はNULLから開始し、以前の新版DBのidentityを別保存先からmergeしない。
+
+実装時の互換回帰は**新版→旧版→新版**を同じ実DBで通す。新版で2.png/raw=1とidentityを記録、
+旧版の実page-only SQLで3.jpg/raw=2を保存し、新版再openでidentityがNULL、最新raw=2を読むこと、
+除外ありでは古い2.pngへ戻らず旧raw通知へ進むこと、除外なしでは従来raw=2を使うことを検査する。
+さらに列変更/投影で別ページが同じraw=1にあるケースも旧版SQLで保存し、値が同じでもNULLになること、
+新版の続くidentity付き保存がcommit後に復元可能になること、raw/meterが失効triggerで変わらないことを検査する。
+これは旧版更新後の記録整合性を守る設計契約であり、Q15の復元制約への回答待ちとは分離する。
+
 identityのない旧記録から過去ページを確実に復元することはできない。
 種類除外が読書ページ列に適用されるsessionでは旧raw indexを自動採用せず、通知して利用者の選択から
 再記録する案を推奨する（除外設定を戻した従来列では現行raw復元を維持）。
@@ -230,7 +261,8 @@ identityのない旧記録から過去ページを確実に復元することは
 
 ## 6. 永続化とUI案
 
-新fieldは`Settings.file_type_visibility`のみ。既定は全対応形式を表示。
+新しい設定fieldは`Settings.file_type_visibility`のみ。既定は全対応形式を表示。
+読書位置DBの追加identity列とraw-only失効契約は§5.5で扱う。
 settings.dbの既存Settings carrierへ追加し、旧fieldの意味・既存facet値を移行しない。
 新設定は未出荷、旧設定ファイルからのmissing fieldはdefaultで読み込む。
 古い版へ戻したときの未知field保存/互換判定はSettings DBの現行方針を使い、
@@ -246,7 +278,7 @@ favorite_view_overlay、A/B記憶、起動一覧recordには追加しない。
 category checkbox＋拡張子詳細、全表示へ戻すボタン、除外適用の説明を示す。
 既存「書庫を無視/確認/変換」とは別設定で、表示を許可しても開封処理が許可されるとは限らない。
 toolbar quick導線は同じ設定を開く任意登録ボタンと適用中の印を推奨し、
-一時解除boolや第二のeffective policyを増やさない（Q10）。
+一時解除boolや第二のeffective policyを増やさない（D10）。
 「全部表示」操作も採用するなら同じ永続設定の変更として扱い、元状態stashを作らない。
 新キー操作を付ける場合は`KeyAction`とkeymap helper一式、既定割当なし。raw keyイベントを追加しない。
 
@@ -278,7 +310,7 @@ detached述語/viewport変更に達した場合はrework§2の合意と§11記�
 rare cache/DB failureの多段回復は追加しない。現行ログ/通知/次回再生成の範囲で扱い、
 利用者の設定や登録データを落とす割り切りはしない。
 
-## 8. 決定した設計既定と、残る利用者質問（r3）
+## 8. 決定した設計既定と、残る利用者質問（r4）
 
 ### 8.1 決定した設計既定（利用者が上書き可能）
 
@@ -292,25 +324,26 @@ rare cache/DB failureの多段回復は追加しない。現行ログ/通知/次
 | D4（Q4） | 同名優先は表示対象候補だけで判定する。動画除外なら同名JPEGが残る |
 | D8（Q8） | 種類設定による非表示を件数内訳に追加し、登録数と表示数を区別する |
 | D9（Q9） | settings_transferの環境設定export/import対象に分類する |
+| D10（Q10、r4） | 環境設定＋任意登録toolbarボタンで同じ設定を開く。一時解除toggle/stashは作らず、「全表示」も同じ永続設定を変更 |
+| D13（Q13、r4） | categoryと個別拡張子を両方選べるUI。RAW全体またはCR2だけ除外でき、PDF/EPUB・ZIP/RAR/7z/LZHも分ける |
 | D14（Q14） | 履歴再入場も通常openと同じく、live親条件を退避して子では条件なし。地点別filter記憶の要望がある場合のみ再相談 |
 
 ### 8.2 残る利用者質問（未回答、具体例と推奨）
 
-**変更**は今回具体化した既存質問、**新規**はr3指摘に伴う追加質問。IDは以前の議論と対応させる。
+**変更**はr4で分割・補完した質問、**継続**はr3からの未回答質問。IDは以前の議論と対応させる。
 
 | ID / 状態 | 質問・具体例 | 推奨回答と費用/影響 |
 | --- | --- | --- |
-| Q3 / 変更 | 本内部にも適用し、PNG除外後のZIP内2.pngのbookmark openや、PDF除外中のPDF直接openは理由を出して拒否しますか？ | はい。ZIPはmember、文書ページは元形式で判定。単体画像/動画/音声の外部openは維持し、兄弟一覧に適用。隠れた明示targetを別ページで代用しない |
-| Q5 / 変更 | RAWをfolder代表へpinした後RAWを除外した場合、pinを残してJPEGの自動代表へ表示を替えますか？ | はい。候補なしならアイコン。動画のsidecar JPEGは補助資源として使い続ける |
-| Q6 / 変更 | 動画だけのfolderで動画を除外したとき、Ctrl+上下はそのfolderをskipしますか？ | はい。従来skip_limit/fallbackを維持し、直接クリックでは空folderにも入れる |
-| Q7 / 変更 | JPEG＋MP4のfolderで動画を除外すると、JPEGだけの本として自動open/畳み込みしてよいですか？ | はい。非空の表示mediaが全画像で子コンテナなし。全画像除外なら非本。通常/Remote/page countを揃える |
-| Q10 / 継続 | 設定をすぐ変える導線は、環境設定＋任意toolbarボタンでよいですか？ 例: RAW除外を解除するには同じ設定を開く | はい。独立した一時解除toggle/stashは作らない。「全表示」も同じ永続設定を変更 |
-| Q11 / 変更 | PNG除外を確定した際、検索結果やサブ展開を閉じて元folderへ戻してよいですか？ | はいを推奨。一時結果が閉じる代わりに既存reloadを使える。不便なら各producerの再実行を設計 |
-| Q12 / 変更 | 動画再生中に動画を除外しても再生は継続し、閉じて一覧を作る時から除外してよいですか？ | はいを推奨。開いている本の読順もsession終了まで保持。全windowへの即時適用なら中断動作と所有変更を再相談 |
-| Q13 / 継続 | 画像/RAW等のcategoryと個別拡張子の両方を選べるUIでよいですか？ 例: RAW全体でなくCR2だけ除外 | はい。PDF/EPUB、ZIP/RAR/7z/LZHも分ける。細かい設定を持つ分UI項目が増える |
-| Q15 / 新規 | 2.png保存後にPNGを除外して3.jpgへ誤復元しないため、今後はページidentityも保存し、identityのない旧記録は種類除外を適用する読書sessionで自動復元を見送ってよいですか？ | はいを推奨（§5.5）。旧記録は通知後に再選択・再記録が必要。追加optional永続列と移行/旧版互換テストが必要。raw-onlyで投影後indexを採用する案は推奨しない |
-| Q16 / 新規 | ZIP内book.zipを除外しnotes.zipという実folderは残すため、列挙来歴を追加し、旧変換cacheの来歴が必要なときは再変換を求めてよいですか？ | はいを推奨（§3.1）。旧cacheの再変換に時間がかかる。内部書庫を今回対象外にするならその例外を明記して設計を縮小 |
-| Q17 / 新規 | PNG除外中のcollection並べ替えで、非表示entryの元slotを固定して可視entryだけ入れ替えてよいですか？ 例: A,H,B,J,C→C,H,A,J,B（H/JがPNG） | はいを推奨（§5.4）。全ID保存・revision検証を維持。編集画面だけ全登録を見せる簡素化案は全一覧適用の例外になる |
+| Q3a / 変更（Q3を分割） | 種類設定を本内部のページ列にも適用しますか？ 例: PNG除外でZIP内1.jpg/2.png/3.jpgから2.pngを除く | はいを推奨。書庫はmember、PDF/EPUBページは元文書形式で判定。読順・ページ数・復元のprojectionが変わるため§5.5/Q15も必要 |
+| Q3b / 変更（Q3を分割） | 非表示の本・内部ページを明示指定しても拒否しますか？ 例: PNG除外中のZIP内2.png bookmark、PDF除外中のPDF直接open | はいを推奨。理由を表示し、他ページで代用しない。単体画像/動画/音声の外部openは維持し、兄弟一覧だけに適用。拒否しない案なら明示openの例外sessionを定義する |
+| Q5 / 継続 | RAWをfolder代表へpinした後RAWを除外した場合、pinを残してJPEGの自動代表へ表示を替えますか？ | はい。候補なしならアイコン。動画のsidecar JPEGは補助資源として使い続ける |
+| Q6 / 継続 | 動画だけのfolderで動画を除外したとき、Ctrl+上下はそのfolderをskipしますか？ | はい。従来skip_limit/fallbackを維持し、直接クリックでは空folderにも入れる |
+| Q7 / 継続 | JPEG＋MP4のfolderで動画を除外すると、JPEGだけの本として自動open/畳み込みしてよいですか？ | はい。非空の表示mediaが全画像で子コンテナなし。全画像除外なら非本。通常/Remote/page countを揃える |
+| Q11 / 継続 | PNG除外を確定した際、検索結果やサブ展開を閉じて元folderへ戻してよいですか？ | はいを推奨。一時結果が閉じる代わりに既存reloadを使える。不便なら各producerの再実行を設計 |
+| Q12 / 継続 | 動画再生中に動画を除外しても再生は継続し、閉じて一覧を作る時から除外してよいですか？ | はいを推奨。開いている本の読順もsession終了まで保持。全windowへの即時適用なら中断動作と所有変更を再相談 |
+| Q15 / 変更 | 2.png保存後にPNGを除外して3.jpgへ誤復元しないため、今後はページidentityも保存し、identityのない旧記録や旧版で更新した記録は種類除外を適用する読書sessionで自動復元を見送ってよいですか？ | はいを推奨（§5.5）。通知後に再選択・再記録が必要。追加optional永続列、raw-only失効trigger、新版→旧版→新版回帰が必要。raw-onlyで投影後indexを採用する案は推奨しない |
+| Q16 / 継続 | ZIP内book.zipを除外しnotes.zipという実folderは残すため、列挙来歴を追加し、旧変換cacheの来歴が必要なときは再変換を求めてよいですか？ | はいを推奨（§3.1）。旧cacheの再変換に時間がかかる。内部書庫を今回対象外にするならその例外を明記して設計を縮小 |
+| Q17 / 継続 | PNG除外中のcollection並べ替えで、非表示entryの元slotを固定して可視entryだけ入れ替えてよいですか？ 例: A,H,B,J,C→C,H,A,J,B（H/JがPNG） | はいを推奨（§5.4）。全ID保存・revision検証を維持。編集画面だけ全登録を見せる簡素化案は全一覧適用の例外になる |
 
 ## 9. §1.339 — 履歴再入場のfacet退避を採用境界へ集約する
 
@@ -449,6 +482,7 @@ aggregate producer → Remoteとcache/reloadの順でcoherent chunkに分ける�
 - Settings旧値/default/roundtrip/export-import/Cancel、policy変更後のstale完了・reload・snapshot復帰。
 - data rowsとsidecar/tag/collection順が不変、local/Remoteの表示列・読順・count一致、Remote prepared cache更新。
 - 2.png保存→PNG除外で3.jpgへ誤復元しないこと、identity/旧raw/除外target/設定復帰、永続列の互換。
+- 新版identity保存→旧版raw-only更新→新版再open、同raw値の旧版再保存でも失効、以後の新版保存でidentity再確定（§5.5.1）。
 - 同suffix実directoryと実書庫、同prefix alias、複数段のcontainer ancestry、旧変換cache manifest欠落。
 - collection全ID集合、非表示slot/相対順、可視drag後の全ID保存、設定変更・revision conflictで旧投影を保存しないこと。
 - headless UI snapshot（prefs・適用中表示・件数）、full lib、fmt、通常/portable core check、glyph。
@@ -464,3 +498,11 @@ raw-kind検証では投影後identityを守れない点を§5.5/Q15へ、facet�
 ZipDirに来歴がない点を§3.1/Q16へ、collection subset merge ownerが存在しない点を§5.4/Q17へ訂正した。
 Q1/Q2/Q4/Q8/Q9/Q14は上書き可能な決定した設計既定へ移した。
 残る質問は§8.2。今回も設計のみであり、§1.339/§1.345のコードや永続列を実装していない。
+
+### r4補完（2026-10-08）
+
+page-only upsertが未知のidentity列を残す指摘は現行SQLと一致し、採用した（反対意見なし）。
+§5.5.1にDB triggerによるraw-only更新の失効、新版writerの一transaction保存、
+新版→旧版→新版と同raw値更新の回帰契約を追加した。永続コードは変更していない。
+Q10/Q13は利用者が上書きできる推奨設計既定D10/D13へ移し、Q3は本内部適用Q3aと
+明示open拒否Q3bへ分割した。Q15には旧版で更新した記録の制約も明記した。

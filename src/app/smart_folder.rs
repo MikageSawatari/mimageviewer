@@ -539,6 +539,24 @@ impl SmartFolderOpenOrigin {
 }
 
 impl SmartFolderSession {
+    pub(in crate::app) fn invalidate_cached_sources(&mut self) {
+        if let Some(grid) = self.phase.parked_root_mut() {
+            ConvertedArchiveSourceState::invalidate_cached_paths(
+                &mut grid.converted_archive_cache_paths,
+            );
+        }
+        if let Some(prepared) = self.phase.offscreen_root_mut()
+            && let Some(metadata) = prepared.metadata.aggregate.as_mut()
+        {
+            ConvertedArchiveSourceState::invalidate_cached_paths(
+                &mut metadata.converted_archive_cache_paths,
+            );
+        }
+        // Shared sort metadata and in-flight prepare replies remain reusable. Their source
+        // maps are revalidated at start_loading_items_inner before publication, so no large
+        // metadata clone, navigation cancellation, or second cache epoch is required.
+    }
+
     fn new(
         snapshot: SmartFolderSnapshot,
         resort_metadata: Arc<ReusedSmartFolderMetadata>,
@@ -1648,7 +1666,11 @@ impl App {
             }
             current.insert(key, index);
         }
-        if let Some(extra) = aggregate {
+        if let Some(mut extra) = aggregate {
+            // Membership prepare can complete after deletion, just like a full prepare.
+            ConvertedArchiveSourceState::invalidate_cached_paths(
+                &mut extra.converted_archive_cache_paths,
+            );
             self.folder_pin_map.extend(extra.folder_pin_map);
             self.converted_archive_cache_paths
                 .extend(extra.converted_archive_cache_paths);
