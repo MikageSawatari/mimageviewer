@@ -29,6 +29,15 @@
   初回設定の小画面: サブ PC の Windows Sandbox 1093×614 で、修正版は見出しと「開始」が表示、v4.3.0 は表示されない。
 - **ui-smoke**: RatingFolderBack (600 行・10 列) のツールバー 6 ケース PASS。キー系は前面を取れず SKIPPED。
 - **panic.log**: 52 件 15 種すべて disposition あり (`check-panic-log.ps1` exit 0)。CI は最終 push 時に確認する。
+- **idle health (配布ビルドの core、利用者が実施)**: `static-foreground` / `static-background` / `tray-residency` とも **PASS**。
+  測定区間の perf event 0 件 (完全 sleep)、CPU 1 コア比 0.0125 / 0.0083 / 0.0042、`tray-residency` は `8/0 visible`。
+  `video-pin-background` は未実施 (waiver): v4.3.0 からアイドル高画質化 (`idle_upgrade`) のコードに差分なし。
+- **perf smoke (利用者が操作)**: 5,392 フレーム。直前が `request_repaint` の描画フレーム 2,417 件中 **98.4% が 16ms 未満**。
+  `ui.pre_grid_breakdown` total p50 0.04ms / p95 0.09ms / max 1.66ms。100ms 超の間隔 32 件のうち 30 件は `none` /
+  `request_repaint_after_idle_upgrade` (正常)、1 件は起動直後。残る 1 件は 7.5s の 529ms で直前が
+  `request_repaint_after_ai_upscale`、内訳は `fs_render_breakdown.viewport_render_ms` 508ms (同期 I/O の段ではない)。
+  直後に AI のタイル推論が始まっており、初回 AI アップスケール開始時の GPU 競合と推定 (未確認)。AI のコードは v4.3.0 から変更なし。
+  v4.3.0 でも同じかは比較していない。
 - **見送り**: 案A 段2 (初期フォルダの UI スレッド外化) はリリース後。§1.339 (★一覧の絞り込みが → で ZIP に残る) は次版。
 
 ## v4.2.0 (2026-09-29)
