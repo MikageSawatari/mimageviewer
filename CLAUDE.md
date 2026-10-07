@@ -2253,6 +2253,28 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
       コード署名は build-dist.ps1 が実施済み (本書 Phase 3 / 「code signing」)。詳細な経緯・ハマりどころは
       [docs/release-operations.md](docs/release-operations.md) §8 参照。
 
+
+### Phase 6: 公開後の後始末 (毎リリース、2026-10-07 利用者指示)
+
+GitHub Release の公開と Phase 5 の案内が済んだら、同じ作業の中で次を片付ける。放置するとビルドキャッシュは
+数百 GB に膨らみ (2026-10-07 時点で本体 `target` 523 GB、worktree 12 個で計約 785 GB)、バックログは出荷済み項目で読みにくくなる。
+
+20. **ビルドキャッシュの整理** (作り直せるので確認不要):
+    - 本体 worktree の `target/*/incremental` (`debug` / `dev-runtime` / `release` / `dev-runtime-staging/*`) を削除する。
+      配布物 (`target/release/mimageviewer*.exe`、`installer/Output/`、`dist/`) は Phase 4 の添付と Store 申請が済むまで消さない。
+    - 撤去しない worktree も、しばらく使わないなら `target/` を削除してよい (次回ビルドが遅くなるだけ)。
+    - 削除前後のサイズを報告する。
+21. **完了した worktree の撤去** (元に戻せないので、候補一覧を利用者に見せて了承を得てから):
+    - `git worktree list` の各 worktree について、HEAD が master に取り込み済みか (`git merge-base --is-ancestor`)、
+      未コミット変更が無いかを確認して候補を出す。保留中の作業 (backlog-on-hold の検証ラボ等) と未統合ブランチは残す。
+    - 撤去は必ず `scripts/safe-worktree-remove.ps1` 経由 (「worktree + Windows junction の地雷」節)。
+      取り込み済みのブランチは `git branch -d` で消す。`.claude/worktrees/` 配下は Claude アプリが作ったものなので、
+      アプリ側の片付け (`clean_up_worktrees`) を優先する。
+22. **バックログの整理**: 今回出荷した項目を `docs/next-release-backlog.md` から削除し (経緯は git 履歴と
+    CHANGELOG に残る)、出荷しなかった残件・見送りは見出しの状態を更新する。報告者に返信済みかどうかの記録は残す。
+    削除した項目の一覧をコミットメッセージに書く。
+23. **メモの更新**: `project_next_version_plan.md` 等の進行メモを「公開済み」に更新し、次の版の予定を書く。
+
 ## Codex CLI レビュー
 
 担当・実施粒度は [AGENTS.md](AGENTS.md#model-roles-and-coordination) に従う。
