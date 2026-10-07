@@ -1,7 +1,9 @@
 # F11 全画面中のロック済みクローム一時抑制 (§1.344)
 
 作成: 2026-10-07 / ライン E / `next-viewer` / 調査基点 `d29bcfbec`。  
-状態: **設計案のみ。利用者の未決事項・ClaudeCode の構造合意・独立レビューは未完了。**
+改訂: 2026-10-07 R2 / コード照合基点 `ff538c48c`（初版の上に置く文書改訂）。
+状態: **設計案のみ。独立 GPT-6.1 Sol / xhigh レビューは REVISE。構造方針への同意あり、
+本改訂の再レビュー・利用者判断・ClaudeCode の構造合意は未完了。**
 
 ## 1. 依頼と確定済みの境界
 
@@ -13,7 +15,8 @@ E は §1.344 → §1.342 → §1.341 → §1.340 の順で、できた分を出
 - ウィンドウ表示のロックを保ち、**描画対象の窓が F11 全画面の間だけ**固定による常時表示を抑制する。
 - 保存済み HUD / strip のロックを F11 入退場で書き換えない。右情報パネルの context-local なロックも維持する。
 - F11 を戻すと現在のロック設定に従う。入場時の値を保存して復元する方式にはしない。
-- 通常の自動表示と同じ召喚・操作を残す。画面端ホバー、touch、popup、操作中の drag を禁止する機能ではない。
+- 通常の自動表示と同じ召喚・操作を残す。同一 core の画面端ホバー、touch、popup、開始済み drag は維持する。
+  native core 再生成をまたぐ操作の維持は現コードの保証ではないため、§6 と Q7 で別に扱う。
 - 静止画、本、native 動画、F12 detached の F11 を同じ契約で扱う。F12 ON だけで抑制しない。
 - 「ページ全体」など fit 方式、グリッドの F11 最大化、全画面解除 / 一覧復帰とは別の問いにする。
 
@@ -47,6 +50,10 @@ placement / HUD / 固定バー、[右パネル設計](fullscreen-side-panel-mode
 | passive 静止画は live HUD のコピーではない | `DetachedImageWindowSnapshot` は frozen image / placement 等で、borderless lock のコピーではない。`adopt_active_detached_viewport_runtime_from_passive` は borderless を false にする。park / resume の F11 記憶仕様をこの機能で拡張しない |
 | native 動画 HUD は別の描画・入力面 | [render_core.rs](../src/video/native_presenter/render_core.rs) の `NativeEguiOverlay` / `VideoSeekGeometry` / `VideoVisualLayout` / `compute_hud_regions`、[overlay_draw.rs](../src/video/native_presenter/overlay_draw.rs)。`ui_fullscreen.rs` だけでは native 動画を変更できない |
 | native 初期化と更新の共通入口は存在する | [native_video.rs](../src/app/native_video.rs) の `native_bar_lock_state` / `sync_native_video_metadata`、[video/mod.rs](../src/video/mod.rs) の config / `SetBarLockState` / `SetSidePanelState`。raw と effective を一つの経路で運ぶ方向が取れる |
+| native 通常 command は切替先へ遅延適用される | `placement_transition_control` は control 以外を `pending_commands` に保持。candidate commit で `cur_placement` / `cur_generation` / `cur_owner_hwnd` を更新し、abort では旧値と旧 core を戻す。App で解決済みの旧 F11 bool を通常更新へ載せると、新 core を旧表示契約へ戻し得る。§4.1 で適用時に解く |
+| native HUD 非表示は drag の終了原因になる | `hud_visible()` は seek drag owner を参照せず、`!bottom_hud_visible` の終端で `seek_row_gesture` / `seek_strip_drag_origin` を消す。capture-all region だけでは防げない。同一 core の可視判定に既存 owner を接続する必要がある |
+| 通常 native F11 は overlay の入力状態を移譲しない | placement switch は `NativeRenderCore::new` で candidate を作り、`NativeEguiOverlay::new` は drag / popup を初期化する。decoder / strip resource の保持と overlay interaction の保持は別。§6 と Q7 で保証範囲を訂正する |
+| 右 panel の × は現在 raw lock で禁止される | `ui_metadata_panel.rs` の `explicit && !locked_now`、`overlay_draw.rs` の `click_to_show && !info_panel_locked`、`ui_music_panels.rs` の `!locked_now && music_side_panel_close_visible`。鍵と × に同じ lock 入力を使わず、× は effective に接続する |
 | ナビゲータは鍵ボタンではなく固定表示設定 | `fullscreen_navigator_visible` と `FsNavigatorToggle` / `FsNavigatorHold`、`fs_navigator_visibility_requested`。fixed、hold、interaction owner の OR で、Alt を離しても既存 drag は継続する。対象追加は利用者に質問する |
 
 依頼の核（保存ロックを変更せず、F11 表示先から派生させる）は現コードで成立する。
@@ -115,9 +122,44 @@ rect / monitor 一致、サイズ、foreground HWND、`settings.detached_viewer_
 通常の初回 fullscreen open も同じ表示先なら適用する案を Q1 に含める。
 
 F11 の request 受付ではなく、既存の presentation / borderless 適用境界で表示契約を切り替える。
-native candidate はその候補の target placement から初期 snapshot を作り、旧 committed surface の値を
-流用しない。候補が失敗したら旧 renderer は旧 snapshot を保持する。既存 transition owner の成功 / 失敗を使い、
-本機能独自の rollback、世代、ack 待機を追加しない。
+native の入力 snapshot は raw 設定・context 状態・対象方針を運び、非 detached の F11 bool / effective lock を
+App で確定して運ばない。candidate / 遅延更新 / abort は次節の同じ適用規則を使う。
+既存 transition owner の成功 / 失敗を使い、本機能独自の rollback、世代、ack 待機を追加しない。
+
+### 4.1 native snapshot の適用先契約（R2・指摘1）
+
+コード根拠: `src/video/mod.rs` の `placement_transition_control`（2193行付近）、
+`NativeRenderCore::new`（6109行付近）、commit の `cur_placement` 更新（6322行付近）、
+retire 待ち後の abort による旧 core / generation / owner 復元。
+通常 command は待機中にも到着し、成功後は新 core、abort 後は旧 core に適用される。
+**一 command 化だけでは、旧表示先で解決した実効値の遅延上書きを防げない。**
+
+snapshot 内の二種類の値を同じ適用境界で区別する。
+
+- **context / source に属する raw policy**: raw bar / info lock、info open / mode、抑制対象、寸法設定等。
+  同じ player / source / context owner の最新値として、既存 command queue の順序・latest-slot 規則で適用する。
+  F11 switch 前の presenter generation で生成したという理由だけで raw 設定更新を捨てない。
+  source / context が変わったものは既存の source / binding 検査に従い、別 context の state は適用しない。
+- **detached host に属する applied fact**: `DetachedSessionLease.window_id` と
+  `DetachedHostClaim { incarnation, hwnd }`、対応する既存 native generation に結び付けた borderless 値。
+  App の `current_detached_host_lease` / target の lease から作り、candidate / committed target の契約内で運ぶ。
+  lease だけでは同じ host の placement 前後を識別できないので、既存 request / candidate epoch の対応も使う。
+  独立した suppression generation、App-global host bool、geometry heuristic は追加しない。
+
+| 適用場面 | surface と snapshot の解決規則 |
+| --- | --- |
+| 初回生成 / candidate prepare | native driver が `NativeRenderConfig` へ実際の placement / owner identity を渡す。candidate は prepare request の target placement / candidate epoch と exact target host fact で解く。非 detached では detached fact を参照しない |
+| 通常更新（保留されていた分を含む） | raw policy を採用後、driver の **現在の `cur_placement` と target identity** から実効値を再計算する。App の旧 `viewer_presentation` / 解決済み F11 値は適用しない |
+| detached host fact の通常更新 | 現 target の window lease・host incarnation / HWND・native generation が一致した fact だけ更新する。不一致や旧 main 由来の「detached ではない」という値で、candidate が既に持つ matched fact を消さない。raw policy 部分の更新は別に維持する |
+| commit → retire | 新 core / `cur_placement` / generation / owner が同じ target 契約を持つ。App がまだ旧 presentation の間に発行した保留 command も、新 placement で解き直す。旧 generation の host fact は新 target を上書きしない。App の commit 回収後は既存 generation で exact host fact を同期する |
+| prepare failure / commit 前 abort | 旧 core と旧 target 契約はそのまま。保留 raw policy は旧 placement で解く。candidate の host fact を旧 core へ移さない |
+| commit 後・retire 前 abort | 現行 rollback が旧 core / placement / generation / owner を戻す際、旧 target の host fact もその core に属したまま戻る。その後の raw policy は戻った placement で解き直し、candidate epoch の host fact は適用しない |
+| F12 窓の F11（同一 core） | `app.rs::apply_detached_viewer_borderless_target` の applied 境界から、同じ exact host / generation の fact を送る。既存 queue の発行順を保ち、後で作った metadata 更新も同じ現 applied 値を読む。resize や UI tick で旧値を再推定しない |
+
+native 側が exact target lease を受け取れるよう、既存 config / prepare payload と chrome snapshot の型を延長する。
+これは既存 target contract に事実を載せる変更で、placement reducer の phase / effect / commit / retire / abort 条件は変更しない。
+host 未確定なら既存 prepare の host 待機境界に従い、抑制専用の待機を作らない。
+host fact の absence / mismatch は raw policy の全破棄や別窓の fact による fallback の理由にしない。
 
 ## 5. 描画・予約・ポインタ領域を同じ結果へ接続する
 
@@ -131,8 +173,9 @@ native candidate はその候補の target placement から初期 snapshot を�
 - 右は `still_info_panel_lock_effective_for_idx` / `locked_info_panel_reserved_width_for_eligibility` と
   `draw_metadata_panel_inner` / navigation shell のコピー投影を揃える。元の `fs_info_panel.locked` は変更しない。
   通常 panel と shell の `visible`、`side_panel_visible`、click sink、wheel / drag 抑止に別の raw-lock 判定を残さない。
-  Q4 を確定したら `on_display_target_changed` の transient 寿命も実効 lock で解く。F11 抑制中の明示 open が
-  raw lock を理由に次ページでも保持されないようにし、raw lock 自体は保持する。
+  Q4 の推奨案では `open` / `hover_active` の入場 reset と `on_display_target_changed` の変更は行わない。
+  明示 open は既存 lifecycle に従って残ることを利用者へ説明する。Q4 の別案が選ばれた場合だけ
+  target-change を含む単一の typed open owner の設計へ戻し、raw lock は保持する。
 - メディア矩形から fit、見開き、連結、回転、zoom、pan、ルーペ、navigator、preview、PDF display target まで
   同じ geometry を渡す。画像デコード / 補正 / AI resource を F11 抑制のために reset しない。
 - Q5 で音楽ビューの右 lock を含める場合は `draw_fs_music_view` の右 panel 表示 / 予約 / waveform hit、
@@ -142,6 +185,26 @@ native candidate はその候補の target placement から初期 snapshot を�
   召喚用の端判定は残すが、不可視のパネル全体を hit rect として残さない。
   ClickToShow の callout と touch handle は実際に描いた矩形だけが操作を受ける。
 
+### 5.1 右パネルの鍵と × を分ける（R2・指摘3）
+
+静止画の `explicit`、native 動画の `click_to_show`、音楽の `music_side_panel_close_visible` という
+既存の mode / open 条件は維持する。これらに掛ける **lock による close 禁止だけを effective_info_lock** にする。
+鍵アイコン・tooltip・toggle は raw lock、予約・配置・close 可否は effective lock を使う。
+raw lock ON / effective OFF でも、明示的に一時表示した右 panel は従来の mode の × で閉じられる。
+
+- 静止画: `begin_metadata_panel_frame` と navigation shell のタイトル部で `explicit && !effective_info_lock`。
+- native: `draw_native_metadata_panel` に raw と effective を別の意味入力で渡し、
+  `click_to_show && !effective_info_lock` で × とその hit / HUD region を生成する。
+- 音楽（Q5 採用時）: `draw_fs_music_right_panel` の close predicate を effective へ接続し、
+  raw の鍵描画 / toggle とは分ける。
+
+close は context の `close_fullscreen_info_panel` が所有する `open=Closed` / `hover_active=false` と、
+該当 presenter の tag picker / transient の close に限る。**raw lock を解除せず、Settings に保存しない。**
+native の現 × は `ToggleClickInfoOpen` を返すため、close intent は明示 close として App の既存 close owner へ
+収束させる（必要なら native command / event を close 専用にする）。遅延した × を再openの toggle にしない。
+以後の描画・sink・wheel・HUD region は閉じた結果に従い、F11退出で raw lock による固定表示へ戻る。
+通常 Hover の端だけによる表示へ新しい × を足す、という mode 変更はしない。
+
 ### native 動画: `src/video/native_presenter/` を実装面に含める
 
 raw lock を effective に置き換えて `NativeBarLockState` だけ送る案では、鍵の見た目と toggle 基準を失う。
@@ -149,8 +212,9 @@ raw lock を effective に置き換えて `NativeBarLockState` だけ送る案�
 **既存の bar / side-panel snapshot を一つの typed chrome snapshot にまとめる案**を推奨する。
 
 - App の共通 factory（現 `native_bar_lock_state` / `sync_native_video_metadata`）で raw bar lock、
-  context-owned info state / mode、対象方針、exact surface の F11 入力を収集する。
-  生成 config、更新 command、placement candidate の初期化が同じ factory / resolver を使う。
+  context-owned info state / mode、対象方針、identity付き detached host fact を収集する。
+  生成 config、更新 command、placement candidate の初期化が同じ raw policy と §4.1 の適用時 resolver を使う。
+  通常 native placement からの F11 判定は App factory の役割にしない。
   既存 `SetBarLockState` / `SetSidePanelState` の可変な二重更新は置換し、互換 owner を並置しない。
 - renderer は一つの snapshot を適用してから実効値・eligibility・geometry を解く。
   `NativeRenderCore::set_overlay_bar_lock_state` / side-panel reservation の再計算をこの境界へまとめる。
@@ -165,7 +229,7 @@ raw lock を effective に置き換えて `NativeBarLockState` だけ送る案�
   fullscreen の独立 HUD HWND と、detached child の通常 overlay の双方を対象にする。
   隠れた領域は OS ポインタを奪わない。popup の実描画 rect、touch help、既存 capture-all の所有中例外は残す。
 - `DetachedViewerChild` は placement enum だけでは F11 を区別できないので、exact host の applied borderless
-  入力も snapshot に載せる。F11 の host 拡大 / 復元時は既存 transition 適用境界でこの snapshot を同期する。
+  入力も §4.1 の identity に対応付けて snapshot に載せる。F11 の host 拡大 / 復元時は既存 transition 適用境界で同期する。
   通常 main / parked owner の metadata poll が active detached の抑制値を送らないことを検証する。
 - strip の一時非表示は既存の最終成功 present の `Hidden`、再表示は `Visible { window }` へ投影する。
   `CloseSeekStrip`、設定 OFF、worker cancel / decoder 再生成へ変換しない。
@@ -174,7 +238,8 @@ raw lock を effective に置き換えて `NativeBarLockState` だけ送る案�
 
 ## 6. 端ホバー・touch・popup・drag・明示操作
 
-抑制は **lock が与える表示理由だけ**を外す。その他の入力 owner を先に解き、既存の mode / modal gate を保つ。
+Q4 の推奨案では、抑制は **lock が与える表示理由だけ**を外す。その他の入力 owner を先に解き、
+既存の mode / modal gate を保つ。同一 core と core 再生成の境界を区別する。
 
 - 上端 / 下端 hover の閾値・維持帯、side panel に連動する上下表示は既存どおり。
   既に端へポインタがある場合、F11 入場で直ちに自動表示されても正しい。強制的にカーソルを動かさない。
@@ -182,16 +247,57 @@ raw lock を effective に置き換えて `NativeBarLockState` だけ送る案�
   F11 中だけ別の召喚方式へ切り替えない。ナビゲータを含める場合、隠れた navigator の exclusion は解除する。
 - 中央 touch の session-only chrome latch、左右 touch handle、native HUD touch の widget passthrough を維持する。
   抑制中も時間で touch chrome を消さず、promoted mouse を二重に実行しない。
-- spread / fit / rotation / overflow、seek-strip / speed / audio-track menu、tag picker は既存の表示維持 owner。
-  popup を F11 のために閉じたり、不可視の backdrop だけ残したりしない。TextEdit / IME 中のキー優先も維持する。
-- seek / strip / navigator の開始済み drag は release / cancel まで同じ owner が処理する。
-  F11 と同 frame の release を失わず、release 後に新規 drag を合成しない。
-  native `SetCapture` / capture-all region の既存寿命を維持し、非操作中だけ region を通常の可視形へ戻す。
+- egui の spread / fit / rotation / overflow と navigator の既存表示維持を使う。
+  native 同一 core は下記の owner 接続を追加する。TextEdit / IME 中のキー優先を維持する。
 - external D&D、pan / 360、crop / edit / capture、help modal は既存の表示・入力優先を維持する。
   lock の抑制で新たな edge-hover owner を作らない。
 - F11 中の鍵クリックは Q6 の回答に従う。推奨は現在の raw lock を通常どおり変更・保存し、
   F11 退出時はその最新値を使う。抑制中も表示選択・strip mode の明示変更は従来の操作として扱う。
 - 右 lock と既存の明示 open の重なりは Q4。回答がないまま blanket reset を実装しない。
+
+### 6.1 native 同一 core の操作継続（R2・指摘2）
+
+現 `hud_visible()` は drag owner を見ず、描画終端の `!bottom_hud_visible` は seek gesture / strip drag を消す。
+F12 host の F11拡大では core は同じでも、旧下端のポインタが新下端帯から外れる。
+したがって「既存の drag 寿命で足りる」という初版の前提を撤回する。
+
+既存 `seek_row_gesture` / `seek_strip_drag_origin` と各 popup の owner を、
+**可視候補判定より前**の入力へ接続する。新しい `drag_active` / `keep_hud` bool を保存しない。
+下 chrome は開始済み seek / strip 操作、seek-strip / audio-track / speed popup、
+上 chrome は panorama projection 等のその面に属する popup によって一時表示を維持する。
+mode / modal / source terminal の優先は変えず、単なる hover 消失・lock 抑制・同core resize を terminal にしない。
+
+開始済み pointer / touch drag の move・release / cancel は viewport 外でも既存 owner に届くようにし、
+同 pass の終端で一度だけ消費する。F11 / resize と同 frame の release は、見た目の新しい hit rect に
+再hitして所有者を変えず、開始 owner のまま完了する。表示する geometry は新 viewport で解くが、
+seek gesture / strip の既存 origin と確定規則を勝手に作り直さない。
+popup が開いている間は popup rect と必要な HUD を draw / hit / region に含める。
+release / cancel / popup close 後は通常の実効 lock・hoverで再計算して隠す。
+
+`compute_hud_regions` の capture-all は配送の仕組みであり、これだけで可視維持を代用しない。
+非表示時の既存 cleanup は source / mode / 明示 terminal 等で必要なため一律削除しない。
+同coreの継続 owner を先に可視条件へ接続し、lock 抑制で誤って cleanup に入らないようにする。
+
+### 6.2 native core 再生成時の境界（R2・Q7 新規）
+
+通常動画の F11 / placement変更で `NativeRenderCore::new` を通る場合、現実装は popup / drag / egui focus を
+candidate に移譲しない。chrome policy snapshot はこれらの入力 owner の所有者にならない。
+decoder / source / strip resource session が継続することから、overlay interaction の継続を推論しない。
+
+**Q7 の推奨案は現行の core 境界を維持する。** candidate の drag / popup は初期状態で始め、
+成功して旧 core を retire したら旧 overlay の interaction はそこで終了する。新 core に旧押下からの
+release / down level を新規 drag として注入せず、既存 window epoch / generation の配送規則に従う。
+旧 core が実際に処理済みの seek / 設定 command は維持し、未処理の最終 release による seek 完了を
+新たに保証しない。この制限は抑制機能の都合で追加する操作制限ではなく、現 F11 実装の境界である。
+
+prepare失敗・commit前abort・commit後retire前abortでは、既存 protocol が維持 / 復元した旧 core が
+入力状態も所有する。Prepare時に旧ownerを一律resetしない。旧epochのrelease / capture-cancel は
+旧coreの配送規則で終端し、新epochへ移し替えない。abortを理由に新しいドラッグを再武装しない。
+
+利用者が再生成をまたぐ継続を必要とする場合は、chrome snapshot だけの実装へ進めない。
+exact old/new window epoch、source、gesture origin、popup focus / IME、capture と release/cancel の
+一度だけの所有移譲を設計し直し、placement target の既存 transition owner 内で合意する。
+F11を操作中だけ無効にする、popupを勝手に先に閉じる等の代案も、利用者承認なく採用しない。
 
 ## 7. 組み合わせを減らすために検討したこと
 
@@ -202,8 +308,9 @@ raw lock を effective に置き換えて `NativeBarLockState` だけ送る案�
 | F11 中は input を modal にして競合を消す | 不採用。長い保存処理ではなく閲覧表示であり、navigation・端召喚・touch・drag を止めると要求を満たさない |
 | 抑制設定変更で viewer / panel を閉じて開き直す | 不採用案。decoder、情報編集、context-local lock、placement を閉じる費用が大きい。O(1) の既存 snapshot 更新で済み、専用の非同期 live rebuild は不要 |
 | 下 HUD と strip の選択を一組にする | Q2 の推奨。既存の3値 lock と一体描画を維持し、第4状態と独立 visibility owner を増やさない |
-| raw は既存 owner、effective は純 resolver、native 更新は一 snapshot | 採用案。create / mutate / draw / hit / reserve で別々の force を作らない。F11 を抜けると再計算するだけ |
-| 右 panel の既存 transient を入場時に区切る | Q4 の推奨。必要なら既存 open owner の明示 lifecycle として扱い、入場前 open の backup / restore を新設しない |
+| raw は既存 owner、effective は純 resolver、native 更新は一 snapshot | 採用案。遅延commandもnative driverの現placementで再計算し、host固有factだけ既存identityで照合する。native更新の一体化だけで競合解消とはしない |
+| 右 panel の明示openまで抑制開始で閉じる | Q4 の別案。F11入場・設定変更・migrationと操作保護例外後を扱うownerが必要になる。推奨はlock forceだけ外し、既存openを保持して組み合わせを増やさない |
+| 再生成するnative coreへdrag/popupも移譲 | Q7の別案。入力epoch・capture・IME/focus・abortまで所有移譲が広がる。推奨は現core境界を維持し、同coreの可視継続だけ補う |
 
 UI thread の追加処理は固定個数の設定・owner 読み取りと geometry 計算に限定する。
 同期 I/O、DB 読み込み、folder scan、decode、追加 GPU upload、blocking wait、`try_lock + sleep` を加えない。
@@ -211,7 +318,9 @@ UI thread の追加処理は固定個数の設定・owner 読み取りと geomet
 
 ## 8. Detached §2 への適合と §11 記録案
 
-**本案は症状パッチではなく構造的な表示責務の修正である、という実装担当の判断。合意はまだ未取得。**
+**本案は症状パッチではなく構造的な表示責務の修正である、という実装担当の判断。**
+利用者が提示した独立 GPT-6.1 Sol / xhigh レビューもこの構造方針へ同意している。
+ただし判定は REVISE で、transport / interaction 等の補完後の再レビューとClaudeCodeの合意は未取得。
 根拠は、固定表示の force と予約を raw 設定から各描画面で直接読む境界を、exact 表示先に従う共通の
 実効値へ揃えることにある。描画だけを隠す guard ではなく、同じ owner の draw / layout / hit を一緒に変える。
 detached F11 は exact window binding と既存 applied state を使い、main / sibling の context を変更しない。
@@ -231,12 +340,19 @@ owner を特定できない経路、behavior 削除が必要な経路が残れ�
 に次の内容を記録する。**今回 §11 へ合意済みの行は追記しない。**
 
 > 日付: 合意日。対象: §1.344 F11 中の locked chrome 実効値。  
-> 範囲: `ui_fullscreen.rs` の surface / navigation continuation / geometry / hit、
-> `app/native_video.rs` と `video/mod.rs` の initial / update / placement chrome snapshot、
-> `video/native_presenter/{render_core,overlay_draw}.rs` の draw / media reservation / HUD region、
-> `ui_helpers.rs` / `ui_metadata_panel.rs` の context-local info lock 投影。  
+> 範囲: `app.rs::apply_detached_viewer_borderless_target` のapplied fact同期、既存のpresentation適用・
+> preferences確定・F12 migration入口から共通policyを投影する接続。`ui_fullscreen.rs` のsurface / navigation
+> continuation / geometry / hit、`app/native_video.rs` と `video/mod.rs` のinitial / deferred update /
+> placement target snapshot、`app/presentation_transition.rs` の既存target leaseを運ぶ型境界、
+> `video/native_presenter/{render_core,overlay_draw}.rs` のdraw / media reservation / HUD region /
+> 同core interaction visibility / 右panel close、`ui_helpers.rs` / `ui_metadata_panel.rs` のinfo lock投影。
+> Q5採用時は `ui_music_panels.rs` の右panel close / sinkと音楽render consumerも含む。
+> Q4別案採用時だけ `app.rs::close_fs_side_panel_runtime` / `reset_fs_side_panel_runtime_for_file_change`
+> （79095行付近）→ `FullscreenInfoPanelState::on_display_target_changed` のtransient寿命接続を追加。
+> 実装した入口・consumerだけを最終記録へ列挙し、条件付き範囲を実施済みと書かない。
 > 理由: raw lock を変えず、描画窓の既存 F11 applied state から一つの実効値を導出する。
-> viewport / host / placement / focus の owner は変えず、症状 guard や復元状態は追加しない。
+> viewport / host / placement / focus のowner、transitionのphase / effect / commit / retire / abort条件は
+> 変えず、既存target identityとapplied境界へchrome factを載せる。症状guardや復元状態は追加しない。
 > main・sibling 不変と gap / native region / drag 回帰で所有境界を固定する。  
 > 合意者・独立レビュー参照: 実際の合意後に記入。テスト件数・実機状況: 実行した証拠だけを記入。
 
@@ -251,19 +367,29 @@ owner を特定できない経路、behavior 削除が必要な経路が残れ�
 3. **Q3: ナビゲータの固定表示も対象候補に含めるか。** 推奨: 別の選択項目として用意し、初期 OFF。
    抑制中も `FsNavigatorHold`（既定 Alt）と開始済み操作は有効にする。
    端ホバーでは呼び出さず既存 hold を使うことも含めて判断してほしい。
-4. **Q4: F11 入場前から右 panel が明示 open だった場合も隠すか。** 推奨: 対象指定かつ raw lock ON の
-   右 panel は、F11 の適用時に既存 transient open / hover の表示理由を区切り、lock は保持する。
-   開いている tag picker / TextEdit / touch・pointer drag は既存の操作終了・明示 close まで維持する。
-   その例外では入場時の強制非表示を求めず、新しい遅延 close pending は作らない。
-   その後の端・callout・touch での open は許可する。単に lock force だけ外す案では既存 open が残り、
-   F11 入場で panel が消えない場合がある。利用者判断と owner ごとの実装設計が必要。
+4. **Q4【改訂】: 抑制が有効になったとき、右 panel の既存の明示 open も閉じるか。**
+   **推奨は lock の表示理由だけを外し、明示 open は維持する案へ変更。** F11入場、fullscreen中の対象設定ON、
+   F12 migration、初回openのすべてで同じ純resolverを使い、抑制開始用のtransient resetを作らない。
+   tag picker / TextEdit / dragなどの保護操作が終了しても、明示openは既存close / target-changeまで残る。
+   このため、lockと明示openの両方で開いていたpanelは、抑制開始だけでは消えない。×は§5.1で使える。
+   別案は「既存明示openも閉じ、開始後の再openは許可」。その場合はF11だけに入口を限定せず、
+   設定ON・migration・初回openと、保護例外の終了後まで一つのcontext-owned open ownerで扱う必要がある。
+   「保護例外として開いたままにする / 終了後に自動で閉じる」もこの同じ質問の判断に含む。
+   別案の採用時は、開始前後のopen provenanceと例外終了のtyped遷移を設計・再レビューしてから実装する。
+   新しいpending boolやF11入場前openのbackupだけを足す実装には進まない。
 5. **Q5: 音楽ビュー（音声・動画→音声）も右 lock の対象でよいか。** 推奨: 右 lock は同じ方針を適用。
    lock のない常時上下 UI は維持する。上下まで隠す要望は別仕様として相談する。
 6. **Q6: 抑制中の鍵クリックで通常の lock を変えてよいか。** 推奨: 通常どおり変更し、
    F11 退出後は最新の値を使う。鍵は raw 状態を示し、抑制中は自動表示になる旨を tooltip で説明する。
    F11 中だけ別 lock を持つ案は採らない。
+7. **Q7【新規】: native core再生成を伴うF11でも、drag / popupの継続が必要か。**
+   推奨: 現行どおり新coreへの移譲は行わず、成功時に旧coreの操作を終了する。
+   同じcoreのまま変わるF12窓のF11拡大・設定変更等は§6.1でdrag / popupを維持する。
+   通常F11の再生成まで継続させるなら、chrome snapshotを超える入力・capture・focusの所有移譲設計が必要。
+   操作中のF11を無効にする案を、継続の代わりに勝手に採らない。
 
-Q4 は表示理由の残り方を含む利用者仕様の質問であり、未回答のまま実装を開始しない。
+Q1・Q2・Q3・Q5・Q6は既存の質問。Q4は範囲・推奨を改訂、Q7だけ新規追加。
+Q4とQ7は表示理由・操作保証の利用者仕様の質問であり、未回答のまま実装を開始しない。
 上記の回答と structural agreement を coordinator がまとめてから、bounded 実装 handoff を作る。
 
 ## 10. 実装・文書・検証の handoff
@@ -275,7 +401,8 @@ Q4 は表示理由の残り方を含む利用者仕様の質問であり、未�
    native transport の集約を先に行い、片側描画だけの途中状態を出荷しない。
 3. 設定を追加するなら `Settings` の serde 欠落値は OFF とし、旧 settings.db の保存 lock / strip 選択 / unknown 値を
    維持する読み替えと roundtrip を検証する。既存 lock は出荷済みデータなので破壊変更しない。
-   既存 DB の汎用設定保存で新しい選択値を追加できるなら schema version は不要だが、DDL 変更が必要なら移行必須。
+   `settings_db.rs` の既存 `settings_kv` のkey/value保存で新しい選択値を追加できるため、本案のDDL変更・
+   schema version更新は不要。欠落値の互換読込・保存・export/importの回帰は必要。
    `settings_transfer.rs` の field 分類、export / import、preferences draft → OK のコピーも漏らさない。
 4. 同時更新: 本書の決定・実装記録、`docs/spec.md`、右 panel 計画 §6.6、表示 / 動画アーキテクチャ、
    keymap 仕様（既存 F11 操作の意味）、strip 寿命文書への関連付け、`docs/README.md`、バックログ、
@@ -290,8 +417,11 @@ Q4 は表示理由の残り方を含む利用者仕様の質問であり、未�
 | App / context | main + detached A/B、main を mount したまま A を描く pass、A borderless でも main / B 不変、open / switch / close / cancel / error / park / resume、F12 migration と context promotion。lock、items generation、cache、worker identity が sibling へ漏れない |
 | navigation | 通常 / embedded / separate / detached の content・holdover・gap shell、Ctrl+↑↓ / sibling / sidecar wait 中にも同じ effective geometry。loading の `None` で予約が復活しない |
 | geometry / hit | 上・下・右予約と gap 解放、短い viewport、DPI / UI倍率、strip heights、show / hide / waveform、見開き / 連結 / 回転 / zoom。隠れた sink / wheel / edge exclusion なし、再表示の drawn rect と hit の一致 |
-| input | 端 hover、Hover / ClickToShow、touch latch / handle、popup / tag picker / IME、F11 と release 同 frame、navigator hold解除後のdrag完了、external D&D / modal / motion mode 優先。Q4 の入場前 open と入場後 open を区別 |
-| native | initial config / update / candidate placement の共通値、fullscreen HUD HWND / DetachedViewerChild、draw snapshot と HUD region、DComp media target、failed switch は旧契約、lock event は raw を更新 |
+| input | 端 hover、Hover / ClickToShow、touch latch / handle、popup / tag picker / IME、navigator hold解除後のdrag完了、external D&D / modal / motion mode優先。Q4の選択案をF11・設定ON・F12 migration・初回open・保護例外終了で固定 |
+| panel close | 三媒体でraw ON / effective OFF / 明示openの×が描画・hit / HUD region内にあり、一度のcloseでopen / hover / tag pickerを閉じる。raw lockは不変、非表示sinkなし、F11退出で固定表示へ戻る。raw ON / effective ONの従来×禁止、Hover端だけ表示の既存条件も維持 |
+| native transport | initial / prepare candidate / delayed updateが適用先placementで再計算。Prepare→旧surface由来raw更新→Commit→Retireで抑制を旧値へ戻さない。prepare failure、commit前abort、commit後retire前abortでも復元されたplacementで解く。old generation / 別host incarnationのfactはtargetを上書きせず、raw設定更新は失わない |
+| native interaction | 同coreのF12 F11拡大でポインタが新下端帯外でもseek gesture / strip dragが可視維持され、viewport外release / cancelを一度だけ処理。popupをpointer移動・設定ONで消さず、close後は通常の可視性へ。core再生成の成功はQ7の終端契約、abortは旧coreにownerが残り、新epochにreleaseを誤配送しない |
+| native geometry | fullscreen HUD HWND / DetachedViewerChild、draw snapshotとHUD region、DComp media target、lock eventはrawを更新。capture-allだけを操作維持の証拠にしない |
 | strip lifetime | F11 hide→Hidden / Suspended→edge reveal→Visible + exact window。session / decoder / worker を再生成しない。source変更 / explicit close だけが既存 terminal に到達 |
 | UI / persistence | 新設定行の light / dark snapshot、狭幅とUI倍率、raw鍵表示と抑制説明、旧JSON欠落 / export-import / save roundtrip。既存設定の消失なし |
 
@@ -317,7 +447,24 @@ python scripts/check_ui_glyphs.py
 native / 実機確認は利用者が行い、installed / tray 常駐を先に閉じること、通常 `%APPDATA%\mimageviewer` を使い
 実データを更新し得ることを添えて `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` を渡す。
 確認シナリオは、各 lock を通常窓でON → F11で余白解放 → 端 / touchで召喚 → popup / drag → F11退出でlock表示、
-静止画・ZIP/PDF・動画場面/波形・F12窓・別窓不変・navigation待ち・Q4の右openを含める。
+静止画・ZIP/PDF・動画場面/波形・F12窓・別窓不変・navigation待ち、右panelの×、設定ONとF12 migration、
+同coreのresize中drag / popupと通常F11の再生成境界、Q4 / Q7で決定した挙動を含める。
 
-今回の証拠: source inspection と文書設計のみ。自動テスト0件、build未実行、独立レビュー未実施、実機未確認。
-本 worktree で commit / `.git` 書込は行わない。コミットメッセージ案は `target/E-1344-design-msg.txt` に置く。
+今回の証拠: source inspection と文書設計のみ。自動テスト0件、build未実行、製品起動なし。
+初版は独立レビューREVISE、本改訂の独立再レビュー・実機確認は未実施。
+本 worktree で commit / `.git` 書込は行わない。初版メッセージは `target/E-1344-design-msg.txt`、
+HEAD上の追補コミットメッセージ案は `target/E-design-r2-msg.txt` に置く。
+
+## 11. R2 独立設計レビューの指摘と処置
+
+レビュー元は利用者が提示した別 GPT-6.1 Sol / xhigh セッションの結果。判定は REVISE。
+5件とも現HEADのコードと照合し、指摘を受け入れた。反論・未修正扱いの指摘はない。
+構造方針への同意は記録するが、本改訂の承認や実装独立レビュー済みとは書かない。
+
+| 指摘 | コード照合 / 改訂先 |
+| --- | --- |
+| 1 P2: delayed snapshotの適用先 | `video/mod.rs` の2193 / 6109 / 6322行付近とretire待ち後abortを読んだ。§4.1でraw policyとexact host factを分け、適用時placement、candidate初期化、二つのabort、generation/leaseの照合、raw更新を失わない規則を追加 |
+| 2 P2: drag / popup寿命の前提 | `render_core.rs` の11723 / 14410 / 9197行付近、`video/mod.rs` の6109行付近を読んだ。§6.1で同coreのdrag ownerを可視入力へ接続し、§6.2で再生成時の終了 / abort復元を分離。Q7新規と回帰を追加 |
+| 3 P2: 右panelの× | `ui_metadata_panel.rs` の2159行付近、`overlay_draw.rs` の5943行付近、`ui_music_panels.rs` の758行付近とApp close handlerを読んだ。§5.1で鍵raw / close effective、mode条件維持、closeのraw不変、明示closeの配送と三媒体回帰を追加 |
+| 4 P2: 抑制開始の別入口 | `ui_helpers.rs::visible`、`app.rs::apply_detached_viewer_borderless_target` / target-change、native snapshot同期を読んだ。Q4を全入口・保護例外終了を含む一問へ改訂し、reset不要のlock-forceのみ案を推奨。別案はtyped open ownerの再設計が前提と明記 |
+| 5 P3: detached §11範囲 | `app.rs` の60410 / 79095行付近を読んだ。§8の記録案にapplied / migration / 設定入口、target lease payload、Q4別案のtarget-changeとQ5の音楽consumerを追加。既存transition owner / phase / effectを変更しない境界も明記 |
