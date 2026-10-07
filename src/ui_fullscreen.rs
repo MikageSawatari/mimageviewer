@@ -30214,10 +30214,6 @@ impl App {
         }
         if key_0 && display_mode_keys_supported {
             self.cycle_fullscreen_fit_mode(ctx, fs_idx);
-            self.show_feedback_toast(format!(
-                "[0:{}]",
-                self.effective_fullscreen_fit_mode().label()
-            ));
         }
 
         // U キー: AI アップスケールモデルをサイクル
@@ -37087,11 +37083,23 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn cycle_fullscreen_fit_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn cycle_fullscreen_fit_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        // The key, ring, gesture and mouse buttons share the same image-only operation.
+        // A stale image-context command must not change the next image's fit during media playback.
+        if !self.continuous_reading_supported_idx(fs_idx)
+            || self.fs_music_view_active(fs_idx)
+            || self.is_overlay_edit_mode_active()
+        {
+            return;
+        }
         let next = self
             .effective_fullscreen_fit_mode()
             .next_for_flow(self.reading_flow);
         self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, next);
+        self.show_feedback_toast(format!(
+            "[0:{}]",
+            self.effective_fullscreen_fit_mode().label()
+        ));
     }
 
     fn set_default_fullscreen_fit_for_flow(

@@ -2599,6 +2599,7 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridSiblingFolderNext => RingActionId::SiblingFolderNext,
         KeyAction::GridToggleCheck => RingActionId::GridToggleCheck,
         KeyAction::GridSelectAll => RingActionId::GridSelectAll,
+        KeyAction::GridOrganizeFiles => RingActionId::GridOrganizeFiles,
         KeyAction::GridOpenSelectedAsPage => RingActionId::GridOpenSelectedAsPage,
         KeyAction::GridOpenSelectedAsList => RingActionId::GridOpenSelectedAsList,
         KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,
@@ -2641,6 +2642,7 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::FsZoomMode => RingActionId::ImageZoomMode,
         KeyAction::FsPixelGrid => RingActionId::ImagePixelGrid,
         KeyAction::FsBgCycle => RingActionId::ImageBackgroundCycle,
+        KeyAction::FsFitModeCycle => RingActionId::ImageFitModeCycle,
         KeyAction::FsCompareToggle => RingActionId::ImageComparePin,
         KeyAction::VideoCapture => RingActionId::VideoCapture,
         KeyAction::VideoMute => RingActionId::VideoMute,
@@ -10828,6 +10830,17 @@ mod tests {
 
     #[test]
     fn settings_dialog_key_actions_map_to_grid_ring_actions() {
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridOrganizeFiles),
+            vec![(RingShortcutContext::Grid, RingActionId::GridOrganizeFiles)]
+        );
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::FsFitModeCycle),
+            vec![(
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ImageFitModeCycle
+            )]
+        );
         assert_eq!(
             ring_bindings_for_key_action(KeyAction::GridOpenPreferences),
             vec![(RingShortcutContext::Grid, RingActionId::OpenPreferences)]
