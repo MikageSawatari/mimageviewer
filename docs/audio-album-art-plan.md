@@ -1,9 +1,9 @@
 # 音声サムネイル: MP3 埋め込み画像・手動 pin の計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の設計のみ。
-改訂: 2026-10-08 / 利用者決定 Q1〜Q7 を反映 (R4)。R1 / R2 の指摘対応は保持。
-**未実装・Q1〜Q7 は決定済み・新規 Q8 のみ回答待ち・改訂設計の再レビュー待ち・実アプリ未起動。**
-独立レビューの直近判定は R2 の REVISE。今回の追加設計の合格を主張しない。
+改訂: 2026-10-08 / Q8 の利用者決定とレビュー履歴表記を反映 (R5)。R4 の設計内容は保持。
+**未実装・Q1〜Q8 は決定済み・利用者への未決質問なし・実アプリ未起動。**
+利用者から伝達された独立レビュー履歴: 前版の設計は **ACCEPT**、最新改訂 (手動 pin + 表示マーク) は **ACCEPT WITH CHANGES**。R5 は Q8 の決定記録と P3 の履歴表記修正のみ。
 以下の「提案」は実装担当の推奨であり、利用者の決定済み事項とは区別する。
 
 ## 1. 決定済みの範囲と守る契約
@@ -23,11 +23,12 @@
 | Q5 (推奨を採用) | まれな album-art **cache** DB 障害は source 表示を継続し、ログ・一度の通知・次回再生成。自動 retry / 復旧 journal は作らず、利用者データを削除しない |
 | Q6 (推奨を採用) | mtime 秒 + size が同一の外部編集は検出保証なし。cache 削除 / 明示 SourceOnly 再生成で対応 |
 | Q7 (推奨を採用) | Remote の外部編集反映は明示 refresh に限定。新一覧の artEpoch で HTTP cache と終端結果を更新し、60 秒保証 / 自動 polling は設けない |
+| Q8 (推奨を採用、2026-10-08) | 初版の手動画像は P / リング / メニューから **JPEG / PNG ファイルを一枚選択**。埋め込み候補の手動選択は不要 (自動選定は前面表紙 → 最初の有効画像を維持)。貼付・drag/drop・Remote upload は延期 |
 
 手動 pin は既存の実ファイル `GridItem::Audio` 全形式を対象とする。非 MP3 も pin があれば表示する。
 FLAC/M4A 等の **自動埋め込み抽出**、外部 folder.jpg / cover.jpg の自動探索、タグ書込、
 音楽再生画面への画像表示は延期する。利用者が cover.jpg を手動で選ぶことは可能だが自動探索とは別。
-音声再生画面に pin 操作を設けても再生画面の絵は変えない。画像選択方法のみ新規 Q8 (§8)。
+音声再生画面に pin 操作を設けても再生画面の絵は変えない。画像選択方法も利用者決定 Q8 (§8) として確定。
 
 - 手動 pin も使用可能な埋め込み画像もない音声は従来の音楽アイコンを表示する。
 - Audio の種別・ソート・検索・★・タグ・ブックマーク・再生位置・連続再生は保持する。
@@ -79,7 +80,7 @@ FLAC/M4A 等の **自動埋め込み抽出**、外部 folder.jpg / cover.jpg の
 ID3v2.2 PIC / v2.3・v2.4 APIC のパーサを自作せず、unsynchronization、extended header、
 description の文字コードを FFmpeg に任せる。JPEG / PNG を初期の必須対応素材とする。
 自動抽出が MP3 から始まることは既決事項。手動画像は §3.3 の共通 pin 経路に入り、
-MP3 parser を通さない。初版の画像入力は JPEG / PNG を推奨する (Q8)。
+MP3 parser を通さない。初版の画像入力は JPEG / PNG とする (利用者決定 2026-10-08、Q8)。
 
 公式 [AVStream の契約](https://ffmpeg.org/doxygen/trunk/structAVStream.html) は
 ATTACHED_PIC の packet を demuxer が所有すると定義している。
@@ -197,15 +198,16 @@ pin bytes は動画と同じく catalog を経由せず表示する。texture / 
 Cache Off / Auto / CacheOnly / SourceOnly と全件・期限・フォルダ cache 削除でも pin は保持・優先する。
 これは source cache policy の変更ではなく、既存動画と同じ利用者指定の優先である。
 
-#### 画像選択と UI の入口 (最小案、Q8)
+#### 画像選択と UI の入口 (利用者決定 2026-10-08、Q8)
 
-初版の推奨は **本体で画像ファイルを一枚選ぶ**方式。JPEG / PNG の既存 decode / orientation を用い、
+初版は **本体で JPEG / PNG 画像ファイルを一枚選ぶ**方式。JPEG / PNG の既存 decode / orientation を用い、
 16 MiB / 40 MP / 160 MiB の上限、取消・10 秒期限、既存 thumb_px の縮小・WebP encode を worker で行う。
 画像選択後の decode も既存 heavy queue / GlobalIoSemaphore の同じ予算に参加させ、
 modal UI は join / I/O 待ちをせず、取消・完了通知だけを扱う。
 保存完了した WebP の寸法を保持し、Auto 比率にも使う。設定後の画素数増大で元画像を自動再読込しない
 (動画 pin と同じ保存画像方式)。より大きい画像が必要なら選び直す。
-クリップボード、drag/drop、埋め込み候補選択、Remote upload は初版に増やさない案。入力方法の Q8 は未決。
+埋め込み候補の手動選択は不要。前面表紙 → 最初の有効画像という自動選定規則を維持する。
+クリップボード貼付、drag/drop、Remote upload は延期する (利用者決定 2026-10-08、Q8)。
 
 | 入口 | Audio に対する動作 |
 | --- | --- |
@@ -623,7 +625,7 @@ Remote も本体の同じ設定に従う。一覧 payload とブラウザへの�
 ThumbnailEngine は image/video/container の dispatch に実 Audio の AudioThumbnail を追加し、
 §3〜5 の本体共通生成関数へ渡す。共通 pin の reader で手動 WebP を先に照会し、miss の MP3 だけ
 自動 art へ進む。非 MP3 も pin hit なら WebP、miss なら NoThumbnail。catalog、選定、limits、
-CacheDecision、WebP を PC と共有する。Remote の pin set / clear / upload API は追加しない案 (Q8)。
+CacheDecision、WebP を PC と共有する。Remote の pin set / clear / upload API は初版に追加しない (利用者決定 Q8)。
 現在の動画と同じく、本体で設定した pin の表示に対応する。pin DB の migration は共通 owner が行い、
 Remote reader が新表を作る別経路は設けない。
 NoArt は既存 ThumbnailErrorCode::NoThumbnail、他の失敗は既存 error code に写像する。
@@ -751,21 +753,18 @@ ContainerEngine::settings_for_listing (`container.rs:2605`) の live overlay を
 増やさず、単なる sort / DOM 再構築は同じ presentation snapshot を保持する。
 本体側は次の painting で更新し、Remote 更新契約は Q7 と同じ操作境界に揃える。
 
-## 8. 利用者への質問 (決定済み事項は再質問しない)
+## 8. 利用者への質問と決定状況
 
-Q1〜Q7 は **2026-10-08 に決定済み** (§1)。Q1 / Q3 は変更、Q2 / Q4 / Q5 / Q6 / Q7 は推奨採用。
-Q1 の「手動設定も初版から」、Q3 の「3 択と既定の音楽アイコン」は未決事項ではない。
-R1 / R2 の過去の質問状態は §11 / §12 に履歴として残す。
-
-| ID | 新しい質問と推奨回答 |
-| --- | --- |
-| **Q8 (新規・入力方法だけ)** | 初版の手動画像は、本体の P / リング / メニューから **JPEG / PNG ファイルを一枚選択**する方法でよいか。**推奨: はい**。既存の全実 Audio に保存でき、Remote はその pin を表示する。貼付・drag/drop・埋め込み候補選択・Remote からの編集は後続に回す |
+Q1〜Q8 は **2026-10-08 に決定済み** (§1)。Q1 / Q3 は変更、Q2 / Q4 / Q5 / Q6 / Q7 / Q8 は推奨採用。
+**未決の利用者質問はない。** Q8 は JPEG / PNG ファイル一枚の選択を初版の入力方法として確定した。
+埋め込み候補の手動選択は不要で、自動選定を維持する。貼付・drag/drop・Remote upload は延期。
+R1 / R2 / R4 の過去の質問状態は §11〜§14 に履歴として残す。
 
 ## 9. 実装順序・受入条件・検証所有
 
-1. coordinator が Q8 の入力方法を確定し、別 context の Sol / xhigh に改訂設計の再レビューを依頼する。
-   R4 の共通 pin owner・出荷済み DB / transfer の追加移行・設定 / Remote parity、
-   R2 の catalog maintenance 境界・422 分類と、R1 の 6 件の変更境界を重点とする。
+1. coordinator は記録済みの Q1〜Q8 とレビュー結果 (前版 ACCEPT、R4 ACCEPT WITH CHANGES) を
+   引き継ぎ、共通 pin owner・出荷済み DB / transfer の追加移行・設定 / Remote parity、
+   R2 の catalog maintenance 境界・422 分類と、R1 の 6 件の変更境界を実装 brief に含める。
    extraction の有界性、terminal 契約、親 catalog、Remote session Flight も維持する。
 2. 合意後の最初の作業は §3 の synthetic ID3 fixture と同梱 FFmpeg adapter 検証。
    front / back の選定 metadata、open-only、取消 / 上限が成立しなければ設計を戻す。
@@ -813,7 +812,7 @@ art なしで idle CPU / repaint、再生中の一覧・F12・Remote の取得 /
 
 ## 10. 文書更新と今回の引き継ぎ
 
-初版では本計画と docs/README.md の索引を追加した。今回の R4 は本計画と索引の範囲説明を改訂する。
+初版では本計画と docs/README.md の索引を追加した。R4 で本計画と索引の範囲説明を改訂した。R5 は決定状況とレビュー履歴の表記だけを更新する。
 backlog の利用者決定や
 未実装のマニュアル・製品紹介は完成形に書き換えない。
 実装時に catalog-design、display-pipeline、async-architecture、architecture-overview、
@@ -823,11 +822,11 @@ keymap 2 文書と生成 shortcut reference、spec、マニュアル、製品ペ
 「安心して使えます」も照合し、新しい外部通信は増えないこと、既存認証済み Remote への
 ジャケット配信が画像配信の記述に含まれることを確認する。
 
-coordinator への引き継ぎ: 記録済み Q1〜Q7 の決定、未決 Q8、R4 と R2 / R1 を含む設計再レビュー、
+coordinator への引き継ぎ: 記録済み Q1〜Q8 の決定、前版 ACCEPT / R4 ACCEPT WITH CHANGES の履歴、
 入力有界化の技術ゲート、
 全 producer / consumer を含む実装 brief と file ownership、統合 IPC 番号の決定が次の作業。
-commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-r4-msg.txt` に置く。
-過去の `target/D-design-msg.txt` / `target/D-design-r2-msg.txt` / `target/D-r3-msg.txt` は変更しない。
+commit は行わない。HEAD 上の follow-up 用英語メッセージは `target/D-r5-msg.txt` に置く。
+過去の `target/D-design-msg.txt` / `target/D-design-r2-msg.txt` / `target/D-r3-msg.txt` / `target/D-r4-msg.txt` は変更しない。
 
 ## 11. 独立設計レビュー R1 への対応記録
 
@@ -847,7 +846,7 @@ R1 対応時点では改訂した所有境界・更新契約は再レビュー�
 ## 12. 独立設計レビュー R2 への対応記録
 
 2 件ともコードで確認して採用した。異論はない。R1 の直接指摘については R2 で解消方針の
-確認を受けたが、全体判定は REVISE であり、今回の改訂版の合格を主張しない。
+確認を受けたが、R2 時点の全体判定は REVISE だった。後続の判定は §14 に記録する。
 R2 対応時点では質問は Q1〜Q7 のまま未回答で、追加・変更はなかった。現在の決定は §1 / §8。
 
 | 指摘 | 確認したコードと解消内容 |
@@ -859,7 +858,7 @@ R2 対応時点では質問は Q1〜Q7 のまま未回答で、追加・変更�
 
 Q2 / Q4 / Q5 / Q6 / Q7 の推奨採用と、Q1 / Q3 の変更を §1 の確定仕様へ記録した。
 動画 pin の実装は stub ではなく v0.9.0 から出荷済みと確認し、既存機能・利用者データを維持する。
-音声への手動 pin と表示マーク 3 択を初版の完了条件へ追加した。新質問は入力方法の Q8 一件。
+音声への手動 pin と表示マーク 3 択を初版の完了条件へ追加した。R4 時点の新質問は入力方法の Q8 一件だった。R5 で決定済み (§14)。
 
 | 確認対象 | コード照合と設計反映 |
 | --- | --- |
@@ -870,4 +869,15 @@ Q2 / Q4 / Q5 / Q6 / Q7 の推奨採用と、Q1 / Q3 の変更を §1 の確定�
 | 設定 / Remote | settings.rs:617,4437,7368,9805、settings_transfer.rs:269、preferences/pages.rs:1491,1621、grid_paint.rs:145,198、settings_db.rs:295,846、remote_ipc/container.rs:2605、collections.rs:33、remote-ipc/src/lib.rs:200,1442,1574。§6.1 / §7.4 の default・sanitize・分類・配置・live listing metadata・snapshot 検証 |
 
 今回も設計改訂のみ。製品コード・IPC 定数・出荷済み DB は変更せず、製品 binary は起動しない。
-製品テスト実行数は 0。R4 を含む設計の独立レビューは未実施であり、実装前に依頼する。
+製品テスト実行数は 0。R4 作成時点では独立レビュー未実施だった。伝達された後続判定は §14。
+
+## 14. Q8 決定とレビュー履歴表記の修正 (R5、2026-10-08)
+
+- **利用者決定 Q8 (2026-10-08): 推奨を採用。** 初版は P / リング / メニューから JPEG / PNG
+  画像ファイルを一枚選ぶ。埋め込み候補の手動選択は不要。自動選定は前面表紙 → 最初の有効画像を維持し、
+  貼付・drag/drop・Remote upload は延期する。未決の利用者質問はない。
+- **利用者から伝達された独立レビュー結果:** 前版の設計は ACCEPT、最新改訂
+  (R4: 手動 pin + 表示マーク) は ACCEPT WITH CHANGES。冒頭の「直近は R2 REVISE」は
+  履歴更新漏れだったため、P3 指摘に従って修正した。R1 / R2 の当時の判定は履歴として保持する。
+- R5 は決定記録と履歴表記だけ。抽出・pin・設定・Remote・移行・検証の設計は変更しない。
+  製品コード変更・commit・製品 binary 起動なし。製品テスト実行数は 0。
