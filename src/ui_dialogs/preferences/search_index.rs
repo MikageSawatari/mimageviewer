@@ -246,6 +246,34 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["詳細表示", "列設定", "専用設定"]
     ),
     entry!(
+        "thumbnail/details-name-colors",
+        Thumbnail,
+        "名前の色分け",
+        [
+            "詳細一覧",
+            "名前",
+            "色",
+            "フォルダ",
+            "本",
+            "単体画像",
+            "RAW",
+            "動画",
+            "音声",
+            "Light",
+            "Dark",
+            "HEX",
+            "カスタム",
+            "既定",
+            "コントラスト",
+            "通常行",
+            "交互行",
+            "hover",
+            "選択",
+            "チェック",
+            "切り取り"
+        ]
+    ),
+    entry!(
         "thumbnail/tooltip-items",
         Thumbnail,
         "ツールチップに表示する項目:",
@@ -1246,6 +1274,7 @@ mod tests {
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
+    const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1384,6 +1413,12 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "thumbnail/details-name-colors" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("super::name_colors::draw_settings(ui, &mut state.settings)")
+                    );
+                    NAME_COLORS_SOURCE
                 } else {
                     PAGES_SOURCE
                 };
@@ -1520,7 +1555,7 @@ mod tests {
         ] {
             let results = search_preferences(query, test_tree_position);
             assert!(!results.is_empty(), "no RAW settings result for {query}");
-            assert!(results.iter().all(|entry| {
+            assert!(results.iter().any(|entry| {
                 entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
             }));
         }
@@ -1595,6 +1630,24 @@ mod tests {
                 .find(|entry| entry.anchor == anchor)
                 .expect("clipboard capture settings must be discoverable");
             assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
+    }
+    #[test]
+    fn details_name_color_search_finds_categories_themes_and_validation() {
+        for query in [
+            "名前 色",
+            "RAW HEX",
+            "Light カスタム",
+            "通常行 コントラスト",
+            "切り取り 名前",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Thumbnail
+                        && entry.anchor == "thumbnail/details-name-colors"),
+                "missing name-color result: {query}"
+            );
         }
     }
 }

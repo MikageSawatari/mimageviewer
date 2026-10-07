@@ -1,6 +1,6 @@
 # §1.346 詳細一覧の名前色 仕様提案
 
-2026-10-08、ライン C。**黄系HEX・状態別表示・確定条件まで利用者仕様決定済み、未実装**。
+2026-10-08、ライン C。**§1.346 実装・自動検証・検証用ビルド完了。実機未確認**。
 正本: [バックログ](next-release-backlog.md) §1.346。
 関連: [UI snapshot方針](ui-snapshot-policy.md)、[仮想フォルダ](virtual-folders.md)、
 [設定永続化](settings-sqlite-migration.md)。
@@ -11,7 +11,7 @@
 分類は **フォルダ／本 (ZIP・PDF・RAR・EPUB)／単体画像／RAW／動画／音声**。
 サムネイル一覧へ色分けを追加する要望ではない。
 
-`src/ui_main.rs` の `draw_details_row` は名前・他列・アイコンを共通色で描き、
+実装前の `src/ui_main.rs` の `draw_details_row` は名前・他列・アイコンを共通色で描き、
 `details_row_text_color` は選択時 `selection.stroke.color`、通常時テーマの primary を返す。
 `details_row_background` は選択→チェック→hover→交互行→通常の順。
 切り取り中は content painter 全体に `CUT_CONTENT_OPACITY=0.5` (`src/cut_clipboard.rs`) を適用する。
@@ -29,7 +29,7 @@ RAW は独立 GridItem ではなく Image 内にあり、`raw_format::is_raw_pat
 | カテゴリ | 決定した対象 |
 | --- | --- |
 | フォルダ | Folder、SearchContainer::Folder、ZipDir の非書庫ディレクトリ |
-| 本 | ZipFile (CBZ含む)、PdfFile、ConvertibleArchive (RAR/CBR・EPUB・他対応書庫)、ZipDir の書庫、SearchContainer::Zip |
+| 本 | ZipFile (CBZ含む)、PdfFile (PDF・EPUB。EPUBもこの型で一覧に入る)、ConvertibleArchive (RAR/CBR・他対応書庫)、ZipDir の書庫、SearchContainer::Zip |
 | 単体画像 | Image の非RAW、ZipImage の非RAW、PdfPage、画像 Stack |
 | RAW | Image／ZipImage の既存 RAW 判定。混在 Stack は画像分類、代表がRAWでも全体をRAWにはしない |
 | 動画 | Video (再生モードにかかわらずファイル分類) |
@@ -116,7 +116,7 @@ RGB不透明色のみ (alphaなし)、HEXと既存色pickerを使用。各テー
 表示状態ごとの保存色・一覧のlive rebuild・workerを増やす案は不採用。設定確定後の再描画で導出するだけ。
 名前欄変更で新しいキー操作は追加せず、既存環境設定のキー／IME処理を使う。
 
-## 利用者決定 (2026-10-08、未回答質問なし)
+## 利用者決定 (2026-10-08、未回答の利用者仕様質問なし)
 
 - **C346-1 変更決定 (利用者2026-10-08):** 既定ON、フォルダだけ黄系、他五分類は共通文字色。
   青灰色を黄系へ変更し、標準フォルダ色は黄色の認識を優先して4.5:1基準を緩和する。
@@ -134,7 +134,7 @@ RGB不透明色のみ (alphaなし)、HEXと既存色pickerを使用。各テー
 
 **C346-1a 決定 (利用者2026-10-08):** Light標準 `#A87E00`、Dark標準 `#D6BA66`、
 Light強い `#201800`、Dark強い `#F4DFA2` を採用。Light標準の通常3.50／交互3.23／hover2.71:1を受け入れ済み。
-具体色の質問は回答済み。未回答の利用者質問はない。今回は文書のみで実装は行わない。
+具体色の質問は回答済み。EPUBの型記述訂正も調整担当承認済み。未回答質問はない。
 
 ## 実装後の受け入れ・文書
 
@@ -144,4 +144,80 @@ Light強い `#201800`、Dark強い `#F4DFA2` を採用。Light標準の通常3.5
 Light／Dark×標準／強いのsnapshotに六分類、選択、hover、
 チェック、切り取り、色設定表、長い日本語名を含め、snapshotは画像を目視する。
 実装時はspec、一覧・環境設定マニュアル、製品ページと索引を更新する。
-今回は設計文書と配色の数値検証だけで、UI snapshot・製品起動・verification buildは行わない。
+
+## 実装と検証記録 (2026-10-08)
+
+`src/details_name_colors.rs` が分類・最終配色・状態優先・コントラスト計算を所有する。
+`draw_details_row` の名前だけを不透明 painter へ分離し、他列とプレビューの切り取り表示を保つ。
+環境設定は「表示→サムネイル」の既存 draft に表を追加し、既存 IME helper と RGB picker を使う。
+未完成 HEX は編集中の egui 一時データ一つだけに置き、設定値は RGB だけを保持する。
+フォーカス移動では失った欄自身の widget ID に一致する編集データだけを解放し、
+同じフレームで別の欄が開始した未完成入力を取り消さない。新しい pending フィールドは追加しない。
+新しい一覧状態・worker・ファイル I/O・キー操作は追加しない。
+`details_name_colors` は既存 settings_kv に加算し、設定移行ファイルの分類・検査へ追加する。
+旧設定の欠落時は既定値を導き、既存 DB を作り直さない。
+
+自動検証結果は以下に記録する。製品の起動は行わない。
+利用者はインストール版／tray常駐版を終了してから、当該worktreeで
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` を実行する。
+single-instance mutex を共有する。通常の `%APPDATA%\mimageviewer` を使うため、
+実際の設定・データを更新し得る。エージェントはこの実行を行わない。
+実機では検証用ビルドで以下を確認する:
+
+1. 詳細一覧でフォルダ・本・画像・RAW・動画・音声を表示し、Light／Dark × 標準／強いの最終色を確認する。
+2. フォルダの hover は分類色、チェックと選択は共通色となることを確認する。
+   Ctrl+X では名前が不透明、アイコン・他列が薄く、切り取りバッジが付くことを確認し、Ctrl+C で解除する。
+3. 環境設定でカテゴリをカスタムにし、HEX／picker、各状態の比、通常3:1未満の OK 抑止、
+   Light `#A87E00` の hover 警告付き確定、キャンセルとカテゴリ／全体リセットを確認する。
+4. 色分け OFF と強い配色への切替後もカスタムが保存され、標準へ戻すと再適用されることを確認する。
+   選択情報バー・サムネイル一覧・他列がカテゴリ色にならないことも確認する。
+
+### EPUB の型記述訂正 (調整担当承認2026-10-08)
+
+訂正前の分類表は EPUB を `ConvertibleArchive` に含めていたが、現在の
+`src/app/folder_scan.rs` は EPUB を `GridItem::PdfFile` として列挙する
+(`epub_is_paged_grid_item_and_same_name_pdf_wins_only_when_enabled` のテストも同じ型を検査)。
+`src/archive_converter.rs::ArchiveFormat` には EPUB がない。
+作成済みの分類 helper は両 variant を本とするため表示結果は一致するが、
+「コードが設計前提と矛盾したら停止して報告」という実装指示に従い、後続の検証とビルドを停止した。
+
+**調整担当決定 (2026-10-08):** 分類表を
+「PdfFile (PDF・EPUB)、ConvertibleArchive (RAR/CBR・他対応書庫)」に訂正する。
+EPUBは既存のPdfFile表現を使って本へ分類し、列挙・変換経路は変更しない。
+この訂正を承認して残りの実装検証を再開する。利用者仕様の新規質問はない。
+
+新規テストの DB 初期化は既存専用 `SettingsDb::open` からテスト専用 `create_new` に訂正した。
+旧DBの新キー欠落も検査し、再開後の対象14件と切り取り描画1件は成功した。
+検索索引の整合性検査は、新しい描画 helper の呼び出しと同 helper の表示文字列を確認する。
+HEX欄のクリック移動＋同フレーム入力は、古い欄が新しい欄の未完成入力を消す red を確認し、
+上記の widget 所有境界で修正した。red ログは `target/C-1346-hex-focus-red.log`。
+### 最終自動検証 (未コミット差分、HEAD a3ff1cff5dd5b1c8cba10772d3fdffa82c44ac8f)
+
+全コマンドは当該 worktree で実行。full lib は pipe なし、実終了コードを確認した。
+入力所有境界と索引検査を修正した後の成功結果を採用し、失敗した初回結果では代替していない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | exit 0。既存のCRLFを維持し、`git diff --numstat` に全体書換なし |
+| `cargo test -p mimageviewer --lib name_color` | exit 0、15成功 (DB初期化・キー欠落・HEX移動を含む) |
+| `cargo test -p mimageviewer --lib ui_dialogs::preferences` | exit 0、115成功。上記と重複あり、索引の整合性も検査 |
+| `cargo test -p mimageviewer --lib details_name_cut_paint` | exit 0、1成功 |
+| `cargo test -p mimageviewer --lib` | exit 0、10,952成功・52 ignore、994.15秒 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、通常feature |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | exit 0 |
+| `cargo test -p mimageviewer --test ui_snapshot` | exit 0、111成功、更新フラグなしの比較 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険なglyph 0件 |
+| `.\scripts\build-dev.ps1` | exit 0。normal featureのdev-runtimeでcore／Remote／EPUB workerを生成、DLLとVST3 bundleを配置。依存DLL検査はruntime=4／PE=3成功。起動していない |
+
+snapshot は追加8枚 (1,133,075 bytes)、既存更新3枚を目視した。
+切り取りの2枚は名前の不透明化、お気に入り設定の1枚は同じページの本文増加による
+スクロールつまみの変化だけである。名前色のテストは各テーマ／配色を独立したharnessで検査する。
+記録: `target/C-1346-focused.log`、`target/C-1346-full-lib.log`、`target/C-1346-ui-snapshot.log`、
+`target/C-1346-build-dev.log`。コミットメッセージは `target/C-1346-msg.txt`。
+`build-dist`／`test-full`／製品起動は実行していない。
+
+検証用ビルドの初回は libjpeg-turbo の MSBuild が並列24で exit 1、並列2でも同じ境界で
+停止した (詳細エラーなし)。当該worktreeの成果物に対する CMake の並列1は exit 0、
+警告0・エラー0。スクリプトや製品コードを変更せず、`CARGO_BUILD_JOBS=1` と
+`build-dev.ps1 -WaitForOtherBuildsMinutes 0` で再実行して exit 0。
+core 15分43秒、Remote 3分46秒、EPUB worker 2分09秒。feature/profile は通常のまま。

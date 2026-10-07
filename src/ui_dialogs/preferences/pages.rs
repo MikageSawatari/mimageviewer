@@ -1578,6 +1578,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "サムネイル表示では一覧と同じ列設定を使います。詳細表示では、一覧と同じ設定・専用の設定・表示しないを選べます。",
     );
     });
+    ui.add_space(12.0);
+    ui.separator();
+    anchored(ui, state, "thumbnail/details-name-colors", |ui, state| {
+        super::name_colors::draw_settings(ui, &mut state.settings);
+    });
+    ui.add_space(12.0);
+    ui.separator();
     anchored(ui, state, "thumbnail/tooltip-items", |ui, state| {
         let s = &mut state.settings;
         ui.label("ツールチップに表示する項目:");

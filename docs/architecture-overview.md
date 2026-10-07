@@ -77,6 +77,7 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 | `crates/startup-diagnostics` | launcher/core共通の常時起動timeline。UIは固定容量のmemoryへ非blockingで公開し、独立writerがJSONLを保存する。UI heartbeatと独立した限定watchdog、同runの引継ぎ、保存先分類を所有する。詳細は [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §3・§10 |
 | `ui_startup.rs` | 起動stage/経過時間と「検索の準備中」の純粋描画。Indexerの5秒overlay上限・worker継続・単一採用はAppの `IndexerInit` が所有する |
 | `raw_format.rs` | 23 種の RAW 拡張子の単一リスト。フォルダ列挙はこれを含み、WIC はこの集合を拒否する |
+| `details_name_colors.rs` | 詳細一覧の名前だけの六分類・設定・既定/カスタム色・コントラストを純粋に導出。I/Oや行状態cacheを持たず、選択/チェックは共通色、強めは固定色。設定UIと描画が背景・検査を共有する |
 | `raw/{raw_decoder,executor,brightness}.rs` | LibRaw の安全な info / preview / Full・half 現像、固定明るさ処理、優先度と取消を持つ App 共有の現像 executor。RAW は各入口で他の画像デコーダより先に分岐する |
 | `crates/libraw-sys` | vendored LibRaw との Windows FFI 境界と native build。非 Windows は safe API の Unsupported を返す |
 | `cut_clipboard.rs` | Windows の現在の file clipboard を App 単位で観測し、実ファイル / 実フォルダの cut 表示 snapshot を所有する。message-only window の通知 thread と OLE reader threadを分離し、UI は正規化済み `Arc<HashSet>` を可視項目の実パスと照合するだけにする。mIV の cut data object は private token と Shell の完了 format を同じ reducer へ返し、古い通知・読取・callback が新しい clipboard を上書きしない。viewer context やファイル / DB には cut 状態を保存しない |

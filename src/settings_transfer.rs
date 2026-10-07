@@ -265,6 +265,7 @@ preferences_policy! {
         grid_open_selected_item_on_click: bool => ("選択中の項目をクリックで開く", |_, _| true, plain, plain);
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
+        details_name_colors: crate::details_name_colors::DetailsNameColors => ("詳細一覧の名前色", |v, _raw| v.valid_standard_custom(), plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
@@ -864,6 +865,12 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings.details_name_colors.enabled = false;
+        settings.details_name_colors.colors[0] =
+            crate::details_name_colors::DetailsNameColor::Custom {
+                light: [80, 60, 0],
+                dark: [214, 186, 102],
+            };
         settings.raw_brightness = crate::raw::RawBrightness::None;
         settings.ui_theme = different_enum(
             &settings.ui_theme,
@@ -1537,15 +1544,50 @@ mod tests {
     }
 
     #[test]
+    fn details_name_colors_transfer_preserves_disabled_custom_and_rejects_invalid() {
+        use crate::details_name_colors::DetailsNameColor;
+        let mut source = Settings::default();
+        source.details_name_colors.enabled = false;
+        source.details_name_colors.colors[2] = DetailsNameColor::Custom {
+            light: [55, 80, 15],
+            dark: [180, 220, 140],
+        };
+        let exported = export_preferences(&source).unwrap();
+        assert!(exported.issues.is_empty());
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(source.details_name_colors, destination.details_name_colors);
+        let before = destination.details_name_colors.clone();
+        for invalid in [
+            json!({"enabled": true, "colors": [{"mode": "custom", "light": [255,255,255], "dark": [0,0,0]}, {"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"}]}),
+            json!({"enabled": true, "colors": [{"mode":"default"}]}),
+            json!({"enabled": true}),
+            json!({"enabled": true, "colors": [{"mode":"future"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"}]}),
+        ] {
+            let parsed =
+                parse_preferences(&document(json!({"details_name_colors": invalid}))).unwrap();
+            assert_eq!(parsed.issues.len(), 1);
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.details_name_colors, before);
+        }
+        let parsed = parse_preferences(INITIAL_V1).unwrap();
+        parsed.apply_to(&mut destination);
+        assert_eq!(destination.details_name_colors, before);
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 446);
+        assert_eq!(entries.len(), 447);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            134
+            135
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1555,7 +1597,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 132);
+        assert_eq!(wire.len(), 133);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
