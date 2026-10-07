@@ -39,6 +39,8 @@ pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;

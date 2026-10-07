@@ -3662,11 +3662,37 @@ impl FullscreenFitMode {
         Self::all()
     }
 
-    pub fn next_for_flow(self, flow: ReadingFlow) -> Self {
-        let modes = Self::selectable_for_flow(flow);
+    /// Stable IDs in the excluded set. Unknown IDs survive loading for forward compatibility.
+    pub fn cycle_id(self) -> &'static str {
+        match self {
+            Self::Page => "Page",
+            Self::MarginFit => "MarginFit",
+            Self::Width => "Width",
+            Self::Height => "Height",
+            Self::Original => "Original",
+        }
+    }
+
+    pub fn cycle_enabled(self, excluded: &[String]) -> bool {
+        !excluded.iter().any(|id| id == self.cycle_id())
+    }
+
+    pub fn next_for_flow(self, flow: ReadingFlow, excluded: &[String]) -> Self {
+        let modes: Vec<_> = Self::selectable_for_flow(flow)
+            .iter()
+            .copied()
+            .filter(|mode| mode.cycle_enabled(excluded))
+            .collect();
+        // Loading repairs an empty set to the first selectable mode. Keep the pure
+        // operation consistent even for an unsanitized caller's settings draft.
+        let Some(&first) = modes.first() else {
+            return Self::selectable_for_flow(flow)[0];
+        };
         let current = self.effective_for_flow(flow);
-        let pos = modes.iter().position(|&m| m == current).unwrap_or(0);
-        modes[(pos + 1) % modes.len()]
+        modes
+            .iter()
+            .position(|&mode| mode == current)
+            .map_or(first, |pos| modes[(pos + 1) % modes.len()])
     }
 }
 
@@ -4959,6 +4985,10 @@ pub struct Settings {
     /// フルスクリーンの倍率/フィット基準。
     #[serde(default)]
     pub fullscreen_fit_mode: FullscreenFitMode,
+    /// Excluded stable fit-mode IDs; empty means all modes, including future additions.
+    /// Unknown IDs are retained so an explicitly excluded future mode stays excluded.
+    #[serde(default)]
+    pub fullscreen_fit_cycle_excluded: Vec<String>,
     /// 自動フィット時に 100% を超える拡大をしない。
     #[serde(default)]
     pub fullscreen_fit_no_upscale: bool,
@@ -7446,6 +7476,7 @@ impl Default for Settings {
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
             fullscreen_fit_mode: FullscreenFitMode::default(),
+            fullscreen_fit_cycle_excluded: Vec::new(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
             downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
@@ -9499,9 +9530,43 @@ impl Settings {
         self.details_selection_bar_name_width = self.details_name_width;
     }
 
+    pub fn set_fullscreen_fit_cycle_enabled(
+        &mut self,
+        mode: FullscreenFitMode,
+        enabled: bool,
+    ) -> bool {
+        if !FullscreenFitMode::all().contains(&mode)
+            || mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded) == enabled
+        {
+            return false;
+        }
+        if enabled {
+            self.fullscreen_fit_cycle_excluded
+                .retain(|id| id != mode.cycle_id());
+        } else {
+            if FullscreenFitMode::all()
+                .iter()
+                .filter(|mode| mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded))
+                .count()
+                <= 1
+            {
+                return false;
+            }
+            self.fullscreen_fit_cycle_excluded
+                .push(mode.cycle_id().to_owned());
+        }
+        true
+    }
+
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        if FullscreenFitMode::all()
+            .iter()
+            .all(|mode| !mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded))
+        {
+            self.set_fullscreen_fit_cycle_enabled(FullscreenFitMode::all()[0], true);
+        }
         normalize_image_ext_priority(&mut self.image_ext_priority);
         self.restore_post_filter_variants_after_load();
         self.restore_toolbar_name_filter_after_load();
@@ -14314,6 +14379,64 @@ mod tests {
     }
 
     #[test]
+    fn fit_cycle_subset_settings_default_sanitize_and_future_ids() {
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("fullscreen_fit_cycle_excluded");
+        let old: Settings = serde_json::from_value(legacy).unwrap();
+        assert!(old.fullscreen_fit_cycle_excluded.is_empty());
+
+        let mut settings = Settings::default();
+        for &mode in &[
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+        ] {
+            assert!(settings.set_fullscreen_fit_cycle_enabled(mode, false));
+        }
+        assert!(!settings.set_fullscreen_fit_cycle_enabled(FullscreenFitMode::Original, false));
+        assert!(FullscreenFitMode::Original.cycle_enabled(&settings.fullscreen_fit_cycle_excluded));
+        assert!(
+            !settings
+                .fullscreen_fit_cycle_excluded
+                .iter()
+                .any(|id| id == "FutureScale")
+        );
+
+        settings.fullscreen_fit_cycle_excluded = vec![
+            "FutureScale".into(),
+            "Original".into(),
+            "Page".into(),
+            "Width".into(),
+            "Height".into(),
+        ];
+        settings.sanitize();
+        assert!(FullscreenFitMode::Page.cycle_enabled(&settings.fullscreen_fit_cycle_excluded));
+        assert!(
+            !FullscreenFitMode::Original.cycle_enabled(&settings.fullscreen_fit_cycle_excluded)
+        );
+        assert!(
+            settings
+                .fullscreen_fit_cycle_excluded
+                .contains(&"FutureScale".into())
+        );
+        let mut loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded.fullscreen_fit_cycle_excluded,
+            settings.fullscreen_fit_cycle_excluded
+        );
+        let future_only = vec!["FutureScale".to_owned()];
+        assert_eq!(
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged, &future_only),
+            FullscreenFitMode::Width
+        );
+    }
+
+    #[test]
     fn fullscreen_fit_mode_cycles_exclude_legacy_margin_fit() {
         assert_eq!(
             FullscreenFitMode::default_for_flow(ReadingFlow::Paged),
@@ -14328,11 +14451,11 @@ mod tests {
             FullscreenFitMode::Height
         );
         assert_eq!(
-            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged),
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged, &[]),
             FullscreenFitMode::Width
         );
         assert_eq!(
-            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Vertical),
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Vertical, &[]),
             FullscreenFitMode::Width
         );
         assert_eq!(
@@ -14354,7 +14477,7 @@ mod tests {
             assert!(!modes.contains(&FullscreenFitMode::MarginFit));
             // メニュー一覧は [0] 循環の対象集合と一致する。
             for &m in modes {
-                assert!(modes.contains(&m.next_for_flow(flow)));
+                assert!(modes.contains(&m.next_for_flow(flow, &[])));
             }
         }
     }

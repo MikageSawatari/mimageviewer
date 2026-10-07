@@ -16,6 +16,13 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+#[doc(hidden)]
+pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings::default();
+    settings.fullscreen_fit_cycle_excluded = vec!["Page".into(), "Width".into(), "Height".into()];
+    pages::draw_fullscreen_fit_cycle_settings(ui, &mut settings);
+}
+
 mod pages;
 mod search_index;
 mod transfer;

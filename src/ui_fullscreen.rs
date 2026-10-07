@@ -37092,9 +37092,10 @@ impl App {
         {
             return;
         }
-        let next = self
-            .effective_fullscreen_fit_mode()
-            .next_for_flow(self.reading_flow);
+        let next = self.effective_fullscreen_fit_mode().next_for_flow(
+            self.reading_flow,
+            &self.settings.fullscreen_fit_cycle_excluded,
+        );
         self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, next);
         self.show_feedback_toast(format!(
             "[0:{}]",

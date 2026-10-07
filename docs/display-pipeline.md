@@ -1684,7 +1684,10 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 `zip_spread_zoom_pan` の倍率・パン解決は 1 回だけ行う。`Original` 以外は従来の高さ合わせ
 composite をそのまま使う。
 
-`settings.fullscreen_fit_mode` は <kbd>0</kbd> で循環する。ホバーバーのフィットボタンは
+`settings.fullscreen_fit_mode` は <kbd>0</kbd> と割り当てたリング／ジェスチャ／マウスボタン／
+パッドリングで、同じ `cycle_fullscreen_fit_mode` を経由して循環する。
+`FullscreenFitMode::next_for_flow` は `fullscreen_fit_cycle_excluded` を除外して通常順に進む。
+現在モードが対象外なら最初の有効モードへ、1つだけならその方式を設定／維持する。ホバーバーのフィットボタンは
 クリックで選択メニュー (`fit_popup_open`) を開き、flow で選べるモードを一覧表示して現在モードを
 青でハイライトする (見開きボタンのポップアップと同型)。メニュー項目選択は
 `set_fullscreen_fit_mode_for_current` を直接呼び、<kbd>0</kbd> 循環 (`cycle_fullscreen_fit_mode`)

@@ -9576,6 +9576,101 @@ mod next_input_tests {
         }
     }
 
+    fn dispatch_fit_cycle(app: &mut App, ctx: &egui::Context, route: Option<Route>) {
+        if let Some(route) = route {
+            dispatch(
+                app,
+                ctx,
+                RingShortcutContext::ImageFullscreen,
+                route,
+                action("image_fit_mode_cycle"),
+            );
+        } else {
+            #[cfg(windows)]
+            crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
+                virtual_key: 0x30,
+                scan_code: 0x0b,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }]);
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Num0,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_fs_key_input(ctx, 0, false);
+            let _ = ctx.end_pass();
+            #[cfg(windows)]
+            crate::key_input::set_test_frame(Vec::new());
+        }
+    }
+
+    #[test]
+    fn fit_cycle_subset_all_input_routes_use_the_same_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            app.reading_flow = flow;
+            for (excluded, start, expected) in [
+                (
+                    vec!["Width", "Height"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Page],
+                ),
+                (
+                    vec!["Width", "Height"],
+                    FullscreenFitMode::Width,
+                    vec![FullscreenFitMode::Page, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Original,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+            ] {
+                for route in ROUTES.into_iter().map(Some).chain(std::iter::once(None)) {
+                    let mut saved = serde_json::to_value(&app.settings).unwrap();
+                    saved["fullscreen_fit_cycle_excluded"] = serde_json::json!(excluded);
+                    app.settings = serde_json::from_value(saved).unwrap();
+                    app.settings.fullscreen_fit_mode = start;
+                    for &mode in &expected {
+                        dispatch_fit_cycle(&mut app, &ctx, route);
+                        assert_eq!(
+                            app.settings.fullscreen_fit_mode, mode,
+                            "{route:?}, {flow:?}, {excluded:?}"
+                        );
+                    }
+                    // A direct picker choice must remain available even when excluded from cycling.
+                    app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::Width);
+                    assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Width);
+                }
+            }
+        }
+    }
+
     #[test]
     fn next_input_fit_routes_share_the_key_cycle_for_all_reading_flows() {
         let mut app = crate::app::setup_app_for_test();

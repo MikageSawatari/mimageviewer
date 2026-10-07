@@ -9625,6 +9625,29 @@ pub(super) fn draw_still_seek_strip_settings(
     ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
 }
 
+pub(super) fn draw_fullscreen_fit_cycle_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.label(egui::RichText::new("フィット循環に含めるモード").strong());
+    for &mode in FullscreenFitMode::all() {
+        let mut included = mode.cycle_enabled(&settings.fullscreen_fit_cycle_excluded);
+        let can_toggle = !included
+            || FullscreenFitMode::all()
+                .iter()
+                .filter(|mode| mode.cycle_enabled(&settings.fullscreen_fit_cycle_excluded))
+                .count()
+                > 1;
+        if ui
+            .add_enabled(can_toggle, egui::Checkbox::new(&mut included, mode.label()))
+            .changed()
+        {
+            settings.set_fullscreen_fit_cycle_enabled(mode, included);
+        }
+    }
+    ui.small("1つ以上選択してください。0キー・リング・ジェスチャ・マウスボタンの循環に適用します。直接選択メニューにはすべてのモードが表示されます。");
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/side-panels", |ui, state| {
         let s = &mut state.settings;
@@ -9747,6 +9770,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     );
                 }
             });
+    });
+    anchored(ui, state, "spread/fit-cycle", |ui, state| {
+        draw_fullscreen_fit_cycle_settings(ui, &mut state.settings);
     });
     anchored(ui, state, "spread/fit", |ui, state| {
         let s = &mut state.settings;
@@ -10121,6 +10147,58 @@ mod context_menu_layout_settings_tests {
         );
         apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::Reset);
         assert_eq!(layout, ContextMenuLayoutSettings::default());
+    }
+
+    #[test]
+    fn fit_cycle_subset_ui_keeps_the_last_mode_enabled() {
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+        let mut settings = crate::settings::Settings::default();
+        settings.fullscreen_fit_cycle_excluded =
+            vec!["Page".into(), "Width".into(), "Height".into()];
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_state(
+                |ctx, (settings, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| draw_fullscreen_fit_cycle_settings(ui, settings));
+                },
+                (settings, false),
+            );
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("100%原寸")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("ページ全体").click();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label("100%原寸")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("100%原寸").click();
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("ページ全体")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            FullscreenFitMode::Page.cycle_enabled(&harness.state().0.fullscreen_fit_cycle_excluded)
+        );
     }
 
     #[test]

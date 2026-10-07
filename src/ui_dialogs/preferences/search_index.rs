@@ -739,6 +739,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["右から左", "左から右", "RTL", "LTR", "読み方向"]
     ),
     entry!(
+        "spread/fit-cycle",
+        SpreadMode,
+        "フィット循環に含めるモード",
+        ["切り替え", "リング", "ジェスチャ", "0キー", "倍率"]
+    ),
+    entry!(
         "spread/fit",
         SpreadMode,
         "ズーム/フィット",

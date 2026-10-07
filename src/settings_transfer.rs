@@ -332,6 +332,7 @@ preferences_policy! {
         continuous_reading_gap_px: u32 => ("連結読書のページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         fullscreen_image_margin_color: [u8; 3] => ("閲覧表示の余白色", |_, _| true, plain, plain);
         fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, plain);
+        fullscreen_fit_cycle_excluded: Vec<String> => ("フィット循環に含めるモード", |v, _| FullscreenFitMode::all().iter().any(|mode| mode.cycle_enabled(v)), plain, plain);
         fullscreen_fit_no_upscale: bool => ("フィットで拡大しない", |_, _| true, plain, plain);
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
         fullscreen_side_panel_mode: FsSidePanelMode => ("閲覧表示の左右パネル", |v, _raw| FsSidePanelMode::all().contains(v), plain, plain);
@@ -1130,6 +1131,7 @@ mod tests {
                 FullscreenFitMode::Original,
             ],
         );
+        settings.fullscreen_fit_cycle_excluded = vec!["Width".into(), "FutureScale".into()];
         settings.fullscreen_fit_no_upscale = !settings.fullscreen_fit_no_upscale;
         settings.fullscreen_fit_no_downscale = !settings.fullscreen_fit_no_downscale;
         settings.fullscreen_side_panel_mode = different_enum(
@@ -1537,15 +1539,51 @@ mod tests {
     }
 
     #[test]
+    fn fit_cycle_subset_transfer_preserves_unknown_ids_and_rejects_empty_cycle() {
+        let mut settings = Settings::default();
+        let document = |ids: serde_json::Value| {
+            serde_json::json!({
+                "format": "mimageviewer.preferences", "format_version": 1,
+                "preferences": {"fullscreen_fit_cycle_excluded": ids}
+            })
+            .to_string()
+        };
+        let parsed =
+            parse_preferences(&document(serde_json::json!(["Width", "FutureScale"]))).unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert_eq!(
+            settings.fullscreen_fit_cycle_excluded,
+            vec!["Width", "FutureScale"]
+        );
+        let exported = export_preferences(&settings).unwrap();
+        assert!(exported.issues.is_empty());
+        let mut copy = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut copy);
+        assert_eq!(
+            copy.fullscreen_fit_cycle_excluded,
+            settings.fullscreen_fit_cycle_excluded
+        );
+        let before = settings.fullscreen_fit_cycle_excluded.clone();
+        let parsed = parse_preferences(&document(serde_json::json!([
+            "Page", "Width", "Height", "Original"
+        ])))
+        .unwrap();
+        assert_eq!(parsed.apply_to(&mut settings).issues.len(), 1);
+        assert_eq!(settings.fullscreen_fit_cycle_excluded, before);
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 446);
+        assert_eq!(entries.len(), 447);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            134
+            135
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1555,7 +1593,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 132);
+        assert_eq!(wire.len(), 133);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

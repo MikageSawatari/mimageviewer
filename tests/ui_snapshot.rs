@@ -1557,6 +1557,17 @@ fn metadata_panel_similar_states_dark() {
 }
 
 #[test]
+fn fullscreen_fit_cycle_single_mode_dark() {
+    snapshot_with_theme_at_size(
+        "fullscreen_fit_cycle_single_mode_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 300.0),
+        None,
+        mimageviewer::draw_fullscreen_fit_cycle_settings_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_favorite_view_state_dark() {
     snapshot_with_theme_at_size(
         "preferences_favorite_view_state_dark",
