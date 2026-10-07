@@ -2268,6 +2268,10 @@ GitHub Release の公開と Phase 5 の案内が済んだら、同じ作業の�
     - `git worktree list` の各 worktree について、HEAD が master に取り込み済みか (`git merge-base --is-ancestor`)、
       未コミット変更が無いかを確認して候補を出す。保留中の作業 (backlog-on-hold の検証ラボ等) と未統合ブランチは残す。
     - 撤去は必ず `scripts/safe-worktree-remove.ps1` 経由 (「worktree + Windows junction の地雷」節)。
+    - **`Filename too long` で git が途中まで消して止まることがある** (2026-10-07、EffeTune bundle などの深いパス)。
+      その場合 worktree の登録は外れ、フォルダの中身が一部残る。reparse point が無いことを
+      `Get-ChildItem -Recurse -Attributes ReparsePoint` で確かめてから、`cmd /c rmdir /s /q "\\?\<フォルダ>"` で残りを消し、
+      `git worktree prune` と `git branch -d` を行う。先に `target*` を同じ方法で消しておくと失敗しにくい。
       取り込み済みのブランチは `git branch -d` で消す。`.claude/worktrees/` 配下は Claude アプリが作ったものなので、
       アプリ側の片付け (`clean_up_worktrees`) を優先する。
 22. **バックログの整理**: 今回出荷した項目を `docs/next-release-backlog.md` から削除し (経緯は git 履歴と
