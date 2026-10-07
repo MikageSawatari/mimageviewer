@@ -798,10 +798,17 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
 
 ## 設計メモ
 
-一覧の余白ダブルクリック (§1.298) は
-[設計レビュー用ノート](grid-background-double-click-plan.md) に分離。既定なしの割り当て、
-セルとのclick-pair所有、バー／dialog／touch／一覧種類、選択解除の扱いと利用者への質問を記載。
-本段階では実装しない。
+一覧の余白ダブルクリック (§1.298) は環境設定 → 表示 → サムネイルで
+「なし／親フォルダへ」を選ぶ（既定なし）。サムネイル・詳細一覧のセル／行に所属しない
+背景だけが対象で、セル内の画像・ラベル余白、詳細行の空列、操作バー、dialog／popup は除外する。
+セルが占有していない隙間も背景として扱い、セル矩形は変更しない。touch／ペンのdouble tapにも
+同じ設定を使う。背景2打は同じ一覧世代・表示面・入力種別、OS の double-click 時間と既存
+`max_click_dist` 内でのみ対になる。セルとの混在、押下／解放の所属不一致、scroll／pinch／cancel、
+一覧変更や表示面の切替で対を切る。発火時は対を消費し、既存の選択解除を行ってから
+キー `GridParentFolder` と共有する親操作へ渡す。Check 方式ではチェックを維持する。
+ドライブルートはドライブ一覧へ戻り、検索・仮想一覧は既存キーの戻り方／no-op を保つ。
+これは固定ポインター操作の専用設定であり、キーの chord 割り当ては変更しない。
+[決定と入力所有・検証の詳細](grid-background-double-click-plan.md) を参照。
 
 - 動画モードで ↑↓ をファイル移動に再アサインする方針は、旧 egui 経路では
   `handle_video_input` がプレーン ArrowUp/ArrowDown を consume せず後段へ流すことで

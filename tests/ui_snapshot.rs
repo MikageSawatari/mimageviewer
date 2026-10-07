@@ -1557,6 +1557,17 @@ fn metadata_panel_similar_states_dark() {
 }
 
 #[test]
+fn grid_background_double_click_settings_dark() {
+    snapshot_with_theme_at_size(
+        "grid_background_double_click_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 150.0),
+        None,
+        mimageviewer::draw_grid_background_double_click_settings_snapshot_fixture,
+    );
+}
+
+#[test]
 fn fullscreen_fit_cycle_single_mode_dark() {
     snapshot_with_theme_at_size(
         "fullscreen_fit_cycle_single_mode_dark",

@@ -1455,6 +1455,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-08 §1.298 一覧背景の親操作を既存キー入口へ共有**
+
+独立レビュー済みの `grid-background-double-click-plan.md` と利用者決定に従い、
+キー `GridParentFolder` の処理を `handle_grid_parent_folder_action` へ移し、メイン一覧背景の
+ダブルクリック／double tapからも同じ入口を使う。ネストZIPの戻り前に行う既存の
+active detached保存・fullscreen closeと、仮想ページ一覧からの既存close処理は、
+条件・順序・所有経路をそのまま移した。detached判定やviewport・mount・hostの変更、
+専用復元状態、症状パッチは追加していない。detached表示面そのものは背景判定の対象外。
+
+
 **2026-10-06 §1.241 plan A Phase A 起動診断・Indexer単一採用**
 
 設計 `docs/startup-diagnostics-plan.md` は f2fcef6b2 の独立レビューで ready（指摘なし）となり、

@@ -13752,26 +13752,45 @@ impl GridClickSelectionAnchor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridClickSource {
+    Mouse,
+    Touch,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct PendingGridCellClick {
-    index: usize,
+pub(crate) struct GridBackgroundClickContext {
+    pub(crate) items_generation: u64,
+    pub(crate) view_mode: crate::settings::GridViewMode,
+    pub(crate) viewport: egui::ViewportId,
+    pub(crate) source: GridClickSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GridClickTarget {
+    Cell(usize),
+    Background {
+        context: GridBackgroundClickContext,
+        pos: egui::Pos2,
+        frame: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingGridClick {
+    target: GridClickTarget,
     items_generation: u64,
     at: f64,
 }
 
-/// グリッドセルを開くためのクリック対を所有する状態。
-///
-/// egui には click として成立したかだけを任せ、同じ一覧・同じセル・OS 由来の時間内かは
-/// この owner が判定する。起動した対を `None` に戻すことで、3 打目や fullscreen 退出後の
-/// 1 打目を前の対へ連結しない。
+/// セル／背景のクリック対の単一 owner。セルの既存条件を保ち、背景だけ距離・入力種別を照合する。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct GridClickPairingState {
-    pending: Option<PendingGridCellClick>,
+    pending: Option<PendingGridClick>,
+    background_press: Option<(GridBackgroundClickContext, u64)>,
 }
 
 impl GridClickPairingState {
-    /// primary click の frame では直前状態を一時的に取り出す。セルが `clicked()` を
-    /// 受理しなければ App 側は空のままなので、空白や別 widget の click が対を切る。
     pub(crate) fn begin_primary_click_frame(&mut self, primary_clicked: bool) -> Self {
         if primary_clicked {
             std::mem::take(self)
@@ -13789,31 +13808,127 @@ impl GridClickPairingState {
         max_delay: f64,
     ) -> bool {
         let paired = previous.pending.is_some_and(|pending| {
-            pending.index == index
+            pending.target == GridClickTarget::Cell(index)
                 && pending.items_generation == items_generation
                 && at - pending.at < max_delay
         });
-        // Store this click first. The caller clears it when either this pair or the independent
-        // selected-item reclick path activates the item, so every activation has one end-run
-        // transition instead of separate cleanup branches.
-        self.pending = Some(PendingGridCellClick {
-            index,
+        self.pending = Some(PendingGridClick {
+            target: GridClickTarget::Cell(index),
             items_generation,
             at,
         });
         paired
     }
 
-    /// §2.5 の選択済みセル再クリックを含め、item activation は click run を終える。
+    pub(crate) fn validate_background(&mut self, context: GridBackgroundClickContext, frame: u64) {
+        // A missing grid frame means the surface was closed/hidden. Do not carry a pair back.
+        if self.background_press.is_some_and(|(press, last_frame)| {
+            press.items_generation != context.items_generation
+                || press.view_mode != context.view_mode
+                || press.viewport != context.viewport
+                || frame.saturating_sub(last_frame) > 1
+        }) {
+            self.background_press = None;
+        }
+        if self.pending.is_some_and(|pending| match pending.target {
+            GridClickTarget::Background {
+                context: old,
+                frame: last_frame,
+                ..
+            } => {
+                old.items_generation != context.items_generation
+                    || old.view_mode != context.view_mode
+                    || old.viewport != context.viewport
+                    || frame.saturating_sub(last_frame) > 1
+            }
+            GridClickTarget::Cell(_) => false,
+        }) {
+            self.pending = None;
+        }
+        // Keep the live background identity current through ordinary idle frames.
+        if let Some((_, last_frame)) = &mut self.background_press {
+            *last_frame = frame;
+        }
+        if let Some(PendingGridClick {
+            target:
+                GridClickTarget::Background {
+                    frame: last_frame, ..
+                },
+            ..
+        }) = &mut self.pending
+        {
+            *last_frame = frame;
+        }
+    }
+
+    pub(crate) fn end_background_run(&mut self) {
+        self.background_press = None;
+        if self
+            .pending
+            .is_some_and(|pending| matches!(pending.target, GridClickTarget::Background { .. }))
+        {
+            self.pending = None;
+        }
+    }
+
+    pub(crate) fn background_press_cancel(&mut self) {
+        self.background_press = None;
+    }
+
+    pub(crate) fn begin_background_press(
+        &mut self,
+        context: GridBackgroundClickContext,
+        frame: u64,
+    ) {
+        self.background_press = Some((context, frame));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_background_click(
+        &mut self,
+        previous: Self,
+        context: GridBackgroundClickContext,
+        pos: egui::Pos2,
+        frame: u64,
+        at: f64,
+        max_delay: f64,
+        max_dist: f32,
+    ) -> bool {
+        let press = self.background_press.take().or(previous.background_press);
+        if !press.is_some_and(|(press_context, _)| press_context == context) {
+            self.pending = None;
+            return false;
+        }
+        let paired = previous.pending.is_some_and(|pending| {
+            pending.items_generation == context.items_generation
+                && at - pending.at < max_delay
+                && matches!(pending.target, GridClickTarget::Background { context: old, pos: old_pos, .. }
+                    if old == context && old_pos.distance(pos) <= max_dist)
+        });
+        self.pending = (!paired).then_some(PendingGridClick {
+            target: GridClickTarget::Background {
+                context,
+                pos,
+                frame,
+            },
+            items_generation: context.items_generation,
+            at,
+        });
+        paired
+    }
+
     pub(crate) fn end_activation(&mut self) {
-        self.pending = None;
+        *self = Self::default();
     }
 
     #[cfg(test)]
     pub(crate) fn pending_index_for_generation(self, items_generation: u64) -> Option<usize> {
         self.pending
             .filter(|pending| pending.items_generation == items_generation)
-            .map(|pending| pending.index)
+            .and_then(|pending| match pending.target {
+                GridClickTarget::Cell(index) => Some(index),
+                GridClickTarget::Background { .. } => None,
+            })
     }
 }
 
@@ -49058,6 +49173,68 @@ impl App {
         None
     }
 
+    /// キーと一覧背景から同じ親ナビゲーション意味を要求する単一入口。
+    pub(crate) fn handle_grid_parent_folder_action(
+        &mut self,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        // フルスクリーン中の BS はフルスクリーン側ビューポートで処理する (ZIP/PDF ページ
+        // なら 1 段戻って L2 ページ一覧)。ここは grid (L1/L2) での BS = 親フォルダへ。
+        // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を
+        // render する状態) に戻る。snapshot 内 child folder に居る場合のみ動作し、既に
+        // snapshot root 表示中なら通常の親フォルダ移動を試みる (= load_folder guard で
+        // 範囲外なら toast block される)。
+        if self.is_snapshot_active() && self.snapshot_return_to_list_view() {
+            return None;
+        }
+        // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
+        // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
+        if self.global_search.active {
+            if self.global_search.drill.is_some() {
+                self.drill_back_one_level();
+                return None;
+            }
+            // Aggregated (検索仮想階層の最上位) で BS: no-op。BS は「階層を 1 段
+            // 上がる・根で停止・検索モードからは出ない」キー。検索の終了は ESC のみ。
+            // ここで return しないと FS 親遡行に流れ、search bar が active のまま
+            // saved_folder の親 → ドライブ root の中身が表示される事故になる。
+            return None;
+        }
+        if self.favsearch.active {
+            self.favsearch_back();
+            // favsearch_back 内で load_folder 済み。navigate 経路には流さない。
+            return None;
+        }
+        if self.tag_view.active {
+            self.tag_view_back();
+            return None;
+        }
+        if self.rating_view_parent_nav_available() {
+            self.rating_view_parent_nav();
+            return None;
+        }
+        if self.local_search_blocks_parent_nav() {
+            self.cancel_pending_folder_nav();
+            return None;
+        }
+        // ネスト ZIP ツリー内なら、実フォルダ親へ抜ける前に 1 階層戻る (Phase 3)。
+        // ルート (スタック底) では zip_nav_back は false → そのまま親フォルダへ抜ける
+        // (= load_folder が zip_nav をクリアして ZIP を出る)。
+        #[cfg(windows)]
+        let close_detached_after_zip_back = self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root())
+            && self.should_preserve_active_detached_image_window_for_main_context_change();
+        #[cfg(windows)]
+        if close_detached_after_zip_back {
+            self.preserve_active_detached_image_window_for_main_context_change();
+            self.close_fullscreen();
+        }
+        if self.zip_nav_back() {
+            return None;
+        }
+        #[cfg(windows)]
+        self.close_detached_viewer_for_virtual_page_list_parent_nav();
+        return self.resolve_grid_parent_nav();
+    }
+
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<crate::ui_main::AddressBarNav> {
         // マウスドライバ / AHK 経由で積まれた進む/戻る pending を early-return より前に
         // drain する。検索バー / ダイアログ / IME 変換中などショートカットを止める分岐で
@@ -49898,63 +50075,7 @@ impl App {
         let parent_key = self.keymap.consume_action(ctx, KeyAction::GridParentFolder);
         if parent_key {
             crate::modifier_probe::record_modified_action(ctx, "GridParentFolder", "keymap");
-            // フルスクリーン中の BS はフルスクリーン側ビューポートで処理する (ZIP/PDF ページ
-            // なら 1 段戻って L2 ページ一覧)。ここは grid (L1/L2) での BS = 親フォルダへ。
-            // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を
-            // render する状態) に戻る。snapshot 内 child folder に居る場合のみ動作し、既に
-            // snapshot root 表示中なら通常の親フォルダ移動を試みる (= load_folder guard で
-            // 範囲外なら toast block される)。
-            if self.is_snapshot_active() && self.snapshot_return_to_list_view() {
-                return None;
-            }
-            // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
-            // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
-            if self.global_search.active {
-                if self.global_search.drill.is_some() {
-                    self.drill_back_one_level();
-                    return None;
-                }
-                // Aggregated (検索仮想階層の最上位) で BS: no-op。BS は「階層を 1 段
-                // 上がる・根で停止・検索モードからは出ない」キー。検索の終了は ESC のみ。
-                // ここで return しないと FS 親遡行に流れ、search bar が active のまま
-                // saved_folder の親 → ドライブ root の中身が表示される事故になる。
-                return None;
-            }
-            if in_favsearch {
-                self.favsearch_back();
-                // favsearch_back 内で load_folder 済み。navigate 経路には流さない。
-                return None;
-            }
-            if in_tag_view {
-                self.tag_view_back();
-                return None;
-            }
-            if self.rating_view_parent_nav_available() {
-                self.rating_view_parent_nav();
-                return None;
-            }
-            if self.local_search_blocks_parent_nav() {
-                self.cancel_pending_folder_nav();
-                return None;
-            }
-            // ネスト ZIP ツリー内なら、実フォルダ親へ抜ける前に 1 階層戻る (Phase 3)。
-            // ルート (スタック底) では zip_nav_back は false → そのまま親フォルダへ抜ける
-            // (= load_folder が zip_nav をクリアして ZIP を出る)。
-            #[cfg(windows)]
-            let close_detached_after_zip_back =
-                self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root())
-                    && self.should_preserve_active_detached_image_window_for_main_context_change();
-            #[cfg(windows)]
-            if close_detached_after_zip_back {
-                self.preserve_active_detached_image_window_for_main_context_change();
-                self.close_fullscreen();
-            }
-            if self.zip_nav_back() {
-                return None;
-            }
-            #[cfg(windows)]
-            self.close_detached_viewer_for_virtual_page_list_parent_nav();
-            return self.resolve_grid_parent_nav();
+            return self.handle_grid_parent_folder_action();
         }
 
         let history_shortcut_allowed = !self.global_search.active
@@ -89254,6 +89375,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         let first_update = !FIRST_UPDATE.swap(true, std::sync::atomic::Ordering::Relaxed);

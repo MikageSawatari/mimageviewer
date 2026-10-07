@@ -21632,7 +21632,7 @@ mod phase_c_folder_nav_history_tests {
         );
         app.selected = Some(3);
         let Some(crate::ui_main::AddressBarNav::Direct(target, restore_intent)) =
-            app.resolve_grid_parent_nav()
+            app.handle_grid_parent_folder_action()
         else {
             panic!("Backspace must return to the parent folder");
         };
@@ -27744,7 +27744,7 @@ mod phase_c_drill_nav_tests {
             Some(crate::ui_main::AddressBarNav::ReadingHistory)
         ));
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory)
         ));
 
@@ -88581,7 +88581,7 @@ mod smart_folder_transition_tests {
         assert_eq!(app.address, archive.to_string_lossy());
         assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &folder)
         ));
@@ -89196,13 +89196,13 @@ mod smart_folder_transition_tests {
         assert!(app.address.contains("entry"));
         assert!(app.address.contains("child"));
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &entry)
         ));
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &synthetic)
         ));
@@ -89374,7 +89374,7 @@ mod smart_folder_transition_tests {
         app.scroll_offset_y = 900.0;
         app.scroll_to_selected = false;
         app.open_staged_smart_folder_and_wait(&ctx, entry);
-        let parent = match app.resolve_grid_parent_nav() {
+        let parent = match app.handle_grid_parent_folder_action() {
             Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
@@ -89418,7 +89418,7 @@ mod smart_folder_transition_tests {
         assert!(app.begin_staged_smart_drill(&pdf));
         finish_smart_pdf_enumeration(&mut app, &pdf);
 
-        let parent = match app.resolve_grid_parent_nav() {
+        let parent = match app.handle_grid_parent_folder_action() {
             Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };

@@ -224,7 +224,11 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "複数選択",
             "選択済み項目",
             "もう一度",
-            "開く"
+            "開く",
+            "余白",
+            "ダブルクリック",
+            "ダブルタップ",
+            "親フォルダ"
         ]
     ),
     entry!(

@@ -1536,6 +1536,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.small(
             "修飾キーなしのマウスクリックにだけ適用します。エクスプローラー方式で他の項目が選択されているときは、1 件へ畳むだけで開きません。タッチ操作は対象外です。",
         );
+        draw_grid_background_double_click_setting(ui, s);
     });
     ui.add_space(6.0);
     anchored(ui, state, "thumbnail/cursor-wrap", |ui, state| {
@@ -9623,6 +9624,24 @@ pub(super) fn draw_still_seek_strip_settings(
         );
     });
     ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
+}
+
+pub(super) fn draw_grid_background_double_click_setting(ui: &mut egui::Ui, s: &mut Settings) {
+    ui.horizontal(|ui| {
+        ui.label("一覧の余白ダブルクリック:");
+        egui::ComboBox::from_id_salt("grid_background_double_click_action")
+            .selected_text(s.grid_background_double_click_action.label())
+            .show_ui(ui, |ui| {
+                for &action in crate::settings::GridBackgroundDoubleClickAction::all() {
+                    ui.selectable_value(
+                        &mut s.grid_background_double_click_action,
+                        action,
+                        action.label(),
+                    );
+                }
+            });
+    });
+    ui.small("サムネイル・詳細一覧のセル外の余白に適用します。タッチ／ペンのダブルタップも同じ設定です。");
 }
 
 pub(super) fn draw_fullscreen_fit_cycle_settings(
