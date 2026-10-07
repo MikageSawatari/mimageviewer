@@ -614,11 +614,19 @@ private残量からsmooth deltaが届き得る。これらは移動可能な経�
 通常thumbnailのscroll target発行は確認できず、test-scriptのrow revealは別の診断producer。
 旧touch glideは世代と行高で失効し、folder pane/musicのScrollAreaは別IDを持つ。
 
-`[grid-scroll]`はRatingの保存/復元、初描画予測、ensure-visible、行snap、clamp、touch、
+`[grid-scroll]`はRatingの保存/復元、ensure-visible、行snap、clamp、touch、
 aspect fixup、wheel/gamepad、eguiの読み戻しをnormal loggerへ記録する。世代、保存/適用offset、
 選択index、行矩形、列数、セル幅/高、viewport高を記録し、ScrollArea直前の入力と前後のStateも
 採取する。パスや項目名は出さない。ログはこれらの境界/位置変更時のみで、待機や追加repaintを
 導入しない。State reset、ID変更、再ensure-visibleで症状を覆う変更は行わない。
+
+2026-10-07追補: touchの比較は描画offset（anchor+端数）ではなくcanonical anchor同士とし、
+anchor変更とglide開始/終了だけを記録する。20pxの端数が静止中に残る場合や、glide中の
+端数だけの進行では記録しない。egui viewport/Stateは一度だけ消費するensure-visible要求時に
+採取し、端数/丸め差分を理由に毎frame出力しない。wheel/gamepad/readbackも実offset変更時のみ。
+初layout前に繰り返され得るqueue予測の追加診断は削除した。logger用の選択位置探索は行わず、
+行矩形はensure-visible ownerが既に計算した表示位置を再利用する。他の診断には選択indexと
+geometryを残す。新しい重複除去stateや待機は不要で、既存ownerの境界だけで発火を決める。
 
 Rating workerは宛先favoriteの表示順を純粋に投影し、既存のnavigation requestに保持する。
 準備中の設定変更は既存のsort再準備経路で検証し、まだ表示中の子には適用しない。

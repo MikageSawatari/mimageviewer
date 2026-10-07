@@ -2237,6 +2237,27 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 ### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — 選択・表示設定の採用順を修正、実機再確認待ち (2026-10-07)
 
+- `6b2c1c9d8`追補 (2026-10-07):
+  - touch診断がcanonical offsetと端数付き描画offsetを比較し、20pxの静止端数でも毎frame
+    loggerへ出力していた。canonical anchor変更/glide境界へ限定し、eguiの端数差による反復診断と
+    layout前の反復queue診断を除いた。wheel/gamepad/readbackも実位置変更だけ。診断専用のO(N)
+    選択探索は削除し、ensure ownerで既に計算した表示位置からだけ行矩形を記録する。
+  - RatingFolderBackの最新runは★3・600件・10列に到達していた。`item_names`の先頭16件上限に対し
+    600名の完全一致待ちをしていたことがtimeout原因。起動load待ちのcoordinator変更を保持し、
+    全件数は`items_len`、対象は世代+container keyで実セルへ解決する。復帰後のkey/name・可視性・
+    実表示行/列数/geometryを検査し、全件順序やraw indexに依存しない。snapshot上限は維持する。
+    fixture/overrideは600行・10列、子6列/2:3のまま。実アプリは起動せず再runへ引き継ぐ。
+    実gridの未focus pointer回帰で、reveal animation途中の座標ACKが別行（310→320）を開く
+    診断経路の問題も確認。test-script targetの可視化だけを既存ScrollAreaで即時に行い、
+    実セルのclick/double-click producerは維持する。通常scrollのanimationは変更しない。
+  - 利用者がdev-runtimeを実機確認中のため、指示どおりbuild-devは実行しない。
+    非対話検証はtest-script 143件・scroll診断2件・1.328回帰35件、計180件成功。
+    全libは10933 passed / 0 failed / 52 ignored（pipeなし、exit 0）。fixture Python 7件、
+    PowerShell AST、fmt、通常/portable core check、glyph（危険文字0件）も成功。
+    `prepare-portable-smoke.ps1 -TestScript`はexit 0、runtime 4 / PE 17の検証も成功。
+    package/isolated smoke treeの準備完了。dev-runtimeのSHA256は作業開始時と一致。
+    実アプリは未起動、修正scenarioの実runはcoordinator待ち。文案は`target/1328-msg-6.txt`。
+
 - 600項目の実機追補 (`983d68272`後、2026-10-07):
   - toolbar ←で開いたfolderが選択される一方、3:4復元後にSwitchなしでも画面が末尾へ
     移るとの再報告。Rating採用が宛先favorite遷移を通らず、子の表示設定が初回描画まで

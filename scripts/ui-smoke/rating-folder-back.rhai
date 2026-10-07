@@ -5,11 +5,11 @@ fn input_ready(s) {
     s.target_registered && s.focused && s.target_viewport == "ROOT"
 }
 
-fn grid_adopted(s, surface, path, names, generation) {
+fn grid_adopted(s, surface, path, count, generation) {
     !s.startup_open_pending && !s.is_fullscreen
         && !s.modal_open && !s.popup_open && !s.text_input_or_pending_focus && !s.ime_active
         && s.grid_surface == surface && s.current_folder_path == path
-        && s.item_names == names && s.items_generation > generation
+        && s.items_len == count && s.items_generation > generation
 }
 
 // Never request foreground focus. Physical input is optional in unattended runs.
@@ -34,20 +34,21 @@ fn pointer(label, kind) {
 
 fn click(label) { pointer(label, "single"); }
 
-fn row_widget(index) {
-    let s = snapshot();
-    "grid-row:" + s.items_generation + ":" + index + ":" + s.item_names[index]
+fn row_widget(index, name) {
+    "grid-row:" + snapshot().items_generation + ":" + index + ":" + name
 }
 
-fn arrive(surface, path, names, generation, label) {
+fn key_widget(key) { "grid-key:" + snapshot().items_generation + ":" + key }
+
+fn arrive(surface, path, count, generation, label) {
     try {
-        wait_until(|s| grid_adopted(s, surface, path, names, generation), 30000);
+        wait_until(|s| grid_adopted(s, surface, path, count, generation), 30000);
         wait_until(|s| s.grid.generation == s.items_generation
             && s.grid.selected_index == s.selected_index, 30000);
     } catch (error) {
         let s = snapshot();
         log("rating-folder-back: adoption timeout " + label + " surface=" + s.grid_surface
-            + " path=" + s.current_folder_path + " names=" + s.item_names.to_debug()
+            + " path=" + s.current_folder_path + " count=" + s.items_len + " prefix=" + s.item_names.to_debug()
             + " generation=" + s.items_generation + " target=" + s.target_registered
             + " focused=" + s.focused);
         throw error;
@@ -56,12 +57,12 @@ fn arrive(surface, path, names, generation, label) {
         + " generation=" + snapshot().items_generation);
 }
 
-fn rating_root(path, names) {
+fn rating_root(path) {
     click("places-menu");
     click("rating-menu");
     let generation = snapshot().items_generation;
     click("rating-three");
-    arrive("Rating { stars: 3 }", path, names, generation, "rating-root");
+    arrive("Rating { stars: 3 }", path, 600, generation, "rating-root");
     tall_aspect_settled("rating-root");
 }
 
@@ -74,42 +75,40 @@ fn tall_aspect_settled(label) {
 
 fn tall_aspect_ready(s) {
     let minimum = 31;
-    if s.item_names.len < minimum { minimum = s.item_names.len; }
+    if s.items_len < minimum { minimum = s.items_len; }
     s.grid.generation == s.items_generation
         && s.grid.aspect_auto && s.grid.aspect_label == "3:4"
         && s.grid.aspect_sample_count >= minimum
 }
 
-// Use the painted geometry, including the clip viewport, rather than assuming window size
-// equals grid size. The fixture targets row30 in a sixty-row list, never the final screen.
-fn mid_list_geometry(s, index) {
-    if s.item_names.len != 600 || s.grid.columns != 10 || s.grid.cell_height <= 0.0 {
+// Use actual counts and painted geometry. item_names is only the first sixteen rows,
+// and raw item index is not necessarily the display position under grouping or sorting.
+fn mid_list_viewport(s) {
+    if s.items_len != 600 || s.grid.columns != 10 || s.grid.cell_height <= 0.0 {
         return false;
     }
-    let row = index / s.grid.columns;
     let visible_rows = s.grid.viewport_height / s.grid.cell_height;
-    let target_center = (row + 0.5) * s.grid.cell_height;
-    row >= 25 && row <= 35 && visible_rows >= 6.0 && visible_rows <= 8.0
-        && s.grid.scroll_offset > 0.0
-        && target_center >= s.grid.scroll_offset
-        && target_center <= s.grid.scroll_offset + s.grid.viewport_height
+    let top_row = s.grid.scroll_offset / s.grid.cell_height;
+    visible_rows >= 6.0 && visible_rows <= 8.0 && top_row >= 20.0 && top_row <= 35.0
         && s.grid.content_height - s.grid.scroll_offset - s.grid.viewport_height
             >= 10.0 * s.grid.cell_height
 }
 
+fn mid_list_geometry(s) {
+    if !mid_list_viewport(s) { return false; }
+    let row = s.grid.row_content_y / s.grid.cell_height;
+    row >= 25.0 && row <= 35.0 && s.grid.visible
+}
+
 fn record(label, screenshot) {
     let s = snapshot();
-    let name = "<none>";
-    if s.selected_index >= 0 && s.selected_index < s.item_names.len {
-        name = s.item_names[s.selected_index];
-    }
     log("rating-folder-back: " + label + " surface=" + s.grid_surface
         + " path=" + s.current_folder_path + " generation=" + s.items_generation
-        + " selected_index=" + s.selected_index + " selected_name=" + name
+        + " selected_index=" + s.selected_index + " selected_name=" + s.grid.selected_name
         + " grid=" + s.grid.to_debug());
     if s.grid.columns > 0 && s.grid.cell_height > 0.0 {
-        log("rating-folder-back: geometry " + label + " items=" + s.item_names.len
-            + " selected_row=" + s.selected_index / s.grid.columns
+        log("rating-folder-back: geometry " + label + " items=" + s.items_len
+            + " selected_row=" + s.grid.row_content_y / s.grid.cell_height
             + " viewport_rows=" + s.grid.viewport_height / s.grid.cell_height
             + " visible_cell_capacity=" + s.grid.viewport_height / s.grid.cell_height * s.grid.columns);
     }
@@ -145,26 +144,30 @@ fn depart(kind, forward) {
     }
 }
 
-fn returned(label, opened_key, opened_name, opened_index, generation, rating_path, rating_names) {
-    arrive("Rating { stars: 3 }", rating_path, rating_names, generation, label);
+fn returned_row_matches(s, opened_key, opened_name) {
+    s.grid.selected_index == s.selected_index && s.grid.selected_key == opened_key
+        && s.grid.selected_name == opened_name && s.grid.visible
+        && mid_list_geometry(s)
+}
+
+fn returned(label, opened_key, opened_name, generation, rating_path) {
+    arrive("Rating { stars: 3 }", rating_path, 600, generation, label);
     tall_aspect_settled(label);
     // Assert the same observation that was logged, rather than a later capture-time state.
     let s = record(label, true);
-    let ok = s.selected_index == opened_index && s.grid.selected_key == opened_key
-        && s.grid.selected_name == opened_name && s.grid.visible
-        && mid_list_geometry(s, opened_index);
+    let ok = returned_row_matches(s, opened_key, opened_name);
     log("rating-folder-back: result=" + ok + " case=" + label
         + " expected_key=" + opened_key + " expected_name=" + opened_name
-        + " expected_index=" + opened_index);
+        + " actual_index=" + s.selected_index);
     ok
 }
 
 fn fourth_page(path, pages, generation, label) {
-    arrive("Folder", path, pages, generation, label);
-    wait_until(|s| s.grid.generation == s.items_generation && s.grid.aspect_auto
+    arrive("Folder", path, pages.len, generation, label);
+    wait_until(|s| s.item_names == pages && s.grid.generation == s.items_generation && s.grid.aspect_auto
         && s.grid.columns == 6 && s.grid.aspect_label == "2:3"
         && s.grid.aspect_sample_count >= pages.len, 30000);
-    click(row_widget(3));
+    click(row_widget(3, "page-04.png"));
     wait_until(|s| s.selected_index == 3 && s.grid.generation == s.items_generation
         && s.grid.selected_index == 3 && s.grid.visible, 30000);
     let s = record(label, false);
@@ -174,28 +177,26 @@ fn fourth_page(path, pages, generation, label) {
     }
 }
 
-fn run_case(target, kind, roundtrip, library, rating_path, rating_names, pages) {
+fn run_case(target, kind, roundtrip, library, rating_path, pages) {
     let label = case_label(target, kind, roundtrip);
     log("rating-folder-back: begin " + label);
-    rating_root(rating_path, rating_names);
-    let index = snapshot().item_names.index_of(target);
-    if index < 0 { throw "fixture row is missing: " + target; }
-    let widget = row_widget(index);
-    pointer(widget, "hover");
-    let opened = record(label + "-before-open", false);
-    log("rating-folder-back: setup target_index=" + index + " target_row=" + index / 10);
-    if !mid_list_geometry(opened, index) {
-        throw "fixture does not exercise a mid-list rating row with ten columns and about seventy visible cells";
-    }
+    rating_root(rating_path);
     let path = library + "\\" + target;
     let key = path;
-    log("rating-folder-back: opening expected_key=" + key + " expected_index=" + index);
+    let widget = key_widget(key);
+    pointer(widget, "hover");
+    let opened = record(label + "-before-open", false);
+    // Hover reveals the exact generation/key without selecting a different row.
+    if !mid_list_viewport(opened) {
+        throw "fixture does not exercise a mid-list rating viewport with ten columns and about seventy visible cells";
+    }
+    log("rating-folder-back: opening expected_key=" + key);
     // First pointer click selects; the second enters the production double-click owner.
     pointer(widget, "double");
     fourth_page(path, pages, opened.items_generation, label + "-fourth-page");
     let generation = snapshot().items_generation;
     depart(kind, false);
-    let ok = returned(label + "-back", key, target, index, generation, rating_path, rating_names);
+    let ok = returned(label + "-back", key, target, generation, rating_path);
     if roundtrip {
         generation = snapshot().items_generation;
         depart(kind, true);
@@ -203,25 +204,19 @@ fn run_case(target, kind, roundtrip, library, rating_path, rating_names, pages) 
         fourth_page(path, pages, generation, label + "-forward-fourth-page");
         generation = snapshot().items_generation;
         depart(kind, false);
-        let second = returned(label + "-second-back", key, target, index, generation, rating_path, rating_names);
+        let second = returned(label + "-second-back", key, target, generation, rating_path);
         ok = ok && second;
     }
     ok
 }
 
 // Scenario entry: helpers above are also exercised by headless contract tests.
-let rating_names = [];
-for n in 1..601 {
-    let number = n.to_string();
-    while number.len < 4 { number = "0" + number; }
-    if n >= 299 && n <= 310 { rating_names.push(number + "-folder"); }
-    else if n >= 311 && n <= 313 { rating_names.push(number + "-book.zip"); }
-    else { rating_names.push(number + "-image.png"); }
-}
 let pages = [];
 for n in 1..9 { pages.push("page-0" + n + ".png"); }
+// Preserve the starting-folder load check: the bounded names prefix and physical-folder
+// display order do not describe the entire list. Rating adoption uses its actual count.
 wait_until(|s| !s.startup_open_pending && !s.is_fullscreen
-    && s.grid_surface == "Folder" && s.item_names == rating_names, 30000);
+    && s.grid_surface == "Folder" && s.items_len > 0, 30000);
 let library = snapshot().current_folder_path;
 if !library.ends_with("\\rating-folder-back\\library") { fail("unexpected fixture root: " + library); }
 let rating_path = library;
@@ -246,7 +241,7 @@ for target in ["0310-folder", "0311-book.zip"] {
             }
             executed += 1;
             try {
-                if !run_case(target, kind, roundtrip, library, rating_path, rating_names, pages) { failures += 1; }
+                if !run_case(target, kind, roundtrip, library, rating_path, pages) { failures += 1; }
             } catch (error) {
                 if error.to_string().contains("SKIPPED no-focus") {
                     skipped += 1;

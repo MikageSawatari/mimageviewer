@@ -47850,18 +47850,6 @@ impl App {
             fractional_drag_y,
         );
         let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
-        if self.items_are_rating_view
-            && !matches!(self.grid_aspect_layout,
-            GridAspectLayout::Thumbnail { context_id, items_generation, .. }
-            if context_id == self.projected_viewer_context_id() && items_generation == self.items_generation)
-        {
-            self.log_rating_grid_scroll(
-                &format!("queue-forecast vis=[{vis_first}..{strict_visible_end}) laid_out=false"),
-                self.scroll_offset_y,
-                self.scroll_offset_y,
-                (cols, self.last_cell_size, cell_h, viewport_h),
-            );
-        }
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
@@ -52627,18 +52615,18 @@ impl App {
                     scroll_delta_y,
                     cell_h,
                 );
-                self.log_rating_grid_scroll(
-                    &format!("wheel delta={scroll_delta_y:.1}"),
-                    prev_offset,
-                    self.scroll_offset_y,
-                    (
-                        self.last_grid_cols,
-                        self.last_cell_size,
-                        cell_h,
-                        self.last_viewport_h,
-                    ),
-                );
                 if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+                    self.log_rating_grid_scroll(
+                        &format!("wheel delta={scroll_delta_y:.1}"),
+                        prev_offset,
+                        self.scroll_offset_y,
+                        (
+                            self.last_grid_cols,
+                            self.last_cell_size,
+                            cell_h,
+                            self.last_viewport_h,
+                        ),
+                    );
                     self.bump_input_seq(
                         "grid_wheel",
                         Some(&format!("offset={:.0}", self.scroll_offset_y)),
@@ -52671,12 +52659,23 @@ impl App {
         if !self.items_are_rating_view {
             return;
         }
+        self.log_rating_grid_scroll_at_position(source, before, after, geometry, None);
+    }
+
+    /// Only an owner that already computed the display position supplies it. Never scan rows
+    /// merely for diagnostics, including canonical writes during wheel/touch movement.
+    fn log_rating_grid_scroll_at_position(
+        &self,
+        source: &str,
+        before: f32,
+        after: f32,
+        geometry: (usize, f32, f32, f32),
+        position: Option<usize>,
+    ) {
+        if !self.items_are_rating_view {
+            return;
+        }
         let (cols, cell_w, cell_h, viewport_h) = geometry;
-        let position = self.selected.and_then(|selected| {
-            self.current_grid_order()
-                .iter()
-                .position(|index| *index == selected)
-        });
         let row_rect = position.map(|position| {
             egui::Rect::from_min_size(
                 egui::pos2(
@@ -52721,11 +52720,12 @@ impl App {
         if let Some(rows_above) = self.scroll_selected_to_rows_above.take() {
             let top_row = row.saturating_sub(rows_above as usize);
             self.scroll_offset_y = top_row as f32 * cell_h;
-            self.log_rating_grid_scroll(
+            self.log_rating_grid_scroll_at_position(
                 "startup-row-anchor",
                 before,
                 self.scroll_offset_y,
                 (cols, self.last_cell_size, cell_h, self.last_viewport_h),
+                Some(vis_pos),
             );
             return;
         }
@@ -52741,11 +52741,12 @@ impl App {
             // 行境界にスナップ
             self.scroll_offset_y = (self.scroll_offset_y / cell_h).ceil() * cell_h;
         }
-        self.log_rating_grid_scroll(
+        self.log_rating_grid_scroll_at_position(
             "ensure-visible",
             before,
             self.scroll_offset_y,
             (cols, self.last_cell_size, cell_h, self.last_viewport_h),
+            Some(vis_pos),
         );
     }
 

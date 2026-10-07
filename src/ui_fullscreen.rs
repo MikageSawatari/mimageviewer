@@ -28411,12 +28411,7 @@ impl App {
             selected_index: self
                 .selected
                 .map_or(-1, |index| i64::try_from(index).unwrap_or(i64::MAX)),
-            item_names: self
-                .items
-                .iter()
-                .take(crate::test_script::MAX_ITEM_ROWS_IN_SNAPSHOT)
-                .map(|item| item.name().into_owned())
-                .collect(),
+            item_names: crate::test_script::item_names_for_snapshot(&self.items),
             item_ratings: (0..self
                 .items
                 .len()
