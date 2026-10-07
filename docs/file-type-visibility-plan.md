@@ -371,6 +371,15 @@ toolbar ←で★3へ → toolbar →でZIPページ一覧**が空になる。
    trailing separator付きfolderにも同型。比較だけ直してもRating再入場は残る。
 5. `FolderNavHistoryTarget`は現在地/親provenanceを持つがfacetの退避routeを持たない。
    paint/rebuildでの推定とopen intent側の明示操作に責任が分散している。
+6. 実装前提照合（2026-10-08）で、**通常folder履歴には成功採用transactionが未整備**と分かった。
+   `dispatch_main_folder_history_input`の通常Path branch（`app.rs:22969`）は
+   `navigate_folder_history_back/forward`で先にstackをpop/pushし、`target.into_path()`を返す。
+   `ClassifiedOpenContinuation::DirectNavigation`（`app.rs:890`）に残るのはPathとrollback snapshotで、
+   typedなreplay宛先、source location/items generation/slot-switch sequenceではない。
+   classificationのpollもrequest/context/cancelの検証であり、physical履歴のsource/history検証とは異なる。
+   「全入口で既存transactionをそのまま再利用できる」という旧§9.2の前提を撤回する。
+   以下はcoordinator指示による設計改訂であり、通常folder側の要求移行も§1.339の実装範囲とする。
+   改訂前のbf509352dへのレビュー承認を、この追加構造の承認とは扱わない。
 
 不変条件: **採用済み表示scopeに対応するfacetを、初回visible_indices計算より前に確定する**。
 親の条件はその子scope内では退避し、親へ戻れば復元する。
@@ -380,7 +389,25 @@ reload、fullscreen→同じ本のページ一覧、ZIP内部の同scope移動�
 
 ### 9.2 単一の状態ownerと要求
 
-提案: 現行`facet_filter_scope`と`facet_filter_suppression_stack`の責任を
+#### 9.2.1 状態を減らす案の比較と選択
+
+transactionを足す前に、CLAUDE.md「設計の簡素化」に従い次を比較した。
+
+| 案 | 判断と理由 |
+| --- | --- |
+| stashを宛先path/identityだけで引き、採用時だけ解決する | **採用時解決は採用、pathだけのmapは不採用**。同じZIPを★3、通常folder、Collectionの別entryから開く場合は帰路が違う。path単独ではどの親条件を戻すか決まらず、親条件編集後の再入場にも古い値を使ってしまう。場所ごとのfilter記憶はD14にも反する。originを含むtyped routeで帰路を区別し、filter値はlive ownerの退避frameだけが持つ |
+| stackのpop/pushを成功したloadの後へ移す | **採用**。pending中はcommitted stackを変更しないので、通常履歴の「stack変更済み＋旧表示＋rollback待ち」をなくせる。単一採用点でfacet、items、履歴を確定し、失敗時は要求をdropするだけにする |
+| 通常folder履歴だけ新しいtransaction manager/全bundle複製を作る | **不採用**。Folder scanを扱える既存`PhysicalHistoryTransition`/preflightを拡張する。分類・scan・PDF列挙・変換の既存ownerへ一つのtyped要求をmoveし、新しいApp pendingや表示rollback用bundleを増やさない |
+| 通常のscanまでモーダルにして履歴連打・別openを止める | **不採用**。通常閲覧を遅くし操作を削る。変換/passwordの既存モーダルは維持し、通常pendingは既存の取消・置換で扱う。連打の仮cursorは既存Smart履歴の方式を同じ要求内へ統合する（§9.3.2） |
+| filterを毎回clear、forward禁止、stash全消去、全地点snapshot永続化 | **不採用**。公開済み機能を削るか、親編集と過去値の組合せを増やす |
+
+選択は**typedな宛先/帰路を一つの既存読込要求に保持し、stack更新を成功後へ遅らせる**こと。
+stashのための別transactionは作らない。要求中に保存するのは場所・帰路・履歴操作・所有証明で、
+active filterやstashのrollback copyは持たない。読込失敗へのretry/回復phaseも追加しない。
+
+#### 9.2.2 採用済みfacetのownerと履歴entry
+
+現行`facet_filter_scope`と`facet_filter_suppression_stack`の責任を
 **App-globalのmain grid専用**`FacetNavigationState`へ集約する。
 scope/stackは現行でもApp全体が所有し、ViewerContextBundleに含まれない。
 A/Bにもslot別facet stashはない。以前の「既存context runtime内に閉じる」前提は撤回する。
@@ -400,8 +427,16 @@ cache ZIPへのalias変更を別scope entryと扱わず、元書庫identityを�
 本内階層のcontainsはzip prefixのcomponent境界で扱い、filesystem pathとの文字列混合をやめる。
 
 `FacetRoute`（提案）は**親→子のscope連鎖だけ**を保持し、設定値のhistory snapshotを持たない。
-既存history entry/restore/requestの同じownerにrouteを組み込む。
+履歴vectorのentryを`FolderNavHistoryEntry { location: FolderNavHistoryTarget, route: FacetRoute }`
+という一つの値にする（型名は提案）。normal/A/Bのback/forward、history snapshot、
+Smartの仮cursor、要求のsource/targetは同じentryを受け渡す。`FolderNavHistoryTarget`の
+既存typedな場所表現は保持し、route用の別mapを作らない。
 targetの場所identityとrouteの帰路を分離し、同じpathでもRatingPhysical/通常Pathのprovenanceを失わない。
+同一地点reload/dedupの判定は既存location比較を維持し、採用した新しいentryで帰路を更新する。
+source/history headの所有検証ではroute込みのentryを比較する。履歴の読み出しでlocationを表示用に
+投影することはできるが、読込要求へ渡すときにentryを`PathBuf`へ潰してはならない。
+検索等のreturn originも既存restore payloadにrouteを添えて保持し、退出要求へmoveする。
+routeはruntime情報で、SettingsのA/B保存path、MRU、起動復元target、DB keyの形式は変更しない。
 通常openで成功した親→子edgeを記録し、履歴再入場はそのedgeを再利用する。
 単に「宛先拡張子がzipならfilterを消す」boolをhistoryへ足す案は採らない。
 
@@ -412,6 +447,21 @@ history entryがrouteを持つので、戻るとstashがpopされても進む先
 親のzip条件を戻って編集した後の再入場は、古いsnapshotでなく**その時点の親条件**を退避する。
 子で手動編集したfilterは親stashを書き換えない。親へ出たら従来の親復元を維持する。
 独立した場所への移動は既存の条件復元/解除仕様を保ち、すべての場所別filter記憶へ広げない。
+具体的には、退出するedgeのsaved frameを内側から復元して消費し、独立先へは復元後のactive条件を
+引き継ぐ。本/子へ新たに入るedgeだけがそのlive条件を退避する。退出した子での条件は親stashを
+上書きせず、親saved frameを復元する場合に置き換えられる。親条件が無効でframeを作らなかった
+場合や、手動復元でframeを消費済みの場合は、復元対象がないのでactive条件を無条件clearしない。
+この場合の子で編集した条件の引継ぎも現行互換とする。
+場所変更ではactive/frame内の`place_keys`を従来どおり除去する。
+同じrouteのreload、ソート、通知、cache alias変更は退避・復元ともno-op。
+saved frameはentered scope/route内のedgeに対応付ける。有効な保存条件がないedgeもrouteには残すので、
+frameの有無で現在地を推定しない。消費済みframeを再入場まで作り直さない。
+
+「親絞り込み退避中」バッジのクリックによる手動復元（`ui_main.rs:12180`）も維持する。
+同じownerが直近saved frameを一回だけ消費しactive値/name runtimeを更新する。
+現在routeや履歴cursorは変えず、その場所での再描画が再退避を起こさないようにする。
+親へ退出するときは残存frameだけを復元する。filter UI編集/name入力もownerを通すが、
+検索入力debounce、IME helper、Settings保存時期、手動復元の保存は現行互換を維持する。
 
 route組立は、要求時のsource typed locationと、成功したdestination分類/ownerから行う。
 合成親は既存RatingPhysical.nav_chain、Collection entry、Smart.position、search originから得る。
@@ -421,18 +471,6 @@ ZIP/PDF/EPUB/変換書庫は**成功した読込payload**で本entryと分類す
 アドレス直接openやhistory Pathとしての本openにも同じdestination分類を使い、
 sourceが存在する場合に親filterを退避する。検索の一時surface/退出は既存origin routeを使う。
 
-採用時の順序:
-
-1. main gridのnavigation採用であることを既存navigation scope/ownerで確定する。
-   detached/parkedの一時mountやread-only context交換は対象外とする。
-   既存ownerがsource location / items generation / slot / request / history headの妥当性と
-   読込payloadの採用可能性を検証する。失敗があり得る作業を先に済ませる。
-2. 既存の可視採用transactionでsource grid位置を保存し、facet reducerを適用する。
-   `place_keys`は現在の場所依存条件として既存どおり除去、name-query runtimeも値と同期する。
-3. 新locationとitems/metadataをinstallし、確定済みfacetでvisible/order/selectionを計算する。
-4. 同じtransactionでhistory/current/BS provenanceをcommitする。
-   reducerの実行後に採用拒否となる配置は許さず、rollback専用状態を足さない。
-
 `sync_facet_filter_scope`のframe中path推定は撤去し、scope一致の検証か純粋なprojectionだけにする。
 現行open helper群は共通採用要求へのadapterに縮め、退避pop/pushを個別に行わない。
 ZIP階層の`maybe_restore_facet_filter_after_zip_level_change`も同reducerへ接続する。
@@ -441,26 +479,194 @@ filter UI編集もowner経由でruntime同期する。settings保存時期は現
 
 ### 9.3 横断する入口・終了と簡素化
 
-| 経路 | 保証 |
-| --- | --- |
-| 通常folder/drive root → child、本tile → ZIP/PDF/EPUB/RAR/cache ZIP | 初回openと再入場が同じrouteを採用。direct/warm/coldの違いでscopeが先行しない |
-| Rating/Collection/Smart/Tag/Search/History/Bookmarks/Sub展開から本open | typed origin/親chainでentryを確定。物理path親子関係を要求しない |
-| toolbar/キー/マウスの←→、BS、アドレス、A/B | mainの既存routerを保ち、成功した採用を同じmain ownerへ送る。A/Bは採用されたmain場所のrouteとして扱い、slot別stashやfilter値コピーは新設しない |
-| 本内ZIP階層/入れ子/単一wrapper collapse、fullscreen→ページ一覧 | prefix scopeを使い、同じscopeでは何もしない。退出したbook分だけ復元 |
-| reload/notify/ソート/同場所再install | route不変なので二重stashを作らない |
-| conversion/password/sidecar待ち、cancel/error/superseded、close | 未採用要求のdiscardだけ。既存モーダル/取消ownerを維持。成功までactive値とstashに触れない |
-| F12/複数viewer | facetはmain専用App-globalのまま。fork/mount/swap/closeはscope/stack/Settings.facet_filterを変更せず、detachedのglobal filter除外を維持。bundleへfacetを追加しない |
+#### 9.3.1 通常folderのtyped要求への移行
 
-簡素化の検討: 履歴の→を禁止する、facetを常時解除する、ZIPを開くたび全stashをclearする案は
-既存機能を削るため不採用。全場所のfilter snapshot永続化も要求外で、親編集との古い値競合を増やすので不採用。
-既存のモーダルを維持して変換中の割込みを増やさず、既存採用transactionと親chainを再利用する。
-新ownerは既存runtime fieldsを置換するもので、追加の並行状態ではない。
-§1.345とは設定・owner・受入テストを分離し、1.339単独の差分として先に実装できる。
+共通の値`MainListNavigation`（提案名）は、source entry/context/surface・items generation、
+発行時のactive slotとslot-switch sequence、宛先entryまたは未分類のtyped location候補、
+履歴操作、selection/restore intentを保持する。履歴操作は`Direct / Replay / Restore / SameLocation`の
+排他enumにする。Directは成功時にsourceをbackへ積んでforwardを消す、Replayは指定方向の
+仮cursor操作を確定、Restoreは本内/検索等の外側履歴に記録しない移動・復元でcursor不変、SameLocationは
+reload/ページ一覧復帰でcursor/route不変とする。BSをReplayと混同しない。
+
+この値は**要求を受け付ける時点、分類workerを開始する前**にcaptureする。
+現行のclassification後に初めてsourceをcaptureする配置を残さない。
+既存request ID/cancel/worker receiverは各読込phaseが保持し、navigationの所有証明と
+宛先entryは同じ値をmoveして引き継ぐ。phaseと別のApp `pending_facet_*`は設けない。
+
+| 現行入口/実行先 | 移行後の受渡し |
+| --- | --- |
+| `dispatch_main_folder_history_input`の通常Path branch | headをpeekしてReplay要求を作る。`navigate_folder_history_back/forward`を先に実行せず、`Option<PathBuf>`で宛先を返す経路を廃止。toolbar、KeyAction、mouse、ring/gamepadで同じtyped要求をdispatchする |
+| 通常folderのBS/親ボタン、`resolve_grid_parent_nav`、`resolve_return_to_parent_nav` | 現行の親優先順位と選択anchorを保持し、Direct要求として渡す。親を求めた時点の`select_after_load`等の副作用は要求のselection intentへ移し、採用時だけ適用。root→DriveListもtypedな成功採用へ接続する |
+| 通常folder履歴/親の実folder読込 | `PhysicalHistoryIntent::Navigation`をDirect/Replay/Restore/SameLocationのtyped要求へ置換・拡張する。既存`PhysicalHistoryTransition`と`PhysicalHistoryPreflightPayload::Folder(ScannedDir)`を再利用し、workerでscanする。prescan/分類で得たscanは同じ要求へmoveし、二重scanしない |
+| `OpenPathClassification` / `ClassifiedOpenContinuation::DirectNavigation`・`Physical` | 共通navigation値をmoveで保持し、分類完了で同じ値をPhysical要求へ移す。request/context/cancelに加えてcapture済みsource/slot/履歴proofを再検証。通常履歴用`history_nav_rollback`は置換する |
+| Direct/warm/cold PDF、EPUB/書庫変換 | warmの初回placeholder採用を待たせず維持する。`DirectPdfAdoption`等の既存adoption payloadに同じnavigation値をmoveする。coldは成功列挙まで未採用、warmは初回採用で消費して後のverificationはSameLocation。変換/passwordの既存continuationはrequest IDを参照し、navigationを二重所有しない |
+| Rating/Collection/Smartの既存要求 | 既存typedな場所/準備phase/親chainを維持し、source/history情報を共通navigation値へ集約して同じ採用APIを呼ぶ。別のpending ownerを併設しない |
+| 本内ZIP prefix、検索のdrill/戻り、resident Smart root復帰 | worker不要なら準備済みitems/metadataとtyped routeを同じ採用APIへ直接渡す。ZIP内部だけの移動は外側folder履歴を変更せず、成功したprefix/本edgeだけをfacet reducerへ送る |
+
+既存synchronous通常openもscan等が成功した後のinstall tailをこのAPIへ接続できる。
+本件は全folder scanner、全decoder、全fullscreen loadを新executorへ置き換える作業ではない。
+新たに履歴/親要求を非同期化する部分のI/Oは上記workerへ置き、UI採用はメモリ上の結果を使う。
+
+#### 9.3.2 履歴cursorとrollback snapshotを一つにする
+
+履歴のcommitted vectorは既存のnormal/A/B ownerに残す。要求が持つ履歴proofは
+**発行元workspaceの未変更cursorのread-only baseline**であり、復元命令ではない。
+まず既存snapshotのactive workspace部分を再利用し、別history revision/rollback fieldを足さない。
+source items/surface、slot-switch sequence、baselineとhead/entryを採用直前に検証する。
+collection削除prune等がbaselineを変えたら要求をdiscardし、古いbaselineを書き戻さない。
+
+連打で複数地点を選べた既存操作を失わないため、`SmartHistoryPeek`のoriginal/virtual cursorを
+**一つのnavigation要求の履歴plan**へ統合する。連続Replayだけが同じcommitted baselineから
+仮cursorを進め、前のworkerを取消して最新targetのworkerへplanをmoveする。
+仮cursor/target routeにfilter値を保存しない。Smart→通常Pathで現行の`next.commit(self)`＋
+rollbackに戻す経路（`smart_folder.rs:2971`）も、planを新しい読込phaseへmoveして未採用のまま渡す。
+仮cursorがsourceへ戻ればworker/planをdropするだけで、facet・committed stackを動かさない。
+通常open/親/slot切替という別intentが勝つ場合は古いplanを捨て、**表示中のcommitted source**を
+新要求のsourceとする。未表示の中間targetをDirectの移動元にしない。
+toolbarの連打可否/target表示はこのplanからread-onlyに投影できるが、採用検証はcommitted baselineを使う。
+仮cursor自体は現行Smart履歴にも存在するため、二つのpeek ownerを併置しない。
+単発Replayはcommitted headとtarget entryの一致を検証する。複数Replayの最終targetは
+committed headそのものではないため、未変更baselineからplanをpureに再適用した仮cursor/targetとの
+一致を検証する。共通採用後に旧helperで再び`head == final_target`を検査・popしてはならない。
+成功時はplanの最終back/forwardを一回だけ確定する。途中targetの読込成功やfilter退避は不要で、
+履歴entryの並びは既存peekのpop/push/dedup/MAX規則を使って算出する。
+
+現行`FolderNavHistorySnapshot`全体を一括廃止するのではない。履歴要求については
+`history_nav_rollback`、`ArchiveConvertState::nav_history_rollback`、
+`EpubOpenRestore.history`の**同じ要求に対応するstack rollback**を共通値に置換する。
+archive/EPUB dialogには共通要求へのcontinuationだけを残し、abort時のstack restoreをなくす。
+検索自身のnav stack、address_before、retained PDF verifier、既存の非履歴restore用途はそのownerに残せる。
+一つの要求が共通navigation値と旧history rollback snapshotの両方を保持する移行状態は認めない。
+legacy snapshot restoreが残る用途も、facet ownerを復元せず、catalog prune契約を維持する。
+
+`suppress_record_once`は、移行済み要求の履歴責務をinstall側の自動記録へ重複させるために使わない。
+Direct/Replay等のenumが記録可否を決め、共通採用が一回だけ履歴を書く。
+既存非移行callerの互換one-shotを残す場合はadapterで消費し、common採用の後へ漏らさない。
+
+#### 9.3.3 単一の成功採用点
+
+`adopt_main_list_navigation(navigation, prepared_install)`（提案名）を**新たに整備する**。
+既存の`commit_physical_history_transition`、folder scan install、warm/cold PDF adoption、
+typed surface/root install、ZIP prefix installはここへのadapterになる。
+各load ownerの妥当性検証と既存のread-only context交換を混同しない。
+
+1. mainのnavigation要求であること、request/context、source entry/surface/items、slot/sequence、
+   baseline/headを検証。scope、Snapshot制限、catalog/revision、sidecar gate、EPUB lease等の
+   採用拒否を先に解決する。scan/列挙/row構築、ZIP collapse後prefixとlogical aliasの解決も先に済ませる。
+   `prepared_install`はsuccess payloadを持ち、ここで失敗なら要求をdropしてsourceを保つ。
+2. sourceの選択/スクロールを既存保存経路へ渡す。成功payloadで確定した宛先entry/routeを使い、
+   facet reducerを一回適用する。退出したsaved frameを復元・消費し、Directなら成功した親子edgeを
+   作り、Replayなら保存routeを採用してlive親条件を新たに退避する。不要になった子frame/条件だけを
+   捨てる。`place_keys`除去とname runtime同期を済ませる。
+3. location/surface/BS provenance、items/metadataをinstallし、確定したfacetで最初のvisible/order/
+   selectionを計算。要求にある親selection anchor、§1.328の位置復元、StartupListIntentを従来の順で適用する。
+4. 同じUI-thread呼出し内で、Directの記録、Replayの仮cursor確定、Restore/SameLocationの無変更を
+   実行して要求を消費する。MRU/active workspace targetの更新も既存のintent別規則で一回だけ行う。
+
+これはDB transactionや全bundleのcopyではなく、**拒否可能なprepareと拒否不能なinstall tailを分けるAPI**。
+step 2後に`false`/early returnで採用を拒む関数を呼んではならない。現行の
+`adopt_collection_surface_for_physical_load`や`start_loading_items_inner`等にあるscope/sidecar/leaseの
+拒否はstep 1へ寄せ、成功を返す前に確定する。現在は「loader呼出しがLoaded」だけでhistoryを進める
+箇所もあるので、pending admissionとvisible adoptionを区別し、Loadedを採用済みの代用にしない。
+表示を確定した後のthumbnail/metadata worker失敗は既存のitem-level errorとして扱い、履歴を巻き戻さない。
+warm PDFの後続verificationは既存契約を維持し、再びfacet/historyをcommitしない。
+
+#### 9.3.4 producer / consumer棚卸し（2026-10-08、製品codeのみ）
+
+下表は入口名とowner境界の一覧。tests内の直接field操作は製品producerとして数えない。
+実装時はfield/helper参照を再検索し、表の各群を共通要求/採用に接続したことを確認する。
+
+| 履歴stackのproducer / consumer | 現行接続と改訂時の扱い |
+| --- | --- |
+| 作成・workspace選択・Settings投影 | `App`初期化、`QuickFolderWorkspace`、`active_quick_folder_workspace[_mut]`、`sync_quick_folder_settings`。normal/A/B vector owner、Settings保存path/MRUは維持。entry値だけroute付きにする |
+| 直接移動の記録 | `push_active_folder_nav_back_stack`、`clear_active_folder_nav_forward_stack`、`push_folder_nav_stack`、`record_folder_nav_transition[_with_rating/_from_current/_from_restore]`、`push_nav_history_entry`。共通Direct採用の内部primitive/adapterに限定。same-place dedupとMAX_FOLDER_NAV_STACKを維持 |
+| typed source記録 | `record_collection_nav_transition`、`record_collection_physical_nav_transition`（`collection_grid.rs`のroot/physical source commit）、`commit_rating_physical_load_owner`、`record_smart_folder_scope_transition`。sourceをsurface交換前にcaptureし、historyとfacetを一回の採用へ送る |
+| synthetic entry | `enter_drive_list_from_navigation`、`enter_reading_history_from_menu`、`open_bookmark_browser`、Rating entry/restore、Collection open/parent、Smart install/root復帰。合成pathをFS親子判定せずtypedなprepared surfaceを採用。Collectionの既存loading shell採用時点は変更しない |
+| targetの読出し/実行 | `folder_nav_current_target`、`folder_history_back_target/forward_target`、`dispatch_main_folder_history_input`、`dispatch_synthetic_folder_history_target[_with_rollback]`、`navigate_folder_history_back/forward`、`commit_staged_history_replay_after_adoption`。読出しはentry保持、先行popを廃止し成功時の一回のcursor commitへ統合 |
+| 入力と親選択 | `ui_main.rs`のtoolbar/history menu/parent/cell、`handle_keyboard`と`update_frame`の入力merge、KeyAction GridHistoryBack/Forward、mouse/ring、`gamepad_input.rs::apply_folder_history_nav/handle_gamepad_grid_back`、`grid_parent_nav_target/resolve_grid_parent_nav/resolve_return_to_parent_nav/take_pending_return_to_parent_nav`。既存優先順位・keymapを維持しtyped intentだけを発行 |
+| async requestのproof/commit | `PhysicalHistoryTransition`のstart/poll/source検証、`RatingNavigationTransition`のstart/poll/commit、`CollectionHistoryTransition`のstart/poll/source検証、`SmartHistoryPeek`のcapture/advance/is_current/commitと`advance_staged_smart_history`。既存phaseを維持し、共通navigation値がproof/planを単独所有 |
+| classification/direct load・rollback | `open_direct_navigation_target[_classified]`、`poll_open_path_classification`、`load_folder_with_scan_*`、`adopt_collection_surface_for_physical_load`、PDF adoption、`folder_nav_history_snapshot/restore_folder_nav_history`、archive rollback attach/clearとdialog cancel/error、`EpubOpenRestore`。通常履歴のrollbackをread-only baselineへ置換。別要求が勝った後にsnapshotを書き戻さない |
+| 検索等の透明origin・直接jump | `global_search_ui`のdrill/exit、favsearch/tagのnav open/restore、`context_menu::dismiss_source_for_jump_to_folder`、keyboard/context/grid openのsearch rollback、`collection_navigation::commit_collection_grid_source_open`。origin routeを既存return ownerからmove。jumpの先行`push_nav_history_entry`は成功Direct採用へ移す。自動再生/page continuationは従来どおり履歴を増やさない |
+| 削除prune・read-only context | `collections::prune_collection_folder_history_from_ready_catalog`（normal/A/B、restore後にも適用）、viewer bundle fork/mount/swap/park/close、detachedのmain-history除外。prune後の旧要求を失効させる。context交換はglobal vector/facet ownerを変更しない |
+
+| facet stashのproducer / consumer | 現行接続と改訂時の扱い |
+| --- | --- |
+| state作成 | `App`のscope/stack初期化、`FacetFilterSuppression`。一つの`FacetNavigationState`へ置換、ViewerContextBundleには入れない |
+| rebuildの推定/場所条件除去 | `rebuild_visible_indices_impl`→`sync_facet_filter_scope`→`update_facet_filter_suppression_for_scope_change`、`clear_place_facet_for_scope_change`、`restore_facet_filter_suppression_for_path`。mutationを共通採用へ移す。rebuild/read-only再投影でscopeを推定してstashを動かさない |
+| container/grid open | `suppress_current_facet_filter_at`、`maybe_suppress_facet_filter_for_opened_container[_path]`、`maybe_suppress_facet_filter_for_opened_zip_book`、`commit_grid_virtual_open_effects`、`commit_main_grid_archive_transition`、`resolve_main_folder_open_ready`、keyboard/ui_main/gamepadの各open。helperは要求adapterへ縮小、成功payload採用前にはfilterを変更しない |
+| ZIP階層 | `zip_nav_show_current_level`、`maybe_restore_facet_filter_after_zip_level_change`。typed source archive＋実効prefixで同じreducerを使い、DB normalized keyのprefix推定をやめる |
+| Smart root/child | `adopt_smart_child_session`と`install_prepared_smart_folder`のstash anchor書換え、`adopt_smart_child_ready`の退避、resident root復帰。anchorの後付けretargetを撤去し、成功したSmart ID/positionのrouteを採用 |
+| Ctrl+G drill/return | `drill_into_container`、`drill_into_subfolder`、`drill_back_to_top`の全pop、`drill_back_one_level`のpath復元。検索origin/rootを含むrouteの成功採用へ接続し、main履歴は透明のまま |
+| UI表示・手動復元・編集 | `facet_filter_suppressed`、`restore_facet_filter_suppression`、ui_mainの退避badge/各facet chip/menu/reset、`facet_name_filter.rs`のclear/edit/runtime同期。ownerの読出し/明示編集APIへ統合し、手動復元とIME動作を維持 |
+| context再投影 | `rebuild_visible_indices_preserving_facet_scope`、`viewer_context_registry::swap_viewer_context_bundle`等。active Settings値・scope・frameを読み取り専用とし、同一main contextのnavigation成功だけがreducerを呼ぶ |
+
+`rating_filter_suppressed_at`等の独立したrating filterは別機能のownerとして維持する。
+facet修正のためにratingの意味や永続値を変更せず、同じ採用adapter内で既存効果の順序を保つ。
+
+#### 9.3.5 open / switch / cancel / error / closeの契約
+
+| lifecycle | history / facetへの効果 |
+| --- | --- |
+| open受理・分類・scan・列挙pending | source proofとtyped targetを一つの要求へcapture。旧items/current/active facet/stash/committed stackを維持。address/loading表示は要求からのpreviewで、採用した現在地と混同しない |
+| 成功 | §9.3.3を一回実行。同じZIPへの初回・history再入場・BS、Direct/CachedZip、warm/coldで結果が一致する |
+| 別open/連続Replay・A/B切替 | 通常pendingは取消・置換できる。Replay連打は同じplanをmove、別intentは表示中sourceから作り直す。slot切替の成功時だけtarget slot/routeを採用。切替前の遅延replyはslot/sequenceで棄却。slot別stashは作らない |
+| conversion/password/sidecar | 既存モーダルの操作受付規則を維持。変換/password待ちは同じ要求phase。sidecarが可視採用を所有する間は要求を採用しない。facetや履歴の変更を先行させず、既存deferred採用境界へ引き継ぐ |
+| cancel・scan/列挙エラー・worker disconnect・refusal・stale | 要求とそのworker/cancel/leaseだけを退役し、旧表示・facet・committed cursorを保つ。既存toast等の通知を使い、履歴snapshotの書戻し、retry、delayによる救済をしない |
+| reload・通知・ソート・fullscreenから同じ本のページ一覧 | SameLocationとしてroute/cursor不変、二重stashなし。表示位置や本内部prefixの既存復帰を維持 |
+| Main context退役・park・detached fork/mount/swap/close | 要求がsource contextと共に移る場合もmain採用資格を満たす時だけcommit。一時mount/read-only swapは採用ではない。sourceが退役した要求はdropし、sibling/global ownerのrollbackをしない。既存detached predicate/viewportは変更しない |
+| Collection削除prune | authoritative Ready catalogで既存どおりentryをprune。旧baselineの要求は失効。表示中childのPathへの既存投影を保ち、消えたCollectionへ復帰・再記録しない。次の実navigationでfacet frameを通常の退出規則で消費する |
+
+§1.345のファイル種類設定・保存形式とは独立して実装する。新しいhistory/filter DB、paint内I/O、
+UI threadのscanや待機、detached所有範囲の変更は含めない。
 
 ### 9.4 履歴再入場の設計既定（D14、旧Q14）
 
 通常openと同じくlive親条件を退避し、子は条件なしから開始することを決定した既定とする。
 子/履歴地点別の過去filter記憶は追加しない。利用者がその追加を要望した場合にだけ再相談する。
+
+### 9.5 実装規模・残せる部分・公開済み動作の回帰検証
+
+通常履歴移行は小さな退避helper修正ではない。見積りは**L、実装3〜5開発日＋検証/レビュー修正1〜2日**。
+製品差分約1,000〜2,000行、tests約600〜1,200行、主な変更は`app.rs`、新facet reducer module、
+history/typed restore、Smart、PDF/変換continuation、ui_main/global_search/gamepadのadapter。
+既存field/helper参照が広いための概算で、実測ではない。個別symptom patchを先に公開せず、
+次の順で一つの§1.339 chunkを完成させる。
+
+1. 報告された本番handler経路をredにし、pure route/reducer、route付きentryを整備する。
+2. 通常履歴/親要求とrollback移行、既存typed ownerへのmove、拒否可能prepare/採用tailを整備する。
+3. すべてのstash producer/consumerと入力adapterを接続し、横断回帰と指定gateを通す。
+
+残せる部分: workerのscan/列挙アルゴリズム、cache/lease service、thumbnail/decoder/GPU経路、
+ZIP treeの構築、Collection actor/prepare、Smart resident payload、PDF warm placeholder/verification、
+変換/password modal、keymap/IME helpers、Settings/DB key/転送/起動復元の保存形式、
+§1.328の位置保存/復元primitive、normal/A/Bの履歴vector owner、detached bundle交換/viewport。
+これらの採用adapterやhistory entryの型が変わることはあるが、機能自体を再設計しない。
+
+公開済み動作へのリスクと必須回帰:
+
+- **cursor記録時期/連打**: 通常folder←/→、toolbar、Alt+左右、mouse、ring/gamepadが同じhandlerに着地する。
+  prescan/workerの双方で成功後だけcursor変更、同place dedup/MAX上限/forward消去、BSはDirect、
+  ZIP内部BSは外側cursor不変を検証。待ち中の←←/←→、Smart→通常folderへの連打handoffを
+  controlled channelで試し、古いreply・旧snapshotが最新plan/表示を巻き戻さないことを検査する。
+- **退避の帰路**: 報告の★3→ZIP→BS→←→→と、同じZIPを別parent/provenanceから開く対照をhandlerで検証。
+  再入場はlive親条件、子編集は親へ漏れず、stash depthが増えない。drive/UNC/trailing separator/
+  cross-drive、ZIP prefix/nested/collapse、PDF/EPUB/変換cache aliasをpure reducer＋採用handlerで検査する。
+- **手動UI/入力**: badge手動復元後のrebuild/親復帰、parent条件編集、name-query runtime、place_keys、
+  facet resetを検証。既存IME/KeyActionを変更しない。表示を変えた場合はheadless ui_snapshotを更新する。
+- **採用の成否/位置**: scan/error/cancel/stale/snapshot拒否/sidecar gate/EPUB lease拒否の直前・直後を
+  handler/lifecycle testで検証。未採用時はsettings active値・frame・history・visible source不変。
+  warm PDFの初回表示を遅らせず、cold/変換/passwordは同じ要求で継続し、後続verificationで二重commitしない。
+  §1.328の選択/scroll、起動一覧復元、rating sort、search close/jump/drillの既存回帰を併用する。
+- **workspace/context/削除**: normal/A/B別履歴、A→B→A後の古いreply、Ready catalog prune、
+  detached/parked fork/mount/swap/close時のglobal facet/history不変を検証。slot別facet stashのtestは作らない。
+
+実装時のgateはfocused（有効なred→green）、`cargo fmt`、`cargo test -p mimageviewer --lib`、
+normal/portable core check、glyph lint、UIを変更した場合のui_snapshot、`scripts/build-dev.ps1`。
+製品起動はしない。design-only改訂ではRust gate/buildは不要。
+利用者から見た仕様変更は§1.339の誤適用解消と、失敗した移動で履歴/退避条件が先行しないことだけ。
+追加modal、操作禁止、履歴地点別filter記憶、履歴連打の削除は採らない。
+実装中に既存挙動を残せないと分かった場合は、具体例と費用を示して利用者へ再相談する。
+現時点で新しい利用者質問はない。D14その他の2026-10-08確定仕様を変更しない。
 
 ## 10. 受入条件・実装順・引継ぎ
 
