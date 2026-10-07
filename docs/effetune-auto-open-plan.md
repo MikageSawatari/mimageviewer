@@ -1,6 +1,6 @@
 # §1.337 動画再生時の EffeTune 自動表示 設計案
 
-2026-10-07、ライン C。**R2: 設計指摘反映・再レビュー待ち、未実装**。
+2026-10-08、ライン C。**R3: 設計指摘反映・再レビュー待ち、未実装**。
 正本: [バックログ](next-release-backlog.md) §1.337、
 [EffeTune 統合](effetune-integration-plan.md) §0・§4・§10.1・§14、
 [動画アーキテクチャ](video-architecture.md) と [detached 憲法](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要)。
@@ -29,6 +29,11 @@
   復帰はtray threadのOS表示後に `sync_after_restore` (:355) でAppへ反映する。
   EffeTune observer (src/effetune/window.rs:188) の連番は `WM_SIZE/SIZE_MINIMIZED` でのみ進む。
   現在のGuiGateに自動設定ON／tray可視性のprojectionはなく、これらの往復は最小化連番で検出できない。
+- R3コード照合: `GuiGate::note_minimized` (src/effetune/gui_gate.rs:110) は最小化連番だけを増やす。
+  `SessionStateMachine::transition_lifecycle` (src/remote_ipc/session.rs:290) はBeginAcquireで取得連番を
+  増やし、phaseとともに `publish_remote` へ送る。両者はR2案の3要因projectionとは別更新であり、
+  成功後・poll前の最小化／Remote往復を成功時のprojectionだけでは検出できなかった。
+  下記では両抑止も同じ自動専用projectionへ含め、既存の手動表示連番・表示済み窓の契約は維持する。
 
 ## 発火点と一度だけの所有者
 
@@ -69,10 +74,11 @@
   設定OFF／全画面／tray／最小化／Remote／対象外／Spentでもdrainして棄却する。
   設定ON時だけ成功を読む早期returnは不可。判定時に現在source・viewer bindingが一致し、
   close／置換／ユーザーpauseを経ていないことを確認する。通知を次の復帰まで保持しない。
-  成功事実にはPlaying確定時の自動表示projection (下記) のrevision／allowedも添付する。
+  成功事実にはPlaying確定時の自動表示projection (下記の**5要因**) のrevision／allowedも添付する。
   transport ownerへ注入したread-only共有値を同境界で読むだけで、GUI操作や追加lockは行わない。
   poll時も同revisionで適格な場合だけ採用し、OFF中の成功を未drainのままONにした場合や
-  成功→抑止往復→pollの場合も棄却する。候補条件はopen要求時でなく再生成功時に採取する。
+  成功→抑止往復→pollの場合も棄却する。最小化→復元、Remote取得→drain完了もrevisionが進むため含む。
+  候補条件はopen要求時でなく再生成功時に採取する。成功時にblockedなら復帰後もその事実を棄却する。
   「OFFで動画成功→ONへ変更→同じ再生中にnormalize」は成功済みstartの内部継続なので発火しない。
 
 ## 適格性・非同期表示の境界
@@ -93,7 +99,9 @@ seek、設定を ON にしただけでは再生開始通知を生成しない。
 ロード中／hidden attach中／host配送後に**設定OFF・tray格納・全画面・最小化・Remote**へ入った場合は、
 未表示のAutoVideoだけを取消し、解除／ON／復元で復活させない。試行済みのAutoOpenSessionはSpentを維持する。
 `ShowIntent::Manual(ShowPermit)` / `AutoVideo(AutoPermit)` にまとめ、同じLoading／host queueに流す。
-AutoPermitは既存最小化／Remote連番に加えて、下記の自動表示projectionのrevisionを採取する。
+AutoPermitは既存最小化／Remote連番の追加検査に加えて、**成功事実のprojection revisionをそのまま継承**する。
+poll時・ロード完了時・再配送時の現在revisionで置換しない。成功時のallowedと同revisionの現在allowedを
+確認できた通知だけ要求へ進める。古い通知の棄却はArmedを消費せず、次の別の再生開始成功を待つ。
 
 | 正本の変更境界 | AutoVideo限定の公開契約 |
 | --- | --- |
@@ -101,14 +109,22 @@ AutoPermitは既存最小化／Remote連番に加えて、下記の自動表示p
 | `hide_to_tray` | `window_visible=false`の確定と同境界、`SW_HIDE`やsurface非表示の**前**にblockedとrevisionを公開 |
 | tray復元／その他のmain可視性変更 | 既存native observerにWM_SHOWWINDOW／WM_WINDOWPOSCHANGEDの可視性観測を追加する案。現在のOS可視性を確認してprojectionを更新し、tray threadの復元でApp同期を先行させない。hide→showの往復でも古いrevisionは戻さない |
 | 全viewerのpresentation ownerによる全画面入退 | 非適格化を同じ遷移境界で公開。C337-2の採用範囲に従い、context mount／swapで別窓の全画面情報を失わない |
-| 最小化／Remote | 既存native最小化連番／SessionStateMachineの取得連番・phaseを従来境界で公開・検査 |
+| 最小化／復元 | 既存native observerのWM_SIZE境界でMinimized bitを公開。SIZE_MINIMIZEDでは既存note_minimizedに合わせてrevisionも必ず増やし、下流WndProc／worker通知より前に確定する。復元では現在のIsIconic(main)を確認してbit解除とrevision増分を確定する。keep_visible_when_minimizedによらず自動開始は抑止 |
+| Remote取得／所有／drain／Local復帰 | transition_lifecycleと同じSessionStateMachineロック内でRemoteBlocked bitをphase.blocks_local_control()から公開。BeginAcquireで既存取得連番が進む境界ではrevisionも必ず増やし、解除でも増やす。set_gui_gateの登録／切離しも同ロック内で自動projectionを同期・失効させ、通知／UI次frameへ公開を遅らせない |
 
-projectionの唯一の公開先はcontrollerの既存GuiGate。自動設定／root可視性／全画面から導く
-`AutoPresentation`を、SettingOff／RootHidden／Fullscreenの抑止bitと単調revisionを含む
+projectionの唯一の公開先はcontrollerの既存GuiGate。自動設定／root可視性／全画面／最小化／Remoteから導く
+`AutoPresentation`を、SettingOff／RootHidden／Fullscreen／Minimized／RemoteBlockedの抑止bitと単調revisionを含む
 **一つのatomic値**でhostと成功通知producerに共有する案とする。各正本ownerは自分のbitだけを
 CASで更新し、別ownerの抑止を古い全体snapshotで消さない。allowedは抑止bitが全て0から導く。
 複数atomicの別読みによる整合窓を作らず、Rust／C++のmapping versionも揃えて検査する。
 bit変更とrevision増分は同じCASで確定し、再適格化しても過去値に戻さない。復帰は新しい自動要求を作らない。
+最小化イベント／Remote取得の既存連番が進む場合は、対応bitが既に立っていてもrevisionを進める。
+Remote独自の取得連番や別state machineは作らず、既存ownerの確定境界のread-only projectionとする。
+初期設定・mainの可視性／IsIconic・登録中SessionHandleのphaseを各ownerが公開してから成功producerへ
+共有値を注入する。再登録／切離しは旧projectionを失効させ、古い成功事実やAutoPermitを新gateへ移さない。
+5要因を一度のatomic loadで読むため、成功時に別々の最小化状態・Remote状態・連番を組み合わせない。
+既存の最小化連番／Remote tokenはManual・表示済み窓の処理とAutoVideoの追加検査に残すが、
+それらをpoll時に採取し直しても成功時revisionの一致条件を代替できない。
 host-control workerはロード完了時・hidden attach前後に照合し、host GUI threadは**表示直前**にも
 一致・allowed・現在の `IsWindowVisible(main)`／`IsIconic(main)`／HWND生存を検査する。
 取消ACKはrequested-visibleを作らない。Cancelledでロード／attach済みbridgeを作り直さない。
@@ -129,6 +145,8 @@ workerの一度の確認、minimize sequenceのtray代用、UI次frameだけの�
 由来をnormalizeごとのpendingへコピーする案より、transport ownerの単一startを内部継続で保持する案を採用。
 自動表示の設定／tray／全画面を既存窓のhide reasonへ足す案は、表示済み窓の挙動を変えるため不採用。
 AutoVideo permitの失効projectionに限り集約し、取消し後のロードrollback・再attach・resume待ちを持たない。
+R3では成功時に最小化／Remoteの別snapshotを加える案も検討したが、複数atomicの整合取得と
+permitへの引継ぎ項目を増やすため不採用。同じprojectionへ5要因を集約し、成功から表示まで同じrevisionを使う。
 再生や窓移動のモーダル化は通常操作を止めるため不採用。ロード・attach・表示 IPC は既存 worker、
 UI は成功事実と gate の軽量更新だけにする。DSP 経路の起動後常時接続／保存契約は維持する。
 
@@ -147,6 +165,7 @@ UI は成功事実と gate の軽量更新だけにする。DSP 経路の起動�
 
 **R2で新規の利用者質問はない。** C337-1〜3は維持、C337-4は既存の一度だけ／遅延表示なしの提案を
 設定切替と内部再開にも明示した。由来所有と取消し公開境界は技術設計の修正で、利用者へ選択を委ねない。
+**R3で新規・変更の利用者質問はない。** 最小化／Remote往復の検出は「遅延表示なし」を成立させる技術補完。
 
 ## 実装前後のレビュー・受け入れ
 
@@ -161,6 +180,12 @@ R2追加回帰: OFFで成功した継続動画→ON→normalize (仮測定／完
 では0回、paused open／ユーザーplay→初回normalize→初めてPlayingでは適格時1回。
 seek／DSP／loopの内部継続では追加0回。source置換／ユーザーpauseで旧成功を破棄、OFFでの通知drainを検証。
 成功通知未drainでOFF→ON／各抑止往復した場合も0回、複数ownerのbit更新で別抑止が消えないことを検証。
+R3追加回帰: Playing成功→最小化→復元→poll、Playing成功→Remote取得→所有→drain→Local→pollは
+projection revision不一致で棄却し、表示要求0回・Armed維持。成功時に最小化／Remote blockedだった通知も
+復帰後に棄却する。抑止のない成功では1回となり、AutoPermitのrevisionは成功時の値から変わらないことを確認する。
+成功後のgate再登録／切離し、bit更新中の成功通知採取、ロード／host配送への引継ぎでも旧revisionを
+現在値に更新しないことをstate／fake hostで検証する。最小化表示設定ONでもこの自動抑止は変わらず、
+Manualと既存表示済み窓の従来挙動・連番検査は維持されることを確認する。
 設定OFF／tray格納をload中・hidden attach中・host配送後の各段階で入れ、OFF→ON／hide→showの
 抑止往復もCancelled、表示希望なし、Spent維持、後からpopupなしをfake hostで検証する。
 Preferences Cancelは失効なし、既存表示済み窓とManualは自動専用projectionでhideされないことも確認する。
@@ -169,4 +194,5 @@ Preferences Cancelは失効なし、既存表示済み窓とManualは自動専�
 bridge変更時の最終確認は release launcher/core build が必要。今回は製品を起動せず、実機挙動は検証しない。
 
 R1レビューのP2「normalize内部再開の由来」とP2「要求後のtray／設定OFF取消し」を
-コード照合して採用した。上記は対応案であり、R2の独立レビュー承認はまだない。
+コード照合して採用し、次の独立レビューで対応確認済み。R3のP2「成功通知未消費中の最小化／Remote往復」も
+コード照合して採用した。上記は対応案であり、R3の独立レビュー承認はまだない。
