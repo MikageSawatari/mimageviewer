@@ -90,6 +90,7 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
 #[doc(hidden)]
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
+    pages::draw_effetune_auto_open_settings(ui, &mut Settings::default());
     pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
 }
 
@@ -2177,6 +2178,8 @@ impl App {
             || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
+        #[cfg(windows)]
+        self.publish_effetune_auto_setting();
         if old_raw_brightness != self.settings.raw_brightness {
             self.raw_brightness_changed();
         }
@@ -6242,6 +6245,85 @@ mod tests {
             !app.remote_clockless_audio_processing(1.0)
                 .effetune_pre_limiter_enabled()
         );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_auto_open_preferences_cancel_ok_save_reload() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.effetune_auto_open_on_video);
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-auto-open",
+        ));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for cancel in [true, false] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::Video,
+                        "video/effetune-auto-open",
+                    ));
+            }
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            let before = harness.state().effetune.auto_reader().unwrap().snapshot();
+            harness
+                .get_by_label("起動後の最初の動画再生で音響調整の窓を自動で開く")
+                .click();
+            harness.run();
+            assert!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_auto_open_on_video
+            );
+            assert!(!harness.state().settings.effetune_auto_open_on_video);
+            assert_eq!(
+                harness.state().effetune.auto_reader().unwrap().snapshot(),
+                before
+            );
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert_eq!(
+                    harness.state().effetune.auto_reader().unwrap().snapshot(),
+                    before
+                );
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness.state().settings.effetune_auto_open_on_video,
+                !cancel
+            );
+            let after = harness.state().effetune.auto_reader().unwrap().snapshot();
+            if cancel {
+                assert_eq!(after, before);
+            } else {
+                assert_ne!(after.revision, before.revision);
+                assert!(Settings::load().effetune_auto_open_on_video);
+            }
+        }
+        let mut disabled = harness.state().settings.clone();
+        disabled.effetune_auto_open_on_video = false;
+        let before = harness.state().effetune.auto_reader().unwrap().snapshot();
+        harness.state_mut().install_preferences_settings(disabled);
+        let after = harness.state().effetune.auto_reader().unwrap().snapshot();
+        assert!(!after.allowed);
+        assert_ne!(after.revision, before.revision);
     }
 
     #[test]

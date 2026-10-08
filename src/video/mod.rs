@@ -106,6 +106,9 @@ use std::sync::{Mutex, OnceLock};
 
 use engine::EngineEvent;
 use engine::actor::{EngineActor, OpenOptions};
+pub use engine::actor::{
+    InternalContinuation, PlaybackStartContext, PlaybackStartOrigin, PlaybackSuccess,
+};
 
 /// Worker/native-window notifications share one root-viewport wake owner per player.
 ///
@@ -8934,6 +8937,7 @@ impl VideoPlayer {
             resume_secs,
             loop_enabled: false, // VideoPlayer 側で個別管理 (Phase 3+ で統合予定)
             hw_decode,
+            playback_start: PlaybackStartContext::default(),
         };
         let engine = Arc::new(Mutex::new(EngineActor::new(
             opts,
@@ -9643,7 +9647,7 @@ impl VideoPlayer {
 
     /// Phase 9.C: engine state machine に Play / Pause を伝える。
     /// `toggle_play` / `set_playing` から共有。`apply_command` は idempotent。
-    fn dispatch_play_pause(&self, playing: bool) {
+    fn dispatch_play_pause(&self, playing: bool, continuation: InternalContinuation) {
         #[cfg(windows)]
         if playing && self.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata) {
             return;
@@ -9652,12 +9656,10 @@ impl VideoPlayer {
         if !playing {
             self.cancel_dsp_acquisition();
         }
-        let cmd = if playing {
-            engine::actor::TransportCommand::Play
-        } else {
-            engine::actor::TransportCommand::Pause
-        };
-        self.engine.lock().unwrap().apply_command(cmd);
+        self.engine
+            .lock()
+            .unwrap()
+            .apply_internal_continuation(playing, continuation);
     }
 
     #[cfg(windows)]
@@ -9698,7 +9700,7 @@ impl VideoPlayer {
         self.engine
             .lock()
             .unwrap()
-            .apply_command(engine::actor::TransportCommand::Pause);
+            .apply_internal_continuation(false, InternalContinuation::Dsp);
         self.clock.set_paused_position(position_secs);
         if self.info.is_none() {
             *self.dsp_handoff.lock().unwrap() =
@@ -9717,7 +9719,7 @@ impl VideoPlayer {
                     self.engine
                         .lock()
                         .unwrap()
-                        .apply_command(engine::actor::TransportCommand::Play);
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
                 }
                 return true;
             }
@@ -9774,7 +9776,7 @@ impl VideoPlayer {
                     self.engine
                         .lock()
                         .unwrap()
-                        .apply_command(engine::actor::TransportCommand::Play);
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
                 }
             }
         }
@@ -9818,7 +9820,7 @@ impl VideoPlayer {
                 self.engine
                     .lock()
                     .unwrap()
-                    .apply_command(engine::actor::TransportCommand::Play);
+                    .apply_internal_continuation(true, InternalContinuation::Dsp);
             }
             return;
         }
@@ -9829,12 +9831,12 @@ impl VideoPlayer {
                     self.engine
                         .lock()
                         .unwrap()
-                        .apply_command(engine::actor::TransportCommand::Play);
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
                 } else if coordinator.local_dry_resume_allowed() {
                     self.engine
                         .lock()
                         .unwrap()
-                        .apply_command(engine::actor::TransportCommand::Play);
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
                 }
             }
             audio::LocalDspHandoffResult::TimedOut | audio::LocalDspHandoffResult::ResetFailed => {
@@ -9847,7 +9849,7 @@ impl VideoPlayer {
                     self.engine
                         .lock()
                         .unwrap()
-                        .apply_command(engine::actor::TransportCommand::Play);
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
                 }
             }
             audio::LocalDspHandoffResult::Cancelled => {}
@@ -9857,7 +9859,13 @@ impl VideoPlayer {
     pub fn toggle_play(&self) {
         #[cfg(windows)]
         if self.cancel_dsp_acquisition() {
+            self.engine.lock().unwrap().discard_playback_start();
             return;
+        }
+        if self.is_at_eof() || !self.intent_playing() {
+            self.register_playback_start(PlaybackStartOrigin::UserPlay);
+        } else {
+            self.engine.lock().unwrap().discard_playback_start();
         }
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
@@ -9893,7 +9901,7 @@ impl VideoPlayer {
             // autoplay=true 設定だけ走る。
             let mut g = self.engine.lock().unwrap();
             g.handle_seek_request(0.0);
-            g.apply_command(engine::actor::TransportCommand::Play);
+            g.apply_internal_continuation(true, InternalContinuation::Transport);
             return;
         }
         // 非 EOF: **intent 基準で方向決定** (Codex P2 2026-05-17)。
@@ -9908,16 +9916,87 @@ impl VideoPlayer {
         } else {
             self.clear_pending_user_seek();
         }
-        self.dispatch_play_pause(new_playing);
+        self.dispatch_play_pause(new_playing, InternalContinuation::Transport);
     }
 
+    pub(crate) fn bind_playback_viewer_context(&self, viewer_context: u64) {
+        self.engine
+            .lock()
+            .unwrap()
+            .bind_playback_viewer_context(viewer_context);
+    }
+
+    pub(crate) fn classify_pending_playback_start(&self, origin: PlaybackStartOrigin) {
+        self.engine
+            .lock()
+            .unwrap()
+            .classify_pending_playback_start(origin);
+    }
+
+    pub fn register_playback_start(&self, origin: PlaybackStartOrigin) {
+        self.engine.lock().unwrap().register_playback_start(origin);
+    }
+
+    pub(crate) fn playback_success_is_current(&self, id: u64) -> bool {
+        self.engine.lock().unwrap().playback_success_is_current(id)
+    }
+
+    pub fn take_playback_success(&self) -> Option<PlaybackSuccess> {
+        self.engine.lock().unwrap().take_playback_success()
+    }
+
+    /// Explicit user/source request. Internal resumes must use the continuation API.
+    pub fn set_playing_with_origin(&self, p: bool, origin: PlaybackStartOrigin) {
+        if p {
+            self.register_playback_start(origin);
+        } else {
+            self.engine.lock().unwrap().discard_playback_start();
+        }
+        self.set_playing_internal(p, InternalContinuation::Transport);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_playback_start_for_test(&self, origin: PlaybackStartOrigin) {
+        let mut actor = self.engine.lock().unwrap();
+        if actor.published_state_code() == engine::actor::state_code::IDLE {
+            actor.begin_loading();
+            let epoch = actor.current_seek_epoch();
+            actor.handle_decoder_event(engine::state::DecoderEvent::InfoReceived {
+                epoch,
+                duration_secs: 30.0,
+                has_audio: false,
+                has_video: true,
+            });
+        }
+        actor.register_playback_start(origin);
+        actor.apply_internal_continuation(true, InternalContinuation::Transport);
+        let epoch = actor.current_seek_epoch();
+        actor
+            .handle_decoder_event(engine::state::DecoderEvent::FirstFrameReady { epoch, pts: 0.0 });
+    }
+
+    pub(crate) fn set_auto_presentation_reader(
+        &self,
+        reader: crate::effetune::gui_gate::AutoPresentationReader,
+    ) {
+        self.engine
+            .lock()
+            .unwrap()
+            .set_auto_presentation_reader(reader);
+    }
+
+    /// Compatibility transport continuation; never infer a user start from this API.
     pub fn set_playing(&self, p: bool) {
+        self.set_playing_internal(p, InternalContinuation::Transport);
+    }
+
+    pub fn set_playing_internal(&self, p: bool, continuation: InternalContinuation) {
         #[cfg(windows)]
         if !p && self.cancel_dsp_acquisition() {
             self.engine
                 .lock()
                 .unwrap()
-                .apply_command(engine::actor::TransportCommand::Pause);
+                .apply_internal_continuation(false, continuation);
             return;
         }
         // **intent 基準で dispatch 判定** (Codex P2 2026-05-17): 旧版は
@@ -9962,7 +10041,7 @@ impl VideoPlayer {
         #[cfg(not(windows))]
         let needs_dsp_acquisition = false;
         if prev_intent != p || force_dispatch || needs_dsp_acquisition {
-            self.dispatch_play_pause(p);
+            self.dispatch_play_pause(p, continuation);
         }
         crate::logger::log(format!(
             "[video-debug] set_playing({p}) done: engine_state={} playing={} intent={} seek_serial={}",
@@ -10061,7 +10140,7 @@ impl VideoPlayer {
         // (詳細は toggle_play を参照)。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(target_secs);
-        g.apply_command(engine::actor::TransportCommand::Play);
+        g.apply_internal_continuation(true, InternalContinuation::Seek);
         state.pending_target_secs = None;
         state.last_issued = Some(IssuedUserSeek {
             target_secs,
@@ -10422,6 +10501,7 @@ impl VideoPlayer {
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
     pub fn seek_paused(&self, target_secs: f64) {
+        self.engine.lock().unwrap().discard_playback_start();
         #[cfg(windows)]
         self.cancel_dsp_acquisition();
         self.clear_pending_user_seek();
@@ -10441,7 +10521,7 @@ impl VideoPlayer {
         // FirstFrameReady で Paused 入場) 経由で AvClock を freeze する。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(clamped);
-        g.apply_command(engine::actor::TransportCommand::Pause);
+        g.apply_internal_continuation(false, InternalContinuation::Seek);
     }
 
     fn seek_paused_frame_step_internal(
@@ -10465,7 +10545,7 @@ impl VideoPlayer {
         self.clock.set_paused_position(base);
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(base);
-        g.apply_command(engine::actor::TransportCommand::Pause);
+        g.apply_internal_continuation(false, InternalContinuation::Seek);
     }
 
     /// 前後 1 フレームへ移動し、一時停止する。
@@ -10473,6 +10553,7 @@ impl VideoPlayer {
         if direction == 0 {
             return;
         }
+        self.engine.lock().unwrap().discard_playback_start();
         self.clear_pending_user_seek();
         let pending_step_base = self.frame_step_base();
         let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
@@ -11806,7 +11887,7 @@ impl VideoPlayer {
                     // (engine 経由で更新)。
                     let mut g = self.engine.lock().unwrap();
                     g.handle_seek_request(target);
-                    g.apply_command(engine::actor::TransportCommand::Play);
+                    g.apply_internal_continuation(true, InternalContinuation::Loop);
                 } else {
                     // ループ OFF: 末端到達 → engine に `EofReached` を **同期的に** 渡す。
                     // engine の `transition_to_eof(duration)` が走り:
@@ -12033,7 +12114,7 @@ impl VideoPlayer {
                 // (詳細は toggle_play を参照)。
                 let mut g = self.engine.lock().unwrap();
                 g.handle_seek_request(target);
-                g.apply_command(engine::actor::TransportCommand::Play);
+                g.apply_internal_continuation(true, InternalContinuation::Loop);
             } else {
                 // 末端到達 → engine に EofReached を同期的に流し、state=Eof +
                 // AvClock freeze(duration) + playing=false を atomic に確定する。
@@ -12491,6 +12572,7 @@ impl VideoPlayer {
     /// 現象が観測される。先に shutdown() を呼ぶことで、entry を
     /// fs_cache から消す瞬間に音声が止まる。
     pub fn shutdown(&mut self) {
+        self.engine.lock().unwrap().discard_playback_start();
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
         self.stop_video_output();
@@ -12511,6 +12593,7 @@ impl VideoPlayer {
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        self.engine.lock().unwrap().discard_playback_start();
         // shutdown() が事前に呼ばれていなければここで stop。
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -12556,6 +12639,83 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    fn playback_start_test_player() -> super::VideoPlayer {
+        use crate::effetune::gui_gate::{AutoSuppression, GuiGate};
+        let player = super::VideoPlayer::disconnected_for_test("logical-start.mp4".into(), 0.0);
+        let gate = GuiGate::create_for_test();
+        gate.set_auto_factor(AutoSuppression::SettingOff, false);
+        gate.set_auto_factor(AutoSuppression::RootHidden, false);
+        player.set_auto_presentation_reader(gate.auto_reader());
+        player
+    }
+
+    #[test]
+    fn playback_start_player_user_pause_invalidates_drained_fact_and_next_play_is_new() {
+        use super::PlaybackStartOrigin;
+        let player = playback_start_test_player();
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let first = player.take_playback_success().unwrap();
+        player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+        assert!(!player.playback_success_is_current(first.id));
+        player.set_playing_with_origin(true, PlaybackStartOrigin::UserPlay);
+        let next = player.take_playback_success().unwrap();
+        assert_eq!(next.origin, PlaybackStartOrigin::UserPlay);
+        assert_ne!(next.id, first.id);
+    }
+
+    #[test]
+    fn playback_start_player_toggle_is_user_request_internal_resume_is_not() {
+        use super::{InternalContinuation, PlaybackStartOrigin};
+        let player = playback_start_test_player();
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let first = player.take_playback_success().unwrap();
+        player.set_playing_internal(false, InternalContinuation::Normalize);
+        player.set_playing_internal(true, InternalContinuation::Normalize);
+        assert!(player.take_playback_success().is_none());
+        assert!(player.playback_success_is_current(first.id));
+        player.toggle_play();
+        assert!(!player.playback_success_is_current(first.id));
+        player.toggle_play();
+        let next = player.take_playback_success().unwrap();
+        assert_eq!(next.origin, PlaybackStartOrigin::UserPlay);
+        assert_ne!(next.id, first.id);
+    }
+
+    #[test]
+    fn playback_start_player_viewer_move_before_and_after_success_follows_binding() {
+        use super::PlaybackStartOrigin;
+        let player = playback_start_test_player();
+        player.bind_playback_viewer_context(1);
+        player.bind_playback_viewer_context(2);
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        assert_eq!(
+            player.take_playback_success().unwrap().viewer_context,
+            Some(2)
+        );
+        player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+        player.set_playing_with_origin(true, PlaybackStartOrigin::UserPlay);
+        player.bind_playback_viewer_context(3);
+        assert!(player.take_playback_success().is_none());
+        player.set_playing_internal(false, super::InternalContinuation::Normalize);
+        player.set_playing_internal(true, super::InternalContinuation::Normalize);
+        assert!(player.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_player_shutdown_discards_unconsumed_success_without_touching_sibling() {
+        use super::PlaybackStartOrigin;
+        let mut first = playback_start_test_player();
+        let second = playback_start_test_player();
+        first.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        second.confirm_playback_start_for_test(PlaybackStartOrigin::ContinuousAdvance);
+        first.shutdown();
+        assert!(first.take_playback_success().is_none());
+        assert_eq!(
+            second.take_playback_success().unwrap().origin,
+            PlaybackStartOrigin::ContinuousAdvance
+        );
+    }
+
     #[cfg(windows)]
     fn real_audio_tail_player(name: &str, sample_rate: u32) -> super::VideoPlayer {
         use super::engine::state::DecoderEvent;

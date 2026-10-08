@@ -1548,6 +1548,16 @@ fn preferences_effetune_input_limit_dark() {
 }
 
 #[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_auto_open_light() {
+    snapshot_with_theme(
+        "preferences_effetune_auto_open_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_book_resume_meter_light() {
     snapshot_with_theme(
         "preferences_book_resume_meter_light",

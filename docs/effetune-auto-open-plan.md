@@ -1,11 +1,11 @@
 # §1.337 動画再生時の EffeTune 自動表示 設計案
 
-2026-10-08、ライン C。**R3設計指摘反映・再レビュー待ち、利用者仕様決定済み、未実装**。
+2026-10-08、ライン C。**設計承認・利用者仕様決定済み、§1.337 実装済み。Rust検証成功、SDK配置後のhost／検証用ビルド待ち**。
 正本: [バックログ](next-release-backlog.md) §1.337、
 [EffeTune 統合](effetune-integration-plan.md) §0・§4・§10.1・§14、
 [動画アーキテクチャ](video-architecture.md) と [detached 憲法](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要)。
 
-## 決定済みとコード上の前提
+## 決定済みと実装前のコード上の前提
 
 - 利用者決定: **起動後の最初の適格なローカル動画再生で 1 回、全画面中は開かない、既定 OFF**。
 - `VideoPlayer::is_playing()` は play intent と別。`src/video/mod.rs` の説明と
@@ -167,15 +167,15 @@ UI は成功事実と gate の軽量更新だけにする。DSP 経路の起動�
 **R2で新規の利用者質問はない。** C337-1〜3は維持、C337-4は既存の一度だけ／遅延表示なしの提案を
 設定切替と内部再開にも明示した。由来所有と取消し公開境界は技術設計の修正で、利用者へ選択を委ねない。
 **R3で新規・変更の利用者質問はない。** 最小化／Remote往復の検出は「遅延表示なし」を成立させる技術補完。
-2026-10-08時点で未回答の利用者質問はない。仕様回答はR3技術設計の再レビュー承認とは別であり、今回は未実装。
+2026-10-08時点で未回答の利用者質問はない。今回の実装指示で、設計の独立レビュー承認と全質問の決定を受領した。
 
 ## 実装前後のレビュー・受け入れ
 
 成功通知のlogical startとnormalize／seek／handoffの区別、全transport呼出しの由来分類、
 全viewer producer／close／swap／cancel、Manual / AutoVideoの優先、設定／tray／fullscreenの公開境界と
-host最終検査を**実装前に独立レビュー**する。
+host最終検査を含む設計は、利用者の実装指示で独立レビュー承認済みとして受領した。実装差分は別途レビュー対象とする。
 detached／presentation 経路に入る変更は設計 lead と独立 reviewer が構造的修正として合意し、
-detached-rework-plan.md §11 に記録する。現時点ではその合意はない。
+detached-rework-plan.md §11 に記録する。今回の受領済み設計に従い、表示先の正本を読む projection 公開に限る。
 非起動の state／fake host テストは open失敗→成功、paused open→play、各抑止開始→復帰→
 次開始、ロード中の抑止往復、手動意図優先、二窓同時、設定OFF→ON、portable欠落を対象とする。
 R2追加回帰: OFFで成功した継続動画→ON→normalize (仮測定／完了／失敗／取消し／開始失敗／不開始)
@@ -197,4 +197,43 @@ bridge変更時の最終確認は release launcher/core build が必要。今回
 
 R1レビューのP2「normalize内部再開の由来」とP2「要求後のtray／設定OFF取消し」を
 コード照合して採用し、次の独立レビューで対応確認済み。R3のP2「成功通知未消費中の最小化／Remote往復」も
-コード照合して採用した。上記は対応案であり、R3の独立レビュー承認はまだない。
+コード照合して採用した。上記の対応設計は、今回の利用者の実装指示により承認済みとして受領した。
+
+## 実装記録 (2026-10-08、非起動のコード照合)
+
+- PlaybackStart は EngineActor だけが所有し、明示的開始／内部継続 API を通す。
+  reader と viewer binding は constructor 直後、tick／transport より前に注入する。
+  constructor は Loading を作るだけで、decoder worker は actor を持たず、Playing はイベント適用時に確定する。
+- App は不適格な通知も消費し、native の pause／close／source 結果の処理後に現行 start ID・path・viewer identity を検査する。
+  context 移動前の未消費成功は移動先で破棄し、normalize で再通知しない。
+  source-swap の HistoryTrigger と deferred native open の request origin が EOF の別 source を ContinuousAdvance とする。
+  constructor の未確定 start を分類するときは ID を増やさず、同 source の巻戻しは Loop 継続とする。
+- 全画面 projection は各 context の ViewerSession.presentation と現在の別窓の borderless fact から導く。
+  受動別窓の既存 builder は decorations=true を要求するので、退避窓の全画面を geometry から推測しない。
+  mount／swap 自体で revision を進めず、意味上の表示先・content・F11 変更境界で公開する。
+- startup の inert 保存状態は bridge を作らず Idle に戻るが、Video／Audio の初回 cache-miss open は
+  media_startup_load_pending() で player 作成前に待つ。Playing 成功がそのロードへ合流する経路はなく、
+  AutoVideo 自身のロードは inert を skip しない。
+- 成功した Manual ACK は自動機会を消費し、projection の revision だけも進める。
+  配送済みで未表示の古い AutoVideo も取消し、Manual／表示済み窓の hide 理由は増やさない。
+- この記録はソースと非起動テストの対象範囲であり、製品の表示・フォーカス挙動は未確認。
+
+## 非起動検証とビルド前提 (2026-10-08)
+
+- PlaybackStart 20件、EffeTune 40件、自動表示連携 10件、normalize 117件 (1件 ignore)、
+  portable の設定／公開境界 4件と自動表示拒否 1件、全 UI snapshot 116件が成功した。
+  通常／portable core check、cargo fmt と fmt --check、glyph lint (危険文字0件) も成功。
+- 全 lib 初回は 11,022 passed / 1 failed / 52 ignored、exit 1。
+  設定移行の分類には新設定を追加済みだったが、総数の期待値が447件のままだった。
+  総数を448件へ更新し、設定移行17件は成功。製品側の移行仕様や期待値の許容範囲は変更していない。
+  修正後の全 lib は 11,023 passed / 0 failed / 52 ignored、exit 0 (990.40秒、pipeなし)。
+  再実行中のソース・fixture 29ファイルのhashは不変で、検証結果は固定した差分に対応する。
+- C++ 表示取消しの22個の static_assert は MSVC の compile-only で成功し、製品は起動していない。
+  完全な host ビルドは未完了。CMake configure は vendor/vst3sdk 未配置で exit 1、
+  vendor host の source identity は今回のソースと不一致。公式 SDK アーカイブの取得もネットワーク制限で失敗した。
+  SDK の実コピーをこの worktree へ配置し、C++ host を再ビルドして source identity を検証する必要がある。
+  build-dev.ps1 は host を再ビルドしないため、この前提が揃うまで実行しない。
+  現在の dev-runtime は本変更前の成果物であり、§1.337 の確認用には使わない。
+- 詳細なコマンド・件数・失敗修正・未検証の実機シナリオは target/C-1337-verification.md。
+  SDK 配置後の host／build-dev と変更 bridge の release launcher/core gate は未完了。
+  実装差分の独立レビュー、Visualizer保持・Windowsフォーカスの実機確認も受け入れ前に残る。

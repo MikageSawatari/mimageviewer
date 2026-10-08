@@ -1173,6 +1173,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
+        "video/effetune-auto-open",
+        Video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+        [
+            "音響調整",
+            "ビジュアライザー",
+            "自動表示",
+            "初回",
+            "EffeTune"
+        ]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -1509,6 +1522,18 @@ mod tests {
         assert_eq!(
             result.first().map(|entry| entry.anchor),
             Some("video/effetune-minimized")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn effetune_auto_open_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 自動表示", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-auto-open")
         );
         #[cfg(feature = "portable")]
         assert!(result.is_empty());

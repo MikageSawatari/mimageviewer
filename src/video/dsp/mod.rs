@@ -1579,6 +1579,17 @@ impl DspBridge {
         minimized_sequence: u64,
         remote_token: u64,
     ) -> Result<(), String> {
+        self.show_slot_gui_checked_with_origin(idx, minimized_sequence, remote_token, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn show_slot_gui_checked_with_origin(
+        &self,
+        idx: usize,
+        minimized_sequence: u64,
+        remote_token: u64,
+        auto_revision: Option<u64>,
+    ) -> Result<bridge::GuiVisibilityOutcome, String> {
         let (bridge, slot_id, hwnd) = {
             let inner = self.inner.lock().unwrap();
             let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
@@ -1587,16 +1598,23 @@ impl DspBridge {
         if hwnd == 0 || self.gui_gate.get().is_none() {
             return Err("GUI or presentation gate is not attached".into());
         }
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
-                bridge.process_id(),
-            );
+        if auto_revision.is_none() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                    bridge.process_id(),
+                );
+            }
         }
-        bridge
-            .set_gui_visibility_checked(slot_id, true, minimized_sequence, remote_token)
-            .map_err(|error| error.to_string())?;
         // Only the ordered host signal stream publishes slot visibility.
-        Ok(())
+        bridge
+            .set_gui_visibility_checked_with_origin(
+                slot_id,
+                true,
+                minimized_sequence,
+                remote_token,
+                auto_revision,
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub fn attach_slot_gui_hidden(&self, idx: usize) -> Result<(), String> {

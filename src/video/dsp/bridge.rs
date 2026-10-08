@@ -978,12 +978,30 @@ impl Bridge {
         minimized_sequence: u64,
         remote_token: u64,
     ) -> Result<GuiVisibilityOutcome, ConcurrentStateError> {
+        self.set_gui_visibility_checked_with_origin(
+            slot_id,
+            visible,
+            minimized_sequence,
+            remote_token,
+            None,
+        )
+    }
+
+    pub fn set_gui_visibility_checked_with_origin(
+        &self,
+        slot_id: u64,
+        visible: bool,
+        minimized_sequence: u64,
+        remote_token: u64,
+        auto_revision: Option<u64>,
+    ) -> Result<GuiVisibilityOutcome, ConcurrentStateError> {
         let id = self.next_request_id.fetch_add(1, Ordering::AcqRel) + 1;
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.pending_gui_requests.lock().unwrap().insert(id, tx);
         let result = (|| {
             self.send_value(&serde_json::json!({"cmd": "set_gui_visibility_checked", "request_id": id,
-                "slot_id": slot_id, "visible": u32::from(visible), "minimized_sequence": minimized_sequence, "remote_token": remote_token}))
+                "slot_id": slot_id, "visible": u32::from(visible), "minimized_sequence": minimized_sequence, "remote_token": remote_token,
+                "auto_video": u32::from(auto_revision.is_some()), "auto_revision": auto_revision.unwrap_or(0)}))
                 .map_err(|_| ConcurrentStateError::HostExited)?;
             rx.recv_timeout(std::time::Duration::from_secs(5))
                 .map_err(|error| {

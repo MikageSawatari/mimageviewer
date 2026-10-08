@@ -11296,6 +11296,8 @@ impl App {
         self.cancel_superseded_fs_navigation_display_target(target_idx);
         self.spread_mode = crate::settings::SpreadMode::Single;
         self.fullscreen_idx = Some(target_idx);
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
     }
@@ -11358,6 +11360,8 @@ impl App {
         self.cancel_superseded_fs_navigation_display_target(pivot.navigation_anchor_idx);
         self.spread_mode = pivot.saved_mode;
         self.fullscreen_idx = Some(pivot.navigation_anchor_idx);
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
     }
@@ -13613,7 +13617,7 @@ fn pause_current_media_player_for_remote_session(
         return false;
     };
     let was_playing = player.intent_playing();
-    player.set_playing(false);
+    player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
     was_playing
 }
 
@@ -19804,6 +19808,8 @@ impl App {
                 .set_hud_raise_hook(std::sync::Arc::new(move || {
                     hud_raise_pending.store(true, std::sync::atomic::Ordering::Release);
                 }));
+            app.publish_effetune_auto_setting();
+            app.publish_effetune_auto_fullscreen();
             app.effetune
                 .set_keep_visible_when_minimized(app.settings.effetune_keep_visible_when_minimized);
             app.effetune
@@ -27569,6 +27575,59 @@ impl App {
                 Some(EffectiveState::Unparseable(_)) => "音響調整の設定を判定できません".into(),
                 None => "音響調整の設定を確認中です".into(),
             },
+        }
+    }
+
+    /// Classify source provenance before cached or deferred playback becomes ready.
+    fn register_media_playback_origin(
+        &mut self,
+        idx: usize,
+        origin: crate::video::PlaybackStartOrigin,
+    ) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+            player.classify_pending_playback_start(origin);
+        }
+        #[cfg(windows)]
+        if let Some(pending) = self
+            .native_video_open_pending
+            .as_mut()
+            .filter(|pending| pending.idx == idx)
+        {
+            pending.playback_origin = origin;
+        }
+    }
+
+    /// Publish committed settings only; Preferences drafts never reach this boundary.
+    #[cfg(windows)]
+    pub(crate) fn publish_effetune_auto_setting(&self) {
+        if let Some(gate) = self.effetune.gui_gate() {
+            gate.set_auto_factor(
+                crate::effetune::gui_gate::AutoSuppression::SettingOff,
+                cfg!(feature = "portable") || !self.settings.effetune_auto_open_on_video,
+            );
+        }
+    }
+
+    /// Aggregate canonical context presentation facts, including an active F12 window.
+    /// Passive detached builders request decorated, normal windows; mounting a different
+    /// context does not change the active window's borderless fact.
+    #[cfg(windows)]
+    pub(crate) fn publish_effetune_auto_fullscreen(&self) {
+        let fullscreen = self.detached_viewer_borderless_fullscreen
+            || (self.fullscreen_idx.is_some()
+                && self.viewer_presentation == ViewerPresentation::Fullscreen)
+            || self.viewer_context_ids().into_iter().any(|id| {
+                self.with_viewer_context_ref(id, |context| {
+                    context.fullscreen_idx().is_some()
+                        && context.presentation() == ViewerPresentation::Fullscreen
+                })
+                .unwrap_or(false)
+            });
+        if let Some(gate) = self.effetune.gui_gate() {
+            gate.set_auto_factor(
+                crate::effetune::gui_gate::AutoSuppression::Fullscreen,
+                fullscreen,
+            );
         }
     }
 
@@ -40277,11 +40336,15 @@ impl App {
                     OpenAdmission::Accepted => {}
                     OpenAdmission::NotApplicable => {
                         self.fullscreen_idx = None;
+                        #[cfg(windows)]
+                        self.publish_effetune_auto_fullscreen();
                         self.fullscreen_epub_source = None;
                     }
                     OpenAdmission::Refused(reason) => {
                         self.show_open_admission_refusal(reason);
                         self.fullscreen_idx = None;
+                        #[cfg(windows)]
+                        self.publish_effetune_auto_fullscreen();
                         self.fullscreen_epub_source = None;
                     }
                 }
@@ -56883,7 +56946,11 @@ impl App {
                 // 同じ後始末で main を非 detached へ戻す。
                 self.fullscreen_epub_source = None;
                 self.fullscreen_idx = None;
+                #[cfg(windows)]
+                self.publish_effetune_auto_fullscreen();
                 self.viewer_presentation = self.non_detached_viewer_presentation();
+                #[cfg(windows)]
+                self.publish_effetune_auto_fullscreen();
                 self.detached_viewer_independent_active = false;
                 self.last_viewer_sync_stamp = None;
                 self.log_detached_image_window_debug(format!(
@@ -59145,7 +59212,11 @@ impl App {
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
         self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.viewer_presentation = self.non_detached_viewer_presentation();
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.detached_viewer_independent_active = false;
         self.last_viewer_sync_stamp = None;
         self.log_detached_image_window_debug(format!(
@@ -59274,7 +59345,11 @@ impl App {
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
         self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.viewer_presentation = self.non_detached_viewer_presentation();
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.detached_viewer_independent_active = false;
         self.last_viewer_sync_stamp = None;
         self.log_detached_image_window_debug(format!(
@@ -59545,7 +59620,11 @@ impl App {
 
         self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.viewer_presentation = self.non_detached_viewer_presentation();
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.detached_viewer_independent_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
         self.detached_viewer_focus_requested = false;
@@ -60345,6 +60424,7 @@ impl App {
         );
         crate::logger::log(&message);
         self.detached_viewer_borderless_fullscreen = borderless;
+        self.publish_effetune_auto_fullscreen();
         self.detached_viewer_restore_placement = restore_placement;
     }
 
@@ -61336,6 +61416,8 @@ impl App {
             self.detached_image_windows.len()
         ));
         self.viewer_presentation = presentation;
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         if detached_still && !independent_detached_still {
             let _ = self.take_parked_fullfeature_linked_still_for_grid_open(idx, presentation);
         }
@@ -61734,6 +61816,8 @@ impl App {
             self.cleanup_normalize_state_for_fs_idx(previous_idx);
         }
         self.fullscreen_idx = Some(idx);
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         if load_contract == FsPageLoadContract::LatestSeek {
             self.apply_fs_page_load_contract(idx, load_contract);
         }
@@ -61968,6 +62052,16 @@ impl App {
                     #[cfg(not(windows))]
                     let should_autoplay_cached_video = true;
                     if should_autoplay_cached_video {
+                        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                            player.register_playback_start(match history_trigger {
+                                HistoryTrigger::UserChosen => {
+                                    crate::video::PlaybackStartOrigin::NewSource
+                                }
+                                HistoryTrigger::AutoAdvance => {
+                                    crate::video::PlaybackStartOrigin::ContinuousAdvance
+                                }
+                            });
+                        }
                         #[cfg(windows)]
                         let started_normalize_scan =
                             self.start_normalize_scan_for_deferred_play_intent(idx);
@@ -61983,7 +62077,10 @@ impl App {
                             if let Some(FsCacheEntry::Video { player, .. }) =
                                 self.fs_cache.get(&idx)
                             {
-                                player.set_playing(true);
+                                player.set_playing_with_origin(
+                                    true,
+                                    crate::video::PlaybackStartOrigin::NewSource,
+                                );
                             }
                         }
                     }
@@ -62002,7 +62099,17 @@ impl App {
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
                     self.fs_open_intent_from_grid = grid_open_intent;
                     let start_fs_load_perf_t0 = start_fs_open_perf_span(&perf);
-                    self.start_fs_load(idx);
+                    self.start_media_load_with_origin(
+                        idx,
+                        match history_trigger {
+                            HistoryTrigger::UserChosen => {
+                                crate::video::PlaybackStartOrigin::NewSource
+                            }
+                            HistoryTrigger::AutoAdvance => {
+                                crate::video::PlaybackStartOrigin::ContinuousAdvance
+                            }
+                        },
+                    );
                     finish_fs_open_perf_span(
                         &mut perf,
                         FsOpenPerfSpan::StartFsLoad,
@@ -62015,7 +62122,10 @@ impl App {
                 // cache があれば再生再開、無ければ start_fs_load が headless player を作る。
                 if self.fs_cache.contains_key(&idx) {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-                        player.set_playing(true);
+                        player.set_playing_with_origin(
+                            true,
+                            crate::video::PlaybackStartOrigin::NewSource,
+                        );
                     }
                     // ノーマライズ UI 状態は close_fullscreen で normalize_ui_states が cleanup
                     // されるので、キャッシュ再生で戻ってきたら再同期する (でないと player には
@@ -62046,7 +62156,17 @@ impl App {
                     // これで「音声 × 一覧から開く」設定 (music_open_resume) が効く (Codex P2)。
                     self.fs_open_intent_from_grid = grid_open_intent;
                     let start_fs_load_perf_t0 = start_fs_open_perf_span(&perf);
-                    self.start_fs_load(idx);
+                    self.start_media_load_with_origin(
+                        idx,
+                        match history_trigger {
+                            HistoryTrigger::UserChosen => {
+                                crate::video::PlaybackStartOrigin::NewSource
+                            }
+                            HistoryTrigger::AutoAdvance => {
+                                crate::video::PlaybackStartOrigin::ContinuousAdvance
+                            }
+                        },
+                    );
                     finish_fs_open_perf_span(
                         &mut perf,
                         FsOpenPerfSpan::StartFsLoad,
@@ -68418,6 +68538,12 @@ impl App {
             #[cfg(windows)]
             native_output_config,
         );
+        #[cfg(windows)]
+        player.bind_playback_viewer_context(self.projected_viewer_context_id().serial());
+        #[cfg(windows)]
+        if let Some(reader) = self.effetune.auto_reader() {
+            player.set_auto_presentation_reader(reader);
+        }
         player.set_playback_speed(self.video_playback_speed);
         if play_test_mute || self.video_session_muted {
             player.set_muted(true);
@@ -68858,6 +68984,12 @@ impl App {
         );
         // 音声ファイルは動画の hidden 音声モードと同じ readiness 要件を使う。
         player.set_media_visual_mode(music_core::MediaVisualMode::Music);
+        #[cfg(windows)]
+        player.bind_playback_viewer_context(self.projected_viewer_context_id().serial());
+        #[cfg(windows)]
+        if let Some(reader) = self.effetune.auto_reader() {
+            player.set_auto_presentation_reader(reader);
+        }
         player.set_playback_speed(self.video_playback_speed);
         if self.video_session_muted {
             player.set_muted(true);
@@ -68899,9 +69031,24 @@ impl App {
         self.start_fs_load_with_contract(idx, FsPageLoadContract::Sequential);
     }
 
+    fn start_media_load_with_origin(
+        &mut self,
+        idx: usize,
+        origin: crate::video::PlaybackStartOrigin,
+    ) {
+        let purpose = FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx));
+        self.start_fs_load_with_purpose(idx, purpose, FsPageLoadContract::Sequential, origin);
+        self.register_media_playback_origin(idx, origin);
+    }
+
     fn start_fs_load_with_contract(&mut self, idx: usize, contract: FsPageLoadContract) {
         let purpose = FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx));
-        self.start_fs_load_with_purpose(idx, purpose, contract);
+        self.start_fs_load_with_purpose(
+            idx,
+            purpose,
+            contract,
+            crate::video::PlaybackStartOrigin::NewSource,
+        );
     }
 
     fn start_fs_load_with_purpose(
@@ -68909,6 +69056,7 @@ impl App {
         idx: usize,
         purpose: FsLoadPurpose,
         contract: FsPageLoadContract,
+        playback_origin: crate::video::PlaybackStartOrigin,
     ) {
         // 360 度パノラマビュー Phase 2a: 内部で使う tee 判定パラメータ。
         // `start_fs_load` 開始時点で App の状態をスナップショットして worker に渡す
@@ -69046,6 +69194,7 @@ impl App {
                     #[cfg(windows)]
                     native_config,
                 );
+                player.classify_pending_playback_start(playback_origin);
                 #[cfg(windows)]
                 if native_config_missing {
                     player.fail_native_init(
@@ -69105,6 +69254,7 @@ impl App {
                     from_grid,
                     !self.remote_session_blocks_local_control(),
                 );
+                player.classify_pending_playback_start(playback_origin);
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {
@@ -70237,6 +70387,8 @@ impl App {
         let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted();
         if !preserve_detached_for_folder_nav {
             self.viewer_presentation = self.non_detached_viewer_presentation();
+            #[cfg(windows)]
+            self.publish_effetune_auto_fullscreen();
             self.last_viewer_sync_stamp = None;
             self.detached_viewer_focus_requested = false;
             self.detached_viewer_recreate_on_next_render = false;
@@ -70327,6 +70479,8 @@ impl App {
                 self.fs_open_intent_from_grid = false;
                 self.fs_viewport_shown = true;
                 self.viewer_presentation = viewer_presentation;
+                #[cfg(windows)]
+                self.publish_effetune_auto_fullscreen();
                 self.fs_viewport_presentation = fs_viewport_presentation;
                 self.write_detached_viewer_borderless_state(
                     detached_viewer_borderless_fullscreen,
@@ -70705,6 +70859,8 @@ impl App {
         }
         self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         // A true viewer close ends ownership of the last painted page layout. Temporary context
         // parking does not enter this teardown and therefore keeps its context-local layout.
         self.fullscreen_page_layout.clear();
@@ -76136,7 +76292,12 @@ impl App {
             target_idx: idx,
             started_at: std::time::Instant::now(),
         };
-        self.start_fs_load_with_purpose(idx, purpose, FsPageLoadContract::Sequential);
+        self.start_fs_load_with_purpose(
+            idx,
+            purpose,
+            FsPageLoadContract::Sequential,
+            crate::video::PlaybackStartOrigin::NewSource,
+        );
         self.fs_pending
             .get(&idx)
             .is_some_and(|pending| pending.purpose == purpose)
@@ -79212,6 +79373,8 @@ impl App {
             return;
         }
         self.viewer_presentation = target_presentation;
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.native_video_in_window_active =
             matches!(target_presentation, ViewerPresentation::MainWindow);
         self.last_viewer_sync_stamp =
@@ -85219,7 +85382,7 @@ impl App {
         if next_idx == fs_idx {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }
@@ -85249,6 +85412,10 @@ impl App {
             self.fs_video_open_ignore_resume_once = true;
             self.open_fullscreen(next_idx, history_trigger);
         }
+        self.register_media_playback_origin(
+            next_idx,
+            crate::video::PlaybackStartOrigin::ContinuousAdvance,
+        );
     }
 
     /// 音声モードにトグルした動画 (`video_audio_mode == Some(fs_idx)`) が連続再生 EOF に達した
@@ -85354,7 +85521,7 @@ impl App {
             // フォルダ内に動画が 1 本だけ: 先頭へ戻して再生継続 (音声モード維持)。
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }
@@ -85381,7 +85548,7 @@ impl App {
             ));
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
         }
     }
@@ -85640,7 +85807,7 @@ impl App {
         if next_idx == fs_idx {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }
@@ -85652,6 +85819,10 @@ impl App {
         // 手動の音声前/次ファイルナビと同じ着地経路 (open_fullscreen が Audio → 音楽ビューへ
         // dispatch、build_audio_player_for_open は autoplay=true)。
         self.open_fullscreen_from_fs_navigation(ctx, next_idx, history_trigger);
+        self.register_media_playback_origin(
+            next_idx,
+            crate::video::PlaybackStartOrigin::ContinuousAdvance,
+        );
     }
 
     /// ParkedLive poll 中の音声 EOF 進行。通常の `open_fullscreen` 系へ入ると active session /
@@ -85664,7 +85835,10 @@ impl App {
 
         if self.fs_cache.contains_key(&next_idx) {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&next_idx) {
-                player.set_playing(true);
+                player.set_playing_with_origin(
+                    true,
+                    crate::video::PlaybackStartOrigin::ContinuousAdvance,
+                );
             }
             self.apply_music_loop_mode(next_idx);
             self.init_normalize_state_for_opened_video(next_idx);
@@ -85672,6 +85846,10 @@ impl App {
         } else {
             self.start_fs_load(next_idx);
         }
+        self.register_media_playback_origin(
+            next_idx,
+            crate::video::PlaybackStartOrigin::ContinuousAdvance,
+        );
 
         crate::logger::log(format!(
             "[native-video] parked audio EOF advanced without open_fullscreen: target_idx={next_idx} \
@@ -85689,6 +85867,8 @@ impl App {
         self.sync_main_selection_from_viewer_idx(next_idx);
         self.fullscreen_epub_source = None;
         self.fullscreen_idx = Some(next_idx);
+        #[cfg(windows)]
+        self.publish_effetune_auto_fullscreen();
         self.video_zoom_state = None;
         self.video_audio_mode = None;
         self.video_audio_vst = None;
@@ -85763,6 +85943,10 @@ impl App {
         let mut native_events: Vec<(usize, crate::video::NativeVideoOutputEventEnvelope)> =
             Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
+        #[cfg(windows)]
+        let playback_viewer_context = self.projected_viewer_context_id().serial();
+        #[cfg(windows)]
+        let mut auto_video_successes = Vec::new();
         #[cfg(windows)]
         let mut anime4k_info_ready_indices: Vec<usize> = Vec::new();
         // 連続再生 EOF の振り分け種別 (Inc 7):
@@ -85847,6 +86031,8 @@ impl App {
                     is_audio_file,
                     video_audio_mode == Some(*idx),
                 ));
+                #[cfg(windows)]
+                player.bind_playback_viewer_context(playback_viewer_context);
                 if let Some(d) = player.tick(ctx) {
                     merge_repaint_deadline(&mut next_repaint, Some(d));
                 }
@@ -85854,6 +86040,18 @@ impl App {
                     self.settings
                         .video_audio_track_choices
                         .insert(crate::adjustment_db::normalize_path(player.path()), choice);
+                }
+                #[cfg(windows)]
+                if let Some(success) = player.take_playback_success() {
+                    // fs_cache is bound to this mounted context; only its current real-file
+                    // video is adopted, never an audio-mode or unadopted cached player.
+                    if success.viewer_context == Some(playback_viewer_context)
+                        && self.fullscreen_idx == Some(*idx)
+                        && video_audio_mode != Some(*idx)
+                        && matches!(self.items.get(*idx), Some(GridItem::Video(path)) if path == player.path())
+                    {
+                        auto_video_successes.push((*idx, player.path().to_path_buf(), success));
+                    }
                 }
                 resume_save_playing |= player.is_playing();
                 #[cfg(windows)]
@@ -85951,6 +86149,7 @@ impl App {
                 }
             }
         }
+
         #[cfg(windows)]
         for idx in &active_video_indices {
             if let Some(stream_index) = self.fs_cache.get(idx).and_then(|entry| match entry {
@@ -86183,6 +86382,22 @@ impl App {
                 self.show_feedback_toast(format!("動画を再生できません: {err}"));
             }
             return;
+        }
+        // Sole automatic decision boundary: adopted playback facts survive all native
+        // pause/close/source-result processing above, or are discarded in this frame.
+        #[cfg(all(windows, not(feature = "portable")))]
+        for (idx, path, success) in auto_video_successes {
+            if self.fullscreen_idx == Some(idx)
+                && self.video_audio_mode != Some(idx)
+                && matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { player, .. })
+                    if player.path() == &path && player.playback_success_is_current(success.id))
+            {
+                self.effetune.try_auto_open(
+                    success.projection,
+                    self.settings.effetune_gui_pos,
+                    self.settings.effetune_gui_size,
+                );
+            }
         }
         if do_save {
             self.video_resume_last_save = Some(now);

@@ -1365,6 +1365,7 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) idx: usize,
     pub(crate) path: std::path::PathBuf,
     pub(crate) from_grid: bool,
+    pub(crate) playback_origin: crate::video::PlaybackStartOrigin,
     pub(crate) autoplay_override: Option<bool>,
     pub(crate) ignore_resume: bool,
     pub(crate) wait_for_detached_host: bool,
@@ -1834,7 +1835,7 @@ impl App {
         state.cancel();
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if state.was_playing {
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
             }
             player.set_audio_preroll_suspended(false);
         }
@@ -2381,6 +2382,7 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override,
             ignore_resume,
             wait_for_detached_host: false,
@@ -2429,6 +2431,7 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override,
             ignore_resume,
             wait_for_detached_host: true,
@@ -2512,6 +2515,7 @@ impl App {
         let idx = pending.idx;
         let path = pending.path.clone();
         let from_grid = pending.from_grid;
+        let playback_origin = pending.playback_origin;
         let autoplay_override = pending.autoplay_override;
         let ignore_resume = pending.ignore_resume;
         let wait_for_detached_host = pending.wait_for_detached_host;
@@ -2609,6 +2613,7 @@ impl App {
                 );
             }
             resume_open(self, idx);
+            self.register_media_playback_origin(idx, playback_origin);
             ctx.request_repaint();
             return;
         }
@@ -3354,7 +3359,7 @@ impl App {
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
                 player.clear_audio_output_buffer();
                 player.take_native_output()
             }
@@ -3981,6 +3986,10 @@ impl App {
         if audio_mode_after_swap {
             new_player.set_media_visual_mode(music_core::MediaVisualMode::Music);
         }
+        if matches!(history_trigger, crate::app::HistoryTrigger::AutoAdvance) {
+            new_player
+                .register_playback_start(crate::video::PlaybackStartOrigin::ContinuousAdvance);
+        }
         new_player.attach_native_output(native_output);
         let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
         new_player.switch_native_source(payload);
@@ -4055,7 +4064,7 @@ impl App {
 
         if reason == "tile" {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
             }
             self.video_tile_mode_active = true;
             self.video_tile_swap_pending = Some(VideoTileSwapPending {
@@ -5089,6 +5098,7 @@ impl App {
         } else {
             ViewerPresentation::Fullscreen
         };
+        self.publish_effetune_auto_fullscreen();
         if in_window
             && self
                 .fullscreen_idx
@@ -5156,6 +5166,7 @@ impl App {
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
+        self.publish_effetune_auto_fullscreen();
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
             self.ensure_mounted_detached_session_binding(id);
@@ -7109,6 +7120,11 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => !player.intent_playing(),
             _ => false,
         };
+        if will_request_play {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.register_playback_start(crate::video::PlaybackStartOrigin::UserPlay);
+            }
+        }
         if will_request_play && self.start_normalize_scan_for_deferred_play_intent(fs_idx) {
             self.mark_native_video_hud_activity(ctx);
             return;
@@ -7138,7 +7154,7 @@ impl App {
             return;
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_playing(false);
+            player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
         }
         crate::ui_helpers::open_url(&url);
         self.mark_native_video_hud_activity(ctx);
@@ -7542,7 +7558,8 @@ impl App {
                 if state.was_playing
                     && player.applied_audio_stream_index() == Some(state.stream_index)
                 {
-                    player.set_playing(true);
+                    player
+                        .set_playing_internal(true, crate::video::InternalContinuation::Normalize);
                     player.set_audio_preroll_suspended(false);
                 }
             }
@@ -7614,7 +7631,10 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = owner.fs_cache.get(&state.fs_idx) {
                 if player.path() == state.file_path.as_path() {
                     if state.was_playing {
-                        player.set_playing(true);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                     }
                     player.set_audio_preroll_suspended(false);
                     owner.normalize_ui_states.insert(
@@ -7727,7 +7747,7 @@ impl App {
                     "[native-video] deferred normalize scan not started; resume playback idx={fs_idx}"
                 ));
             }
-            player.set_playing(true);
+            player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
             player.set_audio_preroll_suspended(false);
         }
     }
@@ -7803,7 +7823,7 @@ impl App {
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_audio_preroll_suspended(true);
-            player.set_playing(false);
+            player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
         }
         true
     }
@@ -7851,7 +7871,7 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if was_playing {
                 player.set_audio_preroll_suspended(true);
-                player.set_playing(false);
+                player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
             }
             // A manual scan can supersede an in-flight lookup. Invalidate its exact request
             // after suspension so a late cache result cannot replace this scan's gain.
@@ -7907,7 +7927,10 @@ impl App {
                 if was_playing {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                         player.set_normalize_gain_for_stream(stream_index, 1.0);
-                        player.set_playing(true);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                         player.set_audio_preroll_suspended(false);
                     }
                 }
@@ -7990,7 +8013,10 @@ impl App {
                         "scan_provisional",
                     );
                     if was_playing && player.applied_audio_stream_index() == Some(stream_index) {
-                        player.set_playing(true);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                         player.set_audio_preroll_suspended(false);
                     }
                 }
@@ -8061,7 +8087,10 @@ impl App {
                         if state.was_playing
                             && player.applied_audio_stream_index() == Some(state.stream_index)
                         {
-                            player.set_playing(true);
+                            player.set_playing_internal(
+                                true,
+                                crate::video::InternalContinuation::Normalize,
+                            );
                             player.set_audio_preroll_suspended(false);
                         }
                     }
@@ -8111,7 +8140,10 @@ impl App {
                             if state.was_playing
                                 && player.applied_audio_stream_index() == Some(state.stream_index)
                             {
-                                player.set_playing(true);
+                                player.set_playing_internal(
+                                    true,
+                                    crate::video::InternalContinuation::Normalize,
+                                );
                                 player.set_audio_preroll_suspended(false);
                             }
                         }
@@ -14936,7 +14968,7 @@ impl App {
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
                 player.clear_audio_output_buffer();
                 player.take_native_output()
             }
@@ -14976,6 +15008,10 @@ impl App {
             crate::video::VideoOutputConsumer::Presentation,
             None,
         );
+        if matches!(history_trigger, crate::app::HistoryTrigger::AutoAdvance) {
+            new_player
+                .register_playback_start(crate::video::PlaybackStartOrigin::ContinuousAdvance);
+        }
         new_player.attach_native_output(native_output);
         self.video_zoom_state = None;
         new_player.set_native_video_zoom_state(None);
@@ -15144,7 +15180,7 @@ impl App {
         };
 
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-            player.set_playing(false);
+            player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
         }
         self.video_tile_mode_active = true;
         self.video_tile_swap_pending = Some(VideoTileSwapPending {

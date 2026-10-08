@@ -1385,6 +1385,13 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn presentation(self) -> ViewerPresentation {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.viewer_presentation,
+            ContextRefSource::AtRest(bundle) => bundle.viewer_session.presentation,
+        }
+    }
+
     pub(in crate::app) fn fullscreen_idx(self) -> Option<usize> {
         match self.source {
             ContextRefSource::Mounted(app) => app.fullscreen_idx,

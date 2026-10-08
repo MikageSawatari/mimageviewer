@@ -1481,3 +1481,13 @@ CPU time とログ増加量も含むリリース前手順は
 4. ワーカー側で `perf::event("<cat>", "begin"/"end", key, req.input_seq, &[...])` を emit
 5. Ready 遷移 (texture upload 完了) で `perf::event("<cat>", "ready", ...)` を emit
 6. `docs/async-architecture.md` のこの表にエントリを追加
+
+### §1.337 再生成功からの EffeTune 自動表示
+
+EngineActor の PlaybackStart が NewSource／UserPlay／ContinuousAdvance を所有し、Playing 確定時に
+共有 GuiGate の5要因 atomic projection と viewer binding を採取する。normalize／seek／DSP／loop は内部継続である。
+App は不適格な通知も消費し、現行 source／start ID／viewer を検査して既存 controller の Armed/Spent と
+Loading／host-control queue へ合流する。AutoVideo permit は成功時 revision を host GUI 表示直前まで保持する。
+設定OFF・root hide・全画面・最小化・Remote は各正本の境界で公開し、復帰でも古い permit は再利用しない。
+成功した手動表示も古い AutoVideo を失効させる。自動表示は非アクティブとし、既存 Manual と表示済み窓の
+visibility lifecycle、worker 数、owner=0 を維持する。

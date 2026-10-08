@@ -57786,6 +57786,7 @@ mod still_window_mode_key_tests {
             idx: target_idx,
             path: target_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -70874,6 +70875,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: video,
             path: video_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -80626,6 +80628,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: 0,
             path,
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: true,
@@ -99264,3 +99267,7 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
 
 #[path = "tests/startup_restore.rs"]
 mod startup_restore_tests;
+
+#[cfg(all(windows, not(feature = "portable")))]
+#[path = "tests/effetune_auto_open.rs"]
+mod effetune_auto_open_tests;

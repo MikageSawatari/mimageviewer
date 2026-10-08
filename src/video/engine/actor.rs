@@ -47,6 +47,65 @@ pub enum TransportCommand {
     Shutdown,
 }
 
+/// Only explicit logical starts can produce an automatic-presentation success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackStartOrigin {
+    NewSource,
+    UserPlay,
+    ContinuousAdvance,
+}
+
+/// Transport operations which continue the same logical playback start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InternalContinuation {
+    Normalize,
+    Seek,
+    Dsp,
+    AudioTrack,
+    Loop,
+    Transport,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaybackStartContext {
+    pub origin: PlaybackStartOrigin,
+    pub(crate) auto_presentation: Option<crate::effetune::gui_gate::AutoPresentationReader>,
+}
+
+impl Default for PlaybackStartContext {
+    fn default() -> Self {
+        Self {
+            origin: PlaybackStartOrigin::NewSource,
+            auto_presentation: None,
+        }
+    }
+}
+
+/// Immutable success fact captured at the first actual Playing transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackSuccess {
+    pub id: u64,
+    pub origin: PlaybackStartOrigin,
+    pub viewer_context: Option<u64>,
+    pub(crate) projection: crate::effetune::gui_gate::AutoPresentationSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackStart {
+    None,
+    AwaitingSuccess {
+        id: u64,
+        origin: PlaybackStartOrigin,
+    },
+    SuccessReady(PlaybackSuccess),
+    Established {
+        id: u64,
+        origin: PlaybackStartOrigin,
+    },
+}
+
+static NEXT_PLAYBACK_START_ID: AtomicU64 = AtomicU64::new(1);
+
 /// VideoEngine 構築時の options (= `VideoPlayer::open(path, opts)` の opts)。
 /// resume seek を atomic open path に取り込むため、`open` に渡す。
 #[derive(Debug, Clone)]
@@ -57,6 +116,7 @@ pub struct OpenOptions {
     pub resume_secs: Option<f64>,
     pub loop_enabled: bool,
     pub hw_decode: bool,
+    pub playback_start: PlaybackStartContext,
 }
 
 impl Default for OpenOptions {
@@ -67,6 +127,7 @@ impl Default for OpenOptions {
             resume_secs: None,
             loop_enabled: false,
             hw_decode: false,
+            playback_start: PlaybackStartContext::default(),
         }
     }
 }
@@ -149,6 +210,8 @@ pub struct EngineActor {
     /// 現在の再生速度。現行 path の source of truth は AvClock だが、EngineActor
     /// 内部の MasterClock も同じ速度で動かして future integration と tests を保つ。
     playback_speed: f64,
+    playback_start: PlaybackStart,
+    viewer_context: Option<u64>,
 }
 
 /// EngineState を `AtomicU8` で publish するための discriminant code。
@@ -198,7 +261,91 @@ impl EngineActor {
             last_audio_epoch: initial_serial,
             opts,
             playback_speed: 1.0,
+            playback_start: PlaybackStart::None,
+            viewer_context: None,
         }
+    }
+
+    /// Register before normalization/DSP delegation can pause the transport.
+    pub fn register_playback_start(&mut self, origin: PlaybackStartOrigin) {
+        if origin == PlaybackStartOrigin::UserPlay {
+            if matches!(self.playback_start, PlaybackStart::AwaitingSuccess { .. }) {
+                return;
+            }
+            if self.opts.autoplay && self.state != EngineState::Eof {
+                return;
+            }
+        }
+        self.playback_start = PlaybackStart::AwaitingSuccess {
+            id: NEXT_PLAYBACK_START_ID.fetch_add(1, Ordering::Relaxed),
+            origin,
+        };
+    }
+
+    /// Classify an initial source start before readiness without creating another ID.
+    /// Cached playback which already succeeded keeps its original logical start.
+    pub fn classify_pending_playback_start(&mut self, origin: PlaybackStartOrigin) {
+        if let PlaybackStart::AwaitingSuccess { id, .. } = self.playback_start {
+            self.playback_start = PlaybackStart::AwaitingSuccess { id, origin };
+        }
+    }
+
+    pub fn apply_internal_continuation(
+        &mut self,
+        playing: bool,
+        _continuation: InternalContinuation,
+    ) {
+        // Pausing this way changes transport intent, never logical-start ownership.
+        self.apply_command(if playing {
+            TransportCommand::Play
+        } else {
+            TransportCommand::Pause
+        });
+    }
+
+    pub fn bind_playback_viewer_context(&mut self, viewer_context: u64) {
+        let next = Some(viewer_context);
+        if self.viewer_context == next {
+            return;
+        }
+        self.viewer_context = next;
+        if let PlaybackStart::SuccessReady(success) = self.playback_start {
+            // Moving a player cannot redeliver success owned by its old viewer.
+            // Awaiting/established transport is otherwise retained unchanged.
+            if success.viewer_context != next {
+                self.playback_start = PlaybackStart::Established {
+                    id: success.id,
+                    origin: success.origin,
+                };
+            }
+        }
+    }
+
+    pub fn discard_playback_start(&mut self) {
+        self.playback_start = PlaybackStart::None;
+    }
+
+    /// Drain even when automatic presentation is disabled or ineligible.
+    pub fn take_playback_success(&mut self) -> Option<PlaybackSuccess> {
+        let PlaybackStart::SuccessReady(success) = self.playback_start else {
+            return None;
+        };
+        self.playback_start = PlaybackStart::Established {
+            id: success.id,
+            origin: success.origin,
+        };
+        Some(success)
+    }
+
+    pub fn playback_success_is_current(&self, id: u64) -> bool {
+        matches!(self.playback_start, PlaybackStart::Established { id: current, .. } if current == id)
+    }
+
+    pub(crate) fn set_auto_presentation_reader(
+        &mut self,
+        reader: crate::effetune::gui_gate::AutoPresentationReader,
+    ) {
+        self.opts.playback_start.auto_presentation = Some(reader);
     }
 
     /// 外部から `Acquire` で state code を読む public な entry point。
@@ -306,6 +453,24 @@ impl EngineActor {
         self.last_audio_epoch = self.current_seek_epoch();
         self.clock.set_anchor(anchor);
         self.state = EngineState::Playing;
+        if let PlaybackStart::AwaitingSuccess { id, origin } = self.playback_start {
+            let projection = self
+                .opts
+                .playback_start
+                .auto_presentation
+                .as_ref()
+                .map(|reader| reader.snapshot())
+                .unwrap_or(crate::effetune::gui_gate::AutoPresentationSnapshot {
+                    revision: 0,
+                    allowed: false,
+                });
+            self.playback_start = PlaybackStart::SuccessReady(PlaybackSuccess {
+                id,
+                origin,
+                viewer_context: self.viewer_context,
+                projection,
+            });
+        }
         // ⚠️ 順序固定: AvClock 更新 → published_state.store。詳細は doc コメント参照。
         self.av_clock.engine_start_playing(anchor);
         self.published_state
@@ -394,6 +559,9 @@ impl EngineActor {
     /// Phase 3b で本関数を直接呼ぶため。Phase 3d でカプセル化する予定。
     pub fn begin_loading(&mut self) {
         debug_assert_eq!(self.state, EngineState::Idle);
+        if self.opts.autoplay {
+            self.register_playback_start(self.opts.playback_start.origin);
+        }
         let initial_pts = self.opts.resume_secs.unwrap_or(0.0);
         self.transition_to_loading(initial_pts);
     }
@@ -453,6 +621,7 @@ impl EngineActor {
                 // Phase 3b で配線したときに本 handler は no-op で良い。
             }
             TransportCommand::Shutdown => {
+                self.discard_playback_start();
                 // run loop 側で扱う (= apply_command の呼び出し元が break する)
             }
         }
@@ -626,6 +795,7 @@ impl EngineActor {
                 }
             }
             DecoderEvent::Failed { reason } => {
+                self.discard_playback_start();
                 crate::logger::log(format!("[engine] decoder failed: {reason}"));
                 // 致命的エラー: state を Idle に戻す (run loop は別途 channel close で抜ける)
                 self.transition_to_loading(self.clock.anchor().pts_secs);
@@ -788,6 +958,316 @@ mod tests {
 
     fn fresh_actor() -> EngineActor {
         fresh_actor_with_opts(OpenOptions::default())
+    }
+
+    fn playback_start_gate(enabled: bool) -> Arc<crate::effetune::gui_gate::GuiGate> {
+        use crate::effetune::gui_gate::{AutoSuppression, GuiGate};
+        let gate = GuiGate::create_for_test();
+        gate.set_auto_factor(AutoSuppression::RootHidden, false);
+        gate.set_auto_factor(AutoSuppression::SettingOff, !enabled);
+        gate
+    }
+
+    fn playback_start_actor(
+        autoplay: bool,
+        enabled: bool,
+    ) -> (EngineActor, Arc<crate::effetune::gui_gate::GuiGate>) {
+        let gate = playback_start_gate(enabled);
+        let mut actor = fresh_actor_with_opts(OpenOptions {
+            autoplay,
+            playback_start: PlaybackStartContext {
+                origin: PlaybackStartOrigin::NewSource,
+                auto_presentation: Some(gate.auto_reader()),
+            },
+            ..Default::default()
+        });
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 60.0,
+            has_audio: false,
+            has_video: true,
+        });
+        (actor, gate)
+    }
+
+    fn playback_start_first_frame(actor: &mut EngineActor) {
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: actor.current_seek_epoch(),
+            pts: 0.0,
+        });
+    }
+
+    #[test]
+    fn playback_start_autoplay_success_is_readiness_confirmed_and_consumed_once() {
+        let (mut actor, gate) = playback_start_actor(true, true);
+        assert!(actor.take_playback_success().is_none());
+        playback_start_first_frame(&mut actor);
+        let success = actor
+            .take_playback_success()
+            .expect("actual Playing success");
+        assert_eq!(success.origin, PlaybackStartOrigin::NewSource);
+        assert_eq!(success.projection, gate.auto_snapshot());
+        assert!(success.projection.allowed);
+        assert!(actor.playback_success_is_current(success.id));
+        assert!(actor.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_paused_open_first_user_play_survives_normalize() {
+        let (mut actor, _) = playback_start_actor(false, true);
+        playback_start_first_frame(&mut actor);
+        assert_eq!(actor.state, EngineState::Paused);
+        assert!(actor.take_playback_success().is_none());
+        actor.register_playback_start(PlaybackStartOrigin::UserPlay);
+        actor.apply_internal_continuation(false, InternalContinuation::Normalize);
+        assert!(actor.take_playback_success().is_none());
+        actor.apply_internal_continuation(true, InternalContinuation::Normalize);
+        let success = actor
+            .take_playback_success()
+            .expect("first play after normalize");
+        assert_eq!(success.origin, PlaybackStartOrigin::UserPlay);
+        assert!(actor.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_off_success_drained_then_on_normalize_never_restarts() {
+        use crate::effetune::gui_gate::AutoSuppression;
+        let (mut actor, gate) = playback_start_actor(true, false);
+        playback_start_first_frame(&mut actor);
+        let success = actor.take_playback_success().unwrap();
+        assert!(!success.projection.allowed);
+        gate.set_auto_factor(AutoSuppression::SettingOff, false);
+        for branch in [
+            "provisional",
+            "complete",
+            "failed",
+            "cancel",
+            "supersede",
+            "start_failed",
+            "deferred_not_started",
+        ] {
+            actor.apply_internal_continuation(false, InternalContinuation::Normalize);
+            actor.apply_internal_continuation(true, InternalContinuation::Normalize);
+            assert!(
+                actor.take_playback_success().is_none(),
+                "normalize branch {branch}"
+            );
+            assert!(actor.playback_success_is_current(success.id));
+        }
+    }
+
+    #[test]
+    fn playback_start_internal_seek_dsp_track_and_loop_preserve_established_start() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        let success = actor.take_playback_success().unwrap();
+        for continuation in [
+            InternalContinuation::Seek,
+            InternalContinuation::Dsp,
+            InternalContinuation::AudioTrack,
+            InternalContinuation::Loop,
+            InternalContinuation::Transport,
+        ] {
+            actor.apply_internal_continuation(false, continuation);
+            actor.handle_seek_request(1.0);
+            actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+                epoch: actor.current_seek_epoch(),
+                actual_pts: 1.0,
+            });
+            actor.apply_internal_continuation(true, continuation);
+            playback_start_first_frame(&mut actor);
+            assert!(
+                actor.take_playback_success().is_none(),
+                "continuation {continuation:?}"
+            );
+            assert!(actor.playback_success_is_current(success.id));
+        }
+    }
+
+    #[test]
+    fn playback_start_success_keeps_original_revision_across_all_suppression_round_trips() {
+        use crate::effetune::gui_gate::AutoSuppression;
+        for factor in [
+            AutoSuppression::SettingOff,
+            AutoSuppression::RootHidden,
+            AutoSuppression::Fullscreen,
+            AutoSuppression::Minimized,
+            AutoSuppression::RemoteBlocked,
+        ] {
+            let (mut actor, gate) = playback_start_actor(true, true);
+            playback_start_first_frame(&mut actor);
+            let at_success = gate.auto_snapshot();
+            gate.set_auto_factor(factor, true);
+            gate.set_auto_factor(factor, false);
+            let success = actor.take_playback_success().unwrap();
+            assert_eq!(success.projection, at_success);
+            assert!(gate.auto_snapshot().allowed);
+            assert_ne!(
+                success.projection.revision,
+                gate.auto_snapshot().revision,
+                "factor {factor:?}"
+            );
+            assert!(actor.take_playback_success().is_none());
+        }
+    }
+
+    #[test]
+    fn playback_start_success_minimize_round_trip_before_poll_keeps_stale_revision() {
+        use crate::effetune::gui_gate::AutoSuppression;
+        let (mut actor, gate) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        let at_success = gate.auto_snapshot();
+        gate.note_minimized();
+        gate.set_auto_factor(AutoSuppression::Minimized, false);
+        let success = actor.take_playback_success().unwrap();
+        assert_eq!(success.projection, at_success);
+        assert_ne!(success.projection.revision, gate.auto_snapshot().revision);
+    }
+
+    #[test]
+    fn playback_start_success_remote_round_trip_before_poll_keeps_stale_revision() {
+        let (mut actor, gate) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        let at_success = gate.auto_snapshot();
+        gate.publish_remote_with_revision(Some(1), true, true);
+        gate.publish_remote(Some(1), true); // Owned and drain remain blocked.
+        gate.publish_remote(Some(1), false);
+        let success = actor.take_playback_success().unwrap();
+        assert_eq!(success.projection, at_success);
+        assert_ne!(success.projection.revision, gate.auto_snapshot().revision);
+    }
+
+    #[test]
+    fn playback_start_blocked_success_never_refreshes_snapshot_after_restore() {
+        use crate::effetune::gui_gate::AutoSuppression;
+        for factor in [
+            AutoSuppression::SettingOff,
+            AutoSuppression::RootHidden,
+            AutoSuppression::Fullscreen,
+            AutoSuppression::Minimized,
+            AutoSuppression::RemoteBlocked,
+        ] {
+            let (mut actor, gate) = playback_start_actor(true, true);
+            gate.set_auto_factor(factor, true);
+            playback_start_first_frame(&mut actor);
+            let at_success = gate.auto_snapshot();
+            gate.set_auto_factor(factor, false);
+            let success = actor.take_playback_success().unwrap();
+            assert!(!success.projection.allowed);
+            assert_eq!(success.projection, at_success);
+            assert!(gate.auto_snapshot().allowed);
+        }
+    }
+
+    #[test]
+    fn playback_start_user_pause_and_failure_discard_unconsumed_or_drained_success() {
+        for drain_first in [false, true] {
+            let (mut actor, _) = playback_start_actor(true, true);
+            playback_start_first_frame(&mut actor);
+            let drained = drain_first.then(|| actor.take_playback_success().unwrap());
+            actor.discard_playback_start();
+            actor.apply_internal_continuation(false, InternalContinuation::Transport);
+            assert!(actor.take_playback_success().is_none());
+            if let Some(success) = drained {
+                assert!(!actor.playback_success_is_current(success.id));
+            }
+            actor.register_playback_start(PlaybackStartOrigin::UserPlay);
+            actor.apply_internal_continuation(true, InternalContinuation::Transport);
+            assert_eq!(
+                actor.take_playback_success().unwrap().origin,
+                PlaybackStartOrigin::UserPlay
+            );
+        }
+        let (mut actor, _) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        actor.handle_decoder_event(DecoderEvent::Failed {
+            reason: "test failure".into(),
+        });
+        assert!(actor.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_explicit_continuous_advance_supersedes_old_fact() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        let old = actor.take_playback_success().unwrap();
+        actor.register_playback_start(PlaybackStartOrigin::ContinuousAdvance);
+        assert!(!actor.playback_success_is_current(old.id));
+        actor.apply_internal_continuation(false, InternalContinuation::Transport);
+        actor.apply_internal_continuation(true, InternalContinuation::Transport);
+        let next = actor.take_playback_success().unwrap();
+        assert_ne!(next.id, old.id);
+        assert_eq!(next.origin, PlaybackStartOrigin::ContinuousAdvance);
+    }
+
+    #[test]
+    fn playback_start_viewer_move_before_success_captures_current_binding() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        actor.bind_playback_viewer_context(1);
+        actor.bind_playback_viewer_context(2);
+        playback_start_first_frame(&mut actor);
+        let success = actor.take_playback_success().unwrap();
+        assert_eq!(success.viewer_context, Some(2));
+        assert_eq!(success.origin, PlaybackStartOrigin::NewSource);
+    }
+
+    #[test]
+    fn playback_start_viewer_move_after_success_drops_old_fact_without_reemitting() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        actor.bind_playback_viewer_context(1);
+        playback_start_first_frame(&mut actor);
+        actor.bind_playback_viewer_context(2);
+        assert!(actor.take_playback_success().is_none());
+        actor.apply_internal_continuation(false, InternalContinuation::Normalize);
+        actor.apply_internal_continuation(true, InternalContinuation::Normalize);
+        assert!(actor.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_same_viewer_rebind_keeps_success_and_none_is_explicit() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        assert_eq!(actor.take_playback_success().unwrap().viewer_context, None);
+        let (mut actor, _) = playback_start_actor(true, true);
+        actor.bind_playback_viewer_context(1);
+        playback_start_first_frame(&mut actor);
+        actor.bind_playback_viewer_context(1);
+        assert_eq!(
+            actor.take_playback_success().unwrap().viewer_context,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn playback_start_initial_origin_classification_preserves_id_and_successful_cache() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        let PlaybackStart::AwaitingSuccess { id, .. } = actor.playback_start else {
+            panic!("autoplay must have one initial logical start");
+        };
+        actor.classify_pending_playback_start(PlaybackStartOrigin::ContinuousAdvance);
+        playback_start_first_frame(&mut actor);
+        actor.classify_pending_playback_start(PlaybackStartOrigin::UserPlay);
+        let success = actor.take_playback_success().unwrap();
+        assert_eq!(success.id, id);
+        assert_eq!(success.origin, PlaybackStartOrigin::ContinuousAdvance);
+        actor.classify_pending_playback_start(PlaybackStartOrigin::NewSource);
+        assert!(actor.playback_success_is_current(id));
+        assert!(actor.take_playback_success().is_none());
+        actor.discard_playback_start();
+        actor.classify_pending_playback_start(PlaybackStartOrigin::NewSource);
+        assert_eq!(actor.playback_start, PlaybackStart::None);
+    }
+
+    #[test]
+    fn playback_start_idempotent_user_play_does_not_create_new_start() {
+        let (mut actor, _) = playback_start_actor(true, true);
+        playback_start_first_frame(&mut actor);
+        let old = actor.take_playback_success().unwrap();
+        actor.register_playback_start(PlaybackStartOrigin::UserPlay);
+        actor.apply_internal_continuation(true, InternalContinuation::Transport);
+        assert!(actor.take_playback_success().is_none());
+        assert!(actor.playback_success_is_current(old.id));
     }
 
     #[test]

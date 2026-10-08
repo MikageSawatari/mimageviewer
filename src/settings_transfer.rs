@@ -391,6 +391,7 @@ preferences_policy! {
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
+        effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1581,7 +1582,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 447);
+        assert_eq!(entries.len(), 448);
         assert_eq!(
             entries
                 .iter()
@@ -1779,6 +1780,7 @@ mod tests {
         source.show_facet_sort = true;
         source.toolbar_folder_section_migrated = false;
         source.effetune_pre_limiter_enabled = false;
+        source.effetune_auto_open_on_video = true;
         source.effetune_keep_visible_when_minimized = true;
         source.window_pos = Some([100.0, 200.0]);
         source.toolbar_section_order.reverse();
@@ -1791,6 +1793,7 @@ mod tests {
             ("show_facet_sort", serde_json::json!(true)),
             ("toolbar_folder_section_migrated", serde_json::json!(false)),
             ("effetune_pre_limiter_enabled", serde_json::json!(false)),
+            ("effetune_auto_open_on_video", serde_json::json!(true)),
             (
                 "effetune_keep_visible_when_minimized",
                 serde_json::json!(true),
@@ -1812,7 +1815,7 @@ mod tests {
         let before = destination.clone();
         let parsed = parse_preferences(&document.to_string()).unwrap();
         let report = parsed.apply_to(&mut destination);
-        assert_eq!(report.unknown_count, 11);
+        assert_eq!(report.unknown_count, 12);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
 

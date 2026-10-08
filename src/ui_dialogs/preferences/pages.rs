@@ -8079,6 +8079,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_effetune_input_limit_settings(ui, &mut state.settings);
     });
     #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-auto-open", |ui, state| {
+        draw_effetune_auto_open_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-minimized", |ui, state| {
         draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
@@ -8223,6 +8227,22 @@ pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &m
              OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
         );
     }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_auto_open_on_video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+    )
+    .on_hover_text(
+        "初期値は OFF です。再生が始まったときに、この起動で一度だけ、キー操作を奪わずに開きます。\n\
+         全画面・最小化・トレイ格納・リモート閲覧中は開きません。復帰しただけでは開きません。\n\
+         音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
+         未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
+    );
     #[cfg(feature = "portable")]
     let _ = (ui, settings);
 }
