@@ -1,8 +1,8 @@
 # 音声サムネイル: 同名 sidecar・MP3 埋め込み画像の計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の §1.347。
-改訂: 2026-10-08 / 921f1e457 の再レビュー2件とRemote全catalog入口をコード照合し、受付証明とCacheOnly継続を根本修正 (§21)。
-**921f1e457 の再レビューは REVISE。前回8件の解消とfuzz代替の受入が伝達され、今回のRemote P2二件を根本修正し、自動再検証・確認build完了、独立再受入待ち (§21)。先頭 ID3v2 タグ限定と既決仕様を維持・実アプリ未起動。**
+改訂: 2026-10-08 / 5cd2dab23 の ACCEPT WITH CHANGES に伴うP3文書訂正。待機取消の保証と利用者確認をsession lifecycleに限定 (§21.2 / §21.4)。
+**利用者から伝達された5cd2dab23の再レビューは ACCEPT WITH CHANGES (待機取消の文書P3一件)。前回のRemote P2二件は解消、待機取消の保証を実装に合わせて文書訂正済み (§21)。既存の自動検証・確認build記録を保持。先頭 ID3v2 タグ限定と既決仕様を維持・実アプリ未起動。**
 利用者から伝達されたレビュー履歴: 前版は **ACCEPT**、R4 の改訂は **ACCEPT WITH CHANGES**。
 R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。
 R7 対応後の独立レビュー受入・全利用者質問決定済みは、2026-10-08 の実装依頼で伝達された。
@@ -1451,6 +1451,12 @@ Remote/Web/Nodeは `target/remote-fix-validation.json`、gateは§20.8の結果�
 以下の新しいP2二件をコードで再現し、両方を所有境界で修正した。指摘への異議なし。
 音声抽出・codec・EXIF・設定・UI・IPC wire formatは変更しない (IPC v67を維持)。
 
+2026-10-08 追記: 利用者から伝達された5cd2dab23の再レビューは **ACCEPT WITH CHANGES**。
+前回のP2二件と監査表のmutable open境界は確認済みとされた。P3は§21.2の待機取消保証と
+§21.4の利用者確認を§7.1のsession release / takeover / shutdownに合わせる文書訂正のみ。
+`session.rs`のdrainと`app.js`のfetch abortをコードで照合した。製品コードは変更せず、
+以下の前回テスト/build結果を保持し、今回の文書訂正ではテスト/buildを再実行しない。
+
 ### 21.1 PDF AI source callbackと共通PDF検証の受付証明
 
 AI操作入口は削除中にDisplayOnlyを捕捉していたが、source callbackに証明がなく、
@@ -1484,10 +1490,14 @@ Deleting終了後、一回だけ`open_existing_read_only_admitted`と対象key�
 全件削除でDBがなければ通常のNoThumbnailとなり、DBを再作成しない。
 
 ThumbnailEngineが持つ既存RemoteOperationCancellationのflagをContainerEngineへそのまま渡し、
-load/source/waitで共有する。切断・スクロール等の取消は待機中でもCancelled→Busyで終了する。
+load/source/waitで共有する。§7.1と同じく、待機取消の保証はsession release / takeover / shutdownに
+限定する。これらのsession drainでflagが更新されると、待機はCancelled→Busyで終了する
+(`session.rs:748`、takeoverは同322、releaseは同440、shutdownは`pipe.rs:620`からretire/drain)。
+スクロールやtile破棄はfetchをabortするだけで、coreの待機は止まらない
+(`app.js:9070`、個別Thumbnail cancel IPCなし)。その待機はDeleting終了またはsession取消まで続く。
 別cancel ownerやpending stateは追加しない。元の要求のwrite用proofを新世代へ更新しない。
 ZIPの代表・entry・directoryについて残存cacheを読むこと、DB内容が不変であることを検証する。
-実ThumbnailEngine.handleでDeleting中の待機、完了後の読取、完了前の取消も検証する。
+実ThumbnailEngine.handleでDeleting中の待機、完了後の読取、session取消flagによる完了前の取消も検証する。
 
 ### 21.3 Remote全catalog入口の監査
 
@@ -1551,7 +1561,9 @@ gate再利用のSHA照合は `target/audio-review2-gate-reuse.json`。
 利用者確認: キャッシュ管理で削除を開始し、画面を閉じてRemoteで未取得PDFのAIを要求する。
 削除をまたいでも原本判定/表示を継続し、旧要求がcatalog DBを再作成しない (自動回帰で確認)。
 プレビューなしRAWを含むZIPの既存cacheが期限削除で残る場合、削除完了後も表紙/entry/directoryを
-Remoteで再表示できる。削除中に画面を離れる/接続解除する場合は待機を取り消せる。
+Remoteで再表示できる。削除中の待機取消は、Remoteのログアウト/操作権返却 (session release)、
+別sessionへの操作権切替 (takeover)、または本体終了 (shutdown)で確認する。
+同じsession内のスクロール/画面離脱ではfetchだけがabortされ、coreの待機取消を期待しない。
 全件削除でcacheが消えた場合は通常のNoThumbnailとなる。
 起動前にinstalled/tray-resident mIVを閉じる (single-instance mutex共通)。
 通常の検証binaryは `%APPDATA%\mimageviewer` の実設定/データを更新し得る。
