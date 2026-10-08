@@ -6327,14 +6327,21 @@ enum DetachedPhysicalFolderOpenPoll {
 pub(crate) enum ConvertedArchiveSourceState {
     Pending,
     Direct(PathBuf),
-    CachedZip(PathBuf),
-    Unavailable,
+    CachedZip {
+        logical_source: PathBuf,
+        path: PathBuf,
+    },
+    // No loadable cache; retain the worker-confirmed logical book for its stable resume key.
+    // None means metadata/header resolution could not establish that identity.
+    Unavailable {
+        logical_source: Option<PathBuf>,
+    },
 }
 
 impl ConvertedArchiveSourceState {
     fn invalidate_cached_paths(paths: &mut HashMap<String, Self>) {
         for state in paths.values_mut() {
-            if matches!(state, Self::CachedZip(_)) {
+            if matches!(state, Self::CachedZip { .. }) {
                 *state = Self::Pending;
             }
         }
@@ -6342,8 +6349,8 @@ impl ConvertedArchiveSourceState {
 
     pub(crate) fn load_path(&self) -> Option<&Path> {
         match self {
-            Self::Direct(path) | Self::CachedZip(path) => Some(path),
-            Self::Pending | Self::Unavailable => None,
+            Self::Direct(path) | Self::CachedZip { path, .. } => Some(path),
+            Self::Pending | Self::Unavailable { .. } => None,
         }
     }
 
@@ -6355,8 +6362,8 @@ impl ConvertedArchiveSourceState {
         match self {
             Self::Pending => "pending",
             Self::Direct(_) => "direct",
-            Self::CachedZip(_) => "cached_zip",
-            Self::Unavailable => "unavailable",
+            Self::CachedZip { .. } => "cached_zip",
+            Self::Unavailable { .. } => "unavailable",
         }
     }
 }
@@ -6735,6 +6742,8 @@ fn resolve_converted_archive_candidate_with(
         return None;
     }
     let mut cache_src = candidate.path.clone();
+    let mut logical_source =
+        (!crate::rar_loader::is_rar_path(&candidate.path)).then(|| cache_src.clone());
     let mut cache_mtime = candidate.mtime;
     let mut cache_file_size = candidate.file_size;
     if crate::rar_loader::is_rar_path(&candidate.path) {
@@ -6743,6 +6752,7 @@ fn resolve_converted_archive_candidate_with(
         // a valid converted ZIP then avoids the full per-entry direct-read inspection entirely.
         if let Ok(resolved_path) = resolve_volume(&candidate.path) {
             cache_src = resolved_path;
+            logical_source = Some(cache_src.clone());
             if cache_src != candidate.path
                 && let Ok(metadata) = std::fs::metadata(&cache_src)
             {
@@ -6755,20 +6765,28 @@ fn resolve_converted_archive_candidate_with(
         return None;
     }
     if let Some(cached) = peek(&cache_src, cache_mtime, cache_file_size) {
-        return Some(ConvertedArchiveSourceState::CachedZip(cached));
+        return Some(ConvertedArchiveSourceState::CachedZip {
+            logical_source: cache_src.clone(),
+            path: cached,
+        });
     }
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
     if !crate::rar_loader::is_rar_path(&candidate.path) {
-        return Some(ConvertedArchiveSourceState::Unavailable);
+        return Some(ConvertedArchiveSourceState::Unavailable {
+            logical_source: Some(cache_src),
+        });
     }
     match inspect(&candidate.path, cancel) {
         Ok((crate::rar_loader::RarDirectReadDecision::Direct, resolved_path)) => {
             Some(ConvertedArchiveSourceState::Direct(resolved_path))
         }
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => None,
-        Ok(_) | Err(_) => Some(ConvertedArchiveSourceState::Unavailable),
+        Ok((_, resolved_path)) => Some(ConvertedArchiveSourceState::Unavailable {
+            logical_source: Some(resolved_path),
+        }),
+        Err(_) => Some(ConvertedArchiveSourceState::Unavailable { logical_source }),
     }
 }
 
@@ -38901,7 +38919,9 @@ impl App {
             let state = if self.image_metas.get(idx).and_then(|meta| *meta).is_some() {
                 ConvertedArchiveSourceState::Pending
             } else {
-                ConvertedArchiveSourceState::Unavailable
+                ConvertedArchiveSourceState::Unavailable {
+                    logical_source: None,
+                }
             };
             self.converted_archive_cache_paths
                 .entry(archive_key)
@@ -39003,8 +39023,12 @@ impl App {
                 continue;
             }
             let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|meta| *meta) else {
-                self.converted_archive_cache_paths
-                    .insert(archive_key, ConvertedArchiveSourceState::Unavailable);
+                self.converted_archive_cache_paths.insert(
+                    archive_key,
+                    ConvertedArchiveSourceState::Unavailable {
+                        logical_source: None,
+                    },
+                );
                 continue;
             };
             let candidate = ConvertedArchiveCandidate {
@@ -39314,7 +39338,9 @@ impl App {
                     if let Some(state) = self.converted_archive_cache_paths.get_mut(&key)
                         && matches!(state, ConvertedArchiveSourceState::Pending)
                     {
-                        *state = ConvertedArchiveSourceState::Unavailable;
+                        *state = ConvertedArchiveSourceState::Unavailable {
+                            logical_source: None,
+                        };
                     }
                 }
                 crate::logger::log(format!("archive_cache_peek spawn failed: {e}"));
@@ -91718,10 +91744,10 @@ fn make_load_request(
                         (path.as_path(), LoadSourcePolicy::CacheOnly)
                     }
                     ConvertedArchiveSourceState::Direct(load_path)
-                    | ConvertedArchiveSourceState::CachedZip(load_path) => {
-                        (load_path.as_path(), base.source_policy)
-                    }
-                    ConvertedArchiveSourceState::Unavailable => return None,
+                    | ConvertedArchiveSourceState::CachedZip {
+                        path: load_path, ..
+                    } => (load_path.as_path(), base.source_policy),
+                    ConvertedArchiveSourceState::Unavailable { .. } => return None,
                 };
             let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
             let req = LoadRequest {

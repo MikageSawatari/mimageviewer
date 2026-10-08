@@ -637,7 +637,11 @@ README の更新履歴で確認できる最新リリース v2.13.0 までの cat
 読み取り専用で参照する経路では、未追加の `layout_*` を NULL として扱う。
 
 `ConvertibleArchive` の読み取り元表 (`App.converted_archive_cache_paths`) は、候補ごとに
-`Pending / Direct(PathBuf) / CachedZip(PathBuf) / Unavailable` を持つ。map entry の欠落を
+`Pending / Direct(PathBuf) / CachedZip { logical_source, path } / Unavailable { logical_source }` を持つ。
+キャッシュなしでもworkerが確認した論理sourceを保持し、保存済み読書位置バーはそのsourceから
+純粋計算した決定的な変換ZIP keyを参照する。論理sourceが未確定ならNoneで、RARのファイル名から
+先頭volumeを推測しない。Pendingのバーは非表示。cache削除後もサムネイル／pin用sourceの共有失効
+（Smartのstash／prepared再利用、parked context、旧reply取消）は維持する。map entry の欠落を
 「未判定」と「判定済みだが読み取り元なし」の兼用 sentinel にしない。`install_new_items` は
 current-folder generation の全候補を I/O なしで先に `Pending` 登録する。実際の判定 batch は
 **現在の可視範囲 + thumbnail keep set + その範囲の container pin 依存先**だけを対象にする。

@@ -429,6 +429,12 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 その結果は同 generation なら採用し、現 batch 終了後に新 range の `Pending` key だけを次 batch へ渡す。
 終端 key は再投入しない。
 
+2026-10-08の利用者決定により、CachedZipとキャッシュなしのUnavailableは論理sourceを
+同じtyped ownerに保持する（未確定ならNone）。メーターはload_pathの可用性ではなく、
+Directの実pathまたは論理sourceから純粋計算した変換ZIP keyでBookResumeMetersを参照する。
+キャッシュ削除後も保存済みのバーを表示し、Pending／未確定／設定OFFでは非表示。
+分割RARの論理sourceはworkerのheader確認で確定し、描画中のI/Oやファイル名推測はしない。
+
 変換cache管理のDeletedSelected / DeletedMissing / DeletedAll完了は、読込元ownerへ
 変異通知を渡す。旧batchのreceiverを破棄/cancelし、CachedZipだけをPendingへ戻して
 既存range/admission経路で非同期再判定する。Direct / Unavailable、pin rootの来歴、

@@ -234,14 +234,34 @@ impl App {
         {
             return None;
         }
+        let converted_key;
         let path = match self.items.get(idx)? {
             crate::grid_item::GridItem::Folder(path)
             | crate::grid_item::GridItem::ZipFile(path)
             | crate::grid_item::GridItem::PdfFile(path) => path,
-            crate::grid_item::GridItem::ConvertibleArchive { path, .. } => self
-                .converted_archive_cache_paths
-                .get(&crate::path_key::normalize_keep_drive(path))?
-                .load_path()?,
+            crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
+                match self
+                    .converted_archive_cache_paths
+                    .get(&crate::path_key::normalize_keep_drive(path))?
+                {
+                    super::ConvertedArchiveSourceState::Direct(path) => path,
+                    super::ConvertedArchiveSourceState::CachedZip { logical_source, .. }
+                    | super::ConvertedArchiveSourceState::Unavailable {
+                        logical_source: Some(logical_source),
+                    } => {
+                        // Stable resume key, independent of cache existence. Pure path computation.
+                        converted_key = crate::archive_cache::cache_zip_path_for_data_dir(
+                            &crate::data_dir::get(),
+                            logical_source,
+                        );
+                        &converted_key
+                    }
+                    super::ConvertedArchiveSourceState::Pending
+                    | super::ConvertedArchiveSourceState::Unavailable {
+                        logical_source: None,
+                    } => return None,
+                }
+            }
             _ => return None,
         };
         self.book_resume_meters.get(path)

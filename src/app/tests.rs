@@ -27983,7 +27983,10 @@ mod phase_c_drill_nav_tests {
 
         app.converted_archive_cache_paths.insert(
             crate::path_key::normalize_keep_drive(&src),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cache.clone(),
+            },
         );
         app.rebuild_visible_indices();
         assert_eq!(
@@ -32248,9 +32251,10 @@ fn begin_detached_bookmark_media_test(
     );
     app.converted_archive_cache_paths.insert(
         "main-grid-archive".to_string(),
-        crate::app::ConvertedArchiveSourceState::CachedZip(PathBuf::from(
-            r"C:\main-grid\cached.zip",
-        )),
+        crate::app::ConvertedArchiveSourceState::CachedZip {
+            logical_source: PathBuf::from(r"C:\main-grid\source.7z"),
+            path: PathBuf::from(r"C:\main-grid\cached.zip"),
+        },
     );
     app.current_color_cache_map = Some(std::sync::Arc::new(std::sync::RwLock::new(
         std::collections::HashMap::from([(
@@ -41667,7 +41671,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&src),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cache.clone(),
+            },
         );
         let pins: std::collections::HashMap<String, FolderPinSource> =
             std::collections::HashMap::new();
@@ -41734,7 +41741,10 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             state,
-            Some(crate::app::ConvertedArchiveSourceState::CachedZip(cached))
+            Some(crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: cached
+            })
         );
         assert_eq!(inspections.get(), 0);
     }
@@ -41768,7 +41778,10 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             state,
-            Some(crate::app::ConvertedArchiveSourceState::CachedZip(cached)),
+            Some(crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: cached
+            }),
             "A1 intentionally changes Direct + converted from Direct to CachedZip"
         );
         assert!(!direct_inspection_would_run.get());
@@ -41885,7 +41898,9 @@ mod favorite_adjustment_defaults_tests {
 
         let unavailable_sources = std::collections::HashMap::from([(
             key.clone(),
-            crate::app::ConvertedArchiveSourceState::Unavailable,
+            crate::app::ConvertedArchiveSourceState::Unavailable {
+                logical_source: None,
+            },
         )]);
         assert!(
             make_load_request(
@@ -41911,7 +41926,10 @@ mod favorite_adjustment_defaults_tests {
 
         for state in [
             crate::app::ConvertedArchiveSourceState::Direct(direct.clone()),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cached.clone(),
+            },
         ] {
             let expected = state.load_path().unwrap().to_path_buf();
             let sources = std::collections::HashMap::from([(key.clone(), state)]);
@@ -42125,9 +42143,10 @@ mod favorite_adjustment_defaults_tests {
         };
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(
-                app.tmp.path().join("first.zip"),
-            ),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                path: app.tmp.path().join("first.zip"),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 5.0,
@@ -42154,9 +42173,10 @@ mod favorite_adjustment_defaults_tests {
         app.requested.insert(0, false);
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(
-                app.tmp.path().join("first.zip"),
-            ),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                path: app.tmp.path().join("first.zip"),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 5.0,
@@ -42213,7 +42233,10 @@ mod favorite_adjustment_defaults_tests {
         let cached = app.tmp.path().join("first.zip");
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                path: cached.clone(),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 5.0,
@@ -42276,9 +42299,10 @@ mod favorite_adjustment_defaults_tests {
         });
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: key.clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(
-                app.tmp.path().join("stale.zip"),
-            ),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: app.tmp.path().join("stale.zip"),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 1.0,
@@ -42315,7 +42339,9 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             app.converted_archive_cache_paths.get(&keys[0]),
-            Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+            Some(&crate::app::ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(app.items[0].drag_source_path().unwrap().to_path_buf())
+            })
         );
         for key in &keys[1..] {
             assert_eq!(
@@ -42340,7 +42366,9 @@ mod favorite_adjustment_defaults_tests {
         poll_archive_decisions_for_test(&mut app);
         assert_eq!(
             app.converted_archive_cache_paths.get(&keys[2]),
-            Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+            Some(&crate::app::ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(app.items[2].drag_source_path().unwrap().to_path_buf())
+            })
         );
     }
 
@@ -42419,10 +42447,12 @@ mod favorite_adjustment_defaults_tests {
 
         app.start_converted_archive_cache_paths_refresh(&scope, (0, 1), (0, 1));
         poll_archive_decisions_for_test(&mut app);
-        for key in keys {
+        for (idx, key) in keys.into_iter().enumerate() {
             assert_eq!(
                 app.converted_archive_cache_paths.get(&key),
-                Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+                Some(&crate::app::ConvertedArchiveSourceState::Unavailable {
+                    logical_source: Some(app.items[idx].drag_source_path().unwrap().to_path_buf())
+                })
             );
         }
     }
@@ -43157,7 +43187,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&src),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cache.clone(),
+            },
         );
         let mut pins = std::collections::HashMap::new();
         pins.insert(crate::path_key::normalize_keep_drive(&src), source.clone());
@@ -43363,7 +43396,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive.clone(),
+                path: cached.clone(),
+            },
         );
 
         let req = make_load_request(
@@ -43457,7 +43493,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive.clone(),
+                path: cached.clone(),
+            },
         );
 
         let req = make_load_request(
@@ -43955,7 +43994,10 @@ mod favorite_adjustment_defaults_tests {
 
         app.converted_archive_cache_paths.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive.clone(),
+                path: cached.clone(),
+            },
         );
         let ready_in_memory = app.compute_folder_pin_button_state().unwrap();
         assert!(ready_in_memory.enabled);

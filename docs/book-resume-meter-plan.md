@@ -3,7 +3,7 @@
 現行の配置方針は、共有設定ONで全セルに固定下端帯を予約し、下端ラベルを一律13 logical pt上へ移す方式 (§5.1 / §14)。代表画像なし・未ロードの検索セルの多行階層パスは上端を元位置に保ち、下端だけ13pt縮めて末端名を優先する。代表画像ありは背景/パスの全体を13pt移動する方式を維持する (§14.4)。帯はセルの左右4pt内側の幅・高さ9 logical ptで、位置記録の有無や媒体種別によって位置・厚さを変えない。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を維持する。§10〜§13と§14.3の実装・検証記録は各修正時点の履歴として保持し、後続修正の成功証跡には流用しない。
 
 作成・改訂: 2026-10-04。コード調査基準: `next-file-ops` / `e804db069`。
-2026-10-07追記: §1.350のRAR/CBR/7z/CB7/LZH/LHAセル対応は§15。初版の除外契約を§2で更新した。本件は独立レビュー・実機確認前であり、それ以前の検証・レビュー記録は当時の履歴として保持する。
+2026-10-07追記: §1.350のRAR/CBR/7z/CB7/LZH/LHAセル対応は§15。初版の除外契約を§2で更新した。当時の検証・レビュー記録は履歴として保持する。2026-10-08の実機確認後の決定（キャッシュ削除後もバーを保持）は§18。
 状態: **固定下端予約帯への改訂は検証・確認用ビルド済み。後続P2の検索セル名消失も修正済み (§14.4)、修正後gate・独立レビュー・確認用ビルドは完了。利用者の実機確認待ち。§12/§13と§14.3の成功記録は各修正時点の結果。** 保存・watched・常に左→右の仕様は維持する。独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。commit・アプリ起動は行っていない。
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
 
@@ -97,7 +97,7 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 | ZIPのroot / 単一wrapper root | 現状記録する範囲を維持。rootにZipDirが混じっていても、記録時に送り得るZipImageだけで数える |
 | 入れ子ZIP内側 | 現状 `record_book_resume` が記録しないため対象外。その閲覧で外側rootの過去記録を消す処理も足さない |
 | Stackセル / Image / ZipImage / PdfPage / ZipDir個別セル | メーターを描かない。flat stack閲覧が従来記録する値はHUDの読み順で補助値も記録でき、後の通常Folderセルに表示される。stack専用keyを新設しない |
-| ConvertibleArchive (直接閲覧RARを含む) | 既存の非同期`converted_archive_cache_paths`で解決済みの`Direct` / `CachedZip`の実読込元を使って同じmapを参照。Pending / Unavailable / 未登録では描かない。元書庫への推測fallbackやセル描画中のI/Oを追加しない。保存・復元keyは維持（§15） |
+| ConvertibleArchive (直接閲覧RARを含む) | 既存の非同期`converted_archive_cache_paths`を使う。Directは元書庫key、CachedZip / 論理sourceが確定したUnavailableは論理sourceから純粋計算した決定的な変換ZIP keyで同じmapを参照。キャッシュ削除後もバーを表示する。Pending / 未登録 / 論理source未確定では描かない。分割RARはheaderで確認した先頭volumeを使用し、ファイル名による推測や描画中I/Oはしない。保存・復元keyは維持（§18） |
 | PdfFile扱いのEPUB | resume保存keyと当該cell pathが一致して行があれば同じmap参照で表示。変換generation/内容を解き直さず、異なるkeyを推測で結ばない |
 | 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFile/ConvertibleArchiveセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
 
@@ -718,6 +718,8 @@ captionの13pt移動後を計測すると、高さ94ptのSearchContainerの深�
 
 ## 15. §1.350 変換対象書庫の一覧セル（2026-10-07、ラインA）
 
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示だけは§18の利用者決定で置き換える。サムネイル／pinの共有source失効は維持する。
+
 利用者とmIVスレ>>529の報告では、v4.4.0のRARサムネイルにバーが出ない。
 コード上の根因は`thumbnail_book_resume_meter`の対象kindから`ConvertibleArchive`を除いていたこと。
 保存失敗の観測とは扱わない。初版の対象外という§2と既存テストの仕様を今回拡張する。
@@ -773,6 +775,8 @@ cache DBのstamp/実体照合をworkerで行い、直読みなら解決済みRAR
 
 ## 16. §1.350 独立レビューr3 — cache削除完了の失効（2026-10-08）
 
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示だけは§18の利用者決定で置き換える。サムネイル／pinの共有source失効は維持する。
+
 利用者提示の独立レビューP2をコードで照合し、採用した。反対意見はない。
 `poll_archive_cache_maint_pending`はDeletedSelected / DeletedMissing / DeletedAllで管理画面の
 行を再読込するだけだった。一方、read source workerはPendingだけを再投入するため、
@@ -807,6 +811,8 @@ BookResumeMeters、DB保存・復元key、既に表示したtextureは変更し�
 §15の2026-10-07確認用バイナリには、このr3失効修正は含まれない。
 
 ## 17. r4 — 退避した解決元ownerへのキャッシュ失効（2026-10-08）
+
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示だけは§18の利用者決定で置き換える。サムネイル／pinの共有source失効は維持する。
 
 指摘の根因は一致した。r3はmounted mapのみ失効させ、SmartFolderPreparedGridの親mapや
 parked ViewerContextBundleを残したため、親→子→cache削除→BSで古いCachedZipが戻る。
@@ -866,3 +872,44 @@ CARGO_BUILD_JOBS=1 / RUST_TEST_THREADS=4）。各filterは重複を含むため�
 §15の確認用バイナリにはr3/r4の失効修正が含まれない。
 coordinatorはsource-ownerの退避/採用境界とPageIdentity契約を独立再レビューへ渡し、
 [残る利用者質問](file-type-visibility-plan.md#82-残る利用者質問未回答具体例と推奨)への判断を集める。
+
+## 18. キャッシュ削除後のバー保持（利用者決定 2026-10-08）
+
+実機確認を受け、solid RAR / 7z / LZH等の変換書庫は、変換キャッシュを削除しても保存済みの読書位置バーを表示する。次回openで再変換し、同じkeyから再開する。Direct RARは従来どおり元書庫のkeyを使う。表示設定OFFでも記録を維持する。
+
+### 保存データ・source owner
+
+`record_book_resume`は変換後の`current_folder`（キャッシュZIP）へ保存する。`cache_zip_path_for_data_dir`は論理sourceの正規化pathからhashとbasenameを計算するだけで、mtime / sizeを含めない。同じdata-dir・sourceでは削除後の再変換もsource変更後も同じkeyになる。元書庫とZIPのkeyを移行・統合しない。
+
+調査では、管理画面の単体・元ファイル消失・全削除、stamp不一致の掃除、容量上限のLRU整理は`converted_archives`とZIPだけを削除し、`book_resume`行を削除しない。metadata孤立掃除もDriveStrippedのbook_resumeを対象外としている。キャッシュ削除を読書位置クリアへ接続しない。利用者による明示的な位置クリア／実ファイル削除の既存規則は変更しない。
+
+既存の`ConvertedArchiveSourceState`だけを拡張する。CachedZipは論理sourceと実読込pathを保持し、Unavailableはworkerが確認した論理sourceを保持する。metadata欠落・worker起動失敗・RARのheader確認失敗では論理source未確定（None）を明示し、推測しない。RARのheader probeで先頭volumeが確定した後、詳細inspectionが失敗してもその確定結果は残す。Smartのprepared sourceにも同じ来歴を運ぶ。
+
+### 表示と共有失効
+
+ConvertibleArchiveのバーはDirectならそのpath、CachedZip / source確定済みUnavailableなら論理sourceから計算した変換ZIP pathで既存BookResumeMetersを引く。キャッシュ存在確認・stat・書庫検査・DB照会はセル描画へ追加しない。行無しやPendingは非表示。削除後の再判定中に一時的にバーが消えることは利用者が許容した。
+
+状態削減として、別のmeter専用source mapやalias、cache削除履歴は作らない。実読込元の`load_path`へメーターを結合する条件だけを外す。管理画面完了poll→既存source owner失効、Smart親一覧のstash／再利用prepared payload、parked contextへの伝播、旧worker replyの取消はすべて維持する。これらはサムネイル・pinが削除済みZIPを使わないためにも必要で、メーター専用の失効経路は存在しなかった。Directやtexture、BookResumeMeters自体の失効は追加しない。
+
+### 回帰確認
+
+実削除worker→完了poll→非同期source再判定で、単体／消失／全削除後も保存行とバーが残ることを確認する。header-confirmedの後続RARから先頭volumeのkeyへ解決するケース、Directとのkey分離、Pending／未登録／未知source／設定OFFの非表示も対象。実7z変換→位置記録→削除→再変換→ZIP採用／位置復元、およびsource stamp変更でcacheが失効しても同じkey／保存位置が残ることを確認する。共有sourceのSmart parent→child→削除→BS、parked context、pinの回帰も維持する。
+
+### 実装担当の検証（2026-10-08）
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| 修正前の実cache削除回帰 | exit 101、1 failed。削除完了・worker再判定後にNoneとなり、期待した3/5が消える。`target/A-1350-keep-red.log` |
+| `cargo fmt` / `cargo fmt --check` | exit 0 / 0。変更ファイルは既存どおりUTF-8・CRLF、`git diff --numstat` / `--check`も確認 |
+| `--lib book_resume_meter` | exit 0、47 passed。`target/A-1350-keep-focused-green.log` |
+| `--lib archive_decision_scope` / `archive_rollup_edit_filter` / `archive_pin_root` | 各exit 0、4 / 1 / 8 passed。`target/A-1350-keep-<filter>.log` |
+| `--lib convertible_archive` / `converted_rar` / `stale_incremental_archive_result_is_rejected_per_message` | 各exit 0、32 / 1 / 1 passed。`target/A-1350-keep-convertible_archive.log` / `converted_rar.log` / `stale.log`（後2件も同じA-1350-keep-接頭辞） |
+| `cargo test -p mimageviewer --lib` | exit 0、10998 passed / 52 ignored / 0 failed、1255.97s。`target/A-1350-keep-lib-final.log` |
+| 通常 / portable core check | 各exit 0。`target/A-1350-keep-check.log` / `target/A-1350-keep-portable.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyph 0 |
+
+対象filterは重複なし計94件。初回full libは今回更新した旧reply fixtureが空の現itemsを参照する誤りを検出し、途中中断した。replyが所有するsourceを渡すようテストを訂正し、その対象1件と上記full libを完走した。初回の未完了runは成功証跡に数えない。
+
+分割RAR回帰は実volume fixtureの局所コピーでRAR5 main headerのsolid宣言とCRCを変更し、native DLLでSolid判定・先頭volume解決・実変換を検証した。外部packerやfilename推測は使っていない。7z回帰は実writer・converter・ZIP採用・resume取得を通る。描画layoutは変更せず、既存lib内のメーターsnapshotも上記filterとfull libで成功した。
+
+利用者の指示どおりbuild-dev・製品起動・commitは行っていない。現在利用者が試しているbinaryは再作成していない。ClaudeCodeによる再ビルド後、solid RAR / 7z / LZHを途中まで読み、変換cacheを削除→一覧でバー保持（再判定中だけ一時非表示）→再openで再変換・前回位置へ復帰、後続RAR volume、設定OFFを実機確認する。コミットメッセージは`target/A-1350-keep-msg.txt`。

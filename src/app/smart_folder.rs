@@ -5743,6 +5743,7 @@ fn prepared_converted_archive_path(
     db: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> ConvertedArchiveSourceState {
     let mut source = path.to_path_buf();
+    let mut logical_source = (!crate::rar_loader::is_rar_path(path)).then(|| source.clone());
     if crate::rar_loader::is_rar_path(path) {
         match crate::rar_loader::inspect_for_direct_read(path) {
             Ok(inspection)
@@ -5752,6 +5753,7 @@ fn prepared_converted_archive_path(
             }
             Ok(inspection) => {
                 source = inspection.resolved_path;
+                logical_source = Some(source.clone());
                 if let Ok(metadata) = std::fs::metadata(&source) {
                     mtime = crate::ui_helpers::mtime_secs(&metadata);
                     size = metadata.len() as i64;
@@ -5761,8 +5763,11 @@ fn prepared_converted_archive_path(
         }
     }
     db.and_then(|db| db.peek(&source, mtime, size))
-        .map(ConvertedArchiveSourceState::CachedZip)
-        .unwrap_or(ConvertedArchiveSourceState::Unavailable)
+        .map(|path| ConvertedArchiveSourceState::CachedZip {
+            logical_source: source.clone(),
+            path,
+        })
+        .unwrap_or(ConvertedArchiveSourceState::Unavailable { logical_source })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12103,7 +12108,10 @@ mod tests {
         edits.adjustment.insert(format!("{cache_key}::page:0"));
         let converted = HashMap::from([(
             crate::path_key::normalize_keep_drive(&archive_path),
-            ConvertedArchiveSourceState::CachedZip(cache_path),
+            ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive_path.clone(),
+                path: cache_path,
+            },
         )]);
 
         assert!(metadata_filter_passes(
