@@ -1511,6 +1511,18 @@ fn preferences_video_thumbnail_indicator_dark() {
 }
 
 #[test]
+fn preferences_media_thumbnail_sources_light() {
+    snapshot_with_theme(
+        "preferences_media_thumbnail_sources_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_video_thumbnail_indicator_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
 fn metadata_panel_information_tab_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_information_tab_dark",

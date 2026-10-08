@@ -1487,6 +1487,10 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "video/sidecar-thumbnail", |ui, state| {
+        draw_media_sidecar_thumbnail_settings(ui, &mut state.settings);
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/video-indicator", |ui, state| {
         draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
     });
@@ -1645,6 +1649,26 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
     );
+}
+
+pub(super) fn draw_media_sidecar_thumbnail_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("動画・音声のサムネイル").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut settings.video_thumb_use_sidecar_image,
+        "同名の画像をサムネイルに使う（動画・音声）",
+    )
+    .on_hover_text(
+        "例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダに置きます。\n\
+         「同名の動画・音声がある画像を省略」も ON にする必要があります。\n\
+         OFF の場合、動画は Windows 標準サムネイル、MP3 は埋め込み画像を使います。\n\
+         画像行の省略は別設定です。省略が ON なら、この項目を OFF にしても画像行は表示されません。\n\
+         既存設定の OFF は音声にも引き継ぎます。動画のピン留めフレームは常に最優先。",
+    );
+    ui.small("同名画像の表示・省略は「ファイル処理 → 同名ファイル」で設定します。");
 }
 
 pub(super) fn draw_audio_thumbnail_indicator_settings(
@@ -8123,27 +8147,6 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "video/normalize-cache", |ui, state| {
         draw_audio_normalize_cache_controls(ui, state);
     });
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-
-    {
-        anchored(ui, state, "video/sidecar-thumbnail", |ui, state| {
-            let s = &mut state.settings;
-            ui.label(egui::RichText::new("グリッドサムネイル").strong());
-            ui.add_space(4.0);
-            ui.checkbox(
-                &mut s.video_thumb_use_sidecar_image,
-                "同名の画像をサムネイルに使う（動画・音声）",
-            )
-            .on_hover_text(
-                "例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダに置きます。\n\
-         OFF の場合、動画は Windows 標準サムネイル、MP3 は埋め込み画像を使います。\n\
-         既存設定の OFF は音声にも引き継ぎます。動画のピン留めフレームは常に最優先。",
-            );
-        });
-    }
 
     // VST3 プラグイン処理は専用ページ "VST3 プラグイン" に分離した (= ユーザー要望
     // 「環境設定の中に新しい項目」)。動画タブには出さない。

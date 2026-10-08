@@ -1164,7 +1164,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "video/sidecar-thumbnail",
-        Video,
+        Thumbnail,
         "同名の画像をサムネイルに使う（動画・音声）",
         ["サイドカー", "sidecar", "動画サムネイル", "音声", "音楽"]
     ),
@@ -1614,7 +1614,12 @@ mod tests {
             (
                 "音声 サイドカー",
                 "video/sidecar-thumbnail",
-                PreferencesPage::Video,
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "動画 サイドカー",
+                "video/sidecar-thumbnail",
+                PreferencesPage::Thumbnail,
             ),
             (
                 "音声 重複",

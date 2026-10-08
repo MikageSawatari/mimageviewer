@@ -1,7 +1,7 @@
 # 音声サムネイル: 同名 sidecar・MP3 埋め込み画像の計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の §1.347。
-改訂: 2026-10-08 / 5cd2dab23 の ACCEPT WITH CHANGES に伴うP3文書訂正。待機取消の保証と利用者確認をsession lifecycleに限定 (§21.2 / §21.4)。
+改訂: 2026-10-08 / 利用者実機確認の成功記録と共有設定の配置follow-up。画像省略の動画・音声一致をコード照合 (§22)。
 **利用者から伝達された5cd2dab23の再レビューは ACCEPT WITH CHANGES (待機取消の文書P3一件)。前回のRemote P2二件は解消、待機取消の保証を実装に合わせて文書訂正済み (§21)。既存の自動検証・確認build記録を保持。先頭 ID3v2 タグ限定と既決仕様を維持・実アプリ未起動。**
 利用者から伝達されたレビュー履歴: 前版は **ACCEPT**、R4 の改訂は **ACCEPT WITH CHANGES**。
 R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。
@@ -326,7 +326,7 @@ album-art 成功 / absence は MP3 の埋め込みだけ (§5)。その cache hi
 **video_thumb_use_sidecar_image を動画・音声共通に拡張**する。serde field 名、settings DB key、
 既定 true、設定転送の field 名 / bool 型は保持し、migration / 新しい sidecar 用 audio setting は不要。
 既存利用者が OFF にしていた場合、音声 sidecar も OFF。勝手に true へ戻さない。
-環境設定の既存 checkbox を「同名の画像をサムネイルに使う（動画・音声）」へ relabel し、
+環境設定の「表示 → サムネイル」に既存 checkbox を置き、「同名の画像をサムネイルに使う（動画・音声）」と表示し、
 movie.mp4 + movie.jpg / song.mp3 + song.jpg の例、省略 setting も必要なこと、OFF 時の fallback を説明する。
 動画 pin は引き続き独立して最優先であり、「今後実装予定」という古い説明は出荷済み挙動に合わせる。
 `skip_image_if_video_exists` も field 名 / 既定を保ち、「同名の動画・音声がある画像を省略」へ表示を揃える。
@@ -1568,3 +1568,89 @@ Remoteで再表示できる。削除中の待機取消は、Remoteのログア�
 起動前にinstalled/tray-resident mIVを閉じる (single-instance mutex共通)。
 通常の検証binaryは `%APPDATA%\mimageviewer` の実設定/データを更新し得る。
 利用者の起動コマンド: `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+
+
+## 22. 利用者実機確認後の配置と画像省略の確認 (2026-10-08)
+
+利用者から、生成sample `C:\home\miv-audio-art-samples` とスクリーンショットによる実機確認結果が
+伝達された。同名sidecar → 埋め込み → アイコン、PNG/JPEG、横長/縦長、前面表紙以外へのfallback、
+ID3v2.4、FLAC埋め込みを使わないこと、共有sidecar設定OFFは設計どおり動作した。
+実機確認は利用者の実施記録であり、実装担当によるアプリ起動ではない。
+
+### 22.1 共通の「表示 → サムネイル」へ配置
+
+sidecar採用checkboxは「動画・音声 → 動画」に置かれており、音声の利用者に見つけにくかった。
+既存の「表示 → サムネイル」ページに、動画・音声の表示マークと並べて移設する。
+新しいtree categoryや音声専用stateは作らず、`video_thumb_use_sidecar_image`の単一draft値を編集する。
+既存anchor `video/sidecar-thumbnail`は内部IDとして維持し、検索索引のpageだけをThumbnailへ変更する。
+「音声 サイドカー」「動画 サイドカー」の検索は共通pageの同じcheckboxへ着地する。
+設定DB key、転送分類、OFFの継承、OK時の既存reloadは不変。UI threadのI/Oは追加しない。
+
+簡素化として、同じboolを複数pageに描画する案と新しい共通groupを増やす案を検討した。
+共通サムネイルpageが既にあり、マーク設定もそこにあるため、一か所への移設が最も単純である。
+実page描画・クリック・page再訪で一つの値だけが変わるhandler回帰と、検索page、snapshotで検証する。
+
+### 22.2 sidecar OFFでも同名画像が隠れる理由
+
+コード照合: `folder_scan.rs:146`のaggregate discoveryは二設定がともにONのときだけ出所を返す。
+通常物理一覧は同324の`skip_image_if_video_exists`を条件にfilterを呼び、
+`filter_video_image_duplicates`はVideo/Audio両方を対象に同stemのImage行を省略する。
+第二引数`video_thumb_use_sidecar_image`は出所を返すかだけを決め、画像行の省略を変更しない。
+
+したがって、動画・音声とも以下は再走査後も同じである (§3.3の既存表を維持):
+
+| 画像省略 | sidecar採用 | 同名画像の行 | サムネイル |
+| --- | --- | --- | --- |
+| ON | ON | 省略 | sidecarを使う (動画pinは最優先) |
+| ON | OFF | 省略 | 動画はpin/Shell、MP3は埋め込み、他音声はアイコン |
+| OFF | ON/OFF | 表示 | sidecarを採用しない |
+
+画像行を表示したい場合は「ファイル処理 → 同名ファイル」の
+「同名の動画・音声がある画像を省略」をOFFにする。
+既存`audio_and_video_sidecars_share_all_four_released_flag_combinations`は
+新しいscanからの4組合せ、画像行数、省略数、出所を照合する。
+Preferences OKも両設定をduplicate-settings tupleに含め、変更時に既存folder reloadを呼ぶ
+(`preferences.rs`の`duplicate_settings_changed`)。
+
+利用者の画像非表示は、画像省略ONなら動画と同じ仕様であり、stale一覧を原因とする必要はない。
+スクリーンショット時のreload有無そのものは未確認だが、音声だけの差異はコードで見つからない。
+利用者指示に従いscan/filterは修正しない。manualには設定の場所と独立した画像省略を明記する。
+未決の利用者質問なし。
+
+修正前の有効red: 実Thumbnail pageに共有checkboxがないhandler assertionと、
+検索結果がVideoへ着地するassertionが各0成功/1失敗。二件を一つのPowerShellで実行し、
+shell exit1と双方の失敗集計を確認した (compile成功後の製品経路の失敗)。
+
+### 22.3 検証 (2026-10-08)
+
+修正後のPreferences集中テストは108件成功、四組合せscan回帰は1件成功。
+ライト/ダークの共通設定snapshotを目視確認し、文字切れや説明文の欠落がないことを確認した。
+最初の全ui_snapshotは105件成功/1件失敗: 既存favorite-view fixtureもThumbnail pageを
+描くため、追加項目によるcontent height増加でscrollbar thumbだけが変わった。
+差分画像と期待画像を照合して該当snapshotを更新し、全106件の再照合は成功した。
+変更対象は共通設定dark、共通設定light (追加)、favorite-view darkの3画像。
+通常/portable core check、cargo fmt/check、glyph lint (危険glyph0)、git diff --checkは成功。
+変更した既存textファイルはCRLFを維持し、numstatで全行差分がないことを確認した。
+
+全lib (`cargo test -p mimageviewer --lib`、pipeなし)は11,075成功/失敗0/
+既存ignore52、1175.03秒、実exit0。実行時は `RUST_TEST_THREADS=8`、
+ui_snapshotは1、buildは `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1`。
+`.\scripts\build-dev.ps1 -PreserveRuntime` はexit0、core 7分20秒、
+Remote service/EPUB workerを含め通常featureで作成、runtime4/PE3検査成功。
+portable featureなし。確認binaryは未起動。
+完全ログ・exit code・source SHAは `target/audio-hw-*.log` /
+`target/audio-hw-validation.json` に保存。英語commit messageは
+`target/D-1347-hw-msg.txt`。次はこの差分の独立レビューと利用者による配置確認。
+
+利用者確認手順:
+1. installed/tray-resident mIVを閉じる (single-instance mutex共通)。
+   通常の確認binaryは `%APPDATA%\mimageviewer` の実設定/データを更新し得る。
+   `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で起動する。
+2. 環境設定の「表示 → サムネイル」に共有checkboxがあることを確認し、
+   「音声 サイドカー」「動画 サイドカー」の検索でも同じ項目へ着地することを確認する。
+3. sampleフォルダで、画像省略ONのままsidecar採用をOFFにしてOKを押す。
+   一覧は再読込され、MP3は埋め込み/アイコンになり、同名画像行は引き続き隠れる。
+   次に「ファイル処理 → 同名ファイル」の画像省略をOFFにしてOKを押し、
+   同名JPG/PNGの行が表示されることを確認する。確認後は必要に応じて元の設定へ戻す。
+
+製品binaryは起動せず、commitしない。利用者のsample/実設定には触れない。
