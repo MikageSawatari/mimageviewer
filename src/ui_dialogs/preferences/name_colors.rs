@@ -32,7 +32,11 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, settings: &mut Settings) {
     if warned {
         ui.colored_label(
             ui.visuals().warn_fg_color,
-            "標準配色の名前色は4.5:1未満です。交互行やhoverでは読みにくくなる場合があります",
+            if strong {
+                "強い配色のフォルダ色はhoverで4.5:1未満です"
+            } else {
+                "標準配色の名前色は4.5:1未満です。交互行やhoverでは読みにくくなる場合があります"
+            },
         );
         ui.small("各サンプルに実際の表示比を示します。3:1未満の状態には ! を付けます。");
     }
@@ -293,6 +297,32 @@ fn draw_samples(ui: &mut egui::Ui, color: egui::Color32, visuals: &egui::Visuals
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_color_warning_matches_standard_and_strong_previews() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let standard_warning =
+            "標準配色の名前色は4.5:1未満です。交互行やhoverでは読みにくくなる場合があります";
+        let strong_warning = "強い配色のフォルダ色はhoverで4.5:1未満です";
+        for contrast in [TextContrast::Standard, TextContrast::Strong] {
+            let mut draft = Settings::default();
+            draft.text_contrast = contrast;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(760.0, 1200.0))
+                .build_state(
+                    |ctx, draft| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            draw_settings(ui, draft);
+                        });
+                    },
+                    draft,
+                );
+            harness.run();
+            let strong = contrast == TextContrast::Strong;
+            assert_eq!(harness.query_by_label(strong_warning).is_some(), strong);
+            assert_eq!(harness.query_by_label(standard_warning).is_some(), !strong);
+        }
+    }
 
     #[test]
     fn category_reset_and_all_reset_handlers_only_edit_the_draft() {

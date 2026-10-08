@@ -129,7 +129,7 @@ impl DetailsNameColors {
         let [r, g, b] = match (visuals.dark_mode, strong) {
             (false, false) => [0xA8, 0x7E, 0x00],
             (true, false) => [0xD6, 0xBA, 0x66],
-            (false, true) => [0x20, 0x18, 0x00],
+            (false, true) => [0x80, 0x60, 0x00],
             (true, true) => [0xF4, 0xDF, 0xA2],
         };
         Color32::from_rgb(r, g, b)
@@ -375,8 +375,8 @@ mod tests {
             (
                 ResolvedTheme::Light,
                 TextContrast::Strong,
-                [0x20, 0x18, 0],
-                [16.59, 15.32, 12.85, 7.48],
+                [0x80, 0x60, 0],
+                [5.51, 5.09, 4.26, 7.48],
             ),
             (
                 ResolvedTheme::Dark,
