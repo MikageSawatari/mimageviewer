@@ -1001,18 +1001,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("{files}").strong());
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(concat!(
-                    "渡すファイルのパスに置き換わります。「1 件ずつ」なら 1 つ、",
-                    "「まとめて渡す」なら選んだ数だけ並びます。",
-                    "何も書かないときは {files} が 1 つ付きます。",
-                ))
-                .weak(),
-            )
-            .wrap(),
-        );
+        crate::external_tool::draw_external_tool_placeholder_help(ui);
     }
     ui.add_space(6.0);
     // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない

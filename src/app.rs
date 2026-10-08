@@ -16239,10 +16239,10 @@ pub struct App {
     pub(crate) association_prewarm_queue: std::collections::VecDeque<String>,
     /// 外部ツールの process spawn を UI スレッド外で行う、操作単位の短命 worker。
     /// `Each` の複数結果は各 pending 内で集約し、別々の利用者操作はこの Vec で並行保持する。
-    pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
+    pub(crate) external_tool_retired_launch: Vec<crate::external_tool::ExternalLaunchPending>,
     /// 仮想ページの実体化から spawn までを所有する P3 worker。新要求は世代を進めて旧要求を破棄する。
     pub(crate) external_tool_materializer: crate::materializer::Materializer,
-    pub(crate) external_tool_materialize_pending:
+    pub(crate) external_tool_retired_materialize:
         Vec<crate::external_tool::ExternalMaterializePending>,
     /// 外部ツールの modal を**この frame で既に描いた** (viewport, frame 番号)。
     ///
@@ -16264,10 +16264,7 @@ pub struct App {
     /// 全 viewer viewport より後なので、この 1 個で「所有者が描かなかった」が判る。
     pub(crate) external_tool_modal_owner_drawn_frame: Option<u64>,
     /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
-    pub(crate) external_tool_launch_confirmation:
-        Option<crate::external_tool::ExternalLaunchConfirmation>,
-    /// キー操作で開いた外部ツール選択モーダル。対象は open 時点の snapshot を保持する。
-    pub(crate) external_tool_picker: Option<crate::external_tool::ExternalToolPickerRequest>,
+    pub(crate) external_tool_operation: crate::external_tool::ExternalOperation,
 
     // ── viewer navigation の導出一覧キャッシュ ──────────────────
     /// nav / 静止画 / seek 情報を一括失効する context-local owner。
@@ -19275,19 +19272,18 @@ impl App {
             association_prewarm: None,
             association_prewarm_generation: None,
             association_prewarm_queue: std::collections::VecDeque::new(),
-            external_tool_launch_pending: Vec::new(),
+            external_tool_retired_launch: Vec::new(),
             external_tool_materializer: crate::materializer::Materializer::new_with_raw(
                 crate::raw::RawDecodeContext::new(
                     Arc::clone(&raw_develop_executor),
                     raw_brightness_for_materializer,
                 ),
             ),
-            external_tool_materialize_pending: Vec::new(),
+            external_tool_retired_materialize: Vec::new(),
             external_tool_launch_ui_frame: None,
             external_tool_modal_viewport: egui::ViewportId::ROOT,
             external_tool_modal_owner_drawn_frame: None,
-            external_tool_launch_confirmation: None,
-            external_tool_picker: None,
+            external_tool_operation: crate::external_tool::ExternalOperation::Idle,
             viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
 
             // AI (settings から復元)
@@ -21112,8 +21108,9 @@ impl App {
             self.book_reorder.is_some() => "book_reorder",
             self.show_preferences => "preferences",
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
-            self.external_tool_launch_confirmation.is_some() => "external_tool_launch_confirmation",
-            self.external_tool_picker.is_some() => "external_tool_picker",
+            self.external_tool_operation.modal_reason() == Some("external_tool_preparing") => "external_tool_preparing",
+            self.external_tool_operation.modal_reason() == Some("external_tool_launch_confirmation") => "external_tool_launch_confirmation",
+            self.external_tool_operation.modal_reason() == Some("external_tool_picker") => "external_tool_picker",
             // **描く条件と同じ述語から導く。** pending の非空から導くと、supersede 済みで
             // まだ drain されていない要求が「ダイアログが無いのに入力だけ止まる」状態を作る
             // (2026-09-02)。

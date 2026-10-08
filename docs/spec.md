@@ -82,19 +82,26 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   (ページ番号昇順) の 2 件、`MainPageOnly` は現在ページ 1 件。
   効くのはフルスクリーンで見えているページを渡すときだけ。`Single` + `BothPages` は
   見開き中に必ず 2 件になるため起動せず、設定画面で警告する。
-- 引数のプレースホルダは `{file}` `{files}` `{dir}` `{name}` `{stem}` `{ext}` `{uri}`
-  `{container}` `{entry}` `{page}` `{time}` `{time_ms}` `{time_hms}`。対象が持たない値は
-  そのトークンごと引数列から取り除く。`{container}` は利用者から見た書庫 (変換アーカイブでは
-  cache ZIP でなく元の RAR / 7z / LZH)、`{page}` はその書庫を開いて見ているときだけ付く。
+- 引数のプレースホルダは `{files}` と `{file_list}`。引数を分割してから `OsString` として置換し、
+  未知記法は文字どおり残す (`{file}` は既存互換で `{files}` へ正規化)。どちらも無い場合だけ
+  `{files}` を自動追加する。`{file_list}` は起動ごとに別名の `.txt` を worker で作り、
+  その起動へ渡す準備済みの絶対パスを UTF-8 BOM なし・1 行 1 パス・最終行も CRLF で書く。
+  ヘッダー・引用符は付けず、非 Unicode / CR / LF / NUL を含むパスは当該起動を拒否する。
+  `Single` / `Each` は 1 行、`Batch` は全件。繰り返した `{file_list}` は同じリストを指し、
+  `{files}` との混在でも対象順を維持する。対象件数上限とコマンドライン長検査は維持する。
 - PDF ページはツールごとの長辺
   2048 / 4096 / 8192 (既定 4096) で PNG 化する。旧設定値 `0` も 4096 として読む。
   実体化、補正 DB 読み込み、decode / compose / encode、外部起動は worker で行い、進捗表示から
-  キャンセルできる。新しい要求や対象移動で古い世代を無効化し、古い結果から起動しない。
+  キャンセルできる。UI の対象列挙・Stack 展開・編集 snapshot は、単一の準備 owner が
+  1 frame 最大 128 entry / 2ms に分割する。index と所有 context / items generation / source identity
+  を保持し、RealFile のページ探索をしない。準備中は所有 context の変更・終了で取消し、
+  別 context の変更では取消さない。具体的 source の確定後は明示 cancel / 新要求でのみ無効化する。
 - 実体化した一時ファイルは `%TEMP%\mimageviewer\ext-<pid>` (portable は data 配下の
   `temp\ext-<pid>`) に置く。起動前は要求が所有して cancel / 失敗時に削除し、外部アプリへ
   渡した後は終了時まで削除しない。起動時の孤児回収は PID が生きていないディレクトリと、process
   directory 作成前から存在する現 PID 名の stale directory だけを対象にする。PID の生死が不明なら
-  alive として扱う。
+  alive として扱う。成功したリストと参照する一時メディアは同時に process 所有へ移し、
+  `keep_temp` は双方の終了時削除を抑止する (次回起動時の孤児回収は行う)。リストは再利用しない。
   編集用ツールは元ファイルそのものを渡せる場合だけ起動し、仮想ページ等はメニューの同期判定と
   worker の最終判定で拒否する。メニューで無効にした編集用ツールは、native `HMENU` と egui fallback
   のどちらでも hover 時に理由を表示する。

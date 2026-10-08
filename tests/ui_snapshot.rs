@@ -2859,3 +2859,46 @@ fn content_restore_prompt_light() {
     harness.run();
     harness.snapshot("content_restore_prompt_light");
 }
+#[test]
+fn external_tool_file_list_help_light() {
+    snapshot_with_theme(
+        "external_tool_file_list_help_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::external_tool::draw_external_tool_placeholder_help,
+    );
+}
+
+#[test]
+fn external_tool_file_list_help_dark() {
+    snapshot_with_theme(
+        "external_tool_file_list_help_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::external_tool::draw_external_tool_placeholder_help,
+    );
+}
+
+#[test]
+fn external_tool_preparing_light() {
+    snapshot_with_theme_and_contrast_settling(
+        "external_tool_preparing_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| {
+            mimageviewer::external_tool::draw_external_tool_preparing_body(ui, 128);
+        },
+    );
+}
+
+#[test]
+fn external_tool_preparing_dark() {
+    snapshot_with_theme_and_contrast_settling(
+        "external_tool_preparing_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| {
+            mimageviewer::external_tool::draw_external_tool_preparing_body(ui, 128);
+        },
+    );
+}

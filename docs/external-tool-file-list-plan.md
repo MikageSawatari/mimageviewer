@@ -1,10 +1,13 @@
 # §1.329 外部ツールの {file_list} 設計案
 
-2026-10-08、ライン C。**設計レビューACCEPT・利用者仕様決定済み、未実装**。
+2026-10-08、ライン C。**設計レビューACCEPT・利用者仕様決定済み、実装・自動検証完了 (独立実装レビュー・利用者動作確認待ち)**。
 正本: [バックログ §1.329](next-release-backlog.md#1329-外部ツールへ渡すファイルの一覧を書いたリストファイルを渡す-file_list--利用者要望-2026-10-05)、
 [外部ツール起動](external-tool-launch-plan.md) §4.4〜4.7。
 
 ## 決定済みとコード上の前提
+
+以下の「現在」は実装前のコード照合記録 (R1〜R3)。要求構築の全走査と DirectOriginal の
+早期 return を確認したうえで、決定済みの境界に沿って実装する。
 
 - 利用者決定: **1 行 1 パス、UTF-8 BOM なし、CRLF 固定**。文字コード・改行の設定は作らない。
 - `{file_list}` は「この起動に渡すファイルの一覧」。対象・順序・実体化ポリシーは `{files}` と同じ。
@@ -124,8 +127,52 @@ snapshot途中の同context取消しと別context不変をfake入力・計数・
 準備phaseの所有と既存確認／workerへの受け渡しも実装前の独立レビュー対象。
 互換性確認は利用者が受け手プレイヤーを操作する (mIV 終了後に読むなら keep_temp が必要)。
 実装時は外部起動正本、spec、環境設定の記法説明、manual/external-tools.html、製品ページを更新し、
-保存先の記述は privacy.html と突き合わせる。今回はコード・現行仕様・公開マニュアルを変更しない。
+保存先の記述は privacy.html と突き合わせる。
 
 R1レビューのP2「UI要求構築の同期全走査」とP3「元ファイルのみのdirectory初期化」を
 コード照合して採用し、次の独立レビューで対応確認済み。R3レビュー結果はACCEPT (利用者回答待ち)、
-利用者は2026-10-08にC329-1を採用した。実装は今回の作業に含めない。
+利用者は2026-10-08にC329-1を採用した。初回の設計作業は文書のみ、続く実装指示で §1.329 を実装する。
+
+
+## 実装記録 (2026-10-08、自動検証完了)
+
+- `ExternalOperation` が Idle / Preparing / Picker / Confirmation / Materializing / Launching を
+  所有する。旧 worker の Vec は完了通知の drain 用で、並行した準備状態にはしない。既存の
+  `edit_request_owner_context` / `with_owner_viewer_context` を使い、detached の predicate を追加しない。
+- 起動 / ピッカーの開始要求は context / generation / source descriptor のみ。右クリックメニューの
+  可否判定は別の参照 summary、準備は `ExternalPreparationBudget` の 128 entry / 2ms と
+  同 frame の再入防止で区切る。Listed の直接参照、RealFile の探索省略、必要時のみ一度の
+  page / Stack index を使い、共通設定・AI 材料・LUT map の不変 snapshot を要求内で共有する。
+- worker の `PreparedInvocation` は引数・リスト lease・参照メディア index を持つ局所状態。
+  **全リストの書込み / close と引数検査を UI launch ACK より前**に済ませる。Each は起動ごとの
+  1 行リスト、Batch は準備成功分の全行。ACK 取消 / 世代置換では双方の要求 lease を drop し、
+  spawn / Invoke 成功時だけ参照メディアとリストを process 所有へ移す。
+- `MaterializeSession::create_file_list` は自分で process directory を初期化し、一意名を予約する。
+  `PreparedFileList` は stamp / cache key を持たない成果物で、既存の request lease / keep_paths /
+  孤児回収を使う。keep_temp は終了時だけ残し、次回起動時の死んだ PID の回収は維持する。
+- 有効な red: HEAD `3a0409e86` の実際の `launch_target_item_index` に観測 counter だけを付け、
+  M=4,096 / N=128 の RealFile で **524,288 probes (期待0)** を確認した。焦点回帰1件が assertion
+  failure / exit101。診断後は保存した実装ファイルを自動復元した。記録: `target/C-1329-red-proof.txt`。
+  修正後は大規模準備の entry 数・frame 数・空のページ照合表・Listed 編集の直接参照で検証する。
+- 本体・manual・spec・architecture・UI responsiveness・privacy を同時更新する。設定の項目や
+  DB schema は追加しない。確認用の受け手と手順は `target/C-1329-capture-list.ps1` /
+  `target/C-1329-manual-check.md`。製品の起動と受け手プレイヤー互換性の確認は利用者が行う。
+
+
+### 自動検証結果 (2026-10-08)
+
+- 焦点: external_tool 73 / materializer 45 / creative_lut 14 / context_menu 61、
+  計193件成功。全libは `cargo test -p mimageviewer --lib` をpipeなしで実行し、
+  **10,986件成功、52件ignore、失敗0、exit0** (1,134.98秒)。
+- `cargo fmt` / `cargo fmt --check`、通常／portableのcore check、glyph lint
+  (危険glyph 0)、`git diff --check` が成功。CRLFを維持し、numstatに全体改行変換はない。
+- 記法説明と準備bodyの明暗4枚を追加して目視確認し、更新モードを外した
+  ui_snapshot全体115件が成功。回り続けるspinnerは既存の固定frame撮影を使う。
+- 初回全libで、menu fixtureが既存Appの共有test lockを持ちながら別Appを作る
+  再入待ちを検出して停止した。fixtureは既存Appと純粋なtest用descriptor構築を再利用する形に
+  修正し、上記の焦点／全libを再実行した。製品の状態遷移やテスト期待値の回避変更はない。
+- `CARGO_BUILD_JOBS=1 .\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`
+  はexit0。通常featureのdev-runtime core・Remote・EPUB workerを配置し、VCRT/PE検査も成功。
+  core buildは11分24秒。製品を起動していない。
+- 詳細記録: `target/C-1329-verification.md`。独立実装レビューと受け手互換性／実動作の
+  利用者確認は未実施。利用者仕様の未回答質問はない。コミットは行っていない。
