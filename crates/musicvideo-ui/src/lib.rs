@@ -13,6 +13,9 @@ mod modulators;
 mod resources;
 mod timeline;
 
+#[cfg(test)]
+mod layout_tests;
+
 pub use document::{DocumentSession, DocumentSessionId, EditGeneration, SaveCheckpoint};
 pub use keyframes::{
     AnimProperty, AnimationValue, CommandResult, EditorCommand, EditorCommandError,
@@ -77,6 +80,7 @@ pub struct EditorState {
     lyrics_editors: HashMap<LayerId, LyricsTextBuffer>,
     pending_text_edit_restores: Vec<(egui::Id, PendingLyricsInvalidation)>,
     pending_layer_delete: Option<LayerId>,
+    inspector_tab: InspectorTab,
     modulator_editor: ModulatorEditorState,
     history: UndoHistory,
 }
@@ -93,6 +97,7 @@ impl Default for EditorState {
             lyrics_editors: HashMap::new(),
             pending_text_edit_restores: Vec::new(),
             pending_layer_delete: None,
+            inspector_tab: InspectorTab::Layer,
             modulator_editor: ModulatorEditorState::default(),
             history: UndoHistory::default(),
         }
@@ -743,178 +748,253 @@ pub struct MissingImageNotice {
     pub reason: String,
 }
 
-/// Draws the layer list and property editor without owning the project.
-pub fn draw_editor(
-    ui: &mut egui::Ui,
-    project: &mut Project,
-    state: &mut EditorState,
-    current_time_secs: f64,
-    modulator_values: &[ModulatorValue],
-    calibrations: &[ModulatorCalibration],
-) -> EditorResponse {
-    state.restore_pending_text_edit_states(ui.ctx());
-    state.reconcile_preserving_native_reachability(project);
-    let context = ui.ctx().clone();
-    let mut history_changed = apply_history_shortcut(&context, project, state);
-    ui.horizontal(|ui| {
-        ui.heading("プロパティ");
-        if ui
-            .add_enabled(state.can_undo(), egui::Button::new("元に戻す"))
-            .on_hover_text("Ctrl+Z")
-            .clicked()
-        {
-            history_changed |= state.undo_in_context(&context, project);
-        }
-        if ui
-            .add_enabled(state.can_redo(), egui::Button::new("やり直す"))
-            .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
-            .clicked()
-        {
-            history_changed |= state.redo_in_context(&context, project);
-        }
-    });
-    ui.separator();
-    let checkpoint = state.begin_external_edit(project);
-    let body_width = ui.available_width();
-    let body_height = ui.available_height().max(0.0);
-    let allocation = ui.allocate_ui_with_layout(
-        egui::vec2(body_width, body_height),
-        egui::Layout::top_down(egui::Align::LEFT),
-        |ui| {
-            ui.set_min_width(body_width);
-            ui.set_max_width(body_width);
-            ui.set_min_height(body_height);
-            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-            let mut response = egui::ScrollArea::vertical()
-                .max_height(body_height)
-                .min_scrolled_height(0.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut project_changed = ui
-                        .add(
-                            egui::DragValue::new(&mut project.display_gain_db)
-                                .range(-48.0..=48.0)
-                                .speed(0.1)
-                                .prefix("表示ゲイン ")
-                                .suffix(" dB"),
-                        )
-                        .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
-                        .changed();
-                    project_changed |= modulators::draw_modulators(
-                        ui,
-                        project,
-                        &mut state.modulator_editor,
-                        modulator_values,
-                        calibrations,
-                    );
-                    ui.separator();
-                    ui.heading("レイヤー");
-                    ui.small("一覧の上が奥、下が手前です");
-                    for (index, layer) in project.layers.iter().enumerate() {
-                        if ui
-                            .selectable_label(state.selected_layer == Some(layer.id), &layer.name)
-                            .clicked()
-                        {
-                            state.select_layer(project, index);
-                        }
-                    }
+/// UI-only inspector selection, excluded from saving and Undo snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InspectorTab {
+    #[default]
+    Layer,
+    Modulators,
+    Project,
+}
 
-                    let selected_index = state.selected_layer(project);
-                    let selected_layer = project.layers.get(selected_index).map(|layer| layer.id);
-                    let mut order_command = None;
-                    ui.horizontal(|ui| {
-                        let can_move_toward_back = selected_layer.is_some() && selected_index > 0;
-                        if ui
-                            .add_enabled(
-                                can_move_toward_back,
-                                egui::Button::new("一覧の上へ（奥）"),
-                            )
-                            .on_hover_text("描画順を1つ奥へ移動します")
-                            .clicked()
-                            && let Some(layer) = selected_layer
-                        {
-                            order_command = Some(EditorCommand::MoveLayer {
-                                layer,
-                                direction: LayerMoveDirection::TowardBack,
-                            });
-                        }
-                        let can_move_toward_front =
-                            selected_layer.is_some() && selected_index + 1 < project.layers.len();
-                        if ui
-                            .add_enabled(
-                                can_move_toward_front,
-                                egui::Button::new("一覧の下へ（手前）"),
-                            )
-                            .on_hover_text("描画順を1つ手前へ移動します")
-                            .clicked()
-                            && let Some(layer) = selected_layer
-                        {
-                            order_command = Some(EditorCommand::MoveLayer {
-                                layer,
-                                direction: LayerMoveDirection::TowardFront,
-                            });
-                        }
-                    });
-                    if let Some(command) = order_command {
-                        project_changed |= state.apply_command(project, &command);
-                    }
-                    if ui
-                        .add_enabled(
-                            selected_layer.is_some(),
-                            egui::Button::new("選択中のレイヤーを削除…"),
-                        )
-                        .clicked()
-                    {
-                        state.pending_layer_delete = selected_layer;
-                    }
+impl EditorState {
+    pub fn inspector_tab(&self) -> InspectorTab {
+        self.inspector_tab
+    }
+    pub fn set_inspector_tab(&mut self, tab: InspectorTab) {
+        self.inspector_tab = tab;
+    }
 
-                    let mut new_layer = None;
-                    let mut add_image_layer_requested = false;
-                    ui.menu_button("＋ レイヤーを追加", |ui| {
-                        for (preset, label) in NEW_LAYER_PRESETS {
-                            if ui.button(label).clicked() {
-                                if preset == NewLayerPreset::Image {
-                                    add_image_layer_requested = true;
-                                } else {
-                                    new_layer = Some(preset);
-                                }
-                                ui.close();
-                            }
-                        }
+    /// Prepare once before any timeline or properties input.
+    /// Typed phases keep timeline edits outside the Properties checkpoint.
+    pub fn begin_frame<'a>(
+        &'a mut self,
+        context: &egui::Context,
+        project: &'a mut Project,
+    ) -> PreparedEditorFrame<'a> {
+        self.restore_pending_text_edit_states(context);
+        self.reconcile_preserving_native_reachability(project);
+        let history_changed = apply_history_shortcut(context, project, self);
+        PreparedEditorFrame {
+            context: context.clone(),
+            project,
+            state: self,
+            history_changed,
+        }
+    }
+}
+
+/// Pre-properties phase: restoration/shortcut has run. Draw history controls and
+/// the full-width timeline, then consume this phase with `properties`.
+#[must_use]
+pub struct PreparedEditorFrame<'a> {
+    context: egui::Context,
+    project: &'a mut Project,
+    state: &'a mut EditorState,
+    history_changed: bool,
+}
+
+impl<'a> PreparedEditorFrame<'a> {
+    pub fn history_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.state.can_undo(), egui::Button::new("元に戻す"))
+                .on_hover_text("Ctrl+Z")
+                .clicked()
+            {
+                self.history_changed |= self.state.undo_in_context(&self.context, self.project);
+            }
+            if ui
+                .add_enabled(self.state.can_redo(), egui::Button::new("やり直す"))
+                .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
+                .clicked()
+            {
+                self.history_changed |= self.state.redo_in_context(&self.context, self.project);
+            }
+        });
+    }
+    pub fn timeline(
+        &mut self,
+        ui: &mut egui::Ui,
+        position_secs: f64,
+        waveform: Option<&TimelineWaveform>,
+    ) -> TimelineResponse {
+        draw_timeline(ui, self.project, self.state, position_secs, waveform)
+    }
+    /// Start the single transaction shared by the list and all inspector tabs.
+    pub fn properties(self) -> EditorFrame<'a> {
+        let checkpoint = self.state.begin_external_edit(self.project);
+        EditorFrame {
+            context: self.context,
+            project: self.project,
+            state: self.state,
+            checkpoint,
+            response: EditorResponse {
+                history_changed: self.history_changed,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+/// One Properties transaction. Regions only draw and accumulate edits. Consuming
+/// `finish` performs deletion confirmation and exactly one history observation.
+#[must_use]
+pub struct EditorFrame<'a> {
+    context: egui::Context,
+    project: &'a mut Project,
+    state: &'a mut EditorState,
+    checkpoint: EditCheckpoint,
+    response: EditorResponse,
+}
+
+impl EditorFrame<'_> {
+    pub fn layer_list(&mut self, ui: &mut egui::Ui) {
+        panel_scroll(ui, "musicvideo-layer-list", |ui| {
+            let project = &mut *self.project;
+            let state = &mut *self.state;
+            let mut project_changed = false;
+            ui.heading("レイヤー");
+            ui.small("一覧の上が奥、下が手前です");
+            for (index, layer) in project.layers.iter().enumerate() {
+                if ui
+                    .selectable_label(state.selected_layer == Some(layer.id), &layer.name)
+                    .clicked()
+                {
+                    state.select_layer(project, index);
+                }
+            }
+
+            let selected_index = state.selected_layer(project);
+            let selected_layer = project.layers.get(selected_index).map(|layer| layer.id);
+            let mut order_command = None;
+            ui.vertical(|ui| {
+                let can_move_toward_back = selected_layer.is_some() && selected_index > 0;
+                if ui
+                    .add_enabled(can_move_toward_back, egui::Button::new("一覧の上へ（奥）"))
+                    .on_hover_text("描画順を1つ奥へ移動します")
+                    .clicked()
+                    && let Some(layer) = selected_layer
+                {
+                    order_command = Some(EditorCommand::MoveLayer {
+                        layer,
+                        direction: LayerMoveDirection::TowardBack,
                     });
-                    if let Some(preset) = new_layer {
-                        let layers = match preset {
-                            NewLayerPreset::Image => {
-                                unreachable!("画像の選択は呼び出し側が所有します")
-                            }
-                            NewLayerPreset::RadialSpectrum => {
-                                vec![new_radial_spectrum_layer(project)]
-                            }
-                            NewLayerPreset::LinearSpectrum => {
-                                vec![new_linear_spectrum_layer(project)]
-                            }
-                            NewLayerPreset::MivSpectrum => {
-                                vec![new_miv_spectrum_layer(project)]
-                            }
-                            NewLayerPreset::MivSpectrumKeyboard => {
-                                new_miv_spectrum_keyboard_layers(project).into()
-                            }
-                            NewLayerPreset::PitchKeyboard => {
-                                vec![new_pitch_keyboard_layer(project)]
-                            }
-                            NewLayerPreset::ProgressBar => {
-                                vec![new_progress_bar_layer(project)]
-                            }
-                            NewLayerPreset::TimeText => vec![new_time_text_layer(project)],
-                            NewLayerPreset::Text => vec![new_text_layer(project)],
-                            NewLayerPreset::Lyrics => vec![new_lyrics_layer(project)],
-                            NewLayerPreset::Solid => vec![new_solid_layer(project)],
-                        };
-                        project.layers.extend(layers);
-                        state.select_layer(project, project.layers.len() - 1);
-                        project_changed = true;
+                }
+                let can_move_toward_front =
+                    selected_layer.is_some() && selected_index + 1 < project.layers.len();
+                if ui
+                    .add_enabled(
+                        can_move_toward_front,
+                        egui::Button::new("一覧の下へ（手前）"),
+                    )
+                    .on_hover_text("描画順を1つ手前へ移動します")
+                    .clicked()
+                    && let Some(layer) = selected_layer
+                {
+                    order_command = Some(EditorCommand::MoveLayer {
+                        layer,
+                        direction: LayerMoveDirection::TowardFront,
+                    });
+                }
+            });
+            if let Some(command) = order_command {
+                project_changed |= state.apply_command(project, &command);
+            }
+            if ui
+                .add_enabled(
+                    selected_layer.is_some(),
+                    egui::Button::new("選択中のレイヤーを削除…"),
+                )
+                .clicked()
+            {
+                state.pending_layer_delete = selected_layer;
+            }
+
+            let mut new_layer = None;
+            let mut add_image_layer_requested = false;
+            ui.menu_button("＋ レイヤーを追加", |ui| {
+                for (preset, label) in NEW_LAYER_PRESETS {
+                    if ui.button(label).clicked() {
+                        if preset == NewLayerPreset::Image {
+                            add_image_layer_requested = true;
+                        } else {
+                            new_layer = Some(preset);
+                        }
+                        ui.close();
                     }
-                    ui.separator();
+                }
+            });
+            if let Some(preset) = new_layer {
+                let layers = match preset {
+                    NewLayerPreset::Image => {
+                        unreachable!("画像の選択は呼び出し側が所有します")
+                    }
+                    NewLayerPreset::RadialSpectrum => {
+                        vec![new_radial_spectrum_layer(project)]
+                    }
+                    NewLayerPreset::LinearSpectrum => {
+                        vec![new_linear_spectrum_layer(project)]
+                    }
+                    NewLayerPreset::MivSpectrum => {
+                        vec![new_miv_spectrum_layer(project)]
+                    }
+                    NewLayerPreset::MivSpectrumKeyboard => {
+                        new_miv_spectrum_keyboard_layers(project).into()
+                    }
+                    NewLayerPreset::PitchKeyboard => {
+                        vec![new_pitch_keyboard_layer(project)]
+                    }
+                    NewLayerPreset::ProgressBar => {
+                        vec![new_progress_bar_layer(project)]
+                    }
+                    NewLayerPreset::TimeText => vec![new_time_text_layer(project)],
+                    NewLayerPreset::Text => vec![new_text_layer(project)],
+                    NewLayerPreset::Lyrics => vec![new_lyrics_layer(project)],
+                    NewLayerPreset::Solid => vec![new_solid_layer(project)],
+                };
+                project.layers.extend(layers);
+                state.select_layer(project, project.layers.len() - 1);
+                state.inspector_tab = InspectorTab::Layer;
+                project_changed = true;
+            }
+
+            self.response.project_changed |= project_changed;
+            self.response.add_image_layer_requested |= add_image_layer_requested;
+        });
+    }
+    pub fn inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+        current_time_secs: f64,
+        modulator_values: &[ModulatorValue],
+        calibrations: &[ModulatorCalibration],
+    ) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.state.inspector_tab,
+                InspectorTab::Layer,
+                "レイヤー",
+            );
+            ui.selectable_value(
+                &mut self.state.inspector_tab,
+                InspectorTab::Modulators,
+                "モジュレータ",
+            );
+            ui.selectable_value(
+                &mut self.state.inspector_tab,
+                InspectorTab::Project,
+                "プロジェクト",
+            );
+        });
+        ui.separator();
+        let tab = self.state.inspector_tab;
+        panel_scroll(ui, ("musicvideo-inspector", tab as u8), |ui| {
+            let project = &mut *self.project;
+            let state = &mut *self.state;
+            match tab {
+                InspectorTab::Layer => {
+                    let mut project_changed = false;
                     let mut commands = Vec::new();
                     let mut import_lrc_requested = None;
                     let mut export_lrc_requested = None;
@@ -940,38 +1020,69 @@ pub fn draw_editor(
                     for command in commands {
                         project_changed |= state.apply_command(project, &command);
                     }
-                    EditorResponse {
-                        project_changed,
-                        history_changed: false,
-                        add_image_layer_requested,
-                        import_lrc_requested,
-                        export_lrc_requested,
-                    }
-                })
-                .inner;
-            if let Some(command) = draw_layer_delete_confirmation(&context, project, state) {
-                response.project_changed |= state.apply_command(project, &command);
+
+                    self.response.project_changed |= project_changed;
+                    self.response.import_lrc_requested = import_lrc_requested;
+                    self.response.export_lrc_requested = export_lrc_requested;
+                }
+                InspectorTab::Modulators => {
+                    self.response.project_changed |= modulators::draw_modulators(
+                        ui,
+                        project,
+                        &mut state.modulator_editor,
+                        modulator_values,
+                        calibrations,
+                    );
+                }
+                InspectorTab::Project => {
+                    self.response.project_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut project.display_gain_db)
+                                .range(-48.0..=48.0)
+                                .speed(0.1)
+                                .prefix("表示ゲイン ")
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
+                        .changed();
+                }
             }
-            response
-        },
-    );
-    let mut response = allocation.inner;
-    response.history_changed = history_changed;
-    let pointer_active = context.input(|input| input.pointer.primary_down());
-    // Context::wants_keyboard_input is true while a TextEdit (including the
-    // editable part of DragValue) owns focus. This both defines the text-edit
-    // transaction boundary and keeps IME input owned by egui.
-    let text_focus = context.memory(|memory| memory.focused());
-    state.observe_ui_pass(
-        EditSurface::Properties,
-        project,
-        checkpoint,
-        response.project_changed,
-        pointer_active,
-        text_focus,
-    );
-    response.project_changed |= history_changed;
-    response
+        });
+    }
+    pub fn finish(mut self) -> EditorResponse {
+        if let Some(command) =
+            draw_layer_delete_confirmation(&self.context, self.project, self.state)
+        {
+            self.response.project_changed |= self.state.apply_command(self.project, &command);
+        }
+        let pointer_active = self.context.input(|input| input.pointer.primary_down());
+        let text_focus = self.context.memory(|memory| memory.focused());
+        self.state.observe_ui_pass(
+            EditSurface::Properties,
+            self.project,
+            self.checkpoint,
+            self.response.project_changed,
+            pointer_active,
+            text_focus,
+        );
+        self.response.project_changed |= self.response.history_changed;
+        self.response
+    }
+}
+
+fn panel_scroll(ui: &mut egui::Ui, id: impl std::hash::Hash, draw: impl FnOnce(&mut egui::Ui)) {
+    let size = ui.available_size().max(egui::Vec2::ZERO);
+    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::LEFT), |ui| {
+        ui.set_min_size(size);
+        ui.set_max_width(size.x);
+        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::vertical()
+            .id_salt(id)
+            .max_height(size.y)
+            .min_scrolled_height(0.0)
+            .auto_shrink([false, false])
+            .show(ui, draw);
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2164,14 +2275,31 @@ mod tests {
     ) {
         let _ = context.run(
             egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 900.0),
+                )),
                 time: Some(time),
                 events,
                 ..Default::default()
             },
             |context| {
-                egui::CentralPanel::default().show(context, |ui| {
-                    draw_editor(ui, project, state, 0.0, &[], &[]);
+                let mut prepared = state.begin_frame(context, project);
+                egui::TopBottomPanel::bottom("test-timeline").show(context, |ui| {
+                    prepared.timeline(ui, 0.0, None);
                 });
+                let mut frame = prepared.properties();
+                egui::SidePanel::left("test-layers")
+                    .default_width(220.0)
+                    .show(context, |ui| {
+                        frame.layer_list(ui);
+                    });
+                egui::SidePanel::right("test-inspector")
+                    .default_width(360.0)
+                    .show(context, |ui| {
+                        frame.inspector(ui, 0.0, &[], &[]);
+                    });
+                frame.finish();
             },
         );
     }
@@ -2184,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_editor_leading_paste_keeps_existing_lyric_times() {
+    fn editor_frame_leading_paste_keeps_existing_lyric_times() {
         let (mut project, layer_id) = project_with_lyrics(vec![
             lyric_line("一行目", Some(1.0)),
             lyric_line("二行目", Some(2.0)),
@@ -2217,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_editor_ime_replacement_keeps_the_timed_line_identity() {
+    fn editor_frame_ime_replacement_keeps_the_timed_line_identity() {
         let (mut project, layer_id) = project_with_lyrics(vec![lyric_line("旧歌詞", Some(3.0))]);
         let mut state = EditorState::default();
         state.reset_for_project(&project);
@@ -2267,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_editor_native_undo_reaches_the_initial_checkpoint_after_many_input_passes() {
+    fn editor_frame_native_undo_reaches_the_initial_checkpoint_after_many_input_passes() {
         let original = (0..180)
             .map(|index| lyric_line(&format!("歌詞 {index}"), Some(index as f64 * 0.5)))
             .collect::<Vec<_>>();
@@ -2347,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_draw_editor_merge_restores_the_text_cursor_and_project() {
+    fn cancelling_an_editor_frame_merge_restores_the_text_cursor_and_project() {
         let original = vec![lyric_line("A", Some(1.0)), lyric_line("B", Some(2.0))];
         let (mut project, layer_id) = project_with_lyrics(original.clone());
         let mut state = EditorState::default();
@@ -2585,7 +2713,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_editor_layer_switch_keeps_each_lyrics_identity_separate() {
+    fn editor_frame_layer_switch_keeps_each_lyrics_identity_separate() {
         let (mut project, first_id) = project_with_lyrics(vec![lyric_line("一", Some(1.0))]);
         let mut second = new_lyrics_layer(&project);
         let second_id = second.id;

@@ -1,0 +1,384 @@
+//! Headless egui input tests for the split layout and its transaction boundaries.
+use super::*;
+use egui::{Event, FullOutput, Modifiers, Pos2, Rect, Vec2};
+use musicvideo_core::default_project;
+
+struct Harness {
+    context: egui::Context,
+    project: Project,
+    state: EditorState,
+    time: f64,
+    output: FullOutput,
+    response: EditorResponse,
+    panels: [Rect; 3],
+    timeline_entry: Project,
+    properties_entry: Project,
+}
+
+impl Harness {
+    fn new() -> Self {
+        let project = default_project(10.0);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        let mut harness = Self {
+            context: egui::Context::default(),
+            timeline_entry: project.clone(),
+            properties_entry: project.clone(),
+            project,
+            state,
+            time: 0.0,
+            output: FullOutput::default(),
+            response: EditorResponse::default(),
+            panels: [Rect::NOTHING; 3],
+        };
+        harness.frame(vec![]);
+        harness.frame(vec![]);
+        harness
+    }
+
+    fn frame(&mut self, events: Vec<Event>) {
+        self.time += 0.1;
+        self.output = self.context.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 1000.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                let mut prepared = self.state.begin_frame(ctx, &mut self.project);
+                // Capture what the FIRST input region sees, not just final state.
+                self.timeline_entry = prepared.project.clone();
+                egui::TopBottomPanel::top("history").show(ctx, |ui| prepared.history_controls(ui));
+                self.panels[0] = egui::TopBottomPanel::bottom("timeline")
+                    .default_height(300.0)
+                    .show(ctx, |ui| prepared.timeline(ui, 0.0, None))
+                    .response
+                    .rect;
+                let mut frame = prepared.properties();
+                self.properties_entry = frame.checkpoint.0.project.clone();
+                self.panels[1] = egui::SidePanel::left("layers")
+                    .default_width(220.0)
+                    .show(ctx, |ui| frame.layer_list(ui))
+                    .response
+                    .rect;
+                self.panels[2] = egui::SidePanel::right("inspector")
+                    .default_width(360.0)
+                    .show(ctx, |ui| frame.inspector(ui, 0.0, &[], &[]))
+                    .response
+                    .rect;
+                self.response = frame.finish();
+                egui::CentralPanel::default().show(ctx, |_| {});
+            },
+        );
+    }
+
+    fn label(&self, text: &str) -> Rect {
+        self.shapes()
+            .into_iter()
+            .rev()
+            .find_map(|shape| match shape {
+                egui::Shape::Text(shape) if shape.galley.text() == text => {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing rendered label: {text}"))
+    }
+
+    fn opacity_track(&self) -> Rect {
+        let label = self.label("不透明度");
+        self.shapes()
+            .into_iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Rect(shape)
+                    if shape.rect.width() > 80.0
+                        && shape.rect.height() < 12.0
+                        && (shape.rect.center().y - label.center().y).abs() < 4.0 =>
+                {
+                    Some(shape.rect)
+                }
+                _ => None,
+            })
+            .expect("rendered opacity slider track")
+    }
+
+    fn shapes(&self) -> Vec<&egui::Shape> {
+        fn collect<'a>(shape: &'a egui::Shape, shapes: &mut Vec<&'a egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(children) => {
+                    for child in children {
+                        collect(child, shapes);
+                    }
+                }
+                shape => shapes.push(shape),
+            }
+        }
+        let mut shapes = Vec::new();
+        for shape in &self.output.shapes {
+            collect(&shape.shape, &mut shapes);
+        }
+        shapes
+    }
+
+    fn pointer(&mut self, pos: Pos2, pressed: bool) {
+        self.frame(vec![
+            Event::PointerMoved(pos),
+            Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+    }
+
+    fn click(&mut self, label: &str) {
+        let pos = self.label(label).center();
+        self.pointer(pos, true);
+        self.pointer(pos, false);
+    }
+
+    fn drag_opacity(&mut self, leave_panel: bool) {
+        let track = self.opacity_track();
+        let start = Pos2::new(track.center().x, track.center().y);
+        self.pointer(start, true);
+        self.frame(vec![Event::PointerMoved(start - Vec2::new(20.0, 0.0))]);
+        let end = if leave_panel {
+            self.panels[1].center()
+        } else {
+            start - Vec2::new(35.0, 0.0)
+        };
+        if leave_panel {
+            self.frame(vec![Event::PointerMoved(end)]);
+            assert!(
+                self.state.history.has_continuous_edit(),
+                "pointer gesture stays open while crossing panels"
+            );
+        }
+        // The release carries a new position too: the last slider change must
+        // belong to the same transaction, even though the list is drawn first.
+        self.pointer(end, false);
+    }
+
+    fn shortcut(&mut self, key: egui::Key, modifiers: Modifiers) {
+        self.frame(vec![Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }]);
+        self.frame(vec![Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        }]);
+    }
+}
+
+#[test]
+fn split_layout_reorder_then_property_drag_keeps_two_undo_steps_and_selection() {
+    let mut h = Harness::new();
+    let before = h.project.clone();
+    let selected = h.state.selected_layer;
+    h.click("一覧の上へ（奥）");
+    let reordered = h.project.clone();
+    assert_ne!(before, reordered);
+    assert_eq!(h.state.history_depths(), (1, 0));
+    h.drag_opacity(false);
+    let edited = h.project.clone();
+    assert_ne!(reordered, edited);
+    assert_eq!(h.state.history_depths(), (2, 0));
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, reordered);
+    assert_eq!(h.state.selected_layer, selected);
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, before);
+    assert_eq!(h.state.selected_layer, selected);
+    h.shortcut(egui::Key::Y, Modifiers::CTRL);
+    assert_eq!(h.project, reordered);
+    h.shortcut(egui::Key::Y, Modifiers::CTRL);
+    assert_eq!(h.project, edited);
+    // Both visible regions point to the restored ID, even after reordering.
+    let layer = &h.project.layers[h.state.selected_layer(&h.project)];
+    assert_eq!(Some(layer.id), selected);
+    for panel in [h.panels[1], h.panels[2]] {
+        assert!(h.shapes().iter().any(|shape| matches!(shape,
+            egui::Shape::Text(shape) if shape.galley.text() == layer.name
+                && panel.contains(shape.pos))));
+    }
+    assert_eq!(h.state.inspector_tab(), InspectorTab::Layer);
+    h.opacity_track();
+}
+
+#[test]
+fn split_layout_pointer_drag_released_over_left_panel_is_one_undo_step() {
+    let mut h = Harness::new();
+    let before = h.project.clone();
+    h.drag_opacity(true);
+    let after = h.project.clone();
+    assert_ne!(before, after);
+    assert_eq!(h.state.history_depths(), (1, 0));
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, before);
+    h.shortcut(egui::Key::Y, Modifiers::CTRL);
+    assert_eq!(h.project, after);
+}
+
+#[test]
+fn split_layout_tab_switch_is_not_history_and_modulator_edit_is_separate() {
+    let mut h = Harness::new();
+    let before = h.project.clone();
+    h.drag_opacity(false);
+    let properties = h.project.clone();
+    h.click("モジュレータ");
+    assert_eq!(h.state.history_depths(), (1, 0));
+    h.click("＋ キックに合わせる動きを追加");
+    let modulated = h.project.clone();
+    assert_ne!(properties, modulated);
+    assert_eq!(h.state.history_depths(), (2, 0));
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, properties);
+    assert_eq!(h.state.inspector_tab(), InspectorTab::Modulators);
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, before);
+    assert_eq!(h.state.inspector_tab(), InspectorTab::Modulators);
+}
+
+#[test]
+fn split_layout_selection_keeps_tab_but_added_layer_opens_properties() {
+    let mut h = Harness::new();
+    h.click("プロジェクト");
+    let first_name = h.project.layers[0].name.clone();
+    h.click(&first_name);
+    assert_eq!(h.state.selected_layer, Some(h.project.layers[0].id));
+    assert_eq!(h.state.inspector_tab(), InspectorTab::Project);
+    assert_eq!(h.state.history_depths(), (0, 0));
+    h.click("＋ レイヤーを追加");
+    h.frame(vec![]);
+    h.click("テキスト");
+    assert_eq!(h.state.inspector_tab(), InspectorTab::Layer);
+    assert_eq!(
+        h.state.selected_layer,
+        h.project.layers.last().map(|layer| layer.id)
+    );
+    assert_eq!(h.state.history_depths(), (1, 0));
+}
+
+#[test]
+fn split_layout_shortcut_precedes_timeline_and_runs_once() {
+    let mut h = Harness::new();
+    let before = h.project.clone();
+    h.click("一覧の上へ（奥）");
+    let reordered = h.project.clone();
+    h.drag_opacity(false);
+    h.frame(vec![Event::Key {
+        key: egui::Key::Z,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::CTRL,
+    }]);
+    assert_eq!(h.timeline_entry, reordered);
+    assert_eq!(h.project, reordered);
+    assert_ne!(h.project, before);
+    assert_eq!(h.state.history_depths(), (1, 1));
+    assert!(h.response.history_changed);
+}
+
+#[test]
+fn split_layout_lyrics_native_undo_does_not_move_project_history() {
+    let mut h = Harness::new();
+    let mut layer = new_lyrics_layer(&h.project);
+    let id = layer.id;
+    let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
+        unreachable!()
+    };
+    lyrics.lines = vec![LyricLine {
+        text: "original".into(),
+        time_secs: Some(1.0),
+    }];
+    h.project.layers.push(layer);
+    h.state.reset_for_project(&h.project);
+    h.state.select_layer(&h.project, h.project.layers.len() - 1);
+    let checkpoint = h.state.begin_external_edit(&h.project);
+    h.project.display_gain_db = 3.0;
+    h.state.finish_external_edit(&h.project, checkpoint);
+    h.frame(vec![]);
+    let widget = h.state.lyrics_editors[&id].widget_id(id);
+    let mut native = egui::text_edit::TextEditState::load(&h.context, widget).unwrap();
+    native
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(8),
+        )));
+    native.store(&h.context, widget);
+    h.context.memory_mut(|memory| memory.request_focus(widget));
+    for _ in 0..12 {
+        h.frame(vec![]);
+    }
+    h.frame(vec![Event::Text(" edited".into())]);
+    for _ in 0..12 {
+        h.frame(vec![]);
+    }
+    let depth = h.state.history_depths();
+    h.shortcut(egui::Key::Z, Modifiers::CTRL | Modifiers::COMMAND);
+    let LayerKind::Lyrics(lyrics) = &h.project.layers.last().unwrap().kind else {
+        unreachable!()
+    };
+    assert_eq!(lyrics.lines[0].text, "original");
+    assert_eq!(lyrics.lines[0].time_secs, Some(1.0));
+    assert_eq!(h.project.display_gain_db, 3.0);
+    assert_eq!(h.state.history_depths(), depth);
+}
+
+#[test]
+fn split_layout_timeline_mutation_is_outside_properties_checkpoint() {
+    let mut h = Harness::new();
+    let id = h.state.selected_layer.unwrap();
+    h.state.apply_external_command(
+        &mut h.project,
+        &EditorCommand::AddKey {
+            layer: id,
+            property: AnimProperty::Opacity,
+            t: 2.0,
+        },
+    );
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let before = h.project.clone();
+    let marker = h
+        .shapes()
+        .into_iter()
+        .find_map(|shape| match shape {
+            egui::Shape::Path(path)
+                if path.closed
+                    && path.points.len() == 4
+                    && path.points.iter().all(|pos| h.panels[0].contains(*pos)) =>
+            {
+                Some(Rect::from_points(&path.points).center())
+            }
+            _ => None,
+        })
+        .expect("timeline key diamond");
+    h.pointer(marker, true);
+    h.frame(vec![Event::PointerMoved(marker + Vec2::new(6.5, 0.0))]);
+    let end = marker + Vec2::new(100.0, 0.0);
+    h.frame(vec![Event::PointerMoved(end)]);
+    assert_eq!(
+        h.properties_entry, h.project,
+        "properties starts after this frame's timeline mutation"
+    );
+    h.pointer(end, false);
+    let timeline_edit = h.project.clone();
+    assert_ne!(before, timeline_edit);
+    h.drag_opacity(false);
+    assert_ne!(h.project, timeline_edit);
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, timeline_edit);
+    h.shortcut(egui::Key::Z, Modifiers::CTRL);
+    assert_eq!(h.project, before);
+}

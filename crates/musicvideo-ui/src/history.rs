@@ -36,6 +36,11 @@ pub(crate) struct UndoHistory {
 }
 
 impl UndoHistory {
+    #[cfg(test)]
+    pub(crate) fn has_continuous_edit(&self) -> bool {
+        self.continuous.is_some()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();

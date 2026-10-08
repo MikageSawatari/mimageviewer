@@ -506,6 +506,18 @@ Undo/Redo shortcut の処理、外部編集の checkpoint、履歴の観測（�
 L1 の回帰テストに次を加える: 領域をまたぐ連続編集、タブ切替、ドラッグの release、歌詞の native Undo、
 Undo/Redo 後の選択復元、入力と非同期完了が同じフレームに届く場合。
 
+L1 の実装入口（2026-10-09）: `EditorState::begin_frame(ctx, project)` が復元・reconcile・shortcut を
+処理し、`PreparedEditorFrame` を返す。上部の `history_controls` と下部の `timeline` を描いた後、
+`properties()` で `EditorFrame` へ移る。左の `layer_list`、右の `inspector` は同じ checkpoint を共有し、
+消費型の `finish()` だけが削除確認・Properties の履歴観測を行う。旧 `draw_editor` 入口は廃止。
+タイムライン自身が文書を変更し別 surface の履歴を記録するため、Properties の checkpoint は
+タイムライン入力の**後**に取る。これを二段階の型で表し、入力前 checkpoint の持ち越しを避ける。
+右タブは `InspectorTab` として `EditorState` にだけ保持し、保存・Undo snapshot へ含めない。
+一覧選択ではタブを維持し、追加完了（非同期画像追加も含む）ではレイヤータブを開く。
+ホストの `draw_editing_panels` は上部履歴操作 → 全幅タイムライン → 左220px → 右360px → `finish`
+の順で描き、各入力の `note_edit` を済ませる。左右は可変幅で、親領域の高さと非縮小スクロールを確保する。
+その後に `poll_projects` / `poll_lrc` / `sync_runtime_resources`、最後に中央プレビューを描く。
+
 ### D15. 文字装飾の初版範囲（2026-10-09）
 
 **初版は `comic-core` に既にある装飾だけ**を対象にする（ユーザー判断）。
@@ -722,7 +734,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P3h** ✅ | レイヤー管理: 削除確認、奥／手前への並べ替え、最終画像参照の整理 | **完了**（2026-09-05）。`EditorCommand` 経由で操作し、共有画像は最後の参照を削除するまで `Project.images` に残す。一覧の上が奥、下が手前で実描画順と一致する |
 | **P3i** ✅ | 歌詞レイヤー: 行単位の時刻付け、音声再生中のタップ入力、タイムライン修正、LRC 読み書き | **完了**（2026-09-05）。未設定行・空行・同一時刻の後勝ちを含む専用モデルを追加し、描画は comic-core の既存テキスト経路を共有。UTF-8 / Shift_JIS 判定、複数時刻タグ、offset、行内時刻タグを扱い、ファイル I/O はラボのワーカーに閉じる |
 | **P3j** 実装済み・実機未検収 | 編集履歴: Project・素材・歌詞行 identity の snapshot、選択復元、連続操作のグループ化 | 共有履歴の初期実装は `4f41cce35`。2026-09-08 に `91326ca8d` / `0c24a453e` で画像・音声の履歴と host 復元を補完、`8e12458e4` で歌詞本文と native Undo の対応を補完。128 段、ドラッグ/フォーカス単位、読込時消去、Redo 破棄、入力中の shortcut 抑止を維持。独立レビューと全体テスト完了。実音・実 IME・操作感は未検収。[検証記録](brief-musicvideo-edit-integrity.md) を参照 |
-| **L1** | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | ラボで確認。既存の編集操作・Undo 単位・選択復元が変わらない（既存テスト維持＋配置変更に伴う handler テスト）。`musicvideo-ui` が eframe / cpal / ffmpeg に依存しないこと（`cargo tree`）を維持 |
+| **L1** 実装済み・検収待ち | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | **実装・自動テスト済み**（2026-10-09、musicvideo 未コミット差分）。core 73件 / UI 94件（既存87＋新規7）/ lab 46件（既存45＋新規1）、全213件成功。新規は領域横断編集・release・タブ・native Undo・選択/追加・shortcut順・timeline checkpoint境界と実ホスト配置。既存の同フレームProject/LRC完了2件を実パネル入力へ強化。`cargo tree` の禁止依存なし、fmt・glyph検査成功。releaseラボのビルド結果と変異検証は下記。アプリ未起動・コミットなし |
 | **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトはフレームハッシュ不変。補間規則（構造一致時のみ補間）をテストで固定。保存往復。装飾ありシーンの合成時間を実測して記録 |
 | **I1** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | 本体の既存 IME テスト・raw TextEdit 禁止検査が全件維持。`musicvideo-ui` の single-line 入力は共有 helper 経由。歌詞は独自の multiline（`LyricsTextBuffer`）なので、入力補正 plugin を効かせたうえで既存の buffer・widget ID・native Undo を保つ。IME の Esc 取消・候補選択中 Tab・Enter 確定・フォーカス復帰・Undo 所有を handler テストで固定。独立レビューで「挙動不変の切り出し」に合意 |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
@@ -733,6 +745,33 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
+
+L1 自動検証記録（2026-10-09）:
+
+| 回帰テスト（UIの名前は `split_layout_` を省略） | 意図的な不正実装による失敗確認 |
+| --- | --- |
+| `reorder_then_property_drag_keeps_two_undo_steps_and_selection` | 左領域にも履歴観測を追加すると失敗。選択復元を先頭レイヤーへ固定しても失敗 |
+| `pointer_drag_released_over_left_panel_is_one_undo_step` | pointer継続の判定を右パネル内に限定すると失敗 |
+| `tab_switch_is_not_history_and_modulator_edit_is_separate` | タブをsnapshotへ含め、切替を文書変更として観測すると失敗 |
+| `lyrics_native_undo_does_not_move_project_history` | TextEditフォーカスを無視してshortcutを処理すると失敗 |
+| `selection_keeps_tab_but_added_layer_opens_properties` | 追加時のレイヤータブ切替を削除すると失敗 |
+| `shortcut_precedes_timeline_and_runs_once` | shortcutをProperties開始時まで遅らせると失敗 |
+| `timeline_mutation_is_outside_properties_checkpoint` | Propertiesのcheckpointをtimeline入力前へ移すと失敗 |
+| lab `editor_panels_keep_timeline_full_width_and_inspector_tabs_separate` | timelineより先にSidePanelを置くと失敗。実ホストのPanelState・各タブの描画内容で配置を検査 |
+| lab 既存 `project_load_completion_after_same_frame_input_waits_for_a_choice` / `lrc_completion_after_same_frame_input_waits_for_a_choice` | 実パネル入力前に完了をpollすると両方失敗 |
+
+10種類の変異をすべて検出し、その都度元のソースへ復元した。checkpoint前倒しの初回変異は
+Undo結果だけでは検出できなかったため、timelineが変更した同フレームのProperties入口snapshotも検査して
+再実行し、失敗を確認した。最終ソースで上記全件テストを再実行済み。
+ビットマップsnapshotは追加せず、headless eguiの実入力・描画shapeと実ホストPanelStateの矩形を検査する。
+既存の歌詞native Undo・IME・identityテストも新入口と左右＋下配置へ移行し、全件維持した。
+
+検証環境はWindows、`MSBUILDDISABLENODEREUSE=1`。各commandのexit codeは0。
+ログは `target/l1-{core-tests,ui-tests,lab-tests,ui-dependencies,format,glyphs,release-lab}.log`、
+集計は `target/l1-verification-summary.txt`。変異ログは `target/l1-mutation-*.log` と
+`target/l1-mutation-summary.txt`（いずれも未追跡のビルド領域）。
+`cargo build --release -p musicvideo_lab` は43.5秒で成功し、`target/release/musicvideo_lab.exe` を生成した。
+アプリは起動していない。利用者・設計担当による配置/操作感の確認と独立レビューは未実施。
 
 P4e の範囲（独立レビューの整理による）:
 

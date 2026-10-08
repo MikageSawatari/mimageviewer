@@ -14,9 +14,8 @@ use musicvideo_core::{
 };
 use musicvideo_ui::{
     DocumentSession, DocumentSessionId, EditGeneration, EditTargetLifetime, EditorCommand,
-    EditorResponse, EditorState, MissingImageNotice, ResourceLease, ResourceManifest,
-    ResourceRevision, SaveCheckpoint, TimelineWaveform, draw_editor, draw_missing_images,
-    draw_preview, draw_timeline,
+    EditorResponse, EditorState, InspectorTab, MissingImageNotice, ResourceLease, ResourceManifest,
+    ResourceRevision, SaveCheckpoint, TimelineWaveform, draw_missing_images, draw_preview,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -941,6 +940,7 @@ impl MusicVideoLabApp {
                 self.project.layers.insert(insertion_index, layer);
                 self.editor_state
                     .select_layer(&self.project, insertion_index);
+                self.editor_state.set_inspector_tab(InspectorTab::Layer);
                 id
             }
         };
@@ -1066,6 +1066,52 @@ impl MusicVideoLabApp {
             pending.queued = None;
         }
         self.lrc_load = LrcLoadState::Idle;
+    }
+
+    /// All editor input and generation updates precede asynchronous completion admission.
+    fn draw_editing_panels(&mut self, ctx: &egui::Context) -> EditorResponse {
+        let mut prepared = self.editor_state.begin_frame(ctx, &mut self.project);
+        egui::TopBottomPanel::top("musicvideo-history").show(ctx, |ui| {
+            prepared.history_controls(ui);
+        });
+        let timeline_response = egui::TopBottomPanel::bottom("musicvideo-timeline")
+            .resizable(true)
+            .default_height(320.0)
+            .min_height(150.0)
+            .show(ctx, |ui| {
+                prepared.timeline(ui, self.position_secs, self.waveform.as_ref())
+            })
+            .inner;
+        let mut frame = prepared.properties();
+        egui::SidePanel::left("musicvideo-layers")
+            .resizable(true)
+            .default_width(220.0)
+            .min_width(180.0)
+            .show(ctx, |ui| frame.layer_list(ui));
+        egui::SidePanel::right("musicvideo-properties")
+            .resizable(true)
+            .default_width(360.0)
+            .min_width(300.0)
+            .show(ctx, |ui| {
+                frame.inspector(
+                    ui,
+                    self.position_secs,
+                    &self.preview_modulator_values,
+                    &self.modulator_calibrations,
+                );
+            });
+        let response = frame.finish();
+        self.handle_editor_response(response);
+        if timeline_response.project_changed {
+            self.document.note_edit();
+        }
+        if let Some(position_secs) = timeline_response.seek_to {
+            self.seek_to(position_secs);
+        } else if timeline_response.project_changed {
+            self.schedule_project_edit_preview();
+        }
+
+        response
     }
 
     fn handle_editor_response(&mut self, response: EditorResponse) {
@@ -2124,8 +2170,6 @@ impl eframe::App for MusicVideoLabApp {
         let audio_sync_ms = audio_sync_started.elapsed().as_secs_f64() * 1000.0;
         let mut replacement_request = None;
         let mut add_image_layer_requested = false;
-        let mut import_lrc_requested = None;
-        let mut export_lrc_requested = None;
         let mut reset_preview_perf = false;
         let mut apply_ready_project = false;
         let mut discard_ready_project = false;
@@ -2449,22 +2493,10 @@ impl eframe::App for MusicVideoLabApp {
             self.start_image_load(id, path, ctx);
         }
 
-        egui::SidePanel::right("musicvideo-properties")
-            .default_width(330.0)
-            .show(ctx, |ui| {
-                let response = draw_editor(
-                    ui,
-                    &mut self.project,
-                    &mut self.editor_state,
-                    self.position_secs,
-                    &self.preview_modulator_values,
-                    &self.modulator_calibrations,
-                );
-                add_image_layer_requested = response.add_image_layer_requested;
-                import_lrc_requested = response.import_lrc_requested;
-                export_lrc_requested = response.export_lrc_requested;
-                self.handle_editor_response(response);
-            });
+        let response = self.draw_editing_panels(ctx);
+        add_image_layer_requested |= response.add_image_layer_requested;
+        let import_lrc_requested = response.import_lrc_requested;
+        let export_lrc_requested = response.export_lrc_requested;
 
         if let Some(layer) = import_lrc_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -2488,29 +2520,6 @@ impl eframe::App for MusicVideoLabApp {
                 .pick_file()
         {
             self.start_image_request(ImageLoadTarget::AddLayer, path, ctx);
-        }
-
-        let timeline_response = egui::TopBottomPanel::bottom("musicvideo-timeline")
-            .resizable(true)
-            .default_height(320.0)
-            .min_height(150.0)
-            .show(ctx, |ui| {
-                draw_timeline(
-                    ui,
-                    &mut self.project,
-                    &mut self.editor_state,
-                    self.position_secs,
-                    self.waveform.as_ref(),
-                )
-            })
-            .inner;
-        if timeline_response.project_changed {
-            self.document.note_edit();
-        }
-        if let Some(position_secs) = timeline_response.seek_to {
-            self.seek_to(position_secs);
-        } else if timeline_response.project_changed {
-            self.schedule_project_edit_preview();
         }
 
         // Project/LRC completion can replace the document or lyrics. Apply the current frame's
@@ -2908,6 +2917,103 @@ mod tests {
         }
     }
 
+    fn editor_input(
+        app: &mut MusicVideoLabApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 1200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_editing_panels(ctx);
+            },
+        )
+    }
+
+    fn pointer_input(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn rendered_editor_text(
+        app: &mut MusicVideoLabApp,
+        context: &egui::Context,
+        text: &str,
+        exact: bool,
+    ) -> egui::Pos2 {
+        editor_input(app, context, vec![]);
+        let output = editor_input(app, context, vec![]);
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(shape)
+                    if if exact {
+                        shape.galley.text() == text
+                    } else {
+                        shape.galley.text().starts_with(text)
+                    } =>
+                {
+                    Some(shape.pos + shape.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing panel text: {text}"))
+    }
+
+    #[test]
+    fn editor_panels_keep_timeline_full_width_and_inspector_tabs_separate() {
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        let context = egui::Context::default();
+        for tab in [
+            InspectorTab::Layer,
+            InspectorTab::Modulators,
+            InspectorTab::Project,
+        ] {
+            app.editor_state.set_inspector_tab(tab);
+            editor_input(&mut app, &context, vec![]);
+            let output = editor_input(&mut app, &context, vec![]);
+            let panel = |id| {
+                egui::containers::panel::PanelState::load(&context, egui::Id::new(id))
+                    .unwrap()
+                    .rect
+            };
+            let timeline = panel("musicvideo-timeline");
+            let left = panel("musicvideo-layers");
+            let right = panel("musicvideo-properties");
+            assert_eq!(timeline.left(), 0.0);
+            assert_eq!(timeline.right(), 1400.0);
+            assert!(left.bottom() <= timeline.top());
+            assert!(right.bottom() <= timeline.top());
+            assert!((left.width() - 220.0).abs() < 2.0);
+            assert!((right.width() - 360.0).abs() < 2.0);
+            let inspector_text = |text: &str| {
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(shape) if shape.galley.text().starts_with(text) && right.contains(shape.pos)))
+            };
+            assert_eq!(inspector_text("不透明度"), tab == InspectorTab::Layer);
+            assert_eq!(
+                inspector_text("＋ キックに合わせる動きを追加"),
+                tab == InspectorTab::Modulators
+            );
+            assert_eq!(inspector_text("表示ゲイン"), tab == InspectorTab::Project);
+        }
+    }
+
     #[test]
     fn project_load_completion_after_same_frame_input_waits_for_a_choice() {
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
@@ -2919,14 +3025,25 @@ mod tests {
             rx,
             queued: None,
         });
-        app.project.display_gain_db = 4.0;
-        app.document.note_edit();
+        let context = egui::Context::default();
+        app.editor_state.set_inspector_tab(InspectorTab::Project);
+        let pos = rendered_editor_text(&mut app, &context, "表示ゲイン", false);
+        editor_input(&mut app, &context, pointer_input(pos, true));
         tx.send(Ok(loaded_project("loaded.mivmv.json", 25.0)))
             .unwrap();
 
-        app.poll_projects(&egui::Context::default());
+        // Completion is already available while this frame's panel changes the document.
+        editor_input(
+            &mut app,
+            &context,
+            vec![egui::Event::PointerMoved(pos + egui::vec2(40.0, 0.0))],
+        );
+        let gain = app.project.display_gain_db;
+        assert_ne!(gain, 0.0);
+        assert_ne!(app.document.edit_generation(), started_at);
+        app.poll_projects(&context);
 
-        assert_eq!(app.project.display_gain_db, 4.0);
+        assert_eq!(app.project.display_gain_db, gain);
         assert!(matches!(app.project_load, ProjectLoadState::Ready(_)));
         let ProjectLoadState::Ready(loaded) = std::mem::take(&mut app.project_load) else {
             unreachable!();
@@ -3388,18 +3505,30 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.lrc_load = LrcLoadState::Loading { owner, rx };
         let report = parse_lrc(b"[00:02.00]loaded\n").unwrap();
-        let LayerKind::Lyrics(lyrics) = &mut app
-            .project
-            .layers
-            .iter_mut()
-            .find(|layer| layer.id == layer_id)
-            .unwrap()
-            .kind
-        else {
-            unreachable!();
-        };
-        lyrics.lines[0].text = "edited while loading".to_owned();
+        app.editor_state
+            .select_layer(&app.project, app.project.layers.len() - 1);
+        let pos = rendered_editor_text(&mut app, &context, "original", true);
+        editor_input(&mut app, &context, pointer_input(pos, true));
+        editor_input(&mut app, &context, pointer_input(pos, false));
         tx.send(Ok((PathBuf::from("loaded.lrc"), report))).unwrap();
+        editor_input(
+            &mut app,
+            &context,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text("edited while loading".to_owned()),
+            ],
+        );
+        assert_eq!(
+            app.current_lyrics(layer_id).unwrap()[0].text,
+            "edited while loading"
+        );
 
         app.poll_lrc(&context);
 
