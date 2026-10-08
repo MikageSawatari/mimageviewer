@@ -99264,3 +99264,197 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
 
 #[path = "tests/startup_restore.rs"]
 mod startup_restore_tests;
+
+mod background_click_scroll_regression_tests {
+    use super::*;
+    use egui_kittest::Harness;
+
+    struct State {
+        app: AppTestEnvForTest,
+        navs: Vec<crate::ui_main::AddressBarNav>,
+        wheels_consumed: Vec<bool>,
+        parent_return_scroll: Vec<f32>,
+    }
+
+    fn install_items(app: &mut App, folder: &Path, count: usize) {
+        app.current_folder = Some(folder.to_path_buf());
+        app.items = (0..count)
+            .map(|idx| GridItem::ZipFile(folder.join(format!("book-{idx:03}.zip"))))
+            .collect();
+        app.visible_indices = (0..count).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; count];
+        app.image_metas = vec![None; count];
+    }
+
+    fn harness(app: AppTestEnvForTest) -> Harness<'static, State> {
+        let mut fonts_set = false;
+        Harness::builder()
+            .with_size(egui::vec2(2000.0, 480.0))
+            .with_step_dt(0.01)
+            .build_state(
+                move |ctx, state| {
+                    if !fonts_set {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_set = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    state.app.begin_grid_click_input_frame(ctx);
+                    // Match App::update: the wheel owner runs before render_grid.
+                    let had_wheel = ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5);
+                    state.app.process_scroll(ctx);
+                    if had_wheel {
+                        assert_eq!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
+                        assert!(!ctx.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                        }));
+                        state
+                            .wheels_consumed
+                            .push(ctx.input(|input| input.modifiers.ctrl));
+                    }
+                    let old_folder = state.app.current_folder.clone();
+                    if let Some(nav) = state.app.render_grid(ctx) {
+                        state.navs.push(nav);
+                    }
+                    if state.app.current_folder != old_folder {
+                        state.parent_return_scroll.push(state.app.scroll_offset_y);
+                    }
+                },
+                State {
+                    app,
+                    navs: Vec::new(),
+                    wheels_consumed: Vec::new(),
+                    parent_return_scroll: Vec::new(),
+                },
+            )
+    }
+
+    fn click(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+    }
+
+    fn wheel_breaks_pair(view: crate::settings::GridViewMode) {
+        for ctrl in [false, true] {
+            let mut app = setup_app_for_test();
+            let child = app.tmp.path().join("child");
+            install_items(&mut app, &child, 1);
+            app.settings.grid_view_mode = view;
+            // Ctrl+wheel is still accepted at the column limit, without saving a change.
+            app.settings.grid_cols = crate::settings::MAX_GRID_COLS;
+            app.settings.grid_background_double_click_action =
+                crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+            let mut harness = harness(app);
+            harness
+                .ctx
+                .options_mut(|options| options.input_options.max_double_click_delay = 5.0);
+            harness.run_steps(6);
+            let pos = egui::pos2(30.0, 430.0);
+            click(&mut harness, pos);
+            assert!(harness.state().navs.is_empty());
+            let modifiers = egui::Modifiers {
+                ctrl,
+                ..egui::Modifiers::NONE
+            };
+            harness.event_modifiers(
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers,
+                },
+                modifiers,
+            );
+            harness.step();
+            assert_eq!(harness.state().wheels_consumed, vec![ctrl]);
+            click(&mut harness, pos);
+            assert!(
+                harness.state().navs.is_empty(),
+                "consumed wheel must break the pair: {view:?}, ctrl={ctrl}"
+            );
+            // This click was the first in a new pair, rather than disabling the feature.
+            click(&mut harness, pos);
+            assert_eq!(harness.state().navs.len(), 1);
+        }
+    }
+
+    fn snapshot_return_keeps_new_scroll(view: crate::settings::GridViewMode) {
+        let mut app = setup_app_for_test();
+        let origin = app.tmp.path().join("origin");
+        install_items(&mut app, &origin, 240);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        install_items(&mut app, &origin.join("child"), 41);
+        app.settings.grid_view_mode = view;
+        app.settings.grid_cols = 4;
+        app.settings.grid_background_double_click_action =
+            crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+        app.scroll_offset_y = 100_000.0;
+        let mut harness = harness(app);
+        harness
+            .ctx
+            .options_mut(|options| options.input_options.max_double_click_delay = 5.0);
+        harness.run_steps(6);
+        let old_offset = harness.state().app.scroll_offset_y;
+        assert!(old_offset > 100.0);
+        // The snapped end extent includes unowned background below the last row.
+        let body_top = if view == crate::settings::GridViewMode::Details {
+            38.0
+        } else {
+            8.0
+        };
+        let pos = egui::pos2(30.0, body_top + harness.state().app.last_viewport_h - 1.0);
+        assert!(pos.y < 480.0);
+        click(&mut harness, pos);
+        assert_eq!(
+            harness.state().app.current_folder.as_ref(),
+            Some(&origin.join("child"))
+        );
+        assert!(harness.state().parent_return_scroll.is_empty());
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.current_folder.as_ref(), Some(&origin));
+        assert_eq!(harness.state().app.items.len(), 240);
+        assert_eq!(
+            harness.state().parent_return_scroll,
+            vec![0.0],
+            "old {view:?} ScrollArea offset {old_offset} must not overwrite the restored list"
+        );
+        assert_eq!(harness.state().app.scroll_offset_y, 0.0);
+        harness.run_steps(6);
+        assert_eq!(
+            harness.state().app.scroll_offset_y,
+            0.0,
+            "long restored list must remain at its own position"
+        );
+    }
+
+    #[test]
+    fn background_scroll_consumed_wheel_thumbnail_breaks_pair() {
+        wheel_breaks_pair(crate::settings::GridViewMode::Thumbnail);
+    }
+
+    #[test]
+    fn background_scroll_consumed_wheel_details_breaks_pair() {
+        wheel_breaks_pair(crate::settings::GridViewMode::Details);
+    }
+
+    #[test]
+    fn background_scroll_snapshot_return_thumbnail_keeps_new_offset() {
+        snapshot_return_keeps_new_scroll(crate::settings::GridViewMode::Thumbnail);
+    }
+
+    #[test]
+    fn background_scroll_snapshot_return_details_keeps_new_offset() {
+        snapshot_return_keeps_new_scroll(crate::settings::GridViewMode::Details);
+    }
+}

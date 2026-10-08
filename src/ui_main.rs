@@ -16807,6 +16807,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             },
         );
 
+        // Commit this list's ScrollArea result before background actions can
+        // replace the list and establish the destination's own scroll position.
+        if (egui_offset_y - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
+            self.scroll_offset_y =
+                (egui_offset_y / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H;
+        }
+
         self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
         self.update_grid_mouse_ring_flick(ctx);
         nav = nav.or_else(|| {
@@ -16831,11 +16838,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.open_current_folder_context_menu(ctx);
         }
         self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
-
-        if (egui_offset_y - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
-            self.scroll_offset_y =
-                (egui_offset_y / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H;
-        }
 
         let full_rect = ui.max_rect();
         self.draw_mouse_ring_flick_overlay(
@@ -19351,36 +19353,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     });
 
-                self.begin_grid_background_pointer_trace(ctx, scroll_output.inner_rect);
-                self.finish_grid_pointer_trace(ctx);
-
-                // グリッドの空白部分で右クリック → フォルダメニュー。
-                // セルの右クリックは handle_cell_interaction 側で先に `context_menu_idx`
-                // をセットする。ここではそれが無かった場合だけ、ScrollArea の表示領域
-                // 全体を背景として扱う。content Ui の `ui_contains_pointer()` だと、
-                // サムネイル総高さが viewport より低いときに最後の行より下の余白を
-                // 拾えないため、`scroll_output.inner_rect` を使う。
-                self.start_grid_background_mouse_ring_flick_if_pressed(
-                    ctx,
-                    scroll_output.inner_rect,
-                );
-                self.update_grid_mouse_ring_flick(ctx);
-                nav = nav.or_else(|| self.handle_grid_background_primary_click(
-                    ctx, grid_background_rect_without_scrollbars(scroll_output.inner_rect, scroll_output.content_size, ui.spacing().scroll),
-                    primary_click_hit_cell, primary_press_hit_cell, suppress_primary_pointer,
-                    previous_grid_click_pairing, &touch_frame,
-                ));
-                let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
-                    && ctx.input(|i| i.pointer.secondary_clicked());
-                if bg_right_clicked
-                    && self.context_menu_idx.is_none()
-                    && !self.selection_info_bar_contains_pointer(ctx)
-                    && !self.mouse_ring_context_menu_suppressed(ctx)
-                {
-                    self.open_current_folder_context_menu(ctx);
-                }
-                self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
-
+                // Finish the old list's scroll writeback before any background
+                // action can replace it (snapshot return may return no nav).
                 // スクロールバードラッグによるオフセット変化を読み戻す。
                 // egui が内部で管理するオフセットと自前オフセットを同期させる。
                 // ただし行スナップによる端数差分で毎フレーム振動するのを防ぐため、
@@ -19410,6 +19384,36 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             (cols, cell_w, cell_h, self.last_viewport_h));
                     }
                 }
+
+                self.begin_grid_background_pointer_trace(ctx, scroll_output.inner_rect);
+                self.finish_grid_pointer_trace(ctx);
+
+                // グリッドの空白部分で右クリック → フォルダメニュー。
+                // セルの右クリックは handle_cell_interaction 側で先に `context_menu_idx`
+                // をセットする。ここではそれが無かった場合だけ、ScrollArea の表示領域
+                // 全体を背景として扱う。content Ui の `ui_contains_pointer()` だと、
+                // サムネイル総高さが viewport より低いときに最後の行より下の余白を
+                // 拾えないため、`scroll_output.inner_rect` を使う。
+                self.start_grid_background_mouse_ring_flick_if_pressed(
+                    ctx,
+                    scroll_output.inner_rect,
+                );
+                self.update_grid_mouse_ring_flick(ctx);
+                nav = nav.or_else(|| self.handle_grid_background_primary_click(
+                    ctx, grid_background_rect_without_scrollbars(scroll_output.inner_rect, scroll_output.content_size, ui.spacing().scroll),
+                    primary_click_hit_cell, primary_press_hit_cell, suppress_primary_pointer,
+                    previous_grid_click_pairing, &touch_frame,
+                ));
+                let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
+                    && ctx.input(|i| i.pointer.secondary_clicked());
+                if bg_right_clicked
+                    && self.context_menu_idx.is_none()
+                    && !self.selection_info_bar_contains_pointer(ctx)
+                    && !self.mouse_ring_context_menu_suppressed(ctx)
+                {
+                    self.open_current_folder_context_menu(ctx);
+                }
+                self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 
                 // 右上フィードバックトースト (Q / Ctrl+Backspace / F7〜F10 / レーティング等)
                 // show_feedback_toast でセットされたテキストをグリッド画面でも描画する。

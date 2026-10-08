@@ -52714,6 +52714,10 @@ impl App {
         // マウスホイールイベントだけを取り出し、egui には渡さない
         let (scroll_delta_y, ctrl) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta_y.abs() > 0.5 {
+            // This owner consumes the wheel before render_grid can observe it.
+            // An accepted scroll (including Ctrl+wheel at a column limit) ends
+            // the grid click run even when the resulting offset is unchanged.
+            self.grid_click_pairing.end_activation();
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
