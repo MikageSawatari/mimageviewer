@@ -25667,32 +25667,13 @@ impl App {
         continuation: ClassifiedOpenContinuation,
     ) -> OpenAdmission {
         let proof = match &continuation {
-            ClassifiedOpenContinuation::Direct {
-                owner: OpenRequestOwner::Bookmark(owner),
-                ..
+            ClassifiedOpenContinuation::Direct { owner, .. }
+            | ClassifiedOpenContinuation::DirectNavigation { owner, .. }
+            | ClassifiedOpenContinuation::DirectScan { owner, .. } => {
+                Some(self.copied_open_source_proof(owner))
             }
-            | ClassifiedOpenContinuation::DirectNavigation {
-                owner: OpenRequestOwner::Bookmark(owner),
-                ..
-            }
-            | ClassifiedOpenContinuation::DirectScan {
-                owner: OpenRequestOwner::Bookmark(owner),
-                ..
-            } => Some(MainListSourceProof::Bookmark(owner.clone())),
-            // This continuation retains a row index and derives kind after classification.
-            // Unlike path-based Smart moves, a row refresh must invalidate its authority.
-            ClassifiedOpenContinuation::SmartGrid { .. } => Some(MainListSourceProof::Row),
-            ClassifiedOpenContinuation::Direct {
-                owner: OpenRequestOwner::Navigation,
-                ..
-            }
-            | ClassifiedOpenContinuation::DirectNavigation {
-                owner: OpenRequestOwner::Navigation,
-                ..
-            } if crate::folder_tree::is_paged_document_path(candidate_source.as_path()) => self
-                .smart_folder_source_lease()
-                .map(MainListSourceProof::Surface)
-                .or(Some(MainListSourceProof::Row)),
+            // SmartGrid retains an index and derives kind after classification. Other
+            // native row/snapshot continuations also keep their strict source contract.
             _ => Some(MainListSourceProof::Row),
         };
         let navigation = if self.main_folder_history_available() {
@@ -26245,7 +26226,7 @@ impl App {
             self.main_folder_history_available().then(|| {
                 self.capture_main_list_navigation(
                     MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
-                    MainListSourceProof::Row,
+                    self.copied_open_source_proof(&owner),
                 )
             })
         });
@@ -27291,6 +27272,18 @@ impl App {
         }
     }
 
+    fn copied_open_source_proof(&self, owner: &OpenRequestOwner) -> MainListSourceProof {
+        match owner {
+            // These requests own the destination path/effects and never read a source index
+            // after admission. Keep their semantic owner across same-query/folder row refreshes.
+            OpenRequestOwner::Navigation => self.copied_destination_source_proof(),
+            OpenRequestOwner::Bookmark(owner) => MainListSourceProof::Bookmark(owner.clone()),
+            // Rating, Collection and grid-archive requests retain native row/snapshot owners.
+            // Their items/revision/index checks must remain strict, regardless of file suffix.
+            _ => MainListSourceProof::Row,
+        }
+    }
+
     fn capture_physical_open_navigation(
         &mut self,
         owner: &OpenRequestOwner,
@@ -27299,15 +27292,7 @@ impl App {
         if !self.main_folder_history_available() {
             return None;
         }
-        let proof = match owner {
-            OpenRequestOwner::Bookmark(owner) => MainListSourceProof::Bookmark(owner.clone()),
-            OpenRequestOwner::Navigation if crate::folder_tree::is_paged_document_path(path) => {
-                self.smart_folder_source_lease()
-                    .map(MainListSourceProof::Surface)
-                    .unwrap_or(MainListSourceProof::Row)
-            }
-            _ => MainListSourceProof::Row,
-        };
+        let proof = self.copied_open_source_proof(owner);
         let operation = if matches!(owner, OpenRequestOwner::QuickFolderSwitch(_))
             || self
                 .effective_folder()
@@ -35560,15 +35545,7 @@ impl App {
                 && restore_override.is_none()
                 && self.main_folder_history_available())
             .then(|| {
-                let proof = if let OpenRequestOwner::Bookmark(owner) = &owner {
-                    MainListSourceProof::Bookmark(owner.clone())
-                } else if matches!(owner, OpenRequestOwner::Navigation) {
-                    self.smart_folder_source_lease()
-                        .map(MainListSourceProof::Surface)
-                        .unwrap_or(MainListSourceProof::Row)
-                } else {
-                    MainListSourceProof::Row
-                };
+                let proof = self.copied_open_source_proof(&owner);
                 self.capture_main_list_navigation(
                     MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
                     proof,

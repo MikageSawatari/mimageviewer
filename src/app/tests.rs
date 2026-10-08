@@ -25515,6 +25515,251 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[cfg(windows)]
+    fn refresh_favorite_zip_search_for_test(
+        app: &mut App,
+        directory: &std::path::Path,
+        book: &std::path::Path,
+    ) {
+        let addition = directory.join("a-book.zip");
+        std::fs::write(&addition, b"addition").unwrap();
+        let db = crate::search_index_db::SearchIndexDb::open_at(
+            &directory.join("zip-open-refresh-index.db"),
+        )
+        .unwrap();
+        let indexed = [addition, book.to_path_buf()]
+            .into_iter()
+            .map(|path| crate::search_index_db::IndexEntry {
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            })
+            .collect::<Vec<_>>();
+        db.upsert_children(directory, directory, &indexed).unwrap();
+        app.search_index_db = Some(std::sync::Arc::new(db));
+        let mut favorite =
+            crate::settings::FavoriteEntry::new("books".into(), directory.to_path_buf());
+        favorite.auto_index_structure = true;
+        app.settings.favorites.push(favorite);
+        let generation = app.items_generation;
+        app.execute_favsearch();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.favsearch_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search refresh worker must finish"
+            );
+            app.poll_favsearch();
+            std::thread::yield_now();
+        }
+        assert!(app.items_generation > generation);
+        assert_eq!(app.items.len(), 2);
+        assert!(app.favsearch.active);
+        assert_ne!(
+            app.items[0].drag_source_path(),
+            Some(book),
+            "the copied path must survive row reordering"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_search_result_zip_open_crosses_real_refresh_in_preflight() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let origin = app.tmp.path().join("zip-search-origin");
+        let directory = app.tmp.path().join("zip-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        app.settings.facet_filter.exts.insert("zip".into());
+        app.rebuild_visible_indices();
+        let history = app.folder_nav_history_snapshot();
+        let ctx = egui::Context::default();
+        // Go through the real explicit page-list handler, including its admission gates
+        // and source/effects capture. Only the async completion poll is held back.
+        let Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) = app
+            .open_grid_container_with_mode(
+                &ctx,
+                0,
+                crate::app::GridContainerOpenMode::PageList,
+                "zip-search-regression",
+            )
+        else {
+            panic!("search ZIP must produce the ordinary copied-path intent");
+        };
+        assert!(app.start_grid_virtual_open(intent));
+        // Ordinary ZIP bypasses classification and starts its real ZIP worker directly.
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&book),
+            "same-query refresh cannot cancel the copied ZIP request"
+        );
+        assert_eq!(app.items.len(), 4);
+        assert_eq!(app.visible_indices.len(), 4);
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_copied_zip_classification_adapters_cross_real_search_refresh() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let directory = app.tmp.path().join("classified-zip-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        let origin = app.tmp.path().join("classified-zip-origin");
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        // ZIP normally bypasses classification. Exercise the shared typed classification
+        // boundary directly with the real worker, including the scan adapter that also owns
+        // its path/effects instead of retaining a source row index.
+        assert!(matches!(
+            app.start_open_path_classification_owned(
+                crate::pdf_loader::LeasedEpubPath::try_new(book.clone()).unwrap(),
+                crate::app::ClassifiedOpenContinuation::DirectScan {
+                    pre_scan: None,
+                    owner: crate::app::OpenRequestOwner::Navigation,
+                    grid_effects: None,
+                    restore_intent: crate::app::StartupListIntent::ExplicitList,
+                },
+            ),
+            crate::app::OpenAdmission::Accepted
+        ));
+        assert!(app.top_level_grid_view.open_path_classification().is_some());
+        refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert_eq!(app.items.len(), 4);
+    }
+
+    #[test]
+    fn section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh() {
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let mut env = setup_app();
+        env.active_quick_folder_slot = None;
+        env.settings.sidecar_backup_enabled = false;
+        env.settings.auto_fullscreen_zip_pdf = false;
+        let parent = env.tmp.path().join("address-zip-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        env.load_folder(parent.clone());
+        env.address = book.to_string_lossy().into_owned();
+        env.settings.show_toolbar_folder_tree_button = false;
+        env.settings.show_toolbar_effetune = false;
+        env.settings.show_toolbar_bookshelf = false;
+        env.settings.show_toolbar_collections = false;
+        env.settings.show_toolbar_cols = false;
+        env.settings.show_toolbar_aspect = false;
+        env.settings.show_toolbar_sort = false;
+        env.settings.show_toolbar_rating = false;
+        env.settings.show_toolbar_favorites = false;
+        env.settings.show_toolbar_smart_folders = false;
+        env.settings.show_toolbar_tags = false;
+        env.settings.show_toolbar_folder = true;
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if let Some(nav) = app.render_toolbar(ctx).1 {
+                    let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
+                        panic!("address Enter must produce Direct navigation");
+                    };
+                    // The exact consumer used by App::update after merging AddressBarNav::Direct.
+                    app.open_direct_navigation_target(
+                        path,
+                        None,
+                        crate::app::OpenRequestOwner::Navigation,
+                        None,
+                        None,
+                        restore_intent,
+                    );
+                }
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let mut app = app.borrow_mut();
+        let Some(crate::app::HistoryNavigationTransition::Physical(candidate)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("real address Enter starts ZIP preflight");
+        };
+        assert_eq!(candidate.path.as_path(), book.as_path());
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        let old_generation = app.items_generation;
+        app.install_new_items(
+            vec![
+                GridItem::ZipFile(parent.join("other.zip")),
+                GridItem::ZipFile(book.clone()),
+            ],
+            vec![None, None],
+        );
+        assert!(app.items_generation > old_generation);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert_eq!(app.items.len(), 4);
+        assert_eq!(
+            app.folder_nav_back_stack.last().unwrap().location,
+            FolderNavHistoryTarget::Path(parent)
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn section1339_context_jump_keeps_each_search_source_until_successful_adoption() {
         use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};

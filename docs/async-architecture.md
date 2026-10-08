@@ -44,13 +44,41 @@ row依存要求は既存items世代・revision証明を維持し、Smartのsurfa
 PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
 ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の
 行再読込をitems世代だけで失効させない。要求を置換した旧取消は新requestに届かない。
-検索の「フォルダへ移動」は宛先と選択pathをコピー済みのsurface要求で、同queryの結果追加を許す。
+検索の「フォルダへ移動」と通常Navigationのopen（ZIPを含む検索結果・アドレスバー・分類済みpath）は、
+宛先path・effectsをコピー済みのsurface要求で、同query／同folderの行更新を許す。拡張子では証明を選ばない。
+Direct / DirectNavigation / DirectScan、Physical受付、Directの分類済みadapter、PDFのfallbackは
+`copied_open_source_proof`へ揃え、分類から準備・採用まで元の証明をmoveする。
+Rating / Collection / MainGridArchive等のnative row ownerはRowのまま、Bookmarkはnative request証明を維持する。
 SmartGridの分類はrow要求で、items世代と要求時pathの一致を検証してからrowのkindを読む。
 Collectionの採用拒否・native取消完了も既存の要求終端を通し、所有するfullscreen lock/holdoverを解除する。
 Collectionの自動再生・本をまたぐページ継続はRestoreとして同じ採用境界へ渡し、
 外側の履歴cursorを進めない。payloadと元要求の準備後にだけroot/physical表示を交換する。
 既存のinput gate・holdoverとwarm PDFの即時placeholder表示は維持する。
 詳細と回帰一覧は[file-type-visibility-plan.md §9](file-type-visibility-plan.md#9-1339--履歴再入場のfacet退避を採用境界へ集約する)。
+
+### source proof選択箇所の監査（2026-10-08）
+
+Rowは行／準備snapshotの既存契約、Surfaceはコピー済み宛先の安定した表示owner、Bookmarkはnative要求を証明する。
+新しいpendingやrollbackは追加しない。以下は製品codeの選択箇所（テスト内のfixture指定を除く）。
+
+| 選択箇所 | 証明と理由 |
+| --- | --- |
+| `app.rs::start_open_path_classification_owned` | Direct / DirectNavigation / DirectScanはowner別共通helper。SmartGrid等はRow：完了時に旧indexからkindを読む |
+| `app.rs::copied_open_source_proof` → `capture_physical_open_navigation`、`open_direct_navigation_target_classified`、PDF受付のfallback | NavigationはSurface：コピー済みpath/effectsのみ。Bookmarkはnative request、RatingPhysical / CollectionGridPhysical / MainGridArchive / QuickFolderSwitch / DetachedGridArchiveは既存Row ownerを維持 |
+| `app.rs::dispatch_main_folder_history_input` | Smart履歴の新規要求はSurface（既存lease）。通常/Rating/CollectionのReplayと別intentからのReplayはRow（既存source/cursor snapshot）。連続Replayは元要求の証明をmove |
+| `app.rs::apply_collection_input_nav`、`collection_grid.rs::open_collection_grid_from_navigation` | Row：現在の帰路をcaptureし、loading shellを同じ呼出しで採用 |
+| `app.rs::dispatch_synthetic_folder_history_target`、`adopt_synthetic_surface` | Row：typed restore/synthetic surfaceのsource snapshotを維持。同期採用は行更新と交差しない |
+| `app.rs::start_collection_history_transition`、`start_rating_navigation`、`start_physical_history_transition_with_dfs` | Row：native snapshot／履歴cursor／DFS・Rating・Collection rowの既存所有証明を維持。owned版は渡された証明を再captureしない |
+| `app.rs::restore_view_return_origin` | Surface（取得不能なら既存Row）：コピー済みorigin/routeの復元で、source indexを参照しない |
+| `app.rs::offer_zip_foreign_archive_conversion`、`zip_nav_show_current_level` | Row：現在のZIP tree/itemsからSameLocationまたはprefixの復元を準備する |
+| `app.rs::open_bookmark_browser_row_classified` | Row：browser row分類の受付snapshot。resolver受付後はnative Bookmark証明へ引き継ぎ、startup resolverも同じ要求を保持 |
+| `app.rs::copied_destination_source_proof` → context Jump / `start_folder_open_scan_with_restore`のJump branch | Surface（取得不能なら既存Row）：宛先・exact selectionをコピー済み。通常pane／order refresh等のscanはRowでその準備snapshotを維持 |
+| `smart_folder.rs::capture_smart_list_navigation`、`begin_smart_physical_navigation_with_navigation`、`begin_smart_history_navigation` | Surface：native leaseのcontext/surface/slotとlogical path・定義ID・positionを照合。index依存SmartGridの分類は上のRowを引き継ぐ |
+| `collection_navigation.rs::enqueue_collection_navigation` | 共通headerはSurface（取得不能ならRow）、native requestは別に厳密なrow/entry ID/revision/anchorを照合。共通headerだけでnative検証を緩めない |
+| `collection_grid.rs::adopt_collection_history_child`のprepared adapter | Row：既に準備済みのCollection snapshotを同じ呼出しで採用。async owned版は元要求を保持 |
+| `global_search_ui.rs::capture_search_view_adoption` | Row：準備済みsearch viewのinstall直前にcapture。通常ZIPのコピー済みopen要求とは別のowner |
+| `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | Row：選択root群／除去path集合を含む展開snapshotの世代を固定 |
+| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark：resolver request ID/targetで照合。通常startupはnative startup ownerで共通main要求を新規captureしない |
 
 ## 1. ワーカー一覧
 
