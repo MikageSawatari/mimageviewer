@@ -574,13 +574,15 @@ fn decode_remote_source(
     drop(tx);
     let drain_started = Instant::now();
     let mut saw_canceled = false;
-    let loaded = rx.into_iter().find_map(|message| {
-        saw_canceled |= message.canceled;
-        if !message.finalized && !message.canceled {
-            message.image.map(|image| (image, message.source_dims))
-        } else {
+    let loaded = rx.into_iter().find_map(|message| match message.payload {
+        crate::thumb_loader::ThumbMsgPayload::Pixels(pixels) => {
+            Some((pixels.image, pixels.source_dims))
+        }
+        crate::thumb_loader::ThumbMsgPayload::Canceled => {
+            saw_canceled = true;
             None
         }
+        _ => None,
     });
     let drain_ms = drain_started.elapsed().as_secs_f64() * 1000.0;
     let (color_image, decoded_source_dims) = loaded.ok_or_else(|| {
@@ -2602,6 +2604,10 @@ impl ContainerEngine {
         }
     }
 
+    pub(super) fn raw_develop_executor(&self) -> &crate::raw::RawDevelopExecutor {
+        &self.raw_develop_executor
+    }
+
     pub(super) fn settings_for_listing(
         &self,
     ) -> Result<crate::settings::Settings, RemoteWriteError> {
@@ -2990,6 +2996,10 @@ impl ContainerEngine {
                     return FolderListResponse::Error(media_error_from_remote_write(error));
                 }
             };
+        let presentation_settings = match self.settings_for_listing() {
+            Ok(settings) => settings,
+            Err(error) => return FolderListResponse::Error(media_error_from_remote_write(error)),
+        };
         let thumbnail_sources =
             super::RemoteThumbnailSources::from_pairs(&listing.video_thumb_overrides);
         let entries = listing
@@ -3001,6 +3011,7 @@ impl ContainerEngine {
             })
             .collect::<Vec<_>>();
         let response = FolderListResponse::Success(FolderListPayload {
+            thumbnail_presentation: super::thumbnail_presentation(&presentation_settings),
             effective_address: request.address,
             root_name: absolute_root_name(&resolved.logical),
             thumb_aspect_height_ratio: listing.thumb_aspect_height_ratio,
@@ -5352,6 +5363,11 @@ impl ContainerEngine {
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
         Ok(ContainerPayload {
+            thumbnail_presentation: super::thumbnail_presentation(
+                &self
+                    .settings_for_listing()
+                    .map_err(media_error_from_remote_write)?,
+            ),
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
             kind: ContainerKind::Folder,
@@ -5503,6 +5519,11 @@ impl ContainerEngine {
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
         Ok(ContainerPayload {
+            thumbnail_presentation: super::thumbnail_presentation(
+                &self
+                    .settings_for_listing()
+                    .map_err(media_error_from_remote_write)?,
+            ),
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
             kind: ContainerKind::Zip,
@@ -5610,6 +5631,11 @@ impl ContainerEngine {
         let (entry_limit, truncated) =
             container_limit_metadata(page_count as usize, entries.len(), byte_truncated);
         Ok(ContainerPayload {
+            thumbnail_presentation: super::thumbnail_presentation(
+                &self
+                    .settings_for_listing()
+                    .map_err(media_error_from_remote_write)?,
+            ),
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
             kind: ContainerKind::Pdf,
@@ -10815,6 +10841,7 @@ mod tests {
             })
             .collect();
         ContainerPayload {
+            thumbnail_presentation: mimageviewer_ipc::ThumbnailPresentation::default(),
             title: "test".to_owned(),
             root_name: "C:".to_owned(),
             kind: ContainerKind::Pdf,

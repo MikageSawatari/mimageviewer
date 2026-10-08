@@ -104,6 +104,9 @@ pub fn draw_video_thumbnail_indicator_settings_snapshot_fixture(ui: &mut egui::U
         ..Settings::default()
     };
     pages::draw_video_thumbnail_indicator_settings(ui, &mut settings);
+    ui.add_space(8.0);
+    pages::draw_audio_thumbnail_indicator_settings(ui, &mut settings);
+    pages::draw_media_duration_settings(ui, &mut settings);
 }
 
 #[doc(hidden)]

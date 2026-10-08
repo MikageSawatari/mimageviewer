@@ -12,6 +12,11 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 
 ---
 
+### 音声サムネイル (§1.347、2026-10-08)
+
+`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は v67、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
+
+
 ## 1. レイヤー構造
 
 ```

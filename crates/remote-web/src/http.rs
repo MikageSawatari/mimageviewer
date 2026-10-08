@@ -3373,6 +3373,7 @@ fn api_list(
                 "path": payload.effective_address.path,
                 "root_name": payload.root_name,
                 "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
+                "thumbnail_presentation": payload.thumbnail_presentation,
                 "sort_state": payload.sort_state,
                 "sort_notice": payload.sort_notice,
                 "entries": entries,
@@ -4300,7 +4301,9 @@ fn ipc_error_response(
                 ThumbnailErrorCode::PageOutOfRange => 416,
                 ThumbnailErrorCode::Internal => 500,
             };
-            let code = if remote.code == ThumbnailErrorCode::NotReady {
+            let code = if remote.code == ThumbnailErrorCode::NoThumbnail {
+                "no_thumbnail"
+            } else if remote.code == ThumbnailErrorCode::NotReady {
                 "thumbnail_not_ready"
             } else {
                 "miv_thumbnail_error"
@@ -5931,6 +5934,7 @@ mod tests {
         };
         let survivor_address = RemoteAddress::file(survivor_path.to_string_lossy().into_owned());
         let mut payload = PersistentCollectionSnapshotPayload {
+            thumbnail_presentation: mimageviewer_ipc::ThumbnailPresentation::default(),
             collection_id: "33333333-3333-4333-8333-333333333333".to_owned(),
             collection_revision: 1,
             view_token: "view".to_owned(),
@@ -7066,6 +7070,30 @@ mod tests {
     }
 
     #[test]
+    fn generation_failure_422_is_not_normal_no_art() {
+        let response = ipc_error_response(
+            IpcClientError::Remote(mimageviewer_ipc::ThumbnailError::new(
+                mimageviewer_ipc::ThumbnailErrorCode::GenerationFailed,
+                "generation failed",
+            )),
+            0,
+            Vec::new(),
+            Duration::from_millis(5),
+            256,
+            "file",
+        );
+        assert_eq!(response.status, 422);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "miv_thumbnail_error");
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| *name == "Cache-Control" && value == "no-store")
+        );
+    }
+
+    #[test]
     fn no_raw_thumbnail_uses_existing_failure_response_with_distinct_log_status() {
         let response = ipc_error_response(
             IpcClientError::Remote(mimageviewer_ipc::ThumbnailError::new(
@@ -7080,7 +7108,7 @@ mod tests {
         );
         assert_eq!(response.status, 422);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body["error"], "miv_thumbnail_error");
+        assert_eq!(body["error"], "no_thumbnail");
         assert_eq!(
             response.log_details.unwrap()["thumb"]["ipc_status"],
             "miv_no_thumbnail"

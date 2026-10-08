@@ -80,6 +80,7 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 /// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
 /// detached context へ移譲する。
 pub(crate) struct ScannedDir {
+    pub(crate) complete_audio_inventory: Option<std::collections::HashSet<String>>,
     /// Folder / ZipFile / PdfFile / ConvertibleArchive と、表示用metadata・一覧sort用metadata。
     /// load_folder 内で3本を同じ順序へ並べ替える。
     pub folders: Vec<ScannedFolderEntry>,
@@ -155,7 +156,16 @@ pub(crate) fn discover_aggregate_video_sidecars_while(
 
     let mut parent_keys = std::collections::HashSet::new();
     let mut parents = Vec::new();
-    for video in videos {
+    let mut ordered = videos.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|path| {
+        crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS
+            .iter()
+            .any(|ext| {
+                path.extension()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+            })
+    });
+    for video in ordered {
         if !keep_running() {
             return None;
         }
@@ -568,6 +578,7 @@ pub(crate) fn is_image_only_book_contents(
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
         ScannedDir {
+            complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: Vec::new(),
             omitted: OmittedFolderEntryCounts::default(),
@@ -632,6 +643,7 @@ where
     let mut folders: Vec<ScannedFolderEntry> = Vec::new();
     let mut all_media: Vec<ScannedMediaEntry> = Vec::new();
     let mut omitted = OmittedFolderEntryCounts::default();
+    let mut complete_audio_inventory = Some(std::collections::HashSet::new());
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for entry in entries {
@@ -651,13 +663,26 @@ where
         }
         // file_type() は FindFirstFile のキャッシュ読み (syscall なし)。
         // metadata() も同様にキャッシュから返るが、失敗しても fallback 0 で続行する。
-        let kind = entry
-            .file_type()
-            .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft))
-            .unwrap_or(crate::fs_entry::DirEntryKind::Other);
+        let kind = match entry.file_type() {
+            Ok(ft) => crate::fs_entry::classify_dir_entry(&entry, &ft),
+            Err(_) => {
+                complete_audio_inventory = None;
+                crate::fs_entry::DirEntryKind::Other
+            }
+        };
         let entry_name = entry.file_name().to_string_lossy().to_lowercase();
         // OS 由来の付随ファイルはどの経路で落ちても `system` に寄せる。分類だけで、
         // 一覧へ出す / 出さないの判定は一切変えない。
+        if kind.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
+        {
+            if let Some(inventory) = complete_audio_inventory.as_mut() {
+                inventory.insert(entry_name.clone());
+            }
+        }
         let is_system_file = is_system_metadata_name(&entry_name);
         entry_file_names_ci.insert(entry_name);
         if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
@@ -769,6 +794,7 @@ where
     }
     filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
     Ok(ScannedDir {
+        complete_audio_inventory,
         folders,
         all_media,
         omitted,
@@ -835,7 +861,7 @@ pub(crate) fn filter_video_image_duplicates(
     let mut videos_by_stem: std::collections::HashMap<String, Vec<PathBuf>> =
         std::collections::HashMap::new();
     for entry in media.iter() {
-        if entry.kind == ScanMediaKind::Video {
+        if matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio) {
             videos_by_stem
                 .entry(super::stem_lower(&entry.path))
                 .or_default()
@@ -1287,6 +1313,7 @@ pub(crate) mod signature_tests {
         })
         .collect();
         ScannedDir {
+            complete_audio_inventory: None,
             folders,
             all_media,
             omitted: Default::default(),
@@ -1624,6 +1651,7 @@ mod page_count_tests {
         db.set_user_rating(&key("z.jpg"), 5, None).unwrap();
         db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
         let scan = || ScannedDir {
+            complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: ["a.jpg", "z.jpg", "x.jpg", "x.png"]
                 .into_iter()
@@ -1737,6 +1765,7 @@ mod page_count_tests {
             sort_meta: crate::settings::ListingSortMetadata::new(7, known.then_some(file_size)),
         };
         let scan = || ScannedDir {
+            complete_audio_inventory: None,
             folders: vec![ScannedFolderEntry {
                 item: GridItem::Folder(PathBuf::from(r"C:\sizes\child")),
                 display_meta: Some((7, 0)),
@@ -2043,5 +2072,274 @@ mod page_count_tests {
             );
         }
         assert_eq!(settings.image_ext_priority, saved_priority);
+    }
+
+    #[test]
+    fn audio_and_video_sidecars_share_all_four_released_flag_combinations() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["Song.MP3", "song.flac", "song.mp4", "song.jpg", "SONG.png"] {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        for skip in [false, true] {
+            for use_sidecar in [false, true] {
+                let mut settings = crate::settings::Settings::default();
+                settings.skip_image_if_video_exists = skip;
+                settings.video_thumb_use_sidecar_image = use_sidecar;
+                settings.skip_duplicate_images = false;
+                settings.sort_order = crate::settings::SortOrder::FileName;
+                let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+                let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+                assert_eq!(
+                    listing
+                        .items
+                        .iter()
+                        .filter(|item| matches!(item, GridItem::Audio(_)))
+                        .count(),
+                    2,
+                );
+                assert_eq!(
+                    listing
+                        .items
+                        .iter()
+                        .filter(|item| matches!(item, GridItem::Video(_)))
+                        .count(),
+                    1,
+                );
+                assert_eq!(
+                    listing
+                        .items
+                        .iter()
+                        .filter(|item| matches!(item, GridItem::Image(_)))
+                        .count(),
+                    if skip { 0 } else { 2 },
+                );
+                assert_eq!(listing.omitted.same_name, if skip { 2 } else { 0 });
+                if skip && use_sidecar {
+                    assert_eq!(listing.video_thumb_overrides.len(), 6);
+                    let selected = listing
+                        .video_thumb_overrides
+                        .iter()
+                        .map(|(source, image)| {
+                            (crate::path_key::normalize_keep_drive(source), image)
+                        })
+                        .collect::<std::collections::HashMap<_, _>>();
+                    let video = selected
+                        [&crate::path_key::normalize_keep_drive(&temp.path().join("song.mp4"))];
+                    assert_eq!(
+                        selected
+                            [&crate::path_key::normalize_keep_drive(&temp.path().join("Song.MP3"))],
+                        video,
+                    );
+                    assert_eq!(
+                        selected[&crate::path_key::normalize_keep_drive(
+                            &temp.path().join("song.flac")
+                        )],
+                        video,
+                    );
+                } else {
+                    assert!(listing.video_thumb_overrides.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audio_sidecar_candidates_keep_video_order_and_last_candidate_adoption() {
+        let root = std::path::Path::new(r"C:\same-parent");
+        let entry = |name: &str, kind| ScannedMediaEntry {
+            path: root.join(name),
+            kind,
+            mtime: 0,
+            file_size: 1,
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
+        };
+        for candidates in [["song.jpg", "song.png"], ["song.png", "song.jpg"]] {
+            let mut media = vec![
+                entry("song.mp4", ScanMediaKind::Video),
+                entry("song.mp3", ScanMediaKind::Audio),
+                entry("song.flac", ScanMediaKind::Audio),
+                entry(candidates[0], ScanMediaKind::Image),
+                entry(candidates[1], ScanMediaKind::Image),
+            ];
+            let filtered = filter_video_image_duplicates(&mut media, true);
+            let selected = filtered
+                .sidecars
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(filtered.omitted, 2);
+            assert_eq!(media.len(), 3);
+            for source in ["song.mp4", "song.mp3", "song.flac"] {
+                assert_eq!(
+                    selected.get(&root.join(source)),
+                    Some(&root.join(candidates[1]))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_audio_sidecars_are_full_path_scoped_and_video_parents_keep_priority() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let left_audio = left.join("same.mp3");
+        let right_audio = right.join("same.FLAC");
+        let right_video = right.join("same.mp4");
+        let left_image = left.join("same.jpg");
+        let right_image = right.join("same.png");
+        for path in [
+            &left_audio,
+            &right_audio,
+            &right_video,
+            &left_image,
+            &right_image,
+        ] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_image_if_video_exists = true;
+        settings.video_thumb_use_sidecar_image = true;
+        // The audio parent appears first in the request, yet the released video budget wins.
+        let sources = [left_audio.clone(), right_audio.clone(), right_video.clone()];
+        let complete =
+            discover_aggregate_video_sidecars_while(&settings, &sources, 64, || true).unwrap();
+        assert_eq!(complete.by_video_path.len(), 3);
+        assert_eq!(
+            complete
+                .by_video_path
+                .get(&crate::path_key::normalize_keep_drive(&left_audio)),
+            Some(&left_image),
+        );
+        for source in [&right_audio, &right_video] {
+            assert_eq!(
+                complete
+                    .by_video_path
+                    .get(&crate::path_key::normalize_keep_drive(source)),
+                Some(&right_image),
+            );
+        }
+        let capped =
+            discover_aggregate_video_sidecars_while(&settings, &sources, 1, || true).unwrap();
+        assert_eq!(capped.scanned_parents, 1);
+        assert_eq!(capped.skipped_parents, 1);
+        assert_eq!(capped.by_video_path.len(), 2);
+        assert!(
+            !capped
+                .by_video_path
+                .contains_key(&crate::path_key::normalize_keep_drive(&left_audio))
+        );
+
+        let mut polls = 0;
+        assert!(
+            discover_aggregate_video_sidecars_while(&settings, &sources, 64, || {
+                polls += 1;
+                polls < 5
+            })
+            .is_none()
+        );
+        assert_eq!(
+            polls, 5,
+            "cancellation after the first parent discards partial provenance"
+        );
+    }
+
+    #[test]
+    fn complete_audio_inventory_keeps_hidden_mp3_before_display_and_duplicate_filters() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "Shown.MP3",
+            ".hidden.mp3",
+            "shown.mp4",
+            "shown.jpg",
+            "other.flac",
+        ] {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        std::fs::create_dir(temp.path().join("directory.mp3")).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+            let wide = temp
+                .path()
+                .join(".hidden.mp3")
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            unsafe {
+                SetFileAttributesW(windows::core::PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN)
+            }
+            .unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.show_hidden_files = false;
+        settings.skip_image_if_video_exists = true;
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        assert_eq!(
+            scan.complete_audio_inventory.as_ref().unwrap(),
+            &std::collections::HashSet::from(["shown.mp3".to_owned(), ".hidden.mp3".to_owned()]),
+        );
+        assert!(
+            !scan
+                .all_media
+                .iter()
+                .any(|entry| entry.path.file_name().unwrap() == ".hidden.mp3")
+        );
+        let inventory = scan.complete_audio_inventory.clone();
+        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        assert!(listing.items.iter().any(
+            |item| matches!(item, GridItem::Audio(path) if path.file_name().unwrap() == "Shown.MP3")
+        ));
+        assert!(
+            !listing
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(_)))
+        );
+        assert_eq!(
+            inventory.unwrap().len(),
+            2,
+            "prune ownership is independent of visible rows"
+        );
+    }
+
+    #[test]
+    fn failed_or_canceled_directory_scans_never_supply_a_complete_audio_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let fallback = scan_directory(&missing);
+        assert!(fallback.complete_audio_inventory.is_none());
+        assert!(fallback.all_media.is_empty());
+        assert!(
+            scan_directory_with_settings(&missing, &crate::settings::Settings::default()).is_err()
+        );
+
+        std::fs::write(temp.path().join("song.mp3"), b"audio").unwrap();
+        let entry = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let interrupted = std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "incomplete audio inventory",
+        );
+        assert!(
+            scan_directory_entries(vec![Ok(entry), Err(interrupted)], true, true, false, None)
+                .is_err()
+        );
+
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let canceled = scan_directory_with_convertible_archives_cancel(
+            temp.path(),
+            true,
+            true,
+            false,
+            Some(&cancel),
+        );
+        assert!(matches!(canceled, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
     }
 }

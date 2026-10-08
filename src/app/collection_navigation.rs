@@ -5123,6 +5123,7 @@ mod tests {
                 crate::grid_item::ThumbnailState::Pending => "pending",
                 crate::grid_item::ThumbnailState::Loaded { .. } => "loaded",
                 crate::grid_item::ThumbnailState::Failed => "failed",
+                crate::grid_item::ThumbnailState::NoArt => "no-art",
                 crate::grid_item::ThumbnailState::Evicted => "evicted",
             })
             .collect()

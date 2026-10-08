@@ -193,6 +193,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再生アイコン", "左下バッジ", "非表示"]
     ),
     entry!(
+        "thumbnail/audio-indicator",
+        Thumbnail,
+        "音声サムネイルの目印",
+        ["音声", "音楽", "マーク", "左下バッジ", "非表示"]
+    ),
+    entry!(
         "thumbnail/resume-meter",
         Thumbnail,
         "本・動画・音声のサムネイルに前回の位置を表示",
@@ -635,8 +641,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/video-image",
         DuplicateFiles,
-        "同名の動画と画像がある場合、画像をスキップ",
-        ["重複", "sidecar", "サイドカー"]
+        "同名の動画・音声がある画像を省略",
+        ["重複", "動画", "音声", "sidecar", "サイドカー"]
     ),
     entry!(
         "duplicate/image-priority",
@@ -1159,8 +1165,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "video/sidecar-thumbnail",
         Video,
-        "同名ファイル名の画像があれば動画サムネに優先採用",
-        ["サイドカー", "sidecar", "動画サムネイル"]
+        "同名の画像をサムネイルに使う（動画・音声）",
+        ["サイドカー", "sidecar", "動画サムネイル", "音声", "音楽"]
     ),
     entry!(
         "vst3/enabled",
@@ -1595,6 +1601,33 @@ mod tests {
                 .find(|entry| entry.anchor == anchor)
                 .expect("clipboard capture settings must be discoverable");
             assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
+    }
+    #[test]
+    fn audio_thumbnail_indicator_and_common_sidecar_settings_are_searchable() {
+        for (query, anchor, page) in [
+            (
+                "音声 マーク",
+                "thumbnail/audio-indicator",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "音声 サイドカー",
+                "video/sidecar-thumbnail",
+                PreferencesPage::Video,
+            ),
+            (
+                "音声 重複",
+                "duplicate/video-image",
+                PreferencesPage::DuplicateFiles,
+            ),
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("audio thumbnail setting is searchable");
+            assert_eq!(entry.page, page);
+            assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
         }
     }
 }

@@ -33,6 +33,7 @@ pub(crate) mod raw;
 pub mod raw_format;
 /// 一括書き出しの要求が必ず伴う借用。`app` module 自体は非公開なのでここで出す。
 pub use app::LocalAiActivityLease;
+pub use app::draw_audio_thumbnail_indicator_snapshot_fixture;
 pub use app::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
@@ -45,8 +46,10 @@ pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_s
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
+pub(crate) mod audio_album_art;
 pub mod audio_decode;
 pub mod audio_normalize_db;
+pub(crate) mod audio_thumbnail;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
@@ -200,6 +203,7 @@ pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
 pub mod reading_history_db;
+pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
 mod settings_override;
 #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -1593,6 +1597,9 @@ pub fn run() -> eframe::Result {
                 saved.clone(),
                 collection_remote_producer.clone(),
                 Arc::clone(&raw_develop_executor),
+                io_semaphore::GlobalIoSemaphore::process_shared(
+                    saved.indexer_speed_profile.io_permits(),
+                ),
             )
         },
     ) {

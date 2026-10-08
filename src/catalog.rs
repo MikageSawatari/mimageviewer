@@ -225,8 +225,583 @@ pub fn decode_thumb_dims(data: &[u8]) -> Option<(u32, u32)> {
 // CatalogDb
 // -----------------------------------------------------------------------
 
+// Shared exclusively by catalogs in one cache directory. The owner never holds
+// its state lock while acquiring a connection lock or doing filesystem/SQLite I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CatalogAdmission {
+    Admitted(u64),
+    DisplayOnly(u64),
+}
+
+#[derive(Debug)]
+pub(crate) enum CatalogDeleteOperation {
+    All,
+    OlderThan(u64),
+    Folder(PathBuf),
+}
+
+#[derive(Debug)]
+enum CatalogAccessState {
+    Accepting(u64),
+    Deleting {
+        epoch: u64,
+        operation: CatalogDeleteOperation,
+    },
+}
+
+enum AudioArtCacheNotice {
+    Fresh,
+    Pending(String),
+    Shown,
+}
+
+struct CatalogAccessInner {
+    state: CatalogAccessState,
+    active: usize,
+    connections: Vec<std::sync::Weak<CatalogConnection>>,
+    audio_art_notice: AudioArtCacheNotice,
+}
+
+pub struct CatalogAccess {
+    inner: Mutex<CatalogAccessInner>,
+    changed: std::sync::Condvar,
+}
+
+impl CatalogAccess {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(CatalogAccessInner {
+                state: CatalogAccessState::Accepting(0),
+                active: 0,
+                connections: Vec::new(),
+                audio_art_notice: AudioArtCacheNotice::Fresh,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    pub fn for_cache_dir(cache_dir: &Path) -> std::sync::Arc<Self> {
+        static OWNERS: OnceLock<Mutex<HashMap<String, std::sync::Arc<CatalogAccess>>>> =
+            OnceLock::new();
+        let mut owners = OWNERS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        let key = path_key::normalize_keep_drive(cache_dir);
+        if let Some(owner) = owners.get(&key).cloned() {
+            return owner;
+        }
+        let owner = std::sync::Arc::new(Self::new());
+        owners.insert(key, owner.clone());
+        owner
+    }
+
+    pub fn admit(&self) -> CatalogAdmission {
+        match self.inner.lock().unwrap().state {
+            CatalogAccessState::Accepting(epoch) => CatalogAdmission::Admitted(epoch),
+            CatalogAccessState::Deleting { epoch, .. } => CatalogAdmission::DisplayOnly(epoch),
+        }
+    }
+
+    /// Expected epoch retirement is not a rare cache fault or a user notice.
+    pub fn is_admitted(&self, admission: CatalogAdmission) -> bool {
+        matches!((self.admit(), admission), (CatalogAdmission::Admitted(current), CatalogAdmission::Admitted(epoch)) if current == epoch)
+    }
+
+    /// One rebuildable-cache notice per process/cache directory; no retry state.
+    pub fn record_audio_art_cache_error(&self, detail: impl Into<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        if matches!(inner.audio_art_notice, AudioArtCacheNotice::Fresh) {
+            inner.audio_art_notice = AudioArtCacheNotice::Pending(detail.into());
+        }
+    }
+
+    /// Memory-only UI polling. A notice can be consumed only once.
+    pub fn take_audio_art_notice(&self) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        if !matches!(inner.audio_art_notice, AudioArtCacheNotice::Pending(_)) {
+            return None;
+        }
+        let AudioArtCacheNotice::Pending(detail) =
+            std::mem::replace(&mut inner.audio_art_notice, AudioArtCacheNotice::Shown)
+        else {
+            unreachable!()
+        };
+        Some(detail)
+    }
+
+    /// Worker-only continuation of a catalog-only lookup, never an extraction retry.
+    pub fn wait_read_admission(&self, cancel: &AtomicBool) -> Option<CatalogAdmission> {
+        self.wait_read_admission_with(|| cancel.load(Ordering::Relaxed))
+    }
+
+    pub fn wait_read_admission_with(
+        &self,
+        canceled: impl Fn() -> bool,
+    ) -> Option<CatalogAdmission> {
+        loop {
+            if canceled() {
+                return None;
+            }
+            let inner = self.inner.lock().unwrap();
+            if let CatalogAccessState::Accepting(epoch) = inner.state {
+                return Some(CatalogAdmission::Admitted(epoch));
+            }
+            let _wait = self
+                .changed
+                .wait_timeout(inner, std::time::Duration::from_millis(20))
+                .unwrap();
+        }
+    }
+
+    fn lease(
+        self: &std::sync::Arc<Self>,
+        admission: CatalogAdmission,
+    ) -> rusqlite::Result<CatalogLease> {
+        let mut inner = self.inner.lock().unwrap();
+        if !matches!((&inner.state, admission), (CatalogAccessState::Accepting(current), CatalogAdmission::Admitted(epoch)) if *current == epoch)
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        inner.active += 1;
+        Ok(CatalogLease {
+            owner: self.clone(),
+        })
+    }
+
+    fn close_lease(self: &std::sync::Arc<Self>) -> CatalogLease {
+        // Existing registered handles may close during Deleting. Keep the close
+        // in the drain count, without permitting any new SQL or connection open.
+        self.inner.lock().unwrap().active += 1;
+        CatalogLease {
+            owner: self.clone(),
+        }
+    }
+
+    fn register(&self, connection: &std::sync::Arc<CatalogConnection>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .connections
+            .retain(|connection| connection.strong_count() > 0);
+        inner
+            .connections
+            .push(std::sync::Arc::downgrade(connection));
+    }
+
+    /// Memory-only invalidation before starting the cache-maint worker.
+    pub(crate) fn begin_delete(
+        self: &std::sync::Arc<Self>,
+        operation: CatalogDeleteOperation,
+    ) -> rusqlite::Result<CatalogDeletion> {
+        let mut inner = self.inner.lock().unwrap();
+        let CatalogAccessState::Accepting(epoch) = inner.state else {
+            return Err(rusqlite::Error::InvalidQuery);
+        };
+        inner.state = CatalogAccessState::Deleting {
+            epoch: epoch.wrapping_add(1),
+            operation,
+        };
+        Ok(CatalogDeletion {
+            owner: self.clone(),
+        })
+    }
+}
+
+struct CatalogLease {
+    owner: std::sync::Arc<CatalogAccess>,
+}
+impl Drop for CatalogLease {
+    fn drop(&mut self) {
+        let mut inner = self.owner.inner.lock().unwrap();
+        inner.active -= 1;
+        if inner.active == 0 {
+            self.owner.changed.notify_all();
+        }
+    }
+}
+
+pub(crate) struct CatalogDeletion {
+    owner: std::sync::Arc<CatalogAccess>,
+}
+impl CatalogDeletion {
+    pub(crate) fn retire_connections(&self) {
+        self.retire_connections_after_drain(|| {});
+    }
+
+    fn retire_connections_after_drain(&self, after_drain: impl FnOnce()) {
+        let operation = {
+            let inner = self.owner.inner.lock().unwrap();
+            match &inner.state {
+                CatalogAccessState::Deleting {
+                    operation: CatalogDeleteOperation::All,
+                    ..
+                } => "all".to_owned(),
+                CatalogAccessState::Deleting {
+                    operation: CatalogDeleteOperation::OlderThan(days),
+                    ..
+                } => format!("older_than_{days}"),
+                CatalogAccessState::Deleting {
+                    operation: CatalogDeleteOperation::Folder(folder),
+                    ..
+                } => format!("folder:{}", folder.display()),
+                CatalogAccessState::Accepting(_) => return,
+            }
+        };
+        crate::logger::log(format!("catalog maintenance retire operation={operation}"));
+        let connections = {
+            let mut inner = self.owner.inner.lock().unwrap();
+            while inner.active != 0 {
+                inner = self.owner.changed.wait(inner).unwrap();
+            }
+            std::mem::take(&mut inner.connections)
+        };
+        after_drain();
+        for connection in connections
+            .into_iter()
+            .filter_map(|connection| connection.upgrade())
+        {
+            let old = std::mem::replace(
+                &mut *connection.state.lock().unwrap(),
+                CatalogConnectionState::Retired,
+            );
+            drop(old); // SQLite close is worker-owned, outside both state locks.
+        }
+        // A final Arc can begin normal Drop after the first drain and take its
+        // Connection just before retirement. That close owns a close lease;
+        // wait for it before remove_file, even though the registry now sees Retired.
+        let mut inner = self.owner.inner.lock().unwrap();
+        while inner.active != 0 {
+            inner = self.owner.changed.wait(inner).unwrap();
+        }
+    }
+}
+impl Drop for CatalogDeletion {
+    fn drop(&mut self) {
+        let mut inner = self.owner.inner.lock().unwrap();
+        if let CatalogAccessState::Deleting { epoch, .. } = inner.state {
+            inner.state = CatalogAccessState::Accepting(epoch);
+        }
+        self.owner.changed.notify_all();
+    }
+}
+
+enum CatalogConnectionState {
+    Open { connection: Connection, epoch: u64 },
+    Retired,
+}
+struct CatalogConnection {
+    state: Mutex<CatalogConnectionState>,
+}
+struct CatalogConnectionGuard<'a>(std::sync::MutexGuard<'a, CatalogConnectionState>);
+impl std::ops::Deref for CatalogConnectionGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match &*self.0 {
+            CatalogConnectionState::Open { connection, .. } => connection,
+            CatalogConnectionState::Retired => {
+                unreachable!("retired connection guards are never issued")
+            }
+        }
+    }
+}
+impl std::ops::DerefMut for CatalogConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match &mut *self.0 {
+            CatalogConnectionState::Open { connection, .. } => connection,
+            CatalogConnectionState::Retired => {
+                unreachable!("retired connection guards are never issued")
+            }
+        }
+    }
+}
+impl CatalogConnection {
+    fn new(connection: Connection, admission: CatalogAdmission) -> std::sync::Arc<Self> {
+        let CatalogAdmission::Admitted(epoch) = admission else {
+            unreachable!()
+        };
+        std::sync::Arc::new(Self {
+            state: Mutex::new(CatalogConnectionState::Open { connection, epoch }),
+        })
+    }
+    fn lock(&self) -> rusqlite::Result<CatalogConnectionGuard<'_>> {
+        let guard = self.state.lock().unwrap();
+        if matches!(*guard, CatalogConnectionState::Retired) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(CatalogConnectionGuard(guard))
+    }
+    #[cfg(test)]
+    fn try_lock(&self) -> Result<CatalogConnectionGuard<'_>, ()> {
+        self.state
+            .try_lock()
+            .map(CatalogConnectionGuard)
+            .map_err(|_| ())
+    }
+}
+
+// Declaration order matters: release the connection/transaction before the lease.
+struct CatalogPhase<'a> {
+    connection: CatalogConnectionGuard<'a>,
+    _lease: CatalogLease,
+}
+impl std::ops::Deref for CatalogPhase<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+impl std::ops::DerefMut for CatalogPhase<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioArtCatalogScope {
+    pub parent: PathBuf,
+    prefix: String,
+}
+impl AudioArtCatalogScope {
+    pub fn new(parent: &Path) -> Self {
+        let normalized = path_key::normalize_keep_drive(parent);
+        let hash = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+        Self {
+            parent: parent.to_owned(),
+            prefix: format!("audioart:{hash}:"),
+        }
+    }
+    pub fn key_for(&self, source: &Path) -> String {
+        let basename = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        format!("{}v1:{basename}", self.prefix)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioArtSourceStamp {
+    pub mtime_secs: i64,
+    pub file_size: i64,
+}
+impl AudioArtSourceStamp {
+    pub fn read(path: &Path) -> Option<Self> {
+        media_source_identity(path).map(|(mtime_secs, file_size)| Self {
+            mtime_secs,
+            file_size,
+        })
+    }
+}
+
+fn catalog_file_exists(path: &Path) -> rusqlite::Result<bool> {
+    path.try_exists()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+pub enum AudioArtCached {
+    Miss,
+    Pixels(CacheEntry),
+    NoArt,
+}
+
+fn ensure_audio_art_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS audio_art_absence (filename TEXT NOT NULL PRIMARY KEY, mtime INTEGER NOT NULL, file_size INTEGER NOT NULL);")
+}
+
+/// Worker-only APIs return owned values and drop all handles before source work.
+pub fn lookup_audio_art(
+    cache_dir: &Path,
+    scope: &AudioArtCatalogScope,
+    key: &str,
+    stamp: AudioArtSourceStamp,
+    admission: CatalogAdmission,
+) -> rusqlite::Result<AudioArtCached> {
+    if !key.starts_with(&format!("{}v1:", scope.prefix)) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+
+    let Some(db) =
+        CatalogDb::open_existing_read_only_admitted(cache_dir, &scope.parent, admission)?
+    else {
+        return Ok(AudioArtCached::Miss);
+    };
+    let conn = db.phase()?;
+    let has_absence: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio_art_absence')", [], |row| row.get(0))?;
+    let sql = if has_absence {
+        "SELECT thumb_data, source_width, source_height FROM thumbnails WHERE filename=?1 AND mtime=?2 AND file_size=?3 UNION ALL SELECT NULL, NULL, NULL FROM audio_art_absence WHERE filename=?1 AND mtime=?2 AND file_size=?3 LIMIT 1"
+    } else {
+        "SELECT thumb_data, source_width, source_height FROM thumbnails WHERE filename=?1 AND mtime=?2 AND file_size=?3 LIMIT 1"
+    };
+    let row = conn
+        .query_row(
+            sql,
+            params![key, stamp.mtime_secs, stamp.file_size],
+            |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<u32>>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(jpeg_data), width, height)) => AudioArtCached::Pixels(CacheEntry {
+            mtime: stamp.mtime_secs,
+            file_size: stamp.file_size,
+            jpeg_data,
+            source_dims: valid_dims(width, height),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        }),
+        Some((None, _, _)) => AudioArtCached::NoArt,
+        None => AudioArtCached::Miss,
+    })
+}
+
+pub fn save_audio_art_pixels(
+    cache_dir: &Path,
+    scope: &AudioArtCatalogScope,
+    key: &str,
+    entry: &CacheEntry,
+    admission: CatalogAdmission,
+    cancel: &AtomicBool,
+) -> rusqlite::Result<bool> {
+    save_audio_art_pixels_with_cancel_check(cache_dir, scope, key, entry, admission, &|| {
+        cancel.load(Ordering::Relaxed)
+    })
+}
+
+pub fn save_audio_art_pixels_with_cancel_check(
+    cache_dir: &Path,
+    scope: &AudioArtCatalogScope,
+    key: &str,
+    entry: &CacheEntry,
+    admission: CatalogAdmission,
+    should_cancel: &impl Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    if !key.starts_with(&format!("{}v1:", scope.prefix)) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+
+    if should_cancel() {
+        return Ok(false);
+    }
+    let Some((width, height)) = decode_thumb_dims(&entry.jpeg_data) else {
+        return Ok(false);
+    };
+    let db = CatalogDb::open_admitted(cache_dir, &scope.parent, admission)?;
+    let conn = db.phase()?;
+    ensure_audio_art_schema(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM audio_art_absence WHERE filename=?1", [key])?;
+    tx.execute("INSERT OR REPLACE INTO thumbnails (filename,mtime,file_size,width,height,thumb_data,source_width,source_height) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![key,entry.mtime,entry.file_size,width,height,entry.jpeg_data,entry.source_dims.map(|d| d.0),entry.source_dims.map(|d| d.1)])?;
+    if should_cancel() {
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+pub fn save_audio_art_absence(
+    cache_dir: &Path,
+    scope: &AudioArtCatalogScope,
+    key: &str,
+    stamp: AudioArtSourceStamp,
+    admission: CatalogAdmission,
+    cancel: &AtomicBool,
+) -> rusqlite::Result<bool> {
+    save_audio_art_absence_with_cancel_check(cache_dir, scope, key, stamp, admission, &|| {
+        cancel.load(Ordering::Relaxed)
+    })
+}
+
+pub fn save_audio_art_absence_with_cancel_check(
+    cache_dir: &Path,
+    scope: &AudioArtCatalogScope,
+    key: &str,
+    stamp: AudioArtSourceStamp,
+    admission: CatalogAdmission,
+    should_cancel: &impl Fn() -> bool,
+) -> rusqlite::Result<bool> {
+    if !key.starts_with(&format!("{}v1:", scope.prefix)) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+
+    if should_cancel() {
+        return Ok(false);
+    }
+    let db = CatalogDb::open_admitted(cache_dir, &scope.parent, admission)?;
+    let conn = db.phase()?;
+    ensure_audio_art_schema(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM thumbnails WHERE filename=?1", [key])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO audio_art_absence (filename,mtime,file_size) VALUES (?1,?2,?3)",
+        params![key, stamp.mtime_secs, stamp.file_size],
+    )?;
+    if should_cancel() {
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Caller must supply a completed, unfaceted physical inventory for this parent.
+pub fn prune_audio_art_scope(
+    cache_dir: &Path,
+    scope: &AudioArtCatalogScope,
+    complete_inventory: &HashSet<String>,
+    admission: CatalogAdmission,
+    cancel: &AtomicBool,
+) -> rusqlite::Result<usize> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(0);
+    }
+    if !catalog_file_exists(&db_path_for(cache_dir, &scope.parent))? {
+        return Ok(0);
+    }
+    let db = CatalogDb::open_admitted(cache_dir, &scope.parent, admission)?;
+    let conn = db.phase()?;
+    ensure_audio_art_schema(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    let names = {
+        let mut stmt = tx.prepare("SELECT filename FROM thumbnails WHERE substr(filename,1,?1)=?2 UNION SELECT filename FROM audio_art_absence WHERE substr(filename,1,?1)=?2")?;
+        stmt.query_map(params![scope.prefix.len(), scope.prefix], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut deleted = 0;
+    for key in names {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        let basename = key
+            .strip_prefix(&scope.prefix)
+            .and_then(|key| key.split_once(':'))
+            .map(|(_, basename)| basename);
+        if basename.is_some_and(|basename| complete_inventory.contains(basename)) {
+            continue;
+        }
+        deleted += tx.execute("DELETE FROM thumbnails WHERE filename=?1", [&key])?;
+        deleted += tx.execute("DELETE FROM audio_art_absence WHERE filename=?1", [&key])?;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(0);
+    }
+    tx.commit()?;
+    Ok(deleted)
+}
+
 pub struct CatalogDb {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<CatalogConnection>,
+    access: std::sync::Arc<CatalogAccess>,
+    admission: CatalogAdmission,
+    /// Immutable identity for worker-only CacheOnly continuation, not connection state.
+    database_path: Option<PathBuf>,
     has_layout_dims_columns: bool,
     has_folder_proof_columns: bool,
 }
@@ -265,7 +840,102 @@ fn journal_mode_is_wal(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(mode.eq_ignore_ascii_case("wal"))
 }
 
+impl Drop for CatalogDb {
+    fn drop(&mut self) {
+        let _close = self.access.close_lease();
+        // Keep the registered Arc alive until physical close finishes. A maintenance
+        // worker can therefore upgrade it and serialize close through this mutex.
+        let old = std::mem::replace(
+            &mut *self.conn.state.lock().unwrap(),
+            CatalogConnectionState::Retired,
+        );
+        drop(old);
+    }
+}
+
 impl CatalogDb {
+    fn phase(&self) -> rusqlite::Result<CatalogPhase<'_>> {
+        let lease = self.access.lease(self.admission)?;
+        let connection = self.conn.lock()?;
+        if !matches!((&*connection.0, self.admission), (CatalogConnectionState::Open { epoch: current, .. }, CatalogAdmission::Admitted(epoch)) if *current == epoch)
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(CatalogPhase {
+            connection,
+            _lease: lease,
+        })
+    }
+
+    pub fn is_retired(&self) -> bool {
+        // Warm UI lookup touches only memory. Never acquire the SQLite mutex here.
+        !matches!((self.access.admit(), self.admission), (CatalogAdmission::Admitted(current), CatalogAdmission::Admitted(epoch)) if current == epoch)
+    }
+
+    /// Continue one existing CacheOnly lookup after maintenance. The old handle
+    /// remains permanently Retired; this temporary handle never creates/migrates
+    /// a catalog and cannot promote the request to source decoding or new writes.
+    pub fn resume_cache_only_after_maintenance(
+        &self,
+        key: &str,
+        cancel: &impl Fn() -> bool,
+    ) -> rusqlite::Result<Option<CacheEntry>> {
+        let Some(db) = self.resume_cache_only_catalog_after_maintenance(cancel)? else {
+            return Ok(None);
+        };
+        let entry = db.load_one(key)?;
+        if cancel() {
+            return Ok(None);
+        }
+        Ok(entry)
+    }
+
+    /// A short read-only successor for one cache-only lookup using its original
+    /// database identity. It must remain on the worker and is never cached.
+    pub fn resume_cache_only_catalog_after_maintenance(
+        &self,
+        cancel: &impl Fn() -> bool,
+    ) -> rusqlite::Result<Option<Self>> {
+        let Some(path) = self.database_path.as_deref() else {
+            return Ok(None);
+        };
+        let Some(admission) = self.access.wait_read_admission_with(cancel) else {
+            return Ok(None);
+        };
+        let _lease = self.access.lease(admission)?;
+        if cancel() || !catalog_file_exists(path)? {
+            return Ok(None);
+        }
+        let db = Self::open_read_only_at_path(path, self.access.clone(), admission)?;
+        if cancel() {
+            return Ok(None);
+        }
+        Ok(Some(db))
+    }
+
+    fn from_connection(
+        connection: Connection,
+        access: std::sync::Arc<CatalogAccess>,
+        admission: CatalogAdmission,
+        has_layout_dims_columns: bool,
+        has_folder_proof_columns: bool,
+    ) -> Self {
+        let database_path = connection
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let conn = CatalogConnection::new(connection, admission);
+        access.register(&conn);
+        Self {
+            conn,
+            access,
+            admission,
+            database_path,
+            has_layout_dims_columns,
+            has_folder_proof_columns,
+        }
+    }
+
     /// Open one existing catalog for a folder-representative selection. Legacy
     /// catalogs receive only the additive revision schema, without migrations or
     /// thumbnail-row changes. A failed initialization remains readable but its
@@ -274,13 +944,17 @@ impl CatalogDb {
         cache_dir: &Path,
         folder_path: &Path,
     ) -> Result<Option<Self>, String> {
+        let access = CatalogAccess::for_cache_dir(cache_dir);
+        let admission = access.admit();
+        let _lease = access.lease(admission).map_err(|error| error.to_string())?;
         let db_path = db_path_for(cache_dir, folder_path);
         let metadata = match std::fs::metadata(&db_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.to_string()),
         };
-        let db = Self::open_read_only_at_path(&db_path).map_err(|error| error.to_string())?;
+        let db = Self::open_read_only_at_path(&db_path, access.clone(), admission)
+            .map_err(|error| error.to_string())?;
         if matches!(db.revision_state(), CatalogProofState::Present(_)) {
             failed_legacy_initializations()
                 .lock()
@@ -315,7 +989,7 @@ impl CatalogDb {
                 .lock()
                 .unwrap()
                 .remove(&db_path);
-            return Self::open_read_only_at_path(&db_path)
+            return Self::open_read_only_at_path(&db_path, access.clone(), admission)
                 .map(Some)
                 .map_err(|error| error.to_string());
         }
@@ -338,7 +1012,9 @@ impl CatalogDb {
     }
 
     pub fn revision_state(&self) -> CatalogProofState {
-        let conn = self.conn.lock().unwrap();
+        let Ok(conn) = self.phase() else {
+            return CatalogProofState::Unverifiable;
+        };
         conn.query_row(
             "SELECT instance_id, revision, ready FROM folder_selection_revision WHERE singleton = 1",
             [],
@@ -365,7 +1041,7 @@ impl CatalogDb {
         &self,
         key: &str,
     ) -> rusqlite::Result<(CatalogProofState, Option<(i64, i64)>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let tx = conn.unchecked_transaction()?;
         let stamp = tx
             .query_row(
@@ -398,6 +1074,17 @@ impl CatalogDb {
     /// cache_dir 配下の適切な場所に DB を開く（なければ作成）。
     /// サブディレクトリも自動作成する。
     pub fn open(cache_dir: &Path, folder_path: &Path) -> rusqlite::Result<Self> {
+        let access = CatalogAccess::for_cache_dir(cache_dir);
+        Self::open_admitted(cache_dir, folder_path, access.admit())
+    }
+
+    pub fn open_admitted(
+        cache_dir: &Path,
+        folder_path: &Path,
+        admission: CatalogAdmission,
+    ) -> rusqlite::Result<Self> {
+        let access = CatalogAccess::for_cache_dir(cache_dir);
+        let _lease = access.lease(admission)?;
         let db_path = db_path_for(cache_dir, folder_path);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -407,44 +1094,59 @@ impl CatalogDb {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
         migrate_pdf_layout_dims(&mut conn, folder_path)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            has_layout_dims_columns: true,
-            has_folder_proof_columns: true,
-        })
+        Ok(Self::from_connection(
+            conn,
+            access.clone(),
+            admission,
+            true,
+            true,
+        ))
     }
 
-    /// 既存 catalog だけを読み取り専用で開く。
-    ///
-    /// 再帰フォルダ代表の cache-only 伝播では、キャッシュ削除後に空 DB を作り直すと
-    /// 「キャッシュがある」ように見えてしまうため、ファイルが無い場合は `Ok(None)` を返す。
+    /// 既存 catalog だけを読み取り専用で開く。ファイル不在では空 DB を作らず Ok(None)。
     /// 呼び出し元はサムネイル重 I/O worker に限定し、UI スレッドから cold open しないこと。
     pub fn open_existing_read_only(
         cache_dir: &Path,
         folder_path: &Path,
     ) -> rusqlite::Result<Option<Self>> {
-        let db_path = db_path_for(cache_dir, folder_path);
-        if !db_path.try_exists().unwrap_or(false) {
-            return Ok(None);
-        }
-        Self::open_read_only_at_path(&db_path).map(Some)
+        let access = CatalogAccess::for_cache_dir(cache_dir);
+        Self::open_existing_read_only_admitted(cache_dir, folder_path, access.admit())
     }
 
-    fn open_read_only_at_path(db_path: &Path) -> rusqlite::Result<Self> {
+    pub fn open_existing_read_only_admitted(
+        cache_dir: &Path,
+        folder_path: &Path,
+        admission: CatalogAdmission,
+    ) -> rusqlite::Result<Option<Self>> {
+        let access = CatalogAccess::for_cache_dir(cache_dir);
+        let _lease = access.lease(admission)?;
+        let db_path = db_path_for(cache_dir, folder_path);
+        if !catalog_file_exists(&db_path)? {
+            return Ok(None);
+        }
+        Self::open_read_only_at_path(&db_path, access.clone(), admission).map(Some)
+    }
+
+    fn open_read_only_at_path(
+        db_path: &Path,
+        access: std::sync::Arc<CatalogAccess>,
+        admission: CatalogAdmission,
+    ) -> rusqlite::Result<Self> {
+        let _lease = access.lease(admission)?;
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let has_layout_dims_columns = thumbnail_column_exists(&conn, "layout_width")?
             && thumbnail_column_exists(&conn, "layout_height")?;
         let has_folder_proof_columns = thumbnail_column_exists(&conn, "folder_provenance")?
             && thumbnail_column_exists(&conn, "selection_proof")?;
-        Ok(Self {
-            conn: Mutex::new(conn),
+        Ok(Self::from_connection(
+            conn,
+            access.clone(),
+            admission,
             has_layout_dims_columns,
             has_folder_proof_columns,
-        })
+        ))
     }
 
-    /// filename -> 元画像の寸法を、thumbnail の blob を読まずに返す。
-    ///
     /// `load_all` は `thumb_data` も SELECT する。実測で 1 行あたり平均 35 KiB あり
     /// (4,628 枚のカタログで 157 MiB)、5 万枚のフォルダでは寸法を知るためだけに
     /// 1.7 GB を運ぶことになる。整数列だけで答えられる問いにはこちらを使う。
@@ -453,9 +1155,9 @@ impl CatalogDb {
     /// key の不在は「行が無い」を表す。blob からの復元が要る呼び出し側は、前者のときだけ
     /// `load_one` で個別に取り直す。
     pub fn load_source_dims(&self) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let mut stmt =
-            conn.prepare("SELECT filename, source_width, source_height FROM thumbnails")?;
+            conn.prepare("SELECT filename, source_width, source_height FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'")?;
         let mut map = HashMap::new();
         let iter = stmt.query_map([], |row| {
             Ok((
@@ -477,10 +1179,10 @@ impl CatalogDb {
         mtime: i64,
         file_size: i64,
     ) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let mut stmt = conn.prepare(
             "SELECT filename, source_width, source_height FROM thumbnails \
-             WHERE mtime = ?1 AND file_size = ?2",
+             WHERE mtime = ?1 AND file_size = ?2 AND substr(filename,1,9) <> 'audioart:'",
         )?;
         let mut map = HashMap::new();
         let iter = stmt.query_map(rusqlite::params![mtime, file_size], |row| {
@@ -498,7 +1200,7 @@ impl CatalogDb {
 
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。
     pub fn load_all(&self) -> rusqlite::Result<HashMap<String, CacheEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let layout_columns = if self.has_layout_dims_columns {
             "layout_width, layout_height"
         } else {
@@ -511,7 +1213,7 @@ impl CatalogDb {
         };
         let sql = format!(
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns}, {proof_columns} FROM thumbnails"
+                    {layout_columns}, {proof_columns} FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut map = HashMap::new();
@@ -566,7 +1268,7 @@ impl CatalogDb {
     /// 単一エントリのみ取り出す。`load_all` を呼ぶほどではないが特定 key だけ確認したい
     /// 場合用 (例: 仮想フォルダ進入時の親 catalog からの seed lookup)。
     pub fn load_one(&self, filename: &str) -> rusqlite::Result<Option<CacheEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let layout_columns = if self.has_layout_dims_columns {
             "layout_width, layout_height"
         } else {
@@ -622,7 +1324,16 @@ impl CatalogDb {
         &self,
         prefix: &str,
     ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
-        let conn = self.conn.lock().unwrap();
+        self.load_latest_with_prefix_matching(prefix, None)
+    }
+
+    /// As above, but generation validation happens before selecting a winner.
+    pub fn load_latest_with_prefix_matching(
+        &self,
+        prefix: &str,
+        stamp: Option<(i64, i64)>,
+    ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
+        let conn = self.phase()?;
         let layout_columns = if self.has_layout_dims_columns {
             "layout_width, layout_height"
         } else {
@@ -636,25 +1347,33 @@ impl CatalogDb {
         let sql = format!(
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
                     {layout_columns}, {proof_columns} FROM thumbnails \
-             WHERE substr(filename, 1, ?1) = ?2 \
+             WHERE substr(filename, 1, ?1) = ?2 AND (?3 IS NULL OR (mtime = ?3 AND file_size = ?4)) \
              ORDER BY mtime DESC, file_size DESC, filename DESC \
              LIMIT 1"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut iter = stmt.query_map(params![prefix.chars().count() as i64, prefix], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Option<u32>>(4)?,
-                row.get::<_, Option<u32>>(5)?,
-                row.get::<_, Option<u32>>(6)?,
-                row.get::<_, Option<u32>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-            ))
-        })?;
+        let mut iter = stmt.query_map(
+            params![
+                prefix.chars().count() as i64,
+                prefix,
+                stamp.map(|stamp| stamp.0),
+                stamp.map(|stamp| stamp.1)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<u32>>(4)?,
+                    row.get::<_, Option<u32>>(5)?,
+                    row.get::<_, Option<u32>>(6)?,
+                    row.get::<_, Option<u32>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )?;
         if let Some(item) = iter.next() {
             let (
                 filename,
@@ -757,7 +1476,7 @@ impl CatalogDb {
         provenance: Option<FolderThumbProvenance>,
         proof: Option<&FolderSelectionProof>,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let src_w: Option<u32> = source_dims.map(|(w, _)| w);
         let src_h: Option<u32> = source_dims.map(|(_, h)| h);
         let layout_w: Option<u32> = layout_dims.map(|(w, _)| w);
@@ -908,7 +1627,7 @@ impl CatalogDb {
     /// 消えた / 空になった場合、`folderthumb:{dir}#pin:...` のキャッシュ行を明示的に
     /// 削除して worker を auto-pick fallback に落とすため (Codex Phase C P2 指摘)。
     pub fn delete_one(&self, filename: &str) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         conn.execute(
             "DELETE FROM thumbnails WHERE filename = ?1",
             params![filename],
@@ -925,7 +1644,7 @@ impl CatalogDb {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> rusqlite::Result<bool> {
         use std::sync::atomic::Ordering;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -961,9 +1680,11 @@ impl CatalogDb {
 
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
     pub fn delete_missing(&self, existing: &HashSet<String>) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let db_names: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT filename FROM thumbnails")?;
+            let mut stmt = conn.prepare(
+                "SELECT filename FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'",
+            )?;
             stmt.query_map([], |r| r.get(0))?.flatten().collect()
         };
         for name in db_names {
@@ -1001,7 +1722,7 @@ impl CatalogDb {
         mtime: i64,
         file_size: i64,
     ) -> rusqlite::Result<Option<(u32, bool)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let mut stmt = conn.prepare(
             "SELECT page_count, password_required FROM pdf_meta \
              WHERE filename = ?1 AND mtime = ?2 AND file_size = ?3",
@@ -1029,7 +1750,7 @@ impl CatalogDb {
         page_count: u32,
         password_required: bool,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         conn.execute(
             "INSERT OR REPLACE INTO pdf_meta \
              (filename, mtime, file_size, page_count, password_required) \
@@ -1069,7 +1790,7 @@ impl CatalogDb {
         file_size: i64,
         page_count: u32,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         conn.execute(
             "UPDATE pdf_meta \
              SET page_count = ?4 \
@@ -1101,7 +1822,7 @@ impl CatalogDb {
         file_size: i64,
         page_count: u32,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         conn.execute(
             "INSERT INTO pdf_meta \
              (filename, mtime, file_size, page_count, password_required) \
@@ -1127,7 +1848,7 @@ impl CatalogDb {
         file_size: i64,
         fingerprint: i64,
     ) -> rusqlite::Result<Option<ContainerPageMeta>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         let mut stmt = conn.prepare(
             "SELECT page_count FROM container_page_meta \
              WHERE filename = ?1 AND kind = ?2 AND mtime = ?3 \
@@ -1151,7 +1872,7 @@ impl CatalogDb {
         mtime: i64,
         file_size: i64,
     ) -> rusqlite::Result<Option<VideoMeta>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         conn.query_row(
             "SELECT readable, duration_secs, width, height, codec FROM video_meta \
              WHERE filename = ?1 AND mtime = ?2 AND file_size = ?3",
@@ -1211,7 +1932,7 @@ impl CatalogDb {
             } => (true, *duration_secs, *dims, codec.as_deref()),
             VideoMeta::Unreadable => (false, None, None, None),
         };
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.phase()?;
         if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -1255,7 +1976,7 @@ impl CatalogDb {
         fingerprint: i64,
         page_count: Option<u32>,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.phase()?;
         conn.execute(
             "INSERT INTO container_page_meta \
              (filename, kind, mtime, file_size, fingerprint, page_count) \
@@ -1644,36 +2365,190 @@ pub fn cache_stats(cache_dir: &Path) -> (usize, u64) {
 }
 
 /// cache_dir 配下で最終更新時刻が `days` 日以上前の .db ファイルを削除する。
-/// 削除したファイル数を返す。
+/// Actual outcomes, including files retained by external locks or I/O errors.
+pub(crate) struct CatalogDeleteReport {
+    pub deleted: usize,
+    pub failures: Vec<(PathBuf, String)>,
+}
+impl CatalogDeleteReport {
+    pub(crate) fn error_message(&self) -> Option<String> {
+        (!self.failures.is_empty()).then(|| {
+            format!(
+                "{} 件を削除しましたが、{} 件を削除できませんでした: {}",
+                self.deleted,
+                self.failures.len(),
+                self.failures[0].1
+            )
+        })
+    }
+}
+
+/// Existing public helpers also cross the same boundary (worker callers only).
 pub fn delete_old_cache(cache_dir: &Path, days: u64) -> usize {
+    let access = CatalogAccess::for_cache_dir(cache_dir);
+    let Ok(deletion) = access.begin_delete(CatalogDeleteOperation::OlderThan(days)) else {
+        return 0;
+    };
+    deletion.retire_connections();
+    delete_old_cache_under_delete(cache_dir, days).deleted
+}
+
+pub fn delete_all_cache(cache_dir: &Path) -> usize {
+    let access = CatalogAccess::for_cache_dir(cache_dir);
+    let Ok(deletion) = access.begin_delete(CatalogDeleteOperation::All) else {
+        return 0;
+    };
+    deletion.retire_connections();
+    delete_all_cache_under_delete(cache_dir).deleted
+}
+
+pub(crate) fn delete_old_cache_under_delete(cache_dir: &Path, days: u64) -> CatalogDeleteReport {
     let now = std::time::SystemTime::now();
-    let threshold = std::time::Duration::from_secs(days * 24 * 3600);
-    let mut deleted = 0usize;
-    collect_db_paths(cache_dir, &mut |path, meta| {
+    let threshold = std::time::Duration::from_secs(days.saturating_mul(24 * 3600));
+    delete_catalog_files(cache_dir, |meta| {
         let age = meta
             .modified()
             .ok()
             .and_then(|mtime| now.duration_since(mtime).ok())
             .unwrap_or(std::time::Duration::ZERO);
-        if age >= threshold {
-            if std::fs::remove_file(path).is_ok() {
-                deleted += 1;
-            }
-        }
-    });
-    deleted
+        age >= threshold
+    })
 }
 
-/// cache_dir 配下の .db ファイルをすべて削除する。
-/// 削除したファイル数を返す。
-pub fn delete_all_cache(cache_dir: &Path) -> usize {
-    let mut deleted = 0usize;
-    collect_db_paths(cache_dir, &mut |path, _| {
-        if std::fs::remove_file(path).is_ok() {
-            deleted += 1;
+pub(crate) fn delete_all_cache_under_delete(cache_dir: &Path) -> CatalogDeleteReport {
+    delete_catalog_files(cache_dir, |_| true)
+}
+
+fn delete_catalog_files(
+    cache_dir: &Path,
+    select: impl Fn(&std::fs::Metadata) -> bool,
+) -> CatalogDeleteReport {
+    let mut report = CatalogDeleteReport {
+        deleted: 0,
+        failures: Vec::new(),
+    };
+    let top = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(error) => {
+            report
+                .failures
+                .push((cache_dir.to_owned(), error.to_string()));
+            return report;
         }
-    });
-    deleted
+    };
+    for entry in top {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report
+                    .failures
+                    .push((cache_dir.to_owned(), error.to_string()));
+                continue;
+            }
+        };
+        let sub = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                report.failures.push((sub, error.to_string()));
+                continue;
+            }
+        }
+        let entries = match std::fs::read_dir(&sub) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.failures.push((sub, error.to_string()));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.failures.push((sub.clone(), error.to_string()));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("db") {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    report.failures.push((path, error.to_string()));
+                    continue;
+                }
+            };
+            if !select(&metadata) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => report.deleted += 1,
+                Err(error) => {
+                    report.failures.push((path, error.to_string()));
+                }
+            }
+        }
+    }
+    for (path, error) in &report.failures {
+        crate::logger::log(format!(
+            "catalog delete failed: {}: {error}",
+            path.display()
+        ));
+    }
+    report
+}
+
+/// Delete general rows and only this parent's audio scope in a drive-shared DB.
+/// This exclusive maintenance connection is closed before the deletion token drops.
+pub(crate) fn delete_folder_cache_under_delete(
+    cache_dir: &Path,
+    parent: &Path,
+) -> rusqlite::Result<bool> {
+    let path = db_path_for(cache_dir, parent);
+    if !catalog_file_exists(&path)? {
+        return Ok(false);
+    }
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let scope = AudioArtCatalogScope::new(parent);
+    let tx = connection.unchecked_transaction()?;
+    tx.execute("DELETE FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:' OR substr(filename,1,?1)=?2", params![scope.prefix.len(),scope.prefix])?;
+    let has_absence: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio_art_absence')", [], |row| row.get(0))?;
+    if has_absence {
+        tx.execute(
+            "DELETE FROM audio_art_absence WHERE substr(filename,1,?1)=?2",
+            params![scope.prefix.len(), scope.prefix],
+        )?;
+    }
+    for table in ["pdf_meta", "container_page_meta", "video_meta"] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if present {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+    }
+    tx.commit()?;
+    let remaining: i64 =
+        connection.query_row("SELECT count(*) FROM thumbnails", [], |row| row.get(0))?;
+    let remaining_absence: i64 = if has_absence {
+        connection.query_row("SELECT count(*) FROM audio_art_absence", [], |row| {
+            row.get(0)
+        })?
+    } else {
+        0
+    };
+    drop(connection);
+    if remaining == 0 && remaining_absence == 0 {
+        std::fs::remove_file(path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
+    Ok(true)
 }
 
 /// cache_dir 配下の .db ファイルのパスとメタデータを列挙してコールバックを呼ぶ。
@@ -1726,11 +2601,13 @@ mod tests {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .unwrap();
         init_schema(&conn).unwrap();
-        CatalogDb {
-            conn: Mutex::new(conn),
-            has_layout_dims_columns: true,
-            has_folder_proof_columns: true,
-        }
+        CatalogDb::from_connection(
+            conn,
+            std::sync::Arc::new(CatalogAccess::new()),
+            CatalogAdmission::Admitted(0),
+            true,
+            true,
+        )
     }
 
     #[test]
@@ -2188,6 +3065,575 @@ mod tests {
     }
 
     // -- CatalogDb schema --
+
+    #[test]
+    fn catalog_delete_all_closes_live_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("music");
+        let db = std::sync::Arc::new(CatalogDb::open(temp.path(), &folder).unwrap());
+        db.save("photo.jpg", 1, 2, 1, 1, None, b"pixels").unwrap();
+        assert_eq!(delete_all_cache(temp.path()), 1);
+        assert!(!db_path_for(temp.path(), &folder).exists());
+        assert!(db.load_one("photo.jpg").is_err());
+    }
+
+    #[test]
+    fn audio_art_scope_keeps_drive_rows_and_negative_results_through_general_prune() {
+        let temp = tempfile::tempdir().unwrap();
+        let c = AudioArtCatalogScope::new(Path::new(r"C:\Music"));
+        let d = AudioArtCatalogScope::new(Path::new(r"D:\Music"));
+        assert_eq!(
+            db_path_for(temp.path(), &c.parent),
+            db_path_for(temp.path(), &d.parent)
+        );
+        let admission = CatalogAccess::for_cache_dir(temp.path()).admit();
+        let cancel = AtomicBool::new(false);
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 7,
+            file_size: 13,
+        };
+        let ck = c.key_for(&c.parent.join("song.mp3"));
+        let dk = d.key_for(&d.parent.join("song.mp3"));
+        assert_ne!(ck, dk);
+        let image = image::DynamicImage::new_rgb8(2, 3);
+        let entry = CacheEntry {
+            mtime: 7,
+            file_size: 13,
+            jpeg_data: encode_thumb_webp(&image, 2, 80.0).unwrap().0,
+            source_dims: Some((2, 3)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        save_audio_art_pixels(temp.path(), &c, &ck, &entry, admission, &cancel).unwrap();
+        save_audio_art_pixels(temp.path(), &d, &dk, &entry, admission, &cancel).unwrap();
+        let cn = c.key_for(&c.parent.join("empty.mp3"));
+        let dn = d.key_for(&d.parent.join("empty.mp3"));
+        save_audio_art_absence(temp.path(), &c, &cn, stamp, admission, &cancel).unwrap();
+        save_audio_art_absence(temp.path(), &d, &dn, stamp, admission, &cancel).unwrap();
+        let db = CatalogDb::open(temp.path(), &c.parent).unwrap();
+        db.save("photo.jpg", 1, 1, 1, 1, None, b"photo").unwrap();
+        assert_eq!(db.load_all().unwrap().len(), 1);
+        assert_eq!(db.load_source_dims().unwrap().len(), 1);
+        assert!(db.load_source_dims_matching(7, 13).unwrap().is_empty());
+        db.delete_missing(&HashSet::new()).unwrap();
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &c, &ck, stamp, admission).unwrap(),
+            AudioArtCached::Pixels(_)
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &d, &dk, stamp, admission).unwrap(),
+            AudioArtCached::Pixels(_)
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &c, &cn, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &d, &dn, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+        let complete = HashSet::from(["empty.mp3".to_owned()]);
+        assert_eq!(
+            prune_audio_art_scope(temp.path(), &c, &complete, admission, &cancel).unwrap(),
+            1
+        );
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &c, &ck, stamp, admission).unwrap(),
+            AudioArtCached::Miss
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &c, &cn, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &d, &dk, stamp, admission).unwrap(),
+            AudioArtCached::Pixels(_)
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &d, &dn, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+    }
+
+    #[test]
+    fn audio_art_positive_and_absence_are_atomic_exclusive_and_stamp_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(&temp.path().join("music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let admission = CatalogAccess::for_cache_dir(temp.path()).admit();
+        let cancel = AtomicBool::new(false);
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 0,
+            file_size: 0,
+        };
+        assert!(
+            save_audio_art_absence(temp.path(), &scope, &key, stamp, admission, &cancel).unwrap()
+        );
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+        assert!(matches!(
+            lookup_audio_art(
+                temp.path(),
+                &scope,
+                &key,
+                AudioArtSourceStamp {
+                    mtime_secs: 1,
+                    ..stamp
+                },
+                admission
+            )
+            .unwrap(),
+            AudioArtCached::Miss
+        ));
+        assert!(matches!(
+            lookup_audio_art(
+                temp.path(),
+                &scope,
+                &key,
+                AudioArtSourceStamp {
+                    file_size: 1,
+                    ..stamp
+                },
+                admission
+            )
+            .unwrap(),
+            AudioArtCached::Miss
+        ));
+        let entry = CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 2), 2, 80.0)
+                .unwrap()
+                .0,
+            source_dims: Some((2, 2)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        save_audio_art_pixels(temp.path(), &scope, &key, &entry, admission, &cancel).unwrap();
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::Pixels(_)
+        ));
+        let db = CatalogDb::open(temp.path(), &scope.parent).unwrap();
+        assert_eq!(
+            db.phase()
+                .unwrap()
+                .query_row("SELECT count(*) FROM audio_art_absence", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        save_audio_art_absence(temp.path(), &scope, &key, stamp, admission, &cancel).unwrap();
+        assert!(db.load_one(&key).unwrap().is_none());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            !save_audio_art_pixels(temp.path(), &scope, &key, &entry, admission, &cancel).unwrap()
+        );
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+    }
+
+    #[test]
+    fn audio_art_lookup_old_read_only_schema_is_miss_without_schema_or_file_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(&temp.path().join("music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let admission = CatalogAccess::for_cache_dir(temp.path()).admit();
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 1,
+            file_size: 2,
+        };
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::Miss
+        ));
+        assert!(!db_path_for(temp.path(), &scope.parent).exists());
+        let db = CatalogDb::open(temp.path(), &scope.parent).unwrap();
+        db.save("original.jpg", 1, 2, 1, 1, None, b"released")
+            .unwrap();
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::Miss
+        ));
+        assert_eq!(
+            db.phase()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='audio_art_absence'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.load_one("original.jpg").unwrap().unwrap().jpeg_data,
+            b"released"
+        );
+    }
+
+    #[test]
+    fn catalog_maintenance_drains_existing_phase_and_rejects_stale_and_display_only_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(&temp.path().join("music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let admitted = access.admit();
+        let db = std::sync::Arc::new(CatalogDb::open(temp.path(), &scope.parent).unwrap());
+        let phase = db.phase().unwrap();
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        let display_only = access.admit();
+        assert!(matches!(display_only, CatalogAdmission::DisplayOnly(_)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            deletion.retire_connections();
+            done_tx.send(deletion).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        drop(phase);
+        let deletion = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(db.is_retired());
+        assert!(db.load_all().is_err());
+        assert_eq!(delete_all_cache_under_delete(temp.path()).deleted, 1);
+        drop(deletion);
+        handle.join().unwrap();
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 1,
+            file_size: 2,
+        };
+        let cancel = AtomicBool::new(false);
+        assert!(
+            save_audio_art_absence(temp.path(), &scope, &key, stamp, admitted, &cancel).is_err()
+        );
+        assert!(
+            save_audio_art_absence(temp.path(), &scope, &key, stamp, display_only, &cancel)
+                .is_err()
+        );
+        assert!(!db_path_for(temp.path(), &scope.parent).exists());
+        let new = access.admit();
+        assert_ne!(new, admitted);
+        save_audio_art_absence(temp.path(), &scope, &key, stamp, new, &cancel).unwrap();
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, new).unwrap(),
+            AudioArtCached::NoArt
+        ));
+    }
+
+    #[test]
+    fn catalog_expiry_retires_handles_but_preserves_unselected_cache_and_read_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("music");
+        let db = CatalogDb::open(temp.path(), &parent).unwrap();
+        db.save("photo.jpg", 1, 2, 1, 1, None, b"released").unwrap();
+        assert_eq!(delete_old_cache(temp.path(), 365), 0);
+        assert!(db.is_retired());
+        let entry = db
+            .resume_cache_only_after_maintenance("photo.jpg", &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.jpeg_data, b"released");
+        assert!(db.is_retired());
+        assert!(db.load_one("photo.jpg").is_err());
+        assert_eq!(delete_old_cache(temp.path(), 0), 1);
+        assert!(
+            CatalogDb::open_existing_read_only(temp.path(), &parent)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn catalog_folder_delete_preserves_other_drive_audio_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let c = AudioArtCatalogScope::new(Path::new(r"C:\Music"));
+        let d = AudioArtCatalogScope::new(Path::new(r"D:\Music"));
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let admitted = access.admit();
+        let cancel = AtomicBool::new(false);
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 1,
+            file_size: 2,
+        };
+        let ck = c.key_for(&c.parent.join("song.mp3"));
+        let dk = d.key_for(&d.parent.join("song.mp3"));
+        save_audio_art_absence(temp.path(), &c, &ck, stamp, admitted, &cancel).unwrap();
+        save_audio_art_absence(temp.path(), &d, &dk, stamp, admitted, &cancel).unwrap();
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        deletion.retire_connections();
+        assert!(delete_folder_cache_under_delete(temp.path(), &c.parent).unwrap());
+        drop(deletion);
+        let new = access.admit();
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &c, &ck, stamp, new).unwrap(),
+            AudioArtCached::Miss
+        ));
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &d, &dk, stamp, new).unwrap(),
+            AudioArtCached::NoArt
+        ));
+    }
+
+    #[test]
+    fn catalog_maintenance_drop_reopens_admission_and_cancel_exits_read_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        assert!(access.wait_read_admission(&AtomicBool::new(true)).is_none());
+        drop(deletion);
+        assert!(matches!(access.admit(), CatalogAdmission::Admitted(_)));
+        assert!(
+            access
+                .wait_read_admission(&AtomicBool::new(false))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn catalog_maintenance_read_wait_cancels_and_unwind_restores_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_access = access.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_access.wait_read_admission(&worker_cancel)
+        });
+        started_rx.recv().unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(worker.join().unwrap().is_none());
+        assert!(
+            std::panic::catch_unwind(move || {
+                let _deletion = deletion;
+                panic!("synthetic worker unwind");
+            })
+            .is_err()
+        );
+        assert!(matches!(access.admit(), CatalogAdmission::Admitted(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_delete_reports_external_lock_and_keeps_actual_remaining_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("music");
+        drop(CatalogDb::open(temp.path(), &parent).unwrap());
+        let db_path = db_path_for(temp.path(), &parent);
+        let external = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&db_path)
+            .unwrap();
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        deletion.retire_connections();
+        let report = delete_all_cache_under_delete(temp.path());
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.error_message().is_some());
+        assert!(db_path.exists());
+        drop(deletion);
+        drop(external);
+        assert_eq!(delete_all_cache(temp.path()), 1);
+    }
+
+    #[test]
+    fn catalog_retirement_waits_for_last_handle_close_started_after_initial_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("music");
+        let db = CatalogDb::open(temp.path(), &parent).unwrap();
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            deletion.retire_connections_after_drain(|| {
+                drained_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            });
+            done_tx.send(deletion).unwrap();
+        });
+        drained_rx.recv().unwrap();
+        // Precisely reproduce the normal final-Arc close boundary, before the
+        // worker sees the already-Retired connection in its weak registry.
+        let close = access.close_lease();
+        let connection = std::mem::replace(
+            &mut *db.conn.state.lock().unwrap(),
+            CatalogConnectionState::Retired,
+        );
+        go_tx.send(()).unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        drop(connection);
+        drop(close);
+        let deletion = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(delete_all_cache_under_delete(temp.path()).deleted, 1);
+        drop(deletion);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn audio_art_cancel_callback_rolls_back_negative_and_positive_replacement_at_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(&temp.path().join("music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let admission = CatalogAccess::for_cache_dir(temp.path()).admit();
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 1,
+            file_size: 2,
+        };
+        let cancel = AtomicBool::new(false);
+        let entry = CacheEntry {
+            mtime: 1,
+            file_size: 2,
+            jpeg_data: encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 2), 2, 80.0)
+                .unwrap()
+                .0,
+            source_dims: Some((2, 2)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        save_audio_art_pixels(temp.path(), &scope, &key, &entry, admission, &cancel).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let check = || {
+            let count = calls.get() + 1;
+            calls.set(count);
+            count > 1
+        };
+        assert!(
+            !save_audio_art_absence_with_cancel_check(
+                temp.path(),
+                &scope,
+                &key,
+                stamp,
+                admission,
+                &check
+            )
+            .unwrap()
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::Pixels(_)
+        ));
+        save_audio_art_absence(temp.path(), &scope, &key, stamp, admission, &cancel).unwrap();
+        calls.set(0);
+        assert!(
+            !save_audio_art_pixels_with_cancel_check(
+                temp.path(),
+                &scope,
+                &key,
+                &entry,
+                admission,
+                &check
+            )
+            .unwrap()
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(matches!(
+            lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
+            AudioArtCached::NoArt
+        ));
+    }
+
+    #[test]
+    fn audio_art_cache_notice_has_one_shared_owner_and_does_not_reset_on_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = CatalogAccess::for_cache_dir(temp.path());
+        let remote = CatalogAccess::for_cache_dir(temp.path());
+        let old = local.admit();
+        assert!(std::sync::Arc::ptr_eq(&local, &remote));
+        assert!(local.take_audio_art_notice().is_none());
+        local.record_audio_art_cache_error("local save failed");
+        remote.record_audio_art_cache_error("remote lookup failed");
+        assert_eq!(
+            remote.take_audio_art_notice().as_deref(),
+            Some("local save failed")
+        );
+        assert!(local.take_audio_art_notice().is_none());
+        let deletion = local.begin_delete(CatalogDeleteOperation::All).unwrap();
+        assert!(!local.is_admitted(old));
+        deletion.retire_connections();
+        drop(deletion);
+        local.record_audio_art_cache_error("later failure");
+        assert!(local.take_audio_art_notice().is_none());
+        let other = tempfile::tempdir().unwrap();
+        let separate = CatalogAccess::for_cache_dir(other.path());
+        separate.record_audio_art_cache_error("different cache");
+        assert_eq!(
+            separate.take_audio_art_notice().as_deref(),
+            Some("different cache")
+        );
+    }
+
+    #[test]
+    fn catalog_cache_only_continuation_cancels_during_delete_and_whole_clear_is_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("music");
+        let db = std::sync::Arc::new(CatalogDb::open(temp.path(), &parent).unwrap());
+        db.save("photo.jpg", 1, 2, 1, 1, None, b"released").unwrap();
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        deletion.retire_connections();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_db = db.clone();
+        let worker_cancel = cancel.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_db.resume_cache_only_after_maintenance("photo.jpg", &|| {
+                worker_cancel.load(Ordering::Relaxed)
+            })
+        });
+        started_rx.recv().unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(worker.join().unwrap().unwrap().is_none());
+        assert_eq!(delete_all_cache_under_delete(temp.path()).deleted, 1);
+        drop(deletion);
+        assert!(
+            db.resume_cache_only_after_maintenance("photo.jpg", &|| false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!db_path_for(temp.path(), &parent).exists());
+        assert!(db.is_retired());
+        assert!(db.load_one("photo.jpg").is_err());
+        let in_memory = open_in_memory();
+        in_memory
+            .save("photo.jpg", 1, 2, 1, 1, None, b"pixels")
+            .unwrap();
+        assert!(
+            in_memory
+                .resume_cache_only_after_maintenance("photo.jpg", &|| false)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn catalog_open_and_schema() {

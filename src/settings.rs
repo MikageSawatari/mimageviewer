@@ -650,6 +650,43 @@ impl VideoThumbnailIndicator {
     }
 }
 
+// 音声の画像がある場合だけ重ねる目印。無画像 fallback は設定に関係なく残す。
+/// サムネイル一覧で音声を示す目印の表示方法。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に、
+/// 既存動作の音楽アイコンへ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AudioThumbnailIndicator {
+    #[default]
+    MusicNoteIcon,
+    BottomLeftBadge,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl AudioThumbnailIndicator {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::MusicNoteIcon => "音楽アイコン",
+            Self::BottomLeftBadge => "左下バッジ",
+            Self::Hidden => "なし",
+            Self::Unknown => unreachable!("normalized audio thumbnail indicator"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::MusicNoteIcon, Self::BottomLeftBadge, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::MusicNoteIcon,
+            indicator => indicator,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // 選択情報の表示方法
 // -----------------------------------------------------------------------
@@ -4435,6 +4472,9 @@ pub struct Settings {
     /// 動画サムネイルを示す目印。既定は従来どおり中央の再生アイコン。
     #[serde(default)]
     pub video_thumbnail_indicator: VideoThumbnailIndicator,
+    /// 音声の代表画像に重ねる目印。無画像時の音楽アイコンは常に表示する。
+    #[serde(default)]
+    pub audio_thumbnail_indicator: AudioThumbnailIndicator,
     /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
     /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
     /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
@@ -4748,7 +4788,7 @@ pub struct Settings {
     pub skip_archive_if_zip_exists: bool,
     #[serde(default = "default_true")]
     pub skip_epub_if_pdf_exists: bool,
-    /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
+    /// 同名の動画・音声と画像がある場合、画像を省略する。released field 名は互換性のため保持。
     #[serde(default = "default_true")]
     pub skip_image_if_video_exists: bool,
     /// 同名の画像が複数拡張子で存在する場合、優先度の低いものをスキップする
@@ -5682,11 +5722,11 @@ pub struct Settings {
     /// interlaced を示す場合に bwdif を適用する。
     #[serde(default)]
     pub video_deinterlace: VideoDeinterlaceMode,
-    /// 動画グリッドサムネに、同名ファイル名の画像 (= sidecar、例 movie.mp4 の隣の
-    /// movie.jpg) があれば優先採用するか。Phase 5.3 で導入。
-    /// 既存ユーザー (= 過去の動作と整合) のため既定 true。OFF にすると Windows Shell
-    /// 経由の動画自身のデフォルトサムネのみが使われる。
-    /// ピン留めサムネ (= Phase 5.4.1 で実装予定) は本設定とは独立で常に最優先。
+    /// 動画・音声の同 stem の sidecar 画像を代表サムネイルに使うか。
+    /// 例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダへ置く。
+    /// released field 名と既定 true は維持する。既存 OFF は音声にも適用する。
+    /// OFF の場合、動画は Windows Shell、MP3 は埋め込み画像へ進む。
+    /// 動画のピン留めフレームは本設定とは独立で常に最優先。
     #[serde(default = "default_true")]
     pub video_thumb_use_sidecar_image: bool,
     /// 動画タイルモードの列数 (Phase 6.D)。タイル中 Ctrl+Wheel で
@@ -7366,6 +7406,7 @@ impl Default for Settings {
             subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
             video_thumbnail_indicator: VideoThumbnailIndicator::default(),
+            audio_thumbnail_indicator: AudioThumbnailIndicator::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
             text_smart_snap_enabled: true,
@@ -9803,6 +9844,7 @@ impl Settings {
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
+        self.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
         // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
@@ -12184,6 +12226,42 @@ mod tests {
         assert_eq!(
             loaded.video_thumbnail_indicator,
             VideoThumbnailIndicator::PlayIcon
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_defaults_to_the_music_note_icon() {
+        assert_eq!(
+            Settings::default().audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        assert_eq!(
+            AudioThumbnailIndicator::all(),
+            &[
+                AudioThumbnailIndicator::MusicNoteIcon,
+                AudioThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::Hidden,
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_normalizes_unknown_to_the_existing_default() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"audio_thumbnail_indicator":"FutureIndicator"}"#).unwrap();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
         );
     }
 
@@ -18539,5 +18617,22 @@ mod tests {
             live.clipboard_capture_min_short_side_px,
             super::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX
         );
+    }
+}
+
+impl Settings {
+    /// A lightweight immutable scan snapshot, without copying histories, preset rows or VST state.
+    pub(crate) fn thumbnail_source_discovery_snapshot(&self) -> Self {
+        Self {
+            skip_image_if_video_exists: self.skip_image_if_video_exists,
+            video_thumb_use_sidecar_image: self.video_thumb_use_sidecar_image,
+            show_hidden_files: self.show_hidden_files,
+            archive_file_handling: self.archive_file_handling,
+            epub_file_handling: self.epub_file_handling,
+            skip_duplicate_images: self.skip_duplicate_images,
+            image_ext_priority: self.image_ext_priority.clone(),
+            susie_enabled: self.susie_enabled,
+            ..Self::default()
+        }
     }
 }

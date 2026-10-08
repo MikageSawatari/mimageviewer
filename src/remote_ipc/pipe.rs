@@ -726,6 +726,7 @@ impl ServerGuard {
             crate::collection_store::CollectionRemoteProducerControl,
         >,
         raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     ) -> Result<Self, String> {
         // 最初の instance は同名サーバの二重起動検出も兼ねる。他の instance も
         // listener 開始前に作り、起動完了時点で複数本が必ず待機できる形にする。
@@ -751,7 +752,7 @@ impl ServerGuard {
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
         let settings_reader_control = favorites.control();
-        let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
+        let thumbnail_engine = Arc::new(ThumbnailEngine::new_with_io_sem(settings.clone(), io_sem));
         let container_engine = Arc::new(ContainerEngine::new_with_session_and_raw_executor(
             settings.clone(),
             session_handle.clone(),
@@ -1036,23 +1037,25 @@ fn worker_loop(
                 enqueued_at,
                 session_operation,
                 page_job,
-            } => execute_work(
-                message,
-                reply,
-                enqueued_at,
-                ExecutionQueue::Heavy(HeavyCompletionGuard::new(
-                    work_queue,
-                    key,
-                    lane,
-                    page_job_key(page_job.as_ref()),
-                )),
-                &format!("heavy-{worker_index}"),
-                session_operation,
-                page_job,
-                |message, session_cancel, page_job| match message {
-                    ClientMessage::Thumbnail { id, request, .. } => ServerMessage::Thumbnail {
+            } => {
+                execute_work(
+                    message,
+                    reply,
+                    enqueued_at,
+                    ExecutionQueue::Heavy(HeavyCompletionGuard::new(
+                        work_queue,
+                        key,
+                        lane,
+                        page_job_key(page_job.as_ref()),
+                    )),
+                    &format!("heavy-{worker_index}"),
+                    session_operation,
+                    page_job,
+                    |message, session_cancel, page_job| {
+                        match message {
+                    ClientMessage::Thumbnail { id, request, owner } => ServerMessage::Thumbnail {
                         id,
-                        response: thumbnail_engine.handle(request, &context, container_engine),
+                        response: thumbnail_engine.handle(request, &context, container_engine, &owner, &session_cancel),
                     },
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
@@ -1224,8 +1227,10 @@ fn worker_loop(
                     | ClientMessage::RemoteArchiveResult { .. }) => {
                         service_stopped_response(&other)
                     }
-                },
-            ),
+                }
+                    },
+                )
+            }
             Work::Stop => unreachable!(),
         }
     }

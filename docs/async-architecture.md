@@ -20,6 +20,13 @@ spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同�
 初期フォルダの同期loaderはPhase Bまで現状維持。詳しくは
 [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §10を参照。
 
+### 音声画像の worker 境界 (§1.347、2026-10-08)
+
+Local は既存 heavy queue、Remote は既存 heavy worker から同じ bounded Rust PIC/APIC reader を使う。FFmpeg input / 再生 decoder / ActivityGate は抽出経路に入れない。全 Audio 抽出・decode は本体と Remote の共通 `GlobalIoSemaphore` の permit 内で行う。共有 owner は indexer profile の 1 / 2 / 4 上限変更と throttle を保持し、上限縮小時にも既存 holder を取り消さない。
+
+sidecar 出所は既存一覧準備 worker の共通 discovery で返す。履歴は entries と source map を一つの準備結果として、context / items generation / navigation sequence が合う場合だけ採用する。合成一覧の明示 refresh も既存の世代所有 worker で出所を再取得する。追加 catalog I/O・schema・prune は worker 限定、削除は admission / lease の境界で Local と Remote を同時に退役させる。[所有契約](audio-album-art-plan.md)。
+
+
 ## 1. ワーカー一覧
 
 クリップボードの既定保存先は、App 起動後に `clipboard-capture-destination` thread が

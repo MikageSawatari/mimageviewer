@@ -1490,6 +1490,11 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "thumbnail/video-indicator", |ui, state| {
         draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
     });
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/audio-indicator", |ui, state| {
+        draw_audio_thumbnail_indicator_settings(ui, &mut state.settings);
+    });
+    draw_media_duration_settings(ui, &mut state.settings);
 
     ui.add_space(8.0);
     anchored(ui, state, "thumbnail/resume-meter", |ui, state| {
@@ -1640,6 +1645,31 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
     );
+}
+
+pub(super) fn draw_audio_thumbnail_indicator_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("音声サムネイルの目印").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示:");
+        egui::ComboBox::from_id_salt("audio_thumbnail_indicator")
+            .selected_text(settings.audio_thumbnail_indicator.label())
+            .show_ui(ui, |ui| {
+                for &indicator in crate::settings::AudioThumbnailIndicator::all() {
+                    ui.selectable_value(
+                        &mut settings.audio_thumbnail_indicator,
+                        indicator,
+                        indicator.label(),
+                    );
+                }
+            });
+    });
+    ui.small("同名画像・埋め込み画像に重ねる音楽アイコンを、左下の文字バッジへ替えるか、非表示にできます。画像がない場合の音楽アイコンは常に表示します。");
+}
+
+pub(super) fn draw_media_duration_settings(ui: &mut egui::Ui, settings: &mut settings::Settings) {
     ui.add_space(6.0);
     ui.checkbox(
         &mut settings.thumb_show_media_duration,
@@ -8105,12 +8135,12 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.add_space(4.0);
             ui.checkbox(
                 &mut s.video_thumb_use_sidecar_image,
-                "同名ファイル名の画像があれば動画サムネに優先採用",
+                "同名の画像をサムネイルに使う（動画・音声）",
             )
             .on_hover_text(
-                "例: movie.mp4 の隣に movie.jpg があれば、それをサムネに使う。\n\
-         OFF にすると Windows 標準のサムネのみ採用 (= 既定動作)。\n\
-         ピン留めしたフレーム (今後実装予定) は本設定に関わらず常に最優先。",
+                "例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダに置きます。\n\
+         OFF の場合、動画は Windows 標準サムネイル、MP3 は埋め込み画像を使います。\n\
+         既存設定の OFF は音声にも引き継ぎます。動画のピン留めフレームは常に最優先。",
             );
         });
     }
@@ -9066,7 +9096,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_image_if_video_exists,
-            "同名の動画と画像がある場合、画像をスキップ",
+            "同名の動画・音声がある画像を省略",
         );
     });
     ui.add_space(4.0);

@@ -222,6 +222,7 @@ pub(crate) struct TagViewResult {
     pub summaries: Vec<TagSummary>,
     pub entries: Vec<TagViewEntry>,
     pub truncated: bool,
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +248,7 @@ pub(crate) fn spawn_tag_view_search(
     data_dir: PathBuf,
     query: String,
     kind_filter: TagViewKindFilter,
+    settings: crate::settings::Settings,
 ) -> TagViewPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
@@ -254,7 +256,39 @@ pub(crate) fn spawn_tag_view_search(
     std::thread::Builder::new()
         .name("tag-view-search".to_string())
         .spawn(move || {
-            let result = run_tag_view_search(&data_dir, &query, kind_filter, &cancel_worker);
+            let result = run_tag_view_search(&data_dir, &query, kind_filter, &cancel_worker)
+                .and_then(|mut result| {
+                    let media_paths = result
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(entry.kind, TagViewItemKind::Video | TagViewItemKind::Audio)
+                        })
+                        .map(|entry| entry.path.clone())
+                        .collect::<Vec<_>>();
+                    let sidecars =
+                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                            &settings,
+                            &media_paths,
+                            64,
+                            || !cancel_worker.load(Ordering::Relaxed),
+                        )
+                        .ok_or_else(|| "cancelled".to_string())?;
+                    if sidecars.skipped_parents > 0 {
+                        crate::logger::log(format!(
+                            "tag sidecar discovery capped: scanned={} skipped={}",
+                            sidecars.scanned_parents, sidecars.skipped_parents
+                        ));
+                    }
+                    for (parent, error) in &sidecars.scan_errors {
+                        crate::logger::log(format!(
+                            "tag sidecar discovery failed {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                    result.video_thumb_overrides = sidecars.by_video_path;
+                    Ok(result)
+                });
             if !cancel_worker.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
             }
@@ -281,6 +315,7 @@ fn run_tag_view_search(
             summaries,
             entries: Vec::new(),
             truncated: false,
+            video_thumb_overrides: Default::default(),
         });
     }
 
@@ -301,6 +336,7 @@ fn run_tag_view_search(
                 summaries,
                 entries,
                 truncated,
+                video_thumb_overrides: Default::default(),
             });
         }
         let path = PathBuf::from(&key);
@@ -330,6 +366,7 @@ fn run_tag_view_search(
         summaries,
         entries,
         truncated,
+        video_thumb_overrides: Default::default(),
     })
 }
 
@@ -800,5 +837,54 @@ mod tests {
         assert!(!TagViewKindFilter::Folder.matches(TagViewItemKind::Audio));
         assert!(TAG_VIEW_KIND_FILTER_CHOICES.contains(&TagViewKindFilter::Audio));
         assert_eq!(TagViewKindFilter::Audio.label(), "音声");
+    }
+    #[test]
+    fn audio_sidecar_is_prepared_by_tag_worker_without_omitting_explicit_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let audio = temp.path().join("song.flac");
+        let cover = temp.path().join("song.png");
+        std::fs::write(&audio, b"flac").unwrap();
+        std::fs::write(&cover, b"image").unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&audio),
+            ["music"],
+            "test",
+        )
+        .unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&cover),
+            ["music"],
+            "test",
+        )
+        .unwrap();
+        drop(db);
+        for enabled in [true, false] {
+            let mut settings = crate::settings::Settings::default();
+            settings.video_thumb_use_sidecar_image = enabled;
+            let pending = spawn_tag_view_search(
+                data_dir.clone(),
+                "#music".into(),
+                TagViewKindFilter::All,
+                settings,
+            );
+            let result = pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.entries.len(),
+                2,
+                "aggregate source discovery must keep explicit image results"
+            );
+            let key = crate::path_key::normalize_keep_drive(&audio);
+            assert_eq!(
+                result.video_thumb_overrides.get(&key),
+                enabled.then_some(&cover)
+            );
+        }
     }
 }

@@ -55,7 +55,7 @@ const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv 
     'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
     'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
-    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
+    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image', 'audio_thumbnail_indicator',
     'skip_duplicate_images', 'image_ext_priority', 'book_root',
     'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
     'detached_viewer_open_images_in_window', 'thumb_aspect', 'thumb_aspect_auto'
@@ -305,6 +305,7 @@ pub(crate) struct RemoteListingSettings {
     skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
     video_thumb_use_sidecar_image: bool,
+    audio_thumbnail_indicator: crate::settings::AudioThumbnailIndicator,
     skip_duplicate_images: bool,
     image_ext_priority: Vec<String>,
     book_root: Option<PathBuf>,
@@ -366,6 +367,7 @@ impl RemoteListingSettings {
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            audio_thumbnail_indicator: settings.audio_thumbnail_indicator.normalized(),
             skip_duplicate_images: settings.skip_duplicate_images,
             image_ext_priority: settings.image_ext_priority.clone(),
             book_root: settings.book_root.clone(),
@@ -390,6 +392,7 @@ impl RemoteListingSettings {
         settings.skip_epub_if_pdf_exists = self.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
         settings.video_thumb_use_sidecar_image = self.video_thumb_use_sidecar_image;
+        settings.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
         settings.skip_duplicate_images = self.skip_duplicate_images;
         settings.image_ext_priority = self.image_ext_priority;
         settings.book_root = self.book_root;
@@ -853,6 +856,7 @@ impl SettingsDb {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
         crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
+        settings.audio_thumbnail_indicator = settings.audio_thumbnail_indicator.normalized();
         Ok(settings)
     }
 
@@ -3132,6 +3136,7 @@ fn apply_remote_listing_setting(
         "skip_epub_if_pdf_exists" => assign!(skip_epub_if_pdf_exists),
         "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
         "video_thumb_use_sidecar_image" => assign!(video_thumb_use_sidecar_image),
+        "audio_thumbnail_indicator" => assign!(audio_thumbnail_indicator),
         "skip_duplicate_images" => assign!(skip_duplicate_images),
         "image_ext_priority" => assign!(image_ext_priority),
         "book_root" => assign!(book_root),
@@ -5828,6 +5833,48 @@ mod tests {
     }
 
     #[test]
+    fn audio_thumbnail_indicator_roundtrips_and_normalizes_live_unknown() {
+        use crate::settings::AudioThumbnailIndicator;
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        for &indicator in AudioThumbnailIndicator::all() {
+            settings.audio_thumbnail_indicator = indicator;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().audio_thumbnail_indicator,
+                indicator
+            );
+        }
+        settings.audio_thumbnail_indicator = AudioThumbnailIndicator::Unknown;
+        db.save_full(&settings).unwrap();
+        let mut snapshot = Settings::default();
+        db.load_remote_listing_settings(&snapshot)
+            .unwrap()
+            .apply_to(&mut snapshot);
+        assert_eq!(
+            snapshot.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'audio_thumbnail_indicator'",
+                [],
+            )
+            .unwrap();
+        snapshot.audio_thumbnail_indicator = AudioThumbnailIndicator::MusicNoteIcon;
+        db.load_remote_listing_settings(&snapshot)
+            .unwrap()
+            .apply_to(&mut snapshot);
+        assert_eq!(
+            snapshot.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+    }
+
+    #[test]
     fn remote_listing_settings_overlay_reads_every_live_field_only() {
         use crate::settings::{
             ArchiveFileHandling, GridDisplayOrder, GridItemDisplayKind, SortOrder, ThumbAspect,
@@ -5852,6 +5899,7 @@ mod tests {
         live.skip_epub_if_pdf_exists = false;
         live.skip_image_if_video_exists = false;
         live.video_thumb_use_sidecar_image = false;
+        live.audio_thumbnail_indicator = crate::settings::AudioThumbnailIndicator::Hidden;
         live.skip_duplicate_images = false;
         live.image_ext_priority = vec!["avif".to_owned(), "png".to_owned()];
         live.book_root = Some(PathBuf::from(r"D:\Books"));

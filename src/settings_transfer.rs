@@ -267,6 +267,7 @@ preferences_policy! {
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
+        audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
@@ -309,7 +310,7 @@ preferences_policy! {
         skip_zip_if_folder_exists: bool => ("同名フォルダがあるZIPを省略", |_, _| true, plain, plain);
         skip_archive_if_zip_exists: bool => ("同名ZIPがあるアーカイブを省略", |_, _| true, plain, plain);
         skip_epub_if_pdf_exists: bool => ("同名PDFがあるEPUBを省略", |_, _| true, plain, plain);
-        skip_image_if_video_exists: bool => ("同名動画がある画像を省略", |_, _| true, plain, plain);
+        skip_image_if_video_exists: bool => ("同名の動画・音声がある画像を省略", |_, _| true, plain, plain);
         skip_duplicate_images: bool => ("同名の重複画像を省略", |_, _| true, plain, plain);
         image_ext_priority: Vec<String> => ("画像拡張子の優先順", valid_extensions, plain, plain);
         minimize_to_tray_on_close: bool => ("閉じるときトレイに常駐", |_, _| true, plain, plain);
@@ -375,7 +376,7 @@ preferences_policy! {
         video_seek_bar_with_strip: VideoSeekBarWithStrip => ("動画サムネイル列とシークバー", |_, _| true, plain, plain);
         video_loop_mode: VideoLoopMode => ("動画のループ再生", |_, _| true, plain, video_loop);
         video_start_muted: bool => ("動画をミュートで開始", |_, _| true, plain, plain);
-        video_thumb_use_sidecar_image: bool => ("動画サムネイルに同名画像を使用", |_, _| true, plain, plain);
+        video_thumb_use_sidecar_image: bool => ("動画・音声サムネイルに同名画像を使用", |_, _| true, plain, plain);
         video_grid_open_starts_from_beginning: bool => ("一覧から開く動画の位置復元", |_, _| true, plain, plain);
         video_nav_resume: ResumeMode => ("移動時の動画の位置復元", |_, _| true, plain, plain);
         book_open_resume: ResumeMode => ("本を開くときの位置復元", |_, _| true, plain, plain);
@@ -917,6 +918,14 @@ mod tests {
                 VideoThumbnailIndicator::PlayIcon,
                 VideoThumbnailIndicator::BottomLeftBadge,
                 VideoThumbnailIndicator::Hidden,
+            ],
+        );
+        settings.audio_thumbnail_indicator = different_enum(
+            &settings.audio_thumbnail_indicator,
+            &[
+                AudioThumbnailIndicator::MusicNoteIcon,
+                AudioThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::Hidden,
             ],
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
@@ -1539,13 +1548,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 446);
+        assert_eq!(entries.len(), 447);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            134
+            135
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1555,7 +1564,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 132);
+        assert_eq!(wire.len(), 133);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1839,6 +1848,8 @@ mod tests {
             ("ui_theme", json!("Standard")),
             ("ui_theme", json!("SECRET_PIN")),
             ("text_contrast", json!("unknown")),
+            ("audio_thumbnail_indicator", json!("FutureIndicator")),
+            ("audio_thumbnail_indicator", json!("Unknown")),
             ("fullscreen_side_panel_mode", json!("Unknown")),
             ("panorama_projection", json!("unknown")),
             ("fullscreen_fit_mode", json!("MarginFit")),

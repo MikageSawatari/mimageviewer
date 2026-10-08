@@ -4916,7 +4916,10 @@ fn scan_one_directory(
                 .then_with(|| a.definition_order.cmp(&b.definition_order))
         });
         let primary = matching_rules[0];
-        if kind == SmartFolderEntryKind::Video {
+        if matches!(
+            kind,
+            SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio
+        ) {
             let video_key = crate::path_key::normalize_keep_drive(&path);
             if let Some(image) = directory_video_overrides.get(&video_key) {
                 video_thumb_overrides.insert(video_key, image.clone());
@@ -10583,22 +10586,22 @@ mod tests {
         app.requested.insert(video_index, false);
         let generation = app.items_generation;
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: video_index,
-                image: Some(egui::ColorImage::from_rgba_unmultiplied(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                video_index,
+                Some(egui::ColorImage::from_rgba_unmultiplied(
                     [2, 2],
                     &[255u8; 16],
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((2, 2)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: generation,
-            })
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                None,
+                Some((2, 2)),
+                None,
+                false,
+                false,
+                0,
+                generation,
+            ))
             .unwrap();
         app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
             .unwrap();

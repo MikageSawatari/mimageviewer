@@ -2786,3 +2786,25 @@ fn content_restore_prompt_light() {
     harness.run();
     harness.snapshot("content_restore_prompt_light");
 }
+
+#[test]
+fn audio_thumbnail_indicator_modes_dark() {
+    snapshot_with_theme_at_size(
+        "audio_thumbnail_indicator_modes_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 430.0),
+        None,
+        mimageviewer::draw_audio_thumbnail_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
+fn audio_thumbnail_indicator_modes_light() {
+    snapshot_with_theme_at_size(
+        "audio_thumbnail_indicator_modes_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 430.0),
+        None,
+        mimageviewer::draw_audio_thumbnail_indicator_snapshot_fixture,
+    );
+}

@@ -13,7 +13,7 @@
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
-| [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 未実装・抽出再設計レビュー待ち (§3)、FFmpeg gate 失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する計画。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
+| [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 実装・自動検証・確認用build完了、独立実装レビュー/実機確認待ち (§19)、Rust gate 42件 / full lib 11,045件成功、FFmpeg gate 失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する仕様・実装と検証記録。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |
 | [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240端近くの実ページ単独表示。旧設定移行、白い空き slot の描画、Remote・多窓検証、将来の本構成との境界 |
@@ -84,7 +84,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全441フィールドの分類 (131対象 / 310除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全447フィールドの分類 (135対象 / 312除外、§1.347更新)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
