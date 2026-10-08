@@ -2149,14 +2149,20 @@ impl App {
         } else {
             "パネルを固定 (画像に重ねず、前後へ移動しても表示したまま)"
         };
-        if lock_resp.on_hover_text(lock_hint).clicked() {
+        if lock_resp
+            .on_hover_text(crate::ui_helpers::chrome_lock_hint(
+                lock_hint,
+                locked_now && !lock_effective,
+            ))
+            .clicked()
+        {
             self.fs_info_panel.locked = !locked_now;
             if !self.fs_info_panel.locked {
                 self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
             }
         }
 
-        if explicit && !locked_now {
+        if explicit && !lock_effective {
             let close_size = 22.0;
             let close_margin = 5.0 + button_size + 4.0;
             let close_rect = egui::Rect::from_min_size(
@@ -2191,6 +2197,7 @@ impl App {
                 stroke,
             );
             if close_resp.on_hover_text("情報パネルを閉じる").clicked() {
+                crate::ime_focus::record_side_panel_close(ctx, "ui_metadata_panel:explicit_close");
                 self.close_fullscreen_info_panel();
             }
         }
@@ -2400,10 +2407,14 @@ impl App {
                 let book_query_demanded = metadata_panel_similar_demanded(
                     similar_feature_capability,
                     self.similar_panel.tab,
-                    self.fs_info_panel.visible(
-                        self.settings.fullscreen_side_panel_mode,
-                        self.fullscreen_tag_picker_open,
-                    ),
+                    {
+                        let mut state = self.fs_info_panel;
+                        state.locked = lock_effective;
+                        state.visible(
+                            self.settings.fullscreen_side_panel_mode,
+                            self.fullscreen_tag_picker_open,
+                        )
+                    },
                 );
                 if !book_query_demanded {
                     if similar_feature_capability.is_enabled() {

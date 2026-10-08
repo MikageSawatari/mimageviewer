@@ -502,13 +502,13 @@ fn native_child_should_set_focus(placement: NativeVideoPlacement, activate_on_sh
 }
 
 /// 上下バーの固定表示状態を 1 つの値として扱う。presenter の生成時に渡す初期値と、
-/// 後からの変更 (`SetBarLockState`) の両方が同じ型を通ることで、「生まれたときだけ固定を
+/// 後からの変更 (`SetChromeSnapshot`) の両方が同じ型を通ることで、「生まれたときだけ固定を
 /// 知らない」状態を作らない。
 ///
 /// シークストリップの高さも同じ値に含める。**帯が場所を取るかどうかは snapshot の有無で
 /// 変わるが、取るときにいくつ取るかは設定でしか変わらない**ので、snapshot と一緒に運ぶと
 /// 動画の切替中に予約高さだけ消える (§1.162 と同型)。presenter を作り直しても
-/// `cur_bar_lock` として保たれる、この経路が高さの正本になる。
+/// `cur_chrome_policy.bars` として保たれる、この経路が高さの正本になる。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeBarLockState {
     pub top_locked: bool,
@@ -531,6 +531,285 @@ impl NativeBarLockState {
                 .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX),
             ..self
         }
+    }
+}
+
+/// Raw policy owned by the source's viewer context. Resolve at the render destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeChromePolicy {
+    pub bars: NativeBarLockState,
+    pub side_panel_mode: crate::settings::FsSidePanelMode,
+    pub(crate) info_open: crate::ui_helpers::MetadataPanelOpenState,
+    pub info_locked: bool,
+    pub suppression: crate::settings::FullscreenChromeSuppression,
+}
+
+/// Exact existing window lease/host incarnation, carried across the prepare boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDetachedChromeHost {
+    pub window_id: u64,
+    pub incarnation: u64,
+    pub hwnd: u64,
+    pub borderless_applied: bool,
+}
+
+impl NativeDetachedChromeHost {
+    fn same_host(self, other: Self) -> bool {
+        self.window_id == other.window_id
+            && self.incarnation == other.incarnation
+            && self.hwnd == other.hwnd
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDetachedChromeFact {
+    pub host: NativeDetachedChromeHost,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeChromeSnapshot {
+    pub policy: NativeChromePolicy,
+    pub detached: Option<NativeDetachedChromeFact>,
+}
+
+/// Target-local facts live with the core, so rollback restores them with that core.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeChromeState {
+    pub(crate) policy: NativeChromePolicy,
+    pub(crate) placement: NativeVideoPlacement,
+    pub(crate) generation: u64,
+    pub(crate) detached: Option<NativeDetachedChromeHost>,
+}
+
+#[cfg(windows)]
+impl NativeChromeState {
+    pub(crate) fn apply(&mut self, snapshot: NativeChromeSnapshot) {
+        self.policy = snapshot.policy;
+        self.policy.bars = self.policy.bars.clamped();
+        if let (Some(current), Some(fact)) = (self.detached, snapshot.detached)
+            && fact.generation == self.generation
+            && current.same_host(fact.host)
+        {
+            self.detached = Some(fact.host);
+        }
+    }
+
+    pub(crate) fn surface(self) -> crate::ui_helpers::ViewerChromeSurface {
+        use crate::ui_helpers::ViewerChromeSurface;
+        match self.placement {
+            NativeVideoPlacement::FullscreenBorderless => ViewerChromeSurface::Fullscreen,
+            NativeVideoPlacement::DetachedViewerChild => {
+                self.detached
+                    .map_or(ViewerChromeSurface::MainEmbedded, |host| {
+                        ViewerChromeSurface::Detached {
+                            window_id: host.window_id,
+                            borderless_applied: host.borderless_applied,
+                        }
+                    })
+            }
+            _ => ViewerChromeSurface::MainEmbedded,
+        }
+    }
+
+    pub(crate) fn resolved(self) -> crate::ui_helpers::ResolvedViewerChrome {
+        crate::ui_helpers::ResolvedViewerChrome::resolve(
+            self.surface(),
+            self.policy.suppression,
+            self.policy.bars.top_locked,
+            self.policy.bars.bottom_lock,
+            self.policy.info_locked,
+            false,
+        )
+    }
+}
+
+#[cfg(all(windows, test))]
+mod chrome_suppression_transport_tests {
+    use super::*;
+    use crate::settings::{BottomBarLock, FullscreenChromeSuppression};
+
+    fn policy() -> NativeChromePolicy {
+        NativeChromePolicy {
+            bars: NativeBarLockState {
+                top_locked: true,
+                bottom_lock: BottomBarLock::BarAndStrip,
+                ..Default::default()
+            },
+            info_locked: true,
+            suppression: FullscreenChromeSuppression {
+                top: true,
+                bottom: true,
+                info: true,
+                navigator: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_command_bus_defers_one_latest_policy_across_commit_and_abort() {
+        for (abort, retire_phase) in [(false, false), (true, false), (true, true)] {
+            let (tx, rx) = native_command_bus(8, Arc::new(AtomicBool::new(false)));
+            let mut first = policy();
+            first.info_locked = false;
+            tx.send(NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot: NativeChromeSnapshot {
+                    policy: first,
+                    detached: None,
+                },
+                source_epoch: 3,
+            })
+            .unwrap();
+            let mut latest = policy();
+            latest.bars.fixed_bar_gap_px = 17;
+            latest.info_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+            tx.send(NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot: NativeChromeSnapshot {
+                    policy: latest,
+                    detached: None,
+                },
+                source_epoch: 3,
+            })
+            .unwrap();
+            tx.send(if abort {
+                NativeVideoOutputCommand::AbortPlacement { request_id: 41 }
+            } else {
+                NativeVideoOutputCommand::CommitPlacement {
+                    request_id: 41,
+                    generation: 2,
+                }
+            })
+            .unwrap();
+            let mut deferred = std::collections::VecDeque::new();
+            let control =
+                consume_placement_transition_batch(rx.drain(), &mut deferred, 41, 2, retire_phase);
+            assert!(matches!(control, Some(PlacementTransitionControl::Abort)) == abort);
+            assert_eq!(
+                deferred.len(),
+                1,
+                "the bar/panel latest slot must retain one coherent policy"
+            );
+            let NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot,
+                source_epoch,
+            } = deferred.pop_front().unwrap()
+            else {
+                panic!("normal chrome command must survive placement waiting");
+            };
+            assert_eq!(source_epoch, 3);
+            let mut applied = NativeChromeState {
+                policy: first,
+                placement: if abort {
+                    NativeVideoPlacement::MainWindowChild
+                } else {
+                    NativeVideoPlacement::FullscreenBorderless
+                },
+                generation: if abort { 1 } else { 2 },
+                detached: None,
+            };
+            applied.apply(snapshot);
+            assert_eq!(applied.policy, latest);
+            assert_eq!(applied.resolved().top_locked, abort);
+            assert_eq!(applied.resolved().info_locked, abort);
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_delayed_raw_update_uses_committed_target_and_abort_restores_old_surface()
+    {
+        let mut old = NativeChromeState {
+            policy: policy(),
+            placement: NativeVideoPlacement::MainWindowChild,
+            generation: 1,
+            detached: None,
+        };
+        let snapshot = NativeChromeSnapshot {
+            policy: policy(),
+            detached: None,
+        };
+        let mut candidate = NativeChromeState {
+            placement: NativeVideoPlacement::FullscreenBorderless,
+            generation: 2,
+            ..old
+        };
+        candidate.apply(snapshot); // A pre-commit App snapshot deferred until after commit.
+        assert!(!candidate.resolved().top_locked);
+        assert_eq!(candidate.resolved().bottom_lock, BottomBarLock::None);
+        assert!(!candidate.resolved().info_locked);
+        // Both pre-commit rejection and post-commit rollback retain this original core's facts.
+        old.apply(snapshot);
+        assert!(old.resolved().top_locked && old.resolved().info_locked);
+        assert_eq!(old.resolved().bottom_lock, BottomBarLock::BarAndStrip);
+        let mut changed = snapshot;
+        changed.policy.bars.top_locked = false;
+        old.apply(changed);
+        assert!(!old.resolved().top_locked); // Raw changes are retained, not backed up/restored.
+    }
+
+    #[test]
+    fn chrome_suppression_host_updates_require_exact_identity_and_generation_without_losing_raw_policy()
+     {
+        let host = NativeDetachedChromeHost {
+            window_id: 9,
+            incarnation: 3,
+            hwnd: 44,
+            borderless_applied: true,
+        };
+        let mut target = NativeChromeState {
+            policy: policy(),
+            placement: NativeVideoPlacement::DetachedViewerChild,
+            generation: 8,
+            detached: Some(host),
+        };
+        for stale in [
+            None,
+            Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 7,
+            }),
+            Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    incarnation: 2,
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 8,
+            }),
+            Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    window_id: 10,
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 8,
+            }),
+        ] {
+            let mut update = policy();
+            update.bars.fixed_bar_gap_px = 17;
+            target.apply(NativeChromeSnapshot {
+                policy: update,
+                detached: stale,
+            });
+            assert!(!target.resolved().top_locked);
+            assert_eq!(target.policy.bars.fixed_bar_gap_px, 17);
+            assert_eq!(target.detached, Some(host));
+        }
+        target.apply(NativeChromeSnapshot {
+            policy: policy(),
+            detached: Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 8,
+            }),
+        });
+        assert!(target.resolved().top_locked && target.resolved().info_locked);
     }
 }
 
@@ -602,7 +881,7 @@ pub struct NativeVideoOutputConfig {
     /// presenter が最初のフレームを出す前から使う上下バー固定状態。
     /// これを渡さないと presenter は「固定なし」で生まれ、App の次フレームの
     /// `sync_native_video_metadata` が届くまで全域に描いてから縮む。
-    pub bar_lock: NativeBarLockState,
+    pub chrome: NativeChromeSnapshot,
 }
 
 #[cfg(any(windows, test))]
@@ -843,6 +1122,7 @@ pub enum NativeVideoOutputEvent {
     },
     SeekStripPresentation(seek_strip::SeekStripPresentationEvent),
     ToggleClickInfoOpen,
+    CloseInfoPanel,
     ToggleInfoPanelLock,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
@@ -1293,13 +1573,9 @@ enum NativeVideoOutputCommand {
     SetMetadata {
         metadata: Option<native_presenter::NativeOverlayMetadata>,
     },
-    SetSidePanelState {
-        mode: crate::settings::FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
-    },
-    SetBarLockState {
-        state: NativeBarLockState,
+    SetChromeSnapshot {
+        snapshot: NativeChromeSnapshot,
+        source_epoch: u64,
     },
     ResetSidePanelSession,
     SetLoopEnabled {
@@ -1382,6 +1658,7 @@ enum NativeVideoOutputCommand {
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
         visible: bool,
+        chrome_host: Option<NativeDetachedChromeHost>,
     },
     CommitPlacement {
         request_id: u64,
@@ -1764,7 +2041,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetJumpEntries { .. } => Some(3),
         NativeVideoOutputCommand::SetVideoGrade { .. } => Some(4),
         NativeVideoOutputCommand::SetMetadata { .. } => Some(5),
-        NativeVideoOutputCommand::SetSidePanelState { .. } => Some(6),
+        NativeVideoOutputCommand::SetChromeSnapshot { .. } => Some(6),
         NativeVideoOutputCommand::SetLoopEnabled { .. } => Some(7),
         NativeVideoOutputCommand::SetLoopMode { .. } => Some(8),
         NativeVideoOutputCommand::SetContinuousMode { .. } => Some(9),
@@ -1787,7 +2064,6 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
         NativeVideoOutputCommand::RequestVideoScaleSettings { .. } => Some(27),
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
-        NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
         NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
         NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
         NativeVideoOutputCommand::SetVideoZoomState { .. } => Some(32),
@@ -2783,25 +3059,13 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetMetadata { metadata });
     }
 
-    fn set_side_panel_state(
-        &self,
-        mode: crate::settings::FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
-    ) {
+    pub(crate) fn set_chrome_snapshot(&self, snapshot: NativeChromeSnapshot) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SetSidePanelState {
-                mode,
-                info_panel_open,
-                info_panel_locked,
+            .send(NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot,
+                source_epoch: self.source_epoch(),
             });
-    }
-
-    fn set_bar_lock_state(&self, state: NativeBarLockState) {
-        let _ = self
-            .command_tx
-            .send(NativeVideoOutputCommand::SetBarLockState { state });
     }
 
     fn reset_side_panel_session(&self) {
@@ -2955,6 +3219,7 @@ impl NativeVideoOutput {
         owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
+        chrome_host: Option<NativeDetachedChromeHost>,
     ) {
         let visible = self.visibility_gate.effective_visible();
         let _ = self
@@ -2966,6 +3231,7 @@ impl NativeVideoOutput {
                 rect,
                 activate_on_show,
                 visible,
+                chrome_host,
             });
     }
 
@@ -4415,6 +4681,7 @@ fn send_native_overlay_command(
             expected: expected.map(|stamp| stamp.at_generation(generation)),
         },
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
+        Command::CloseInfoPanel => NativeVideoOutputEvent::CloseInfoPanel,
         Command::ToggleInfoPanelLock => NativeVideoOutputEvent::ToggleInfoPanelLock,
         Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
         Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
@@ -4789,7 +5056,12 @@ fn run_native_video_output(
                 ui_scale: config.ui_scale,
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
-                bar_lock: config.bar_lock,
+                chrome: NativeChromeState {
+                    policy: config.chrome.policy,
+                    placement: config.placement,
+                    generation: cur_generation,
+                    detached: config.chrome.detached.map(|fact| fact.host),
+                },
                 video_canvas_color: config.video_canvas_color,
                 scale_filter: config.scale_filter,
                 downscale_smoothing_percent: config.downscale_smoothing_percent,
@@ -4853,7 +5125,7 @@ fn run_native_video_output(
     let mut cur_scale_filter = config.scale_filter;
     // presenter を作り直す経路 (F12 の placement 切替) でも固定状態を持ち越す。
     // open 時の config 値のまま作ると、切替のたびに固定なしの 1 枚が出る。
-    let mut cur_bar_lock = config.bar_lock.clamped();
+    let mut cur_chrome_policy = config.chrome.policy;
     let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     let mut cur_anime4k_variant = config.anime4k_variant;
     let mut cur_anime4k_status = crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting;
@@ -5507,27 +5779,17 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
                     presenter.set_overlay_metadata(metadata);
                 }
-                NativeVideoOutputCommand::SetSidePanelState {
-                    mode,
-                    info_panel_open,
-                    info_panel_locked,
+                NativeVideoOutputCommand::SetChromeSnapshot {
+                    snapshot,
+                    source_epoch,
                 } => {
-                    // 固定の切替は映像の transform を作り直す。バーの固定と同じ扱い。
-                    if let Err(err) = presenter.set_overlay_side_panel_state(
-                        mode,
-                        info_panel_open,
-                        info_panel_locked,
-                    ) {
-                        crate::logger::log(format!(
-                            "[native-video] set info panel reservation transform failed: {err}"
-                        ));
+                    if source_epoch != source.source_epoch {
+                        continue;
                     }
-                }
-                NativeVideoOutputCommand::SetBarLockState { state } => {
-                    cur_bar_lock = state.clamped();
-                    if let Err(err) = presenter.set_overlay_bar_lock_state(state) {
+                    cur_chrome_policy = snapshot.policy;
+                    if let Err(err) = presenter.set_overlay_chrome_snapshot(snapshot) {
                         crate::logger::log(format!(
-                            "[native-video] set fixed-bar transform failed: {err}"
+                            "[native-video] set chrome transform failed: {err}"
                         ));
                     } else if source
                         .video_scale_state
@@ -5930,6 +6192,7 @@ fn run_native_video_output(
                     rect: new_rect,
                     activate_on_show,
                     visible,
+                    chrome_host,
                 } => {
                     if presentation_prepare_must_wait_for_frame(
                         placement != cur_placement,
@@ -5944,6 +6207,7 @@ fn run_native_video_output(
                                 rect: new_rect,
                                 activate_on_show,
                                 visible,
+                                chrome_host,
                             },
                         );
                         // この Prepare を次の frame へ送るなら、後ろに並んでいる分も
@@ -6125,7 +6389,12 @@ fn run_native_video_output(
                                 ui_scale: cur_ui_scale,
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
-                                bar_lock: cur_bar_lock,
+                                chrome: NativeChromeState {
+                                    policy: cur_chrome_policy,
+                                    placement,
+                                    generation: candidate_epoch,
+                                    detached: chrome_host,
+                                },
                                 video_canvas_color: cur_video_canvas_color,
                                 scale_filter: cur_scale_filter,
                                 downscale_smoothing_percent: cur_downscale_smoothing_percent,
@@ -6963,6 +7232,9 @@ fn run_native_video_output(
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleClickInfoOpen,
                                 );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CloseInfoPanel => {
+                                send_native_output_event(&ui_event_tx, event_epoch, NativeVideoOutputEvent::CloseInfoPanel);
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleInfoPanelLock => {
                                 send_native_output_event(
@@ -11030,9 +11302,17 @@ impl VideoPlayer {
         owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
+        chrome_host: Option<NativeDetachedChromeHost>,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.prepare_placement(request_id, placement, owner_hwnd, rect, activate_on_show);
+            output.prepare_placement(
+                request_id,
+                placement,
+                owner_hwnd,
+                rect,
+                activate_on_show,
+                chrome_host,
+            );
         }
     }
 
@@ -11239,21 +11519,9 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub(crate) fn set_native_side_panel_state(
-        &self,
-        mode: crate::settings::FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
-    ) {
+    pub(crate) fn set_native_chrome_snapshot(&self, snapshot: NativeChromeSnapshot) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_side_panel_state(mode, info_panel_open, info_panel_locked);
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn set_native_bar_lock_state(&self, state: crate::video::NativeBarLockState) {
-        if let Some(output) = self.native_output.as_ref() {
-            output.set_bar_lock_state(state);
+            output.set_chrome_snapshot(snapshot);
         }
     }
 

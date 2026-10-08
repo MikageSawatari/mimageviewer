@@ -17589,6 +17589,44 @@ impl App {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
     }
 
+    /// Resolve only the destination bound to this projected viewer context.
+    pub(crate) fn viewer_chrome_surface(&self) -> crate::ui_helpers::ViewerChromeSurface {
+        use crate::ui_helpers::ViewerChromeSurface;
+        #[cfg(windows)]
+        {
+            if let Some(window_id) = self.detached_viewer_window_id() {
+                let borderless_applied = self
+                    .active_detached_session
+                    .is_some_and(|session| session.window_id == window_id)
+                    && self.detached_viewer_borderless_fullscreen;
+                return ViewerChromeSurface::Detached {
+                    window_id,
+                    borderless_applied,
+                };
+            }
+            // An active sibling's global presentation is not this main context's surface.
+            if self.active_detached_session.is_some() {
+                return ViewerChromeSurface::MainEmbedded;
+            }
+        }
+        if self.viewer_presentation == ViewerPresentation::Fullscreen {
+            ViewerChromeSurface::Fullscreen
+        } else {
+            ViewerChromeSurface::MainEmbedded
+        }
+    }
+
+    pub(crate) fn resolved_still_chrome(&self) -> crate::ui_helpers::ResolvedViewerChrome {
+        crate::ui_helpers::ResolvedViewerChrome::resolve(
+            self.viewer_chrome_surface(),
+            self.settings.fullscreen_chrome_suppression,
+            self.settings.fullscreen_top_bar_locked,
+            self.settings.still_bottom_lock(),
+            self.fs_info_panel.locked,
+            self.settings.fullscreen_navigator_visible,
+        )
+    }
+
     pub(crate) fn invalidate_similar_preview(&mut self) {
         self.similar_panel.preview.invalidate();
         self.fs_lanczos_cache.retain_similar_preview_resource(None);
@@ -20491,7 +20529,7 @@ impl App {
                 .fullscreen_seek_info_cached(fs_idx)
                 .is_some_and(|info| info.has_page_strip_content());
         let bottom_lock = if allowed {
-            self.settings.still_bottom_lock()
+            self.resolved_still_chrome().bottom_lock
         } else {
             crate::settings::BottomBarLock::None
         };
@@ -20562,7 +20600,7 @@ impl App {
     }
 
     fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.settings.fullscreen_top_bar_locked
+        self.resolved_still_chrome().top_locked
             && !is_video
             && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
             && self.fullscreen_top_bar_chrome_allowed(fs_idx)
@@ -20589,7 +20627,8 @@ impl App {
     /// **表示領域を確保する側と、パネルを描く側の両方がこれを見る。**片方だけが別の条件を
     /// 綴ると、パネルを描かないモードで右に空白の帯が残る (backlog §1.158)。
     fn still_info_panel_lock_effective_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.fs_info_panel.locked && self.still_info_panel_eligible_for_idx(fs_idx, is_video)
+        self.resolved_still_chrome().info_locked
+            && self.still_info_panel_eligible_for_idx(fs_idx, is_video)
     }
 
     fn still_info_panel_eligible_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -20641,13 +20680,13 @@ impl App {
             && chrome.seek_eligible
             && chrome.strip_has_content;
         let bottom_lock = if chrome.seek_eligible {
-            self.settings.still_bottom_lock()
+            self.resolved_still_chrome().bottom_lock
         } else {
             crate::settings::BottomBarLock::None
         };
         StillSeekGeometry::resolve(
             full_rect,
-            self.settings.fullscreen_top_bar_locked && chrome.top_bar_eligible,
+            self.resolved_still_chrome().top_locked && chrome.top_bar_eligible,
             strip_visible,
             self.settings
                 .still_seek_strip_height_values
@@ -20664,7 +20703,7 @@ impl App {
         seek_height: f32,
         eligible: bool,
     ) -> f32 {
-        (eligible && self.fs_info_panel.locked)
+        (eligible && self.resolved_still_chrome().info_locked)
             .then(|| metadata_panel_rect_with_seek_height(full_rect, seek_height).width())
             .unwrap_or(0.0)
     }
@@ -20681,7 +20720,7 @@ impl App {
             };
         };
         let seek_geometry = self.still_seek_geometry_for_navigation_chrome(full_rect, chrome);
-        let lock_effective = chrome.info_panel_eligible && self.fs_info_panel.locked;
+        let lock_effective = chrome.info_panel_eligible && self.resolved_still_chrome().info_locked;
         let reserved_width = self.locked_info_panel_reserved_width_for_eligibility(
             full_rect,
             seek_geometry.total_height,
@@ -20967,7 +21006,7 @@ impl App {
             return;
         }
         if self.fs_seek_overlay_visible
-            && self.settings.still_bottom_lock().bar_locked()
+            && self.resolved_still_chrome().bottom_lock.bar_locked()
             && seek_geometry.bar_height > 0.0
         {
             return;
@@ -21187,7 +21226,8 @@ impl App {
 
         let primary_down = ctx.input(|i| i.pointer.primary_down());
         let bottom_lock = self.settings.still_bottom_lock();
-        let locked = bottom_lock.bar_locked();
+        let locked = self.resolved_still_chrome().bottom_lock.bar_locked();
+        let raw_locked = bottom_lock.bar_locked();
         let strip_locked = bottom_lock.strip_locked();
         let geometry = seek_geometry;
         if geometry.total_height <= 0.0 {
@@ -21269,17 +21309,20 @@ impl App {
                 ui,
                 lock_rect,
                 "fullscreen_seek_lock",
-                |hovered| bar_button_bg(hovered, locked),
-                locked,
-                |p, c, r| draw_seek_lock_icon(p, c, r, locked),
+                |hovered| bar_button_bg(hovered, raw_locked),
+                raw_locked,
+                |p, c, r| draw_seek_lock_icon(p, c, r, raw_locked),
             );
-            let lock_resp = lock_resp.hover_tip_dark(if locked {
-                "シークバー固定を解除"
-            } else {
-                "シークバーを固定表示"
-            });
+            let lock_resp = lock_resp.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+                if raw_locked {
+                    "シークバー固定を解除"
+                } else {
+                    "シークバーを固定表示"
+                },
+                raw_locked && !locked,
+            ));
             if lock_resp.clicked() {
-                self.settings.set_still_seek_bar_locked(!locked);
+                self.settings.set_still_seek_bar_locked(!raw_locked);
                 self.settings.save();
                 ctx.request_repaint();
             }
@@ -21633,11 +21676,15 @@ impl App {
                 strip_lock_response.hovered(),
                 strip_locked,
             );
-            let strip_lock_response = strip_lock_response.hover_tip_dark(if strip_locked {
-                "サムネイル列の固定を解除"
-            } else {
-                "サムネイル列を固定表示"
-            });
+            let strip_lock_response =
+                strip_lock_response.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+                    if strip_locked {
+                        "サムネイル列の固定を解除"
+                    } else {
+                        "サムネイル列を固定表示"
+                    },
+                    strip_locked && !self.resolved_still_chrome().bottom_lock.strip_locked(),
+                ));
             if strip_lock_response.clicked() {
                 self.settings.set_still_seek_strip_locked(!strip_locked);
                 self.settings.save();
@@ -23194,8 +23241,8 @@ impl App {
                             strip_rtl: directions.strip_rtl,
                             seek_bar_rtl: directions.bar_rtl,
                             strip_visible: self.settings.still_seek_strip_visible,
-                            strip_locked: self.settings.still_bottom_lock().strip_locked(),
-                            bar_locked: self.settings.still_bottom_lock().bar_locked(),
+                            strip_locked: self.resolved_still_chrome().bottom_lock.strip_locked(),
+                            bar_locked: self.resolved_still_chrome().bottom_lock.bar_locked(),
                         },
                     );
                 }
@@ -24724,7 +24771,7 @@ impl App {
                             });
                             let top_bar_visible =
                                 still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
-                                    locked: self.settings.fullscreen_top_bar_locked,
+                                    locked: self.resolved_still_chrome().top_locked,
                                     hover_in_top,
                                     side_panel_visible,
                                     spread_popup_open: self.spread_popup_open,
@@ -24763,6 +24810,7 @@ impl App {
                                 Vec::new()
                             };
                             let cursor_hidden = self.cursor_hidden();
+                            let effective_top_bar_locked = self.resolved_still_chrome().top_locked;
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -24824,6 +24872,7 @@ impl App {
                                 embedded,
                                 &mut window_mode_pressed,
                                 self.settings.fullscreen_top_bar_locked,
+                                effective_top_bar_locked,
                                 &mut top_bar_lock_pressed,
                                 cursor_hidden,
                                 navigator_exclusion,
@@ -31020,7 +31069,7 @@ impl App {
         // 「修飾キーを押している間」と「ナビゲータを掴んでいる間」は別の状態。
         // ドラッグ中は後者を優先し、Alt を離しても操作を最後まで継続させる。
         fs_navigator_visibility_requested(
-            self.settings.fullscreen_navigator_visible,
+            self.resolved_still_chrome().navigator_fixed,
             hold_active,
             focused,
             interaction_active,
@@ -32751,7 +32800,7 @@ impl App {
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
-                && (self.settings.still_bottom_lock().bar_locked()
+                && (self.resolved_still_chrome().bottom_lock.bar_locked()
                     || self.fs_seek_drag_active
                     || touch_chrome_latched
                     || ctx.input(|i| {
@@ -33203,7 +33252,7 @@ impl App {
         let top_bar_visible = panel_fs_idx.is_some_and(|idx| {
             self.fullscreen_top_bar_chrome_allowed(idx)
                 && still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
-                    locked: self.settings.fullscreen_top_bar_locked,
+                    locked: self.resolved_still_chrome().top_locked,
                     hover_in_top,
                     side_panel_visible,
                     spread_popup_open: self.spread_popup_open,
@@ -41607,6 +41656,7 @@ impl App {
         in_window_mode: bool,
         window_mode_pressed: &mut bool,
         top_bar_locked: bool,
+        effective_top_bar_locked: bool,
         top_bar_lock_pressed: &mut bool,
         cursor_hidden: bool,
         navigator_exclusion: Option<egui::Rect>,
@@ -41624,7 +41674,7 @@ impl App {
                     .unwrap_or(false)
         });
         if !still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
-            locked: top_bar_locked,
+            locked: effective_top_bar_locked,
             hover_in_top,
             side_panel_visible,
             spread_popup_open: *spread_popup_open,
@@ -41647,7 +41697,7 @@ impl App {
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
         );
-        let separator_y = fullscreen_top_bar_separator_y(bar_rect, top_bar_locked);
+        let separator_y = fullscreen_top_bar_separator_y(bar_rect, effective_top_bar_locked);
         ui.painter().line_segment(
             [
                 egui::pos2(bar_rect.min.x, separator_y),
@@ -41733,11 +41783,14 @@ impl App {
                 top_bar_locked,
                 |p, c, r| draw_seek_lock_icon(p, c, r, top_bar_locked),
             );
-            let lock_resp = lock_resp.hover_tip_dark(if top_bar_locked {
-                "上部情報バー固定を解除"
-            } else {
-                "上部情報バーを固定表示"
-            });
+            let lock_resp = lock_resp.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+                if top_bar_locked {
+                    "上部情報バー固定を解除"
+                } else {
+                    "上部情報バーを固定表示"
+                },
+                top_bar_locked && !effective_top_bar_locked,
+            ));
             if lock_resp.clicked() {
                 *top_bar_lock_pressed = true;
             }
@@ -48480,6 +48533,172 @@ impl App {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn chrome_suppression_right_close_hit_keeps_raw_lock_in_still_and_music() {
+        use crate::ui_helpers::MetadataPanelOpenState;
+        for music in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            app.settings.fullscreen_chrome_suppression.info = true;
+            app.fs_info_panel.locked = true;
+            app.fs_info_panel.open = MetadataPanelOpenState::ByPointer;
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+            let panel = egui::Rect::from_min_max(egui::pos2(960.0, 54.0), rect.max);
+            let mut close = egui::Pos2::ZERO;
+            for (frame, pressed) in [None, None, Some(true), Some(false), None]
+                .into_iter()
+                .enumerate()
+            {
+                let events = pressed.map_or_else(Vec::new, |down| {
+                    vec![
+                        egui::Event::PointerMoved(close),
+                        navigator_button_event(close, egui::PointerButton::Primary, down),
+                    ]
+                });
+                let _ = ctx.run(
+                    navigator_ordered_input_for_screen(
+                        events,
+                        frame as f64 * 0.1,
+                        rect.size(),
+                        1.0,
+                    ),
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if music {
+                                app.draw_fs_music_right_panel(ui, ctx, panel, 0);
+                            } else {
+                                let lock = app.resolved_still_chrome().info_locked;
+                                app.draw_metadata_panel(ui, ctx, rect, lock, 0.0);
+                            }
+                        });
+                    },
+                );
+                if frame == 1 {
+                    close = if music {
+                        ctx.read_response(
+                            egui::Id::new("central_panel").with(("music_right_close", 0usize)),
+                        )
+                        .map(|response| response.rect.center())
+                        .unwrap_or(egui::pos2(panel.right() - 44.0, panel.top() + 16.0))
+                    } else {
+                        crate::ui_metadata_panel::take_metadata_close_button_rect_for_test()
+                            .expect(
+                                "effective-unlocked raw-locked panel must draw its close hit area",
+                            )
+                            .center()
+                    };
+                    assert!(rect.contains(close));
+                }
+            }
+            assert_eq!(
+                app.fs_info_panel.open,
+                MetadataPanelOpenState::Closed,
+                "music={music}"
+            );
+            assert!(
+                app.fs_info_panel.locked,
+                "explicit close must never unlock the saved panel"
+            );
+            app.viewer_presentation = crate::app::ViewerPresentation::MainWindow;
+            assert!(app.resolved_still_chrome().info_locked);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn chrome_suppression_isolated_context_binding_and_latest_raw_exit() {
+        use crate::settings::{BottomBarLock, FullscreenChromeSuppression};
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        app.settings.fullscreen_top_bar_locked = true;
+        app.settings
+            .set_still_bottom_lock(BottomBarLock::BarAndStrip);
+        app.fs_info_panel.locked = true;
+        let a = app.build_window_context_for_test(1344, |app| {
+            app.fs_info_panel.locked = true;
+        });
+        let b = app.build_window_context_for_test(1345, |app| {
+            app.fs_info_panel.locked = true;
+        });
+        app.begin_active_detached_session(1344, crate::app::DetachedSource::Image);
+        app.detached_viewer_borderless_fullscreen = true;
+        let main_generation = app.items_generation;
+        assert!(app.resolved_still_chrome().top_locked && app.resolved_still_chrome().info_locked);
+        app.with_window_context_for_test(a, |app| {
+            let generation = app.items_generation;
+            let cache_count = app.fs_cache.len();
+            let resolved = app.resolved_still_chrome();
+            assert!(!resolved.top_locked && !resolved.info_locked);
+            assert_eq!(resolved.bottom_lock, BottomBarLock::None);
+            assert!(app.fs_info_panel.locked);
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.fs_cache.len(), cache_count);
+        });
+        app.with_window_context_for_test(b, |app| {
+            assert!(
+                app.resolved_still_chrome().top_locked && app.resolved_still_chrome().info_locked
+            );
+        });
+        assert_eq!(app.items_generation, main_generation);
+        app.settings.fullscreen_top_bar_locked = false;
+        app.detached_viewer_borderless_fullscreen = false;
+        app.with_window_context_for_test(a, |app| {
+            assert!(!app.resolved_still_chrome().top_locked);
+            assert!(app.resolved_still_chrome().info_locked);
+            assert_eq!(
+                app.resolved_still_chrome().bottom_lock,
+                BottomBarLock::BarAndStrip
+            );
+        });
+    }
+
+    #[test]
+    fn chrome_suppression_navigation_gap_geometry_releases_reservation_without_resetting_open() {
+        use crate::settings::{BottomBarLock, FullscreenChromeSuppression};
+        let mut app = crate::app::setup_app_for_test();
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.settings.fullscreen_top_bar_locked = true;
+        app.settings
+            .set_still_bottom_lock(BottomBarLock::BarAndStrip);
+        app.settings.still_seek_strip_visible = true;
+        app.fs_info_panel.locked = true;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.fullscreen_idx = None;
+        let chrome = FsNavigationChromeContinuation::Still(FsNavigationStillChromeInputs {
+            top_bar_eligible: true,
+            seek_eligible: true,
+            strip_has_content: true,
+            info_panel_eligible: true,
+        });
+        for size in [egui::vec2(1920.0, 1080.0), egui::vec2(480.0, 320.0)] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let fixed = app.fs_navigation_gap_layout(rect, chrome);
+            assert!(fixed.media_rect.width() < rect.width());
+            assert!(fixed.media_rect.height() < rect.height());
+            app.settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+                top: true,
+                bottom: true,
+                info: true,
+                navigator: true,
+            };
+            let automatic = app.fs_navigation_gap_layout(rect, chrome);
+            assert_eq!(automatic.media_rect, rect);
+            assert_eq!(automatic.panel.unwrap().0, false);
+            assert!(app.fs_info_panel.locked);
+            assert_eq!(
+                app.fs_info_panel.open,
+                crate::ui_helpers::MetadataPanelOpenState::ByPointer
+            );
+            app.settings.fullscreen_chrome_suppression = FullscreenChromeSuppression::default();
+        }
+    }
+    #[test]
     fn raw_review_cancelled_paged_preview_reenters_before_and_after_info() {
         assert_cancelled_raw_preview_reenters(false);
     }
@@ -53517,6 +53736,7 @@ mod tests {
                         false,
                         &mut window_mode_pressed,
                         true,
+                        true,
                         &mut top_bar_lock_pressed,
                         false,
                         None,
@@ -53658,6 +53878,7 @@ mod tests {
                         false,
                         false,
                         &mut window_mode_pressed,
+                        true,
                         true,
                         &mut top_bar_lock_pressed,
                         false,

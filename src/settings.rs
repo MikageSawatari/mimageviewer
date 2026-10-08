@@ -744,6 +744,16 @@ impl DetailsSelectionBarMode {
 // フルスクリーン左右パネルの表示方法
 // -----------------------------------------------------------------------
 
+/// One target set; the empty set is OFF, without a second enable flag.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct FullscreenChromeSuppression {
+    pub top: bool,
+    pub bottom: bool,
+    pub info: bool,
+    pub navigator: bool,
+}
+
 /// フルスクリーン左右パネルを呼び出す方法。
 ///
 /// Unknown は将来版の値を旧版で読み込んだときの受け皿。sanitize 時に
@@ -5014,6 +5024,9 @@ pub struct Settings {
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
+    /// Targets whose fixed display becomes automatic only on the current F11 surface.
+    #[serde(default)]
+    pub fullscreen_chrome_suppression: FullscreenChromeSuppression,
     /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
     #[serde(default = "default_true")]
     pub fullscreen_boundary_notice_visible: bool,
@@ -7485,6 +7498,7 @@ impl Default for Settings {
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
+            fullscreen_chrome_suppression: FullscreenChromeSuppression::default(),
             fullscreen_boundary_notice_visible: true,
             fullscreen_processing_status_visible: true,
             fullscreen_prefetch_status_visible: true,

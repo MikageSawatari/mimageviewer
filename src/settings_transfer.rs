@@ -336,6 +336,7 @@ preferences_policy! {
         fullscreen_fit_no_upscale: bool => ("フィットで拡大しない", |_, _| true, plain, plain);
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
         fullscreen_side_panel_mode: FsSidePanelMode => ("閲覧表示の左右パネル", |v, _raw| FsSidePanelMode::all().contains(v), plain, plain);
+        fullscreen_chrome_suppression: FullscreenChromeSuppression => ("全画面中の固定表示の一時抑制", |_, _| true, plain, plain);
         fullscreen_boundary_notice_visible: bool => ("閲覧表示の境界通知", |_, _| true, plain, plain);
         fullscreen_processing_status_visible: bool => ("閲覧表示の処理状況", |_, _| true, plain, plain);
         fullscreen_prefetch_status_visible: bool => ("閲覧表示の先読み状況", |_, _| true, plain, plain);
@@ -1152,6 +1153,12 @@ mod tests {
             ],
         );
         settings.fullscreen_top_bar_locked = !settings.fullscreen_top_bar_locked;
+        settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
         settings.fullscreen_fixed_bar_gap_px =
             if settings.fullscreen_fixed_bar_gap_px == FULLSCREEN_FIXED_BAR_GAP_MAX_PX {
                 0
@@ -1577,13 +1584,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 447);
+        assert_eq!(entries.len(), 448);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            135
+            136
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1593,7 +1600,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 133);
+        assert_eq!(wire.len(), 134);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

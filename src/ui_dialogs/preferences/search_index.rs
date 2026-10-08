@@ -657,6 +657,21 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["MakerNote", "内部名", "EXIF タグ"]
     ),
     entry!(
+        "spread/chrome-suppression",
+        SpreadMode,
+        crate::ui_helpers::FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL,
+        [
+            "F11",
+            "固定",
+            "ロック",
+            "上部バー",
+            "下部バー",
+            "ストリップ",
+            "右情報パネル",
+            "ナビゲータ"
+        ]
+    ),
+    entry!(
         "spread/side-panels",
         SpreadMode,
         "左右パネルの表示",
@@ -1382,6 +1397,15 @@ mod tests {
                 );
                 assert!(
                     PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
+                );
+            } else if entry.anchor == "spread/chrome-suppression" {
+                assert_eq!(
+                    entry.title,
+                    crate::ui_helpers::FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL
+                );
+                assert!(
+                    PAGES_SOURCE
+                        .contains("crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(")
                 );
             } else {
                 let title_source = if entry.anchor == "raw-develop/settings" {

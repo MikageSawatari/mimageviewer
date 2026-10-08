@@ -2826,3 +2826,11 @@ fullscreen の canonical decode は `AnimationPolicy` を正本にする。現�
 - `keep_range` (自分の idx が範囲外なら結果を捨てる)
 
 新しいワーカーを追加するときは同じパターンに従う。詳細は [async-architecture.md](async-architecture.md)。
+
+### F11での固定表示の実効値 (§1.344)
+
+保存値からの予約とHUD描画は `ResolvedViewerChrome` を共通に使用する。`ViewerChromeSurface` は
+projected contextのwindow bindingとexact active hostのapplied borderlessから導出し、mainやsiblingへ転用しない。
+通常content・holdover・navigation gapは同じresolverで上・下・右の予約を解放する。
+strip表示選択とresource ownerは変更せず、一時表示のrectだけをhit / sinkへ渡す。
+[設計](fullscreen-locked-chrome-suppression-plan.md) §4・5を参照。

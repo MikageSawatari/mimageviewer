@@ -27,6 +27,55 @@
 
 use egui_kittest::{Harness, kittest::Queryable};
 
+#[test]
+fn chrome_suppression_settings_light() {
+    chrome_suppression_settings_snapshot(
+        "chrome_suppression_settings_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn chrome_suppression_settings_dark() {
+    chrome_suppression_settings_snapshot(
+        "chrome_suppression_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn chrome_suppression_settings_narrow_dark() {
+    chrome_suppression_settings_snapshot(
+        "chrome_suppression_settings_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 320.0),
+    );
+}
+
+fn chrome_suppression_settings_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+) {
+    let mut targets = mimageviewer::settings::FullscreenChromeSuppression {
+        top: true,
+        bottom: true,
+        info: true,
+        navigator: true,
+    };
+    snapshot_with_theme_contrast_and_size(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        |ui| {
+            mimageviewer::ui_helpers::draw_fullscreen_chrome_suppression_setting(ui, &mut targets);
+        },
+    );
+}
+
 const STARTUP_DIALOG_CASES: &[(&str, &[&str])] = &[
     ("first_setup", &["開始"]),
     ("boot_incompatible", &["設定の復元を開く", "アプリを終了"]),

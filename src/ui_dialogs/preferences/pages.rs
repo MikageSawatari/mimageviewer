@@ -9649,6 +9649,13 @@ pub(super) fn draw_fullscreen_fit_cycle_settings(
 }
 
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "spread/chrome-suppression", |ui, state| {
+        crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
+            ui,
+            &mut state.settings.fullscreen_chrome_suppression,
+        );
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "spread/side-panels", |ui, state| {
         let s = &mut state.settings;
         egui::ComboBox::from_label("左右パネルの表示")

@@ -724,11 +724,14 @@ impl App {
                 ui.id().with(("music_right_lock", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text(if locked_now {
-                "固定を解除 (重ねる一時表示に戻す)"
-            } else {
-                "パネルを固定 (重ねず、前後へ移動しても表示したまま)"
-            });
+            .on_hover_text(crate::ui_helpers::chrome_lock_hint(
+                if locked_now {
+                    "固定を解除 (重ねる一時表示に戻す)"
+                } else {
+                    "パネルを固定 (重ねず、前後へ移動しても表示したまま)"
+                },
+                locked_now && !self.resolved_still_chrome().info_locked,
+            ));
         if locked_now || lock_response.hovered() {
             ui.painter().rect_filled(
                 lock_rect,
@@ -755,7 +758,7 @@ impl App {
         }
 
         let mut close_requested = false;
-        if !locked_now
+        if !self.resolved_still_chrome().info_locked
             && music_side_panel_close_visible(
                 self.settings.fullscreen_side_panel_mode,
                 self.fs_info_panel.open,
@@ -899,6 +902,7 @@ impl App {
             crate::ui_helpers::open_url(&url);
         }
         if close_requested {
+            crate::ime_focus::record_side_panel_close(ctx, "ui_music_panels:explicit_info_close");
             self.close_fullscreen_info_panel();
         }
     }

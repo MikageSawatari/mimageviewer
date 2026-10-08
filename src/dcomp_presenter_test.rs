@@ -152,7 +152,12 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             ui_scale: 1.0,
             text_contrast: crate::settings::TextContrast::Standard,
             ui_font: crate::settings::UiFontSettings::default(),
-            bar_lock: crate::video::NativeBarLockState::default(),
+            chrome: crate::video::NativeChromeState {
+                policy: Default::default(),
+                placement: crate::video::NativeVideoPlacement::FullscreenBorderless,
+                generation: 0,
+                detached: None,
+            },
             video_canvas_color: [0, 0, 0],
             scale_filter: crate::settings::VideoScaleFilter::OsDefault,
             downscale_smoothing_percent: 0,

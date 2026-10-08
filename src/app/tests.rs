@@ -98187,7 +98187,13 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             0,
             crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
             [17, 34, 201],
-            bar_lock,
+            crate::video::NativeChromeSnapshot {
+                policy: crate::video::NativeChromePolicy {
+                    bars: bar_lock,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             audio_only,
         )
         .expect("presenter config")
@@ -98231,7 +98237,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
-        assert_eq!(config_for(requested, false).bar_lock, requested);
+        assert_eq!(config_for(requested, false).chrome.policy.bars, requested);
     }
 
     #[test]
@@ -98327,10 +98333,17 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
-            config_for(requested, false).bar_lock.fixed_bar_gap_px,
+            config_for(requested, false)
+                .chrome
+                .policy
+                .bars
+                .fixed_bar_gap_px,
             crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX
         );
-        assert_eq!(requested.clamped(), config_for(requested, false).bar_lock);
+        assert_eq!(
+            requested.clamped(),
+            config_for(requested, false).chrome.policy.bars
+        );
     }
 
     /// 設定を読む場所は 1 つ。config へ渡す値と、生成後の同期が送る値がずれない。
