@@ -19230,7 +19230,14 @@ impl App {
             egui::pos2(full_rect.left(), full_rect.bottom() - hud_h),
             full_rect.max,
         );
-        self.draw_music_bottom_hud(ui, hud_rect, info.fs_idx, &chrome, true, false);
+        self.draw_music_bottom_hud(
+            ui,
+            hud_rect,
+            info.fs_idx,
+            &chrome,
+            true,
+            crate::ui_music_panels::MusicHudPresentation::Disabled,
+        );
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -48558,13 +48565,20 @@ impl App {
         }
 
         // 中央モーダル (改名 / 一括登録) 表示中は HUD 操作を止める (Codex 5c-A P2)。
-        self.draw_music_bottom_hud(
+        let hud_presentation = if self.music_normalize_modal_active(fs_idx) {
+            crate::ui_music_panels::MusicHudPresentation::NormalizeScan
+        } else if music_modal_open {
+            crate::ui_music_panels::MusicHudPresentation::Disabled
+        } else {
+            crate::ui_music_panels::MusicHudPresentation::Interactive
+        };
+        let navigation_rects = self.draw_music_bottom_hud(
             ui,
             hud_rect,
             fs_idx,
             &active_chrome,
             dark,
-            !music_modal_open,
+            hud_presentation,
         );
         self.handle_music_timeline_ctrl_wheel_after_hud(
             ctx,
@@ -48576,13 +48590,7 @@ impl App {
         // 上の music_modal_open で背後操作は抑止済み。
         #[cfg(windows)]
         if self.music_normalize_modal_active(fs_idx) {
-            self.draw_music_normalize_modal(
-                ui,
-                ctx,
-                full_rect,
-                fs_idx,
-                crate::ui_music_panels::music_file_navigation_rects(hud_rect),
-            );
+            self.draw_music_normalize_modal(ui, ctx, full_rect, fs_idx, navigation_rects);
         }
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
@@ -48596,6 +48604,83 @@ impl App {
 #[cfg(all(test, windows))]
 mod music_full_width_hud_tests {
     use super::*;
+
+    #[test]
+    fn normalize_hud_navigation_music_scan_time_never_overlaps_arrows() {
+        for width in [360.0, 400.0, 548.0, 640.0, 1000.0 / 1.5, 800.0, 1000.0] {
+            let (mut app, ctx) = fixture();
+            scan(&mut app);
+            let size = egui::vec2(width, 360.0);
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            assert!(
+                probe.time.is_positive(),
+                "time remains visible at {width}pt"
+            );
+            for nav in probe.nav {
+                assert!(
+                    !nav.intersects(probe.time),
+                    "time overlaps arrow at {width}pt"
+                );
+            }
+            for (index, rect) in probe.row.iter().enumerate() {
+                for other in &probe.row[index + 1..] {
+                    assert!(
+                        !rect.intersects(*other),
+                        "real bottom-row controls overlap at {width}pt"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_hud_navigation_parked_music_ignores_other_context_scan_same_idx() {
+        let (mut app, _) = fixture();
+        // A's parked chrome is an owning-context snapshot. B is currently projected,
+        // with the same local index and a different file, and starts a modal scan.
+        let parked = app.build_window_context_for_test(1351, |context| {
+            context.items = vec![GridItem::Audio(PathBuf::from("parked.flac"))];
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
+        assert_ne!(parked, crate::app::ViewerContextId::for_test(0));
+        let draw = |app: &mut App| {
+            let info = app
+                .parked_live_music_window_info_for_window_id(1351)
+                .unwrap();
+            assert_eq!(info.fs_idx, 0);
+            assert_eq!(
+                info.normalize_ui_state,
+                crate::video::normalize_types::NormalizeUiState::Off
+            );
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let mut nav = Vec::new();
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    app.draw_parked_live_music_window(ui, ctx, ui.max_rect(), &info, &mut false);
+                    for name in ["music_hud_prevfile", "music_hud_nextfile"] {
+                        let response = ctx.read_response(ui.id().with((name, info.fs_idx)))
+                            .expect("parked target's arrows must be registered independently of B's scan");
+                        assert!(!response.sense.senses_click());
+                        nav.push(response.rect);
+                    }
+                });
+            });
+            nav
+        };
+        let before = draw(&mut app);
+        scan(&mut app);
+        let seq = app.input_seq;
+        assert_eq!(draw(&mut app), before);
+        assert_eq!(app.input_seq, seq);
+        assert!(app.music_normalize_modal_active(0));
+        app.normalize_state = None;
+        assert_eq!(draw(&mut app), before);
+    }
 
     fn scan(app: &mut App) {
         let path = PathBuf::from("music-hud-layout.flac");
@@ -48681,7 +48766,7 @@ mod music_full_width_hud_tests {
     }
 
     fn narrow_scan_navigation(touch: bool) {
-        for width in [360.0, 400.0, 548.0] {
+        for width in [360.0, 400.0, 548.0, 640.0, 1000.0] {
             let (mut app, ctx) = fixture();
             scan(&mut app);
             let size = egui::vec2(width, 360.0);
@@ -48693,15 +48778,10 @@ mod music_full_width_hud_tests {
             for index in 0..2 {
                 let probe = frame(&mut app, &ctx, size, vec![]);
                 let pos = probe.nav[index].center();
-                if width <= 400.0 {
+                for other in [probe.volume, probe.speed, probe.time, probe.play] {
                     assert!(
-                        probe.volume.contains(pos),
-                        "real slider overlaps arrow at {width}pt"
-                    );
-                } else if index == 1 {
-                    assert!(
-                        probe.speed.contains(pos),
-                        "real speed button overlaps arrow at {width}pt"
+                        !probe.nav[index].intersects(other),
+                        "reserved scan layout at {width}pt never overlaps another control"
                     );
                 }
                 assert!(!probe.volume_enabled && !probe.speed_enabled);
@@ -48723,9 +48803,13 @@ mod music_full_width_hud_tests {
                 assert!(app.music_hud_last_volume_target.is_none());
                 assert!(!app.music_speed_popup_open);
             }
-            // The volume area outside the navigation holes remains modal, including drag.
+            // Shown volume, or its old area when dropped, stays modal including drag.
             let probe = frame(&mut app, &ctx, size, vec![]);
-            let pos = egui::pos2(probe.volume.right() - 2.0, probe.volume.center().y);
+            let pos = if probe.volume.is_positive() {
+                egui::pos2(probe.volume.right() - 2.0, probe.volume.center().y)
+            } else {
+                egui::pos2(width - 94.0, probe.nav[0].center().y)
+            };
             assert!(probe.nav.iter().all(|r| !r.contains(pos)));
             let before = app.input_seq;
             frame(&mut app, &ctx, size, button(pos, true, touch));
@@ -48812,6 +48896,8 @@ mod music_full_width_hud_tests {
     }
 
     struct Probe {
+        time: egui::Rect,
+        row: Vec<egui::Rect>,
         nav: [egui::Rect; 2],
         play: egui::Rect,
         close: egui::Rect,
@@ -48860,6 +48946,27 @@ mod music_full_width_hud_tests {
                         let response = |name| ctx.read_response(ui.id().with((name, 0usize)));
                         let panel = response("music_right_bg");
                         probe = Some(Probe {
+                            time: egui::Rect::NOTHING,
+                            row: [
+                                "music_hud_start",
+                                "music_hud_play",
+                                "music_hud_loop",
+                                "music_hud_continuous",
+                                "music_hud_prevfile",
+                                "music_hud_nextfile",
+                                "music_hud_prevbm",
+                                "music_hud_nextbm",
+                                "music_hud_time",
+                                "music_hud_speed",
+                                "music_hud_mute",
+                                "music_hud_normalize",
+                                "music_hud_vol",
+                                "music_hud_db",
+                                "music_hud_limiter",
+                            ]
+                            .into_iter()
+                            .filter_map(|name| response(name).map(|r| r.rect))
+                            .collect(),
                             nav: [
                                 response("music_hud_prevfile").unwrap().rect,
                                 response("music_hud_nextfile").unwrap().rect,
@@ -48870,13 +48977,11 @@ mod music_full_width_hud_tests {
                                 .rect,
                             seek: response("music_hud_seek").expect("actual seek widget").rect,
                             volume: response("music_hud_vol")
-                                .expect("actual volume widget")
-                                .rect,
+                                .map_or(egui::Rect::NOTHING, |r| r.rect),
                             speed: response("music_hud_speed")
-                                .expect("actual speed widget")
-                                .rect,
-                            volume_enabled: response("music_hud_vol").unwrap().enabled(),
-                            speed_enabled: response("music_hud_speed").unwrap().enabled(),
+                                .map_or(egui::Rect::NOTHING, |r| r.rect),
+                            volume_enabled: response("music_hud_vol").is_some_and(|r| r.enabled()),
+                            speed_enabled: response("music_hud_speed").is_some_and(|r| r.enabled()),
                             nav_above_modal: [false; 2],
                             panel: panel.as_ref().map(|r| r.rect),
                             panel_clicked: panel.is_some_and(|r| r.clicked()),
@@ -48889,6 +48994,16 @@ mod music_full_width_hud_tests {
             },
         );
         let mut probe = probe.unwrap();
+        probe.time = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "0:30 / 2:00" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or(egui::Rect::NOTHING);
         if let Some(modal_index) = output.shapes.iter().position(|shape| {
             matches!(&shape.shape, egui::epaint::Shape::Rect(r)
                 if r.fill == egui::Color32::from_black_alpha(120))

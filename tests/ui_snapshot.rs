@@ -2908,3 +2908,31 @@ fn normalize_hud_navigation_music_360pt_overlap_dark() {
         |_| {},
     );
 }
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_1000pt_time_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_1000pt_time_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(1000.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_400pt_time_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_400pt_time_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(400.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}

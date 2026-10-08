@@ -410,6 +410,306 @@ fn music_volume_slider_rect(hud: egui::Rect) -> egui::Rect {
     )
 }
 
+/// The caller owns the displayed target. A passive snapshot must never consult
+/// the projected player's scan just because their context-local indices match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MusicHudPresentation {
+    Interactive,
+    Disabled,
+    NormalizeScan,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MusicScanItem {
+    Start,
+    Play,
+    Loop,
+    Continuous,
+    Prev,
+    Next,
+    PrevMarker,
+    NextMarker,
+    Time,
+    Speed,
+    Track,
+    Mute,
+    Norm,
+    Volume,
+    Db,
+    Limiter,
+}
+
+#[cfg(windows)]
+const MUSIC_SCAN_ITEMS: [MusicScanItem; 16] = [
+    MusicScanItem::Start,
+    MusicScanItem::Play,
+    MusicScanItem::Loop,
+    MusicScanItem::Continuous,
+    MusicScanItem::Prev,
+    MusicScanItem::Next,
+    MusicScanItem::PrevMarker,
+    MusicScanItem::NextMarker,
+    MusicScanItem::Time,
+    MusicScanItem::Speed,
+    MusicScanItem::Track,
+    MusicScanItem::Mute,
+    MusicScanItem::Norm,
+    MusicScanItem::Volume,
+    MusicScanItem::Db,
+    MusicScanItem::Limiter,
+];
+
+#[cfg(windows)]
+struct MusicScanRowLayout {
+    rects: [Option<egui::Rect>; 16],
+    time_text: String,
+}
+
+#[cfg(windows)]
+impl MusicScanRowLayout {
+    fn navigation(&self) -> [egui::Rect; 2] {
+        [
+            self.rects[MusicScanItem::Prev as usize].unwrap(),
+            self.rects[MusicScanItem::Next as usize].unwrap(),
+        ]
+    }
+}
+
+/// One frame-local owner reserves *all* bottom-row slots before drawing or hit
+/// registration. Navigation wins over controls that cannot operate in the modal.
+/// No stored compact/visibility state and no viewport minimum width are needed.
+#[cfg(windows)]
+fn music_scan_row_layout(
+    hud: egui::Rect,
+    time_text: String,
+    time_width: f32,
+    short_time: String,
+    short_width: f32,
+    has_tracks: bool,
+) -> MusicScanRowLayout {
+    use MusicScanItem::*;
+    let area = hud.width().max(0.0);
+    let padding = 10.0_f32.min(area * 0.1);
+    let available = (area - 2.0 * padding).max(0.0);
+    let gap = 8.0_f32.min(available / 3.0);
+    let button = 28.0_f32.min((available - gap).max(0.0) / 2.0);
+    let mut widths = [Some(28.0); 16];
+    widths[Prev as usize] = Some(button);
+    widths[Next as usize] = Some(button);
+    widths[Time as usize] = Some(time_width.max(132.0));
+    widths[Speed as usize] = Some(28.0 * 1.55);
+    widths[Track as usize] = has_tracks.then_some(62.0);
+    widths[Volume as usize] = Some(144.0);
+    widths[Db as usize] = Some(60.0);
+    widths[Limiter as usize] = Some(14.0);
+    let total = |widths: &[Option<f32>; 16]| {
+        widths.iter().flatten().sum::<f32>()
+            + gap * widths.iter().flatten().count().saturating_sub(1) as f32
+    };
+    // Preserve full time and navigation first. Drop inert detail/controls in
+    // this order; only after all of them are gone shorten, then omit time.
+    for item in [
+        Limiter, Db, Track, Volume, Speed, NextMarker, PrevMarker, Continuous, Loop, Start, Play,
+        Mute, Norm,
+    ] {
+        if total(&widths) <= available {
+            break;
+        }
+        widths[item as usize] = None;
+    }
+    let mut time_text = time_text;
+    if total(&widths) > available {
+        widths[Time as usize] = Some(short_width);
+        time_text = short_time;
+    }
+    if total(&widths) > available {
+        widths[Time as usize] = None;
+    }
+    let cy = (hud.top() + 22.0 + hud.bottom()) * 0.5;
+    let mut rects = [None; 16];
+    let mut x = hud.left() + padding;
+    for item in MUSIC_SCAN_ITEMS.into_iter().take(8) {
+        if let Some(width) = widths[item as usize] {
+            rects[item as usize] = Some(egui::Rect::from_min_size(
+                egui::pos2(x, cy - 14.0),
+                egui::vec2(width, 28.0),
+            ));
+            x += width + gap;
+        }
+    }
+    let mut right = hud.right() - padding;
+    for item in MUSIC_SCAN_ITEMS.into_iter().skip(8).rev() {
+        if let Some(width) = widths[item as usize] {
+            rects[item as usize] = Some(egui::Rect::from_min_size(
+                egui::pos2(right - width, cy - 14.0),
+                egui::vec2(width, 28.0),
+            ));
+            right -= width + gap;
+        }
+    }
+    MusicScanRowLayout { rects, time_text }
+}
+
+/// Shared by the real HUD and snapshots. Only arrows are registered later by
+/// the existing producer above the progress overlay; all other widgets are inert.
+#[cfg(windows)]
+fn draw_music_scan_row(
+    ui: &mut egui::Ui,
+    hud: egui::Rect,
+    fs_idx: usize,
+    chrome: &MusicChromeViewState,
+    tracks: &[crate::video::audio_track_ui::AudioTrackRow],
+    track_id: egui::Id,
+    limiter_visible: bool,
+) -> [egui::Rect; 2] {
+    use MusicScanItem::*;
+    let text = format!(
+        "{} / {}",
+        format_hms(chrome.position_secs),
+        format_hms(chrome.duration_secs)
+    );
+    let short = format_hms(chrome.position_secs);
+    let font = crate::ui_fonts::hud_text_font(14.0);
+    let measure = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.into(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    let layout = music_scan_row_layout(
+        hud,
+        text.clone(),
+        measure(&text),
+        short.clone(),
+        measure(&short),
+        tracks.len() >= 2,
+    );
+    let color = egui::Color32::from_gray(238);
+    for item in MUSIC_SCAN_ITEMS {
+        let Some(rect) = layout.rects[item as usize] else {
+            continue;
+        };
+        if matches!(item, Prev | Next) {
+            continue;
+        }
+        let painter = ui.painter_at(rect);
+        let text_y = rect.center().y + 4.0;
+        let name = match item {
+            Start => "music_hud_start",
+            Play => "music_hud_play",
+            Loop => "music_hud_loop",
+            Continuous => "music_hud_continuous",
+            PrevMarker => "music_hud_prevbm",
+            NextMarker => "music_hud_nextbm",
+            Speed => "music_hud_speed",
+            Mute => "music_hud_mute",
+            Norm => "music_hud_normalize",
+            Volume => "music_hud_vol",
+            Time => "music_hud_time",
+            Db => "music_hud_db",
+            Limiter => "music_hud_limiter",
+            Track => "music_hud_track",
+            Prev | Next => unreachable!(),
+        };
+        let id = ui.id().with((name, fs_idx));
+        match item {
+            Volume => {
+                let slider =
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 8.0));
+                ui.add_enabled_ui(false, |ui| {
+                    let _ = draw_overlay_volume_slider(
+                        ui,
+                        &painter,
+                        slider,
+                        chrome.volume,
+                        id,
+                        None,
+                        &mut None,
+                    );
+                });
+            }
+            Speed => {
+                let popup_id = id.with("popup");
+                ui.add_enabled_ui(false, |ui| {
+                    let _ = draw_overlay_speed_control(
+                        ui.ctx(),
+                        ui,
+                        &painter,
+                        rect,
+                        text_y,
+                        chrome.playback_speed,
+                        id,
+                        popup_id,
+                        hud.left(),
+                        hud.width(),
+                        hud.top(),
+                        &mut false,
+                        &mut None,
+                    );
+                });
+            }
+            Track => {
+                let _ = draw_music_audio_track_selector(ui, rect, tracks, false, track_id);
+            }
+            _ => {
+                let _ = ui.interact(rect, id, egui::Sense::hover());
+                match item {
+                    Start => draw_overlay_replay_icon(&painter, rect.center(), 28.0 * 0.36),
+                    Play if chrome.playing => {
+                        draw_overlay_pause_icon(&painter, rect.center(), 28.0 * 0.30)
+                    }
+                    Play => draw_overlay_play_icon(&painter, rect.center(), 28.0 * 0.38),
+                    Loop => draw_overlay_loop_icon(&painter, rect.center(), 28.0 * 0.36, color),
+                    Continuous => {
+                        draw_overlay_continuous_icon(&painter, rect, chrome.continuous_mode)
+                    }
+                    PrevMarker | NextMarker => draw_overlay_skip_to_marker_icon(
+                        &painter,
+                        rect,
+                        if item == PrevMarker { -1 } else { 1 },
+                        !chrome.bookmark_secs.is_empty(),
+                    ),
+                    Mute => draw_overlay_speaker_icon(
+                        &painter,
+                        rect.center(),
+                        28.0 * 0.46,
+                        chrome.muted,
+                    ),
+                    Time | Norm | Db => {
+                        let (text, size) = match item {
+                            Time => (layout.time_text.clone(), 14.0),
+                            Norm => ("Norm".into(), 11.0),
+                            _ => (
+                                crate::video::native_presenter::format_video_volume_db_compact(
+                                    chrome.volume,
+                                ),
+                                13.0,
+                            ),
+                        };
+                        painter.text(
+                            egui::pos2(rect.center().x, text_y),
+                            egui::Align2::CENTER_CENTER,
+                            text,
+                            crate::ui_fonts::hud_text_font(size),
+                            color,
+                        );
+                    }
+                    Limiter if limiter_visible => {
+                        painter.circle_filled(
+                            rect.center(),
+                            4.0,
+                            egui::Color32::from_rgb(255, 72, 72),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    layout.navigation()
+}
+
 /// The same HUD widgets are drawn once: in normal playback, or above the scan overlay.
 #[cfg(windows)]
 fn draw_music_file_navigation(
@@ -433,7 +733,8 @@ fn draw_music_file_navigation(
             .interact(rect, ui.id().with((name, fs_idx)), sense)
             .hover_tip_dark(label_with_shortcut(label, shortcuts[index]));
         if scan_overlay {
-            // Narrow HUD controls can overlap: only the arrow is drawn and hit here.
+            // Keep navigation legible above the dimmed progress backdrop. Its
+            // reserved slot does not overlap any other bottom-row item.
             ui.painter()
                 .rect_filled(rect, 4.0, egui::Color32::from_gray(20));
         }
@@ -1193,8 +1494,9 @@ impl App {
         _fs_idx: usize,
         _chrome: &MusicChromeViewState,
         _dark: bool,
-        _interactive: bool,
-    ) {
+        _presentation: MusicHudPresentation,
+    ) -> [egui::Rect; 2] {
+        music_file_navigation_rects(_hud_rect)
     }
 
     #[cfg(windows)]
@@ -1206,11 +1508,12 @@ impl App {
         fs_idx: usize,
         chrome: &MusicChromeViewState,
         dark: bool,
-        // 改名 / 一括登録の中央モーダル表示中は false。HUD の見た目は描くが、操作 (seek /
+        // Disabled / NormalizeScan は非操作表示。HUD の見た目は描くが、操作 (seek /
         // play / volume / bookmark ジャンプ) は適用しない。半透明バックドロップも入力を吸収
         // するが、モーダル仕様として HUD 側でも明示的に止める (Codex 5c-A P2、多層防御)。
-        interactive: bool,
-    ) {
+        presentation: MusicHudPresentation,
+    ) -> [egui::Rect; 2] {
+        let interactive = presentation == MusicHudPresentation::Interactive;
         let pos = chrome.position_secs;
         let dur = chrome.duration_secs;
         let playing = chrome.playing;
@@ -1344,7 +1647,7 @@ impl App {
         let mut selected_audio_track = None;
         // 前/次ファイル移動 intent (-1 = 前, +1 = 次)。動画 HUD の ↑↓ = VideoPrevFile/NextFile
         // と同一挙動 (末尾でまとめて適用)。
-        let mut nav_file: Option<i32> = None;
+        let nav_file: Option<i32>;
         // 音量ノーマライズボタン (Norm) の左クリック intent。スキャン機構が windows 限定の
         // ため windows でのみ収集・適用する。右クリックは音楽 HUD では使わない (背後の
         // フルスクリーン右クリックハンドラにも届いて二重動作するため。音量/速度と同方針、
@@ -1447,6 +1750,24 @@ impl App {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
                 );
             }
+        }
+
+        if presentation == MusicHudPresentation::NormalizeScan {
+            // Preserve the existing disabled selector's popup-close behavior even
+            // when its slot is omitted by narrow scan compaction.
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(audio_track_selector_id, false));
+            let navigation = draw_music_scan_row(
+                ui,
+                hud_rect,
+                fs_idx,
+                chrome,
+                &audio_track_rows,
+                audio_track_selector_id,
+                limiter_visible,
+            );
+            painter.rect_filled(hud_rect, 0.0, egui::Color32::from_black_alpha(84));
+            return navigation;
         }
 
         // ── コントロール行: 左クラスタ ──
@@ -1585,16 +1906,14 @@ impl App {
         let navigation_rects = music_file_navigation_rects(hud_rect);
         // 前ファイル (↑ = 前の項目、動画 HUD の ↑ = VideoPrevFile と同一)。continuous と同じ
         // group B に含める (gap のみ、境界なし)。前/次フレーム (コマ送り) とキャプチャは非表示。
-        if !self.music_normalize_modal_active(fs_idx) {
-            nav_file = draw_music_file_navigation(
-                ui,
-                navigation_rects,
-                fs_idx,
-                button_sense,
-                [sc_prev_file.as_deref(), sc_next_file.as_deref()],
-                false,
-            );
-        }
+        nav_file = draw_music_file_navigation(
+            ui,
+            navigation_rects,
+            fs_idx,
+            button_sense,
+            [sc_prev_file.as_deref(), sc_next_file.as_deref()],
+            false,
+        );
         x = navigation_rects[1].right() + gap;
 
         // グループ境界: [ループ][連続][前ファイル][次ファイル] | [前マーカー][次マーカー]
@@ -1919,7 +2238,7 @@ impl App {
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 84),
             );
-            return;
+            return navigation_rects;
         }
         if let Some(stream_index) = selected_audio_track {
             self.select_video_audio_track(fs_idx, stream_index);
@@ -1993,6 +2312,7 @@ impl App {
         if let Some(delta) = nav_file {
             self.music_navigate_file(&ctx, fs_idx, delta);
         }
+        navigation_rects
     }
 
     /// 再生前ノーマライズスキャンがモーダル段階 (= 仮 gain 適用前) で、かつ現在の音楽ビュー
@@ -2180,24 +2500,33 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
         egui::pos2(rect.left(), rect.bottom() - MUSIC_HUD_HEIGHT),
         rect.max,
     );
-    let nav = music_file_navigation_rects(hud);
     ui.painter()
         .rect_filled(rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
     ui.painter()
         .rect_filled(hud, 0.0, egui::Color32::from_black_alpha(150));
-    let painter = ui.painter_at(hud);
-    let volume_id = ui.id().with(("music_hud_vol", 0usize));
-    ui.add_enabled_ui(false, |ui| {
-        let _ = draw_overlay_volume_slider(
-            ui,
-            &painter,
-            music_volume_slider_rect(hud),
-            1.0,
-            volume_id,
-            None,
-            &mut None,
-        );
-    });
+    let chrome = MusicChromeViewState {
+        title: "Music".into(),
+        position_secs: 5.0,
+        duration_secs: 216.0,
+        playing: false,
+        video_audio_mode: false,
+        playback_speed: 1.0,
+        volume: 1.0,
+        muted: false,
+        loop_mode: crate::settings::VideoLoopMode::Off,
+        continuous_mode: crate::video::VideoContinuousMode::Off,
+        row_secs: 30.0,
+        normalize_ui_state: crate::video::normalize_types::NormalizeUiState::Scanning,
+        bookmark_secs: vec![],
+        bookmarks_loaded: false,
+        show_row_stepper: false,
+        show_side_panel_mode: false,
+        show_back_to_video: false,
+        show_vst: false,
+        show_window_toggle: false,
+        show_close: false,
+    };
+    let nav = draw_music_scan_row(ui, hud, 0, &chrome, &[], ui.id().with("track"), false);
     let ctx = ui.ctx().clone();
     let _ = draw_music_normalize_progress(
         ui,
@@ -2217,6 +2546,41 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_hud_navigation_music_scan_layout_packs_every_width() {
+        for width in 1..=2000 {
+            for has_tracks in [false, true] {
+                let hud = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width as f32, MUSIC_HUD_HEIGHT),
+                );
+                let layout = music_scan_row_layout(
+                    hud,
+                    "123:45:56 / 234:56:07".into(),
+                    400.0,
+                    "123:45:56".into(),
+                    160.0,
+                    has_tracks,
+                );
+                let slots: Vec<_> = layout.rects.iter().flatten().copied().collect();
+                for (index, rect) in slots.iter().enumerate() {
+                    assert!(
+                        rect.left() >= hud.left() - 0.001 && rect.right() <= hud.right() + 0.001,
+                        "slot escapes {width}pt HUD"
+                    );
+                    for other in &slots[index + 1..] {
+                        assert!(
+                            !rect.intersects(*other),
+                            "bottom-row slots overlap at {width}pt"
+                        );
+                    }
+                }
+                assert!(layout.navigation().iter().all(|r| r.width() > 0.0));
+            }
+        }
+    }
 
     /// タッチで開いたパネルは Hover モードでも閉じられなければならない。
     ///

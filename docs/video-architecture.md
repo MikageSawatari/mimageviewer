@@ -3471,6 +3471,39 @@ build記録は `target/E-1351-fix-build-dev.log`。
 実機確認では音楽ビューをF12にし、幅360pt / 400pt程度で測定中の↑↓をclick / touchする。
 一度ずつ項目移動でき、音量・速度・seekは操作できず、× / Escで取消できることを確認する。
 
+#### §1.351 実機・再レビュー追補: 音楽HUDの配置と表示対象
+
+利用者の2026-10-09実機画像で、測定中の音楽HUD↑↓が時間表示に重なることを確認。
+独立再レビューP3の、マウント中の別contextの測定により非操作ParkedLiveの矢印が消える
+経路も確認した。配置と表示対象の所有境界を修正する。仕様・省略順・簡素化の検討は
+[音楽HUDの追補](music-integration-plan.md#1351-測定中の移動を音楽hudへ集約2026-10-08)を正本とする。
+native動画、VST shellの既存制限、keymap、取消と既存navigation ownerは変更しない。
+
+修正前の実HUD回帰は640ptで時間galleyと矢印の交差により失敗（終了101）。
+ParkedLiveの実描画回帰も、同じidxの操作側scan開始後に矢印widgetが消えて失敗（終了101）。
+修正後の回帰ではcontext registryに窓Aを実際に登録し、非測定A / 測定Bの同じidxについて
+scan開始前・中・終了後を通す。実HUDのmouse / touch、時間・全controlの非交差、
+全幅の配置検査、同じrow rendererのsnapshotを追加・拡張する。
+
+実機手順: 同じ曲を音楽ビューで測定し、以前の約1000px窓とF12の360 / 400pt相当の窓で
+↑↓と時間が重ならず、↑↓をclick / touchすると一度だけ移動することを確認する。
+非操作の音量・速度・seekは動かず、× / Escで測定を取り消せることを確認する。
+非測定の音楽窓Aを残して窓Bで測定を開始し、Aの矢印表示が変わらないことも確認する。
+通常再生、1.352の全幅HUD、1.344のF11抑制とnative動画の既確認配置は保持する。
+検証（2026-10-09、HEAD `d648a5d54` 上の修正差分）:
+`--lib normalize_hud_navigation` は12件、`--lib music_full_width_hud` は9件成功
+（2つの焦点suiteには重複あり、終了0）。`cargo test -p mimageviewer --lib` は
+10,977成功・52 ignored・失敗0（終了0、1019.21秒）。
+`--test ui_snapshot -- --test-threads=1` は114件成功（終了0、114.23秒）。
+前回確認済みの並列AVを避けて今回は最初から1 threadを使用し、並列版の再試行はしていない。
+更新・追加した1000 / 640 / 400 / 360ptの4枚は目視確認済み。
+fmt / glyph lint（危険glyph 0）、通常 / portable core checkはすべて終了0。
+`scripts/build-dev.ps1 -PreserveRuntime` は終了0。通常featureのcore / remote / EPUB PDF workerを
+`target/dev-runtime/`へ作成し、PE依存確認も成功（runtime=4 / pe=3、core buildは3分26秒）。
+build記録は `target/E-1351-fix2-build-dev.log`。
+ログは `target/E-1351-fix2-{red-layout,red-context,focused,focused-music,full-lib,snapshot-update,snapshot,check,portable-check,fmt,glyph}.log`。
+製品起動・commitは行っていない。実機での修正後確認は利用者へ引き継ぐ。
+
 ### P キー perf overlay 拡張
 
 フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/
