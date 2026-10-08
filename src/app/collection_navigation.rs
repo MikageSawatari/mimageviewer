@@ -1179,8 +1179,10 @@ impl App {
                         CollectionResolvedKind::Zip => {
                             // A ZIP with converted nested archives can have a cached ZIP backing.
                             // Keep DB and filesystem work off the UI thread; if the cache became
-                            // unreadable, the original ZIP remains a valid destination.
+                            // unreadable, the original ZIP remains a valid destination. A native
+                            // RAR backing already passed the shared Direct/cache decision.
                             if use_archive_cache
+                                && !crate::rar_loader::is_rar_path(&path)
                                 && let Some(db) = archive_cache_db.as_ref()
                                 && let Ok(metadata) = std::fs::metadata(&path)
                                 && let Some(backing_path) = db.lookup(
@@ -1235,6 +1237,8 @@ impl App {
                             }
                         }
                         CollectionResolvedKind::ConvertibleArchive => {
+                            // RAR source selection belongs to the shared scan worker, including
+                            // a first-volume cache hit. Preparation must not bypass Direct-first.
                             let extension = path
                                 .extension()
                                 .and_then(|value| value.to_str())

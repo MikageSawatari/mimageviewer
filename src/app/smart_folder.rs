@@ -2596,19 +2596,15 @@ impl App {
             .and_then(|extension| extension.to_str())
             .and_then(crate::archive_converter::ArchiveFormat::from_extension);
         let started = match format {
-            Some(crate::archive_converter::ArchiveFormat::Rar) => {
-                let fallback = self.try_archive_cache_lookup(&path);
-                self.request_rar_open_owned(
-                    path,
-                    auto_fullscreen,
-                    fallback,
-                    owner,
-                    transition.restore_intent.clone(),
-                )
-            }
+            Some(crate::archive_converter::ArchiveFormat::Rar) => self.request_rar_open_owned(
+                path,
+                auto_fullscreen,
+                owner,
+                transition.restore_intent.clone(),
+            ),
             Some(format) => {
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.supply_smart_archive_load_alias(&path, &cached, &owner)
+                    self.supply_smart_archive_load_alias(&cached, &owner)
                 } else {
                     self.request_archive_convert_owned(
                         path,
@@ -2806,7 +2802,6 @@ impl App {
     /// Smart row. It joins the same offscreen request instead of entering the ordinary loader.
     pub(crate) fn supply_smart_archive_load_alias(
         &mut self,
-        source_path: &Path,
         load_path: &Path,
         owner: &super::OpenRequestOwner,
     ) -> bool {
@@ -2816,6 +2811,9 @@ impl App {
         let super::SmartGridArchiveOwner::Transition(request_id) = intent.smart_folder_owner else {
             return false;
         };
+        // The row owner keeps the clicked logical path; the worker may resolve a later RAR
+        // volume to a different physical first-volume source before delivering this alias.
+        let source_path = intent.source_path.as_path();
         if !self.smart_folder_transition_request_is_current(request_id, source_path) {
             return false;
         }

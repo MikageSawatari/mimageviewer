@@ -513,6 +513,8 @@ pub(crate) mod content_identity_restore;
 mod detached_window_manager;
 mod facet_name_filter;
 mod facet_navigation;
+#[cfg(test)]
+mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
 pub(crate) mod folder_scan;
 #[cfg(test)]
@@ -26598,11 +26600,9 @@ impl App {
                 return FolderOpenOutcome::Ignored;
             }
             if format == crate::archive_converter::ArchiveFormat::Rar {
-                let fallback_cached_zip = self.try_archive_cache_lookup(&path);
                 return if self.request_rar_open_owned(
                     path,
                     auto_fullscreen,
-                    fallback_cached_zip,
                     owner,
                     restore_intent.clone(),
                 ) {
@@ -31904,7 +31904,6 @@ impl App {
             self.request_rar_open_owned(
                 path.to_path_buf(),
                 false,
-                self.try_archive_cache_lookup(path),
                 OpenRequestOwner::Navigation,
                 restore_intent.clone(),
             )

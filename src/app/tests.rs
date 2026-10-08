@@ -14909,7 +14909,6 @@ mod startup_open_path_resolve_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(owner),
             pending_sibling_output: None,
@@ -15010,7 +15009,6 @@ mod startup_open_path_resolve_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -15300,15 +15298,16 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    PathBuf::from("late.7z"),
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: PathBuf::from("late.7z"),
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err(),
             "late scan result must not recreate the cancelled dialog"
@@ -15343,15 +15342,16 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx_a.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    archive_a,
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: archive_a,
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err(),
             "archive A receiver must be dropped before its late completion"
@@ -15739,15 +15739,16 @@ mod startup_open_path_resolve_tests {
         assert!(app.archive_convert.is_none());
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    PathBuf::from("late.7z"),
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: PathBuf::from("late.7z"),
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err()
         );
@@ -15778,15 +15779,16 @@ mod startup_open_path_resolve_tests {
         assert!(app.borrow().archive_convert.is_none());
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    PathBuf::from("late.7z"),
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: PathBuf::from("late.7z"),
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err()
         );
@@ -21414,7 +21416,6 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(
                     request_id,
@@ -21489,7 +21490,6 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -21532,7 +21532,6 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -21574,7 +21573,6 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -47933,7 +47931,6 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -47976,7 +47973,6 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -48011,7 +48007,6 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: true,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -48073,7 +48068,6 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -48139,7 +48133,6 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
@@ -67553,7 +67546,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             pending_nav,
             pending_direct_nav,
             allow_direct_read: format == ArchiveFormat::Rar,
-            fallback_cached_zip: None,
             completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::DetachedGridArchive(
                 owner.clone(),
             ),
@@ -68055,24 +68047,21 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .archive_convert
             .as_mut()
             .expect("RAR cache hit must still probe direct-read capability first");
-        assert_eq!(
-            state.fallback_cached_zip.as_deref(),
-            Some(backing.as_path())
-        );
+        assert!(matches!(
+            state.phase,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning
+        ));
         state.cancel.store(true, Ordering::Relaxed);
         state.cancel = Arc::new(AtomicBool::new(false));
         state.rx = scan_rx;
         scan_tx
             .send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 2,
-                        total_uncompressed_bytes: 2,
-                        nested_archive_count: 1,
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::CachedZip {
+                        source: source.clone(),
+                        path: backing.clone(),
                     },
-                    false,
-                    source.clone(),
-                ))),
+                )),
             )
             .unwrap();
 
@@ -71461,7 +71450,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 pending_nav: (!direct).then(|| target.clone()),
                 pending_direct_nav: direct.then(|| target.clone()),
                 allow_direct_read: direct,
-                fallback_cached_zip: None,
                 completion:
                     crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
                 pending_sibling_output: None,
@@ -90488,7 +90476,6 @@ mod smart_folder_transition_tests {
             pending_nav: None,
             pending_direct_nav: Some(source.to_path_buf()),
             allow_direct_read: true,
-            fallback_cached_zip: None,
             completion,
             pending_sibling_output: None,
             auto_fullscreen: false,

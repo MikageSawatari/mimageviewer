@@ -286,6 +286,22 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 ### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
 
+RAR/CBRを開くときは、パスワード入力後も含む共通のnative workerでvolume headerから
+実際のsource（分割RARなら先頭volume）を確定する。Directなら元RARを開き、変換が必要なら
+そのsourceの有効な変換cacheを照会して、DBが保持する実ZIP pathを採用する。
+cacheが無い場合だけ変換へ進む。後続パートのクリックpathでmissになっても、確定した
+先頭volumeのcache照会を省かない。data-dir移動前から保持された有効cacheも、その実pathを使う。
+通常open・起動復元・履歴・Smartの子openは同じsource決定を使い、UIでRAR headerやcache DBを
+読み直さない。Smartのクリックした行と帰路の意図は、物理先頭volumeへの解決とは別に保持する。
+この修正（§1.355）は§1.350の確認中に発見した公開済みv4.4.0の不具合を扱うもので、
+ページ／読書位置keyの変更や、reader解放待ち・publish再試行を加えない。
+
+変換ZIPの保存失敗は、操作・元書庫・一時ZIP・保存先・元OSエラーを既存loggerに記録する。
+Windowsのpublishは捕捉済みHRESULTからWin32 codeを保持し、UIには
+「変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。」
+と通知する。閲覧cacheと明示sibling／batchの共通処理であり、既存ZIPを先に削除しない。
+明示変換の同名ZIP拒否（no-clobber）は従来の専用メッセージを維持する。
+
 ソリッド・入れ子あり・暗号化 RAR/CBR と 7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し
 (`archive_cache\<hash>\book.zip`)、以降はそれを通常 ZIP として開く。このとき **`current_folder` は
 キャッシュ ZIP を指す**が、ユーザー視点 (address bar / BS の親 / 次回起動の復元) では
@@ -293,8 +309,10 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 (`open_archive_via_cache` が set、`effective_folder()` =
 `archive_source_override.or(current_folder)`)。
 
-直接閲覧 RAR/CBR は `current_folder` 自体が元アーカイブを指し、`archive_source_override` は
-使わない。現在開いているコンテナの判定には `is_open_as_container` を使い、静的な一覧分類用
+直接閲覧 RAR/CBR は `current_folder` がheaderで確定した元アーカイブ（分割なら先頭volume）を指す。
+typedな履歴／一覧遷移ではクリックした論理pathを`archive_source_override`へ保持する経路もあるが、
+読込・ページ・読書位置keyは実際のRAR backingのままにする。現在開いているコンテナの判定には
+`is_open_as_container` を使い、静的な一覧分類用
 `is_virtual_folder` は RAR を false のまま保つ。ページ DB / sidecar キーは常に
 `ZipImage.zip_path::{entry_name}` で作るため、直接閲覧は `{元 RAR}::entry`、従来の変換
 キャッシュ閲覧はリリース済みデータと互換の `{cache ZIP}::entry` になる。両経路のキー parity
