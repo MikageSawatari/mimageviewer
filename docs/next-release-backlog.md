@@ -1914,6 +1914,8 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
+**2026-10-09 再観測 (利用者):** 次の版の並行作業中、テストを回している間に「wgpu Device Class」のメモリ read エラーダイアログがときどき出ると利用者が報告 (スクリーンショットあり)。タイトルの実行体名は `mimageviewer-7b8981ee7979cd4e…` で、`ui_snapshot` ではなく **lib テストの実行体** (`cargo test -p mimageviewer --lib`。環境設定などの egui_kittest snapshot を含む)。同じ時間帯は複数の worktree で cargo test / build が並行しており、実装担当の `cargo test` は `test-full.ps1 -SuppressCrashDialogs` を通らないためダイアログが出る。同型の AV が lib 実行体でも起きることになるので、調査対象を lib 実行体にも広げる。利用者の判断待ち: 調査の時期 (推奨は次の版の取り込みが一段落した後、他の重い処理と重ねずに cdb で繰り返し実行して例外時の stack を取る)。
+
 **2026-09-08 再観測:** v3.7.0向け動画高さ設定追加後の全体gateで、
 `ui_snapshot-6bb93fba2c7d6bab.exe` が45件の途中で `0xc0000005 / STATUS_ACCESS_VIOLATION` により終了した。
 利用者が報告した「wgpu Device Class」のWindowsメモリreadエラーダイアログとexe名が一致する。
