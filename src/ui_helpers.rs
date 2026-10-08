@@ -1489,6 +1489,7 @@ pub fn format_badge_background(
         FormatBadgeKind::Zip => egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
         FormatBadgeKind::Pdf => egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
         FormatBadgeKind::Archive => egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
+        FormatBadgeKind::Audio => egui::Color32::from_rgba_unmultiplied(95, 75, 160, 200),
         FormatBadgeKind::Video => egui::Color32::from_rgba_unmultiplied(20, 135, 145, 200),
     }
 }

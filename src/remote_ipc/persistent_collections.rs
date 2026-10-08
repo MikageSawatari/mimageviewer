@@ -93,6 +93,8 @@ struct PersistentCollectionViewKey {
     spread: SpreadRequest,
     spread_page_gap_px: u32,
     include_epub: bool,
+    sidecar_enabled: (bool, bool),
+    audio_indicator: crate::settings::AudioThumbnailIndicator,
 }
 
 impl PersistentCollectionViewKey {
@@ -102,6 +104,11 @@ impl PersistentCollectionViewKey {
             spread,
             spread_page_gap_px: settings.spread_page_gap_px,
             include_epub: !settings.epub_file_handling_ignores_epub(),
+            sidecar_enabled: (
+                settings.skip_image_if_video_exists,
+                settings.video_thumb_use_sidecar_image,
+            ),
+            audio_indicator: settings.audio_thumbnail_indicator.normalized(),
         }
     }
 }
@@ -343,6 +350,21 @@ impl PersistentCollectionEngine {
             super::container::core_spread_mode(effective),
             &landscape,
         );
+        let mut source_paths = Vec::new();
+        for entry in exact.prepared.entries.iter() {
+            if !current() {
+                return Err(request_interrupted_error(cancellation, deadline));
+            }
+            let wire = wire_entry_with_epub_policy(entry, settings);
+            if let PersistentCollectionEntryState::Available { address, kind, .. } = wire.state {
+                if matches!(kind, RemoteEntryKind::Video | RemoteEntryKind::Audio) {
+                    source_paths.push((std::path::PathBuf::from(address.path), kind));
+                }
+            }
+        }
+        let thumbnail_sources =
+            super::RemoteThumbnailSources::for_paths_while(settings, &source_paths, &mut current)
+                .ok_or_else(|| request_interrupted_error(cancellation, deadline))?;
         const ENVELOPE_RESERVE: usize = 1024 * 1024;
         let retain_budget = MAX_RESPONSE_FRAME_BYTES.saturating_sub(ENVELOPE_RESERVE);
         let mut remote_eligible = Vec::new();
@@ -351,7 +373,20 @@ impl PersistentCollectionEngine {
             exact.prepared.entries.as_ref(),
             retain_budget,
             &mut current,
-            |entry| wire_entry_with_epub_policy(entry, settings),
+            |entry| {
+                let mut wire = wire_entry_with_epub_policy(entry, settings);
+                if let PersistentCollectionEntryState::Available {
+                    address,
+                    kind,
+                    thumbnail_address,
+                    ..
+                } = &mut wire.state
+                {
+                    *thumbnail_address = thumbnail_sources
+                        .source_address(std::path::Path::new(&address.path), *kind);
+                }
+                wire
+            },
             |prepared_index, wire| {
                 if let Some(kind) = wire_available_resolved_kind(wire) {
                     remote_eligible.push(RemoteEligibleEntry {
@@ -1503,6 +1538,7 @@ fn wire_snapshot(
         }
     }
     Some(PersistentCollectionSnapshotPayload {
+        thumbnail_presentation: super::thumbnail_presentation(settings),
         collection_id: exact.prepared.collection_id.to_string(),
         collection_revision: exact.prepared.collection_revision,
         view_token: exact_view_token.to_owned(),
@@ -1737,6 +1773,11 @@ fn exact_view_token_prefix(
     digest.update(serde_json::to_vec(&spread.mode).unwrap_or_default());
     digest.update(serde_json::to_vec(&spread.direction).unwrap_or_default());
     digest.update([u8::from(spread.force_single)]);
+    digest.update([
+        u8::from(settings.skip_image_if_video_exists),
+        u8::from(settings.video_thumb_use_sidecar_image),
+    ]);
+    digest.update(serde_json::to_vec(&super::thumbnail_presentation(settings)).unwrap_or_default());
     digest
 }
 
@@ -2853,6 +2894,115 @@ mod tests {
             prepared.collection_id,
             prepared.collection_revision
         ));
+        runtime.shutdown_and_join();
+    }
+
+    #[test]
+    fn persistent_audio_sidecar_is_in_snapshot_replacement_and_token_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        let image = temp.path().join("song.jpg");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+            temp.path().join("collection.db"),
+        )
+        .unwrap();
+        let engine =
+            PersistentCollectionEngine::new(CollectionRemoteProducerControl::new(runtime.client()));
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match runtime.try_recv_event() {
+                Some(crate::collection_store::CollectionRuntimeEvent::Ready(_)) => break,
+                Some(event) => panic!("collection startup failed: {event:?}"),
+                None => assert!(
+                    Instant::now() < startup_deadline,
+                    "collection startup timed out"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let created = runtime
+            .client()
+            .create_collection("audio".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let registration = crate::collection_store::CollectionRegistration::from_trusted_path(
+            &audio,
+            CollectionResolvedKind::Audio,
+        )
+        .unwrap();
+        let added = runtime
+            .client()
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![registration],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let lease = engine.producer.begin_request().unwrap();
+        let (cancellation, _wake) = RemoteOperationCancellation::for_test();
+        let settings = Settings::default();
+        let spread = SpreadRequest {
+            mode: Some(RemoteSpreadMode::Single),
+            direction: Some(RemoteReadingDirection::Ltr),
+            force_single: false,
+        };
+        let deadline = Instant::now() + EXACT_REQUEST_BUDGET;
+        let exact = exact_prepared(
+            &lease,
+            &cancellation,
+            added.snapshot.collection_id(),
+            &settings,
+            deadline,
+            None,
+        )
+        .unwrap();
+        let facts = engine
+            .view_facts(&exact, &settings, spread, &lease, &cancellation, deadline)
+            .unwrap();
+        let mut current = || true;
+        let snapshot =
+            wire_snapshot(&exact, &settings, &facts, 100, &facts.token, &mut current).unwrap();
+        assert!(
+            matches!(&snapshot.entries[0].state, PersistentCollectionEntryState::Available { kind: RemoteEntryKind::Audio, thumbnail_address: Some(source), .. } if source.path.ends_with("song.jpg"))
+        );
+        let replacement =
+            wire_snapshot(&exact, &settings, &facts, 100, &facts.token, &mut current).unwrap();
+        assert_eq!(snapshot, replacement);
+        let mut off = settings.clone();
+        off.video_thumb_use_sidecar_image = false;
+        let without = engine
+            .view_facts(&exact, &off, spread, &lease, &cancellation, deadline)
+            .unwrap();
+        assert_ne!(facts.token, without.token);
+        assert!(matches!(
+            &without.entries[0].state,
+            PersistentCollectionEntryState::Available {
+                thumbnail_address: None,
+                ..
+            }
+        ));
+        assert_ne!(
+            PersistentCollectionViewKey::new(
+                exact.prepared.collection_id,
+                exact.prepared.collection_revision,
+                &settings,
+                spread
+            ),
+            PersistentCollectionViewKey::new(
+                exact.prepared.collection_id,
+                exact.prepared.collection_revision,
+                &off,
+                spread
+            )
+        );
+        drop(lease);
         runtime.shutdown_and_join();
     }
 

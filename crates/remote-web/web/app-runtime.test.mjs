@@ -159,6 +159,8 @@ const {
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
+  bindThumbnail,
+  audioArtRuntimeForTest,
   createPinLoginInput,
   filterRemoteTags,
   favoriteSearchEmptyMessage,
@@ -2845,8 +2847,8 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
 
   const preview = tile.children[0];
   assert.equal(preview.children.some((child) => child.tagName === "SVG"), true);
-  assert.equal(preview.children.some((child) => child.tagName === "IMG"), false);
-  assert.equal(tile._thumbnailBinding, undefined);
+  assert.equal(preview.children.some((child) => child.tagName === "IMG"), true);
+  assert.ok(tile._thumbnailBinding);
 
   tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
 
@@ -5366,3 +5368,315 @@ for (const status of [409, 428]) {
     });
   }
 }
+
+for (const indicator of ["music_note_icon", "bottom_left_badge", "hidden"]) {
+  test(`audio art indicator tile snapshot ${indicator}`, () => {
+    const entry = { kind: "audio", name: "song.mp3", path: testPath("Music/song.mp3") };
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}}, { entries:[entry], page_groups:[], thumbnail_presentation:{audio_indicator:indicator} }, false);
+    const tile = createGridTile(entry, 0, new Map(), null, 180, () => {});
+    const preview = tile.children[0];
+    assert.equal(preview.children.filter((node) => node.tagName === "IMG").length, 1);
+    assert.equal(preview.children.filter((node) => node.classList.contains("audio-art-fallback")).length, 1);
+    const markers = preview.children.filter((node) => node.classList.contains("audio-art-indicator") || String(node.className ?? "").includes("audio-art-indicator"));
+    assert.equal(markers.length, indicator === "hidden" ? 0 : 1);
+    if (indicator === "bottom_left_badge") assert.equal(markers[0].textContent, "音声");
+    assert.equal(audioArtRuntimeForTest().indicator, indicator);
+  });
+}
+
+test("audio NoArt binding settles and remount avoids HTTP until explicit payload refresh", async () => {
+  const entry = {kind:"audio",name:"song.mp3",path:testPath("Music/song.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const payload = {entries:[entry],page_groups:[]};
+  const oldFetch = globalThis.fetch;
+  let requests = 0;
+  const urls = [];
+  globalThis.fetch = async (url) => { requests += 1; urls.push(String(url)); return new Response(JSON.stringify({error:"no_thumbnail"}), {status:422,headers:{"Content-Type":"application/json"}}); };
+  try {
+    applyContainerData(address,payload,false);
+    const owner = audioArtRuntimeForTest().owner;
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(owner.terminal(entry), "NoArt");
+    assert.equal(image._thumbnailSettled,true);
+    const remounted = new FakeElement("img");
+    bindThumbnail(remounted,{...entry},null,180);
+    assert.equal(remounted._thumbnailSettled,true);
+    assert.equal(requests,1);
+    applyContainerData(address,payload,false);
+    const refreshed = audioArtRuntimeForTest().owner;
+    assert.notEqual(refreshed.artEpoch,owner.artEpoch);
+    const newImage = new FakeElement("img");
+    bindThumbnail(newImage,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(requests,2);
+    assert.notEqual(new URL(urls[0],testLocation.origin).searchParams.get("artEpoch"),new URL(urls[1],testLocation.origin).searchParams.get("artEpoch"));
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+
+test("old audio response cannot settle a refreshed listing", async () => {
+  const entry = {kind:"audio",name:"old.mp3",path:testPath("Music/old.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const payload = {entries:[entry],page_groups:[]};
+  const oldFetch = globalThis.fetch;
+  const pending = deferred();
+  globalThis.fetch = () => pending.promise;
+  try {
+    applyContainerData(address,payload,false);
+    const oldOwner = audioArtRuntimeForTest().owner;
+    bindThumbnail(new FakeElement("img"),entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    applyContainerData(address,payload,false);
+    const nextOwner = audioArtRuntimeForTest().owner;
+    pending.resolve(new Response(JSON.stringify({error:"no_thumbnail"}),{status:422}));
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(nextOwner.terminal(entry),undefined);
+    assert.equal(oldOwner.terminal(entry),undefined);
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+test("received audio NoArt persists when its old DOM binding is evicted", async () => {
+  const entry = {kind:"audio",name:"evicted.mp3",path:testPath("Music/evicted.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const oldFetch = globalThis.fetch;
+  const pending = deferred();
+  let requests = 0;
+  globalThis.fetch = () => { requests += 1; return pending.promise; };
+  try {
+    applyContainerData(address,{entries:[entry],page_groups:[]},false);
+    const owner = audioArtRuntimeForTest().owner;
+    const evicted = new FakeElement("img");
+    bindThumbnail(evicted,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    evicted._thumbnailGeneration += 1;
+    pending.resolve(new Response(JSON.stringify({error:"no_thumbnail"}),{status:422}));
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(owner.terminal(entry),"NoArt");
+    const remount = new FakeElement("img");
+    bindThumbnail(remount,entry,null,180);
+    assert.equal(remount._thumbnailSettled,true);
+    assert.equal(requests,1);
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+for (const supersession of ["listing", "session"]) {
+  test(`old audio success cannot paint after ${supersession} replacement`, async () => {
+    const entry = {kind:"audio",name:"stale.mp3",path:testPath("Music/stale.mp3")};
+    const address = {path:testPath("Music"),subresource:{kind:"file"}};
+    const payload = {entries:[entry],page_groups:[]};
+    const oldFetch = globalThis.fetch;
+    const oldCreate = URL.createObjectURL;
+    const pending = deferred();
+    let objectUrls = 0;
+    globalThis.fetch = () => pending.promise;
+    URL.createObjectURL = () => { objectUrls += 1; return "blob:old-owner"; };
+    try {
+      applyContainerData(address,payload,false);
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await new Promise((resolve) => setTimeout(resolve,5));
+      if (supersession === "session") applyRemoteSessionId("audio-new-session", () => {});
+      else applyContainerData(address,payload,false);
+      pending.resolve(new Response(new Uint8Array([1,2,3]),{status:200}));
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(objectUrls,0,"obsolete audio owner cannot allocate or adopt an object URL");
+      assert.equal(image.src,undefined);
+      assert.equal(image.classList.contains("thumb-ready"),false);
+    } finally {
+      applyRemoteSessionId(TEST_SESSION_ID, () => {});
+      globalThis.fetch = oldFetch;
+      URL.createObjectURL = oldCreate;
+    }
+  });
+}
+
+test("normal audio NoArt does not emit error telemetry but generation failure does", async () => {
+  const entry = {kind:"audio",name:"empty.mp3",path:testPath("Music/empty.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const oldFetch = globalThis.fetch;
+  const errors = [];
+  setRuntimeTestErrorObserver((error) => errors.push(error));
+  try {
+    for (const error of ["no_thumbnail", "miv_thumbnail_error"]) {
+      applyContainerData(address,{entries:[entry],page_groups:[]},false);
+      globalThis.fetch = async () => new Response(JSON.stringify({error}),{status:422});
+      bindThumbnail(new FakeElement("img"),entry,null,180);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(audioArtRuntimeForTest().owner.terminal(entry),error === "no_thumbnail" ? "NoArt" : "Failed");
+      assert.equal(errors.length,error === "no_thumbnail" ? 0 : 1);
+    }
+    assert.equal(errors[0].category,"fetch_non_2xx");
+  } finally {
+    setRuntimeTestErrorObserver(null);
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("session admission renews retained audio listing so remounted tiles can paint", async () => {
+  const entry = {kind:"audio",name:"session.mp3",path:testPath("Music/session.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const oldFetch = globalThis.fetch;
+  const oldCreate = URL.createObjectURL;
+  const pending = deferred();
+  let requests = 0;
+  globalThis.fetch = () => ++requests === 1 ? pending.promise : Promise.resolve(new Response(new Uint8Array([1]),{status:200}));
+  URL.createObjectURL = () => "blob:current-session";
+  try {
+    applyContainerData(address,{entries:[entry],page_groups:[]},false);
+    const oldOwner = audioArtRuntimeForTest().owner;
+    const oldImage = new FakeElement("img");
+    bindThumbnail(oldImage,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    applyRemoteSessionId("audio-renewed-session", () => {});
+    const owner = audioArtRuntimeForTest().owner;
+    assert(owner,"retained ordinary listing gets a current owner");
+    assert.notEqual(owner,oldOwner);
+    assert.notEqual(owner.artEpoch,oldOwner.artEpoch);
+    assert.equal(owner.sessionId,"audio-renewed-session");
+    const currentImage = new FakeElement("img");
+    bindThumbnail(currentImage,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(currentImage.classList.contains("thumb-ready"),true);
+    pending.resolve(new Response(JSON.stringify({error:"no_thumbnail"}),{status:422}));
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(owner.terminal(entry),undefined);
+    assert.equal(oldImage.classList.contains("thumb-ready"),false);
+  } finally {
+    pending.resolve(new Response("{}",{status:422}));
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    URL.createObjectURL = oldCreate;
+    globalThis.fetch = oldFetch;
+  }
+});
+
+for (const extension of ["mp3", "flac"]) {
+  test(`persistent ${extension} keeps logical audio address while forwarding sidecar`, () => {
+    const audio = {path:testPath(`Music/song.${extension}`),subresource:{kind:"file"}};
+    const source = {path:testPath("Music/song.jpg"),subresource:{kind:"file"}};
+    const entry = normalizePersistentCollectionEntry({entry_id:"entry-a",source_identity:"physical-a",name:`song.${extension}`,state:{state:"available",kind:"audio",address:audio,thumbnail_address:source}});
+    assert.equal(entry.kind,"audio");
+    assert.deepEqual(entry.address,audio);
+    assert.deepEqual(entry.thumbnail_address,source);
+    assert.deepEqual(thumbnailRequestQueryForEntry(entry,{w:180,artEpoch:"new-list"}),{path:audio.path,w:180,artEpoch:"new-list",thumbnail_source_path:source.path});
+    assert.equal(persistentCollectionIdentityKey(entry.persistent_identity),"saved:entry-a:physical-a");
+  });
+}
+
+for (const body of [JSON.stringify({error:"miv_thumbnail_error"}), "malformed JSON"]) {
+  test(`audio 422 ${body} settles Failed outside DOM and avoids remount HTTP`, async () => {
+    const entry = {kind:"audio",name:"failed.mp3",path:testPath("Music/failed.mp3")};
+    const oldFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async () => {requests += 1; return new Response(body,{status:422});};
+    try {
+      applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(audioArtRuntimeForTest().owner.terminal(entry),"Failed");
+      assert.equal(image._thumbnailSettled,true);
+      const remount = new FakeElement("img");
+      bindThumbnail(remount,entry,null,180);
+      assert.equal(remount._thumbnailSettled,true);
+      assert.equal(requests,1);
+    } finally {globalThis.fetch = oldFetch;}
+  });
+}
+
+test("intentional audio binding abort does not publish NoArt or Failed", async () => {
+  const entry = {kind:"audio",name:"aborted.mp3",path:testPath("Music/aborted.mp3")};
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = (_url,options) => new Promise((_resolve,reject) => options.signal.addEventListener("abort", () => reject(new DOMException("canceled","AbortError"))));
+  try {
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    image._thumbnailController.abort();
+    await new Promise((resolve) => setTimeout(resolve,5));
+    assert.equal(audioArtRuntimeForTest().owner.terminal(entry),undefined);
+  } finally {globalThis.fetch = oldFetch;}
+});
+
+for (const cancellation of ["eviction", "recycled binding", "aborted controller"]) {
+  test(`audio decode ${cancellation} does not persist a terminal failure`, async () => {
+    const entry = {kind:"audio",name:"decoding.mp3",path:testPath("Music/decoding.mp3")};
+    const replacement = {kind:"audio",name:"next.mp3",path:testPath("Music/next.mp3")};
+    const oldFetch = globalThis.fetch;
+    const pending = deferred();
+    const decodeStarted = deferred();
+    let requests = 0;
+    let decodes = 0;
+    globalThis.fetch = async () => {
+      requests += 1;
+      return new Response(new Uint8Array([1,2,3]),{status:200});
+    };
+    FakeElement.decodeHook = () => {
+      if (++decodes !== 1) return Promise.resolve();
+      decodeStarted.resolve();
+      return pending.promise;
+    };
+    const errors = [];
+    setRuntimeTestErrorObserver((error) => errors.push(error));
+    try {
+      applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},
+        {entries:[entry,replacement],page_groups:[]},false);
+      const owner = audioArtRuntimeForTest().owner;
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await decodeStarted.promise;
+      if (cancellation === "recycled binding") {
+        bindThumbnail(image,replacement,null,180);
+      } else {
+        image._thumbnailController.abort();
+        if (cancellation === "eviction") {
+          image._thumbnailGeneration += 1;
+          image.removeAttribute("src");
+        }
+      }
+      pending.reject(new DOMException("source removed while decoding","EncodingError"));
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(owner.terminal(entry),undefined);
+      assert.equal(owner.terminal(replacement),undefined);
+      assert.equal(errors.length,0,"intentional cancellation is not a decode failure");
+      if (cancellation === "recycled binding") {
+        assert.equal(image.classList.contains("thumb-ready"),true);
+        assert.equal(image.classList.contains("thumb-missing"),false);
+      } else {
+        assert.equal(image._thumbnailSettled,false,"canceled binding remains eligible for revisit");
+      }
+      const revisit = new FakeElement("img");
+      bindThumbnail(revisit,entry,null,240);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(revisit.classList.contains("thumb-ready"),true);
+      assert.equal(requests,cancellation === "recycled binding" ? 3 : 2);
+    } finally {
+      FakeElement.decodeHook = null;
+      setRuntimeTestErrorObserver(null);
+      globalThis.fetch = oldFetch;
+    }
+  });
+}
+
+test("current audio decode failure remains terminal for its listing", async () => {
+  const entry = {kind:"audio",name:"corrupt.mp3",path:testPath("Music/corrupt.mp3")};
+  const oldFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {requests += 1; return new Response(new Uint8Array([1]),{status:200});};
+  FakeElement.decodeHook = async () => {throw new DOMException("corrupt image","EncodingError");};
+  try {
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(audioArtRuntimeForTest().owner.terminal(entry),"Failed");
+    assert.equal(image._thumbnailSettled,true);
+    bindThumbnail(new FakeElement("img"),entry,null,180);
+    assert.equal(requests,1);
+  } finally {
+    FakeElement.decodeHook = null;
+    globalThis.fetch = oldFetch;
+  }
+});

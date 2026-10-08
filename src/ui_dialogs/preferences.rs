@@ -110,7 +110,12 @@ pub fn draw_video_thumbnail_indicator_settings_snapshot_fixture(ui: &mut egui::U
         video_thumbnail_indicator: crate::settings::VideoThumbnailIndicator::BottomLeftBadge,
         ..Settings::default()
     };
+    pages::draw_media_sidecar_thumbnail_settings(ui, &mut settings);
+    ui.add_space(8.0);
     pages::draw_video_thumbnail_indicator_settings(ui, &mut settings);
+    ui.add_space(8.0);
+    pages::draw_audio_thumbnail_indicator_settings(ui, &mut settings);
+    pages::draw_media_duration_settings(ui, &mut settings);
 }
 
 #[doc(hidden)]
@@ -5723,6 +5728,46 @@ mod tests {
             PreferencesPage::SusiePlugins
         );
         assert!(PreferencesPage::ALL.contains(&PreferencesPage::RawDevelop));
+    }
+
+    #[test]
+    fn shared_sidecar_checkbox_lives_on_thumbnail_page_and_edits_one_setting() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.selected = PreferencesPage::Thumbnail;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 2400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        let label = "同名の画像をサムネイルに使う（動画・音声）";
+        assert!(
+            harness.query_by_label(label).is_some(),
+            "shared setting must be on the Thumbnail page"
+        );
+        assert_eq!(preference_category(PreferencesPage::Thumbnail).0, "表示");
+        harness.get_by_label(label).click();
+        harness.run();
+        assert!(!harness.state().settings.video_thumb_use_sidecar_image);
+        assert!(harness.state().settings.skip_image_if_video_exists);
+        harness.state_mut().selected = PreferencesPage::Video;
+        harness.run();
+        assert!(
+            harness.query_by_label(label).is_none(),
+            "shared setting must have one UI location"
+        );
+        harness.state_mut().selected = PreferencesPage::Thumbnail;
+        harness.run();
+        assert!(!harness.state().settings.video_thumb_use_sidecar_image);
+        harness.get_by_label(label).click();
+        harness.run();
+        assert!(harness.state().settings.video_thumb_use_sidecar_image);
+        assert!(harness.state().settings.skip_image_if_video_exists);
     }
 
     #[test]

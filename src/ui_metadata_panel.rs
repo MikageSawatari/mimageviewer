@@ -947,7 +947,8 @@ fn load_similar_thumbnail(job: SimilarThumbJob) -> Option<egui::ColorImage> {
     if job.cancel.load(Ordering::Relaxed) {
         return None;
     }
-    rx.try_iter().find_map(|message| message.image)
+    rx.try_iter()
+        .find_map(|message| message.into_pixels().map(|pixels| pixels.image))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

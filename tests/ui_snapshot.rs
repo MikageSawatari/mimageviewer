@@ -1560,6 +1560,18 @@ fn preferences_video_thumbnail_indicator_dark() {
 }
 
 #[test]
+fn preferences_media_thumbnail_sources_light() {
+    snapshot_with_theme(
+        "preferences_media_thumbnail_sources_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_video_thumbnail_indicator_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
 fn metadata_panel_information_tab_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_information_tab_dark",
@@ -2845,4 +2857,26 @@ fn content_restore_prompt_light() {
         });
     harness.run();
     harness.snapshot("content_restore_prompt_light");
+}
+
+#[test]
+fn audio_thumbnail_indicator_modes_dark() {
+    snapshot_with_theme_at_size(
+        "audio_thumbnail_indicator_modes_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 430.0),
+        None,
+        mimageviewer::draw_audio_thumbnail_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
+fn audio_thumbnail_indicator_modes_light() {
+    snapshot_with_theme_at_size(
+        "audio_thumbnail_indicator_modes_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 430.0),
+        None,
+        mimageviewer::draw_audio_thumbnail_indicator_snapshot_fixture,
+    );
 }

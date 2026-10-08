@@ -4639,6 +4639,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
+                crate::settings::AudioThumbnailIndicator::default(),
                 true,
                 None,
                 None,
@@ -4657,6 +4658,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
+                crate::settings::AudioThumbnailIndicator::default(),
                 is_cut,
                 None,
             );
@@ -16703,7 +16705,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
             _ => None,
         };
-        let failed = matches!(self.thumbnails.get(idx), Some(ThumbnailState::Failed));
+        let failed = matches!(
+            self.thumbnails.get(idx),
+            Some(ThumbnailState::NoArt | ThumbnailState::Failed)
+        );
+        let is_audio = matches!(self.items.get(idx), Some(GridItem::Audio(_)));
+        let audio_parts = self
+            .items
+            .get(idx)
+            .zip(self.thumbnails.get(idx))
+            .map(|(item, thumb)| {
+                crate::app::audio_thumbnail_indicator_parts(
+                    item,
+                    thumb,
+                    self.settings.audio_thumbnail_indicator,
+                )
+            });
         let image_size = texture
             .as_ref()
             .map(|tex| {
@@ -16763,6 +16780,28 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             img_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
+                        );
+                        if is_audio && let Some(parts) = audio_parts {
+                            let marker_rect = if parts.music_icon {
+                                egui::Rect::from_center_size(
+                                    img_rect.center(),
+                                    egui::vec2(48.0, 48.0).min(img_rect.size()),
+                                )
+                            } else {
+                                img_rect
+                            };
+                            crate::app::paint_audio_thumbnail_indicator(
+                                ui.painter(),
+                                marker_rect,
+                                ui.visuals().dark_mode,
+                                parts,
+                            );
+                        }
+                    } else if is_audio {
+                        crate::ui_helpers::draw_music_icon(
+                            ui.painter(),
+                            rect,
+                            ui.visuals().dark_mode,
                         );
                     } else {
                         ui.centered_and_justified(|ui| {
@@ -19022,6 +19061,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     bookmark_time.as_deref(),
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
+                                    self.settings.audio_thumbnail_indicator,
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
@@ -19067,6 +19107,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         bookmark_time.as_deref(),
                                         self.items_are_drive_list,
                                         self.settings.video_thumbnail_indicator,
+                                    self.settings.audio_thumbnail_indicator,
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
@@ -19115,6 +19156,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     adjusted_tex,
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
+                                    self.settings.audio_thumbnail_indicator,
                                     is_cut,
                                     book_resume_meter,
                                 );

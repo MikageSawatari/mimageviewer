@@ -1,3 +1,4 @@
+import { AudioArtListState, audioArtFailure, normalizedAudioIndicator } from "./audio-art-state.mjs";
 import { RawPrefetchWindowPublisher, rawPrefetchWindow } from "./raw-prefetch-window.mjs";
 import {
   CommandName,
@@ -1477,6 +1478,8 @@ const state = {
   remoteSessionId: "",
   remoteSessionCorrelation: "",
   remoteSessionCacheEpoch: "",
+  audioArtListState: null,
+  audioThumbnailIndicator: "music_note_icon",
   remoteSessionUserActive: false,
   remoteSessionTimer: 0,
   viewerItemState: null,
@@ -1894,6 +1897,8 @@ export function applyRemoteSessionId(
 ) {
   const next = String(sessionId ?? "");
   if (state.remoteSessionId === next) return;
+  const retainedAudioListing = state.audioArtListState;
+  const sessionScopedListing = state.collection?.kind === "saved_collection" || Boolean(savedCollectionRootContext());
   // Identity is the admission boundary. Publish its revocation before invoking an optional
   // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
@@ -1910,6 +1915,9 @@ export function applyRemoteSessionId(
   // session_id 自体は capability なので URL へ出さない。これに従属する非 secret nonce で
   // header を付けられない <img> などの HTTP cache だけを分離する。
   state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
+  state.audioArtListState = next && retainedAudioListing && !sessionScopedListing
+    ? new AudioArtListState(state.entries, retainedAudioListing.addressKey, newRemoteSessionCacheEpoch(), next)
+    : null;
   const previousHistoryState = globalThis.history?.state;
   if (previousHistoryState && typeof globalThis.history?.replaceState === "function") {
     globalThis.history.replaceState(
@@ -1939,6 +1947,21 @@ export function applyRemoteSessionId(
     // acquisition, making acquisition the complete home refresh signal. Per-page display DBs
     // that alter returned pixels remain covered separately by remoteStateGeneration.
     refreshHomeData();
+    if (state.screenContext === "grid" && state.virtualGrid) {
+      if (sessionScopedListing) {
+        // Collection identities and view tokens belong to the retired session. Reuse
+        // the route loader instead of issuing requests against its retained payload.
+        queueMicrotask(() => {
+          if (state.remoteSessionId === next && state.screenContext === "grid") {
+            dispatchRoute().catch(renderError);
+          }
+        });
+      } else if (state.audioArtListState?.addresses.size) {
+        // Recreate existing bindings with the admitted owner; the grid path preserves
+        // viewport/selection and cancels pending requests from the retired session.
+        renderFolder();
+      }
+    }
   }
 }
 
@@ -3837,6 +3860,7 @@ export function reportRetainedVideoProgressForTest() {
 
 function renderHome(tab = "places") {
   cleanupScreen();
+  state.audioArtListState = null;
   state.screenContext = "home";
   state.homeTab = ["favorites", "smart", "places", "search", "tags", "collections"].includes(tab)
     ? tab
@@ -4348,6 +4372,7 @@ function applyCollectionData(route, data, forceSinglePage, options = {}) {
       ? Number(data.thumb_aspect_height_ratio)
       : 1;
   state.entries = data.entries ?? [];
+  adoptAudioArtListing(data);
   state.images = state.entries.filter((entry) => entry.kind === "image");
   applyCollectionSpreadData(data, forceSinglePage);
   state.gridIndex = options.preserveGridIndex
@@ -4388,6 +4413,7 @@ async function showFavoriteSearch(route) {
       ? Number(listing.thumb_aspect_height_ratio)
       : 1;
   state.entries = entries;
+  adoptAudioArtListing(listing);
   // 今のコンテナ索引は画像を返さないが、その前提をここにもう 1 つ置かない。集約ビューと
   // 同じ導出にしておけば、返るものが変わってもセルの開き方が食い違わない。
   state.images = state.entries.filter((entry) => entry.kind === "image");
@@ -4427,6 +4453,7 @@ async function showTagItems(route) {
       ? Number(listing.thumb_aspect_height_ratio)
       : 1;
   state.entries = entries;
+  adoptAudioArtListing(listing);
   state.images = state.entries.filter((entry) => entry.kind === "image");
   applyCollectionSpreadData(listing, false);
   state.gridIndex = 0;
@@ -4690,6 +4717,7 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     "項目";
   state.folderPath = effectiveAddress.path;
   state.entries = nextEntries;
+  adoptAudioArtListing(data);
   state.images = nextImages;
   state.thumbAspectHeightRatio =
     Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
@@ -5224,6 +5252,7 @@ function applyPersistentCollectionSnapshot(data, forceSinglePage, options = {}) 
   state.folderPath = "";
   state.thumbAspectHeightRatio = 1;
   state.entries = entries;
+  adoptAudioArtListing(data);
   state.images = entries.filter((entry) => entry.kind === "image");
   state.spreadMode = data.configured_spread_mode ?? SpreadMode.SINGLE;
   state.effectiveSpreadMode = data.effective_spread_mode ?? SpreadMode.SINGLE;
@@ -6691,6 +6720,7 @@ export async function loadFolder(
       entry.kind === "pdf" ||
       entry.kind === "archive"
   );
+  adoptAudioArtListing(data);
   state.images = state.entries.filter((entry) => entry.kind === "image");
   setSinglePageGroups();
   state.gridIndex = sameFolder
@@ -7102,12 +7132,21 @@ export function createGridTile(
     });
   } else {
     if (entry.kind === "audio") {
-      preview.append(createAudioThumbnailIcon());
+      const fallback = createAudioThumbnailIcon();
+      fallback.classList.add("audio-art-fallback");
+      preview.append(fallback, image);
+      if (state.audioThumbnailIndicator === "music_note_icon") {
+        const marker = createAudioThumbnailIcon();
+        marker.classList.add("audio-art-indicator");
+        preview.append(marker);
+      } else if (state.audioThumbnailIndicator === "bottom_left_badge") {
+        preview.append(textElement("span", "音声", "type-badge audio-art-indicator"));
+      }
     } else {
       preview.append(textElement("span", isEpubBook ? "▤" : "◇", "file-glyph"));
       preview.append(image);
     }
-    if (entry.kind !== "image") {
+    if (entry.kind !== "image" && entry.kind !== "audio") {
       preview.append(
         textElement("span", isEpubBook ? "epub" : entryTypeLabel(entry.kind), "type-badge")
       );
@@ -7205,9 +7244,8 @@ export function createGridTile(
   }
   if (detail) label.title = entry.name + " — " + detail;
   tile.append(preview, label);
-  // Audio and unopened convertible archives have no thumbnail source. Keeping
-  // them out of the binding avoids guaranteed-to-fail /api/thumb requests.
-  if (!entry.unavailable && entry.kind !== "audio" && entry.kind !== "archive") {
+  // Audio has the same image binding, while terminal results survive DOM eviction.
+  if (!entry.unavailable && entry.kind !== "archive") {
     tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
   }
   return tile;
@@ -8944,7 +8982,27 @@ function rememberMediaImageInfo(request, info) {
   }
 }
 
-function bindThumbnail(image, entry, tracker, cellWidth) {
+export function audioArtRuntimeForTest() {
+  return RUNTIME_TEST_MODE ? { owner: state.audioArtListState, indicator: state.audioThumbnailIndicator } : null;
+}
+
+export function adoptAudioArtListing(data) {
+  state.audioThumbnailIndicator = normalizedAudioIndicator(data.thumbnail_presentation?.audio_indicator);
+  state.audioArtListState = new AudioArtListState(
+    state.entries, (entry) => addressIdentity(entryAddress(entry)).replace(/\\/g, "/").toLowerCase(), newRemoteSessionCacheEpoch(), state.remoteSessionId,
+  );
+}
+
+function audioArtOwnerIsCurrent(owner) {
+  return Boolean(owner && owner === state.audioArtListState && owner.sessionId === state.remoteSessionId);
+}
+
+function rememberAudioArtTerminal(owner, entry, result) {
+  if (!result || !audioArtOwnerIsCurrent(owner)) return;
+  owner.settle(entry, result);
+}
+
+export function bindThumbnail(image, entry, tracker, cellWidth) {
   disposeThumbnailBinding(image);
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
   image._thumbnailGeneration = generation;
@@ -8954,6 +9012,12 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   image.parentElement?.classList.remove("thumb-loaded");
   image.parentElement?.removeAttribute("data-retry-exhausted");
   image.parentElement?.removeAttribute("data-unavailable");
+  if (entry.kind === "audio" && state.audioArtListState?.terminal(entry)) {
+    image._thumbnailSettled = true;
+    image.classList.add("thumb-missing");
+    tracker?.settled(thumbnailBindingKey(entry));
+    return;
+  }
   const controller = new AbortController();
   image._thumbnailController = controller;
   const targetPx = clamp(
@@ -9033,17 +9097,22 @@ function clearThumbnailServiceNotice() {
 
 async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
   const bindingKey = thumbnailBindingKey(entry);
+  const audioOwner = entry.kind === "audio" ? state.audioArtListState : null;
+  const responseIsCurrent = () => !signal.aborted && thumbnailResponseIsCurrent(image, generation, bindingKey) &&
+    (entry.kind !== "audio" || audioArtOwnerIsCurrent(audioOwner));
   const url = apiUrl(
     "/api/thumb",
     thumbnailRequestQueryForEntry(entry, {
       w: targetPx,
       epoch: state.remoteSessionCacheEpoch,
+      ...(audioOwner ? { artEpoch: audioOwner.artEpoch } : {}),
     })
   );
   try {
     const result = await fetchThumbnailWithRetry(url, signal);
     const { response, detail, exhausted } = result;
     if (!response.ok) {
+      rememberAudioArtTerminal(audioOwner, entry, audioArtFailure(response.status, detail.error));
       if (
         response.status === 503 &&
         ["miv_not_running", "protocol_version_mismatch"].includes(detail.error)
@@ -9052,7 +9121,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
           detail.message || "mIV 本体が起動していません。"
         );
       }
-      if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
+      if (!responseIsCurrent()) return;
       if (response.status === 423) {
         image.parentElement?.setAttribute("data-unavailable", "パスワード保護");
       }
@@ -9066,8 +9135,9 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
       return;
     }
     const blob = await response.blob();
+    if (!responseIsCurrent()) return;
     const objectUrl = URL.createObjectURL(blob);
-    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) {
+    if (!responseIsCurrent()) {
       URL.revokeObjectURL(objectUrl);
       return;
     }
@@ -9076,7 +9146,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     image.src = objectUrl;
     await image.decode();
     await nextFrame();
-    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) {
+    if (!responseIsCurrent()) {
       URL.revokeObjectURL(objectUrl);
       if (image._thumbnailObjectUrl === objectUrl) image._thumbnailObjectUrl = null;
       return;
@@ -9089,8 +9159,10 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     clearThumbnailServiceNotice();
     tracker?.settled(bindingKey);
   } catch (error) {
-    if (error?.name === "AbortError") return;
-    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
+    // Removing src while image.decode() is pending rejects with EncodingError,
+    // not AbortError. Only the still-current binding owns a terminal failure.
+    if (error?.name === "AbortError" || !responseIsCurrent()) return;
+    rememberAudioArtTerminal(audioOwner, entry, "Failed");
     image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
     image.classList.toggle("thumb-retry-exhausted", Boolean(error?.retryExhausted));
@@ -9104,7 +9176,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     });
   } finally {
     if (
-      thumbnailResponseIsCurrent(image, generation, bindingKey) &&
+      responseIsCurrent() &&
       image._thumbnailController?.signal === signal
     ) {
       image._thumbnailController = null;
@@ -9125,6 +9197,8 @@ async function fetchThumbnailWithRetry(url, signal) {
             credentials: "same-origin",
             cache: "force-cache",
             signal,
+            suppressErrorTelemetryFor: (response, detail) =>
+              response.status === 422 && detail.error === "no_thumbnail",
           }),
         signal
       );

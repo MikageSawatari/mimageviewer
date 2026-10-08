@@ -4,7 +4,7 @@ use eframe::egui;
 
 use super::{draw_rotated_image, drive_display_label, is_miv_upscaled_derivative};
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::settings::VideoThumbnailIndicator;
+use crate::settings::{AudioThumbnailIndicator, VideoThumbnailIndicator};
 use crate::thumb_overlay_layout::{
     BottomContainerInput, BottomContainerKind, EditBadgeFlags, FormatBadgeKind,
     ThumbnailOverlayLayout, ThumbnailOverlayLayoutInput, layout_thumbnail_overlays,
@@ -78,7 +78,7 @@ fn draw_thumb(
                 egui::Color32::from_gray(140),
             );
         }
-        ThumbnailState::Failed => {
+        ThumbnailState::NoArt | ThumbnailState::Failed => {
             let bg = if dark {
                 egui::Color32::from_rgb(80, 30, 30)
             } else {
@@ -141,7 +141,7 @@ pub(crate) struct VideoThumbnailIndicatorParts {
 }
 
 /// Resolve the two mutually exclusive video-thumbnail indicator surfaces from one setting.
-/// Audio is deliberately outside this contract: its music icon is the cell content itself.
+/// Audio uses its own setting and loaded-image-aware indicator contract.
 pub(crate) fn video_thumbnail_indicator_parts(
     item: &GridItem,
     indicator: VideoThumbnailIndicator,
@@ -169,11 +169,75 @@ pub(crate) fn video_thumbnail_indicator_parts(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AudioThumbnailIndicatorParts {
+    pub music_icon: bool,
+    pub bottom_left_badge: bool,
+}
+
+/// Settings control art markings only; missing art always keeps the fallback icon.
+pub(crate) fn audio_thumbnail_indicator_parts(
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    indicator: AudioThumbnailIndicator,
+) -> AudioThumbnailIndicatorParts {
+    if !matches!(item, GridItem::Audio(_)) {
+        return AudioThumbnailIndicatorParts {
+            music_icon: false,
+            bottom_left_badge: false,
+        };
+    }
+    if !matches!(thumb, ThumbnailState::Loaded { .. }) {
+        return AudioThumbnailIndicatorParts {
+            music_icon: true,
+            bottom_left_badge: false,
+        };
+    }
+    AudioThumbnailIndicatorParts {
+        music_icon: indicator.normalized() == AudioThumbnailIndicator::MusicNoteIcon,
+        bottom_left_badge: indicator.normalized() == AudioThumbnailIndicator::BottomLeftBadge,
+    }
+}
+
+/// Shared by grid, cut/deferred painting and details thumbnail preview.
+pub(crate) fn paint_audio_thumbnail_indicator(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    dark: bool,
+    parts: AudioThumbnailIndicatorParts,
+) {
+    if parts.music_icon {
+        crate::ui_helpers::draw_music_icon(painter, rect, dark);
+    }
+    if parts.bottom_left_badge {
+        let galley = painter.layout_no_wrap(
+            "音声".to_owned(),
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+        let badge = egui::Rect::from_min_size(
+            rect.left_bottom() - egui::vec2(0.0, galley.size().y + 4.0),
+            galley.size() + egui::vec2(8.0, 4.0),
+        );
+        painter.rect_filled(
+            badge,
+            2.0,
+            crate::ui_helpers::format_badge_background(FormatBadgeKind::Audio),
+        );
+        painter.galley(
+            badge.min + egui::vec2(4.0, 2.0),
+            galley,
+            egui::Color32::WHITE,
+        );
+    }
+}
+
 pub(crate) fn bottom_left_content<'a>(
     item: &GridItem,
     thumb: &ThumbnailState,
     item_name: &'a str,
     video_indicator: VideoThumbnailIndicator,
+    audio_indicator: AudioThumbnailIndicator,
 ) -> BottomLeftContent<'a> {
     let mut container_kind = None;
     let mut container_label = None;
@@ -194,7 +258,13 @@ pub(crate) fn bottom_left_content<'a>(
             }
             filename = Some(item_name);
         }
-        GridItem::Audio(_) => filename = Some(item_name),
+        GridItem::Audio(_) => {
+            if audio_thumbnail_indicator_parts(item, thumb, audio_indicator).bottom_left_badge {
+                container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Audio));
+                container_label = Some("音声");
+            }
+            filename = Some(item_name);
+        }
         GridItem::ZipFile(_) => {
             container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Zip));
             container_label = Some("ZIP");
@@ -262,6 +332,7 @@ pub(crate) fn layout_cell_overlays(
     bookmark_time: Option<&str>,
     is_drive_list: bool,
     video_indicator: VideoThumbnailIndicator,
+    audio_indicator: AudioThumbnailIndicator,
     is_checked: bool,
     filter_match_count: Option<u32>,
     media_duration: Option<&str>,
@@ -296,7 +367,7 @@ pub(crate) fn layout_cell_overlays(
         container_kind: bottom_kind,
         container_label: bottom_label,
         filename,
-    } = bottom_left_content(item, thumb, &item_name, video_indicator);
+    } = bottom_left_content(item, thumb, &item_name, video_indicator, audio_indicator);
 
     let rating_text = (1..=5).contains(&rating).then(|| {
         let stars = "★".repeat(rating as usize);
@@ -547,6 +618,7 @@ pub(crate) fn draw_cell(
     adjusted_tex: Option<&egui::TextureHandle>,
     is_drive_list: bool,
     video_indicator: VideoThumbnailIndicator,
+    audio_indicator: AudioThumbnailIndicator,
     is_cut: bool,
     resume_meter: Option<f32>,
 ) {
@@ -611,7 +683,10 @@ pub(crate) fn draw_cell(
                 let use_tex = adjusted_tex.unwrap_or(tex);
                 draw_thumb_texture(painter, inner, use_tex, rotation);
             }
-            ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+            ThumbnailState::Pending
+            | ThumbnailState::Evicted
+            | ThumbnailState::NoArt
+            | ThumbnailState::Failed => {
                 if is_drive_list {
                     draw_drive_icon(painter, inner, dark);
                 } else {
@@ -644,7 +719,7 @@ pub(crate) fn draw_cell(
                         egui::Color32::from_gray(160),
                     );
                 }
-                ThumbnailState::Failed => {
+                ThumbnailState::NoArt | ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
                 }
             }
@@ -657,11 +732,30 @@ pub(crate) fn draw_cell(
             }
         }
         GridItem::Audio(_) => {
-            // 音声は固定の音楽アイコン (波形サムネは生成しない、D2)。サムネ状態に依らず
-            // 常に同じアイコンを描く。
-            painter.rect_filled(inner, 2.0, pending_placeholder_bg);
+            if let ThumbnailState::Loaded { tex, .. } = thumb {
+                draw_thumb_texture(painter, inner, tex, rotation);
+            } else {
+                painter.rect_filled(inner, 2.0, pending_placeholder_bg);
+            }
             if !defer_primary_markers {
-                crate::ui_helpers::draw_music_icon(painter, inner, dark);
+                let parts = audio_thumbnail_indicator_parts(item, thumb, audio_indicator);
+                let mark_rect = if matches!(thumb, ThumbnailState::Loaded { .. }) {
+                    egui::Rect::from_center_size(
+                        inner.center(),
+                        egui::vec2(48.0, 48.0).min(inner.size()),
+                    )
+                } else {
+                    inner
+                };
+                paint_audio_thumbnail_indicator(
+                    painter,
+                    mark_rect,
+                    dark,
+                    AudioThumbnailIndicatorParts {
+                        bottom_left_badge: false,
+                        ..parts
+                    },
+                );
             }
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
@@ -678,7 +772,10 @@ pub(crate) fn draw_cell(
                     // ZipFile/PdfFile の代表サムネは補正対象外 (adjusted_tex は常に None)
                     draw_thumb_texture(painter, inner, tex, rotation);
                 }
-                ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                ThumbnailState::Pending
+                | ThumbnailState::Evicted
+                | ThumbnailState::NoArt
+                | ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                     painter.text(
                         inner.center(),
@@ -697,7 +794,10 @@ pub(crate) fn draw_cell(
                 ThumbnailState::Loaded { tex, .. } => {
                     draw_thumb_texture(painter, inner, tex, rotation);
                 }
-                ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                ThumbnailState::Pending
+                | ThumbnailState::Evicted
+                | ThumbnailState::NoArt
+                | ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                     painter.text(
                         inner.center(),
@@ -718,7 +818,10 @@ pub(crate) fn draw_cell(
                     ThumbnailState::Loaded { tex, .. } => {
                         draw_thumb_texture(painter, inner, tex, rotation);
                     }
-                    ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                    ThumbnailState::Pending
+                    | ThumbnailState::Evicted
+                    | ThumbnailState::NoArt
+                    | ThumbnailState::Failed => {
                         painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                         painter.text(
                             inner.center(),
@@ -734,7 +837,10 @@ pub(crate) fn draw_cell(
                     ThumbnailState::Loaded { tex, .. } => {
                         draw_thumb_texture(painter, inner, tex, rotation);
                     }
-                    ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                    ThumbnailState::Pending
+                    | ThumbnailState::Evicted
+                    | ThumbnailState::NoArt
+                    | ThumbnailState::Failed => {
                         painter.text(
                             inner.center() - egui::vec2(0.0, 14.0),
                             egui::Align2::CENTER_CENTER,
@@ -975,7 +1081,21 @@ pub(crate) fn draw_cell(
         draw_play_icon(painter, inner.center(), r);
     }
     if defer_primary_markers && matches!(item, GridItem::Audio(_)) {
-        crate::ui_helpers::draw_music_icon(painter, inner, dark);
+        let parts = audio_thumbnail_indicator_parts(item, thumb, audio_indicator);
+        let mark_rect = if matches!(thumb, ThumbnailState::Loaded { .. }) {
+            egui::Rect::from_center_size(inner.center(), egui::vec2(48.0, 48.0).min(inner.size()))
+        } else {
+            inner
+        };
+        paint_audio_thumbnail_indicator(
+            painter,
+            mark_rect,
+            dark,
+            AudioThumbnailIndicatorParts {
+                bottom_left_badge: false,
+                ..parts
+            },
+        );
     }
     let painter = base_painter;
     if is_cut {
@@ -1232,7 +1352,7 @@ mod book_resume_meter_tests {
                             output=Some(ctx.run(egui::RawInput::default(),|ctx| {egui::CentralPanel::default().show(ctx,|ui| {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None,false,
-                                VideoThumbnailIndicator::PlayIcon,false,None,Some("22:35"),true);
+                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true);
                             let raw=layout.book_resume_meter.unwrap(); let meter=thumbnail_resume_meter_rect(ui.painter(),&layout).unwrap();
                             assert_eq!(raw.height(),9.0); assert_eq!(raw.min.x,cell.min.x+4.0);assert_eq!(raw.max.x,cell.max.x-4.0);
                             assert!((meter.height()*dpi-(9.0_f32*dpi).floor()).abs()<0.001);
@@ -1242,7 +1362,7 @@ mod book_resume_meter_tests {
                             let placements:Vec<_>=layout.badge_placements().cloned().collect();
                             if let Some(labels)=&labels{assert_eq!(&placements,labels);}else{labels=Some(placements);}
                             draw_cell(ui,cell,false,false,false,&layout,&item,&ThumbnailState::Pending,crate::rotation_db::Rotation::None,None,false,
-                                VideoThumbnailIndicator::PlayIcon,false,fraction);
+                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,fraction);
                             if width==140.0 && fraction==Some(0.4) && matches!(item,GridItem::Video(_)) {eprintln!("reserved-meter-measure dpi={dpi} cell={cell:?} meter={meter:?} pixels={}",meter.height()*dpi);}
                         });}));
                         }
@@ -1305,6 +1425,7 @@ mod book_resume_meter_tests {
                                     None,
                                     false,
                                     VideoThumbnailIndicator::Hidden,
+                                    AudioThumbnailIndicator::default(),
                                     false,
                                     None,
                                     None,
@@ -1323,6 +1444,7 @@ mod book_resume_meter_tests {
                                     None,
                                     false,
                                     VideoThumbnailIndicator::Hidden,
+                                    AudioThumbnailIndicator::default(),
                                     false,
                                     None,
                                 );
@@ -1408,6 +1530,7 @@ mod book_resume_meter_tests {
                             None,
                             false,
                             VideoThumbnailIndicator::Hidden,
+                            AudioThumbnailIndicator::default(),
                             false,
                             None,
                             None,
@@ -1426,6 +1549,7 @@ mod book_resume_meter_tests {
                             None,
                             false,
                             VideoThumbnailIndicator::Hidden,
+                            AudioThumbnailIndicator::default(),
                             false,
                             None,
                         );
@@ -1491,6 +1615,7 @@ mod book_resume_meter_tests {
                                 None,
                                 false,
                                 VideoThumbnailIndicator::Hidden,
+                                AudioThumbnailIndicator::default(),
                                 false,
                                 None,
                                 None,
@@ -1509,6 +1634,7 @@ mod book_resume_meter_tests {
                                 None,
                                 false,
                                 VideoThumbnailIndicator::Hidden,
+                                AudioThumbnailIndicator::default(),
                                 false,
                                 None,
                             );
@@ -1701,6 +1827,7 @@ mod book_resume_meter_tests {
                                             None,
                                             false,
                                             VideoThumbnailIndicator::PlayIcon,
+                                            AudioThumbnailIndicator::default(),
                                             false,
                                             None,
                                             duration,
@@ -1720,6 +1847,7 @@ mod book_resume_meter_tests {
                                             None,
                                             false,
                                             VideoThumbnailIndicator::PlayIcon,
+                                            AudioThumbnailIndicator::default(),
                                             false,
                                             fraction,
                                         );
@@ -1811,6 +1939,7 @@ mod book_resume_meter_tests {
                             None,
                             false,
                             VideoThumbnailIndicator::PlayIcon,
+                            AudioThumbnailIndicator::default(),
                             false,
                             None,
                             None,
@@ -1829,6 +1958,7 @@ mod book_resume_meter_tests {
                             None,
                             false,
                             VideoThumbnailIndicator::PlayIcon,
+                            AudioThumbnailIndicator::default(),
                             cut,
                             Some(0.5),
                         );
@@ -1883,6 +2013,7 @@ mod book_resume_meter_tests {
                         None,
                         false,
                         VideoThumbnailIndicator::default(),
+                        AudioThumbnailIndicator::default(),
                         true,
                         None,
                         Some("1:02:03"),
@@ -1902,6 +2033,7 @@ mod book_resume_meter_tests {
                         None,
                         false,
                         VideoThumbnailIndicator::default(),
+                        AudioThumbnailIndicator::default(),
                         false,
                         Some(0.5),
                     );
@@ -2125,6 +2257,7 @@ mod book_resume_meter_tests {
             None,
             false,
             VideoThumbnailIndicator::default(),
+            AudioThumbnailIndicator::default(),
             dense,
             dense.then_some(42),
             duration,
@@ -2143,6 +2276,7 @@ mod book_resume_meter_tests {
             None,
             false,
             VideoThumbnailIndicator::default(),
+            AudioThumbnailIndicator::default(),
             cut,
             fraction,
         );
@@ -2398,6 +2532,7 @@ mod book_resume_meter_tests {
                         None,
                         false,
                         VideoThumbnailIndicator::PlayIcon,
+                        AudioThumbnailIndicator::default(),
                         false,
                         None,
                         duration,
@@ -2416,6 +2551,7 @@ mod book_resume_meter_tests {
                         None,
                         false,
                         VideoThumbnailIndicator::PlayIcon,
+                        AudioThumbnailIndicator::default(),
                         false,
                         value,
                     );
@@ -2660,6 +2796,7 @@ mod cut_content_paint_tests {
                             None,
                             false,
                             VideoThumbnailIndicator::default(),
+                            AudioThumbnailIndicator::default(),
                             true,
                             None,
                         );
@@ -2744,6 +2881,7 @@ mod cut_content_paint_tests {
                                 None,
                                 false,
                                 VideoThumbnailIndicator::PlayIcon,
+                                AudioThumbnailIndicator::default(),
                                 is_cut,
                                 None,
                             );
@@ -2881,6 +3019,7 @@ pub fn draw_collection_placeholder_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::default(),
+                AudioThumbnailIndicator::default(),
                 false,
                 None,
             );
@@ -2896,6 +3035,7 @@ fn draw_video_indicator_snapshot_cell(
     item: &GridItem,
     thumb: &ThumbnailState,
     indicator: VideoThumbnailIndicator,
+    audio_indicator: AudioThumbnailIndicator,
     selected: bool,
     rating: u8,
     tags: &[String],
@@ -2913,6 +3053,7 @@ fn draw_video_indicator_snapshot_cell(
         None,
         false,
         indicator,
+        audio_indicator,
         false,
         None,
         None,
@@ -2931,6 +3072,7 @@ fn draw_video_indicator_snapshot_cell(
         None,
         false,
         indicator,
+        audio_indicator,
         false,
         None,
     );
@@ -2995,6 +3137,7 @@ pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                 &video,
                 &loaded,
                 VideoThumbnailIndicator::PlayIcon,
+                AudioThumbnailIndicator::default(),
                 false,
                 0,
                 &[],
@@ -3008,6 +3151,7 @@ pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                 &video,
                 &ThumbnailState::Pending,
                 VideoThumbnailIndicator::PlayIcon,
+                AudioThumbnailIndicator::default(),
                 false,
                 0,
                 &[],
@@ -3021,6 +3165,7 @@ pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                 &video,
                 &ThumbnailState::Pending,
                 VideoThumbnailIndicator::Hidden,
+                AudioThumbnailIndicator::default(),
                 false,
                 0,
                 &[],
@@ -3037,6 +3182,7 @@ pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                 &video,
                 &loaded,
                 VideoThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::default(),
                 true,
                 4,
                 &dense_tags,
@@ -3050,6 +3196,7 @@ pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                 &video,
                 &ThumbnailState::Pending,
                 VideoThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::default(),
                 false,
                 3,
                 &dense_tags,
@@ -3067,6 +3214,7 @@ pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     &audio,
                     &ThumbnailState::Pending,
                     *indicator,
+                    AudioThumbnailIndicator::default(),
                     false,
                     0,
                     &[],
@@ -3083,7 +3231,7 @@ mod bottom_left_content_tests {
         video_thumbnail_indicator_parts,
     };
     use crate::grid_item::{GridItem, ThumbnailState};
-    use crate::settings::VideoThumbnailIndicator;
+    use crate::settings::{AudioThumbnailIndicator, VideoThumbnailIndicator};
     use std::path::PathBuf;
 
     // 左下レーンのコンテナバッジ / ファイル名プレートの出し分け。レーン共通化 (§2.2) の前は
@@ -3111,8 +3259,13 @@ mod bottom_left_content_tests {
     #[test]
     fn folder_shows_its_name_badge_once_the_thumbnail_is_loaded() {
         let folder = GridItem::Folder(PathBuf::from("c:/x"));
-        let content =
-            bottom_left_content(&folder, &loaded(), "x", VideoThumbnailIndicator::PlayIcon);
+        let content = bottom_left_content(
+            &folder,
+            &loaded(),
+            "x",
+            VideoThumbnailIndicator::PlayIcon,
+            AudioThumbnailIndicator::default(),
+        );
         assert_eq!(content.container_kind, Some(BottomContainerKind::Folder));
         assert_eq!(content.container_label, Some("x"));
         assert_eq!(content.filename, None);
@@ -3126,8 +3279,13 @@ mod bottom_left_content_tests {
             ("evicted", ThumbnailState::Evicted),
             ("failed", ThumbnailState::Failed),
         ] {
-            let content =
-                bottom_left_content(&folder, &thumb, "x", VideoThumbnailIndicator::PlayIcon);
+            let content = bottom_left_content(
+                &folder,
+                &thumb,
+                "x",
+                VideoThumbnailIndicator::PlayIcon,
+                AudioThumbnailIndicator::default(),
+            );
             assert_eq!(content.container_kind, None, "{label}");
             assert_eq!(content.filename, Some("x"), "{label}");
         }
@@ -3154,7 +3312,13 @@ mod bottom_left_content_tests {
                     (&epub, "EPUB", FormatBadgeKind::Pdf),
                     (&archive, "7z", FormatBadgeKind::Archive),
                 ] {
-                    let content = bottom_left_content(item, &thumb, "x", *indicator);
+                    let content = bottom_left_content(
+                        item,
+                        &thumb,
+                        "x",
+                        *indicator,
+                        AudioThumbnailIndicator::default(),
+                    );
                     assert_eq!(
                         content.container_kind,
                         Some(BottomContainerKind::Format(kind)),
@@ -3185,12 +3349,14 @@ mod bottom_left_content_tests {
             &ThumbnailState::Pending,
             "comic.cbz",
             VideoThumbnailIndicator::Hidden,
+            AudioThumbnailIndicator::default(),
         );
         let rar = bottom_left_content(
             &nested_rar,
             &ThumbnailState::Pending,
             "comic.rar",
             VideoThumbnailIndicator::Hidden,
+            AudioThumbnailIndicator::default(),
         );
         assert_eq!(
             zip.container_kind,
@@ -3222,6 +3388,7 @@ mod bottom_left_content_tests {
                 &ThumbnailState::Pending,
                 "x",
                 VideoThumbnailIndicator::PlayIcon,
+                AudioThumbnailIndicator::default(),
             );
             assert_eq!(content.container_kind, None);
         }
@@ -3232,6 +3399,7 @@ mod bottom_left_content_tests {
             &ThumbnailState::Pending,
             "x.mp4",
             VideoThumbnailIndicator::default(),
+            AudioThumbnailIndicator::default(),
         );
         assert_eq!(content.container_kind, None);
         assert_eq!(content.filename, Some("x.mp4"));
@@ -3246,8 +3414,13 @@ mod bottom_left_content_tests {
             (VideoThumbnailIndicator::Hidden, false, false),
         ] {
             let parts = video_thumbnail_indicator_parts(&video, indicator);
-            let content =
-                bottom_left_content(&video, &ThumbnailState::Pending, "clip.mp4", indicator);
+            let content = bottom_left_content(
+                &video,
+                &ThumbnailState::Pending,
+                "clip.mp4",
+                indicator,
+                AudioThumbnailIndicator::default(),
+            );
             assert_eq!(parts.play_icon, play_icon, "{indicator:?}");
             assert_eq!(parts.bottom_left_badge, badge, "{indicator:?}");
             assert!(!(parts.play_icon && parts.bottom_left_badge));
@@ -3275,10 +3448,17 @@ mod bottom_left_content_tests {
             &ThumbnailState::Pending,
             "song.flac",
             VideoThumbnailIndicator::PlayIcon,
+            AudioThumbnailIndicator::default(),
         );
         for &indicator in VideoThumbnailIndicator::all() {
             assert_eq!(
-                bottom_left_content(&audio, &ThumbnailState::Pending, "song.flac", indicator,),
+                bottom_left_content(
+                    &audio,
+                    &ThumbnailState::Pending,
+                    "song.flac",
+                    indicator,
+                    AudioThumbnailIndicator::default(),
+                ),
                 expected,
                 "{indicator:?}"
             );
@@ -3290,5 +3470,191 @@ mod bottom_left_content_tests {
                 }
             );
         }
+    }
+}
+
+/// Headless fixture: loaded art, terminal/pending fallback and cut/resume overlays use production painting.
+#[doc(hidden)]
+pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
+    let audio = GridItem::Audio(std::path::PathBuf::from("song.mp3"));
+    let loaded = snapshot_thumbnail(ui.ctx(), "audio-indicator-art");
+    let tags = vec!["音楽".to_owned()];
+    ui.set_width(440.0);
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+    ui.heading("音声サムネイルの目印");
+    ui.horizontal(|ui| {
+        for &indicator in AudioThumbnailIndicator::all() {
+            ui.vertical(|ui| {
+                draw_video_indicator_snapshot_cell(
+                    ui,
+                    egui::vec2(136.0, 90.0),
+                    indicator.label(),
+                    &audio,
+                    &loaded,
+                    VideoThumbnailIndicator::Hidden,
+                    indicator,
+                    false,
+                    3,
+                    &tags,
+                );
+            });
+        }
+    });
+    ui.horizontal(|ui| {
+        for (label, thumb) in [
+            ("画像なし", ThumbnailState::NoArt),
+            ("失敗・なし設定", ThumbnailState::Failed),
+            ("生成中", ThumbnailState::Pending),
+        ] {
+            ui.vertical(|ui| {
+                draw_video_indicator_snapshot_cell(
+                    ui,
+                    egui::vec2(136.0, 84.0),
+                    label,
+                    &audio,
+                    &thumb,
+                    VideoThumbnailIndicator::Hidden,
+                    AudioThumbnailIndicator::Hidden,
+                    false,
+                    0,
+                    &[],
+                );
+            });
+        }
+    });
+    ui.horizontal(|ui| {
+        for &indicator in AudioThumbnailIndicator::all() {
+            ui.vertical(|ui| {
+                ui.small("切り取り・再生位置");
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(136.0, 84.0), egui::Sense::hover());
+                let layout = layout_cell_overlays(
+                    ui.painter(),
+                    rect,
+                    EditBadgeFlags::default(),
+                    3,
+                    &audio,
+                    &loaded,
+                    &tags,
+                    None,
+                    false,
+                    VideoThumbnailIndicator::Hidden,
+                    indicator,
+                    false,
+                    None,
+                    Some("3:45"),
+                    true,
+                );
+                draw_cell(
+                    ui,
+                    rect,
+                    false,
+                    false,
+                    false,
+                    &layout,
+                    &audio,
+                    &loaded,
+                    crate::rotation_db::Rotation::None,
+                    None,
+                    false,
+                    VideoThumbnailIndicator::Hidden,
+                    indicator,
+                    true,
+                    Some(0.6),
+                );
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+mod audio_indicator_tests {
+    use super::*;
+    #[test]
+    fn audio_thumbnail_indicator_terminal_fallback_is_independent_of_setting() {
+        let audio = GridItem::Audio("song.mp3".into());
+        for thumb in [
+            ThumbnailState::Pending,
+            ThumbnailState::Evicted,
+            ThumbnailState::NoArt,
+            ThumbnailState::Failed,
+        ] {
+            for &indicator in AudioThumbnailIndicator::all() {
+                assert_eq!(
+                    audio_thumbnail_indicator_parts(&audio, &thumb, indicator),
+                    AudioThumbnailIndicatorParts {
+                        music_icon: true,
+                        bottom_left_badge: false
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_loaded_art_has_exactly_the_requested_marker() {
+        let ctx = egui::Context::default();
+        let loaded = snapshot_thumbnail(&ctx, "audio-indicator-test");
+        let audio = GridItem::Audio("song.mp3".into());
+        for (indicator, expected) in [
+            (
+                AudioThumbnailIndicator::MusicNoteIcon,
+                AudioThumbnailIndicatorParts {
+                    music_icon: true,
+                    bottom_left_badge: false,
+                },
+            ),
+            (
+                AudioThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicatorParts {
+                    music_icon: false,
+                    bottom_left_badge: true,
+                },
+            ),
+            (
+                AudioThumbnailIndicator::Hidden,
+                AudioThumbnailIndicatorParts {
+                    music_icon: false,
+                    bottom_left_badge: false,
+                },
+            ),
+            (
+                AudioThumbnailIndicator::Unknown,
+                AudioThumbnailIndicatorParts {
+                    music_icon: true,
+                    bottom_left_badge: false,
+                },
+            ),
+        ] {
+            assert_eq!(
+                audio_thumbnail_indicator_parts(&audio, &loaded, indicator),
+                expected
+            );
+            let content = bottom_left_content(
+                &audio,
+                &loaded,
+                "song.mp3",
+                VideoThumbnailIndicator::PlayIcon,
+                indicator,
+            );
+            assert_eq!(
+                content.container_kind,
+                expected
+                    .bottom_left_badge
+                    .then_some(BottomContainerKind::Format(FormatBadgeKind::Audio))
+            );
+        }
+        let video = GridItem::Video("scene.mp4".into());
+        assert_eq!(
+            audio_thumbnail_indicator_parts(
+                &video,
+                &loaded,
+                AudioThumbnailIndicator::MusicNoteIcon
+            ),
+            AudioThumbnailIndicatorParts {
+                music_icon: false,
+                bottom_left_badge: false
+            }
+        );
     }
 }

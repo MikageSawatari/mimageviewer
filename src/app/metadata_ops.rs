@@ -499,6 +499,7 @@ pub(super) fn run_details_meta_load(
     initial_failed: usize,
     total: usize,
     cache_dir: PathBuf,
+    catalog_admission: crate::catalog::CatalogAdmission,
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
@@ -513,6 +514,7 @@ pub(super) fn run_details_meta_load(
         initial_failed,
         total,
         cache_dir,
+        catalog_admission,
         io_sem,
         cancel,
         tx,
@@ -531,6 +533,7 @@ fn run_details_meta_load_inner(
     initial_failed: usize,
     total: usize,
     cache_dir: PathBuf,
+    catalog_admission: crate::catalog::CatalogAdmission,
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
@@ -577,7 +580,7 @@ fn run_details_meta_load_inner(
         PathBuf,
         Option<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     > = std::collections::HashMap::new();
-    let mut container_catalogs = ContainerCatalogCache::new(8);
+    let mut container_catalogs = ContainerCatalogCache::new_admitted(8, catalog_admission);
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -829,7 +832,7 @@ fn run_details_meta_load_inner(
                             ),
                         );
                     };
-                    crate::catalog::CatalogDb::open(&cache_dir, folder)
+                    crate::catalog::CatalogDb::open_admitted(&cache_dir, folder, catalog_admission)
                         .and_then(|db| db.load_all())
                         .ok()
                 };
@@ -1205,6 +1208,7 @@ mod relative_page_tests {
             0,
             1,
             temp.path().join("cache"),
+            crate::catalog::CatalogAccess::for_cache_dir(&temp.path().join("cache")).admit(),
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -1547,14 +1551,24 @@ fn load_details_page_count_with_pdf_enumerator(
 /// parent folder until the entire metadata job finishes.
 struct ContainerCatalogCache {
     capacity: usize,
+    admission: crate::catalog::CatalogAdmission,
     entries: std::collections::HashMap<PathBuf, Option<crate::catalog::CatalogDb>>,
     lru: std::collections::VecDeque<PathBuf>,
 }
 
 impl ContainerCatalogCache {
-    fn new(capacity: usize) -> Self {
+    #[cfg(test)]
+    fn new(capacity: usize, cache_dir: &Path) -> Self {
+        Self::new_admitted(
+            capacity,
+            crate::catalog::CatalogAccess::for_cache_dir(cache_dir).admit(),
+        )
+    }
+
+    fn new_admitted(capacity: usize, admission: crate::catalog::CatalogAdmission) -> Self {
         Self {
             capacity: capacity.max(1),
+            admission,
             entries: std::collections::HashMap::new(),
             lru: std::collections::VecDeque::new(),
         }
@@ -1578,7 +1592,7 @@ impl ContainerCatalogCache {
                         DetailsMetaIoStage::ContainerCatalogOpen,
                     ));
                 };
-                crate::catalog::CatalogDb::open(cache_dir, folder).ok()
+                crate::catalog::CatalogDb::open_admitted(cache_dir, folder, self.admission).ok()
             };
             self.entries.insert(folder.to_path_buf(), opened);
         }
@@ -2597,7 +2611,7 @@ mod tests {
         };
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut catalogs = ContainerCatalogCache::new(8);
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let config = DetailsPageCountConfig {
             fingerprint: 0,
             image_folder_options: None,
@@ -2729,7 +2743,7 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut catalogs = ContainerCatalogCache::new(8);
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let mut config = DetailsPageCountConfig {
             fingerprint: 77,
             image_folder_options: None,
@@ -2822,7 +2836,7 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut catalogs = ContainerCatalogCache::new(8);
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let config = DetailsPageCountConfig {
             fingerprint: 88,
             image_folder_options: None,
@@ -2899,6 +2913,7 @@ mod tests {
         let worker_sem = Arc::clone(&io_sem);
         let worker_cancel = Arc::clone(&cancel);
         let cache_dir = temp.path().join("cache");
+        let catalog_admission = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit();
         let worker = std::thread::spawn(move || {
             run_details_meta_load(
                 23,
@@ -2908,6 +2923,7 @@ mod tests {
                 0,
                 1,
                 cache_dir,
+                catalog_admission,
                 worker_sem,
                 worker_cancel,
                 tx,
@@ -2973,6 +2989,7 @@ mod tests {
             0,
             3,
             temp.path().join("cache"),
+            crate::catalog::CatalogAccess::for_cache_dir(&temp.path().join("cache")).admit(),
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -3039,6 +3056,7 @@ mod tests {
             0,
             1,
             temp.path().join("cache"),
+            crate::catalog::CatalogAccess::for_cache_dir(&temp.path().join("cache")).admit(),
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -3076,7 +3094,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         for audio in [false, true] {
             let mut target = media_test_target(temp.path(), audio);
-            let mut cache = ContainerCatalogCache::new(8);
+            let mut cache = ContainerCatalogCache::new(8, &cache_dir);
             let first = load_details_video_meta_with_probe(
                 &target,
                 &cache_dir,
@@ -3092,7 +3110,7 @@ mod tests {
             assert_media_test_read(first, audio);
             // A new job/revisit has no connection or in-memory metadata to reuse.
             drop(cache);
-            let mut cache = ContainerCatalogCache::new(8);
+            let mut cache = ContainerCatalogCache::new(8, &cache_dir);
             let cached = load_details_video_meta_with_probe(
                 &target,
                 &cache_dir,
@@ -3150,7 +3168,7 @@ mod tests {
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let cancel = AtomicBool::new(false);
         let target = media_test_target(temp.path(), false);
-        let mut cache = ContainerCatalogCache::new(8);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
         let interrupted = load_details_video_meta_with_probe(
             &target,
             &cache_dir,
@@ -3177,7 +3195,7 @@ mod tests {
         let cached = load_details_video_meta_with_probe(
             &target,
             &cache_dir,
-            &mut ContainerCatalogCache::new(8),
+            &mut ContainerCatalogCache::new(8, &cache_dir),
             &io_sem,
             &cancel,
             |_, _, _| panic!("definitive failure must be cached"),
@@ -3197,7 +3215,7 @@ mod tests {
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let cancel = AtomicBool::new(false);
         let mut target = media_test_target(temp.path(), false);
-        let mut cache = ContainerCatalogCache::new(8);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
         for mode in 0..3 {
             target.source_identity = if mode == 0 { None } else { Some((123, 1024)) };
             target.catalog_key = if mode == 1 {
@@ -3251,7 +3269,7 @@ mod tests {
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let cancel = AtomicBool::new(false);
         let target = media_test_target(temp.path(), false);
-        let mut cache = ContainerCatalogCache::new(8);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
         cache
             .get_or_open(&cache_dir, temp.path(), &io_sem, target.priority, &cancel)
             .unwrap();
@@ -3290,7 +3308,7 @@ mod tests {
         let result = load_details_video_meta_with_probe(
             &target,
             &cache_dir,
-            &mut ContainerCatalogCache::new(8),
+            &mut ContainerCatalogCache::new(8, &cache_dir),
             &io_sem,
             &cancel,
             |_, _, cancel| {
@@ -3367,7 +3385,7 @@ mod tests {
             let outcome = load_details_video_meta_with_probe(
                 &target,
                 &cache_dir,
-                &mut ContainerCatalogCache::new(8),
+                &mut ContainerCatalogCache::new(8, &cache_dir),
                 &crate::io_semaphore::GlobalIoSemaphore::new(1),
                 &cancel,
                 |_, _, _| {
@@ -3412,7 +3430,7 @@ mod tests {
             let result = load_details_video_meta_with_probe(
                 &target,
                 &cache_dir,
-                &mut ContainerCatalogCache::new(8),
+                &mut ContainerCatalogCache::new(8, &cache_dir),
                 &io_sem,
                 &cancel,
                 |path, audio, cancel| {
@@ -3428,7 +3446,7 @@ mod tests {
             let cached = load_details_video_meta_with_probe(
                 &target,
                 &cache_dir,
-                &mut ContainerCatalogCache::new(8),
+                &mut ContainerCatalogCache::new(8, &cache_dir),
                 &io_sem,
                 &cancel,
                 |_, _, _| panic!("known empty file failure must survive reopen"),
@@ -3445,7 +3463,7 @@ mod tests {
         let target = media_test_target(temp.path(), false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let cancel = AtomicBool::new(false);
-        let mut cache = ContainerCatalogCache::new(8);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
         let result = load_details_video_meta_with_probe(
             &target,
             &cache_dir,
@@ -3502,7 +3520,7 @@ mod tests {
         let result = load_details_video_meta_with_probe(
             &target,
             &cache_dir,
-            &mut ContainerCatalogCache::new(8),
+            &mut ContainerCatalogCache::new(8, &cache_dir),
             &crate::io_semaphore::GlobalIoSemaphore::new(1),
             &AtomicBool::new(false),
             |_, _, _| panic!("obsolete cache hit should be discarded before probing"),
@@ -3581,12 +3599,49 @@ mod tests {
     }
 
     #[test]
+    fn details_catalog_admission_does_not_recreate_unvisited_folder_after_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let mut cache = ContainerCatalogCache::new(2, &cache_dir);
+        let first = temp.path().join("first");
+        assert!(
+            cache
+                .get_or_open(
+                    &cache_dir,
+                    &first,
+                    &io_sem,
+                    crate::io_semaphore::IoPriority::Normal,
+                    &cancel
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(crate::catalog::delete_all_cache(&cache_dir), 1);
+        let later = temp.path().join("unvisited");
+        assert!(
+            cache
+                .get_or_open(
+                    &cache_dir,
+                    &later,
+                    &io_sem,
+                    crate::io_semaphore::IoPriority::Normal,
+                    &cancel
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(!crate::catalog::db_path_for(&cache_dir, &later).exists());
+    }
+
+    #[test]
     fn container_catalog_cache_bounds_open_connections() {
         let temp = tempfile::TempDir::new().unwrap();
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let cancel = AtomicBool::new(false);
-        let mut cache = ContainerCatalogCache::new(2);
+        let mut cache = ContainerCatalogCache::new(2, &cache_dir);
         for name in ["one", "two", "three"] {
             let folder = temp.path().join(name);
             std::fs::create_dir_all(&folder).unwrap();

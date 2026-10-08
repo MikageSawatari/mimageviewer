@@ -21477,7 +21477,9 @@ impl App {
                         .map_or(StillSeekStripThumbnail::Unavailable, |&rotation| {
                             StillSeekStripThumbnail::Loaded(tex.size_vec2(), rotation)
                         }),
-                    Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
+                    Some(ThumbnailState::Failed | ThumbnailState::NoArt) => {
+                        StillSeekStripThumbnail::Failed
+                    }
                     Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
                         StillSeekStripThumbnail::Unavailable
                     }
