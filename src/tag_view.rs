@@ -18,6 +18,19 @@ pub(crate) const TAG_VIEW_FILTERED_KEY_SCAN_LIMIT: usize = 50_000;
 const TAG_VIEW_RECENT_LIMIT: usize = 20;
 const TAG_VIEW_POPULAR_LIMIT: usize = 20;
 
+/// PC and Remote inspect the same bounded candidate set when policy projection can remove
+/// rows. The visible response cap is applied after classification and filtering.
+pub(crate) fn key_scan_limit_for_projection(
+    all_kinds: bool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> usize {
+    if all_kinds && visibility.is_all_visible() {
+        TAG_VIEW_RESULT_LIMIT
+    } else {
+        TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TagViewMenuChoice {
     pub name: String,
@@ -247,6 +260,7 @@ pub(crate) fn spawn_tag_view_search(
     data_dir: PathBuf,
     query: String,
     kind_filter: TagViewKindFilter,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
 ) -> TagViewPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
@@ -254,7 +268,13 @@ pub(crate) fn spawn_tag_view_search(
     std::thread::Builder::new()
         .name("tag-view-search".to_string())
         .spawn(move || {
-            let result = run_tag_view_search(&data_dir, &query, kind_filter, &cancel_worker);
+            let result = run_tag_view_search_with_visibility(
+                &data_dir,
+                &query,
+                kind_filter,
+                &visibility,
+                &cancel_worker,
+            );
             if !cancel_worker.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
             }
@@ -263,10 +283,27 @@ pub(crate) fn spawn_tag_view_search(
     TagViewPending { cancel, rx }
 }
 
+#[cfg(test)]
 fn run_tag_view_search(
     data_dir: &Path,
     query: &str,
     kind_filter: TagViewKindFilter,
+    cancel: &AtomicBool,
+) -> Result<TagViewResult, String> {
+    run_tag_view_search_with_visibility(
+        data_dir,
+        query,
+        kind_filter,
+        &crate::file_type_visibility::FileTypeVisibility::default(),
+        cancel,
+    )
+}
+
+fn run_tag_view_search_with_visibility(
+    data_dir: &Path,
+    query: &str,
+    kind_filter: TagViewKindFilter,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
     cancel: &AtomicBool,
 ) -> Result<TagViewResult, String> {
     let db_path = data_dir.join("tags.db");
@@ -284,11 +321,8 @@ fn run_tag_view_search(
         });
     }
 
-    let scan_limit = if kind_filter == TagViewKindFilter::All {
-        TAG_VIEW_RESULT_LIMIT
-    } else {
-        TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
-    };
+    let scan_limit =
+        key_scan_limit_for_projection(kind_filter == TagViewKindFilter::All, visibility);
     let keys = select_tag_view_item_keys(&db, trimmed, scan_limit + 1);
     let scan_truncated = keys.len() > scan_limit;
     let mut truncated = false;
@@ -307,7 +341,11 @@ fn run_tag_view_search(
         match classify_tag_view_path(path) {
             ClassifiedTagViewPath::Existing(classified) => {
                 let entry = classified.entry;
-                if kind_filter.matches(entry.kind) {
+                // Classification already owns the stat result. A directory named *.zip is
+                // a structural row, even if the ZIP file category is disabled.
+                if (classified.is_directory || visibility.allows_physical_file(&entry.path))
+                    && kind_filter.matches(entry.kind)
+                {
                     if entries.len() >= TAG_VIEW_RESULT_LIMIT {
                         truncated = true;
                         break;
@@ -473,6 +511,47 @@ fn classify_file_kind(path: &Path) -> TagViewItemKind {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn file_type_projection_keeps_structural_directories_and_tag_data() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.jpg");
+        let hidden = temp.path().join("hidden.png");
+        let directory = temp.path().join("passage.zip");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(&hidden, b"image").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+        for path in [&image, &hidden, &directory] {
+            db.set_item_tags(
+                &crate::tags_db::item_key_for_path(path),
+                ["visibility"],
+                "test",
+            )
+            .unwrap();
+        }
+        drop(db);
+        let mut visibility = FileTypeVisibility::default();
+        visibility.excluded_extensions.insert("png".into());
+        visibility.excluded_categories.insert(FileTypeCategory::Zip);
+        let result = run_tag_view_search_with_visibility(
+            temp.path(),
+            "visibility",
+            TagViewKindFilter::All,
+            &visibility,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert!(result.entries.iter().any(|entry| entry.path == directory));
+        assert!(result.entries.iter().any(|entry| entry.path == image));
+        let db = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+        assert_eq!(
+            db.display_tags_for_item(&crate::tags_db::item_key_for_path(&hidden)),
+            ["#visibility"]
+        );
+    }
 
     #[test]
     fn tag_view_search_returns_tagged_existing_paths() {

@@ -16,6 +16,7 @@ use std::sync::Arc;
 fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
     let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = super::tests::phase_c_support::setup_app();
+    let ctx = egui::Context::default();
     let nav_root = app.tmp.path().join("r2-navigation");
     let main_folder = nav_root.join("a");
     let next_folder = nav_root.join("b");
@@ -37,7 +38,8 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
         unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
     };
     crate::rating_sort::with_test_rating_order(spec, || {
-        app.load_folder_with_scan(main_folder.clone(), None)
+        app.load_folder_with_scan(main_folder.clone(), None);
+        wait_for_list_hydration(&mut app, &ctx);
     });
     let main_order = app
         .items
@@ -51,7 +53,8 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
     let detached = app.build_active_context_for_test(Some(902), DetachedSource::Image, |_| {});
     crate::rating_sort::with_test_rating_order(spec, || {
         app.with_viewer_context(detached, |mounted| {
-            mounted.load_folder_with_scan(main_folder.clone(), None)
+            mounted.load_folder_with_scan(main_folder.clone(), None);
+            wait_for_list_hydration(mounted, &ctx);
         })
         .unwrap();
     });
@@ -78,7 +81,8 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
         .unwrap();
     crate::rating_sort::with_test_rating_order(spec, || {
         app.with_viewer_context(detached, |mounted| {
-            mounted.load_folder_with_scan(main_folder.clone(), None)
+            mounted.load_folder_with_scan(main_folder.clone(), None);
+            wait_for_list_hydration(mounted, &ctx);
         })
         .unwrap();
     });
@@ -120,7 +124,6 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
             None,
         )
         .unwrap();
-    let ctx = egui::Context::default();
     app.with_viewer_context(detached, |mounted| {
         mounted.start_folder_nav(main_folder.clone(), true, FolderNavMode::Grid);
     })
@@ -132,6 +135,7 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
                 .with_viewer_context(detached, |mounted| {
                     if let Some(result) = mounted.poll_folder_nav() {
                         mounted.apply_folder_nav_result(&ctx, result);
+                        wait_for_list_hydration(mounted, &ctx);
                         true
                     } else {
                         false
@@ -175,6 +179,7 @@ const ROOT_SIZE: egui::Vec2 = egui::vec2(1200.0, 800.0);
 fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings() {
     let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = super::tests::phase_c_support::setup_app();
+    let ctx = egui::Context::default();
     let folder = app.tmp.path().join("r3-shared-ratings");
     std::fs::create_dir_all(&folder).unwrap();
     for name in ["a.jpg", "b.jpg"] {
@@ -195,7 +200,8 @@ fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings(
     filter[5] = true;
     app.settings.rating_filter = filter;
     crate::rating_sort::with_test_rating_order(spec, || {
-        app.load_folder_with_scan(folder.clone(), None)
+        app.load_folder_with_scan(folder.clone(), None);
+        wait_for_list_hydration(&mut app, &ctx);
     });
     let main_generation = app.items_generation;
     let first = app.build_active_context_for_test(Some(911), DetachedSource::Image, |_| {});
@@ -203,7 +209,8 @@ fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings(
     for id in [first, second] {
         crate::rating_sort::with_test_rating_order(spec, || {
             app.with_viewer_context(id, |mounted| {
-                mounted.load_folder_with_scan(folder.clone(), None)
+                mounted.load_folder_with_scan(folder.clone(), None);
+                wait_for_list_hydration(mounted, &ctx);
             })
             .unwrap();
         });
@@ -254,7 +261,8 @@ fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings(
         .unwrap();
     crate::rating_sort::with_test_rating_order(spec, || {
         app.with_viewer_context(first, |mounted| {
-            mounted.load_folder_with_scan(folder.clone(), None)
+            mounted.load_folder_with_scan(folder.clone(), None);
+            wait_for_list_hydration(mounted, &ctx);
         })
         .unwrap();
     });
@@ -1222,6 +1230,15 @@ fn wait_until(label: &str, timeout: std::time::Duration, mut ready: impl FnMut()
     }
 }
 
+fn wait_for_list_hydration(app: &mut App, ctx: &egui::Context) {
+    // Ordinary list installs now hydrate their immutable page identity index on
+    // the same worker as sidecar restore, including when sidecars are disabled.
+    wait_until("list hydration", std::time::Duration::from_secs(10), || {
+        app.poll_sidecar_restore(ctx);
+        app.sidecar_restore.is_none()
+    });
+}
+
 fn run_scenario_a(book: ScenarioABook) {
     let label = match book {
         ScenarioABook::Folder => "S-A folder",
@@ -1398,6 +1415,7 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
         app.global_search.focus_request = false;
         app.global_search.done = true;
         app.replace_search_view_items(vec![GridItem::Image(search_page.clone())], vec![None]);
+        wait_for_list_hydration(&mut app, &driver.ctx);
         assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, 0));
         let window_id = app.active_detached_window_id().expect("search hit opened a window");
         let viewport = App::detached_image_window_viewport_id(window_id);
@@ -1924,7 +1942,8 @@ fn collection_order_fixture(
         || {
             app.poll_collection_ui(&driver.ctx);
             app.poll_collection_grid(&driver.ctx);
-            app.items.len() == 3
+            app.poll_sidecar_restore(&driver.ctx);
+            app.items.len() == 3 && app.sidecar_restore.is_none()
         },
     );
     assert_eq!(
@@ -1973,6 +1992,7 @@ fn collection_order_add_folder(
         || {
             driver.root(app);
             matches!(app.items.get(expected_index), Some(GridItem::Folder(path)) if path == &folder)
+                && app.sidecar_restore.is_none()
         },
     );
     (folder, page)
@@ -3025,7 +3045,9 @@ fn multiwindow_scenario_collection_root_detached_folder_child_restore() {
             || {
                 app.with_active_viewer_context(|owner| {
                     owner.poll_collection_grid(&driver.ctx);
+                    owner.poll_sidecar_restore(&driver.ctx);
                     owner.items == main_items
+                        && owner.sidecar_restore.is_none()
                         && matches!(
                             owner
                                 .top_level_grid_view
@@ -3143,17 +3165,24 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
             || {
                 app.poll_collection_ui(&ctx);
                 app.poll_collection_grid(&ctx);
-                app.items.len() == 2
+                app.poll_sidecar_restore(&ctx);
+                app.items.len() == 2 && app.sidecar_restore.is_none()
             },
         );
         let grid = app.top_level_grid_view.clone();
         let items = app.items.clone();
         let metas = app.image_metas.clone();
+        let page_identity_index =
+            Arc::new(super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &items,
+                None,
+                app.settings.file_type_visibility.clone(),
+            ));
         let window_id = if is_audio { 711 } else { 710 };
         let source = first.clone();
         app.push_window_context_for_test(&ctx, window_id, move |owner| {
             owner.top_level_grid_view = grid;
-            owner.install_prepared_aggregate_items(items, metas);
+            owner.install_prepared_aggregate_items(items, metas, page_identity_index);
             owner
                 .top_level_grid_view
                 .collection_session_mut()

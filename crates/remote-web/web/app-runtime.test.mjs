@@ -156,6 +156,7 @@ const {
   enqueueVideoProgress,
   reportVideoProgressBeforePageHide,
   containerInitialImageIndex,
+  containerResumeRefusalNotice,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
@@ -1250,6 +1251,16 @@ test("container opening resumes the matching page and otherwise falls back safel
     resumePage: images[1].address,
     images,
   }), -1);
+  for (const resumeRefusal of ["saved_page_unavailable", "legacy_position_unverified"]) {
+    assert.equal(containerInitialImageIndex({
+      openMode: "resume_page",
+      resumePage: null,
+      resumeRefusal,
+      images,
+    }), -1);
+    assert.match(containerResumeRefusalNotice(resumeRefusal), /一覧からページを選んでください/);
+  }
+  assert.equal(containerResumeRefusalNotice(null), "");
 });
 
 test("a collection root returns to its list without exposing a root kind", () => {
@@ -4692,6 +4703,53 @@ test("folder rating fallback notice is visible on the rendered grid", async () =
     assert.equal(notice.textContent, noticeText);
   } finally {
     globalThis.fetch = imageFetch;
+  }
+});
+
+test("visibility resume refusals remain on the grid with a visible selection notice", () => {
+  const previousResizeObserver = globalThis.ResizeObserver;
+  const previousHistory = globalThis.history;
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  globalThis.history = { state: {} };
+  const address = { path: testPath("refused-book"), subresource: { kind: "file" } };
+  const entry = {
+    kind: "image",
+    name: "002.jpg",
+    address: { path: testPath("refused-book/002.jpg"), subresource: { kind: "file" } },
+  };
+  const findNotice = (node) => {
+    if (node.classList?.contains("grid-action-notice") ||
+        String(node.className ?? "").split(/\s+/).includes("grid-action-notice")) return node;
+    for (const child of node.children ?? []) {
+      const found = findNotice(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  try {
+    for (const reason of ["saved_page_unavailable", "legacy_position_unverified"]) {
+      applyContainerData(address, {
+        kind: "folder",
+        effective_address: address,
+        entries: [entry],
+        page_groups: [{ anchor: entry.address, pages: [entry.address], slice: "full" }],
+        image_count: 1,
+        resume_page: null,
+        resume_refusal: reason,
+        open_mode: "grid",
+      }, false);
+      const installed = containerRuntimeStateForTest().container;
+      assert.equal(installed.resumeRefusal, reason);
+      assert.equal(containerInitialImageIndex({ ...installed, images: [entry] }), -1);
+      renderFolder();
+      const notice = findNotice(app);
+      assert.ok(notice);
+      assert.equal(notice.hidden, false);
+      assert.equal(notice.textContent, containerResumeRefusalNotice(reason));
+    }
+  } finally {
+    globalThis.ResizeObserver = previousResizeObserver;
+    globalThis.history = previousHistory;
   }
 });
 

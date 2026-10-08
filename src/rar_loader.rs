@@ -508,6 +508,7 @@ pub fn enumerate_image_entries_detailed_with_cancel(
             continue;
         };
         entries.push(ZipImageEntry {
+            container_ancestry: Vec::new(),
             entry_name,
             uncompressed_size: entry.unpacked_size,
             mtime,

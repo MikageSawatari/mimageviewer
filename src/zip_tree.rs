@@ -32,16 +32,18 @@ use crate::settings::SortOrder;
 use crate::zip_loader::{ZipImageEntry, entry_basename, entry_dir};
 
 /// 開いている外側 ZIP の階層ツリー (列挙完了時に構築し、ナビ中は保持)。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZipTree {
     /// 外側 ZIP の実ファイルパス (= 仮想フォルダのルート identity)。
     pub zip_path: PathBuf,
     /// ルート階層 (ZIP 直下)。
     pub root: ZipTreeNode,
+    // Cleanup always sees the complete unprojected enumeration, including excluded rows.
+    pub(crate) source_cache_keys: Option<Vec<String>>,
 }
 
 /// ツリーの 1 階層。子ディレクトリ (内側アーカイブ含む) と、その階層直下の画像を持つ。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ZipTreeNode {
     /// 子ディレクトリ / 内側アーカイブ。
     /// キーは `entry_name` のセグメント文字列を**そのまま** (case 等を改変せず) 保持する。
@@ -51,6 +53,7 @@ pub struct ZipTreeNode {
     /// この階層直下の画像。`entry_name` はフルパスを保持する (DB キー・
     /// `read_entry_bytes` 互換)。並びは列挙順 (= ZIP 内出現順)。
     pub images: Vec<ZipImageEntry>,
+    pub(crate) directory_ancestry: Option<Vec<crate::archive_origin::ArchiveContainerOrigin>>,
 }
 
 impl ZipTree {
@@ -74,12 +77,80 @@ impl ZipTree {
             }
             let dir = entry_dir(&entry.entry_name);
             let mut node = &mut root;
+            let mut prefix = String::new();
             for seg in dir.split('/').filter(|s| !s.is_empty()) {
+                prefix.push_str(seg);
+                prefix.push('/');
                 node = node.dirs.entry(seg.to_string()).or_default();
+                // Physical directories are structural rows; only actual archive boundaries are filtered.
+                let within_archive = entry
+                    .container_ancestry
+                    .iter()
+                    .any(|origin| prefix == origin.navigation_prefix);
+                if !within_archive {
+                    let ancestors: Vec<_> = entry
+                        .container_ancestry
+                        .iter()
+                        .filter(|origin| prefix.starts_with(&origin.navigation_prefix))
+                        .cloned()
+                        .collect();
+                    node.directory_ancestry.get_or_insert(ancestors);
+                }
             }
             node.images.push(entry);
         }
-        Self { zip_path, root }
+        Self {
+            zip_path,
+            root,
+            source_cache_keys: None,
+        }
+    }
+
+    /// Pure display projection. The raw tree and its cleanup identities remain unchanged.
+    pub fn project(&self, policy: &crate::file_type_visibility::FileTypeVisibility) -> Self {
+        fn project_node(
+            node: &ZipTreeNode,
+            policy: &crate::file_type_visibility::FileTypeVisibility,
+        ) -> ZipTreeNode {
+            let directory_ancestry = node
+                .directory_ancestry
+                .as_ref()
+                .filter(|ancestors| ancestors.iter().all(|origin| origin.allows(policy)))
+                .cloned();
+            let images = node
+                .images
+                .iter()
+                .filter(|entry| {
+                    policy.allows_physical_file(std::path::Path::new(&entry.entry_name))
+                        && entry
+                            .container_ancestry
+                            .iter()
+                            .all(|origin| origin.allows(policy))
+                })
+                .cloned()
+                .collect();
+            let dirs = node
+                .dirs
+                .iter()
+                .filter_map(|(name, child)| {
+                    let projected = project_node(child, policy);
+                    (projected.directory_ancestry.is_some()
+                        || !projected.images.is_empty()
+                        || !projected.dirs.is_empty())
+                    .then_some((name.clone(), projected))
+                })
+                .collect();
+            ZipTreeNode {
+                images,
+                dirs,
+                directory_ancestry,
+            }
+        }
+        Self {
+            zip_path: self.zip_path.clone(),
+            root: project_node(&self.root, policy),
+            source_cache_keys: Some(self.all_cache_keys()),
+        }
     }
 
     /// `prefix` (セグメント列、空 = ルート) が指す階層ノードを返す。
@@ -248,6 +319,9 @@ impl ZipTree {
     /// ため、ここで**全階層**のキーを集めて渡さないと、深い階層のサムネが再オープン時に
     /// stale 削除されて再生成ループになる (Phase 2 Codex P2)。
     pub fn all_cache_keys(&self) -> Vec<String> {
+        if let Some(keys) = &self.source_cache_keys {
+            return keys.clone();
+        }
         let mut keys = Vec::new();
         let mut prefix: Vec<String> = Vec::new();
         collect_cache_keys(&self.root, &mut prefix, &mut keys);
@@ -603,6 +677,7 @@ mod tests {
             entry_name: name.to_string(),
             uncompressed_size: 0,
             mtime: 0,
+            container_ancestry: Vec::new(),
         }
     }
 
@@ -1029,6 +1104,7 @@ mod tests {
                 entry_name: "a.jpg".to_string(),
                 uncompressed_size: 1234,
                 mtime: 99,
+                container_ancestry: Vec::new(),
             }],
         );
         let (items, metas) = t.materialize_level(&[], SortOrder::FileName);

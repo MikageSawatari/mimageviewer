@@ -36,6 +36,8 @@ pub(crate) struct ScannedMediaEntry {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OmittedFolderEntryCounts {
     pub(crate) same_name: usize,
+    /// Recognized entries excluded by the global file-type policy.
+    pub(crate) file_type: usize,
     pub(crate) hidden: usize,
     /// 環境設定の書庫処理が「無視する」のため一覧へ出さなかった変換対象書庫。
     pub(crate) ignored_archive: usize,
@@ -55,6 +57,7 @@ impl OmittedFolderEntryCounts {
     /// ノイズ源を名前で `system` に分離し、それ以外は全部数えるほうが目的に合う。
     pub(crate) fn primary_count(self) -> usize {
         self.same_name
+            .saturating_add(self.file_type)
             .saturating_add(self.hidden)
             .saturating_add(self.ignored_archive)
             .saturating_add(self.ignored_epub)
@@ -88,6 +91,10 @@ pub(crate) struct ScannedDir {
     pub all_media: Vec<ScannedMediaEntry>,
     /// 走査時点で一覧へ出さなかった項目。`same_name` は後段の同名 filter 適用時に入る。
     pub omitted: OmittedFolderEntryCounts,
+    /// Auxiliary image sidecars remain available even when images are hidden.
+    pub video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
+    /// Policy-hidden images used by a visible video remain change-detection sources.
+    pub auxiliary_sidecar_stamps: Vec<ScannedMediaEntry>,
 }
 
 /// App::load_folder が走査結果から実際の一覧を組み立てた結果。
@@ -176,15 +183,14 @@ pub(crate) fn discover_aggregate_video_sidecars_while(
         if !keep_running() {
             return None;
         }
-        let mut scan = match scan_directory_with_settings(&parent, settings) {
+        let scan = match scan_directory_with_settings(&parent, settings) {
             Ok(scan) => scan,
             Err(error) => {
                 result.scan_errors.push((parent, error.to_string()));
                 continue;
             }
         };
-        let found = filter_video_image_duplicates(&mut scan.all_media, true);
-        for (video, image) in found.sidecars {
+        for (video, image) in scan.video_thumb_overrides {
             let key = crate::path_key::normalize_keep_drive(&video);
             if requested.contains(&key) {
                 result.by_video_path.insert(key, image);
@@ -220,6 +226,13 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     request: crate::rating_sort::ListingOrderRequest,
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
 ) -> MaterializedFolderListing {
+    let mut scan = scan;
+    if settings.skip_image_if_video_exists && settings.video_thumb_use_sidecar_image {
+        scan.video_thumb_overrides
+            .extend(discover_scanned_video_sidecars(&scan.all_media));
+    }
+    project_scanned_directory(&mut scan, &settings.file_type_visibility);
+    let preserved_sidecars = scan.video_thumb_overrides.clone();
     let mut omitted = scan.omitted;
     let mut folders = Vec::with_capacity(scan.folders.len());
     let mut metas = Vec::with_capacity(scan.folders.len());
@@ -311,7 +324,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
             &mut sort_metas,
         ));
     }
-    let video_thumb_overrides = if settings.skip_image_if_video_exists {
+    let mut video_thumb_overrides = if settings.skip_image_if_video_exists {
         let filtered =
             filter_video_image_duplicates(&mut all_media, settings.video_thumb_use_sidecar_image);
         same_name = same_name.saturating_add(filtered.omitted);
@@ -319,6 +332,22 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     } else {
         Vec::new()
     };
+    if settings.skip_image_if_video_exists && settings.video_thumb_use_sidecar_image {
+        let visible_videos = all_media
+            .iter()
+            .filter(|entry| entry.kind == ScanMediaKind::Video)
+            .map(|entry| entry.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut assigned = video_thumb_overrides
+            .iter()
+            .map(|(video, _)| video.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for (video, image) in preserved_sidecars {
+            if visible_videos.contains(&video) && assigned.insert(video.clone()) {
+                video_thumb_overrides.push((video, image));
+            }
+        }
+    }
     if settings.skip_duplicate_images {
         same_name = same_name.saturating_add(filter_image_ext_duplicates(
             &mut all_media,
@@ -438,6 +467,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageFolderPageCountOptions {
+    pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) include_convertible_archives: bool,
     pub(crate) include_epub: bool,
     pub(crate) show_hidden_files: bool,
@@ -453,6 +483,7 @@ pub(crate) fn image_folder_page_count_options(
     // Even when auto-open is disabled, image-only child folders should expose
     // the same background-loaded page count as ZIP and PDF containers.
     ImageFolderPageCountOptions {
+        file_type_visibility: settings.file_type_visibility.clone(),
         include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
         include_epub: !settings.epub_file_handling_ignores_epub(),
         show_hidden_files: settings.show_hidden_files,
@@ -484,7 +515,12 @@ fn image_page_recognition_fingerprint_with_native_extensions(
             hash = hash.wrapping_mul(0x100000001b3);
         }
     };
-    mix(b"image-folder-page-count-v1\0");
+    mix(b"image-folder-page-count-v2\0");
+    mix(&settings.file_type_visibility.fingerprint().to_le_bytes());
+    mix(&[u8::from(settings.skip_image_if_video_exists)]);
+    mix(&[u8::from(settings.skip_zip_if_folder_exists)]);
+    mix(&[u8::from(settings.skip_archive_if_zip_exists)]);
+    mix(&[u8::from(settings.skip_epub_if_pdf_exists)]);
     mix(&[u8::from(settings.show_hidden_files)]);
     mix(&[u8::from(settings.skip_duplicate_images)]);
     mix(&[u8::from(
@@ -527,8 +563,10 @@ pub(crate) fn image_folder_page_count(
         options.include_convertible_archives,
         options.include_epub,
         options.show_hidden_files,
+        &options.file_type_visibility,
         None,
     )?;
+    project_scanned_directory(&mut scan, &options.file_type_visibility);
     if !is_image_only_book_contents(!scan.folders.is_empty(), &scan.all_media) {
         return Ok(None);
     }
@@ -571,6 +609,8 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
             folders: Vec::new(),
             all_media: Vec::new(),
             omitted: OmittedFolderEntryCounts::default(),
+            video_thumb_overrides: Vec::new(),
+            auxiliary_sidecar_stamps: Vec::new(),
         }
     })
 }
@@ -579,11 +619,77 @@ pub(crate) fn scan_directory_with_settings(
     path: &std::path::Path,
     settings: &crate::settings::Settings,
 ) -> std::io::Result<ScannedDir> {
-    scan_directory_with_convertible_archives(
+    scan_directory_with_visibility_cancel(
         path,
         !settings.archive_file_handling_ignores_convertible(),
         !settings.epub_file_handling_ignores_epub(),
         settings.show_hidden_files,
+        &settings.file_type_visibility,
+        None,
+    )
+}
+
+/// Project recognized candidates before duplicate winners and book recognition are computed.
+/// Directories are structural passages and always survive the global policy.
+pub(crate) fn project_scanned_directory(
+    scan: &mut ScannedDir,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) {
+    // Capture before projection: hidden images still provide video thumbnails and
+    // must invalidate those thumbnails when edited while the application is unfocused.
+    let sidecar_paths = scan
+        .video_thumb_overrides
+        .iter()
+        .filter(|(video, _)| policy.allows_physical_file(video))
+        .map(|(_, image)| image)
+        .collect::<std::collections::HashSet<_>>();
+    for entry in &scan.all_media {
+        if entry.kind == ScanMediaKind::Image
+            && !policy.allows_physical_file(&entry.path)
+            && sidecar_paths.contains(&entry.path)
+            && !scan
+                .auxiliary_sidecar_stamps
+                .iter()
+                .any(|stamp| stamp.path == entry.path)
+        {
+            scan.auxiliary_sidecar_stamps.push(entry.clone());
+        }
+    }
+    let before = scan.folders.len() + scan.all_media.len();
+    scan.folders
+        .retain(|entry| policy.allows_grid_item(&entry.item));
+    scan.all_media
+        .retain(|entry| policy.allows_physical_file(&entry.path));
+    scan.video_thumb_overrides
+        .retain(|(video, _)| policy.allows_physical_file(video));
+    scan.omitted.file_type = scan
+        .omitted
+        .file_type
+        .saturating_add(before.saturating_sub(scan.folders.len() + scan.all_media.len()));
+}
+
+pub(crate) fn discover_scanned_video_sidecars(
+    media: &[ScannedMediaEntry],
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut candidates = media.to_vec();
+    filter_video_image_duplicates(&mut candidates, true).sidecars
+}
+
+pub(crate) fn scan_directory_with_visibility_cancel(
+    path: &std::path::Path,
+    include_convertible_archives: bool,
+    include_epub: bool,
+    show_hidden_files: bool,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<ScannedDir> {
+    scan_directory_entries(
+        std::fs::read_dir(path)?,
+        include_convertible_archives,
+        include_epub,
+        show_hidden_files,
+        policy,
+        cancel,
     )
 }
 
@@ -615,6 +721,7 @@ pub(crate) fn scan_directory_with_convertible_archives_cancel(
         include_convertible_archives,
         include_epub,
         show_hidden_files,
+        &crate::file_type_visibility::FileTypeVisibility::default(),
         cancel,
     )
 }
@@ -624,6 +731,7 @@ fn scan_directory_entries<I>(
     include_convertible_archives: bool,
     include_epub: bool,
     show_hidden_files: bool,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ScannedDir>
 where
@@ -659,7 +767,9 @@ where
         // OS 由来の付随ファイルはどの経路で落ちても `system` に寄せる。分類だけで、
         // 一覧へ出す / 出さないの判定は一切変えない。
         let is_system_file = is_system_metadata_name(&entry_name);
-        entry_file_names_ci.insert(entry_name);
+        if kind.is_directory() || policy.allows_physical_file(&entry.path()) {
+            entry_file_names_ci.insert(entry_name);
+        }
         if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
             if is_system_file {
                 omitted.system = omitted.system.saturating_add(1);
@@ -767,12 +877,17 @@ where
             }
         }
     }
-    filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
-    Ok(ScannedDir {
+    let video_thumb_overrides = discover_scanned_video_sidecars(&all_media);
+    let mut scan = ScannedDir {
         folders,
         all_media,
         omitted,
-    })
+        video_thumb_overrides,
+        auxiliary_sidecar_stamps: Vec::new(),
+    };
+    project_scanned_directory(&mut scan, policy);
+    filter_upscaled_video_pairs_fast(&mut scan.all_media, &entry_file_names_ci);
+    Ok(scan)
 }
 
 #[derive(Debug, Default)]
@@ -1220,6 +1335,14 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> FolderScanSignature {
         };
         entries.push((entry.path.as_os_str(), entry.mtime, entry.file_size, kind));
     }
+    for entry in &scan.auxiliary_sidecar_stamps {
+        entries.push((
+            entry.path.as_os_str(),
+            entry.mtime,
+            entry.file_size,
+            "image",
+        ));
+    }
     entries.sort();
     let mut hasher = DefaultHasher::new();
     let mut listing_hasher = DefaultHasher::new();
@@ -1290,6 +1413,8 @@ pub(crate) mod signature_tests {
             folders,
             all_media,
             omitted: Default::default(),
+            video_thumb_overrides: Vec::new(),
+            auxiliary_sidecar_stamps: Vec::new(),
         }
     }
 
@@ -1353,6 +1478,43 @@ pub(crate) mod signature_tests {
             }
         }
         cases
+    }
+
+    #[test]
+    fn hidden_video_sidecar_remains_in_focus_return_signature() {
+        let mut scan = fixture(std::path::Path::new("sidecar_fixture"));
+        let image = scan
+            .all_media
+            .iter()
+            .find(|entry| entry.kind == ScanMediaKind::Image)
+            .unwrap()
+            .path
+            .clone();
+        let video = scan
+            .all_media
+            .iter()
+            .find(|entry| entry.kind == ScanMediaKind::Video)
+            .unwrap()
+            .path
+            .clone();
+        scan.video_thumb_overrides.push((video, image.clone()));
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Image);
+        project_scanned_directory(&mut scan, &policy);
+        assert!(!scan.all_media.iter().any(|entry| entry.path == image));
+        assert_eq!(scan.auxiliary_sidecar_stamps.len(), 1);
+        let before = signature_from_scan(&scan);
+        project_scanned_directory(&mut scan, &policy);
+        assert_eq!(
+            before,
+            signature_from_scan(&scan),
+            "reprojection cannot duplicate auxiliary stamps"
+        );
+        scan.auxiliary_sidecar_stamps[0].mtime += 1;
+        assert_ne!(before, signature_from_scan(&scan));
+        assert!(!before.same_listing(signature_from_scan(&scan)));
     }
 
     #[test]
@@ -1454,6 +1616,7 @@ mod page_count_tests {
 
     fn options(skip_duplicate_images: bool) -> ImageFolderPageCountOptions {
         ImageFolderPageCountOptions {
+            file_type_visibility: Default::default(),
             include_convertible_archives: true,
             include_epub: true,
             show_hidden_files: true,
@@ -1636,6 +1799,8 @@ mod page_count_tests {
                 })
                 .collect(),
             omitted: OmittedFolderEntryCounts::default(),
+            video_thumb_overrides: Vec::new(),
+            auxiliary_sidecar_stamps: Vec::new(),
         };
         let mut settings = crate::settings::Settings::default();
         settings.skip_duplicate_images = true;
@@ -1699,6 +1864,7 @@ mod page_count_tests {
     #[test]
     fn unsupported_files_are_counted_but_system_files_are_not() {
         let counts = OmittedFolderEntryCounts {
+            file_type: 0,
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
@@ -1713,6 +1879,7 @@ mod page_count_tests {
         );
 
         let system_only = OmittedFolderEntryCounts {
+            file_type: 0,
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
@@ -1748,6 +1915,8 @@ mod page_count_tests {
                 media("zero.jpg", 0, true),
             ],
             omitted: OmittedFolderEntryCounts::default(),
+            video_thumb_overrides: Vec::new(),
+            auxiliary_sidecar_stamps: Vec::new(),
         };
         let mut settings = crate::settings::Settings::default();
         settings.sort_order = crate::settings::SortOrder::SizeAsc;
@@ -1786,6 +1955,7 @@ mod page_count_tests {
     #[test]
     fn ignored_archive_reclassification_preserves_the_primary_total() {
         let counts = OmittedFolderEntryCounts {
+            file_type: 0,
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
@@ -1949,10 +2119,11 @@ mod page_count_tests {
             )),
         ];
 
-        let error = match scan_directory_entries(entries, true, true, false, None) {
-            Ok(_) => panic!("a partial directory snapshot must not be published"),
-            Err(error) => error,
-        };
+        let error =
+            match scan_directory_entries(entries, true, true, false, &Default::default(), None) {
+                Ok(_) => panic!("a partial directory snapshot must not be published"),
+                Err(error) => error,
+            };
 
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
     }
@@ -2043,5 +2214,130 @@ mod page_count_tests {
             );
         }
         assert_eq!(settings.image_ext_priority, saved_priority);
+    }
+}
+
+#[cfg(test)]
+mod file_type_visibility_tests {
+    use super::*;
+    use crate::file_type_visibility::FileTypeCategory;
+
+    fn fixture(names: &[&str]) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        for name in names {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        temp
+    }
+
+    #[test]
+    fn policy_precedes_same_name_winners_and_keeps_aligned_metadata() {
+        let temp = fixture(&[
+            "movie.mp4",
+            "movie.jpg",
+            "book.zip",
+            "book.rar",
+            "raw.cr2",
+            "._page.jpg",
+        ]);
+        std::fs::create_dir(temp.path().join("passage.zip")).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.file_type_visibility.excluded_categories.extend([
+            FileTypeCategory::Video,
+            FileTypeCategory::Zip,
+            FileTypeCategory::Raw,
+        ]);
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        assert_eq!(scan.omitted.file_type, 3);
+        assert_eq!(scan.omitted.system, 1);
+        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let names = listing
+            .items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"movie.jpg".to_owned()));
+        assert!(names.contains(&"book.rar".to_owned()));
+        assert!(names.contains(&"passage.zip".to_owned()));
+        assert_eq!(listing.items.len(), listing.metas.len());
+        assert_eq!(listing.items.len(), listing.sort_metas.len());
+        assert_eq!(listing.omitted.file_type, 3);
+        assert_eq!(listing.omitted.same_name, 0);
+    }
+
+    #[test]
+    fn hidden_images_remain_video_sidecar_resources() {
+        let temp = fixture(&["movie.mp4", "movie.jpg"]);
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_image_if_video_exists = true;
+        settings.video_thumb_use_sidecar_image = true;
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Image);
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        assert_eq!(listing.items.len(), 1);
+        assert!(matches!(listing.items[0], GridItem::Video(_)));
+        assert_eq!(listing.omitted.file_type, 1);
+        assert_eq!(listing.omitted.same_name, 0);
+        assert_eq!(
+            listing.video_thumb_overrides,
+            vec![(temp.path().join("movie.mp4"), temp.path().join("movie.jpg"))]
+        );
+    }
+
+    #[test]
+    fn visible_projection_controls_image_book_count_and_fingerprint() {
+        let temp = fixture(&["page.jpg", "page.png", "clip.mp4", "book.zip"]);
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_duplicate_images = true;
+        let old = image_page_recognition_fingerprint(&settings);
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .extend([FileTypeCategory::Video, FileTypeCategory::Zip]);
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        assert_ne!(old, image_page_recognition_fingerprint(&settings));
+        assert_eq!(
+            image_folder_page_count(temp.path(), &image_folder_page_count_options(&settings))
+                .unwrap(),
+            Some(1)
+        );
+        std::fs::create_dir(temp.path().join("child")).unwrap();
+        assert_eq!(
+            image_folder_page_count(temp.path(), &image_folder_page_count_options(&settings))
+                .unwrap(),
+            None
+        );
+        std::fs::remove_dir(temp.path().join("child")).unwrap();
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Image);
+        assert_eq!(
+            image_folder_page_count(temp.path(), &image_folder_page_count_options(&settings))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_upscaled_derivative_does_not_remove_visible_original() {
+        let temp = fixture(&["movie.mp4", "movie.miv.mkv", "movie.jpg"]);
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("mkv".into());
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        assert!(
+            scan.all_media
+                .iter()
+                .any(|entry| entry.path == temp.path().join("movie.mp4"))
+        );
     }
 }

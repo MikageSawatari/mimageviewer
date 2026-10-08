@@ -1864,6 +1864,8 @@ pub enum ToolbarFacetFilterItem {
     Edit,
     Color,
     NameFilter,
+    /// 全体の永続種類設定を開く任意登録ボタン。
+    FileTypeVisibility,
     /// 未知のボタン (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     #[serde(other)]
     Unknown,
@@ -1884,6 +1886,7 @@ impl ToolbarFacetFilterItem {
             Self::Edit,
             Self::Color,
             Self::NameFilter,
+            Self::FileTypeVisibility,
         ]
     }
 
@@ -1901,6 +1904,7 @@ impl ToolbarFacetFilterItem {
             Self::Edit => "状態",
             Self::Color => "画像色",
             Self::NameFilter => "ファイル名",
+            Self::FileTypeVisibility => "表示するファイル種類",
             Self::Unknown => "不明",
         }
     }
@@ -4740,6 +4744,9 @@ pub struct Settings {
     pub exif_hidden_tags: Vec<String>,
 
     // ── 同名ファイル処理 ──────────────────────────────────────────
+    /// 一覧生成前に適用する全体の種類設定。空の除外集合は全表示。
+    #[serde(default)]
+    pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     /// 同名の ZIP ファイルとフォルダがある場合、ZIP をスキップする
     #[serde(default = "default_true")]
     pub skip_zip_if_folder_exists: bool,
@@ -7180,7 +7187,11 @@ pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
 pub(crate) fn default_toolbar_facet_filter_items() -> Vec<ToolbarFacetFilterItem> {
-    ToolbarFacetFilterItem::all().to_vec()
+    ToolbarFacetFilterItem::all()
+        .iter()
+        .copied()
+        .filter(|item| *item != ToolbarFacetFilterItem::FileTypeVisibility)
+        .collect()
 }
 pub fn default_rating_filter() -> [bool; 6] {
     [true; 6]
@@ -7414,6 +7425,7 @@ impl Default for Settings {
             skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
             skip_duplicate_images: true,
+            file_type_visibility: crate::file_type_visibility::FileTypeVisibility::default(),
             image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
             slideshow_continuous_wait_secs: default_slideshow_continuous_wait_secs(),
@@ -11639,7 +11651,7 @@ mod tests {
         );
         assert_eq!(
             s.toolbar_facet_filter_items,
-            ToolbarFacetFilterItem::all().to_vec(),
+            default_toolbar_facet_filter_items(),
             "絞り込みバーのボタンは旧 settings 欠落時に全表示"
         );
         assert!(
@@ -13946,7 +13958,7 @@ mod tests {
         assert!(s.show_location_drive_roots);
         assert_eq!(
             s.toolbar_facet_filter_items,
-            ToolbarFacetFilterItem::all().to_vec()
+            default_toolbar_facet_filter_items()
         );
         assert_eq!(s.menu_layout, crate::keymap::MenuLayoutSettings::default());
         assert!(s.use_native_shell_context_menu);
@@ -14394,6 +14406,72 @@ mod tests {
     }
 
     // -- Settings JSON roundtrip --
+
+    #[test]
+    fn file_type_visibility_settings_default_roundtrip_and_future_category() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.file_type_visibility.is_all_visible());
+        assert!(
+            !old.toolbar_facet_filter_items
+                .contains(&ToolbarFacetFilterItem::FileTypeVisibility)
+        );
+        let mut settings = old;
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Raw);
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        settings.toolbar_facet_filter_items = vec![
+            ToolbarFacetFilterItem::FileTypeVisibility,
+            ToolbarFacetFilterItem::Kind,
+        ];
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.file_type_visibility, settings.file_type_visibility);
+        assert_eq!(
+            loaded.toolbar_facet_filter_items,
+            settings.toolbar_facet_filter_items
+        );
+        assert_eq!(
+            ToolbarFacetFilterItem::visible_order(&[
+                ToolbarFacetFilterItem::FileTypeVisibility,
+                ToolbarFacetFilterItem::Unknown,
+                ToolbarFacetFilterItem::FileTypeVisibility,
+            ]),
+            vec![ToolbarFacetFilterItem::FileTypeVisibility]
+        );
+        assert!(
+            serde_json::from_str::<Settings>(
+                r#"{"file_type_visibility":{"excluded_categories":["future"]}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_type_visibility_settings_db_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Video);
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("cr2".into());
+        db.save_full(&settings).unwrap();
+        drop(db);
+        let db = crate::settings_db::SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().file_type_visibility,
+            settings.file_type_visibility
+        );
+    }
 
     #[test]
     fn settings_roundtrip_json() {

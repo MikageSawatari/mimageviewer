@@ -92,14 +92,23 @@ fn book_resume_meter_records_hud_ordinal_in_mixed_items() {
         );
         app.record_book_resume(idx);
         assert_eq!(
-            app.last_book_resume,
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
             Some((book.clone(), idx, meter(ordinal, 3)))
         );
         assert_eq!(app.book_resume_meters.get(&book), meter(ordinal, 3));
     }
     app.record_book_resume(1);
     app.record_book_resume(2);
-    assert_eq!(app.last_book_resume, Some((book.clone(), 4, meter(3, 3))));
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        Some((book.clone(), 4, meter(3, 3)))
+    );
     settle(&mut app);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
@@ -127,7 +136,12 @@ fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
         Some("2 / 4")
     );
     app.record_book_resume(1);
-    assert_eq!(app.last_book_resume, Some((book.clone(), 1, meter(2, 4))));
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        Some((book.clone(), 1, meter(2, 4)))
+    );
 
     app.spread_mode = SpreadMode::Rtl;
     assert_eq!(
@@ -135,7 +149,12 @@ fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
         Some("2, 1 / 4")
     );
     app.record_book_resume(1);
-    assert_eq!(app.last_book_resume, Some((book.clone(), 1, meter(2, 4))));
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        Some((book.clone(), 1, meter(2, 4)))
+    );
     assert_eq!(app.book_resume_meters.get(&book), meter(2, 4));
 }
 
@@ -215,7 +234,12 @@ fn book_resume_meter_pending_snapshot_replays_record_remove_and_clear() {
     app.reload_book_resume_meters();
     writer_ack(app.book_resume_writer.as_ref().unwrap());
     app.clear_book_resume_async();
-    assert_eq!(app.last_book_resume, None);
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        None
+    );
     app.persist_book_resume(keep.clone(), 1, meter(2, 3));
     app.poll_book_resume_meters(&egui::Context::default());
     assert_eq!(app.book_resume_meters.get(&keep), meter(2, 3));
@@ -257,14 +281,22 @@ fn book_resume_meter_reload_preserves_latest_pending_resume_source() {
     let latest = Some((book.clone(), 7, value));
     app.reload_book_resume_meters();
     assert_eq!(
-        app.last_book_resume, latest,
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        latest,
         "Remoteの直近raw位置は再読込で失わない"
     );
     assert_eq!(app.book_resume_meters.get(&book), value);
 
     resume.send(()).unwrap();
     settle(&mut app);
-    assert_eq!(app.last_book_resume, latest);
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        latest
+    );
     assert_eq!(app.book_resume_meters.get(&book), value);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
@@ -1050,4 +1082,30 @@ fn book_resume_meter_archive_cache_rows_and_error_do_not_invalidate_sources() {
         );
         assert_eq!(app.thumbnail_book_resume_meter(0), meter(2, 5));
     }
+}
+
+#[test]
+fn book_resume_identity_write_retains_exact_page_and_raw_record_together() {
+    let mut app = setup_app();
+    settle(&mut app);
+    let book = app.tmp.path().join("identity-book");
+    app.current_folder = Some(book.clone());
+    let page = GridItem::Image(book.join("2.png"));
+    set_pages(
+        &mut app,
+        vec![GridItem::Image(book.join("1.jpg")), page.clone()],
+    );
+    app.record_book_resume(1);
+    settle(&mut app);
+    let stored = app
+        .book_resume_db
+        .as_ref()
+        .unwrap()
+        .get_position(&book)
+        .unwrap();
+    assert_eq!(stored.page, 1);
+    assert_eq!(
+        stored.identity,
+        crate::book_resume_db::PageIdentity::for_item(&page, None)
+    );
 }

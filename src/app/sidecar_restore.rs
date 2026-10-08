@@ -149,7 +149,7 @@ struct Common {
     data_dir: PathBuf,
     families: crate::sidecar_import::ImportFamilies,
     tag_item_keys: Vec<String>,
-    source_path: PathBuf,
+    source_path: Option<PathBuf>,
     continuation: ContinuationOwner,
     deferred_fullscreen: Option<DeferredFullscreen>,
     favorite_failures: Vec<crate::favorite_view_state::FavoriteViewStoreCommand>,
@@ -181,6 +181,7 @@ impl DeferredFullscreen {
 
 enum ContinuationOwner {
     Live(SidecarLoadContinuation),
+    IndexOnly { cancel: Arc<AtomicBool> },
     Discarded { cancel: Arc<AtomicBool> },
 }
 
@@ -188,14 +189,14 @@ impl ContinuationOwner {
     fn cancel(&self) -> &Arc<AtomicBool> {
         match self {
             Self::Live(continuation) => &continuation.cancel,
-            Self::Discarded { cancel } => cancel,
+            Self::IndexOnly { cancel } | Self::Discarded { cancel } => cancel,
         }
     }
 
     fn discard(&mut self) -> bool {
         let cancel = Arc::clone(self.cancel());
         cancel.store(true, Ordering::Relaxed);
-        let was_live = matches!(self, Self::Live(_));
+        let was_live = matches!(self, Self::Live(_) | Self::IndexOnly { .. });
         if was_live {
             *self = Self::Discarded { cancel };
         }
@@ -205,7 +206,7 @@ impl ContinuationOwner {
     fn take_live(self) -> Option<SidecarLoadContinuation> {
         match self {
             Self::Live(continuation) => Some(continuation),
-            Self::Discarded { .. } => None,
+            Self::IndexOnly { .. } | Self::Discarded { .. } => None,
         }
     }
 }
@@ -382,7 +383,25 @@ struct RestoreTerminal {
     warning: Option<String>,
 }
 
+enum PageIndexContinuation {
+    RestoreSidecar,
+    ResumeDisplay,
+    PrepareOnly(PageIndexPublication),
+}
+
+#[derive(Clone, Copy)]
+enum PageIndexPublication {
+    CurrentListing,
+    SnapshotListView,
+}
+
+struct PreparingPageIndex {
+    rx: Receiver<super::file_type_resume::PreparedPageIdentityIndex>,
+    next: PageIndexContinuation,
+}
+
 enum Phase {
+    PreparingPageIndex(PreparingPageIndex),
     Checking(Checking),
     Quiescing(Quiescing),
     Running(Running),
@@ -404,6 +423,7 @@ enum PhaseName {
 impl Phase {
     fn name(&self) -> PhaseName {
         match self {
+            Self::PreparingPageIndex(_) => PhaseName::Resuming,
             Self::Checking(_) => PhaseName::Checking,
             Self::Quiescing(_) => PhaseName::Quiescing,
             Self::Running(_) => PhaseName::Running,
@@ -573,6 +593,18 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    pub(super) fn defer_main_list_action(
+        &mut self,
+        action: super::MainListAfterHydration,
+    ) -> Result<(), super::MainListAfterHydration> {
+        if let ContinuationOwner::Live(continuation) = &mut self.common.continuation {
+            continuation.navigation_after_hydration = Some(action);
+            Ok(())
+        } else {
+            Err(action)
+        }
+    }
+
     pub(crate) fn target_context(&self) -> ViewerContextId {
         self.common.target_context
     }
@@ -650,6 +682,17 @@ impl App {
         self.sidecar_restore.is_some()
     }
 
+    /// Index-only preparation follows an already-installed list. It gates exact page opens,
+    /// but has no hydration continuation in which to replay list/cursor adoption.
+    pub(super) fn sidecar_restore_list_adoption_blocked(&self) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            !matches!(
+                state.common.continuation,
+                ContinuationOwner::IndexOnly { .. }
+            )
+        })
+    }
+
     pub(super) fn defer_startup_list_adoption(
         &mut self,
         intent: &super::StartupListIntent,
@@ -659,8 +702,15 @@ impl App {
         };
         if let ContinuationOwner::Live(continuation) = &mut state.common.continuation {
             continuation.restore_intent = intent.clone();
+            true
+        } else {
+            // IndexOnly gates exact page opens, not list/cursor adoption. It has no
+            // hydration continuation in which to retain and replay that intent.
+            !matches!(
+                state.common.continuation,
+                ContinuationOwner::IndexOnly { .. }
+            )
         }
-        true
     }
 
     /// Whether the currently projected viewer is the restore target.
@@ -689,6 +739,47 @@ impl App {
                     .deferred_fullscreen
                     .as_ref()
                     .is_some_and(|deferred| deferred.matches_item(&self.items))
+        })
+    }
+
+    /// A fresh detached media builder may publish the existing exact open while hydration
+    /// prepares its first display. Only that live context's unchanged target is admitted.
+    #[cfg(windows)]
+    pub(super) fn sidecar_restore_deferred_media_target(&self, requested: &Path) -> Option<usize> {
+        let state = self.sidecar_restore.as_ref()?;
+        if !self.sidecar_restore_context_current(&state.common) {
+            return None;
+        }
+        let ContinuationOwner::Live(continuation) = &state.common.continuation else {
+            return None;
+        };
+        if !continuation.detached_physical
+            || continuation.items_len != self.items.len()
+            || continuation.cancel.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let deferred = state.common.deferred_fullscreen.as_ref()?;
+        if !deferred.matches_item(&self.items) {
+            return None;
+        }
+        matches!(self.items.get(deferred.idx), Some(GridItem::Video(path) | GridItem::Audio(path))
+            if crate::path_key::eq_keep_drive(path, requested))
+        .then_some(deferred.idx)
+    }
+
+    /// The accepted detached folder owns its first display until index/hydration completion.
+    /// An ordinary grid, stale source, or discarded continuation cannot keep its shell alive.
+    pub(crate) fn sidecar_restore_detached_auto_fullscreen_wait_active(&self) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            self.sidecar_restore_context_current(&state.common)
+                && matches!(&state.common.continuation,
+                    ContinuationOwner::Live(continuation)
+                        if continuation.detached_physical
+                            && matches!(continuation.first_display_action,
+                                FirstDisplayAction::AutoFullscreenFolder)
+                            && continuation.items_len == self.items.len()
+                            && !continuation.cancel.load(Ordering::Relaxed))
         })
     }
 
@@ -721,7 +812,7 @@ impl App {
                     tags: true,
                 },
                 tag_item_keys: Vec::new(),
-                source_path: folder,
+                source_path: Some(folder),
                 continuation: ContinuationOwner::Discarded {
                     cancel: Arc::new(AtomicBool::new(false)),
                 },
@@ -758,7 +849,7 @@ impl App {
                     tags: true,
                 },
                 tag_item_keys: Vec::new(),
-                source_path: folder.clone(),
+                source_path: Some(folder.clone()),
                 continuation: ContinuationOwner::Live(SidecarLoadContinuation {
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
@@ -967,14 +1058,48 @@ impl App {
         }
     }
 
+    /// The accepted display cannot resume before its logical index exists. Rare worker
+    /// creation failures use the same cancel/notify/reload contract as disconnection.
+    pub(super) fn cancel_unprepared_sidecar_display(
+        &mut self,
+        continuation: SidecarLoadContinuation,
+    ) {
+        continuation.cancel.store(true, Ordering::Relaxed);
+        crate::logger::log(
+            "reading position preparation unavailable; display continuation cancelled",
+        );
+        self.show_feedback_toast(
+            "読書位置を準備できませんでした。一覧を再読み込みしてください".into(),
+        );
+        if self
+            .current_folder
+            .as_deref()
+            .is_some_and(|source| crate::folder_tree::path_eq(source, &continuation.source_path))
+        {
+            if self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
+                crate::folder_tree::path_eq(&pending.0, &continuation.source_path)
+            }) {
+                self.pdf_enumerate_pending = None;
+            }
+            if self.zip_enumerate_pending.as_ref().is_some_and(|pending| {
+                crate::folder_tree::path_eq(&pending.zip_path, &continuation.source_path)
+            }) {
+                self.zip_enumerate_pending = None;
+            }
+            self.fs_nav_after_pdf_enumerate = None;
+            self.finish_visible_container_fs_nav_failed();
+            #[cfg(windows)]
+            self.terminate_active_detached_open_before_viewport("page_index_worker_unavailable");
+        }
+    }
+
     pub(super) fn begin_sidecar_restore(
         &mut self,
         continuation: SidecarLoadContinuation,
         has_prepared_aggregate: bool,
     ) -> Result<(), SidecarLoadContinuation> {
-        if !self.sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate) {
-            return Err(continuation);
-        }
+        let restore_sidecar =
+            self.sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate);
         if self.sidecar_restore.is_some() {
             crate::logger::log(
                 "sidecar restore request rejected: another restore already owns the App"
@@ -983,6 +1108,29 @@ impl App {
             return Err(continuation);
         }
 
+        // The same accepted-list hydration owner prepares resume identities even when
+        // sidecar backup is disabled. A separate pending owner would allow first display
+        // or fullscreen to race the projection, so retain the existing input/continuation gate.
+        let items = self.items.clone();
+        let logical = self.archive_source_override.clone();
+        let policy = self.settings.file_type_visibility.clone();
+        let (page_index_tx, page_index_rx) = mpsc::channel();
+        if let Err(error) = std::thread::Builder::new()
+            .name("reading-position-prepare".to_owned())
+            .spawn(move || {
+                let prepared = super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &items,
+                    logical.as_deref(),
+                    policy,
+                );
+                let _ = page_index_tx.send(prepared);
+            })
+        {
+            crate::logger::log(format!(
+                "reading position preparation worker failed: {error}"
+            ));
+            return Err(continuation);
+        }
         let target_context = self.sidecar_restore_projected_context();
         let items_generation = self.items_generation;
         let folder = Self::sidecar_restore_folder(
@@ -1022,7 +1170,7 @@ impl App {
                 data_dir,
                 families,
                 tag_item_keys,
-                source_path,
+                source_path: Some(source_path),
                 continuation: ContinuationOwner::Live(continuation),
                 deferred_fullscreen: None,
                 favorite_failures: Vec::new(),
@@ -1034,9 +1182,13 @@ impl App {
             // Keep every cache owner in the App throughout recovery. Checking only borrows
             // immutable Arc snapshots after accepted DB completions and their sidecar mirrors
             // have crossed the quiescence barriers.
-            phase: Phase::Quiescing(Quiescing {
-                local_adjust_fence: LocalAdjustFence::NotStarted,
-                favorite_started: false,
+            phase: Phase::PreparingPageIndex(PreparingPageIndex {
+                rx: page_index_rx,
+                next: if restore_sidecar {
+                    PageIndexContinuation::RestoreSidecar
+                } else {
+                    PageIndexContinuation::ResumeDisplay
+                },
             }),
         });
         #[cfg(windows)]
@@ -1065,6 +1217,130 @@ impl App {
         Ok(())
     }
 
+    /// A fixed snapshot changes the item index space after its parent has already
+    /// hydrated. Reuse the hydration owner solely for the new immutable page map;
+    /// no sidecar import, metadata prewarm or first-display action runs again.
+    pub(super) fn prepare_snapshot_page_identity_index(
+        &mut self,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+    ) {
+        self.prepare_listing_page_identity_index(
+            policy,
+            self.archive_source_override.clone(),
+            PageIndexPublication::SnapshotListView,
+        );
+    }
+
+    pub(crate) fn prepare_current_listing_page_identity_index(
+        &mut self,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+        logical_override: Option<PathBuf>,
+    ) {
+        self.prepare_listing_page_identity_index(
+            policy,
+            logical_override,
+            PageIndexPublication::CurrentListing,
+        );
+    }
+
+    fn prepare_listing_page_identity_index(
+        &mut self,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+        logical_override: Option<PathBuf>,
+        publication: PageIndexPublication,
+    ) {
+        let superseded = self.sidecar_restore.as_ref().is_some_and(|state| {
+            state.common.target_context == self.sidecar_restore_projected_context()
+                && matches!(
+                    state.common.continuation,
+                    ContinuationOwner::IndexOnly { .. }
+                )
+                && !self.sidecar_restore_context_current(&state.common)
+        });
+        if superseded {
+            let mut previous = self.sidecar_restore.take().expect("checked index owner");
+            #[cfg(windows)]
+            let had_deferred_fullscreen = previous.common.deferred_fullscreen.is_some();
+            previous.common.discard_target();
+            #[cfg(windows)]
+            if had_deferred_fullscreen {
+                self.terminate_active_detached_open_before_viewport("page_index_superseded");
+            }
+            // No imports or mutable sidecar reservations exist in an IndexOnly owner.
+            // The worker drops an unreceived map on its own thread.
+        }
+        if self.sidecar_restore.is_some() {
+            crate::logger::log("snapshot page index preparation rejected: hydration owner is busy");
+            self.show_feedback_toast("一覧の準備が完了してから固定してください".into());
+            return;
+        }
+        let source_path = self.current_folder.clone();
+        let items = self.items.clone();
+        let logical = logical_override;
+        let (tx, rx) = mpsc::channel();
+        let previous = std::mem::replace(
+            &mut self.page_identity_index,
+            Arc::new(super::file_type_resume::PreparedPageIdentityIndex::empty(
+                policy.clone(),
+            )),
+        );
+        self.retire_smart_folder_payloads([
+            Box::new(previous) as smart_folder::RetiredSmartFolderPayload
+        ]);
+        if let Err(error) = std::thread::Builder::new()
+            .name("snapshot-reading-position-prepare".into())
+            .spawn(move || {
+                let index = super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &items,
+                    logical.as_deref(),
+                    policy,
+                );
+                let _ = tx.send(index);
+            })
+        {
+            crate::logger::log(format!("snapshot reading position worker failed: {error}"));
+            // Its disconnected receiver remains owned by the preparation gate. The
+            // ordinary poll cancels any deferred open through the same failure tail.
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.sidecar_restore = Some(SidecarRestoreState {
+            #[cfg(test)]
+            checking_relay: None,
+            common: Common {
+                request_id: self
+                    .frame_counter
+                    .wrapping_add(self.input_seq)
+                    .wrapping_add(1),
+                started_at: std::time::Instant::now(),
+                target_context: self.sidecar_restore_projected_context(),
+                items_generation: self.items_generation,
+                folder: source_path.clone().unwrap_or_default(),
+                data_dir: crate::data_dir::get(),
+                families: crate::sidecar_import::ImportFamilies {
+                    edits: false,
+                    tags: false,
+                },
+                tag_item_keys: Vec::new(),
+                source_path,
+                continuation: ContinuationOwner::IndexOnly { cancel },
+                deferred_fullscreen: None,
+                favorite_failures: Vec::new(),
+                warning: None,
+                source_change_reprobe: false,
+                clear_sidecar_cache_after_flush: false,
+                effects: RestoreEffects::default(),
+            },
+            phase: Phase::PreparingPageIndex(PreparingPageIndex {
+                rx,
+                next: PageIndexContinuation::PrepareOnly(publication),
+            }),
+        });
+        if let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
+            self.consume_input_during_sidecar_restore(&ctx);
+            ctx.request_repaint();
+        }
+    }
+
     fn report_sidecar_restore_flush_failure(&mut self, error: String) {
         crate::logger::log(format!("sidecar restore flush failed: {error}"));
         self.show_feedback_toast(format!("サイドカーの保存を完了できませんでした: {error}"));
@@ -1073,10 +1349,14 @@ impl App {
     fn sidecar_restore_context_current(&self, common: &Common) -> bool {
         self.sidecar_restore_projected_context() == common.target_context
             && self.items_generation == common.items_generation
-            && self
-                .current_folder
-                .as_deref()
-                .is_some_and(|folder| crate::folder_tree::path_eq(folder, &common.source_path))
+            && match (
+                self.current_folder.as_deref(),
+                common.source_path.as_deref(),
+            ) {
+                (Some(current), Some(captured)) => crate::folder_tree::path_eq(current, captured),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     fn sidecar_restore_has_conflicting_work(
@@ -1444,6 +1724,84 @@ impl App {
 
         let phase = std::mem::replace(&mut state.phase, Phase::Resuming);
         state.phase = match phase {
+            Phase::PreparingPageIndex(preparing) => match preparing.rx.try_recv() {
+                Err(TryRecvError::Empty) => Phase::PreparingPageIndex(preparing),
+                Err(TryRecvError::Disconnected) => {
+                    if matches!(preparing.next, PageIndexContinuation::PrepareOnly(_)) {
+                        crate::logger::log("snapshot reading position worker disconnected");
+                        self.show_feedback_toast("読書位置の準備workerが停止しました".into());
+                        #[cfg(windows)]
+                        let had_deferred_fullscreen = state.common.deferred_fullscreen.is_some();
+                        state.common.discard_target();
+                        self.finish_visible_container_fs_nav_failed();
+                        if self.fullscreen_idx.is_some() {
+                            self.close_fullscreen();
+                        }
+                        #[cfg(windows)]
+                        if had_deferred_fullscreen {
+                            self.terminate_active_detached_open_before_viewport(
+                                "snapshot_page_index_worker_disconnected",
+                            );
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+                    crate::logger::log(
+                        "reading position worker disconnected; display continuation cancelled",
+                    );
+                    self.show_feedback_toast(
+                        "読書位置の準備に失敗しました。一覧を再読み込みしてください".into(),
+                    );
+                    state.common.discard_target();
+                    if self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
+                        state
+                            .common
+                            .source_path
+                            .as_deref()
+                            .is_some_and(|source| crate::folder_tree::path_eq(&pending.0, source))
+                    }) {
+                        self.pdf_enumerate_pending = None;
+                    }
+                    if self.zip_enumerate_pending.as_ref().is_some_and(|pending| {
+                        state.common.source_path.as_deref().is_some_and(|source| {
+                            crate::folder_tree::path_eq(&pending.zip_path, source)
+                        })
+                    }) {
+                        self.zip_enumerate_pending = None;
+                    }
+                    self.fs_nav_after_pdf_enumerate = None;
+                    self.finish_visible_container_fs_nav_failed();
+                    #[cfg(windows)]
+                    self.terminate_active_detached_open_before_viewport(
+                        "page_index_worker_disconnected",
+                    );
+                    ctx.request_repaint();
+                    return;
+                }
+                Ok(index) => {
+                    let previous =
+                        std::mem::replace(&mut self.page_identity_index, Arc::new(index));
+                    self.retire_smart_folder_payloads([
+                        Box::new(previous) as smart_folder::RetiredSmartFolderPayload
+                    ]);
+                    match preparing.next {
+                        PageIndexContinuation::PrepareOnly(publication) => {
+                            if matches!(publication, PageIndexPublication::SnapshotListView) {
+                                if let Some(snapshot) = self.snapshot.as_mut() {
+                                    snapshot.list_view_page_identity_index =
+                                        Arc::clone(&self.page_identity_index);
+                                }
+                            }
+                            Phase::Resuming
+                        }
+                        PageIndexContinuation::RestoreSidecar => Phase::Quiescing(Quiescing {
+                            local_adjust_fence: LocalAdjustFence::NotStarted,
+                            favorite_started: false,
+                        }),
+                        PageIndexContinuation::ResumeDisplay => Phase::Resuming,
+                    }
+                }
+            },
             Phase::Checking(mut checking) => match poll_checking_worker(
                 &mut checking,
                 #[cfg(test)]
@@ -1851,6 +2209,34 @@ impl App {
             return;
         }
 
+        if matches!(
+            state.common.continuation,
+            ContinuationOwner::IndexOnly { .. }
+        ) {
+            if let Some(warning) = state.common.warning.take() {
+                crate::logger::log(format!("snapshot page index preparation: {warning}"));
+                self.show_feedback_toast(warning);
+            }
+            if let Some(deferred) = state.common.deferred_fullscreen.take() {
+                if deferred.matches_item(&self.items) {
+                    self.open_fullscreen_with_materialization_and_contract(
+                        deferred.idx,
+                        deferred.trigger,
+                        deferred.requested_materialization,
+                        deferred.load_contract,
+                        None,
+                    );
+                } else {
+                    #[cfg(windows)]
+                    self.terminate_active_detached_open_before_viewport(
+                        "snapshot_page_index_deferred_identity_mismatch",
+                    );
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
+
         // A family transaction may already be committed when the other family reports
         // SourceChanged/Cancelled. Preserve those concrete effects across the one-shot re-probe
         // and apply them before the DB-hydration continuation even when no snapshot is installable.
@@ -1910,6 +2296,19 @@ impl App {
     ) {
         let phase = std::mem::replace(&mut state.phase, Phase::Resuming);
         let terminal = match phase {
+            Phase::PreparingPageIndex(preparing) => match preparing.rx.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    state.phase = Phase::PreparingPageIndex(preparing);
+                    false
+                }
+                Ok(index) => {
+                    self.retire_smart_folder_payloads([
+                        Box::new(index) as smart_folder::RetiredSmartFolderPayload
+                    ]);
+                    true
+                }
+                Err(TryRecvError::Disconnected) => true,
+            },
             Phase::Quiescing(_) | Phase::Resuming => true,
             Phase::Checking(mut checking) => match poll_checking_worker(
                 &mut checking,
@@ -2584,7 +2983,7 @@ mod tests {
                     tags: true,
                 },
                 tag_item_keys: Vec::new(),
-                source_path: folder,
+                source_path: Some(folder),
                 continuation: ContinuationOwner::Discarded {
                     cancel: Arc::new(AtomicBool::new(false)),
                 },
@@ -2770,6 +3169,504 @@ mod tests {
             assert_eq!(app.items.len(), 1);
             assert_eq!(app.visible_indices, vec![0]);
         }
+    }
+
+    #[test]
+    fn visibility_index_only_does_not_consume_list_adoption_intent() {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = None;
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        assert!(app.sidecar_restore_active());
+        assert!(!app.sidecar_restore_list_adoption_blocked());
+        assert!(!app.defer_startup_list_adoption(&super::super::StartupListIntent::ExplicitList));
+        app.sidecar_restore.take();
+        let folder = app.tmp.path().to_path_buf();
+        app.activate_live_sidecar_restore_for_test(folder);
+        assert!(app.sidecar_restore_list_adoption_blocked());
+        assert!(app.defer_startup_list_adoption(&super::super::StartupListIntent::ExplicitList));
+        let ContinuationOwner::Live(continuation) =
+            &app.sidecar_restore.as_ref().unwrap().common.continuation
+        else {
+            panic!("live owner")
+        };
+        assert!(matches!(
+            continuation.restore_intent,
+            super::super::StartupListIntent::ExplicitList
+        ));
+        app.sidecar_restore
+            .as_mut()
+            .unwrap()
+            .common
+            .discard_target();
+        assert!(app.sidecar_restore_list_adoption_blocked());
+    }
+
+    #[test]
+    fn visibility_current_listing_supersedes_only_stale_same_context_index_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = None;
+        app.items = vec![GridItem::Image("a.jpg".into())];
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        let first_cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        app.items_generation = app.items_generation.wrapping_add(1);
+        app.items = vec![GridItem::Image("b.jpg".into())];
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        app.prepare_current_listing_page_identity_index(policy.clone(), None);
+        assert!(first_cancel.load(Ordering::Relaxed));
+        let second_cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        assert!(Arc::ptr_eq(
+            &second_cancel,
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel()
+        ));
+        assert!(!second_cancel.load(Ordering::Relaxed));
+        let started = std::time::Instant::now();
+        while app.sidecar_restore_active() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            app.poll_sidecar_restore(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(app.page_identity_index.policy, policy);
+        assert_eq!(
+            app.page_identity_index
+                .resolve(&crate::book_resume_db::ReadingPosition {
+                    page: 9,
+                    identity: crate::book_resume_db::PageIdentity::for_item(&app.items[0], None)
+                }),
+            super::super::file_type_resume::PositionResolution::Restored(0)
+        );
+    }
+
+    #[test]
+    fn visibility_current_listing_worker_accepts_no_source_without_overwriting_snapshot_map() {
+        let mut app = crate::app::setup_app_for_test();
+        let row = GridItem::Image(app.tmp.path().join("map.jpg"));
+        app.current_folder = None;
+        app.items = vec![row.clone()];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        // Snapshot maps are an independent return/list owner, not the current ZIP/search map.
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+            query: "map".into(),
+        });
+        while app.sidecar_restore_active() {
+            app.poll_sidecar_restore(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        let saved = Arc::clone(&app.snapshot.as_ref().unwrap().list_view_page_identity_index);
+        app.prepare_current_listing_page_identity_index(policy.clone(), None);
+        let started = std::time::Instant::now();
+        while app.sidecar_restore_active() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            app.poll_sidecar_restore(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(app.page_identity_index.policy, policy);
+        assert!(Arc::ptr_eq(
+            &saved,
+            &app.snapshot.as_ref().unwrap().list_view_page_identity_index
+        ));
+        assert_eq!(
+            app.page_identity_index
+                .resolve(&crate::book_resume_db::ReadingPosition {
+                    page: 8,
+                    identity: crate::book_resume_db::PageIdentity::for_item(&row, None)
+                }),
+            super::super::file_type_resume::PositionResolution::Restored(0)
+        );
+    }
+
+    #[test]
+    fn visibility_current_listing_disconnect_closes_stale_fullscreen_and_preserves_snapshot_maps() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.detached_viewer_open_images_in_window = false;
+        let folder = app.tmp.path().join("failed-current.zip");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::ZipImage {
+            zip_path: folder.clone(),
+            entry_name: "new/page.jpg".into(),
+        }];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.book_resume_db
+            .as_ref()
+            .unwrap()
+            .set(&folder, 7)
+            .unwrap();
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+            query: "failure".into(),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.sidecar_restore_active() {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_sidecar_restore(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        let saved = Arc::clone(&app.snapshot.as_ref().unwrap().saved_page_identity_index);
+        let list = Arc::clone(&app.snapshot.as_ref().unwrap().list_view_page_identity_index);
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        app.fullscreen_idx = Some(0);
+        app.capture_fs_nav_holdover(0);
+        assert!(app.fs_nav_is_locked());
+        app.prepare_current_listing_page_identity_index(policy.clone(), None);
+        let cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        app.sidecar_restore.as_mut().unwrap().phase =
+            Phase::PreparingPageIndex(PreparingPageIndex {
+                rx,
+                next: PageIndexContinuation::PrepareOnly(PageIndexPublication::CurrentListing),
+            });
+        assert!(app.defer_sidecar_restore_fullscreen(
+            0,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+            FsPageLoadContract::Sequential
+        ));
+        app.poll_sidecar_restore(&egui::Context::default());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.sidecar_restore_active());
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(!app.fs_nav_is_locked());
+        assert!(app.fs_holdover_tex.is_none());
+        assert_eq!(app.page_identity_index.policy, policy);
+        assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(7));
+        assert!(Arc::ptr_eq(
+            &saved,
+            &app.snapshot.as_ref().unwrap().saved_page_identity_index
+        ));
+        assert!(Arc::ptr_eq(
+            &list,
+            &app.snapshot.as_ref().unwrap().list_view_page_identity_index
+        ));
+        app.poll_sidecar_restore(&egui::Context::default());
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn visibility_snapshot_index_only_preserves_exact_deferred_open_without_hydration() {
+        for completed in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.detached_viewer_open_images_in_window = false;
+            let folder = app.tmp.path().join("snapshot-index");
+            std::fs::create_dir_all(&folder).unwrap();
+            let image = folder.join("3.jpg");
+            image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]))
+                .save(&image)
+                .unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(image)];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![Some((0, 0))];
+            app.visible_indices = vec![0];
+            app.activate_sidecar_restore_modal_for_test(folder);
+            let (tx, rx) = mpsc::channel();
+            let state = app.sidecar_restore.as_mut().unwrap();
+            state.common.continuation = ContinuationOwner::IndexOnly {
+                cancel: Arc::new(AtomicBool::new(false)),
+            };
+            state.phase = Phase::PreparingPageIndex(PreparingPageIndex {
+                rx,
+                next: PageIndexContinuation::PrepareOnly(PageIndexPublication::SnapshotListView),
+            });
+            assert!(app.defer_sidecar_restore_fullscreen(
+                0,
+                HistoryTrigger::UserChosen,
+                FsOpenMaterialization::Eager,
+                FsPageLoadContract::Sequential
+            ));
+            if completed {
+                tx.send(
+                    super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                        &app.items,
+                        None,
+                        Default::default(),
+                    ),
+                )
+                .unwrap();
+            }
+            drop(tx);
+            app.poll_sidecar_restore(&egui::Context::default());
+            assert!(!app.sidecar_restore_active());
+            assert_eq!(app.fullscreen_idx, completed.then_some(0));
+            assert!(
+                app.sidecars.is_empty(),
+                "index-only completion never imports sidecars"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_live_page_index_disconnect_cancels_display_without_substitution() {
+        for (detached, warm_pdf) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.book_open_resume = crate::settings::ResumeMode::Resume;
+            app.settings
+                .file_type_visibility
+                .excluded_extensions
+                .insert("png".into());
+            let main = app.tmp.path().join("main");
+            let folder = app.tmp.path().join(if warm_pdf {
+                "failed-index-book.pdf"
+            } else {
+                "failed-index-book"
+            });
+            std::fs::create_dir_all(&main).unwrap();
+            if warm_pdf {
+                std::fs::write(&folder, b"PDF fixture").unwrap();
+            } else {
+                std::fs::create_dir_all(&folder).unwrap();
+            }
+            let page = folder.join("first.jpg");
+            let item = if warm_pdf {
+                GridItem::PdfPage {
+                    pdf_path: folder.clone(),
+                    page_num: 0,
+                    content_type: None,
+                }
+            } else {
+                GridItem::Image(page.clone())
+            };
+            app.current_folder = Some(main.clone());
+            app.items = vec![GridItem::Image(main.join("main.jpg"))];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            let main_rows = app.items.clone();
+            let main_generation = app.items_generation;
+            let main_index = Arc::clone(&app.page_identity_index);
+            app.book_resume_db
+                .as_ref()
+                .unwrap()
+                .set(&folder, 0)
+                .unwrap();
+            let target = if detached {
+                app.build_active_context_for_test(
+                    Some(871),
+                    crate::app::DetachedSource::Book,
+                    |_| {},
+                )
+            } else {
+                app.viewer_context_main()
+            };
+            let (cancel, previous_index) = app
+                .with_viewer_context(target, |owner| {
+                    owner.current_folder = Some(folder.clone());
+                    owner.items = vec![item.clone()];
+                    owner.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+                    owner.image_metas = vec![None];
+                    owner.visible_indices = vec![0];
+                    let previous = Arc::clone(&owner.page_identity_index);
+                    let _thumb_rx = owner.activate_live_sidecar_restore_for_test(folder.clone());
+                    let ContinuationOwner::Live(continuation) =
+                        &mut owner.sidecar_restore.as_mut().unwrap().common.continuation
+                    else {
+                        panic!("live fixture")
+                    };
+                    continuation.detached_physical = detached;
+                    continuation.first_display_action = if warm_pdf {
+                        FirstDisplayAction::WarmPdf
+                    } else {
+                        FirstDisplayAction::AutoFullscreenFolder
+                    };
+                    continuation.navigation_after_hydration =
+                        Some(crate::app::MainListAfterHydration::RequiredFullscreen {
+                            target: crate::snapshot::SnapshotTarget::Fs(page.clone()),
+                            history_trigger: HistoryTrigger::UserChosen,
+                        });
+                    let cancel = Arc::clone(&continuation.cancel);
+                    let (tx, rx) = mpsc::channel();
+                    drop(tx);
+                    owner.sidecar_restore.as_mut().unwrap().phase =
+                        Phase::PreparingPageIndex(PreparingPageIndex {
+                            rx,
+                            next: PageIndexContinuation::ResumeDisplay,
+                        });
+                    assert!(owner.defer_sidecar_restore_fullscreen(
+                        0,
+                        HistoryTrigger::UserChosen,
+                        FsOpenMaterialization::Eager,
+                        FsPageLoadContract::Sequential
+                    ));
+                    owner.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                        history_trigger: HistoryTrigger::UserChosen,
+                        resume_slideshow: false,
+                        target: crate::app::DeferredFsTarget::None,
+                        resume_to_last_page: true,
+                        from_explicit_open: true,
+                        preserve_after_password_prompt: false,
+                    });
+                    owner.capture_fs_nav_holdover(0);
+                    assert!(owner.fs_nav_is_locked());
+                    if warm_pdf {
+                        owner.pdf_enumerate_pending = Some((
+                            folder.clone(),
+                            None,
+                            crate::pdf_loader::completed_enumerate_result_handle(
+                                &folder,
+                                Ok(crate::pdf_loader::PdfEnumerateResult {
+                                    pages: vec![crate::pdf_loader::PdfPageEntry {
+                                        page_num: 0,
+                                        mtime: 0,
+                                        file_size: 0,
+                                    }],
+                                    direction: None,
+                                    stamp: None,
+                                }),
+                            ),
+                            Box::new(crate::app::OpenRequestOwner::Navigation),
+                            None,
+                            crate::app::PdfOpenPhase::CommittedVerification {
+                                placeholder_count: 1,
+                            },
+                            crate::pdf_loader::LeasedEpubPath::try_new(folder.clone()).unwrap(),
+                        ));
+                    }
+                    (cancel, previous)
+                })
+                .unwrap();
+            app.poll_sidecar_restore(&egui::Context::default());
+            assert!(!app.sidecar_restore_active());
+            assert!(cancel.load(Ordering::Relaxed));
+            app.with_viewer_context(target, |owner| {
+                assert!(owner.fullscreen_idx.is_none());
+                owner.poll_pdf_enumerate();
+                owner.poll_zip_enumerate();
+                assert_eq!(owner.items, vec![item.clone()]);
+                assert!(
+                    owner.fullscreen_idx.is_none(),
+                    "late verification cannot substitute a page"
+                );
+                assert!(owner.pdf_enumerate_pending.is_none());
+                assert!(owner.zip_enumerate_pending.is_none());
+                assert!(owner.fs_nav_after_pdf_enumerate.is_none());
+                assert!(owner.fs_holdover_tex.is_none());
+                assert!(!owner.fs_nav_is_locked());
+                assert!(Arc::ptr_eq(&owner.page_identity_index, &previous_index));
+                assert!(
+                    owner
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_none()
+                );
+                assert!(!owner.pending_reload);
+            })
+            .unwrap();
+            assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(0));
+            if detached {
+                assert_eq!(
+                    app.detached_window_state(871),
+                    Some(crate::app::DetachedWindowState::Closing)
+                );
+                assert_eq!(app.items, main_rows);
+                assert_eq!(app.items_generation, main_generation);
+                assert!(Arc::ptr_eq(&app.page_identity_index, &main_index));
+            }
+        }
+    }
+
+    #[test]
+    fn no_sidecar_hydration_prepares_the_projected_resume_index_with_captured_policy() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let folder = app.tmp.path().join("identity-no-sidecar");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.current_folder = Some(folder.clone());
+        app.items = vec![
+            GridItem::Image(folder.join("1.jpg")),
+            GridItem::Image(folder.join("3.jpg")),
+        ];
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".to_owned());
+        let expected_policy = app.settings.file_type_visibility.clone();
+        let (tx, _rx) = mpsc::channel();
+        let now = std::time::Instant::now();
+        let continuation = SidecarLoadContinuation {
+            navigation_after_hydration: None,
+            first_display_action: FirstDisplayAction::None,
+            restore_intent: crate::app::StartupListIntent::PreservePresentation,
+            auto_aspect_seed: None,
+            source_path: folder.clone(),
+            source_is_directory: true,
+            prepared_subfolder: None,
+            prepared_page_edits: None,
+            prepared_aggregate: None,
+            catalog_existing_keys: HashSet::new(),
+            video_items: Vec::new(),
+            sli_seq: 0,
+            sli_t0: now,
+            items_len: app.items.len(),
+            detached_physical: false,
+            tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            restore_started_at: now,
+        };
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        assert!(matches!(
+            app.sidecar_restore.as_ref().unwrap().phase,
+            Phase::PreparingPageIndex(_)
+        ));
+        app.settings.file_type_visibility = Default::default();
+        let ctx = egui::Context::default();
+        let deadline = now + std::time::Duration::from_secs(10);
+        while app.sidecar_restore.is_some() {
+            app.poll_sidecar_restore(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.page_identity_index.policy, expected_policy);
+        let position = crate::book_resume_db::ReadingPosition {
+            page: 1,
+            identity: crate::book_resume_db::PageIdentity::for_item(
+                &GridItem::Image(folder.join("2.png")),
+                None,
+            ),
+        };
+        assert_eq!(
+            app.page_identity_index.resolve(&position),
+            crate::app::file_type_resume::PositionResolution::HiddenIdentity
+        );
+        assert!(
+            app.sidecars.is_empty(),
+            "identity-only preparation must not probe or initialize sidecars"
+        );
     }
 
     #[test]
@@ -3471,6 +4368,351 @@ mod tests {
             .common
             .discard_target();
         assert!(!app.sidecar_restore_deferred_fullscreen_wait_active());
+    }
+
+    #[test]
+    fn visibility_detached_auto_first_display_wait_requires_its_live_exact_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("auto-book");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::Image(folder.join("page.jpg"))];
+        let _rx = app.activate_live_sidecar_restore_for_test(folder.clone());
+        let ContinuationOwner::Live(continuation) =
+            &mut app.sidecar_restore.as_mut().unwrap().common.continuation
+        else {
+            panic!("live fixture")
+        };
+        continuation.first_display_action = FirstDisplayAction::AutoFullscreenFolder;
+        assert!(app.sidecar_restore_detached_auto_fullscreen_wait_active());
+        app.items_generation += 1;
+        assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+        app.items_generation -= 1;
+        app.current_folder = Some(app.tmp.path().join("other-source"));
+        assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+        app.current_folder = Some(folder);
+        let context = app.sidecar_restore.as_ref().unwrap().common.target_context;
+        app.sidecar_restore.as_mut().unwrap().common.target_context =
+            ViewerContextId::for_test(999);
+        assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+        app.sidecar_restore.as_mut().unwrap().common.target_context = context;
+        let ContinuationOwner::Live(continuation) =
+            &mut app.sidecar_restore.as_mut().unwrap().common.continuation
+        else {
+            panic!("live fixture")
+        };
+        continuation.detached_physical = false;
+        assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+        let ContinuationOwner::Live(continuation) =
+            &mut app.sidecar_restore.as_mut().unwrap().common.continuation
+        else {
+            panic!("live fixture")
+        };
+        continuation.detached_physical = true;
+        let cancel = Arc::clone(&continuation.cancel);
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+        cancel.store(false, Ordering::Relaxed);
+        app.sidecar_restore
+            .as_mut()
+            .unwrap()
+            .common
+            .discard_target();
+        assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_deferred_media_target_requires_exact_live_detached_ownership() {
+        for failure in [
+            "none",
+            "path",
+            "context",
+            "generation",
+            "source",
+            "item",
+            "cancel",
+            "scope",
+            "discarded",
+            "index-only",
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("deferred-media");
+            let media = folder.join("target.mp4");
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Video(media.clone())];
+            let _rx = app.activate_live_sidecar_restore_for_test(folder);
+            assert!(app.defer_sidecar_restore_fullscreen(
+                0,
+                HistoryTrigger::UserChosen,
+                FsOpenMaterialization::Eager,
+                FsPageLoadContract::Sequential
+            ));
+            let requested = if failure == "path" {
+                media.with_file_name("other.mp4")
+            } else {
+                media.clone()
+            };
+            match failure {
+                "context" => {
+                    app.sidecar_restore.as_mut().unwrap().common.target_context =
+                        ViewerContextId::for_test(999)
+                }
+                "generation" => app.items_generation += 1,
+                "source" => app.current_folder = Some(app.tmp.path().join("other")),
+                "item" => app.items[0] = GridItem::Video(media.with_file_name("other.mp4")),
+                "cancel" | "scope" => {
+                    let ContinuationOwner::Live(continuation) =
+                        &mut app.sidecar_restore.as_mut().unwrap().common.continuation
+                    else {
+                        panic!("live fixture")
+                    };
+                    if failure == "cancel" {
+                        continuation.cancel.store(true, Ordering::Relaxed);
+                    } else {
+                        continuation.detached_physical = false;
+                    }
+                }
+                "discarded" => {
+                    app.sidecar_restore
+                        .as_mut()
+                        .unwrap()
+                        .common
+                        .discard_target();
+                }
+                "index-only" => {
+                    app.sidecar_restore.as_mut().unwrap().common.continuation =
+                        ContinuationOwner::IndexOnly {
+                            cancel: Arc::new(AtomicBool::new(false)),
+                        }
+                }
+                _ => {}
+            }
+            assert_eq!(
+                app.sidecar_restore_deferred_media_target(&requested),
+                (failure == "none").then_some(0),
+                "failure={failure}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_fresh_bookmark_media_index_failure_closes_only_its_published_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.settings.fullfeature_media_window = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let folder = app.tmp.path().join("bookmark-media");
+        std::fs::create_dir(&folder).unwrap();
+        let media = folder.join("target.mp4");
+        std::fs::write(&media, []).unwrap();
+        app.current_folder = Some(crate::app::bookmark_view_synthetic_path());
+        app.items = vec![GridItem::Video(media.clone())];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.items_are_bookmark_view = true;
+        app.selected = Some(0);
+        app.bookmark_open_request_seq = 1;
+        app.bookmark_view_state = Some(crate::app::BookmarkViewState::Opening {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(media.clone()),
+            grid: crate::app::BookmarkViewReturnGridState {
+                row_keys: vec![(0, 7)],
+                selected_key: Some((0, 7)),
+                opened_key: (0, 7),
+                scroll_offset_y: 125.0,
+            },
+        });
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+            crate::bookmark_browser::PendingMediaOpen {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+                path: media.clone(),
+                pts_secs: 42.0,
+                started_at: std::time::Instant::now(),
+                last_wait: None,
+            },
+        ));
+        let main_rows = app.items.clone();
+        let main_generation = app.items_generation;
+        let main_cancel = Arc::clone(&app.cancel_token);
+        let main_index = Arc::clone(&app.page_identity_index);
+        let sibling = app.build_window_context_for_test(902, |owner| {
+            owner.current_folder = Some(PathBuf::from("sibling"));
+            owner.items = vec![GridItem::Image(PathBuf::from("sibling/page.jpg"))];
+            owner.selected = Some(0);
+            owner.scroll_offset_y = 77.0;
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.items.clone(),
+                    owner.items_generation,
+                    Arc::clone(&owner.cancel_token),
+                    Arc::clone(&owner.page_identity_index),
+                )
+            })
+            .unwrap();
+        let ctx = egui::Context::default();
+        assert!(app.open_bookmark_media_in_detached_context(&ctx, &media, folder.clone(), true));
+        let target = app.active_viewer_context_id().unwrap();
+        let window = app.viewer_context_window(target).unwrap();
+        let cancel = app
+            .with_viewer_context(target, |owner| {
+                assert!(owner.fullscreen_idx.is_none());
+                assert_eq!(owner.sidecar_restore_deferred_media_target(&media), Some(0));
+                let state = owner.sidecar_restore.as_mut().unwrap();
+                let cancel = Arc::clone(state.common.continuation.cancel());
+                let (tx, rx) = mpsc::channel();
+                drop(tx);
+                state.phase = Phase::PreparingPageIndex(PreparingPageIndex {
+                    rx,
+                    next: PageIndexContinuation::ResumeDisplay,
+                });
+                cancel
+            })
+            .unwrap();
+        assert!(
+            app.active_detached_session
+                .is_some_and(|session| session.window_id == window
+                    && session.content_phase == crate::app::DetachedSessionContentPhase::Preparing)
+        );
+        app.poll_sidecar_restore(&ctx);
+        assert!(!app.sidecar_restore_active());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.detached_window_state(window),
+            Some(crate::app::DetachedWindowState::Closing)
+        );
+        app.with_viewer_context(target, |owner| {
+            owner.poll_sidecar_restore(&ctx);
+            assert!(
+                owner.fullscreen_idx.is_none(),
+                "a late worker cannot reopen the failed target"
+            );
+        })
+        .unwrap();
+        assert_eq!(app.items, main_rows);
+        assert_eq!(app.items_generation, main_generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &main_cancel));
+        assert!(!main_cancel.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&app.page_identity_index, &main_index));
+        assert!(
+            matches!(app.bookmark_view_state, Some(crate::app::BookmarkViewState::Opening { ref target, .. }) if target.matches_loaded_container(&folder))
+        );
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(owner.items, sibling_before.0);
+            assert_eq!(owner.items_generation, sibling_before.1);
+            assert!(Arc::ptr_eq(&owner.cancel_token, &sibling_before.2));
+            assert!(!owner.cancel_token.load(Ordering::Relaxed));
+            assert!(Arc::ptr_eq(&owner.page_identity_index, &sibling_before.3));
+            assert_eq!(owner.selected, Some(0));
+            assert_eq!(owner.scroll_offset_y, 77.0);
+        })
+        .unwrap();
+        app.retire_context(target, "failed_bookmark_fixture", |_| ())
+            .unwrap();
+        assert!(app.viewer_context_window(target).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_detached_folder_auto_first_display_completes_or_terminates_its_owner() {
+        for outcome in ["success", "main-facet-excludes-page", "resume-refused"] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.tag_sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.settings.detached_viewer_open_images_in_window = true;
+            let main = app.tmp.path().join("main");
+            let folder = app.tmp.path().join("book");
+            std::fs::create_dir_all(&main).unwrap();
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(main.join("main.jpg"), b"fixture").unwrap();
+            std::fs::write(folder.join("page.jpg"), b"fixture").unwrap();
+            app.load_folder(main);
+            app.finish_page_identity_preparation_for_test();
+            let main_rows = app.items.clone();
+            let main_generation = app.items_generation;
+            let main_index = Arc::clone(&app.page_identity_index);
+            if outcome == "main-facet-excludes-page" {
+                app.settings.facet_filter.exts.insert("png".into());
+            } else if outcome == "resume-refused" {
+                app.settings
+                    .file_type_visibility
+                    .excluded_extensions
+                    .insert("png".into());
+                app.settings.book_open_resume = crate::settings::ResumeMode::Resume;
+                app.book_resume_db
+                    .as_ref()
+                    .unwrap()
+                    .set(&folder, 0)
+                    .unwrap();
+            }
+            let ctx = egui::Context::default();
+            assert!(app.start_active_detached_book_context(
+                crate::app::ViewerContextDescriptor::BookFolder {
+                    path: folder.clone()
+                },
+                &ctx,
+                None,
+                None,
+            ));
+            let window = app.active_detached_window_id().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let result = app
+                    .with_active_viewer_context(|owner| {
+                        owner.poll_detached_physical_folder_open(&ctx)
+                    })
+                    .unwrap();
+                if matches!(result, crate::app::DetachedPhysicalFolderOpenPoll::Applied) {
+                    break;
+                }
+                assert!(matches!(
+                    result,
+                    crate::app::DetachedPhysicalFolderOpenPoll::Waiting
+                ));
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "accepted scan did not arrive"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                app.with_active_viewer_context(|owner| {
+                    owner.sidecar_restore_detached_auto_fullscreen_wait_active()
+                })
+                .unwrap()
+            );
+            app.with_active_viewer_context(|owner| {
+                owner.finish_page_identity_preparation_for_test()
+            })
+            .unwrap();
+            if outcome != "resume-refused" {
+                // DetachedPhysical intentionally ignores main-only facets. App-wide
+                // file type visibility is already applied by the scan instead.
+                assert!(
+                    app.with_active_viewer_context(|owner| {
+                        owner.fullscreen_idx == Some(0)
+                            && owner.current_folder.as_ref() == Some(&folder)
+                    })
+                    .unwrap()
+                );
+            } else {
+                assert_eq!(
+                    app.detached_window_state(window),
+                    Some(crate::app::DetachedWindowState::Closing),
+                    "terminal outcome={outcome}"
+                );
+                if outcome == "resume-refused" {
+                    assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(0));
+                }
+            }
+            assert_eq!(app.items, main_rows, "first display cannot alter main rows");
+            assert_eq!(app.items_generation, main_generation);
+            assert!(Arc::ptr_eq(&app.page_identity_index, &main_index));
+        }
     }
 
     #[test]

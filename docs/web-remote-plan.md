@@ -781,6 +781,18 @@ folder entry と同じであり、UNC 等の既存拒否条件も変えない。
 canonicalize／存在確認を行わず、応答の遅い登録先が Home worker と IPC deadline を塞がない。
 wire shape は同じなので protocol 66 を維持する。その他の場所項目の既存解決処理は変更しない。
 
+2026-10-08 の §1.345 では `PROTOCOL_VERSION` を 66 → 67 に更新した。
+`CollectionPayload.registered_total` (任意値) と
+`PersistentCollectionSnapshotPayload.registered_total` (登録全件数) を追加し、
+種類の非表示や表示上限を適用した結果件数とは分けて「表示 X / 登録 Y」を表示する。
+`ContainerPayload.resume_refusal` は serde-default の任意値で、非表示・削除・改名などにより保存した
+論理ページが一覧にない場合は `saved_page_unavailable`、種類を制限した一覧で旧版の
+raw index を検証できない場合は `legacy_position_unverified` を返す。
+「続きから」の再開を拒否した場合は `open_mode=grid` とし、Web は理由と一覧からの
+ページ選択案内を表示する。別ページを自動で代用しない。フォルダ・ZIP・PDF の再開照合は
+列挙に使った種類ポリシーの snapshot を使う。保存位置なし・全種類表示時の旧 raw の範囲外位置・
+UI reader の Busy / Timeout / Stopped は従来どおり先頭ページへの fallback を保つ。
+
 スマートフォルダの定義一覧と、ドライブ一覧・読書履歴・レーティング・本棚・ブックマーク・
 スマートフォルダの評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を
 再実装しない。
@@ -1331,6 +1343,11 @@ protocol v14 は `ContainerPayload` に `resume_page`、`open_mode`、
 container 取得エラーへ伝播させない。Web の viewer は page address から `page_groups` 上の所属 group を引くため、
 見開き時は保存ページを含む見開きを開く。純粋関数テストで有効位置、ページ数ちょうどの上限、
 大幅な超過、Web 側の不一致 fallback を固定する。
+
+§1.345 / protocol v67 の種類制限時は上記の任意情報欠落と再開拒否を区別する。
+新しく保存した位置は論理 identity で照合し、非表示の保存ページや検証できない旧版 index は
+`resume_refusal` と `open_mode=grid` で明示する。Web は理由を一覧に表示して再選択を促し、
+先頭や同じ index の別ページを自動で開かない。
 
 コンテナのサムネイル比率は collection 一覧と同じ
 `aggregate_thumb_aspect_height_ratio(&settings)` から取得する。これはローカル設定に対応する

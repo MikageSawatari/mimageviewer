@@ -3,6 +3,15 @@
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
 
+一覧の種類・拡張子の採否は `file_type_visibility` が一つのpure policyとして所有する。
+一覧producerは同名除去・本判定・集約・代表選定より前にこのpolicyを適用し、facetは
+その後の表示条件として組み合わせる。PCは準備workerにimmutable snapshotを渡し、
+Remoteは次の一覧・読出し要求から最新設定を使う。読書位置の論理ページidentity mapは
+既存sidecar hydration ownerまたは各一覧producerのworkerで最終行順と対で準備し、
+各viewer contextで所有する。退避した親一覧・Collection root・固定一覧にも同じimmutable
+対応表を保持し、行削除は共有する論理identityを再探索せず整数slotだけを変換する。
+来歴と状態遷移の正本は [表示するファイル種類](file-type-visibility-plan.md)。
+
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
 `metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。
 UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は各 manager worker が担う。

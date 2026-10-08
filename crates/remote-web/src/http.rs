@@ -5931,6 +5931,7 @@ mod tests {
         };
         let survivor_address = RemoteAddress::file(survivor_path.to_string_lossy().into_owned());
         let mut payload = PersistentCollectionSnapshotPayload {
+            registered_total: 2,
             collection_id: "33333333-3333-4333-8333-333333333333".to_owned(),
             collection_revision: 1,
             view_token: "view".to_owned(),

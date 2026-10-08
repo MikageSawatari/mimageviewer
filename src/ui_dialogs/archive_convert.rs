@@ -280,7 +280,7 @@ impl App {
         let meta = std::fs::metadata(src).ok()?;
         let mtime = crate::ui_helpers::mtime_secs(&meta);
         let size = meta.len() as i64;
-        db.lookup(src, mtime, size)
+        db.lookup_with_visibility(src, mtime, size, &self.settings.file_type_visibility)
     }
 
     /// 変換済みアーカイブを開く。`src` は元 (RAR/7z/LZH)、`cached_zip` は
@@ -2145,6 +2145,7 @@ mod tests {
                         entry_name: entry_name.into(),
                         uncompressed_size: 1,
                         mtime: 0,
+                        container_ancestry: Vec::new(),
                     })
                     .collect(),
                 has_foreign_archives: false,
@@ -2153,6 +2154,11 @@ mod tests {
 
             // Prepared enumeration exercises the production synchronous finalize path without
             // spawning a RAR/ZIP scanner or relying on a rare OS thread-spawn failure.
+            let enumeration = crate::zip_loader::PreparedZipEnumeration::prepare(
+                backing.clone(),
+                enumeration,
+                app.settings.file_type_visibility.clone(),
+            );
             app.load_zip_as_folder_prepared(
                 backing.clone(),
                 enumeration,
@@ -2176,6 +2182,7 @@ mod tests {
                 app.archive_source_override = Some(source.clone());
             }
             app.finish_converted_archive_list_open(&backing, intent);
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(app.effective_folder().as_ref(), Some(&source));
             assert_eq!(app.selected, Some(1));
             assert_eq!(

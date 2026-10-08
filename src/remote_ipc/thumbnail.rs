@@ -98,6 +98,7 @@ struct RequestKey {
     address: RemoteAddress,
     source_address: Option<RemoteAddress>,
     target_px: u32,
+    policy_fingerprint: u64,
 }
 
 impl PartialEq for RequestKey {
@@ -105,6 +106,7 @@ impl PartialEq for RequestKey {
         self.address == other.address
             && self.source_address == other.source_address
             && self.target_px == other.target_px
+            && self.policy_fingerprint == other.policy_fingerprint
     }
 }
 
@@ -113,6 +115,7 @@ impl Hash for RequestKey {
         self.address.hash(state);
         self.source_address.hash(state);
         self.target_px.hash(state);
+        self.policy_fingerprint.hash(state);
     }
 }
 
@@ -137,10 +140,20 @@ impl ThumbnailEngine {
         context: &WorkerContext,
         container_engine: &ContainerEngine,
     ) -> ThumbnailResponse {
+        let policy = match container_engine.current_file_type_visibility() {
+            Ok(policy) => policy,
+            Err(_) => {
+                return error_response(
+                    ThumbnailErrorCode::Internal,
+                    "表示するファイル種類の設定を読み込めません",
+                );
+            }
+        };
         let key = RequestKey {
             address: request.address.clone(),
             source_address: request.source_address.clone(),
             target_px: request.target_px,
+            policy_fingerprint: policy.fingerprint(),
         };
         let (flight, owner) = {
             let mut inflight = self
@@ -174,7 +187,7 @@ impl ThumbnailEngine {
         }
 
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.generate(&request, context, container_engine)
+            self.generate(&request, context, container_engine, &policy)
         }))
         .unwrap_or_else(|_| {
             error_response(
@@ -202,6 +215,7 @@ impl ThumbnailEngine {
         request: &ThumbnailRequest,
         context: &WorkerContext,
         container_engine: &ContainerEngine,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
     ) -> ThumbnailResponse {
         if request.target_px == 0 || request.target_px > 4096 {
             return error_response(
@@ -223,6 +237,7 @@ impl ThumbnailEngine {
             request.source_address.as_ref(),
             request.target_px,
             context,
+            policy,
         ) {
             Ok(webp_bytes) => ThumbnailResponse::Success { webp_bytes },
             Err(error) => error,
@@ -235,7 +250,16 @@ impl ThumbnailEngine {
         source_address: Option<&RemoteAddress>,
         target_px: u32,
         context: &WorkerContext,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
+        let is_directory =
+            std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_dir());
+        if !is_directory && !policy.allows_physical_file(&resolved.logical) {
+            return Err(error_response(
+                ThumbnailErrorCode::Unsupported,
+                "表示するファイル種類の設定で、このファイルは非表示になっています",
+            ));
+        }
         if is_supported_video(&resolved.canonical) {
             return self.generate_video_resolved(resolved, source_address, target_px, context);
         }
@@ -245,7 +269,7 @@ impl ThumbnailEngine {
                 "サムネイル出所は動画にだけ指定できます",
             ));
         }
-        self.generate_catalog_resolved(resolved, target_px, context)
+        self.generate_catalog_resolved_with_policy(resolved, target_px, context, policy)
     }
 
     fn generate_catalog_resolved(
@@ -253,6 +277,21 @@ impl ThumbnailEngine {
         resolved: &ResolvedPath,
         target_px: u32,
         context: &WorkerContext,
+    ) -> Result<Vec<u8>, ThumbnailResponse> {
+        self.generate_catalog_resolved_with_policy(
+            resolved,
+            target_px,
+            context,
+            &self.settings.file_type_visibility,
+        )
+    }
+
+    fn generate_catalog_resolved_with_policy(
+        &self,
+        resolved: &ResolvedPath,
+        target_px: u32,
+        context: &WorkerContext,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません"))?;
@@ -299,6 +338,7 @@ impl ThumbnailEngine {
             // decode は検証済みの logical path を使う。catalog key、pin DB、回転 DB が
             // 本体 UI と同じ spelling になり、canonical path は境界判定専用に保つ。
             path: resolved.logical.clone(),
+            file_type_visibility: policy.clone(),
             mtime,
             file_size,
             priority: true,
@@ -618,6 +658,9 @@ fn apply_supported_folder_pin(
     ) else {
         return;
     };
+    if !crate::thumb_loader::resolved_pin_allowed(&resolved, &request.file_type_visibility) {
+        return;
+    }
     use crate::folder_thumb_pins::ResolvedKind;
     use crate::thumb_loader::ResolveStrategy;
     let strategy = match resolved.kind {
@@ -1020,6 +1063,8 @@ mod tests {
             address: RemoteAddress::file("C:/Pictures/b.jpg"),
             source_address: None,
             target_px: 128,
+            policy_fingerprint: crate::file_type_visibility::FileTypeVisibility::default()
+                .fingerprint(),
         };
         let mut map = HashMap::new();
         let flight = Arc::new(Flight {

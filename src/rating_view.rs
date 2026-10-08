@@ -89,6 +89,7 @@ pub(crate) struct RatingViewPreparedItems {
 
 pub(crate) struct RatingViewPrepareOptions {
     pub(crate) sort: RatingViewSort,
+    pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) include_epub: bool,
     pub(crate) intent: RatingViewBuildIntent,
     pub(crate) display_order: crate::settings::GridDisplayOrder,
@@ -214,6 +215,11 @@ fn prepare_rating_view(
             !matches!(&row.item, GridItem::PdfFile(path) if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
         });
     }
+    // Project whole rows before sorting/materialization so source keys, rating times and
+    // display metadata stay aligned. The rating database remains the full stored catalog.
+    let mut visibility =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(&options.visibility, cancel);
+    result.rows.retain(|row| visibility.allows_item(&row.item));
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -258,7 +264,7 @@ fn prepare_rating_view(
         .iter()
         .zip(image_metas.iter())
         .flat_map(|(item, meta)| {
-            crate::app::folder_thumb_existing_keys_for(
+            crate::app::folder_thumb_existing_keys_for_with_visibility(
                 item,
                 *meta,
                 &pin_map,
@@ -266,6 +272,7 @@ fn prepare_rating_view(
                 Some(options.folder_thumb_sort),
                 options.folder_thumb_depth,
                 true,
+                &options.visibility,
             )
         })
         .collect();
@@ -369,6 +376,16 @@ pub fn sort_and_materialize_rows(
     sort: RatingViewSort,
     display_order: &crate::settings::GridDisplayOrder,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    sort_and_materialize_rows_with_visibility(rows, sort, display_order, &Default::default())
+}
+
+pub fn sort_and_materialize_rows_with_visibility(
+    rows: &mut Vec<RatingViewRow>,
+    sort: RatingViewSort,
+    display_order: &crate::settings::GridDisplayOrder,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    rows.retain(|row| visibility.allows_grid_item(&row.item));
     sort_rows(rows, sort);
     crate::grid_item::materialize_view_rows(
         rows,
@@ -1084,5 +1101,41 @@ mod tests {
         assert_eq!(rows[0].rated_at_ms, Some(10));
         assert_eq!(rows[1].rated_at_ms, Some(20));
         assert_eq!(rows[2].rated_at_ms, None);
+    }
+    #[test]
+    fn rating_visibility_projects_rows_metadata_and_preserves_database_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let hidden = temp.path().join("hidden.png");
+        let visible = temp.path().join("visible.jpg");
+        std::fs::write(&hidden, b"png").unwrap();
+        std::fs::write(&visible, b"jpeg").unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        db.set(&hidden.to_string_lossy(), 4).unwrap();
+        db.set(&visible.to_string_lossy(), 4).unwrap();
+        drop(db);
+        let mut result =
+            build_rating_view_rows(db_path.clone(), 4, &AtomicBool::new(false)).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        let mut visibility = crate::file_type_visibility::FileTypeVisibility::default();
+        visibility.excluded_extensions.insert("png".into());
+        let (items, metadata) = sort_and_materialize_rows_with_visibility(
+            &mut result.rows,
+            RatingViewSort::RatedAtDesc,
+            &Default::default(),
+            &visibility,
+        );
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(items, vec![result.rows[0].item.clone()]);
+        assert_eq!(metadata, vec![result.rows[0].image_meta]);
+        assert_eq!(metadata[0].unwrap().1, 4);
+        assert_eq!(
+            crate::rating_db::RatingDb::open_readonly(&db_path)
+                .unwrap()
+                .list_by_stars(4)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

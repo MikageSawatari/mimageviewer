@@ -9038,6 +9038,110 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn page_file_type_visibility(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility, normalize_extension};
+    anchored(ui, state, "file-types/categories", |ui, state| {
+        ui.label("一覧に表示する種類を選んでください。");
+        ui.small(
+            "種類と拡張子の両方が許可された項目を表示します。フォルダ・ドライブは表示します。",
+        );
+        ui.small("評価・タグ・ブックマークなどの登録データは削除しません。");
+        egui::Grid::new("file_type_categories")
+            .num_columns(2)
+            .show(ui, |ui| {
+                for (index, category) in FileTypeCategory::ALL.into_iter().enumerate() {
+                    let mut visible = !state
+                        .settings
+                        .file_type_visibility
+                        .excluded_categories
+                        .contains(&category);
+                    if ui.checkbox(&mut visible, category.label()).changed() {
+                        if visible {
+                            state
+                                .settings
+                                .file_type_visibility
+                                .excluded_categories
+                                .remove(&category);
+                        } else {
+                            state
+                                .settings
+                                .file_type_visibility
+                                .excluded_categories
+                                .insert(category);
+                        }
+                    }
+                    if index % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "file-types/extensions", |ui, state| {
+        ui.label("個別に非表示にする拡張子");
+        ui.small("例: png、cr2。別名拡張子は個別に指定します。");
+        ui.horizontal_wrapped(|ui| {
+            let input_width = 120.0_f32.min(ui.available_width().max(40.0));
+            crate::ime_focus::show_singleline(
+                ui,
+                &mut state.file_type_extension_input,
+                None,
+                |edit| edit.hint_text("拡張子").desired_width(input_width),
+            );
+            if ui.button("非表示に追加").clicked() {
+                match normalize_extension(&state.file_type_extension_input) {
+                    Ok(extension) => {
+                        state
+                            .settings
+                            .file_type_visibility
+                            .excluded_extensions
+                            .insert(extension);
+                        state.file_type_extension_input.clear();
+                        state.file_type_extension_error = None;
+                    }
+                    Err(error) => state.file_type_extension_error = Some(error),
+                }
+            }
+        });
+        if let Some(error) = state.file_type_extension_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let extensions: Vec<_> = state
+            .settings
+            .file_type_visibility
+            .excluded_extensions
+            .iter()
+            .cloned()
+            .collect();
+        let mut remove = None;
+        for extension in extensions {
+            ui.horizontal(|ui| {
+                ui.label(format!(".{extension}"));
+                if ui.small_button("表示する").clicked() {
+                    remove = Some(extension);
+                }
+            });
+        }
+        if let Some(extension) = remove {
+            state
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .remove(&extension);
+        }
+    });
+    ui.add_space(8.0);
+    if ui.button("すべて表示に戻す").clicked() {
+        state.settings.file_type_visibility = FileTypeVisibility::default();
+        state.file_type_extension_error = None;
+    }
+    ui.small("OK で確定すると一覧を作り直します。検索結果・サブ展開は閉じます。");
+    ui.small(
+        "開いている本・再生中のメディアは終了まで継続します。登録・評価・タグは削除しません。",
+    );
+    ui.small("書庫の開封処理は「キャッシュ」の書庫・EPUB 設定に従います。");
+}
+
 pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "duplicate/archive-folder", |ui, state| {
         let s = &mut state.settings;

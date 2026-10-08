@@ -1890,17 +1890,23 @@ impl crate::app::App {
                     }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
-                    let latest = self.last_book_resume.as_ref().and_then(|(path, page, _)| {
-                        (crate::path_key::normalize(path)
-                            == crate::path_key::normalize(pending.path()))
-                        .then_some(*page)
-                    });
+                    let latest =
+                        self.last_book_resume
+                            .as_ref()
+                            .and_then(|(path, page, _, identity)| {
+                                (crate::path_key::normalize(path)
+                                    == crate::path_key::normalize(pending.path()))
+                                .then(|| crate::book_resume_db::ReadingPosition {
+                                    page: *page,
+                                    identity: identity.clone(),
+                                })
+                            });
                     let page = latest.or_else(|| {
                         self.book_resume_db
                             .as_ref()
-                            .and_then(|db| db.get(pending.path()))
+                            .and_then(|db| db.get_position(pending.path()))
                     });
-                    pending.complete(page);
+                    pending.complete_position(page);
                 }
                 ClaimedRemoteUiRequest::VideoStream(pending) => {
                     if self.sidecar_restore_active() {
@@ -2754,7 +2760,34 @@ impl crate::app::App {
         let page_index = page_index as usize;
         if record_resume {
             // Remoteの従来のNULL記録を維持し、旧meterを消す。
-            self.persist_book_resume(target.container_path.clone(), page_index, None);
+            let identity = match &address.subresource {
+                mimageviewer_ipc::RemoteSubresource::File => {
+                    Some(crate::book_resume_db::PageIdentity::Image {
+                        path: crate::path_key::normalize_keep_drive(std::path::Path::new(
+                            &address.path,
+                        )),
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::ZipEntry { entry_name } => {
+                    Some(crate::book_resume_db::PageIdentity::Archive {
+                        container: crate::path_key::normalize_keep_drive(&target.container_path),
+                        entry_name: entry_name.replace('\\', "/"),
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
+                    Some(crate::book_resume_db::PageIdentity::Document {
+                        container: crate::path_key::normalize_keep_drive(&target.container_path),
+                        page_num: *page_number as usize,
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::ZipDirectory { .. } => None,
+            };
+            self.persist_book_resume_with_identity(
+                target.container_path.clone(),
+                page_index,
+                None,
+                identity,
+            );
         }
 
         if self.settings.reading_history_enabled
@@ -6043,7 +6076,17 @@ mod tests {
             true,
         );
         assert!(matches!(response, RemoteWriteResponse::Success(_)));
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 1, None)));
+        assert_eq!(
+            app.last_book_resume,
+            Some((
+                folder.clone(),
+                1,
+                None,
+                Some(crate::book_resume_db::PageIdentity::Image {
+                    path: crate::path_key::normalize_keep_drive(&second)
+                })
+            ))
+        );
         assert_eq!(app.book_resume_meters.get(&folder), None);
         settle_book_resume_meter(&mut app);
         assert_eq!(
@@ -6059,11 +6102,8 @@ mod tests {
             handle.snapshot().phase,
             super::super::session::RemoteControlPhase::Local
         );
-        app.current_folder = Some(folder);
-        app.items = vec![
-            crate::grid_item::GridItem::Image(first),
-            crate::grid_item::GridItem::Image(second),
-        ];
+        app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.resume_page_for_container(), Some(1));
     }
 

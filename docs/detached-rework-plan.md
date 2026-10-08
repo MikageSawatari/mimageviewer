@@ -1455,6 +1455,54 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-08 §1.345 表示種類と一時 reader の所有者**
+
+合意済みの [表示種類 plan](file-type-visibility-plan.md) に従い、採用した一覧の
+`PreparedPageIdentityIndex` を items と同じ viewer context に保持する。通常 snapshot は
+既存 sidecar restore の worker / continuation で対応表だけを準備し、表示の再読込や
+metadata import は行わない。deferred fullscreen は対応表の採用後だけ継続する。
+
+除外中の画像・動画・音声を外部から明示して開く `DirectMedia` は、親一覧と一時 reader の
+対を既存 snapshot owner に保持する。materialized still と `LiveMediaPark` の共通 fork が
+成功した時点で、その対と採用済み対応表を実際の reader context へ移送し、main は元の
+表示種類を適用した親一覧へ戻す。次の source 要求を受け付けただけでは退役させず、既存の
+source 採用境界で移送・park 後に残る owner だけを終了する。これにより、再生中の窓を残す
+既存機能を維持し、同じ reader の owner を main と別窓へ重複させない。
+
+実装担当と独立 Sol / xhigh reviewer は、共通 fork / 採用境界への集約を実装前に確認した。
+これは items・対応表・snapshot の所有境界を揃える構造修正で、detached predicate、
+viewport / host / placement / geometry、公開・focus protocol を変更しない。新しい時間窓、
+待機 flag、retry、機能制限を追加しないため §2 の症状パッチに該当しない。
+設計担当による今回の実装差分の検収は未実施で、検収済みとは記録しない。
+
+同項目の回帰検証で、detached の画像フォルダ採用が「まだ fullscreen index がない」ことを
+失敗と判定する境界も確認した。通常の sidecar owner が持つ採用済み
+`AutoFullscreenFolder` continuation は、対応表準備を含む非同期初期表示要求の正本である。
+実装担当と独立 reviewer は、current context / source / items generation と live cancel token、
+`detached_physical` を照合したこの typed continuation を、物理フォルダ open と
+GridFolderCandidate の二つの採用結果で継続中として扱う修正へ実装前に合意した。
+準備終了時に読書位置の復元拒否や可視ページなしで初期ページを選べなかった場合は、
+既存の初回 open terminal へ一度だけ送る。新しい bool / pending や detached lifecycle の
+待機状態・outstanding 述語を増やさず、
+既存要求の採用と終了を対にする構造修正で、viewport / geometry / focus を変更しない。
+
+同じ確認で、Collection rootを別窓へ開くplanにも、generationを照合したrootの
+immutableページ対応表を必須で保持する。別窓に以前の対応表を残したまま行だけを
+交換しない。ZIP階層や固定一覧の対応表だけを準備する`IndexOnly`が切断した場合は、
+所有するdeferred openを破棄し、既存のnavigation失敗・fullscreen close・初回open
+terminalを使って終了する。旧fullscreen indexを新しい行に当てて別ページを表示せず、
+退避したSnapshotの対応表とDB記録は維持する。この失敗処理も構造レビューで合意した。
+
+同項目のlib回帰では、bookmarkの動画・音声fallbackが新規別窓を作る際も、
+対応表準備前のfullscreen indexを成功条件としていた。既存
+`start_active_detached_loading_context`へ集約し、DetachedPhysical scope、実window binding、
+準備中の公開と失敗時の破棄を共通ownerで行う。成功判定は、current context / source /
+items generation、live cancel、detached scope、exact media pathを照合した既存deferred要求を
+使い、最終表示は同じhydration ownerへ任せる。実装担当と独立Sol / xhigh reviewerは、
+実装前にこの構造へ合意した。新しいpendingやwindow predicateを足さず、
+video/audioのseek継続、既存窓再利用、Mainと退避した別窓の内容を維持する。
+準備worker切断は公開した窓だけを既存の初回open terminalで閉じる。
+
 **2026-10-08 §1.339 proof第4回監査・main切替要求の退役**
 
 mainのQuick Folder再選択／往復と検索owner切替を、既存sequence＋共通の未採用要求終了へ接続する。

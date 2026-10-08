@@ -1265,6 +1265,25 @@ fn load_details_page_count(
     )
 }
 
+fn visible_archive_page_count(
+    entries: &[crate::zip_loader::ZipImageEntry],
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> Result<u32, DetailsPageCountError> {
+    u32::try_from(
+        entries
+            .iter()
+            .filter(|entry| {
+                policy.allows_physical_file(Path::new(&entry.entry_name))
+                    && entry
+                        .container_ancestry
+                        .iter()
+                        .all(|origin| origin.allows(policy))
+            })
+            .count(),
+    )
+    .map_err(|_| DetailsPageCountError::Failed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_details_page_count_with_pdf_enumerator(
     target: &DetailsMetaTarget,
@@ -1288,6 +1307,11 @@ fn load_details_page_count_with_pdf_enumerator(
     if let Some(count) = target.warm_page_count {
         return Ok(Some(count));
     }
+    let default_visibility = crate::file_type_visibility::FileTypeVisibility::default();
+    let visibility = config
+        .image_folder_options
+        .as_ref()
+        .map_or(&default_visibility, |options| &options.file_type_visibility);
     let folder = target.catalog_folder.as_ref().ok_or(())?;
     let key = target.catalog_key.as_deref().ok_or(())?;
     // Metadata acquisition can fail during directory enumeration.  In that case
@@ -1337,14 +1361,23 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::ZipEnumerate),
                     ));
                 };
-                crate::zip_loader::enumerate_image_entries(path).map_err(|_| ())?
+                crate::zip_loader::enumerate_image_entries_detailed_with_cancel(path, Some(cancel))
+                    .map_err(|_| {
+                        if cancel.load(Ordering::Relaxed) {
+                            DetailsPageCountError::Cancelled(DetailsMetaCancelReason::AfterIo(
+                                DetailsMetaIoStage::ZipEnumerate,
+                            ))
+                        } else {
+                            DetailsPageCountError::Failed
+                        }
+                    })?
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
                     DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::ZipEnumerate),
                 ));
             }
-            let count = u32::try_from(entries.len()).map_err(|_| ())?;
+            let count = visible_archive_page_count(&entries.entries, visibility)?;
             if let Some(catalog) = catalog {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
                     return Err(DetailsPageCountError::Cancelled(
@@ -1438,21 +1471,42 @@ fn load_details_page_count_with_pdf_enumerator(
                     return Ok(meta.page_count);
                 }
             }
-            let inspection = {
+            let count = {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
                     return Err(DetailsPageCountError::Cancelled(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::RarInspect),
                     ));
                 };
-                crate::rar_loader::inspect_for_direct_read(path).map_err(|_| ())?
+                let inspection =
+                    crate::rar_loader::inspect_for_direct_read(path).map_err(|_| ())?;
+                if inspection.decision != crate::rar_loader::RarDirectReadDecision::Direct {
+                    None
+                } else if visibility.is_all_visible() {
+                    Some(inspection.summary.image_count)
+                } else {
+                    // The inspection summary describes the full conversion input. Only the
+                    // restricted display policy needs a member listing to derive its count.
+                    let entries = crate::rar_loader::enumerate_image_entries_detailed_with_cancel(
+                        path,
+                        Some(cancel),
+                    )
+                    .map_err(|_| {
+                        if cancel.load(Ordering::Relaxed) {
+                            DetailsPageCountError::Cancelled(DetailsMetaCancelReason::AfterIo(
+                                DetailsMetaIoStage::RarInspect,
+                            ))
+                        } else {
+                            DetailsPageCountError::Failed
+                        }
+                    })?;
+                    Some(visible_archive_page_count(&entries.entries, visibility)?)
+                }
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
                     DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::RarInspect),
                 ));
             }
-            let count = (inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct)
-                .then_some(inspection.summary.image_count);
             if let Some(catalog) = catalog {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
                     return Err(DetailsPageCountError::Cancelled(
@@ -2854,6 +2908,207 @@ mod tests {
             ),
             Ok(Some(expected))
         );
+    }
+
+    fn archive_details_target(path: &Path, item: GridItem) -> DetailsMetaTarget {
+        let mut target = no_io_details_target(0);
+        target.key = crate::adjustment_db::normalize_path(path);
+        target.item = item;
+        target.source_identity = Some((123, std::fs::metadata(path).unwrap().len() as i64));
+        target.catalog_folder = Some(path.parent().unwrap().to_path_buf());
+        target.catalog_key = Some(path.file_name().unwrap().to_string_lossy().into_owned());
+        target.load_page_count = true;
+        target.load_ai_metadata = false;
+        target
+    }
+
+    fn archive_details_config(
+        policy: crate::file_type_visibility::FileTypeVisibility,
+    ) -> DetailsPageCountConfig {
+        let settings = crate::settings::Settings {
+            file_type_visibility: policy,
+            ..Default::default()
+        };
+        DetailsPageCountConfig {
+            fingerprint: crate::app::folder_scan::image_page_recognition_fingerprint(&settings),
+            image_folder_options: Some(crate::app::folder_scan::image_folder_page_count_options(
+                &settings,
+            )),
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+        }
+    }
+
+    #[test]
+    fn details_page_count_projects_zip_leaves_and_actual_nested_boundaries() {
+        use std::io::Write as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("book.cbz");
+        write_zip_with_nested_images(&path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut zip = zip::ZipWriter::new_append(file).unwrap();
+        for name in ["notes.zip/page03.jpg", "page04.png", "page05.dng"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"recognized image, not decoded").unwrap();
+        }
+        zip.finish().unwrap();
+        let target = archive_details_target(&path, GridItem::ZipFile(path.clone()));
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = ContainerCatalogCache::new(8);
+        let cases: &[(&[&str], u32)] = &[
+            (&[], 5),
+            (&["jpg"], 3),
+            (&["png"], 3),
+            (&["zip"], 4),
+            (&["zip", "png"], 3),
+        ];
+        for &(extensions, expected) in cases {
+            let config = archive_details_config(crate::file_type_visibility::FileTypeVisibility {
+                excluded_extensions: extensions
+                    .iter()
+                    .map(|extension| (*extension).into())
+                    .collect(),
+                ..Default::default()
+            });
+            assert_eq!(
+                load_details_page_count(
+                    &target,
+                    &cache_dir,
+                    &mut catalogs,
+                    &io_sem,
+                    &cancel,
+                    &config,
+                ),
+                Ok(Some(expected)),
+                "member exclusions {extensions:?}; notes.zip is a real directory"
+            );
+        }
+        // Changing back to a previous policy must not reuse the most recent projection's
+        // count. An ordinary directory with an archive suffix still contributes its page.
+        let config = archive_details_config(crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["zip".into()].into_iter().collect(),
+            ..Default::default()
+        });
+        assert_eq!(
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
+            Ok(Some(4))
+        );
+    }
+
+    #[test]
+    fn details_page_count_projects_direct_rar_and_caches_the_policy_count() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("duplicate-names.rar");
+        std::fs::write(&path, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+        let target = archive_details_target(
+            &path,
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+        );
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = ContainerCatalogCache::new(8);
+        for (policy, expected) in [
+            (
+                crate::file_type_visibility::FileTypeVisibility::default(),
+                2,
+            ),
+            (
+                crate::file_type_visibility::FileTypeVisibility {
+                    excluded_extensions: ["png".into()].into_iter().collect(),
+                    ..Default::default()
+                },
+                0,
+            ),
+        ] {
+            let config = archive_details_config(policy);
+            assert_eq!(
+                load_details_page_count(
+                    &target,
+                    &cache_dir,
+                    &mut catalogs,
+                    &io_sem,
+                    &cancel,
+                    &config,
+                ),
+                Ok(Some(expected))
+            );
+        }
+        assert_eq!(
+            crate::rar_loader::inspect_for_direct_read(&path)
+                .unwrap()
+                .summary
+                .image_count,
+            2,
+            "conversion preview continues to describe all recognized input images"
+        );
+        std::fs::remove_file(&path).unwrap();
+        let config = archive_details_config(crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["png".into()].into_iter().collect(),
+            ..Default::default()
+        });
+        assert_eq!(
+            load_details_page_count(
+                &target,
+                &cache_dir,
+                &mut catalogs,
+                &io_sem,
+                &cancel,
+                &config,
+            ),
+            Ok(Some(0)),
+            "restricted count is reusable without reopening the direct RAR"
+        );
+    }
+
+    #[test]
+    fn details_archive_page_count_classifies_raw_independently_of_images() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("duplicate-names.rar");
+        std::fs::write(&path, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+        let mut entries = crate::rar_loader::enumerate_image_entries_detailed(&path)
+            .unwrap()
+            .entries;
+        // Existing real RAR fixtures contain PNGs. Adapt one recognized leaf to exercise
+        // the shared projection's RAW classification without adding a decoder fixture.
+        entries[1].entry_name = "page.dng".into();
+        for policy in [
+            crate::file_type_visibility::FileTypeVisibility {
+                excluded_categories: [crate::file_type_visibility::FileTypeCategory::Raw]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            crate::file_type_visibility::FileTypeVisibility {
+                excluded_extensions: ["png".into()].into_iter().collect(),
+                ..Default::default()
+            },
+            crate::file_type_visibility::FileTypeVisibility {
+                excluded_categories: [crate::file_type_visibility::FileTypeCategory::Image]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(visible_archive_page_count(&entries, &policy), Ok(1));
+        }
     }
 
     fn no_io_details_target(idx: usize) -> DetailsMetaTarget {

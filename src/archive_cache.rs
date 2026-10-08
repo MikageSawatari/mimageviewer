@@ -43,6 +43,39 @@ pub fn db_path() -> PathBuf {
     crate::data_dir::get().join("archive_cache.db")
 }
 
+/// Worker-only consistency check. A missing manifest must not turn a cache
+/// recorded by the new converter into an archive with no nested boundaries.
+/// Mark the rebuildable cache as legacy; the next policy-aware open reconverts.
+pub(crate) fn mark_missing_origin_manifest_for_reconversion(cache_path: &Path) -> bool {
+    let expected = ArchiveCacheDb::open_readonly()
+        .ok()
+        .and_then(|db| {
+            let conn = db.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM converted_archives WHERE cached_zip_path=?1 AND origin_manifest_version=1)",
+                [cache_path.to_string_lossy().as_ref()],
+                |row| row.get::<_, bool>(0),
+            ).ok()
+        })
+        .unwrap_or(false);
+    if expected {
+        crate::logger::log(format!(
+            "archive_cache: missing origin manifest: {}. Reconvert on next visibility-aware open.",
+            cache_path.display()
+        ));
+        if let Ok(db) = ArchiveCacheDb::open()
+            && let Ok(conn) = db.conn.lock()
+            && let Err(error) = conn.execute(
+                "UPDATE converted_archives SET origin_manifest_version=0 WHERE cached_zip_path=?1 AND origin_manifest_version=1",
+                [cache_path.to_string_lossy().as_ref()],
+            )
+        {
+            crate::logger::log(format!("archive_cache: could not mark missing manifest for reconversion: {error}"));
+        }
+    }
+    expected
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // パスハッシュ (キャッシュ ZIP の保存先を決定する)
 // ──────────────────────────────────────────────────────────────────────
@@ -232,6 +265,44 @@ impl ArchiveCacheDb {
         Some(zip_path)
     }
 
+    /// Older caches remain usable until a policy needs the original nested boundaries.
+    pub fn lookup_with_visibility(
+        &self,
+        src_path: &Path,
+        src_mtime: i64,
+        src_size: i64,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
+    ) -> Option<PathBuf> {
+        if policy.requires_archive_origins() && !self.has_origin_manifest(src_path) {
+            return None;
+        }
+        self.lookup(src_path, src_mtime, src_size)
+    }
+
+    pub fn peek_with_visibility(
+        &self,
+        src_path: &Path,
+        src_mtime: i64,
+        src_size: i64,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
+    ) -> Option<PathBuf> {
+        if policy.requires_archive_origins() && !self.has_origin_manifest(src_path) {
+            return None;
+        }
+        self.peek(src_path, src_mtime, src_size)
+    }
+
+    fn has_origin_manifest(&self, src_path: &Path) -> bool {
+        self.conn.lock().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT origin_manifest_version FROM converted_archives WHERE src_path_key=?1",
+                [crate::path_key::normalize(src_path)],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        }) == Some(1)
+    }
+
     /// [`Self::lookup`] の読み取り専用版。`last_access_at` を更新せず、無効エントリの
     /// 掃除もしない (SELECT + `exists()` のみ、書き込みトランザクションなし)。
     ///
@@ -280,8 +351,8 @@ impl ArchiveCacheDb {
         conn.execute(
             "INSERT OR REPLACE INTO converted_archives \
              (src_path_key, src_path, src_mtime, src_size, format, \
-              cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
+              cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required, origin_manifest_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, 1)",
             params![
                 &key,
                 src_str,
@@ -571,6 +642,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE converted_archives ADD COLUMN password_required INTEGER NOT NULL DEFAULT 0;",
     );
+    let columns = conn
+        .prepare("PRAGMA table_info(converted_archives)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns
+        .iter()
+        .any(|column| column == "origin_manifest_version")
+    {
+        conn.execute_batch("ALTER TABLE converted_archives ADD COLUMN origin_manifest_version INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 
@@ -681,6 +762,79 @@ mod tests {
         assert_eq!(archive.total_size().unwrap(), 0);
         epub.retire_all_current().unwrap();
         assert_eq!(archive.total_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn visibility_old_cache_requires_reconversion_only_when_origins_are_needed() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let src = guard.path().join("book.7z");
+        let cached = guard.path().join("book.zip");
+        std::fs::write(&src, b"7z").unwrap();
+        std::fs::write(&cached, b"zip").unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        let mtime = crate::ui_helpers::mtime_secs(&meta);
+        let size = meta.len() as i64;
+        db.record(
+            &src,
+            mtime,
+            size,
+            ArchiveFormat::SevenZ,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE converted_archives SET origin_manifest_version=0",
+                [],
+            )
+            .unwrap();
+        let all = FileTypeVisibility::default();
+        assert_eq!(
+            db.peek_with_visibility(&src, mtime, size, &all),
+            Some(cached.clone())
+        );
+        let mut image_exclusion = all.clone();
+        image_exclusion.excluded_extensions.insert("png".into());
+        assert_eq!(
+            db.lookup_with_visibility(&src, mtime, size, &image_exclusion),
+            Some(cached.clone())
+        );
+        let mut nested_exclusion = all.clone();
+        nested_exclusion
+            .excluded_categories
+            .insert(FileTypeCategory::Zip);
+        assert!(
+            db.peek_with_visibility(&src, mtime, size, &nested_exclusion)
+                .is_none()
+        );
+        assert!(
+            db.lookup_with_visibility(&src, mtime, size, &nested_exclusion)
+                .is_none()
+        );
+        assert!(cached.exists());
+        assert_eq!(db.list_all().unwrap().len(), 1);
+        db.record(
+            &src,
+            mtime,
+            size,
+            ArchiveFormat::SevenZ,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.peek_with_visibility(&src, mtime, size, &nested_exclusion),
+            Some(cached)
+        );
     }
 
     #[test]

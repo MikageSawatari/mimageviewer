@@ -45,6 +45,7 @@ pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_s
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
+pub mod archive_origin;
 pub mod audio_decode;
 pub mod audio_normalize_db;
 pub mod auto_aspect;
@@ -90,6 +91,7 @@ pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
 mod empty_items_reason;
+pub mod file_type_visibility;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
@@ -2174,3 +2176,8 @@ mod tests {
         assert!(path.ends_with("book.zip"));
     }
 }
+
+pub use ui_dialogs::preferences::draw_file_type_visibility_snapshot_fixture;
+pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
+
+pub(crate) mod archive_visibility;

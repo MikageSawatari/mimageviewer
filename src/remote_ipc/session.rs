@@ -1103,7 +1103,7 @@ struct QueuedRemoteWrite {
 
 struct QueuedBookResumeRead {
     path: std::path::PathBuf,
-    reply: mpsc::SyncSender<Option<usize>>,
+    reply: mpsc::SyncSender<Option<crate::book_resume_db::ReadingPosition>>,
     dispatch: Arc<UiRequestDispatch>,
 }
 
@@ -1128,7 +1128,7 @@ pub(crate) struct ClaimedRemoteWrite {
 
 pub(crate) struct ClaimedBookResumeRead {
     path: std::path::PathBuf,
-    reply: mpsc::SyncSender<Option<usize>>,
+    reply: mpsc::SyncSender<Option<crate::book_resume_db::ReadingPosition>>,
 }
 
 pub(crate) struct ClaimedVideoStreamUiRequest {
@@ -1322,11 +1322,26 @@ impl ClaimedBookResumeRead {
     }
 
     pub(crate) fn complete(self, page: Option<usize>) {
-        let _ = self.reply.send(page);
+        self.complete_position(page.map(|page| crate::book_resume_db::ReadingPosition {
+            page,
+            identity: None,
+        }));
+    }
+
+    pub(crate) fn complete_position(
+        self,
+        position: Option<crate::book_resume_db::ReadingPosition>,
+    ) {
+        let _ = self.reply.send(position);
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(path: std::path::PathBuf) -> (Self, mpsc::Receiver<Option<usize>>) {
+    pub(crate) fn for_test(
+        path: std::path::PathBuf,
+    ) -> (
+        Self,
+        mpsc::Receiver<Option<crate::book_resume_db::ReadingPosition>>,
+    ) {
         let (reply, receiver) = mpsc::sync_channel(1);
         (Self { path, reply }, receiver)
     }
@@ -1942,6 +1957,22 @@ impl SessionHandle {
         path: &std::path::Path,
         timeout: Duration,
     ) -> Result<Option<usize>, UiReadError> {
+        self.read_book_position_with_timeout(path, timeout)
+            .map(|position| position.map(|position| position.page))
+    }
+
+    pub(crate) fn read_book_position(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<crate::book_resume_db::ReadingPosition>, UiReadError> {
+        self.read_book_position_with_timeout(path, UI_REQUEST_ACCEPT_TIMEOUT)
+    }
+
+    fn read_book_position_with_timeout(
+        &self,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<Option<crate::book_resume_db::ReadingPosition>, UiReadError> {
         let dispatch = Arc::new(UiRequestDispatch::pending());
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::BookResumeRead(QueuedBookResumeRead {

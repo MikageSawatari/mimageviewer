@@ -300,6 +300,7 @@ preferences_policy! {
         archive_file_handling: ArchiveFileHandling => ("アーカイブファイルの扱い", |v, _raw| matches!(v, ArchiveFileHandling::Ask | ArchiveFileHandling::Convert | ArchiveFileHandling::Ignore), archive, archive);
         epub_file_handling: EpubFileHandling => ("EPUBファイルの扱い", |_, _| true, plain, plain);
         show_hidden_files: bool => ("隠しファイルを表示", |_, _| true, plain, plain);
+        file_type_visibility: crate::file_type_visibility::FileTypeVisibility => ("表示するファイル種類", |_, _| true, plain, plain);
         folder_thumb_sort: SortOrder => ("フォルダ代表画像の選定順", |v, _raw| matches!(v, SortOrder::FileName | SortOrder::Numeric | SortOrder::DateAsc | SortOrder::DateDesc), plain, plain);
         folder_thumb_depth: u32 => ("フォルダ代表画像の探索深さ", |v, _raw| (0..=10).contains(v), plain, plain);
         folder_skip_limit: usize => ("画像なしフォルダを飛ばす上限", |v, _raw| (1..=30).contains(v), plain, plain);
@@ -864,6 +865,14 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Raw);
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
         settings.raw_brightness = crate::raw::RawBrightness::None;
         settings.ui_theme = different_enum(
             &settings.ui_theme,
@@ -1539,13 +1548,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 446);
+        assert_eq!(entries.len(), 447);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            134
+            135
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1555,7 +1564,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 132);
+        assert_eq!(wire.len(), 133);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1570,6 +1579,63 @@ mod tests {
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn file_type_visibility_import_requires_canonical_values_and_preserves_invalid_input() {
+        // Settings and the preferences input normalize extensions. Transfer input retains
+        // its existing stricter contract: imports accept the canonical exported shape.
+        let normalized: crate::file_type_visibility::FileTypeVisibility =
+            serde_json::from_value(json!({
+                "excluded_categories": ["raw"], "excluded_extensions": [".PNG", "png"]
+            }))
+            .unwrap();
+        assert_eq!(
+            normalized
+                .excluded_extensions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["png"]
+        );
+        let parsed =
+            parse_preferences(&document(json!({ "file_type_visibility": normalized }))).unwrap();
+        let mut destination = Settings::default();
+        let report = parsed.apply_to(&mut destination);
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert!(
+            destination
+                .file_type_visibility
+                .excluded_categories
+                .contains(&crate::file_type_visibility::FileTypeCategory::Raw)
+        );
+        assert_eq!(
+            destination
+                .file_type_visibility
+                .excluded_extensions
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![&"png".to_string()]
+        );
+        let before = destination.file_type_visibility.clone();
+        for invalid in [
+            json!({"excluded_categories":["future"], "excluded_extensions":[]}),
+            json!({"excluded_categories":[], "excluded_extensions":["../png"]}),
+            json!({"excluded_categories":["raw"], "excluded_extensions":[".PNG", "png"]}),
+            json!({"excluded_categories":["raw"], "excluded_extensions":["png", "png"]}),
+            json!({"excluded_categories":["raw"]}),
+        ] {
+            let parsed =
+                parse_preferences(&document(json!({"file_type_visibility": invalid}))).unwrap();
+            assert!(!parsed.apply_to(&mut destination).issues.is_empty());
+            assert_eq!(destination.file_type_visibility, before);
+        }
+        let exported = export_preferences(&destination).unwrap();
+        let mut other = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut other);
+        assert_eq!(other.file_type_visibility, before);
     }
 
     #[test]

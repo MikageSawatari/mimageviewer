@@ -225,6 +225,7 @@ pub(crate) enum PreferencesPage {
     /// v1.7.0: 製本（本棚の保存先ルート）
     Book,
     DuplicateFiles,
+    FileTypeVisibility,
     ExifDisplay,
     SpreadMode,
     /// 履歴と復元 (閲覧履歴、読書/再生位置の復元)
@@ -277,6 +278,7 @@ impl PreferencesOpenRequest {
     /// 同名ファイル処理。ページ内の 4 項目すべてが同名の設定なので、先頭へ寄せずに
     /// ページごと開く。
     pub(crate) const DUPLICATE_FILES: Self = Self::page(PreferencesPage::DuplicateFiles);
+    pub(crate) const FILE_TYPE_VISIBILITY: Self = Self::page(PreferencesPage::FileTypeVisibility);
 
     /// 変換対象書庫の扱い。キャッシュページの下の方にあり、ページを開いただけでは
     /// 画面に入らない (2026-09-05 利用者報告) ので anchor まで指定する。
@@ -315,6 +317,7 @@ impl PreferencesPage {
         Self::Folder,
         Self::Book,
         Self::DuplicateFiles,
+        Self::FileTypeVisibility,
         Self::ExifDisplay,
         Self::SpreadMode,
         Self::PlaybackResume,
@@ -353,6 +356,7 @@ impl PreferencesPage {
             Self::Folder => "フォルダ・ファイル",
             Self::Book => "製本",
             Self::DuplicateFiles => "同名ファイル",
+            Self::FileTypeVisibility => "表示するファイル種類",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "閲覧表示",
             Self::PlaybackResume => "履歴と復元",
@@ -612,6 +616,7 @@ const TREE: &[TreeCategory] = &[
         page: None,
         children: &[
             PreferencesPage::DuplicateFiles,
+            PreferencesPage::FileTypeVisibility,
             PreferencesPage::ExifDisplay,
             PreferencesPage::SusiePlugins,
             PreferencesPage::RawDevelop,
@@ -853,6 +858,9 @@ pub(crate) struct PreferencesState {
     initial_video_normal_wheel_action: crate::ring_shortcut::VideoNormalWheelActionId,
     /// 現在選択中のページ
     pub selected: PreferencesPage,
+    /// 拡張子の追加欄。入力途中の値は永続設定へ混ぜない。
+    pub file_type_extension_input: String,
+    pub file_type_extension_error: Option<&'static str>,
     /// 右クリックメニュー設定に表示する固定の確認場面。保存対象ではない。
     pub context_menu_preview_scenario: crate::context_menu_model::ContextMenuPreviewScenario,
     /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
@@ -1438,6 +1446,8 @@ impl PreferencesState {
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
+            file_type_extension_input: String::new(),
+            file_type_extension_error: None,
             context_menu_preview_scenario:
                 crate::context_menu_model::ContextMenuPreviewScenario::default(),
             right_panel_scroll_generation: 0,
@@ -2190,7 +2200,7 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
-        if self.preferences_transfer_busy() {
+        if self.preferences_transfer_busy() || self.collection_reorder_open() {
             return;
         }
         self.preferences_requested_page = Some(request);
@@ -2413,6 +2423,7 @@ impl App {
         let mut cancel = false;
 
         let transfer_dialog_open = self.preferences_transfer_dialog_open();
+        let collection_reorder_open = self.collection_reorder_open();
         if transfer_dialog_open {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
@@ -2552,7 +2563,8 @@ impl App {
                         font_ready
                             && lut_ready
                             && clipboard_folder_ready
-                            && organize_validation.is_ok(),
+                            && organize_validation.is_ok()
+                            && !collection_reorder_open,
                         egui::Button::new("  OK  "),
                     );
                     #[cfg(all(windows, feature = "test-script"))]
@@ -2609,6 +2621,8 @@ impl App {
                 let old_grid_display_order = self.settings.grid_display_order.clone();
                 let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
                 let old_show_hidden_files = self.settings.show_hidden_files;
+                let file_type_visibility_changed =
+                    self.settings.file_type_visibility != state.settings.file_type_visibility;
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
                 let old_susie = (
@@ -2946,7 +2960,9 @@ impl App {
                 let rating_sort_position_changed = old_rating_sort_unrated_position
                     != self.settings.rating_sort_unrated_position
                     && self.settings.sort_order.is_rating();
-                if duplicate_settings_changed || file_visibility_changed {
+                if file_type_visibility_changed {
+                    self.apply_file_type_visibility_change(ctx);
+                } else if duplicate_settings_changed || file_visibility_changed {
                     self.reload_current_folder_preserving_override();
                 } else if grid_display_order_changed || rating_sort_position_changed {
                     self.apply_sort_change_reload();
@@ -3740,6 +3756,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::Book => page_book(ui, state),
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
+        PreferencesPage::FileTypeVisibility => page_file_type_visibility(ui, state),
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
@@ -3773,9 +3790,148 @@ pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
     draw_page(ui, &mut state, false);
 }
 
+pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.selected = PreferencesPage::FileTypeVisibility;
+    state
+        .settings
+        .file_type_visibility
+        .excluded_categories
+        .insert(crate::file_type_visibility::FileTypeCategory::Raw);
+    state
+        .settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("png".into());
+    draw_page(ui, &mut state, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_type_visibility_page_edits_draft_and_all_show_reset() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let live = Settings::default();
+        let mut state = preferences_state_for_test(&live);
+        state.selected = PreferencesPage::FileTypeVisibility;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(700.0, 650.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        harness.get_by_label("RAW").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .excluded_categories
+                .contains(&crate::file_type_visibility::FileTypeCategory::Raw)
+        );
+        assert!(live.file_type_visibility.is_all_visible());
+        harness.state_mut().file_type_extension_input = "../png".into();
+        harness.get_by_label("非表示に追加").click();
+        harness.run();
+        assert!(harness.state().file_type_extension_error.is_some());
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .is_empty()
+        );
+        harness.state_mut().file_type_extension_input = ".PNG".into();
+        harness.get_by_label("非表示に追加").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .contains("png")
+        );
+        assert!(harness.state().file_type_extension_error.is_none());
+        harness.get_by_label("すべて表示に戻す").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .is_all_visible()
+        );
+    }
+
+    #[test]
+    fn file_type_visibility_preferences_cancel_ok_save_and_reopen() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness.get_by_label("RAW").click();
+        harness.run();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .is_all_visible()
+        );
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+        harness.run();
+        harness.get_by_label("RAW").click();
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        let expected = harness.state().settings.file_type_visibility.clone();
+        assert!(
+            expected
+                .excluded_categories
+                .contains(&crate::file_type_visibility::FileTypeCategory::Raw)
+        );
+        assert_eq!(Settings::load().file_type_visibility, expected);
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .file_type_visibility,
+            expected
+        );
+    }
 
     #[test]
     fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {

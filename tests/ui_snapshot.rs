@@ -825,6 +825,33 @@ fn preferences_transfer_entry_disabled_dark() {
 }
 
 #[test]
+fn file_type_visibility_preferences_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "file_type_visibility_preferences_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(760.0, 700.0),
+        mimageviewer::draw_file_type_visibility_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_type_visibility_status_dark() {
+    use egui_kittest::kittest::Queryable;
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "file_type_visibility_status_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(760.0, 400.0),
+        mimageviewer::draw_file_type_visibility_status_snapshot_fixture,
+        |harness| {
+            harness.get_by_label("非表示 10 件").click();
+            harness.run();
+        },
+    );
+}
+
+#[test]
 fn preferences_transfer_export_explanation_light() {
     snapshot_with_theme(
         "preferences_transfer_export_explanation_light",

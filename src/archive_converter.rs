@@ -604,6 +604,7 @@ pub fn convert_to_zip_with_password(
         cancel,
         progress,
         options.verify,
+        crate::archive_cache::is_under_cache_root(dst),
     )?;
 
     if summary.image_count == 0 {
@@ -773,6 +774,7 @@ fn do_convert(
     cancel: &AtomicBool,
     progress: Option<&dyn Fn(ConvertProgress)>,
     strict: bool,
+    include_origin_manifest: bool,
 ) -> Result<ArchiveImageSummary, ConvertError> {
     let out_file = std::fs::File::create(tmp_path)?;
     let mut zw = zip::ZipWriter::new(std::io::BufWriter::new(out_file));
@@ -786,6 +788,12 @@ fn do_convert(
         bytes_written: 0,
         seen_names: std::collections::HashSet::new(),
         strict,
+        ancestry: Vec::new(),
+        member_index: 0,
+        manifest: crate::archive_origin::ArchiveOriginManifest {
+            version: 1,
+            images: Default::default(),
+        },
     };
     match format {
         ArchiveFormat::Rar => expand_rar(&mut ctx, src, password, "", 0)?,
@@ -803,6 +811,13 @@ fn do_convert(
         total_uncompressed_bytes: ctx.bytes_written,
         nested_archive_count: 0,
     };
+    if include_origin_manifest {
+        let bytes = serde_json::to_vec(&ctx.manifest).map_err(std::io::Error::other)?;
+        ctx.zw
+            .start_file(crate::archive_origin::MANIFEST_ENTRY, store_options())
+            .map_err(zip_writer_error)?;
+        ctx.zw.write_all(&bytes)?;
+    }
     drop(ctx);
 
     // finish が返す BufWriter を明示的に flush し、ハンドルを閉じてから publish 前検証で
@@ -838,6 +853,9 @@ struct ConvertCtx<'a> {
     seen_names: std::collections::HashSet<String>,
     /// 明示 sibling / batch 変換では、欠落につながる skip を許さず変換全体を失敗させる。
     strict: bool,
+    ancestry: Vec<crate::archive_origin::ArchiveContainerOrigin>,
+    member_index: usize,
+    manifest: crate::archive_origin::ArchiveOriginManifest,
 }
 
 impl ConvertCtx<'_> {
@@ -897,6 +915,7 @@ impl ConvertCtx<'_> {
             }
         };
         self.finish_image(copied);
+        self.manifest.images.insert(name, self.ancestry.clone());
         Ok(())
     }
 
@@ -914,6 +933,7 @@ impl ConvertCtx<'_> {
             return Err(ConvertError::Io(e));
         }
         self.finish_image(data.len() as u64);
+        self.manifest.images.insert(name, self.ancestry.clone());
         Ok(())
     }
 
@@ -981,6 +1001,30 @@ fn expand_nested_guarded(
     prefix: &str,
     depth: u32,
 ) -> Result<(), ConvertError> {
+    let mut locators = ctx
+        .ancestry
+        .last()
+        .map(|origin| origin.locators.clone())
+        .unwrap_or_default();
+    let previous_prefix = ctx
+        .ancestry
+        .last()
+        .map(|origin| origin.navigation_prefix.as_str())
+        .unwrap_or("");
+    locators.push(crate::archive_origin::ArchiveEntryLocator {
+        index: ctx.member_index,
+        member_name: prefix
+            .strip_prefix(previous_prefix)
+            .unwrap_or(prefix)
+            .trim_end_matches('/')
+            .to_owned(),
+    });
+    ctx.ancestry
+        .push(crate::archive_origin::ArchiveContainerOrigin {
+            locators,
+            category: crate::file_type_visibility::category_for_archive_format(kind),
+            navigation_prefix: prefix.to_owned(),
+        });
     let result = match kind {
         ArchiveFormat::Zip => std::fs::File::open(nested_path)
             .map_err(ConvertError::from)
@@ -993,6 +1037,7 @@ fn expand_nested_guarded(
         ArchiveFormat::SevenZ => expand_7z(ctx, nested_path, prefix, depth),
         ArchiveFormat::Lzh => expand_lzh(ctx, nested_path, prefix, depth),
     };
+    ctx.ancestry.pop();
     match result {
         Ok(()) => Ok(()),
         // 入れ子側の password error をそのまま返すと、単一変換 UI が外側アーカイブの
@@ -1039,6 +1084,7 @@ fn expand_zip<R: Read + Seek>(
 
     for i in 0..archive.len() {
         ctx.check_cancel()?;
+        ctx.member_index = i;
         let mut entry = match archive.by_index(i) {
             Ok(entry) => entry,
             Err(e) if ctx.strict => {
@@ -1127,11 +1173,14 @@ fn expand_rar(
     }
 
     let mut archive = open_rar_processing(src, password)?;
+    let mut entry_index = 0;
     loop {
         ctx.check_cancel()?;
         let Some(header) = archive.read_header().map_err(rar_error)? else {
             break;
         };
+        ctx.member_index = entry_index;
+        entry_index += 1;
         let entry = header.entry();
         let raw_name = entry.filename.to_string_lossy().to_string();
         // 宣言サイズで RAM ガード。unrar はストリーミング API が無く header.read() が
@@ -1238,7 +1287,10 @@ fn expand_7z(
     // for_each_entries の closure は io::Result しか返せないので、ConvertError
     // (Cancelled / 出力 Io / 入れ子再帰の伝播分) はスロットへ退避して終了後に取り出す。
     let mut deferred: Option<ConvertError> = None;
+    let mut entry_index = 0;
     let iter_result = reader.for_each_entries(|entry, r| {
+        ctx.member_index = entry_index;
+        entry_index += 1;
         if ctx.cancel.load(Ordering::Relaxed) {
             deferred = Some(ConvertError::Cancelled);
             return Ok(false);
@@ -1376,8 +1428,11 @@ fn expand_lzh(
     }
 
     let mut reader = delharc::parse_file(src).map_err(lzh_error)?;
+    let mut entry_index = 0;
     loop {
         ctx.check_cancel()?;
+        ctx.member_index = entry_index;
+        entry_index += 1;
         // header の借用は raw_name 抽出までで終える (この後 reader を Read で使う)。
         let (raw_name, is_dir) = {
             let header = reader.header();
@@ -1590,6 +1645,66 @@ mod tests {
 
     fn names(out: &[(String, Vec<u8>)]) -> Vec<&str> {
         out.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn converted_origin_manifest_retains_real_boundaries_after_flattening() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let nested = build_zip_bytes(&[("p.jpg", b"NESTED")]);
+        let outer = build_zip_bytes(&[("notes.zip/p.jpg", b"DIRECTORY"), ("book.zip", &nested)]);
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.zip");
+        let converted = crate::archive_cache::cache_root().join("converted.zip");
+        std::fs::create_dir_all(converted.parent().unwrap()).unwrap();
+        std::fs::write(&src, outer).unwrap();
+        let cancel = AtomicBool::new(false);
+        do_convert(
+            &src,
+            &converted,
+            ArchiveFormat::Zip,
+            None,
+            &cancel,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&converted).unwrap();
+        assert_eq!(enumeration.entries.len(), 2);
+        assert!(
+            enumeration
+                .entries
+                .iter()
+                .find(|e| e.entry_name == "notes.zip/p.jpg")
+                .unwrap()
+                .container_ancestry
+                .is_empty()
+        );
+        let nested = enumeration
+            .entries
+            .iter()
+            .find(|e| e.entry_name == "book.zip/p.jpg")
+            .unwrap();
+        assert_eq!(nested.container_ancestry[0].category, FileTypeCategory::Zip);
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_categories.insert(FileTypeCategory::Zip);
+        assert!(
+            !crate::zip_loader::visible_image_entry(&converted, "book.zip/p.jpg", &policy).unwrap()
+        );
+        assert!(
+            crate::zip_loader::visible_image_entry(&converted, "notes.zip/p.jpg", &policy).unwrap()
+        );
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            crate::zip_loader::next_remote_image_candidate_with_visibility(
+                &converted, None, None, &cancel, None, &policy
+            )
+            .unwrap()
+            .unwrap()
+            .entry_name,
+            "notes.zip/p.jpg"
+        );
     }
 
     #[test]

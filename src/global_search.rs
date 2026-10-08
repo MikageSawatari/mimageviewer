@@ -132,6 +132,21 @@ pub struct SearchScope {
     pub mode: crate::search_query::MatchMode,
     /// Hide EPUB paths before counting accepted hits toward HARD_MAX.
     pub ignore_epub: bool,
+    /// List policy is captured once per search run and applied before the accepted-hit cap.
+    pub visibility: crate::file_type_visibility::FileTypeVisibility,
+}
+
+/// Classify indexed logical identities without filesystem access. Archive member rows use
+/// their member extension; PDF/EPUB rows use the original document path, never render assets.
+/// Nested archive provenance is separate from this leaf-type predicate.
+pub(crate) fn search_hit_type_is_visible(
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    path: &str,
+) -> bool {
+    let source = path
+        .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+        .map_or(path, |(_, member)| member);
+    visibility.allows_physical_file(std::path::Path::new(source))
 }
 
 /// 検索ワーカーのエントリーポイント。別スレッドで実行する想定。
@@ -249,6 +264,8 @@ fn run_with_hit_limit(
     let mut offset = 0usize;
     let mut scanned = 0usize;
     let mut valid = 0usize;
+    let mut archive_visibility =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(&scope.visibility, cancel);
 
     // final_reason は labeled break で確定させる (unused-assignment 警告回避)。
     let (truncated, final_reason) = 'paging: loop {
@@ -288,6 +305,15 @@ fn run_with_hit_limit(
             // The index has no separate EPUB kind. Skip by indexed path here,
             // before fetching STORED text and before the accepted-hit limit.
             if scope.ignore_epub && is_epub_search_path(&path) {
+                continue;
+            }
+            if !search_hit_type_is_visible(&scope.visibility, &path)
+                || path
+                    .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+                    .is_some_and(|(container, member)| {
+                        !archive_visibility.allows_member(std::path::Path::new(container), member)
+                    })
+            {
                 continue;
             }
             let text = match fts_index::doc_text_for_target(

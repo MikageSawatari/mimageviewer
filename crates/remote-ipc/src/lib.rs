@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 66;
+pub const PROTOCOL_VERSION: u32 = 67;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -993,6 +993,14 @@ pub enum ContainerOpenMode {
     ResumePage,
 }
 
+/// A saved position cannot be safely mapped into the current visibility projection.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerResumeRefusal {
+    SavedPageUnavailable,
+    LegacyPositionUnverified,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ContainerEntry {
     pub address: RemoteAddress,
@@ -1104,8 +1112,10 @@ pub struct ContainerPayload {
     /// ローカル一覧のサムネイルセルに使う高さ / 幅比。
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
-    /// `book_resume.db` の index を現在の列挙結果で検証し、ページ address に解決した値。
+    /// 保存した論理 identity (旧版では index) を現在の列挙結果で照合したページ address。
     pub resume_page: Option<RemoteAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_refusal: Option<ContainerResumeRefusal>,
     /// ローカルの auto-fullscreen と `book_open_resume` から解決した初期遷移。
     pub open_mode: ContainerOpenMode,
     /// spread.db または session override から解決したモード。縦持ちでも保持する。
@@ -1440,6 +1450,9 @@ pub struct RemoteEntry {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CollectionPayload {
+    /// Full saved membership for registration-backed lists; separate from displayed rows.
+    #[serde(default)]
+    pub registered_total: Option<usize>,
     pub title: String,
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
@@ -1572,6 +1585,8 @@ pub struct PersistentCollectionSnapshotRequest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PersistentCollectionSnapshotPayload {
+    #[serde(default)]
+    pub registered_total: usize,
     pub collection_id: String,
     pub collection_revision: u64,
     pub view_token: String,
@@ -3220,6 +3235,40 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v67_registered_collection_total_round_trips_and_defaults() {
+        assert_eq!(PROTOCOL_VERSION, 67);
+        let payload = PersistentCollectionSnapshotPayload {
+            registered_total: 12,
+            collection_id: "fixture".into(),
+            collection_revision: 1,
+            view_token: "fixture-view".into(),
+            title: "fixture".into(),
+            order: PersistentCollectionOrderSummary::Manual,
+            entries: Vec::new(),
+            configured_spread_mode: RemoteSpreadMode::Single,
+            effective_spread_mode: RemoteSpreadMode::Single,
+            reading_direction: RemoteReadingDirection::Ltr,
+            image_count: 0,
+            page_groups: Vec::new(),
+            spread_page_gap_px: 0,
+            entry_limit: 1000,
+            truncated: false,
+        };
+        let mut encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            serde_json::from_value::<PersistentCollectionSnapshotPayload>(encoded.clone()).unwrap(),
+            payload
+        );
+        encoded.as_object_mut().unwrap().remove("registered_total");
+        assert_eq!(
+            serde_json::from_value::<PersistentCollectionSnapshotPayload>(encoded)
+                .unwrap()
+                .registered_total,
+            0
+        );
+    }
+
+    #[test]
     fn protocol_version_mismatch_is_rejected_and_reports_both_versions() {
         let client_version = PROTOCOL_VERSION + 1;
         let reply = negotiate(client_version);
@@ -3235,7 +3284,7 @@ mod tests {
 
     #[test]
     fn protocol_v63_audio_track_control_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         let action = VideoStreamControlAction::AudioTrack {
             stream_index: 3,
             position_secs: 42.5,
@@ -3385,7 +3434,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3428,7 +3477,7 @@ mod tests {
 
     #[test]
     fn protocol_v62_raw_error_codes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         for (code, wire) in [
             (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
             (MediaErrorCode::RawCapacity, "raw_capacity"),
@@ -3450,7 +3499,7 @@ mod tests {
 
     #[test]
     fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         let expected = ClientMessage::RawPrefetchWindow {
             id: 65,
             owner: test_owner("window-client"),
@@ -3650,7 +3699,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3812,6 +3861,7 @@ mod tests {
                 thumb_aspect_height_ratio: 1.5,
                 sort_state: test_sort_state(Some("本として表示中は名前順固定です")),
                 resume_page: Some(page(1)),
+                resume_refusal: None,
                 open_mode: ContainerOpenMode::ResumePage,
                 configured_spread_mode: RemoteSpreadMode::RtlCover,
                 effective_spread_mode: RemoteSpreadMode::RtlCover,
@@ -3861,6 +3911,36 @@ mod tests {
 
         let encoded = serde_json::to_string(&expected).unwrap();
         assert!(encoded.contains("\"front_cover_supplement\""));
+
+        let ServerMessage::Container {
+            response: ContainerResponse::Success(payload),
+            ..
+        } = &expected
+        else {
+            unreachable!();
+        };
+        for reason in [
+            ContainerResumeRefusal::SavedPageUnavailable,
+            ContainerResumeRefusal::LegacyPositionUnverified,
+        ] {
+            let mut refused = payload.clone();
+            refused.resume_page = None;
+            refused.resume_refusal = Some(reason);
+            refused.open_mode = ContainerOpenMode::Grid;
+            let encoded = serde_json::to_value(&refused).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ContainerPayload>(encoded.clone()).unwrap(),
+                refused
+            );
+            let mut legacy = encoded;
+            legacy.as_object_mut().unwrap().remove("resume_refusal");
+            assert_eq!(
+                serde_json::from_value::<ContainerPayload>(legacy)
+                    .unwrap()
+                    .resume_refusal,
+                None
+            );
+        }
 
         let request = ContainerRequest {
             address: RemoteAddress::file("C:/Books/book.pdf"),
@@ -4236,6 +4316,7 @@ mod tests {
         let expected = ServerMessage::Collection {
             id: 77,
             response: CollectionResponse::Success(CollectionPayload {
+                registered_total: None,
                 title: "最近読んだ本".to_owned(),
                 thumb_aspect_height_ratio: 1.0,
                 sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -4277,6 +4358,27 @@ mod tests {
         assert_eq!(decoded, expected);
         let encoded = String::from_utf8(bytes[4..].to_vec()).unwrap();
         assert!(!encoded.contains(r"C:\\"));
+        let ServerMessage::Collection {
+            response: CollectionResponse::Success(payload),
+            ..
+        } = expected
+        else {
+            unreachable!();
+        };
+        let mut projected = payload;
+        projected.registered_total = Some(12);
+        let mut encoded = serde_json::to_value(&projected).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CollectionPayload>(encoded.clone()).unwrap(),
+            projected
+        );
+        encoded.as_object_mut().unwrap().remove("registered_total");
+        assert_eq!(
+            serde_json::from_value::<CollectionPayload>(encoded)
+                .unwrap()
+                .registered_total,
+            None
+        );
     }
 
     #[test]
@@ -4293,6 +4395,7 @@ mod tests {
             id: 78,
             response: FavoriteSearchResponse::Success(FavoriteSearchPayload {
                 listing: CollectionPayload {
+                    registered_total: None,
                     title: "検索結果".to_owned(),
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -4357,6 +4460,7 @@ mod tests {
             id: 80,
             response: TagItemsResponse::Success(TagItemsPayload {
                 listing: CollectionPayload {
+                    registered_total: None,
                     title: "タグの項目".to_owned(),
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -4522,7 +4626,7 @@ mod tests {
         assert_eq!(json["places"][0]["entries"][0]["name"], "保管");
         assert_eq!(json["places"][0]["entries"][1]["path"], "Z:/absent");
         assert_eq!(json["places"][0]["entries"][1]["kind"], "folder");
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
     }
 
     #[test]
@@ -4720,7 +4824,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 66);
+        assert_eq!(PROTOCOL_VERSION, 67);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

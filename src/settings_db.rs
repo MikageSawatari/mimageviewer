@@ -52,7 +52,7 @@ const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_v1";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
-    'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
+    'file_type_visibility', 'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
     'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
     'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
@@ -293,6 +293,7 @@ pub struct SettingsDb {
 /// When a listing starts, the current values below are overlaid on the startup snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RemoteListingSettings {
+    file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     sort_order: crate::settings::SortOrder,
     rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     show_hidden_files: bool,
@@ -352,8 +353,13 @@ impl RemoteReadingSettings {
 }
 
 impl RemoteListingSettings {
+    pub(crate) fn file_type_visibility(&self) -> &crate::file_type_visibility::FileTypeVisibility {
+        &self.file_type_visibility
+    }
+
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
+            file_type_visibility: settings.file_type_visibility.clone(),
             sort_order: settings.sort_order,
             rating_sort_unrated_position: settings.rating_sort_unrated_position,
             show_hidden_files: settings.show_hidden_files,
@@ -378,6 +384,7 @@ impl RemoteListingSettings {
     }
 
     pub(crate) fn apply_to(self, settings: &mut Settings) {
+        settings.file_type_visibility = self.file_type_visibility;
         settings.sort_order = self.sort_order;
         settings.rating_sort_unrated_position = self.rating_sort_unrated_position;
         settings.show_hidden_files = self.show_hidden_files;
@@ -420,6 +427,7 @@ struct Inner {
 /// The small live settings snapshot needed by still-image final composition.
 #[derive(Clone)]
 pub(crate) struct AdjustmentRenderSettings {
+    pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) favorites: Vec<FavoriteEntry>,
     pub(crate) global_preset: crate::adjustment::AdjustParams,
     pub(crate) creative_luts: Vec<crate::creative_lut::CreativeLutEntry>,
@@ -438,6 +446,7 @@ impl AdjustmentRenderSettings {
     #[cfg(test)]
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
+            file_type_visibility: settings.file_type_visibility.clone(),
             favorites: settings.favorites.clone(),
             global_preset: settings.global_preset.clone(),
             creative_luts: settings.creative_luts.clone(),
@@ -787,6 +796,11 @@ impl SettingsDb {
         };
         Ok((
             AdjustmentRenderSettings {
+                file_type_visibility: read_settings_kv_typed(
+                    &inner.conn,
+                    "file_type_visibility",
+                    || defaults.file_type_visibility.clone(),
+                )?,
                 favorites: read_favorites(&inner.conn)?,
                 global_preset: read_settings_kv_typed(
                     &inner.conn,
@@ -3120,6 +3134,7 @@ fn apply_remote_listing_setting(
         };
     }
     match key {
+        "file_type_visibility" => assign!(file_type_visibility),
         "sort_order" => assign!(sort_order),
         "rating_sort_unrated_position" => assign!(rating_sort_unrated_position),
         "show_hidden_files" => assign!(show_hidden_files),
@@ -6124,9 +6139,14 @@ mod tests {
         settings.conceal_fill_opacity_percent = 73;
         settings.erase_inpaint_mono_tolerance = 9;
         settings.raw_brightness = crate::raw::RawBrightness::MatchPreview;
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".to_owned());
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
+        assert_eq!(first.file_type_visibility, settings.file_type_visibility);
         assert_eq!(first.favorites.len(), 1);
         assert_eq!(first.favorites[0].id, favorite.id);
         assert_eq!(first.favorites[0].path, favorite.path);
@@ -6149,9 +6169,11 @@ mod tests {
         settings.conceal_blur_radius_px = 41.0;
         settings.erase_inpaint_mono_tolerance = 27;
         settings.raw_brightness = crate::raw::RawBrightness::None;
+        settings.file_type_visibility.excluded_extensions.clear();
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
+        assert_eq!(second.file_type_visibility, settings.file_type_visibility);
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
         assert_eq!(second.erase_inpaint_mono_tolerance, 27);
