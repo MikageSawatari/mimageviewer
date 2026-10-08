@@ -244,12 +244,14 @@ impl App {
                     .converted_archive_cache_paths
                     .get(&crate::path_key::normalize_keep_drive(path))?
                 {
-                    super::ConvertedArchiveSourceState::Direct(path) => path,
-                    super::ConvertedArchiveSourceState::CachedZip { logical_source, .. }
-                    | super::ConvertedArchiveSourceState::Unavailable {
+                    super::ConvertedArchiveSourceState::Direct(path)
+                    | super::ConvertedArchiveSourceState::CachedZip { path, .. } => path,
+                    super::ConvertedArchiveSourceState::Unavailable {
                         logical_source: Some(logical_source),
                     } => {
-                        // Stable resume key, independent of cache existence. Pure path computation.
+                        // Missing cache: compute the next conversion key without I/O.
+                        // Existing CachedZip paths remain the open/save/restore key,
+                        // including valid absolute paths retained after a data-dir copy.
                         converted_key = crate::archive_cache::cache_zip_path_for_data_dir(
                             &crate::data_dir::get(),
                             logical_source,

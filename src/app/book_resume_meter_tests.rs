@@ -1197,6 +1197,91 @@ fn install_converted_zip(app: &mut AppTestEnv, source: &Path, cached: &Path) {
 }
 
 #[test]
+fn book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key() {
+    use super::tests::phase_c_support::setup_paused_similar_app_with_fixture;
+    use crate::archive_converter::ArchiveFormat;
+
+    let mut old_app = setup_app();
+    settle(&mut old_app);
+    let source = old_app.tmp.path().join("copied-profile.7z");
+    let mut writer = sevenz_rust2::ArchiveWriter::create(&source).unwrap();
+    for name in ["01.jpg", "02.jpg", "03.jpg"] {
+        writer
+            .push_archive_entry(
+                sevenz_rust2::ArchiveEntry::new_file(name),
+                Some(std::io::Cursor::new(vec![1u8; 3])),
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let cached = convert_and_record_cache(&old_app, &source, ArchiveFormat::SevenZ);
+    install_converted_zip(&mut old_app, &source, &cached);
+    old_app.record_book_resume(1);
+    settle(&mut old_app);
+
+    // Close every old-profile DB before copying; retain its directory and valid ZIP,
+    // as the documented migration procedure does until the copied profile is verified.
+    let old_profile = std::mem::replace(&mut old_app.tmp, tempfile::tempdir().unwrap());
+    drop(old_app);
+    let mut app =
+        setup_paused_similar_app_with_fixture(crate::settings::Settings::default(), |new_dir| {
+            for name in ["archive_cache.db", "book_resume.db"] {
+                std::fs::copy(old_profile.path().join(name), new_dir.join(name)).unwrap();
+            }
+        });
+    settle(&mut app);
+    let computed = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &source);
+    assert_ne!(computed, cached);
+    let meta = std::fs::metadata(&source).unwrap();
+    let db = app.archive_cache_db.as_ref().unwrap();
+    let stamp = crate::ui_helpers::mtime_secs(&meta);
+    assert_eq!(
+        db.peek(&source, stamp, meta.len() as i64),
+        Some(cached.clone())
+    );
+    assert_eq!(
+        db.lookup(&source, stamp, meta.len() as i64),
+        Some(cached.clone())
+    );
+
+    app.load_folder(source.parent().unwrap().to_path_buf());
+    let idx = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), meter(2, 3));
+    install_converted_zip(&mut app, &source, &cached);
+    assert_eq!(app.resume_page_for_container(), Some(1));
+    app.record_book_resume(2);
+    settle(&mut app);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((2, Some(3), Some(3)))
+    );
+    assert_eq!(stored_row(app.tmp.path(), &computed), None);
+
+    app.load_folder(source.parent().unwrap().to_path_buf());
+    let idx = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), meter(3, 3));
+    // No aliases/migration machinery: after deleting the old ZIP, the missing-cache
+    // state computes the new profile's key. The old released resume row survives.
+    delete_converted_cache(&mut app, &source);
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), None);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((2, Some(3), Some(3)))
+    );
+}
+
+#[test]
 fn book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_key() {
     use super::ConvertedArchiveSourceState as Source;
     use crate::archive_converter::ArchiveFormat;

@@ -40,7 +40,7 @@
 - 報告: v4.4.0 の読書位置バーが RAR の一覧サムネイルに出ない。利用者の手元でも再現。次のバージョンでの対応を目標にする。
 - 原因: `thumbnail_book_resume_meter` は `Folder` / `ZipFile` / `PdfFile` だけを対象にし、RAR/CBR/7z/LZH の一覧セル `ConvertibleArchive` を除外している。`docs/book-resume-meter-plan.md` §2 でも初版の対象外と明記され、既存テストも非表示を期待している。単なる保存失敗ではない。
 - 保存キー: 直読みRARは `current_folder` が元書庫なので元RARのキーへ記録する。変換が必要なRAR/7z/LZHは `current_folder` がキャッシュZIP、`archive_source_override` が元書庫なので、位置はキャッシュZIPのキーへ記録する。元書庫キーだけを一律に参照しても直らない。
-- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` の実読込元、または `CachedZip` / source確定済み `Unavailable` の論理sourceから計算した変換ZIP keyを使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・論理source未確定・保存行無しでは表示を捏造しない。キャッシュの有無だけでは非表示にしない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。分割RARの後続パートは、既存の読込元解決に従い先頭パートと同じ本を参照する。読書位置の保存・復元キー自体は変更しない。
+- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` の実読込元、またはsource確定済み `Unavailable` だけは現在のdata-dirと論理sourceから計算した変換ZIP keyを使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・論理source未確定・保存行無しでは表示を捏造しない。キャッシュの有無だけでは非表示にしない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。分割RARの後続パートは、既存の読込元解決に従い先頭パートと同じ本を参照する。読書位置の保存・復元キー自体は変更しない。
 - 回帰: 直読みRAR/CBR、変換RAR/CBR・7z/CB7・LZH/LHA、分割RAR、未変換/キャッシュ失効、一覧からの再読込、既存ZIP/PDF/フォルダのバーを確認する。既存の「ConvertibleArchiveは非表示」というテストを新仕様へ更新する。
 - 規模 / 優先度: Small〜Medium / P2 (次版目標)。
 

@@ -431,7 +431,8 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 
 2026-10-08の利用者決定により、CachedZipとキャッシュなしのUnavailableは論理sourceを
 同じtyped ownerに保持する（未確定ならNone）。メーターはload_pathの可用性ではなく、
-Directの実pathまたは論理sourceから純粋計算した変換ZIP keyでBookResumeMetersを参照する。
+Direct / CachedZipの実path、またはsource確定済みUnavailableだけは現在のdata-dirと
+論理sourceから純粋計算した変換ZIP keyでBookResumeMetersを参照する。
 キャッシュ削除後も保存済みのバーを表示し、Pending／未確定／設定OFFでは非表示。
 分割RARの論理sourceはworkerのheader確認で確定し、描画中のI/Oやファイル名推測はしない。
 

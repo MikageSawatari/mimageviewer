@@ -529,9 +529,10 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   内容・並びが変わっても次の記録までは保存比率を表示する。行無し・旧行の追加情報無し・
   不正な位置/総数では track も出さない。Remote で記録した本は補助情報を消し、
   ローカルで再記録するまでメーター不表示とする。従来の raw index による位置復元は維持する。
-  ConvertibleArchiveは既存の非同期source解決を使い、Directは元書庫key、変換対象は
-  確定した論理sourceから純粋計算した変換ZIP keyのmapを参照する。変換キャッシュ削除後も
-  保存済みのバーを表示し、再変換後は同じkeyから再開する。Pending／論理source未確定は非表示。
+  ConvertibleArchiveは既存の非同期source解決を使い、Directは元書庫key、CachedZipは
+  open／保存／復元と同じ実読込path、source確定済みUnavailableだけは現在のdata-dirと
+  論理sourceから純粋計算した変換ZIP keyのmapを参照する。同じdata-dirでは変換キャッシュ
+  削除後も保存済みのバーを表示し、再変換後は同じkeyから再開する。Pending／論理source未確定は非表示。
   分割RARはheader-confirmedの先頭volumeを使用し、ファイル名から推測しない。
   保存・復元keyを変更せず、描画中のI/Oを追加しない。
   Stack / 個別ページ / 詳細行 / 合成ビューのルート / Remote の一覧は対象外。

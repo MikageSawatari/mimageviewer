@@ -638,7 +638,8 @@ README の更新履歴で確認できる最新リリース v2.13.0 までの cat
 
 `ConvertibleArchive` の読み取り元表 (`App.converted_archive_cache_paths`) は、候補ごとに
 `Pending / Direct(PathBuf) / CachedZip { logical_source, path } / Unavailable { logical_source }` を持つ。
-キャッシュなしでもworkerが確認した論理sourceを保持し、保存済み読書位置バーはそのsourceから
+CachedZipの読書位置バーはopen／保存／復元と同じ実読込pathを参照する。
+キャッシュなしでもworkerが確認した論理sourceを保持し、その場合だけ現在のdata-dirとsourceから
 純粋計算した決定的な変換ZIP keyを参照する。論理sourceが未確定ならNoneで、RARのファイル名から
 先頭volumeを推測しない。Pendingのバーは非表示。cache削除後もサムネイル／pin用sourceの共有失効
 （Smartのstash／prepared再利用、parked context、旧reply取消）は維持する。map entry の欠落を
