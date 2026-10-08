@@ -177,6 +177,154 @@ impl Harness {
             modifiers,
         }]);
     }
+
+    fn focused_widget(&self, panel: Rect) -> egui::Id {
+        let id = self
+            .context
+            .memory(|memory| memory.focused())
+            .expect("widget has focus");
+        let response = self
+            .context
+            .read_response(id)
+            .expect("focused widget was drawn");
+        assert!(panel.contains(response.rect.center()));
+        id
+    }
+
+    fn focus_gain_text(&mut self) -> egui::Id {
+        let rect = self
+            .shapes()
+            .into_iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Text(shape) if shape.galley.text().starts_with("表示ゲイン") => {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .expect("gain DragValue");
+        self.pointer(rect.center(), true);
+        self.pointer(rect.center(), false);
+        self.frame(vec![]); // DragValue now draws its native TextEdit.
+        self.focused_widget(self.panels[2])
+    }
+
+    fn replace_focused_text(&mut self, text: &str) {
+        for _ in 0..12 {
+            self.frame(vec![]);
+        }
+        self.shortcut(egui::Key::A, Modifiers::CTRL | Modifiers::COMMAND);
+        self.frame(vec![Event::Text(text.into())]);
+        // Give TextEdit's own undoer a stable checkpoint, as in normal typing.
+        for _ in 0..12 {
+            self.frame(vec![]);
+        }
+    }
+}
+
+#[test]
+fn split_layout_widget_ids_are_distinct_between_tabs_and_layer_list() {
+    let mut h = Harness::new();
+    let modulator = musicvideo_core::new_band_energy_modulator(&h.project);
+    let modulator_name = modulator.name.clone();
+    h.project.modulators.push(modulator);
+    h.frame(vec![]);
+    let mut list_ids = std::collections::HashSet::new();
+    let names: Vec<_> = h
+        .project
+        .layers
+        .iter()
+        .map(|layer| layer.name.clone())
+        .collect();
+    for name in names {
+        let rect = h
+            .shapes()
+            .into_iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Text(shape)
+                    if shape.galley.text() == name && h.panels[1].contains(shape.pos) =>
+                {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .unwrap();
+        h.pointer(rect.center(), true);
+        h.pointer(rect.center(), false);
+        let id = h
+            .context
+            .interaction_snapshot(|interaction| interaction.clicked)
+            .expect("layer list item clicked");
+        assert!(h.panels[1].contains(h.context.read_response(id).unwrap().rect.center()));
+        assert!(list_ids.insert(id));
+    }
+    let name = h.project.layers[h.state.selected_layer(&h.project)]
+        .name
+        .clone();
+    h.click(&name);
+    let name_id = h.focused_widget(h.panels[2]);
+    h.click("プロジェクト");
+    let gain_id = h.focus_gain_text();
+    h.click("モジュレータ");
+    h.click(&modulator_name);
+    let modulator_id = h.focused_widget(h.panels[2]);
+    assert_ne!(name_id, gain_id);
+    assert_ne!(name_id, modulator_id);
+    assert_ne!(gain_id, modulator_id);
+    for id in [name_id, gain_id, modulator_id] {
+        assert!(!list_ids.contains(&id));
+    }
+    h.click("レイヤー");
+    h.click(&name);
+    assert_eq!(h.focused_widget(h.panels[2]), name_id);
+    h.click("プロジェクト");
+    assert_eq!(h.focus_gain_text(), gain_id);
+}
+
+#[test]
+fn split_layout_tab_round_trip_preserves_each_fields_native_undo() {
+    let mut h = Harness::new();
+    let index = h.state.selected_layer(&h.project);
+    let original_name = h.project.layers[index].name.clone();
+    h.click(&original_name);
+    h.replace_focused_text("renamed layer");
+    assert_eq!(h.project.layers[index].name, "renamed layer");
+    h.click("プロジェクト");
+    h.focus_gain_text();
+    h.replace_focused_text("12");
+    h.shortcut(egui::Key::Enter, Modifiers::NONE);
+    assert_eq!(h.project.display_gain_db, 12.0);
+    h.click("レイヤー");
+    h.click("renamed layer");
+    // Native Undo also records cursor selection. A click after returning to the
+    // tab may first undo that selection; every target must still belong here.
+    for _ in 0..3 {
+        h.shortcut(egui::Key::Z, Modifiers::CTRL | Modifiers::COMMAND);
+        if h.project.layers[index].name == original_name {
+            break;
+        }
+        assert_eq!(h.project.layers[index].name, "renamed layer");
+    }
+    assert_eq!(h.project.layers[index].name, original_name);
+    assert_eq!(h.project.display_gain_db, 12.0);
+    h.click("プロジェクト");
+    let gain_id = h.focus_gain_text();
+    for _ in 0..3 {
+        h.shortcut(egui::Key::Z, Modifiers::CTRL | Modifiers::COMMAND);
+        let text = h
+            .context
+            .data(|data| data.get_temp::<String>(gain_id))
+            .unwrap();
+        let value = text
+            .parse::<f32>()
+            .expect("gain Undo must only restore numeric text");
+        if value == 0.0 {
+            break;
+        }
+        assert_eq!(value, 12.0);
+    }
+    h.shortcut(egui::Key::Enter, Modifiers::NONE);
+    assert_eq!(h.project.display_gain_db, 0.0);
+    assert_eq!(h.project.layers[index].name, original_name);
 }
 
 #[test]

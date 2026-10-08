@@ -1068,6 +1068,46 @@ impl MusicVideoLabApp {
         self.lrc_load = LrcLoadState::Idle;
     }
 
+    /// Shared production frame boundary: all input and note_edit calls must
+    /// precede completion admission. Headless input tests use this same entry.
+    fn process_editor_frame(&mut self, ctx: &egui::Context) {
+        let response = self.draw_editing_panels(ctx);
+        let add_image_layer_requested = response.add_image_layer_requested;
+        let import_lrc_requested = response.import_lrc_requested;
+        let export_lrc_requested = response.export_lrc_requested;
+
+        if let Some(layer) = import_lrc_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("時間入り歌詞", &["lrc", "txt"])
+                .pick_file()
+        {
+            self.start_lrc_load(layer, path, ctx);
+        }
+        if let Some(layer) = export_lrc_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("時間入り歌詞", &["lrc"])
+                .set_file_name("lyrics.lrc")
+                .save_file()
+        {
+            self.start_lrc_save(layer, ensure_lrc_extension(path), ctx);
+        }
+
+        if add_image_layer_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .pick_file()
+        {
+            self.start_image_request(ImageLoadTarget::AddLayer, path, ctx);
+        }
+
+        // Project/LRC completion can replace the document or lyrics. Apply the current frame's
+        // editor and timeline input first so that an asynchronous completion cannot skip its
+        // generation/pending-edit conflict check.
+        self.poll_projects(ctx);
+        self.poll_lrc(ctx);
+        self.sync_runtime_resources(ctx);
+    }
+
     /// All editor input and generation updates precede asynchronous completion admission.
     fn draw_editing_panels(&mut self, ctx: &egui::Context) -> EditorResponse {
         let mut prepared = self.editor_state.begin_frame(ctx, &mut self.project);
@@ -2169,7 +2209,6 @@ impl eframe::App for MusicVideoLabApp {
         }
         let audio_sync_ms = audio_sync_started.elapsed().as_secs_f64() * 1000.0;
         let mut replacement_request = None;
-        let mut add_image_layer_requested = false;
         let mut reset_preview_perf = false;
         let mut apply_ready_project = false;
         let mut discard_ready_project = false;
@@ -2493,41 +2532,7 @@ impl eframe::App for MusicVideoLabApp {
             self.start_image_load(id, path, ctx);
         }
 
-        let response = self.draw_editing_panels(ctx);
-        add_image_layer_requested |= response.add_image_layer_requested;
-        let import_lrc_requested = response.import_lrc_requested;
-        let export_lrc_requested = response.export_lrc_requested;
-
-        if let Some(layer) = import_lrc_requested
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("時間入り歌詞", &["lrc", "txt"])
-                .pick_file()
-        {
-            self.start_lrc_load(layer, path, ctx);
-        }
-        if let Some(layer) = export_lrc_requested
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("時間入り歌詞", &["lrc"])
-                .set_file_name("lyrics.lrc")
-                .save_file()
-        {
-            self.start_lrc_save(layer, ensure_lrc_extension(path), ctx);
-        }
-
-        if add_image_layer_requested
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
-                .pick_file()
-        {
-            self.start_image_request(ImageLoadTarget::AddLayer, path, ctx);
-        }
-
-        // Project/LRC completion can replace the document or lyrics. Apply the current frame's
-        // editor and timeline input first so that an asynchronous completion cannot skip its
-        // generation/pending-edit conflict check.
-        self.poll_projects(ctx);
-        self.poll_lrc(ctx);
-        self.sync_runtime_resources(ctx);
+        self.process_editor_frame(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
@@ -2932,7 +2937,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                app.draw_editing_panels(ctx);
+                app.process_editor_frame(ctx);
             },
         )
     }
@@ -3041,7 +3046,6 @@ mod tests {
         let gain = app.project.display_gain_db;
         assert_ne!(gain, 0.0);
         assert_ne!(app.document.edit_generation(), started_at);
-        app.poll_projects(&context);
 
         assert_eq!(app.project.display_gain_db, gain);
         assert!(matches!(app.project_load, ProjectLoadState::Ready(_)));
@@ -3529,8 +3533,6 @@ mod tests {
             app.current_lyrics(layer_id).unwrap()[0].text,
             "edited while loading"
         );
-
-        app.poll_lrc(&context);
 
         assert_eq!(
             app.current_lyrics(layer_id).unwrap()[0].text,

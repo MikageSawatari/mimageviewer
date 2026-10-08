@@ -1071,6 +1071,7 @@ impl EditorFrame<'_> {
 }
 
 fn panel_scroll(ui: &mut egui::Ui, id: impl std::hash::Hash, draw: impl FnOnce(&mut egui::Ui)) {
+    let id = egui::Id::new(id);
     let size = ui.available_size().max(egui::Vec2::ZERO);
     ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::LEFT), |ui| {
         ui.set_min_size(size);
@@ -1081,7 +1082,12 @@ fn panel_scroll(ui: &mut egui::Ui, id: impl std::hash::Hash, draw: impl FnOnce(&
             .max_height(size.y)
             .min_scrolled_height(0.0)
             .auto_shrink([false, false])
-            .show(ui, draw);
+            .show(ui, |ui| {
+                // ScrollArea's salt identifies its scroll state, not its child
+                // Ui. Scope every region/tab's widgets too, so TextEdit native
+                // state cannot be reused by another tab's DragValue.
+                ui.push_id(id, draw);
+            });
     });
 }
 

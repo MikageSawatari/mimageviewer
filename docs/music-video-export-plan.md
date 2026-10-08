@@ -516,7 +516,11 @@ L1 の実装入口（2026-10-09）: `EditorState::begin_frame(ctx, project)` が
 一覧選択ではタブを維持し、追加完了（非同期画像追加も含む）ではレイヤータブを開く。
 ホストの `draw_editing_panels` は上部履歴操作 → 全幅タイムライン → 左220px → 右360px → `finish`
 の順で描き、各入力の `note_edit` を済ませる。左右は可変幅で、親領域の高さと非縮小スクロールを確保する。
-その後に `poll_projects` / `poll_lrc` / `sync_runtime_resources`、最後に中央プレビューを描く。
+`process_editor_frame` が `draw_editing_panels` と既存の素材/LRC選択処理、続く
+`poll_projects` / `poll_lrc` / `sync_runtime_resources` の順序を所有する。`update` とheadless入力テストは
+ともにこの入口を呼ぶ。`update` はその後に中央プレビューを描く。
+各スクロール領域の内容は `push_id` でも分離する。`ScrollArea::id_salt` はスクロール状態だけのIDであり、
+内部部品の自動IDは分離しないため、左一覧と右の各タブのnative TextEdit状態を別のIDスコープへ閉じる。
 
 ### D15. 文字装飾の初版範囲（2026-10-09）
 
@@ -734,7 +738,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P3h** ✅ | レイヤー管理: 削除確認、奥／手前への並べ替え、最終画像参照の整理 | **完了**（2026-09-05）。`EditorCommand` 経由で操作し、共有画像は最後の参照を削除するまで `Project.images` に残す。一覧の上が奥、下が手前で実描画順と一致する |
 | **P3i** ✅ | 歌詞レイヤー: 行単位の時刻付け、音声再生中のタップ入力、タイムライン修正、LRC 読み書き | **完了**（2026-09-05）。未設定行・空行・同一時刻の後勝ちを含む専用モデルを追加し、描画は comic-core の既存テキスト経路を共有。UTF-8 / Shift_JIS 判定、複数時刻タグ、offset、行内時刻タグを扱い、ファイル I/O はラボのワーカーに閉じる |
 | **P3j** 実装済み・実機未検収 | 編集履歴: Project・素材・歌詞行 identity の snapshot、選択復元、連続操作のグループ化 | 共有履歴の初期実装は `4f41cce35`。2026-09-08 に `91326ca8d` / `0c24a453e` で画像・音声の履歴と host 復元を補完、`8e12458e4` で歌詞本文と native Undo の対応を補完。128 段、ドラッグ/フォーカス単位、読込時消去、Redo 破棄、入力中の shortcut 抑止を維持。独立レビューと全体テスト完了。実音・実 IME・操作感は未検収。[検証記録](brief-musicvideo-edit-integrity.md) を参照 |
-| **L1** 実装済み・検収待ち | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | **実装・自動テスト済み**（2026-10-09、musicvideo 未コミット差分）。core 73件 / UI 94件（既存87＋新規7）/ lab 46件（既存45＋新規1）、全213件成功。新規は領域横断編集・release・タブ・native Undo・選択/追加・shortcut順・timeline checkpoint境界と実ホスト配置。既存の同フレームProject/LRC完了2件を実パネル入力へ強化。`cargo tree` の禁止依存なし、fmt・glyph検査成功。releaseラボのビルド結果と変異検証は下記。アプリ未起動・コミットなし |
+| **L1** 実装済み・修正検収待ち | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | 初版 `e6fda1f9b`。**独立レビューP2/P3修正・自動テスト済み**（2026-10-09、同commitに対する未コミット差分）。core 73件 / UI 96件（既存87＋L1新規7＋修正新規2）/ lab 46件（既存45＋L1新規1）、全215件成功。タブ/左一覧の部品ID分離とnative Undo往復を追加検証。同フレームProject/LRC完了2件は本番の共通入口へ移し、入口内の既存poll呼出を入力前へ移す変異で失敗確認。`cargo tree` の禁止依存なし、fmt・glyph検査成功。releaseラボのビルド結果と変異検証は下記。修正作業ではアプリ未起動・コミットなし |
 | **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトはフレームハッシュ不変。補間規則（構造一致時のみ補間）をテストで固定。保存往復。装飾ありシーンの合成時間を実測して記録 |
 | **I1** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | 本体の既存 IME テスト・raw TextEdit 禁止検査が全件維持。`musicvideo-ui` の single-line 入力は共有 helper 経由。歌詞は独自の multiline（`LyricsTextBuffer`）なので、入力補正 plugin を効かせたうえで既存の buffer・widget ID・native Undo を保つ。IME の Esc 取消・候補選択中 Tab・Enter 確定・フォーカス復帰・Undo 所有を handler テストで固定。独立レビューで「挙動不変の切り出し」に合意 |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
@@ -758,7 +762,7 @@ L1 自動検証記録（2026-10-09）:
 | `shortcut_precedes_timeline_and_runs_once` | shortcutをProperties開始時まで遅らせると失敗 |
 | `timeline_mutation_is_outside_properties_checkpoint` | Propertiesのcheckpointをtimeline入力前へ移すと失敗 |
 | lab `editor_panels_keep_timeline_full_width_and_inspector_tabs_separate` | timelineより先にSidePanelを置くと失敗。実ホストのPanelState・各タブの描画内容で配置を検査 |
-| lab 既存 `project_load_completion_after_same_frame_input_waits_for_a_choice` / `lrc_completion_after_same_frame_input_waits_for_a_choice` | 実パネル入力前に完了をpollすると両方失敗 |
+| lab 既存 `project_load_completion_after_same_frame_input_waits_for_a_choice` / `lrc_completion_after_same_frame_input_waits_for_a_choice` | 初版は描画helperへのpoll追加で両方の失敗を確認したが、本番updateの順序退行を検出できないと独立レビューP3で判明。下記の共通入口・既存poll移動による検証へ置換 |
 
 10種類の変異をすべて検出し、その都度元のソースへ復元した。checkpoint前倒しの初回変異は
 Undo結果だけでは検出できなかったため、timelineが変更した同フレームのProperties入口snapshotも検査して
@@ -771,7 +775,31 @@ Undo結果だけでは検出できなかったため、timelineが変更した�
 集計は `target/l1-verification-summary.txt`。変異ログは `target/l1-mutation-*.log` と
 `target/l1-mutation-summary.txt`（いずれも未追跡のビルド領域）。
 `cargo build --release -p musicvideo_lab` は43.5秒で成功し、`target/release/musicvideo_lab.exe` を生成した。
-アプリは起動していない。利用者・設計担当による配置/操作感の確認と独立レビューは未実施。
+初版の検証作業ではアプリを起動していない。その後の独立レビューでP2/P3が報告され、以下の修正を行った。
+
+L1 独立レビュー修正記録（2026-10-09、`e6fda1f9b` に対する未コミット差分）:
+
+- **P2**: `panel_scroll` の内容を領域/タブのIDによる `ui.push_id` で分離。
+  `ScrollArea::id_salt` が子UiのIDに渡らないことをvendored eguiのコードで確認した。
+  新規 `split_layout_widget_ids_are_distinct_between_tabs_and_layer_list` は左一覧の全レイヤー項目、
+  レイヤー名TextEdit、表示ゲインDragValueのTextEdit、モジュレータ名TextEditの実部品IDが異なり、
+  タブ往復後も同じIDであることを検査する。左一覧と右タブ間には元から親SidePanelの分離があり、
+  実クリックで衝突がないことも確認した。
+  新規 `split_layout_tab_round_trip_preserves_each_fields_native_undo` は名前編集→表示ゲイン文字入力→
+  タブ往復後のnative Undoで、名前とゲインがそれぞれ元の値へ戻り、他方の文字列を復元しないことを検査する。
+  native Undoがカーソル選択も記録するため、そのUndo段も許容しつつ各段の文字列所有を検査する。
+  `push_id` を外す変異で新規2件とも失敗を確認。
+- **P3**: `process_editor_frame` に「全パネル入力・note_edit→既存素材/LRC選択処理→Project/LRC完了の採否→
+  runtime同期」を集約し、`update` と入力テストが同じ入口を使用する。テスト自身の後付けpollは削除。
+  共通入口末尾の**既存** `poll_projects` と `poll_lrc` をそれぞれ入力前へ移す2種類の変異で、
+  対応する既存同フレーム完了テストの失敗を確認した（helperにpollを追加する変異ではない）。
+
+変異を元へ戻し、core 73 / UI 96 / lab 46の全215件を再実行して成功。禁止依存なし、fmt・glyph検査も成功。
+修正後の `cargo build --release -p musicvideo_lab` は30.1秒で成功し、
+`target/release/musicvideo_lab.exe` を生成した。環境は `MSBUILDDISABLENODEREUSE=1`、各commandのexit codeは0。
+ログは `target/l1-review-{core-tests,ui-tests,lab-tests,ui-dependencies,format,glyphs,release-lab}.log`、
+`target/l1-review-verification-summary.txt`、`target/l1-review-mutation-*.log` と
+`target/l1-review-mutation-summary.txt`。修正作業ではアプリ未起動・コミットなし。修正の再検収は未実施。
 
 P4e の範囲（独立レビューの整理による）:
 
