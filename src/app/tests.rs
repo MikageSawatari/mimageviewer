@@ -57823,6 +57823,7 @@ mod still_window_mode_key_tests {
             idx: target_idx,
             path: target_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -70916,6 +70917,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: video,
             path: video_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -80668,6 +80670,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: 0,
             path,
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: true,
@@ -99328,3 +99331,7 @@ mod audio_refresh_tests;
 
 #[path = "tests/audio_idle_upgrade.rs"]
 mod audio_idle_upgrade_tests;
+
+#[cfg(all(windows, not(feature = "portable")))]
+#[path = "tests/effetune_auto_open.rs"]
+mod effetune_auto_open_tests;

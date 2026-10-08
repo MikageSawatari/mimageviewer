@@ -3359,7 +3359,7 @@ impl App {
                 && let Some(super::FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }

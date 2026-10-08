@@ -265,6 +265,7 @@ preferences_policy! {
         grid_open_selected_item_on_click: bool => ("選択中の項目をクリックで開く", |_, _| true, plain, plain);
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
+        details_name_colors: crate::details_name_colors::DetailsNameColors => ("詳細一覧の名前色", |v, _raw| v.valid_standard_custom(), plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
@@ -393,6 +394,7 @@ preferences_policy! {
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
+        effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -867,6 +869,12 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings.details_name_colors.enabled = false;
+        settings.details_name_colors.colors[0] =
+            crate::details_name_colors::DetailsNameColor::Custom {
+                light: [80, 60, 0],
+                dark: [214, 186, 102],
+            };
         settings.raw_brightness = crate::raw::RawBrightness::None;
         settings.ui_theme = different_enum(
             &settings.ui_theme,
@@ -1591,15 +1599,50 @@ mod tests {
     }
 
     #[test]
+    fn details_name_colors_transfer_preserves_disabled_custom_and_rejects_invalid() {
+        use crate::details_name_colors::DetailsNameColor;
+        let mut source = Settings::default();
+        source.details_name_colors.enabled = false;
+        source.details_name_colors.colors[2] = DetailsNameColor::Custom {
+            light: [55, 80, 15],
+            dark: [180, 220, 140],
+        };
+        let exported = export_preferences(&source).unwrap();
+        assert!(exported.issues.is_empty());
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(source.details_name_colors, destination.details_name_colors);
+        let before = destination.details_name_colors.clone();
+        for invalid in [
+            json!({"enabled": true, "colors": [{"mode": "custom", "light": [255,255,255], "dark": [0,0,0]}, {"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"}]}),
+            json!({"enabled": true, "colors": [{"mode":"default"}]}),
+            json!({"enabled": true}),
+            json!({"enabled": true, "colors": [{"mode":"future"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"}]}),
+        ] {
+            let parsed =
+                parse_preferences(&document(json!({"details_name_colors": invalid}))).unwrap();
+            assert_eq!(parsed.issues.len(), 1);
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.details_name_colors, before);
+        }
+        let parsed = parse_preferences(INITIAL_V1).unwrap();
+        parsed.apply_to(&mut destination);
+        assert_eq!(destination.details_name_colors, before);
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 449);
+        assert_eq!(entries.len(), 451);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            137
+            138
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1609,7 +1652,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 135);
+        assert_eq!(wire.len(), 136);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1791,6 +1834,7 @@ mod tests {
         source.show_facet_sort = true;
         source.toolbar_folder_section_migrated = false;
         source.effetune_pre_limiter_enabled = false;
+        source.effetune_auto_open_on_video = true;
         source.effetune_keep_visible_when_minimized = true;
         source.window_pos = Some([100.0, 200.0]);
         source.toolbar_section_order.reverse();
@@ -1803,6 +1847,7 @@ mod tests {
             ("show_facet_sort", serde_json::json!(true)),
             ("toolbar_folder_section_migrated", serde_json::json!(false)),
             ("effetune_pre_limiter_enabled", serde_json::json!(false)),
+            ("effetune_auto_open_on_video", serde_json::json!(true)),
             (
                 "effetune_keep_visible_when_minimized",
                 serde_json::json!(true),
@@ -1824,7 +1869,7 @@ mod tests {
         let before = destination.clone();
         let parsed = parse_preferences(&document.to_string()).unwrap();
         let report = parsed.apply_to(&mut destination);
-        assert_eq!(report.unknown_count, 11);
+        assert_eq!(report.unknown_count, 12);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
 

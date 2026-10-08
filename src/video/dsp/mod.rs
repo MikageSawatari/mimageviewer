@@ -1019,6 +1019,35 @@ impl DspBridge {
         self.enabled.store(true, Ordering::Release);
     }
 
+    /// Install only the loaded plugin boundary; all GUI operations remain real.
+    #[cfg(test)]
+    pub(crate) fn install_fake_host_for_test(&self, host: Arc<Bridge>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.slots.push(PluginSlot {
+            slot_id: 0,
+            bridge: host,
+            plugin_path: "fake-host".into(),
+            plugin_name: Some("fake-host".into()),
+            state: SlotState::Loaded,
+            latency_samples: 0,
+            bypass: false,
+            gui_hwnd: 0,
+            gui_visible: false,
+            user_hidden: false,
+            auto_bypassed_for_latency: false,
+            desired_window_pos: None,
+            desired_window_size: None,
+            gui_host: None,
+            gui_close_signal: None,
+            gui_resize_signal: None,
+            pending_resize_notify: None,
+            last_resize_notify: None,
+            gui_resize_session_signal: None,
+            gui_app_active_signal: None,
+            gui_resize_session_active: false,
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn gui_all_visible_desired_for_test(&self) -> bool {
         self.gui_all_visible_desired.load(Ordering::Acquire)
@@ -1579,6 +1608,17 @@ impl DspBridge {
         minimized_sequence: u64,
         remote_token: u64,
     ) -> Result<(), String> {
+        self.show_slot_gui_checked_with_origin(idx, minimized_sequence, remote_token, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn show_slot_gui_checked_with_origin(
+        &self,
+        idx: usize,
+        minimized_sequence: u64,
+        remote_token: u64,
+        auto_revision: Option<u64>,
+    ) -> Result<bridge::GuiVisibilityOutcome, String> {
         let (bridge, slot_id, hwnd) = {
             let inner = self.inner.lock().unwrap();
             let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
@@ -1587,16 +1627,23 @@ impl DspBridge {
         if hwnd == 0 || self.gui_gate.get().is_none() {
             return Err("GUI or presentation gate is not attached".into());
         }
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
-                bridge.process_id(),
-            );
+        if auto_revision.is_none() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                    bridge.process_id(),
+                );
+            }
         }
-        bridge
-            .set_gui_visibility_checked(slot_id, true, minimized_sequence, remote_token)
-            .map_err(|error| error.to_string())?;
         // Only the ordered host signal stream publishes slot visibility.
-        Ok(())
+        bridge
+            .set_gui_visibility_checked_with_origin(
+                slot_id,
+                true,
+                minimized_sequence,
+                remote_token,
+                auto_revision,
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub fn attach_slot_gui_hidden(&self, idx: usize) -> Result<(), String> {

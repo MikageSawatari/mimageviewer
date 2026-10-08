@@ -252,6 +252,34 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["詳細表示", "列設定", "専用設定"]
     ),
     entry!(
+        "thumbnail/details-name-colors",
+        Thumbnail,
+        "名前の色分け",
+        [
+            "詳細一覧",
+            "名前",
+            "色",
+            "フォルダ",
+            "本",
+            "単体画像",
+            "RAW",
+            "動画",
+            "音声",
+            "Light",
+            "Dark",
+            "HEX",
+            "カスタム",
+            "既定",
+            "コントラスト",
+            "通常行",
+            "交互行",
+            "hover",
+            "選択",
+            "チェック",
+            "切り取り"
+        ]
+    ),
+    entry!(
         "thumbnail/tooltip-items",
         Thumbnail,
         "ツールチップに表示する項目:",
@@ -1172,6 +1200,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
+        "video/effetune-auto-open",
+        Video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+        [
+            "音響調整",
+            "ビジュアライザー",
+            "自動表示",
+            "初回",
+            "EffeTune"
+        ]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -1273,6 +1314,7 @@ mod tests {
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
+    const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1420,6 +1462,12 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "thumbnail/details-name-colors" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("super::name_colors::draw_settings(ui, &mut state.settings)")
+                    );
+                    NAME_COLORS_SOURCE
                 } else {
                     PAGES_SOURCE
                 };
@@ -1516,6 +1564,18 @@ mod tests {
     }
 
     #[test]
+    fn effetune_auto_open_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 自動表示", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-auto-open")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn title_prefix_precedes_title_substring() {
         let results = search_preferences("表示", test_tree_position);
         let prefix = results
@@ -1556,7 +1616,7 @@ mod tests {
         ] {
             let results = search_preferences(query, test_tree_position);
             assert!(!results.is_empty(), "no RAW settings result for {query}");
-            assert!(results.iter().all(|entry| {
+            assert!(results.iter().any(|entry| {
                 entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
             }));
         }
@@ -1663,6 +1723,25 @@ mod tests {
                 .expect("audio thumbnail setting is searchable");
             assert_eq!(entry.page, page);
             assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
+        }
+    }
+
+    #[test]
+    fn details_name_color_search_finds_categories_themes_and_validation() {
+        for query in [
+            "名前 色",
+            "RAW HEX",
+            "Light カスタム",
+            "通常行 コントラスト",
+            "切り取り 名前",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Thumbnail
+                        && entry.anchor == "thumbnail/details-name-colors"),
+                "missing name-color result: {query}"
+            );
         }
     }
 }

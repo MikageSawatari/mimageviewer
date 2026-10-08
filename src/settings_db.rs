@@ -4667,6 +4667,42 @@ mod tests {
     }
 
     #[test]
+    fn effetune_auto_open_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_auto_open_on_video);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_auto_open_on_video");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_auto_open_on_video);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_auto_open_on_video: enabled,
+                effetune_keep_visible_when_minimized: true,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.effetune_auto_open_on_video, enabled);
+            assert!(loaded.effetune_keep_visible_when_minimized);
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_auto_open_on_video'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.effetune_auto_open_on_video);
+        assert!(loaded.effetune_keep_visible_when_minimized);
+    }
+
+    #[test]
     fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

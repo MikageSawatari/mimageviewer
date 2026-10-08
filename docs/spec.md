@@ -89,19 +89,26 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   (ページ番号昇順) の 2 件、`MainPageOnly` は現在ページ 1 件。
   効くのはフルスクリーンで見えているページを渡すときだけ。`Single` + `BothPages` は
   見開き中に必ず 2 件になるため起動せず、設定画面で警告する。
-- 引数のプレースホルダは `{file}` `{files}` `{dir}` `{name}` `{stem}` `{ext}` `{uri}`
-  `{container}` `{entry}` `{page}` `{time}` `{time_ms}` `{time_hms}`。対象が持たない値は
-  そのトークンごと引数列から取り除く。`{container}` は利用者から見た書庫 (変換アーカイブでは
-  cache ZIP でなく元の RAR / 7z / LZH)、`{page}` はその書庫を開いて見ているときだけ付く。
+- 引数のプレースホルダは `{files}` と `{file_list}`。引数を分割してから `OsString` として置換し、
+  未知記法は文字どおり残す (`{file}` は既存互換で `{files}` へ正規化)。どちらも無い場合だけ
+  `{files}` を自動追加する。`{file_list}` は起動ごとに別名の `.txt` を worker で作り、
+  その起動へ渡す準備済みの絶対パスを UTF-8 BOM なし・1 行 1 パス・最終行も CRLF で書く。
+  ヘッダー・引用符は付けず、非 Unicode / CR / LF / NUL を含むパスは当該起動を拒否する。
+  `Single` / `Each` は 1 行、`Batch` は全件。繰り返した `{file_list}` は同じリストを指し、
+  `{files}` との混在でも対象順を維持する。対象件数上限とコマンドライン長検査は維持する。
 - PDF ページはツールごとの長辺
   2048 / 4096 / 8192 (既定 4096) で PNG 化する。旧設定値 `0` も 4096 として読む。
   実体化、補正 DB 読み込み、decode / compose / encode、外部起動は worker で行い、進捗表示から
-  キャンセルできる。新しい要求や対象移動で古い世代を無効化し、古い結果から起動しない。
+  キャンセルできる。UI の対象列挙・Stack 展開・編集 snapshot は、単一の準備 owner が
+  1 frame 最大 128 entry / 2ms に分割する。index と所有 context / items generation / source identity
+  を保持し、RealFile のページ探索をしない。準備中は所有 context の変更・終了で取消し、
+  別 context の変更では取消さない。具体的 source の確定後は明示 cancel / 新要求でのみ無効化する。
 - 実体化した一時ファイルは `%TEMP%\mimageviewer\ext-<pid>` (portable は data 配下の
   `temp\ext-<pid>`) に置く。起動前は要求が所有して cancel / 失敗時に削除し、外部アプリへ
   渡した後は終了時まで削除しない。起動時の孤児回収は PID が生きていないディレクトリと、process
   directory 作成前から存在する現 PID 名の stale directory だけを対象にする。PID の生死が不明なら
-  alive として扱う。
+  alive として扱う。成功したリストと参照する一時メディアは同時に process 所有へ移し、
+  `keep_temp` は双方の終了時削除を抑止する (次回起動時の孤児回収は行う)。リストは再利用しない。
   編集用ツールは元ファイルそのものを渡せる場合だけ起動し、仮想ページ等はメニューの同期判定と
   worker の最終判定で拒否する。メニューで無効にした編集用ツールは、native `HMENU` と egui fallback
   のどちらでも hover 時に理由を表示する。
@@ -617,6 +624,16 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   一覧へ戻る位置の周辺を温める。モード切替専用の全破棄は行わず、配分変更の結果として自然に縮退する
 
 ### 3.5 詳細表示モード
+
+- 名前列の色分けは既定ON。フォルダだけ黄系 (Light標準 `#A87E00` / Dark標準 `#D6BA66`、
+  Light強め `#201800` / Dark強め `#F4DFA2`) とし、本・画像・RAW・動画・音声は共通文字色。
+  ZIP/CBZ/PDF/EPUB/変換書庫と内側書庫は本、仮想ディレクトリはフォルダ、PDFページ・混在Stackは画像。
+  環境設定 → 表示 → サムネイルの「名前の色分け」で六分類の標準Light/Dark不透明RGBを指定できる。
+  選択行は共通選択文字色、チェック行は共通primaryを優先し、hoverだけなら分類色を使う。
+  強めではカスタム色を適用せず固定既定色を使い、標準の指定値は保持する。
+  カスタム色の通常/交互/hover比を表示し、通常背景で3:1未満だけ確定不可。交互/hoverの低比は警告のみ。
+  Light標準フォルダの3.50/3.23/2.71:1は利用者承認済み。切り取り中も名前は不透明で、
+  プレビュー・他列の薄表示とバッジは維持する。選択情報バー、サムネイル一覧、Remoteには適用しない。
 
 - ツールバーの列セクションで `詳細` を選ぶか、<kbd>Alt</kbd>+<kbd>-</kbd> で
   `サムネ` / `詳細` を切り替える。<kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>0</kbd> は
@@ -1670,7 +1687,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Ctrl + A | 現在のフィルタで表示中の `is_checkable` アイテムを全てチェック（画像/動画/ZIP・PDF 本体/ZIP 内画像/PDF ページ/変換前アーカイブが対象）。Space はサブフォルダ展開可能な通常一覧で実フォルダもチェックできるが、Ctrl+A は現状フォルダを含めない |
 | Delete | 選択/チェック済みの実ファイル / 実フォルダを削除（確認あり。実項目と ZIP/PDF 内ページなど仮想項目が混在する場合は実項目だけを削除せず、理由とページ選択を外す対処をトーストで示して全体を中止する。確認中は背景を暗くして背面 UI の操作を遮断し、背景クリックは何もせず吸収する。確認ダイアログは対象名を先頭 10 件まで列挙し、超過分を「他 M 件」で示す。削除対象に実フォルダを含む場合は「フォルダの中には一覧に表示していないファイルも含まれます」を常に表示する。この判定は既存の一覧項目だけを使い、確認表示のためにフォルダを走査しない。本文は固定幅で折り返し、画面高に収まる縦スクロール領域に置く。Y = 削除、N / Esc = キャンセル、Enter = 無効の固定操作。通常はゴミ箱に移動。リムーバブル / ネットワーク / ゴミ箱を使わない設定のドライブ / ゴミ箱容量を超える対象では確認文言で警告） |
 | Ctrl + C | `GridCopyFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のコピー verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルコピーを実行せずトーストで通知する |
-| Ctrl + X | `GridCutFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のカット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルカットを実行せずトーストで通知する。現在の Windows file clipboard が cut として保持する実項目はサムネイル / 詳細一覧の内容だけを半透明にし、選択・チェック・hoverは通常表示のままにする。copy、別clipboard内容、確定したmove完了で表示を更新し、paste verbの受付だけでは解除しない |
+| Ctrl + X | `GridCutFiles`。選択/チェック済みの実ファイル / 実フォルダを Windows Shell のカット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合はファイルカットを実行せずトーストで通知する。現在の Windows file clipboard が cut として保持する実項目はサムネイル / 詳細一覧の内容だけを半透明にし、詳細一覧の名前は不透明のままにする。選択・チェック・hoverは通常表示のままにする。copy、別clipboard内容、確定したmove完了で表示を更新し、paste verbの受付だけでは解除しない |
 | Ctrl + V | ファイル類は Windows Shell の背景ペースト verb、画像データは現在の実フォルダへ PNG 保存、HTML は画像の選択ダイアログから現在の実フォルダへ保存。それ以外は Shell 貼り付け。従来無効な一覧では無効。固定入力。詳細は [keymap-spec.md](keymap-spec.md) と §8.11 |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイルをドラッグ＆ドロップでコピー送出。複数チェック選択中はその実パス群をまとめて送出。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外。操作はコピーのみ (移動はしない) |
 | エクスプローラ等からのドロップ | mIV ウィンドウへファイルをドロップすると、現在表示中のフォルダへコピー (**フォルダは v1.1.0 で一旦無効化・skip**)。ZIP / PDF / 検索結果グリッドなど実フォルダ以外を表示中はトーストで拒否。操作はコピーのみ |
@@ -2061,6 +2078,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
 | `details_timestamp_show_seconds` | bool | false | 詳細表示モードの更新日時 / 作成日時を秒まで表示するか |
 | `details_row_style` | DetailsRowStyle | Separator | 詳細表示モードの行表示。`Separator` は DPI 対応の行区切り線のみ、`Stripe` は交互背景色のみ、`SeparatorAndStripe` は両方、`Plain` はどちらも描画しない |
+| `details_name_colors` | DetailsNameColors | enabled=true、六分類Default | 詳細一覧の名前色。六分類のDefault / Custom{light,dark}をまとめて保存。標準だけカスタム適用、強めは固定既定。通常背景3:1未満のカスタムは環境設定/取り込みで拒否。OFFや配色切替で指定値を消さない |
 | `details_column_order` | Vec\<DetailsColumnId\> | [] | セット A (詳細一覧 + サムネイル表示時の下部情報バー) の列順。空なら既定順。列ヘッダの横ドラッグで更新される |
 | `details_column_widths` | Vec\<DetailsColumnWidth\> | [] | セット A の列幅。詳細一覧またはセット A を使う下部情報バーの列ヘッダ右端ドラッグ / best-fit で更新する |
 | `details_name_width_auto` | bool | true | セット A で `名前` 列を残り幅へ自動調整するか。`false` で `details_name_width` を固定幅として使う。`名前` 列右端ドラッグ / ヘッダ右クリックで切替 |
@@ -2298,6 +2316,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `music_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 移動 (↓↑/ホイールの前後ファイル移動 + Ctrl+↑↓/キー)」。既定 FromStart=最初から (誤って別曲へ行って戻っても頭から) |
 | `effetune_pre_limiter_enabled` | bool | true | EffeTune へ渡す前に 0 dBFS 超のピークを抑える。ユーザー VST3 後・EffeTune 前に独立した SafetyLimiter を通す。環境設定 OK 時に共有 atomic へ公開し、動画・音楽・Remote は既存 worker の各音声 block で参照。ON/OFF とも前段約5msの遅延を維持して約5msでクロスフェード。Remote の生成済み・先読み済み音声には遡及しない。portable では設定 UI と検索候補を非表示。欠落 field は ON、最終出力 limiter は常時有効・変更不可 |
 | `effetune_keep_visible_when_minimized` | bool | false | メイン最小化中も表示希望のある音響調整の窓を残す。Preferences OK で即時反映（最小化中も切替）。host の `Minimized` 理由だけを無効にし、`RemoteSession`・user-hidden・未表示 open の最小化取消・非アクティブ復帰は維持。tray-only `SW_HIDE` は最小化ではなく、両設定とも既存どおり窓を残す。ownerless tool window・非 TOPMOST。released settings の欠落 field / DB key は serde default false、既存 `settings_kv` で保存し schema 変更なし。portable の UI・検索候補は非表示 |
+| `effetune_auto_open_on_video` | bool | false | 起動後の最初の適格なローカル実ファイル動画の再生成功で、音響調整の窓を一度だけ非アクティブ表示。通常の別窓も対象だが、いずれかのローカル閲覧窓が全画面、main が非表示・最小化、Remote が取得中・所有中・drain 中ならその成功を棄却し、復帰だけでは開かない。音声ファイル・動画→音声モードは対象外。ユーザー play と新規 source の開始だけを判定し、normalize・seek・DSP の内部再開は対象外。成功時の5要因 projection revision を表示直前まで維持し、設定 OFF 等の抑止往復で未表示要求を取消。手動表示成功も起動内の機会を消費し、自動失敗・取消後は再試行しない。未起動なら既存 DSP の寿命で開始。Preferences OK で公開、Cancel は無変更。旧 JSON field / DB key 欠落は false、加算保存で schema 変更なし。portable は実行・UI・検索候補を除外 |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズの全体 ON/OFF。ON のとき、選択中の音声トラックの測定値を使い -14 LUFS 相当の音量にする。測定結果はトラックごとに保存し、再生開始前から適用する。未測定のトラックは再生前に自動測定し、長い動画では途中の測定値で再生を始めて、測定完了後に音量を徐々に合わせる。測定を中止したトラックは、同じ動画を表示している間は自動で測り直さず、Norm ボタンから再開できる。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |

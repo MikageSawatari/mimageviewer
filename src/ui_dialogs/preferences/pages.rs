@@ -1001,18 +1001,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("{files}").strong());
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(concat!(
-                    "渡すファイルのパスに置き換わります。「1 件ずつ」なら 1 つ、",
-                    "「まとめて渡す」なら選んだ数だけ並びます。",
-                    "何も書かないときは {files} が 1 つ付きます。",
-                ))
-                .weak(),
-            )
-            .wrap(),
-        );
+        crate::external_tool::draw_external_tool_placeholder_help(ui);
     }
     ui.add_space(6.0);
     // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
@@ -1587,6 +1576,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "サムネイル表示では一覧と同じ列設定を使います。詳細表示では、一覧と同じ設定・専用の設定・表示しないを選べます。",
     );
     });
+    ui.add_space(12.0);
+    ui.separator();
+    anchored(ui, state, "thumbnail/details-name-colors", |ui, state| {
+        super::name_colors::draw_settings(ui, &mut state.settings);
+    });
+    ui.add_space(12.0);
+    ui.separator();
     anchored(ui, state, "thumbnail/tooltip-items", |ui, state| {
         let s = &mut state.settings;
         ui.label("ツールチップに表示する項目:");
@@ -8139,6 +8135,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_effetune_input_limit_settings(ui, &mut state.settings);
     });
     #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-auto-open", |ui, state| {
+        draw_effetune_auto_open_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-minimized", |ui, state| {
         draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
@@ -8262,6 +8262,22 @@ pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &m
              OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
         );
     }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_auto_open_on_video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+    )
+    .on_hover_text(
+        "初期値は OFF です。再生が始まったときに、この起動で一度だけ、キー操作を奪わずに開きます。\n\
+         全画面・最小化・トレイ格納・リモート閲覧中は開きません。復帰しただけでは開きません。\n\
+         音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
+         未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
+    );
     #[cfg(feature = "portable")]
     let _ = (ui, settings);
 }

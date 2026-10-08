@@ -86,6 +86,7 @@ pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;
 pub mod delete_worker;
+pub mod details_name_colors;
 pub mod diagnostics;
 mod displayed_image_transform;
 mod double_click_time;
@@ -336,10 +337,14 @@ pub mod ui_helpers;
 mod ui_main;
 pub mod ui_toolbar_layout;
 #[doc(hidden)]
+pub use ui_dialogs::preferences::draw_details_name_color_settings_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_main::draw_color_presets_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 pub use ui_main::draw_details_icons_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_main::draw_details_name_colors_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{

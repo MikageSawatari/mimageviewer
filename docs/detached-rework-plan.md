@@ -4150,3 +4150,14 @@ registry protocol・binding・detached 述語・viewport routing・構造状態�
 Loaded / Pending、generation、cancel token、他親 / drive の scope 外終端を保持する memory-only helper を使う。
 一時 mount による reconciliation / I/O は行わない。通常 open / close はこの mutation を発行しない。
 進行中の表示 / worker owner は既存のまま。[仕様・簡素化](audio-album-art-plan.md#43-組み合わせを減らすために検討した案)。
+
+### §1.337 EffeTune 自動表示の全画面 projection (2026-10-08)
+
+利用者から独立レビュー承認済みの effetune-auto-open-plan.md に従う実装指示を受領した。
+別窓の症状修正ではなく、全ローカル閲覧窓の全画面を自動表示から除くための正本公開である。
+意味上の presentation／content／F11 変更境界から既存 GuiGate の Fullscreen bit を更新し、
+ContextRef には ViewerSession.presentation を読む accessor だけを追加する。
+context mount／swap／退避だけで別 context の全画面抑止を消さない。
+受動別窓 builder は従来どおり decorations=true を要求する。geometry 判定、HWND 取得、時間窓、
+別窓状態 flag、viewport 再生成・保存経路は追加しない。兄弟 context の非起動テストを追加した。
+製品は起動せず実機確認は利用者検証へ残す。実装差分の独立レビューは未実施。

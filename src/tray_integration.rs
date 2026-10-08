@@ -284,6 +284,10 @@ impl App {
         let routed_presenters = self.prepare_media_session_for_tray_residency();
         let retained_viewports = self.sync_retained_viewport_visibility_for_tray(ctx, false);
         self.window_visible = false;
+        #[cfg(windows)]
+        if let Some(gate) = self.effetune.gui_gate() {
+            gate.set_auto_factor(crate::effetune::gui_gate::AutoSuppression::RootHidden, true);
+        }
         self.sync_tray_resident_media_wake();
         let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
         crate::set_ui_heartbeat_suspended(

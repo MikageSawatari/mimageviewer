@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
@@ -137,6 +138,7 @@
 | [nested-zip-tree-plan.md](nested-zip-tree-plan.md) | **実装済み**。`ZipTree` / `ZipDir` によるネスト ZIP のツリーナビ、階層 materialize、サムネイルとナビゲーションの設計契約 |
 | [rar-direct-read-plan.md](rar-direct-read-plan.md) | **実装済み (実 RAR の最終 smoke 対象)**。非ソリッド RAR/CBR の直読みと、ソリッド・入れ子・他形式を ZIP cache 変換へ委譲する routing 仕様 |
 | [external-tool-launch-plan.md](external-tool-launch-plan.md) | **P0/P1/P2a/P2b/P2c/P3 実装済み (2026-09-01、P3 は実機確認待ち)、P4 以降は未実装**。backlog §1.117 の正本。導線は登録した全ツールを平坦に出す右クリックと、既定キーなしの Grid 専用固定スロット / ピッカーの 2 つ。ツールバーとメニューバーの直接起動は一度実装後に撤去した。フォルダー背景・コンテナー項目から現在のフォルダー / 本 1 件を渡す入口を持ち、複数対象は既定 `Each`、ツール別の確認 5 件 / 上限 10 件で扱う。変換アーカイブは元パスを使い、1 コンテナーに定まらない集約ビュー背景と仮想ページは拒否する。外部ツール起動を引数テンプレート / 作業フォルダー / 複数選択 / **ZIP・PDF 内ページの一時実体化** / **動画の現在フレーム**まで広げる設計で、**仮想パスをそのまま渡す方針は採らない**。一時ファイルは NeeView 同型のプロセス単位ディレクトリ + 終了時削除 + 起動時の孤児回収 |
+| [external-tool-file-list-plan.md](external-tool-file-list-plan.md) | §1.329 の決定済み仕様。起動ごとの UTF-8 BOM なし / CRLF リスト、実体化 worker と一時成果物の所有、index を保持したフレーム分割準備、取消・限界・検証 |
 | [sns-split-export-plan.md](sns-split-export-plan.md) | **P1〜P6 実装済み (2026-09-01)**。1 枚の絵を X / Instagram のカルーセル投稿用に 2〜4 枚へ切り分けて書き出す。`CropSettings` / `export_crop.db` には保存しない**一度きりのモード**として分離し、グループ矩形の操作だけを既存の `CropRect` と共有する。比率固定リサイズは反対辺 / 反対角を固定する共通挙動。**X の隙間を実測** (PC ブラウザ 1.588% / iOS アプリ 1.869% / モバイル Web 2.652%、隙間の絶対値は環境ごとに違う) し、枠幅比 **1.7% 固定**を採用。投稿先は X (3:4 / 1.7%) と Instagram (4:5 / 0%) の 2 択のみ。書き出しはパネルボタンから `ExportEntry` に crop を足し、既存の 1 スナップショット→N ファイル経路へ載せる。2x2 グリッドと縦並びは非対象 |
 
 ## 設計メモ (特定領域の詳細)

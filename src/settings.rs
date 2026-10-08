@@ -4259,6 +4259,9 @@ pub struct Settings {
     pub details_timestamp_show_seconds: bool,
     #[serde(default)]
     pub details_row_style: DetailsRowStyle,
+    /// 詳細一覧の名前列だけに適用するカテゴリ色。既存設定の欠落は既定 ON。
+    #[serde(default)]
+    pub details_name_colors: crate::details_name_colors::DetailsNameColors,
     #[serde(default)]
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
@@ -5829,6 +5832,9 @@ pub struct Settings {
     /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。設定の確定時に音声処理へ公開する。
     #[serde(default = "default_true")]
     pub effetune_pre_limiter_enabled: bool,
+    /// 起動後の最初の適格なローカル動画再生で音響調整の窓を非アクティブ表示する。
+    #[serde(default)]
+    pub effetune_auto_open_on_video: bool,
     /// メイン最小化中も、表示していた音響調整の窓を残す。
     #[serde(default)]
     pub effetune_keep_visible_when_minimized: bool,
@@ -7359,6 +7365,7 @@ impl Default for Settings {
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
             details_row_style: DetailsRowStyle::default(),
+            details_name_colors: crate::details_name_colors::DetailsNameColors::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
             details_rated_at_width: None,
@@ -7772,6 +7779,7 @@ impl Default for Settings {
             vst3_plugin_state: None,
             vst3_gui_visible: true,
             effetune_pre_limiter_enabled: true,
+            effetune_auto_open_on_video: false,
             effetune_keep_visible_when_minimized: false,
             effetune_gui_pos: None,
             effetune_gui_size: None,
@@ -10428,6 +10436,41 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn details_name_colors_legacy_missing_and_sqlite_roundtrip() {
+        use crate::details_name_colors::{DetailsNameColor, DetailsNameColors};
+        let old: Settings = serde_json::from_str(r#"{"details_name_width":222.0}"#).unwrap();
+        assert_eq!(old.details_name_colors, DetailsNameColors::default());
+        assert_eq!(old.details_name_width, 222.0);
+        let mut settings = old;
+        settings.details_name_colors.enabled = false;
+        settings.details_name_colors.colors[0] = DetailsNameColor::Custom {
+            light: [90, 60, 0],
+            dark: [214, 186, 102],
+        };
+        settings.text_contrast = TextContrast::Strong;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.details_name_colors, settings.details_name_colors);
+        assert_eq!(loaded.text_contrast, TextContrast::Strong);
+        assert_eq!(loaded.details_name_width, 222.0);
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'details_name_colors'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.details_name_colors, DetailsNameColors::default());
+        assert_eq!(loaded.details_name_width, 222.0);
+        assert_eq!(loaded.text_contrast, TextContrast::Strong);
+    }
+
     #[test]
     fn thumb_show_resume_meter_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_resume_meter);
