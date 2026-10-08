@@ -2894,3 +2894,17 @@ fn normalize_hud_navigation_music_narrow_dark() {
         |_| {},
     );
 }
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_360pt_overlap_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_360pt_overlap_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(360.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}

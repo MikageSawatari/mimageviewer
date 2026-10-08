@@ -305,6 +305,15 @@ egui音楽の上下HUDは§1.352で全viewport幅・常時表示で、§1.344の
 native scan中の下端HUD touchは利用者決定Q3（同日）に従って既存touch latchへ接続し、
 touch End後も同じHUDを維持する。egui音楽の常時HUDにはこの追加接続は不要。
 
+**実装レビュー追補（2026-10-08、狭いF12音楽窓）**: 360pt / 400ptでは右寄せ音量スライダーと
+HUD↑↓が重なる。入力遮断の穴だけでは、後から登録したスライダー・速度ボタンが入力を奪う。
+測定中はそれらの既存UIをdisabledとして描き、HUD↑↓を進捗overlayより後に共通描画関数で
+描画・登録する。重なる非操作部品を矢印の背景で覆い、描画とclick / touchの最前面を一致させる。
+通常HUDと測定中HUDの矢印は同じ矩形・widget ID・music_navigate_fileを使い、二重登録しない。
+専用の表示状態や幅の下限は追加せず、既存scan ownerから登録場所だけを導出する。
+640ptの既存回帰に加え、実音楽HUDを描く360pt / 400ptのmouse / touch回帰で、矢印だけが
+一度移動し、他の音量操作・dragが遮断されることを確認する。結果は動画Normの上記§へ追記する。
+
 ### 5.5 右パネル / 左パネル
 - **右パネル**（D4）: `src/ui_metadata_panel.rs` の `draw_metadata_panel(...)`（:60）の item-kind
   分岐（:529）に **`GridItem::Audio` アーム**を追加。動画の タグ/★/設定 経路をミラー（実装時に

@@ -63,6 +63,7 @@
 - 原因確認: 通常native動画は805.4pt未満でHUD↑↓を省略し、640pt窓ではパネル内ボタンが代替になっていた。音楽HUDはscan中のSense::hover・適用前returnと全面backdropで到達不可だった。HUDの配置・入力責務を揃え、パネル内の2ボタンを撤去する。[決定・到達性](video-architecture.md#1351-測定中の移動を既存hudへ集約2026-10-08)。
 - **利用者決定 Q3 (2026-10-08、推奨案採用)**: scan中の下部HUD描画矩形へのtouchで既存touch latchをONにし、touch End後も同じHUDを表示する。新しい表示bool・代替ボタン・別ナビownerは追加しない。全面modal領域やHUD外のtouchは対象にしない。[Q3・到達性](video-architecture.md#1351-測定中の移動を既存hudへ集約2026-10-08)。
 - 実装 (2026-10-08): Q1〜Q3を実装し、進捗パネル内の前後ボタンを撤去。実CPU描画 / native touch Endと音楽HUDのhandler回帰、snapshot、全lib・通常 / portable checkを確認し、利用者確認用buildも作成した。製品起動・commitはしていない。[検証・実機手順](video-architecture.md#1351-測定中の移動を既存hudへ集約2026-10-08)。
+- 実装レビュー追補: 狭いF12音楽窓で後から登録するvolume / speed UIがHUD↑↓の入力を奪うP2を確認。scan中のdisabled登録と共通HUD矢印の最前面描画へ修正し、実HUDの360pt / 400pt / 548pt click・touch回帰を追加。[原因・修正・検証](video-architecture.md#1351-実装レビュー追補-狭い音楽hudの入力所有)。
 - 規模 / 優先度: Small / P3。
 
 ### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)

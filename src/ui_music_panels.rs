@@ -400,6 +400,52 @@ pub(crate) fn music_file_navigation_rects(hud: egui::Rect) -> [egui::Rect; 2] {
     ]
 }
 
+fn music_volume_slider_rect(hud: egui::Rect) -> egui::Rect {
+    // Right padding, limiter slot, dB label + gap, then the 144pt fader.
+    let right = hud.right() - 10.0 - 14.0 - 60.0 - 8.0;
+    let cy = music_file_navigation_rects(hud)[0].center().y;
+    egui::Rect::from_min_max(
+        egui::pos2(right - 144.0, cy - 4.0),
+        egui::pos2(right, cy + 4.0),
+    )
+}
+
+/// The same HUD widgets are drawn once: in normal playback, or above the scan overlay.
+#[cfg(windows)]
+fn draw_music_file_navigation(
+    ui: &egui::Ui,
+    rects: [egui::Rect; 2],
+    fs_idx: usize,
+    sense: egui::Sense,
+    shortcuts: [Option<&str>; 2],
+    scan_overlay: bool,
+) -> Option<i32> {
+    let mut navigation = None;
+    for (index, (name, label, delta)) in [
+        ("music_hud_prevfile", "前の項目", -1),
+        ("music_hud_nextfile", "次の項目", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = rects[index];
+        let response = ui
+            .interact(rect, ui.id().with((name, fs_idx)), sense)
+            .hover_tip_dark(label_with_shortcut(label, shortcuts[index]));
+        if scan_overlay {
+            // Narrow HUD controls can overlap: only the arrow is drawn and hit here.
+            ui.painter()
+                .rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+        }
+        draw_overlay_button_bg(ui.painter(), rect, response.hovered(), false);
+        draw_overlay_arrow_icon(ui.painter(), rect, delta);
+        if response.clicked() {
+            navigation = Some(delta);
+        }
+    }
+    navigation
+}
+
 impl App {
     // ───────────────────────── ブックマークのデータ操作 ─────────────────────────
 
@@ -1536,45 +1582,20 @@ impl App {
             cycle_continuous = true;
         }
 
-        let navigation_sense = if interactive
-            || (self.music_normalize_modal_active(fs_idx) && !self.music_bookmark_modal_open())
-        {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        };
         let navigation_rects = music_file_navigation_rects(hud_rect);
         // 前ファイル (↑ = 前の項目、動画 HUD の ↑ = VideoPrevFile と同一)。continuous と同じ
         // group B に含める (gap のみ、境界なし)。前/次フレーム (コマ送り) とキャプチャは非表示。
-        let r = navigation_rects[0];
-        let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_prevfile", fs_idx)),
-                navigation_sense,
-            )
-            .hover_tip_dark(label_with_shortcut("前の項目", sc_prev_file.as_deref()));
-        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
-        draw_overlay_arrow_icon(&painter, r, -1);
-        if resp.clicked() {
-            nav_file = Some(-1);
+        if !self.music_normalize_modal_active(fs_idx) {
+            nav_file = draw_music_file_navigation(
+                ui,
+                navigation_rects,
+                fs_idx,
+                button_sense,
+                [sc_prev_file.as_deref(), sc_next_file.as_deref()],
+                false,
+            );
         }
-
-        // 次ファイル (↓ = 次の項目、動画 HUD の ↓ = VideoNextFile と同一)。
-        let r = navigation_rects[1];
-        x = r.right() + gap;
-        let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_nextfile", fs_idx)),
-                navigation_sense,
-            )
-            .hover_tip_dark(label_with_shortcut("次の項目", sc_next_file.as_deref()));
-        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
-        draw_overlay_arrow_icon(&painter, r, 1);
-        if resp.clicked() {
-            nav_file = Some(1);
-        }
+        x = navigation_rects[1].right() + gap;
 
         // グループ境界: [ループ][連続][前ファイル][次ファイル] | [前マーカー][次マーカー]
         x += group_gap_extra;
@@ -1673,10 +1694,7 @@ impl App {
         // マップだと高ブースト/微小音量がつぶれる問題 (Codex P3) も解消済み。永続化は
         // ドラッグ確定 / クリック / ダブルクリック時のみ (`persist=true`、毎フレーム save 回避)。
         let vol_w = 144.0;
-        let vol_rect = egui::Rect::from_min_max(
-            egui::pos2(rx - vol_w, controls_cy - 4.0),
-            egui::pos2(rx, controls_cy + 4.0),
-        );
+        let vol_rect = music_volume_slider_rect(hud_rect);
         rx -= vol_w + 8.0;
         // 音量ツールチップに Shift+↑↓ (`VideoVolumeUp/Down`) のショートカットを併記する
         // (動画 HUD と揃える、実機 FB 2026-07-02)。`&mut self` を握る `vol_target` より前に
@@ -1706,15 +1724,21 @@ impl App {
         } else {
             &mut dummy_vol_target
         };
-        if let Some((v, persist)) = draw_overlay_volume_slider(
-            ui,
-            &painter,
-            vol_rect,
-            cur_vol,
-            ui.id().with(("music_hud_vol", fs_idx)),
-            Some(vol_tooltip),
-            vol_target,
-        ) {
+        let volume_id = ui.id().with(("music_hud_vol", fs_idx));
+        let volume_change = ui
+            .add_enabled_ui(interactive, |ui| {
+                draw_overlay_volume_slider(
+                    ui,
+                    &painter,
+                    vol_rect,
+                    cur_vol,
+                    volume_id,
+                    Some(vol_tooltip),
+                    vol_target,
+                )
+            })
+            .inner;
+        if let Some((v, persist)) = volume_change {
             set_vol = Some(crate::settings::clamp_video_volume(v));
             vol_persist = persist;
         }
@@ -1851,21 +1875,27 @@ impl App {
             &mut dummy_speed_popup
         };
         let mut speed_popup_rect_sink = None;
-        let set_speed = draw_overlay_speed_control(
-            ui.ctx(),
-            ui,
-            &painter,
-            spd_r,
-            text_center_y,
-            speed,
-            ui.id().with(("music_hud_speed", fs_idx)),
-            ui.id().with(("music_hud_speed_popup", fs_idx)),
-            hud_rect.left(),
-            hud_rect.width(),
-            hud_rect.top(),
-            speed_popup_open,
-            &mut speed_popup_rect_sink,
-        );
+        let speed_id = ui.id().with(("music_hud_speed", fs_idx));
+        let speed_popup_id = ui.id().with(("music_hud_speed_popup", fs_idx));
+        let set_speed = ui
+            .add_enabled_ui(interactive, |ui| {
+                draw_overlay_speed_control(
+                    ui.ctx(),
+                    ui,
+                    &painter,
+                    spd_r,
+                    text_center_y,
+                    speed,
+                    speed_id,
+                    speed_popup_id,
+                    hud_rect.left(),
+                    hud_rect.width(),
+                    hud_rect.top(),
+                    speed_popup_open,
+                    &mut speed_popup_rect_sink,
+                )
+            })
+            .inner;
         if *speed_popup_open {
             consume_music_popup_wheel(ui.ctx());
         }
@@ -1882,18 +1912,13 @@ impl App {
         );
 
         // ── 操作を適用 (self / player の可変借用を分離) ──
-        // モーダル中は測定時のHUD↑↓だけを適用し、他の操作intentは破棄する。
+        // Scan navigation is drawn/applied by the same HUD widgets above the modal.
         if !interactive {
             painter.rect_filled(
                 hud_rect,
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 84),
             );
-            if self.music_normalize_modal_active(fs_idx) && !self.music_bookmark_modal_open() {
-                if let Some(delta) = nav_file {
-                    self.music_navigate_file(&ui.ctx().clone(), fs_idx, delta);
-                }
-            }
             return;
         }
         if let Some(stream_index) = selected_audio_track {
@@ -2017,6 +2042,23 @@ impl App {
 
         if draw_music_normalize_progress(ui, ctx, rect, fs_idx, navigation_rects, &progress) {
             self.handle_cancel_normalize_scan(ctx, fs_idx);
+        } else if !self.music_bookmark_modal_open() {
+            let prev = self
+                .keymap
+                .first_chord_label(crate::keymap::KeyAction::VideoPrevFile);
+            let next = self
+                .keymap
+                .first_chord_label(crate::keymap::KeyAction::VideoNextFile);
+            if let Some(delta) = draw_music_file_navigation(
+                ui,
+                navigation_rects,
+                fs_idx,
+                egui::Sense::click(),
+                [prev.as_deref(), next.as_deref()],
+                true,
+            ) {
+                self.music_navigate_file(ctx, fs_idx, delta);
+            }
         }
     }
 }
@@ -2143,10 +2185,19 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
         .rect_filled(rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
     ui.painter()
         .rect_filled(hud, 0.0, egui::Color32::from_black_alpha(150));
-    for (rect, delta) in [(nav[0], -1), (nav[1], 1)] {
-        draw_overlay_button_bg(ui.painter(), rect, false, false);
-        draw_overlay_arrow_icon(ui.painter(), rect, delta);
-    }
+    let painter = ui.painter_at(hud);
+    let volume_id = ui.id().with(("music_hud_vol", 0usize));
+    ui.add_enabled_ui(false, |ui| {
+        let _ = draw_overlay_volume_slider(
+            ui,
+            &painter,
+            music_volume_slider_rect(hud),
+            1.0,
+            volume_id,
+            None,
+            &mut None,
+        );
+    });
     let ctx = ui.ctx().clone();
     let _ = draw_music_normalize_progress(
         ui,
@@ -2160,6 +2211,7 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
             indeterminate: false,
         },
     );
+    let _ = draw_music_file_navigation(ui, nav, 0, egui::Sense::click(), [None; 2], true);
 }
 
 #[cfg(test)]

@@ -48671,6 +48671,79 @@ mod music_full_width_hud_tests {
     }
 
     #[test]
+    fn normalize_hud_navigation_music_narrow_scan_click_owns_overlapping_controls() {
+        narrow_scan_navigation(false);
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_narrow_scan_touch_owns_overlapping_controls() {
+        narrow_scan_navigation(true);
+    }
+
+    fn narrow_scan_navigation(touch: bool) {
+        for width in [360.0, 400.0, 548.0] {
+            let (mut app, ctx) = fixture();
+            scan(&mut app);
+            let size = egui::vec2(width, 360.0);
+            for _ in 0..3 {
+                frame(&mut app, &ctx, size, vec![]);
+            }
+            let volume = app.settings.video_volume;
+            let speed = app.video_playback_speed;
+            for index in 0..2 {
+                let probe = frame(&mut app, &ctx, size, vec![]);
+                let pos = probe.nav[index].center();
+                if width <= 400.0 {
+                    assert!(
+                        probe.volume.contains(pos),
+                        "real slider overlaps arrow at {width}pt"
+                    );
+                } else if index == 1 {
+                    assert!(
+                        probe.speed.contains(pos),
+                        "real speed button overlaps arrow at {width}pt"
+                    );
+                }
+                assert!(!probe.volume_enabled && !probe.speed_enabled);
+                assert!(
+                    probe.nav_above_modal[index],
+                    "arrow is painted above the modal and HUD controls"
+                );
+                let before = app.input_seq;
+                frame(&mut app, &ctx, size, button(pos, true, touch));
+                frame(&mut app, &ctx, size, button(pos, false, touch));
+                assert_eq!(
+                    app.input_seq,
+                    before + 1,
+                    "real HUD arrow owns {width}pt input (touch={touch})"
+                );
+                assert!(app.music_normalize_modal_active(0));
+                assert_eq!(app.settings.video_volume, volume);
+                assert_eq!(app.video_playback_speed, speed);
+                assert!(app.music_hud_last_volume_target.is_none());
+                assert!(!app.music_speed_popup_open);
+            }
+            // The volume area outside the navigation holes remains modal, including drag.
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            let pos = egui::pos2(probe.volume.right() - 2.0, probe.volume.center().y);
+            assert!(probe.nav.iter().all(|r| !r.contains(pos)));
+            let before = app.input_seq;
+            frame(&mut app, &ctx, size, button(pos, true, touch));
+            frame(
+                &mut app,
+                &ctx,
+                size,
+                vec![egui::Event::PointerMoved(pos - egui::vec2(8.0, 0.0))],
+            );
+            frame(&mut app, &ctx, size, button(pos, false, touch));
+            assert_eq!(app.input_seq, before);
+            assert_eq!(app.settings.video_volume, volume);
+            assert!(app.music_hud_last_volume_target.is_none());
+            assert!(app.music_normalize_modal_active(0));
+        }
+    }
+
+    #[test]
     fn normalize_hud_navigation_music_f11_touch_and_cancel_keep_existing_owners() {
         let (mut app, ctx) = fixture();
         app.viewer_presentation = ViewerPresentation::Fullscreen;
@@ -48743,6 +48816,11 @@ mod music_full_width_hud_tests {
         play: egui::Rect,
         close: egui::Rect,
         seek: egui::Rect,
+        volume: egui::Rect,
+        speed: egui::Rect,
+        volume_enabled: bool,
+        speed_enabled: bool,
+        nav_above_modal: [bool; 2],
         panel: Option<egui::Rect>,
         panel_clicked: bool,
         content_clip: egui::Rect,
@@ -48791,6 +48869,15 @@ mod music_full_width_hud_tests {
                                 .expect("actual close button")
                                 .rect,
                             seek: response("music_hud_seek").expect("actual seek widget").rect,
+                            volume: response("music_hud_vol")
+                                .expect("actual volume widget")
+                                .rect,
+                            speed: response("music_hud_speed")
+                                .expect("actual speed widget")
+                                .rect,
+                            volume_enabled: response("music_hud_vol").unwrap().enabled(),
+                            speed_enabled: response("music_hud_speed").unwrap().enabled(),
+                            nav_above_modal: [false; 2],
                             panel: panel.as_ref().map(|r| r.rect),
                             panel_clicked: panel.is_some_and(|r| r.clicked()),
                             content_clip: egui::Rect::NOTHING,
@@ -48802,6 +48889,25 @@ mod music_full_width_hud_tests {
             },
         );
         let mut probe = probe.unwrap();
+        if let Some(modal_index) = output.shapes.iter().position(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Rect(r)
+                if r.fill == egui::Color32::from_black_alpha(120))
+        }) {
+            for (index, rect) in probe.nav.iter().enumerate() {
+                probe.nav_above_modal[index] =
+                    output
+                        .shapes
+                        .iter()
+                        .enumerate()
+                        .any(|(paint_index, shape)| {
+                            matches!(&shape.shape, egui::epaint::Shape::Path(path)
+                        if path.closed && path.fill == egui::Color32::from_gray(238)
+                            && path.points.len() == 3
+                            && path.points.iter().all(|point| rect.contains(*point)))
+                                && paint_index > modal_index
+                        });
+            }
+        }
         let painted = |fill| {
             output.shapes.iter().find_map(|shape| match &shape.shape {
                 egui::epaint::Shape::Rect(rect) if rect.fill == fill => Some(rect.rect),

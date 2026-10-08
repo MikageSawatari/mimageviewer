@@ -3432,6 +3432,45 @@ PE依存確認も成功（runtime=4 / pe=3）。native build競合の待機後�
 4. 音声専用VST shellでは↑↓が移動せず、Escは音楽ビューへ戻ってscanを継続することを確認する。取消は×を使う。
 5. scan完了 / 取消後は通常の狭幅compactionへ戻り、広幅の矢印位置も従来どおりであることを確認する。
 
+#### §1.351 実装レビュー追補: 狭い音楽HUDの入力所有
+
+独立実装レビューのP2をsource inspectionで確認。360ptの音楽HUDでは↑↓の矩形
+（x=162–190 / 198–226）を、後から登録する音量フェーダー（x=124–268）が覆っていた。
+modal中もshared volume / speed helperを入力可能なUIへ登録しており、変更intentを
+捨てるだけではarrow hitの所有が一致しなかった。F12には640ptの最小幅を追加しない。
+
+修正は既存scan ownerから導出する入力責務に限定する。非操作のvolume / speed UIを
+disabledとして登録し、通常と同じHUD↑↓のproducerをscan overlay描画後へ移す。
+その矢印矩形に背景を描いて重なる非操作部品を覆い、描画順・hit順を一致させる。
+HUD矢印・shieldの穴は同じmusic_file_navigation_rects、volumeは同じrect helperから導出する。
+既存music_navigate_file・widget IDを再利用し、矢印を二重登録しない。
+新規の表示bool・代替dialogボタン・navigation owner・window幅制限は追加しない。
+通常再生の配置、native動画のcompaction、音声専用VST shell制限とEscは維持する。
+
+実HUDのclick / touch回帰を360pt / 400pt（volume重なり）と548pt（speed重なり）で追加。
+ownerが一度だけ移動を受け、scanが保持され、volume / speedがdisabledかつ矢印が
+modalより後に描画され、穴の外のvolume dragは遮断されることを検査する。
+既存640pt・native / F11 touch・shell回帰は保持する。snapshotはAppを丸ごと構築せず、
+同じvolume helper・HUD矢印producer・progress描画を使い、360ptの重なりも固定する。
+追加の永続stateを作らず登録責務だけで競合を除去する簡素化を採用した。
+
+検証（2026-10-09）: 変更前は実HUDの360pt click / touchの2件が
+「music_navigate_fileへ到達せずinput_seqが増えない」で失敗（終了101）。
+修正後はnormalize_hud_navigationの9件（既存7件と新規2件）が成功（終了0）。
+snapshotは更新2件を確認し、新規360ptの1枚を含む112件すべて成功
+（`cargo test -p mimageviewer --test ui_snapshot -- --test-threads=1`、終了0）。
+通常の並列snapshot実行はSTATUS_ACCESS_VIOLATIONで途中終了したため成功扱いにせず、
+1 threadで全件を再実行した。更新した2枚は目視確認済み。
+fmt / glyph lint（危険glyph 0）、通常 / portable core checkはすべて終了0。
+`cargo test -p mimageviewer --lib` は10,974成功・52 ignored・失敗0（終了0、905.94秒）。
+`scripts/build-dev.ps1 -PreserveRuntime` は終了0。通常featureのcore / remote / EPUB PDF workerを
+`target/dev-runtime/`へ作成し、PE依存確認も成功（runtime=4 / pe=3、core buildは2分25秒）。
+本追補で製品起動・commitは行っていない。未決質問はなく、実機確認は未実施。
+ログは `target/E-1351-fix-{red,focused,full-lib,snapshot-update,snapshot,snapshot-serial,check,portable-check,fmt,glyph}.log`。
+build記録は `target/E-1351-fix-build-dev.log`。
+実機確認では音楽ビューをF12にし、幅360pt / 400pt程度で測定中の↑↓をclick / touchする。
+一度ずつ項目移動でき、音量・速度・seekは操作できず、× / Escで取消できることを確認する。
+
 ### P キー perf overlay 拡張
 
 フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/
