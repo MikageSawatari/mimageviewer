@@ -3362,6 +3362,76 @@ preroll suspension を復帰し、未補正でも再生不能にしない。
 `analyze_perf.py av_drift` で `norm_apply_begin → buffer_clear → underrun_begin/end →
 audio_pts_jump` の連鎖と、累積的に成長する負値 `A/V offset` として観測されていた。
 
+
+### §1.351 測定中の移動を既存HUDへ集約（2026-10-08）
+
+**利用者決定 Q1（2026-10-08）**: scan中だけ既存native HUDの配置優先順を変更し、
+操作不能の非移動コントロールより同じ↑↓を優先する。通常再生のcompactionは維持する。
+専用の表示bool、進捗パネル内の代替ボタン、別のnavigation ownerは追加しない。
+
+**利用者決定 Q2（2026-10-08）**: 音声専用VST shellの既存ナビ制限とEsc離脱は維持する。
+NavigateItemは既存allow-listで棄却、↑↓キーもMusicVstShell gateで拒否される。
+Escはscan取消より先にshellを離脱し、scanは継続する。×の取消は通る。
+動画の音声モードVST hostとは別の既存制限で、今回許可を広げない。
+
+通常native動画の狭幅HUDはscan中、操作不能の頭出し・再生・ループ・連続を省略し、
+同じHUDの↑↓を左端へ置く。640ptでも右の縮小クラスタと重ならない。
+通常再生は従来のFull / NoCapture / NoMarkers / NoFileNav / Minimalのまま。
+進捗パネルは取消×だけを持ち、前後移動の描画・click producerは既存HUDの共通描画へ一本化する。
+モーダルの入力遮断は、このフレームでHUDが描く↑↓の矩形だけを除外する。
+矩形を保持する専用状態は追加せず、描画側から値として渡す。
+
+scan自体はHUDを強制表示しない。通常の下端220pt hover・touch latch・実効bottom lockで呼び出す。
+§1.344のF11抑制はlock理由だけを外すのでhover / touchは残る。
+HUDが隠れている間は進捗パネルだけを表示し、代替ナビボタンは出さない。
+tile / navigation previewは従来どおり通常chromeを隠す。遷移中の表示・操作ownerは変更しない。
+
+通常動画の↑↓キーは既存VideoPrevFile / VideoNextFileのkeymap入口とscan gateから
+navigate_native_video_fullscreenへ通る。HUDも既存NavigateItemへ通る。
+egui音楽のHUD・↑↓キーはmusic_navigate_fileへ集約する。
+TextEdit / IME / bookmarkモーダルの既存guard、wheelナビ、取消× / Escの既存ownerは保持する。
+
+簡素化検討: scan中の全操作停止は利用者が選んだ移動継続を失うため採らない。
+既存HUDと移動ownerへ集約し、scan表示状態から配置を導出する。
+独立した表示状態・代替producer・新しいnavigation寿命は設けない。
+検証は実CPU overlayの描画・入力を通し、640ptでの矢印の可視性・単一command・
+他操作の遮断、隠れたHUDのedge / touch reveal、通常再生の省略、取消を固定する。
+音声側の実HUD入力と既存navigation owner・キーgate・VST shellの制限もhandler回帰で確認する。
+
+**利用者決定 Q3（2026-10-08、推奨案採用）**: scan中、下部HUDの描画矩形への
+native HUD Touch Startで既存touch latchをONにし、同じHUDを指を離した後も表示する。
+描画と同じseek_geometry.normal_bar_rectとnative_posの変換を使い、
+全面modal入力領域や220ptのhover帯全体をラッチ対象にはしない。
+modalの他の場所、scan外、tile / navigation previewの非表示chromeには適用しない。
+新規表示bool・代替ボタン・別navigation ownerは設けず、既存show_chromeを呼ぶ。
+以後の解除・source-swap等は既存touch latchの寿命に従い、scan終了用の保存・復元状態は作らない。
+
+原因確認: scan中は全面HUD入力領域からTouchがwidget passthroughへ入りToggleChromeを作らず、
+touch EndのPointerGoneでHUDが隠れていた。raw lockを変更せず、
+明示的なHUD touchを既存touch表示ownerへ接続してrelease frameの描画とclickを維持する。
+実CPU draw / native input / touch End / PointerGoneを通る失敗回帰を修正し、
+HUD外のtouchではラッチしないこと、F11抑制中のHUD↑↓と取消も検査する。
+
+検証（2026-10-08）: Q3の変更前red（終了101）と、640pt HUD矢印欠落の変更前redを確認済み。
+対象はHEAD `bde36de42` 上の§1.351未コミット差分。焦点は新規7件と既存key gate / navigationの5件が成功。
+`cargo test -p mimageviewer --lib` は10,972成功・52 ignored・失敗0（通常feature、終了0）。
+`cargo test -p mimageviewer --test ui_snapshot` は追加2枚を含む111件成功。
+`cargo fmt --check`、glyph lint（危険glyph 0）、通常 / portable core checkは終了0。
+ログは `target/E-1351-{focused,existing-key-gates,existing-navigation,full-lib,snapshot,check,portable-check,glyph}.log`。
+未決質問はない。製品起動・commitは行っておらず、実機確認は未実施。
+検証用build `scripts/build-dev.ps1 -PreserveRuntime` は終了0。
+通常featureのcore / remote / EPUB PDF workerを `target/dev-runtime/` に作成し、
+PE依存確認も成功（runtime=4 / pe=3）。native build競合の待機後、core buildは3分13秒で完了した。
+検証用バイナリは起動していない。
+
+実機確認は未測定の動画 / 音声を複数用意し、次を行う。
+
+1. 640pt程度の動画窓でscanを開始し、進捗パネルは取消×だけで、HUD↑↓と↑↓キーが移動できることを確認する。seek / 再生 / 音量は操作できない。
+2. F11でbottom lockとその抑制をONにし、ポインタを下端から離す。edge hoverでHUDを呼び出せること、下部HUDへのtouch後は指を離してもHUDが残り、その↑↓を押せることを確認する。
+3. 音楽ビューでもHUD↑↓のmouse / touchと↑↓キーが移動でき、他操作は遮断されることを確認する。通常ビューの× / Escはscan取消として働く。
+4. 音声専用VST shellでは↑↓が移動せず、Escは音楽ビューへ戻ってscanを継続することを確認する。取消は×を使う。
+5. scan完了 / 取消後は通常の狭幅compactionへ戻り、広幅の矢印位置も従来どおりであることを確認する。
+
 ### P キー perf overlay 拡張
 
 フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/

@@ -388,6 +388,18 @@ pub(crate) fn music_side_panel_close_visible(
     crate::ui_helpers::metadata_panel_explicit_shown(mode, open_state)
 }
 
+/// One geometry source for drawing the existing music HUD arrows and modal shielding.
+pub(crate) fn music_file_navigation_rects(hud: egui::Rect) -> [egui::Rect; 2] {
+    let button = 28.0;
+    let gap = 8.0;
+    let x = hud.left() + 10.0 + 4.0 * (button + gap) + 8.0;
+    let y = (hud.top() + 22.0 + hud.bottom()) * 0.5 - button * 0.5;
+    [
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(button, button)),
+        egui::Rect::from_min_size(egui::pos2(x + button + gap, y), egui::vec2(button, button)),
+    ]
+}
+
 impl App {
     // ───────────────────────── ブックマークのデータ操作 ─────────────────────────
 
@@ -1524,14 +1536,22 @@ impl App {
             cycle_continuous = true;
         }
 
+        let navigation_sense = if interactive
+            || (self.music_normalize_modal_active(fs_idx) && !self.music_bookmark_modal_open())
+        {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let navigation_rects = music_file_navigation_rects(hud_rect);
         // 前ファイル (↑ = 前の項目、動画 HUD の ↑ = VideoPrevFile と同一)。continuous と同じ
         // group B に含める (gap のみ、境界なし)。前/次フレーム (コマ送り) とキャプチャは非表示。
-        let r = alloc(&mut x, bsz);
+        let r = navigation_rects[0];
         let resp = ui
             .interact(
                 r,
                 ui.id().with(("music_hud_prevfile", fs_idx)),
-                button_sense,
+                navigation_sense,
             )
             .hover_tip_dark(label_with_shortcut("前の項目", sc_prev_file.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
@@ -1541,12 +1561,13 @@ impl App {
         }
 
         // 次ファイル (↓ = 次の項目、動画 HUD の ↓ = VideoNextFile と同一)。
-        let r = alloc(&mut x, bsz);
+        let r = navigation_rects[1];
+        x = r.right() + gap;
         let resp = ui
             .interact(
                 r,
                 ui.id().with(("music_hud_nextfile", fs_idx)),
-                button_sense,
+                navigation_sense,
             )
             .hover_tip_dark(label_with_shortcut("次の項目", sc_next_file.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
@@ -1861,13 +1882,18 @@ impl App {
         );
 
         // ── 操作を適用 (self / player の可変借用を分離) ──
-        // モーダル表示中は上で描いたホバー/レスポンスを無視し、一切適用しない。
+        // モーダル中は測定時のHUD↑↓だけを適用し、他の操作intentは破棄する。
         if !interactive {
             painter.rect_filled(
                 hud_rect,
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 84),
             );
+            if self.music_normalize_modal_active(fs_idx) && !self.music_bookmark_modal_open() {
+                if let Some(delta) = nav_file {
+                    self.music_navigate_file(&ui.ctx().clone(), fs_idx, delta);
+                }
+            }
             return;
         }
         if let Some(stream_index) = selected_audio_track {
@@ -1946,7 +1972,7 @@ impl App {
 
     /// 再生前ノーマライズスキャンがモーダル段階 (= 仮 gain 適用前) で、かつ現在の音楽ビュー
     /// (fs_idx) のスキャンかどうか。true の間は左右パネル / timeline seek / HUD 操作 / FS
-    /// ショートカットを抑止し、中央にモーダル進捗を出す。スキャン機構は windows 限定なので
+    /// ショートカットを抑止する (既存HUD↑↓とkeymap項目移動・取消は除く)。windows 限定なので
     /// 非 windows では常に false。
     pub(crate) fn music_normalize_modal_active(&self, fs_idx: usize) -> bool {
         #[cfg(windows)]
@@ -1962,8 +1988,8 @@ impl App {
 
     /// 音楽ビューの再生前スキャン中に出すモーダル進捗パネル (動画 native の
     /// `draw_native_normalize_progress` の egui 版)。背後の操作は
-    /// `music_normalize_modal_active` 経由で別途抑止済みだが、ここでも全面 backdrop で
-    /// 入力を吸収し、× / ESC でキャンセルできる。`draw_fs_music_view` の最後 (最前面) で呼ぶ。
+    /// `music_normalize_modal_active` 経由で別途抑止済み。backdropは描画と同じHUD↑↓矩形だけ
+    /// 入力を通し、× / ESC で取消できる。`draw_fs_music_view` の最後 (最前面) で呼ぶ。
     #[cfg(windows)]
     pub(crate) fn draw_music_normalize_modal(
         &mut self,
@@ -1971,6 +1997,7 @@ impl App {
         ctx: &egui::Context,
         rect: egui::Rect,
         fs_idx: usize,
+        navigation_rects: [egui::Rect; 2],
     ) {
         use crate::video::normalize_types::NormalizeProgressSnapshot;
         use std::sync::atomic::Ordering;
@@ -1988,128 +2015,151 @@ impl App {
             })
             .unwrap_or_default();
 
-        let painter = ui.painter_at(rect);
-        // 全面 backdrop: 背後の HUD / timeline / パネルへの click / hover を吸収する。
-        let _block = ui.interact(
-            rect,
-            ui.id().with(("music_normalize_backdrop", fs_idx)),
-            egui::Sense::click_and_drag(),
-        );
-        painter.rect_filled(
-            rect,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-        );
-
-        // 中央パネル
-        let panel_w = 420.0_f32.min((rect.width() - 40.0).max(120.0));
-        let panel_h = 150.0_f32;
-        let panel_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(panel_w, panel_h));
-        painter.rect_filled(
-            panel_rect,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(20, 20, 24, 236),
-        );
-        painter.text(
-            egui::pos2(panel_rect.center().x, panel_rect.min.y + 22.0),
-            egui::Align2::CENTER_CENTER,
-            "音量ノーマライズ中…",
-            egui::FontId::proportional(16.0),
-            egui::Color32::from_rgb(238, 238, 238),
-        );
-        // プログレスバー / スピナー
-        let bar_pad_x = 24.0;
-        let bar_y = panel_rect.center().y + 6.0;
-        let bar_rect = egui::Rect::from_min_max(
-            egui::pos2(panel_rect.min.x + bar_pad_x, bar_y - 4.0),
-            egui::pos2(panel_rect.max.x - bar_pad_x, bar_y + 4.0),
-        );
-        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(60));
-        if progress.indeterminate || progress.duration_ms == 0 {
-            let t = ctx.input(|i| i.time as f32);
-            let frac = (t * 0.7).fract().clamp(0.0, 1.0);
-            let lo = (frac - 0.18).clamp(0.0, 1.0);
-            let hi = (frac + 0.18).clamp(0.0, 1.0);
-            let chunk = egui::Rect::from_min_max(
-                egui::pos2(bar_rect.min.x + bar_rect.width() * lo, bar_rect.min.y),
-                egui::pos2(bar_rect.min.x + bar_rect.width() * hi, bar_rect.max.y),
-            );
-            painter.rect_filled(chunk, 2.0, egui::Color32::from_rgb(255, 198, 62));
-        } else {
-            let frac =
-                (progress.pts_processed_ms as f32 / progress.duration_ms as f32).clamp(0.0, 1.0);
-            let filled = egui::Rect::from_min_max(
-                bar_rect.min,
-                egui::pos2(bar_rect.min.x + bar_rect.width() * frac, bar_rect.max.y),
-            );
-            painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(255, 198, 62));
-            painter.text(
-                egui::pos2(panel_rect.center().x, bar_y + 18.0),
-                egui::Align2::CENTER_CENTER,
-                format!("{:.0}%", frac * 100.0),
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(200),
-            );
-        }
-        // スキャン中はプログレス更新のため毎フレーム repaint。
-        ctx.request_repaint();
-        // キャンセル × (右上)
-        let cancel_size = 24.0;
-        let cancel_rect = egui::Rect::from_min_size(
-            egui::pos2(panel_rect.max.x - cancel_size - 8.0, panel_rect.min.y + 8.0),
-            egui::vec2(cancel_size, cancel_size),
-        );
-        let cancel_resp = ui
-            .interact(
-                cancel_rect,
-                ui.id().with(("music_normalize_cancel", fs_idx)),
-                egui::Sense::click(),
-            )
-            .hover_tip_dark("キャンセル [ESC]");
-        let cancel_color = if cancel_resp.hovered() {
-            egui::Color32::from_rgb(255, 120, 120)
-        } else {
-            egui::Color32::from_gray(180)
-        };
-        painter.text(
-            cancel_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "\u{00D7}", // U+00D7 multiplication sign (ANSI 安全、glyph lint 通過)
-            egui::FontId::proportional(20.0),
-            cancel_color,
-        );
-        // ESC は消費して背後の FS 閉じ経路へ流さない (音声キー入力側でもモーダル中は
-        // early-return するが、二重防御で consume する)。
-        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if cancel_resp.clicked() || esc {
+        if draw_music_normalize_progress(ui, ctx, rect, fs_idx, navigation_rects, &progress) {
             self.handle_cancel_normalize_scan(ctx, fs_idx);
         }
-        let nav_size = egui::vec2(104.0, 28.0);
-        let nav_y = panel_rect.max.y - nav_size.y - 9.0;
-        for (direction, x, label) in [
-            (-1, panel_rect.center().x - nav_size.x - 6.0, "前の項目"),
-            (1, panel_rect.center().x + 6.0, "次の項目"),
-        ] {
-            let nav_rect = egui::Rect::from_min_size(egui::pos2(x, nav_y), nav_size);
-            let response = ui.interact(
-                nav_rect,
-                ui.id()
-                    .with(("music_normalize_file_nav", fs_idx, direction)),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, nav_rect, response.hovered(), false);
-            painter.text(
-                nav_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::proportional(13.0),
-                egui::Color32::WHITE,
-            );
-            if response.hover_tip_dark(label).clicked() {
-                self.music_navigate_file(ctx, fs_idx, direction);
-            }
-        }
     }
+}
+
+#[cfg(windows)]
+fn draw_music_normalize_progress(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    fs_idx: usize,
+    navigation_rects: [egui::Rect; 2],
+    progress: &crate::video::normalize_types::NormalizeProgressSnapshot,
+) -> bool {
+    let painter = ui.painter_at(rect);
+    // 描画と同じHUD↑↓矩形だけ除外し、他のHUD / timeline / パネル入力を吸収する。
+    for (index, shield) in crate::ui_helpers::modal_shield_rects(rect, &navigation_rects)
+        .into_iter()
+        .enumerate()
+    {
+        ui.interact(
+            shield,
+            ui.id().with(("music_normalize_backdrop", fs_idx, index)),
+            egui::Sense::click_and_drag(),
+        );
+    }
+    painter.rect_filled(
+        rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+    );
+
+    // 中央パネル
+    let panel_w = 420.0_f32.min((rect.width() - 40.0).max(120.0));
+    let panel_h = 110.0_f32;
+    let panel_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(panel_w, panel_h));
+    painter.rect_filled(
+        panel_rect,
+        10.0,
+        egui::Color32::from_rgba_unmultiplied(20, 20, 24, 236),
+    );
+    painter.text(
+        egui::pos2(panel_rect.center().x, panel_rect.min.y + 22.0),
+        egui::Align2::CENTER_CENTER,
+        "音量ノーマライズ中…",
+        egui::FontId::proportional(16.0),
+        egui::Color32::from_rgb(238, 238, 238),
+    );
+    // プログレスバー / スピナー
+    let bar_pad_x = 24.0;
+    let bar_y = panel_rect.center().y + 6.0;
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(panel_rect.min.x + bar_pad_x, bar_y - 4.0),
+        egui::pos2(panel_rect.max.x - bar_pad_x, bar_y + 4.0),
+    );
+    painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(60));
+    if progress.indeterminate || progress.duration_ms == 0 {
+        let t = ctx.input(|i| i.time as f32);
+        let frac = (t * 0.7).fract().clamp(0.0, 1.0);
+        let lo = (frac - 0.18).clamp(0.0, 1.0);
+        let hi = (frac + 0.18).clamp(0.0, 1.0);
+        let chunk = egui::Rect::from_min_max(
+            egui::pos2(bar_rect.min.x + bar_rect.width() * lo, bar_rect.min.y),
+            egui::pos2(bar_rect.min.x + bar_rect.width() * hi, bar_rect.max.y),
+        );
+        painter.rect_filled(chunk, 2.0, egui::Color32::from_rgb(255, 198, 62));
+    } else {
+        let frac = (progress.pts_processed_ms as f32 / progress.duration_ms as f32).clamp(0.0, 1.0);
+        let filled = egui::Rect::from_min_max(
+            bar_rect.min,
+            egui::pos2(bar_rect.min.x + bar_rect.width() * frac, bar_rect.max.y),
+        );
+        painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(255, 198, 62));
+        painter.text(
+            egui::pos2(panel_rect.center().x, bar_y + 18.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{:.0}%", frac * 100.0),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(200),
+        );
+    }
+    // スキャン中はプログレス更新のため毎フレーム repaint。
+    ctx.request_repaint();
+    // キャンセル × (右上)
+    let cancel_size = 24.0;
+    let cancel_rect = egui::Rect::from_min_size(
+        egui::pos2(panel_rect.max.x - cancel_size - 8.0, panel_rect.min.y + 8.0),
+        egui::vec2(cancel_size, cancel_size),
+    );
+    let cancel_resp = ui
+        .interact(
+            cancel_rect,
+            ui.id().with(("music_normalize_cancel", fs_idx)),
+            egui::Sense::click(),
+        )
+        .hover_tip_dark("キャンセル [ESC]");
+    let cancel_color = if cancel_resp.hovered() {
+        egui::Color32::from_rgb(255, 120, 120)
+    } else {
+        egui::Color32::from_gray(180)
+    };
+    painter.text(
+        cancel_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "\u{00D7}", // U+00D7 multiplication sign (ANSI 安全、glyph lint 通過)
+        egui::FontId::proportional(20.0),
+        cancel_color,
+    );
+    // ESC は消費して背後の FS 閉じ経路へ流さない (音声キー入力側でもモーダル中は
+    // early-return するが、二重防御で consume する)。
+    let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    cancel_resp.clicked() || esc
+}
+
+#[cfg(windows)]
+pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    ui.set_min_size(rect.size());
+    let hud = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - MUSIC_HUD_HEIGHT),
+        rect.max,
+    );
+    let nav = music_file_navigation_rects(hud);
+    ui.painter()
+        .rect_filled(rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
+    ui.painter()
+        .rect_filled(hud, 0.0, egui::Color32::from_black_alpha(150));
+    for (rect, delta) in [(nav[0], -1), (nav[1], 1)] {
+        draw_overlay_button_bg(ui.painter(), rect, false, false);
+        draw_overlay_arrow_icon(ui.painter(), rect, delta);
+    }
+    let ctx = ui.ctx().clone();
+    let _ = draw_music_normalize_progress(
+        ui,
+        &ctx,
+        rect,
+        0,
+        nav,
+        &crate::video::normalize_types::NormalizeProgressSnapshot {
+            pts_processed_ms: 30_000,
+            duration_ms: 120_000,
+            indeterminate: false,
+        },
+    );
 }
 
 #[cfg(test)]

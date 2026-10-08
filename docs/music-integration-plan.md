@@ -287,6 +287,24 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   通常 / portable core check・`cargo fmt --check`・glyph lintは終了0。変更ファイルのCRLFと `git diff --check` を確認。
   利用者指示に従いbuild-dev・製品起動・commitは行わず、実機確認は未実施。
 
+
+#### §1.351 測定中の移動を音楽HUDへ集約（2026-10-08）
+
+利用者決定（2026-10-08、Q1・Q2とも推奨案採用）を
+[動画Normの§1.351](video-architecture.md#1351-測定中の移動を既存hudへ集約2026-10-08)へ記録。
+進捗パネル内の前後ボタンを撤去し、音楽HUDの既存↑↓だけをscan中も操作可能にする。
+HUD描画と同じ矩形を入力遮断へ渡し、その2矩形以外のseek・再生・音量・編集は引き続き止める。
+HUD clickとscan中のkeymap ↑↓は同じmusic_navigate_fileへ通す。取消× / Escは維持する。
+
+egui音楽の上下HUDは§1.352で全viewport幅・常時表示で、§1.344のF11抑制の対象外。
+右情報パネルの抑制は中央の予約だけに作用し、scan中もHUD矢印へ到達できる。
+音声専用VST shellのNavigateItem / ↑↓拒否とEscでshell離脱する既存制限は維持する。
+通常native動画のHUD revealと狭幅優先配置は上記動画文書を正本とする。
+新しい可視状態・navigation ownerは作らず、既存scan ownerから操作可否を導出する。
+
+native scan中の下端HUD touchは利用者決定Q3（同日）に従って既存touch latchへ接続し、
+touch End後も同じHUDを維持する。egui音楽の常時HUDにはこの追加接続は不要。
+
 ### 5.5 右パネル / 左パネル
 - **右パネル**（D4）: `src/ui_metadata_panel.rs` の `draw_metadata_panel(...)`（:60）の item-kind
   分岐（:529）に **`GridItem::Audio` アーム**を追加。動画の タグ/★/設定 経路をミラー（実装時に

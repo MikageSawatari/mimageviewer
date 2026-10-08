@@ -48576,7 +48576,13 @@ impl App {
         // 上の music_modal_open で背後操作は抑止済み。
         #[cfg(windows)]
         if self.music_normalize_modal_active(fs_idx) {
-            self.draw_music_normalize_modal(ui, ctx, full_rect, fs_idx);
+            self.draw_music_normalize_modal(
+                ui,
+                ctx,
+                full_rect,
+                fs_idx,
+                crate::ui_music_panels::music_file_navigation_rects(hud_rect),
+            );
         }
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
@@ -48590,6 +48596,123 @@ impl App {
 #[cfg(all(test, windows))]
 mod music_full_width_hud_tests {
     use super::*;
+
+    fn scan(app: &mut App) {
+        let path = PathBuf::from("music-hud-layout.flac");
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&0) {
+            player.set_opened_audio_stream_for_test(1, 0);
+        }
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: crate::app::ViewerContextId::for_test(0),
+            fs_idx: 0,
+            stream_index: 1,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: false,
+            file_path: path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+        assert!(app.music_normalize_modal_active(0));
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_scan_routes_only_hud_arrows() {
+        let (mut app, ctx) = fixture();
+        scan(&mut app);
+        let size = egui::vec2(640.0, 360.0);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, size, vec![]);
+        }
+        for index in 0..2 {
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            let pos = probe.nav[index].center();
+            frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos)]);
+            let before = app.input_seq;
+            frame(&mut app, &ctx, size, button(pos, true, false));
+            frame(&mut app, &ctx, size, button(pos, false, false));
+            assert_eq!(
+                app.input_seq,
+                before + 1,
+                "real HUD invokes the existing music navigation owner exactly once"
+            );
+            assert!(
+                app.music_normalize_modal_active(0),
+                "boundary navigation retains scan"
+            );
+        }
+        let probe = frame(&mut app, &ctx, size, vec![]);
+        for pos in [probe.play.center(), probe.seek.center()] {
+            let before = app.input_seq;
+            let old_pos = app.fs_cache.get(&0).and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => Some(player.position()),
+                _ => None,
+            });
+            frame(&mut app, &ctx, size, button(pos, true, false));
+            frame(&mut app, &ctx, size, button(pos, false, false));
+            assert_eq!(
+                app.input_seq, before,
+                "non-navigation HUD input stays blocked"
+            );
+            assert_eq!(
+                app.fs_cache.get(&0).and_then(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => Some(player.position()),
+                    _ => None,
+                }),
+                old_pos
+            );
+            assert!(app.music_normalize_modal_active(0));
+        }
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_f11_touch_and_cancel_keep_existing_owners() {
+        let (mut app, ctx) = fixture();
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.fullscreen_chrome_suppression.info = true;
+        scan(&mut app);
+        let size = egui::vec2(640.0, 360.0);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, size, vec![]);
+        }
+        for index in 0..2 {
+            let pos = frame(&mut app, &ctx, size, vec![]).nav[index].center();
+            let before = app.input_seq;
+            frame(&mut app, &ctx, size, button(pos, true, true));
+            frame(&mut app, &ctx, size, button(pos, false, true));
+            assert_eq!(
+                app.input_seq,
+                before + 1,
+                "F11 touch reaches the existing music HUD navigation"
+            );
+            assert!(app.music_normalize_modal_active(0));
+        }
+        let cancel = app.normalize_state.as_ref().unwrap().cancel.clone();
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "Esc cancels scan, does not close the viewer"
+        );
+    }
 
     fn fixture() -> (crate::app::AppTestEnvForTest, egui::Context) {
         let mut app = crate::app::setup_app_for_test();
@@ -48616,6 +48739,8 @@ mod music_full_width_hud_tests {
     }
 
     struct Probe {
+        nav: [egui::Rect; 2],
+        play: egui::Rect,
         close: egui::Rect,
         seek: egui::Rect,
         panel: Option<egui::Rect>,
@@ -48657,6 +48782,11 @@ mod music_full_width_hud_tests {
                         let response = |name| ctx.read_response(ui.id().with((name, 0usize)));
                         let panel = response("music_right_bg");
                         probe = Some(Probe {
+                            nav: [
+                                response("music_hud_prevfile").unwrap().rect,
+                                response("music_hud_nextfile").unwrap().rect,
+                            ],
+                            play: response("music_hud_play").unwrap().rect,
                             close: response("music_top_close")
                                 .expect("actual close button")
                                 .rect,

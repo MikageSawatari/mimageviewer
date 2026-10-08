@@ -16032,6 +16032,87 @@ mod native_video_display_mode_toggle_tests {
         }
     }
 
+    #[test]
+    fn normalize_hud_navigation_music_vst_shell_keeps_navigation_gate_and_esc_exit() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let path = std::path::PathBuf::from("shell-scan.flac");
+        app.fullscreen_idx = Some(0);
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: app.projected_viewer_context_id(),
+            fs_idx: 0,
+            stream_index: 1,
+            cancel: cancel.clone(),
+            progress: Arc::new(crate::video::normalize_scanner::NormalizeScanProgress::default()),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: false,
+            file_path: path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+        app.music_vst_shell = Some(super::super::MusicVstShell {
+            fs_idx: 0,
+            activated: true,
+        });
+        assert!(app.normalize_scan_is_modal_for_current_player(0));
+        let key = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let before = app.input_seq;
+        for (virtual_key, delta) in [(0x26, -1), (0x28, 1)] {
+            assert_eq!(
+                app.dispatch_native_video_key_event(&ctx, 0, key(virtual_key)),
+                NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::MusicVstShell)
+            );
+            app.handle_native_video_output_event(
+                &ctx,
+                0,
+                0,
+                crate::video::NativeVideoOutputEvent::NavigateItem {
+                    delta,
+                    via_wheel: false,
+                },
+            );
+            assert_eq!(app.input_seq, before);
+            assert!(app.music_vst_shell.is_some());
+            assert!(!cancel.load(Ordering::Acquire));
+        }
+        assert_eq!(
+            app.dispatch_native_video_key_event(&ctx, 0, key(0x1B)),
+            NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::ExitMusicVstShell)
+        );
+        assert!(app.music_vst_shell.is_none());
+        assert!(app.normalize_scan_is_modal_for_current_player(0));
+        assert!(
+            !cancel.load(Ordering::Acquire),
+            "Esc exits shell without cancelling scan"
+        );
+    }
+
     /// V キーと overlay イベントは同じ 1 つの規則を呼ぶ。ここで固定するのはその規則で、
     /// 「両方の入口が同じ関数を通る」ことは、選ぶ関数がこれ 1 つしかないことが保証する。
     #[test]
