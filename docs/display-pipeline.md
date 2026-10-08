@@ -58,6 +58,17 @@ hover と pointer owner は通常 alpha のまま後段で描く。詳細一覧�
 下部情報バーは表示専用 caller なので opacity 1.0 を維持する。fullscreen 本体はこの projection を
 参照しない。
 
+### 1.1.2 サムネイル余白の一次クリック（§1.298）
+
+既定OFFの「サムネイルの余白部分のダブルクリックで親フォルダへ移動」がONの場合だけ、
+`grid_paint::draw_cell_with_hit_areas`が描画した画像・plate・label・overlayの矩形を同frameの
+一次入力に返す。補正texture・回転・DPI・clipを別計算せず、letterboxと外周余白を背景にする。
+bookmark title plateも実描画の矩形を返す。右クリック／右ドラッグとOFF時は従来のセル全体の判定。
+押下のCell／Background所属は既存pairing ownerの型で持ち、永続hit cacheや別の背景ownerを作らない。
+native D&Dはその押下時の所属を使い、読込み完了後の矩形で押下点を再判定しない。
+小さいセルでplateからはみ出すcaption・理由・アイコンも、描いた領域のセル／一覧clip内を項目として返す。
+媒体別の境界・実描画順の検証は[決定仕様](grid-background-double-click-plan.md#描画領域とセル種類)を参照。
+
 ### 1.2 2 フェーズ優先ロード
 
 `App::update()` 毎フレーム:

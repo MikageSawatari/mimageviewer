@@ -1534,6 +1534,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.small(
             "修飾キーなしのマウスクリックにだけ適用します。エクスプローラー方式で他の項目が選択されているときは、1 件へ畳むだけで開きません。タッチ操作は対象外です。",
         );
+        draw_grid_background_double_click_setting(ui, s);
     });
     ui.add_space(6.0);
     anchored(ui, state, "thumbnail/cursor-wrap", |ui, state| {
@@ -9672,6 +9673,14 @@ pub(super) fn draw_still_seek_strip_settings(
         );
     });
     ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
+}
+
+pub(super) fn draw_grid_background_double_click_setting(ui: &mut egui::Ui, s: &mut Settings) {
+    ui.checkbox(
+        &mut s.grid_background_double_click_parent,
+        "サムネイルの余白部分のダブルクリックで親フォルダへ移動",
+    );
+    ui.small("画像・ファイル名・バッジを除く余白と、詳細一覧の最終行より下に適用します。タッチ／ペンのダブルタップも同じ設定です。");
 }
 
 pub(super) fn draw_fullscreen_fit_cycle_settings(
