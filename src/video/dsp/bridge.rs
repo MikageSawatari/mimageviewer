@@ -398,8 +398,16 @@ unsafe fn reject_existing_handle(handle: HANDLE, label: &str) -> std::io::Result
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
 pub struct Bridge {
+    #[cfg(not(test))]
     child: Child,
+    #[cfg(test)]
+    child: Option<Child>,
+    #[cfg(not(test))]
     stdin: Mutex<ChildStdin>,
+    #[cfg(test)]
+    stdin: Mutex<Option<ChildStdin>>,
+    #[cfg(test)]
+    fake_commands: Option<std::sync::mpsc::Sender<serde_json::Value>>,
     /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
     /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
     /// recv() はここから読む。
@@ -464,6 +472,29 @@ fn route_gui_signal(
     queued
 }
 
+// Visibility publication precedes the synchronous ACK in both transports.
+fn route_gui_event(
+    event: &Event,
+    visibility: &crossbeam_channel::Sender<GuiVisibilitySignal>,
+    bypass: &crossbeam_channel::Sender<u64>,
+    wake: Option<&GuiSignalWake>,
+    pending: &PendingGuiRequests,
+) {
+    route_gui_signal(event, visibility, bypass, wake);
+    if let Event::GuiVisibilityResult {
+        request_id,
+        outcome,
+        ..
+    } = event
+    {
+        route_gui_result(pending, *request_id, *outcome);
+    }
+}
+
+#[cfg(test)]
+#[path = "fake_transport.rs"]
+mod fake_transport;
+
 #[cfg(windows)]
 struct SharedMemory {
     handle: HANDLE,
@@ -495,8 +526,28 @@ unsafe impl Send for EventHandle {}
 unsafe impl Sync for EventHandle {}
 
 impl Bridge {
+    fn child(&self) -> Option<&Child> {
+        #[cfg(test)]
+        {
+            self.child.as_ref()
+        }
+        #[cfg(not(test))]
+        {
+            Some(&self.child)
+        }
+    }
+    fn child_mut(&mut self) -> Option<&mut Child> {
+        #[cfg(test)]
+        {
+            self.child.as_mut()
+        }
+        #[cfg(not(test))]
+        {
+            Some(&mut self.child)
+        }
+    }
     pub fn process_id(&self) -> u32 {
-        self.child.id()
+        self.child().map_or(0, Child::id)
     }
 
     /// Called on a capture worker after stdout EOF. The child handle can lag
@@ -505,7 +556,7 @@ impl Bridge {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            let handle = HANDLE(self.child.as_raw_handle());
+            let handle = HANDLE(self.child()?.as_raw_handle());
             let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
             if unsafe { WaitForSingleObject(handle, wait_ms) }.0 != 0 {
                 return None;
@@ -635,15 +686,8 @@ impl Bridge {
                         Ok(event @ Event::GuiVisibilityResult { .. })
                         | Ok(event @ Event::GuiUserHidden { .. })
                         | Ok(event @ Event::GuiBypassToggle { .. }) => {
-                            route_gui_signal(
-                                &event,
-                                &gui_visibility_tx,
-                                &gui_bypass_toggle_tx,
-                                gui_signal_wake.as_ref(),
-                            );
-                            if let Event::GuiVisibilityResult { request_id, outcome, .. } = event {
-                                route_gui_result(&pending_gui_for_pump, request_id, outcome);
-                            }
+                            route_gui_event(&event, &gui_visibility_tx, &gui_bypass_toggle_tx,
+                                gui_signal_wake.as_ref(), &pending_gui_for_pump);
                         }
                         Ok(Event::PluginState {
                             request_id: Some(request_id),
@@ -703,8 +747,16 @@ impl Bridge {
             .ok();
 
         Ok(Self {
+            #[cfg(not(test))]
             child,
+            #[cfg(test)]
+            child: Some(child),
+            #[cfg(not(test))]
             stdin: Mutex::new(stdin),
+            #[cfg(test)]
+            stdin: Mutex::new(Some(stdin)),
+            #[cfg(test)]
+            fake_commands: None,
             event_rx,
             sync_call_mutex: Mutex::new(()),
             cached_latency_samples: cached_latency,
@@ -1030,19 +1082,29 @@ impl Bridge {
     pub fn terminate_now(&self) {
         use std::os::windows::io::AsRawHandle;
         self.abort_state_queries();
-        unsafe {
-            let _ = TerminateProcess(HANDLE(self.child.as_raw_handle()), 1);
+        if let Some(child) = self.child() {
+            unsafe {
+                let _ = TerminateProcess(HANDLE(child.as_raw_handle()), 1);
+            }
         }
     }
 
     /// 制御メッセージを送る。
     pub fn send(&self, cmd: &Cmd) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fake_commands.is_some() {
+            return self.send_value(&serde_json::to_value(cmd)?);
+        }
         let payload = serde_json::to_vec(cmd)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
         })?;
-        let mut stdin = self.stdin.lock().unwrap();
+        let mut guard = self.stdin.lock().unwrap();
+        #[cfg(test)]
+        let stdin = guard.as_mut().expect("spawned host stdin");
+        #[cfg(not(test))]
+        let stdin = &mut *guard;
         stdin.write_all(&len.to_le_bytes())?;
         stdin.write_all(&payload)?;
         stdin.flush()?;
@@ -1050,12 +1112,22 @@ impl Bridge {
     }
 
     pub fn send_value(&self, value: &serde_json::Value) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(commands) = &self.fake_commands {
+            return commands.send(value.clone()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fake host disconnected")
+            });
+        }
         let payload = serde_json::to_vec(value)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
         })?;
-        let mut stdin = self.stdin.lock().unwrap();
+        let mut guard = self.stdin.lock().unwrap();
+        #[cfg(test)]
+        let stdin = guard.as_mut().expect("spawned host stdin");
+        #[cfg(not(test))]
+        let stdin = &mut *guard;
         stdin.write_all(&len.to_le_bytes())?;
         stdin.write_all(&payload)?;
         stdin.flush()?;
@@ -1430,7 +1502,9 @@ impl Bridge {
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         self.abort_state_queries();
         let _ = self.send(&Cmd::Shutdown);
-        let _ = self.child.wait();
+        if let Some(child) = self.child_mut() {
+            let _ = child.wait();
+        }
         Ok(())
     }
 
@@ -1465,8 +1539,12 @@ impl Drop for Bridge {
             }
             let _ = h.name;
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child_mut() {
+            let _ = child.kill();
+        }
+        if let Some(child) = self.child_mut() {
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1791,7 +1869,7 @@ mod effetune_host_handler_tests {
             .insert(77, reply_tx);
         unsafe {
             TerminateProcess(
-                HANDLE(bridge.child.as_raw_handle()),
+                HANDLE(bridge.child().unwrap().as_raw_handle()),
                 STATE_WATCHDOG_EXIT_CODE,
             )
             .unwrap();

@@ -1019,6 +1019,35 @@ impl DspBridge {
         self.enabled.store(true, Ordering::Release);
     }
 
+    /// Install only the loaded plugin boundary; all GUI operations remain real.
+    #[cfg(test)]
+    pub(crate) fn install_fake_host_for_test(&self, host: Arc<Bridge>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.slots.push(PluginSlot {
+            slot_id: 0,
+            bridge: host,
+            plugin_path: "fake-host".into(),
+            plugin_name: Some("fake-host".into()),
+            state: SlotState::Loaded,
+            latency_samples: 0,
+            bypass: false,
+            gui_hwnd: 0,
+            gui_visible: false,
+            user_hidden: false,
+            auto_bypassed_for_latency: false,
+            desired_window_pos: None,
+            desired_window_size: None,
+            gui_host: None,
+            gui_close_signal: None,
+            gui_resize_signal: None,
+            pending_resize_notify: None,
+            last_resize_notify: None,
+            gui_resize_session_signal: None,
+            gui_app_active_signal: None,
+            gui_resize_session_active: false,
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn gui_all_visible_desired_for_test(&self) -> bool {
         self.gui_all_visible_desired.load(Ordering::Acquire)

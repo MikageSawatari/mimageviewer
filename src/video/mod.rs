@@ -9941,6 +9941,14 @@ impl VideoPlayer {
         self.engine.lock().unwrap().playback_success_is_current(id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_playback_success_for_test(&self) -> Option<PlaybackSuccess> {
+        self.engine
+            .lock()
+            .unwrap()
+            .pending_playback_success_for_test()
+    }
+
     pub fn take_playback_success(&self) -> Option<PlaybackSuccess> {
         self.engine.lock().unwrap().take_playback_success()
     }

@@ -1395,6 +1395,17 @@ impl EffetuneController {
         .unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_load_bridge_completion(&mut self, bridge: Arc<DspBridge>) {
+        let (tx, rx) = mpsc::channel();
+        self.pending_load = Some(rx);
+        tx.send(LoadCompletion::Loaded {
+            bundle: PathBuf::new(),
+            result: Ok(Some(LoadDone { bridge })),
+        })
+        .unwrap();
+    }
+
     pub fn poll(&mut self) -> bool {
         if let Ok(GuiFailure::Attach(detail)) = self.gui_failure_rx.try_recv() {
             self.fail(EffetuneFailure::GuiFailed(detail));
@@ -1757,36 +1768,6 @@ mod tests {
             assert!(!controller.try_auto_open(blocked_success, None, None));
             assert!(!controller.auto_open.spent.load(Ordering::Acquire));
             assert!(controller.try_auto_open(gate.auto_snapshot(), None, None));
-        }
-    }
-
-    #[test]
-    #[cfg(not(feature = "portable"))]
-    fn auto_cancelled_during_load_attach_or_host_dispatch_stays_spent() {
-        for factor in [
-            gui_gate::AutoSuppression::SettingOff,
-            gui_gate::AutoSuppression::RootHidden,
-            gui_gate::AutoSuppression::Fullscreen,
-            gui_gate::AutoSuppression::Minimized,
-            gui_gate::AutoSuppression::RemoteBlocked,
-        ] {
-            let mut controller = auto_test_controller();
-            let gate = controller.gui_gate().unwrap();
-            assert!(controller.try_auto_open(gate.auto_snapshot(), None, None));
-            let EffetuneRuntime::Loading {
-                open_gui_when_ready: Some(intent),
-                ..
-            } = controller.runtime
-            else {
-                panic!("automatic intent missing");
-            };
-            let current = show_permit(&controller.main_window, &controller.remote_session);
-            assert!(intent.allows(current, false, false, &gate));
-            gate.set_auto_factor(factor, true);
-            assert!(!intent.allows(current, false, false, &gate));
-            gate.set_auto_factor(factor, false);
-            assert!(!intent.allows(current, false, false, &gate));
-            assert!(!controller.try_auto_open(gate.auto_snapshot(), None, None));
         }
     }
 
@@ -2587,3 +2568,6 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), b"previous");
     }
 }
+
+#[cfg(all(test, not(feature = "portable")))]
+pub(crate) mod delivery_tests;

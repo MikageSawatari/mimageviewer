@@ -2222,8 +2222,10 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 - 未起動なら既存 worker で EffeTune を開始し、終了まで DSP を経由する。成功した手動表示も自動機会を消費する。
   自動要求後の取消し／失敗では再試行せず、既存表示済み窓・手動表示の lifecycle は維持する。
 - 設定は環境設定 → 動画・音声 → 動画 → 音響調整。旧 settings.db には既定 false の加算設定として保存する。
-  全 lib 11,023件成功／52件ignore、全 UI snapshot 116件成功、通常／portable core check・fmt・glyphも成功。
-  C++ host 再ビルドと検証用バイナリには、この worktree への VST3 SDK 配置が必要。製品は未起動、commitなし。
+  段階別配送テストの修正後、全 lib 11,027件成功／52件ignore。UI変更なしのため全 UI snapshot 116件の既存成功を再利用。
+  818606b3b レビューで host 再ビルド・source identity 一致を確認済みとして受領。
+  焦点85件・通常／portable core check・fmt・glyphも成功。
+  段階別取消しテストの修正後、test-full と変更 host を含む release launcher/core build は ClaudeCode が担当する。
 - 文書: `htdocs/mimageviewer/manual/effetune.html`、`docs/effetune-integration-plan.md`。
 - 規模 / 優先度: Small〜Medium / P3 (利用者本人の運用要望)。
 

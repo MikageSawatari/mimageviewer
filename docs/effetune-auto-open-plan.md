@@ -229,11 +229,45 @@ R1レビューのP2「normalize内部再開の由来」とP2「要求後のtray�
   修正後の全 lib は 11,023 passed / 0 failed / 52 ignored、exit 0 (990.40秒、pipeなし)。
   再実行中のソース・fixture 29ファイルのhashは不変で、検証結果は固定した差分に対応する。
 - C++ 表示取消しの22個の static_assert は MSVC の compile-only で成功し、製品は起動していない。
-  完全な host ビルドは未完了。CMake configure は vendor/vst3sdk 未配置で exit 1、
-  vendor host の source identity は今回のソースと不一致。公式 SDK アーカイブの取得もネットワーク制限で失敗した。
-  SDK の実コピーをこの worktree へ配置し、C++ host を再ビルドして source identity を検証する必要がある。
-  build-dev.ps1 は host を再ビルドしないため、この前提が揃うまで実行しない。
-  現在の dev-runtime は本変更前の成果物であり、§1.337 の確認用には使わない。
+  初回実装時は SDK 未配置により CMake configure が exit 1、host の source identity も不一致だった。
+  この初回時点の制約は target/C-1337-verification.md に履歴として残す。
+  その後、818606b3b のレビュー引継ぎで host 再ビルドと source identity 一致の確認を受領した。
+  今回の修正は Rust の非起動テスト用境界だけを追加し、C++ host の仕様・ソースは変更しない。
 - 詳細なコマンド・件数・失敗修正・未検証の実機シナリオは target/C-1337-verification.md。
-  SDK 配置後の host／build-dev と変更 bridge の release launcher/core gate は未完了。
-  実装差分の独立レビュー、Visualizer保持・Windowsフォーカスの実機確認も受け入れ前に残る。
+  変更 host を含む release launcher/core build と共有変更の test-full gate は、利用者の今回の指示により
+  段階別取消しテストの修正後に ClaudeCode が担当する。host 単体の確認はこの二つの gate を代替しない。
+  Visualizer 保持・Windows フォーカスの実機確認は非起動テストの対象外として残る。
+
+## 818606b3b レビュー対応: 配送経路での段階別取消し (2026-10-08)
+
+P2 の指摘を採用し、Loading から取得した intent の `allows()` だけを調べる旧テストを置き換える。
+App::poll_video → App::poll_effetune (ロード完了) → 実際の host-control worker →
+DspBridge::attach_slot_gui_hidden → checked visibility command／ACK → pump_gui_signals を通す。
+プロセス／editor 境界だけを cfg(test) のメモリ内 fake host とし、ロード結果もテスト用 loaded slot で注入する。
+製品ビルドの Child／stdin 所有は変えず、実 stdout pump と fake host は同じ順序の visibility／ACK router を使う。
+新しい製品状態・取消し機構は追加しない。テスト専用 channel と段階 barrier に限定して状態の組合せを減らす。
+
+設定 OFF・root 非表示 (tray 格納の公開 fact)・全画面・最小化・Remote の5要因 ×
+ロード完了前／hidden attach の ACK 前／host 配送後の最終検査前の3段階 ×
+抑止を保持して配送／抑止を往復してから配送の2条件、計30ケースを検証する。
+各段階で hidden attach／checked command の実行件数も固定し、host 最終取消しは Cancelled ACK と
+成功時 revision の維持を確認する。取消し後、復帰時の実 reconcile と次の適格な pause→play の UserPlay 成功でも、
+host の requested-visible=false・可視=false・表示0回・activate0回・Auto activate0回を確認する。
+実 ACK を drain した slot の gui_visible も false、controller は Running のままで再試行しない。
+単一 PlaybackStart の cfg(test) read-only observation で、次開始の新しい ID・UserPlay origin・
+適格な projection・同じ viewer と、App poll での成功通知消費も assert する。再生中の play の no-op で代替しない。
+
+対照ケースは適格 Auto の表示1回・activate0回と、Manual の表示1回・activate1回。
+したがって fake host の表示／activate 計測が固定0で通るテストにはしない。
+fake host は配送された origin と gate からネイティブ host の最終判断・表示／activate 意図をモデル化する。
+Win32 の実 HWND 可視性／フォーカス動作を検証したとは扱わず、変更 host を含む最終 gate と実機確認は別に残す。
+焦点テスト・全 lib・通常／portable core check の今回の結果は同じ検証台帳へ追記する。
+
+今回の修正後の焦点テストは、自動表示15件・PlaybackStart 20件・EffeTune 39件・bridge ACK/router 11件が
+成功。最終全 lib は 11,027 passed / 0 failed / 52 ignored、exit 0 (898.00秒、pipeなし)。
+Rust の変更8ファイルの hash は全 lib 実行中に不変だった。
+故障注入で worker から Auto origin を落とすと、host 取消しと Auto activate の2テストが失敗し、
+旧 `allows()` だけの検査では見えない配送不備を検出した。故障注入は復元済み。
+通常／portable core check、cargo fmt／fmt --check、glyph lint (危険文字0件)、diff／CRLF 確認も成功。
+UI変更がないため UI snapshot 116件の既存成功を再利用する。テストの観測境界追加なので build-dev は今回追加実行せず、
+test-full と変更 host を含む release launcher/core build は利用者の指定どおり ClaudeCode へ引き継ぐ。

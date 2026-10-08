@@ -337,6 +337,15 @@ impl EngineActor {
         Some(success)
     }
 
+    /// Test observation only; consuming a success remains the App poll's job.
+    #[cfg(test)]
+    pub(crate) fn pending_playback_success_for_test(&self) -> Option<PlaybackSuccess> {
+        match self.playback_start {
+            PlaybackStart::SuccessReady(success) => Some(success),
+            _ => None,
+        }
+    }
+
     pub fn playback_success_is_current(&self, id: u64) -> bool {
         matches!(self.playback_start, PlaybackStart::Established { id: current, .. } if current == id)
     }
