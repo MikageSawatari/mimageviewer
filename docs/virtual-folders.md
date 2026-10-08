@@ -293,7 +293,13 @@ password retryの共通scan入口に適用する。ヘッダー暗号化で番�
 password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」
 と通知・logする。part1／単巻のDirect → 有効cache（DBの実ZIP path）→ 変換は維持する。
 後続巻の公開済み位置・ページ編集が参照できなくなる制約は利用者受容済みで、削除・移行・互換探索はしない。
-後続巻サムネイルの先頭巻解決は維持し、メーターだけ解決先が異なるRARセルでは非表示にする。
+後続巻サムネイルの先頭巻解決は維持し、メーターだけsource ownerのtyped header証明がSubsequentのRARセルでは非表示にする。
+パス差では判定せず、First（単巻を含む）／Subsequent { first }／UnknownEncryptedを保持する。
+Remote、別窓bookmark cache hit、固定snapshot移動もcache採用前に同じ証明を検証する。
+固定範囲のcache missで変換しない契約と、thumbnail／pinのsource解決は維持する。
+固定範囲の先頭巻cacheは元RARのsnapshot identityと実ZIP backingを既存のtyped archive prepareへ渡す。
+snapshot自身のgeneration／entryを成功採用まで検証し、一時的なinternal-nav flagに遅延採用を依存させない。
+DFSは拡張子大小やpart風の名前で絞り込まず、header証明で後続巻を除外する。
 UIスレッドのI/Oや新しい状態は追加せず、既存のモーダルowner・取消・成功時採用境界を維持する。
 別ウィンドウ本ブックマークcache hit／★固定のcache-only等の既存例外は[入口表](book-resume-meter-plan.md#入口と維持する例外)参照。
 

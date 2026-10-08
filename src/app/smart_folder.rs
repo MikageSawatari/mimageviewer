@@ -9684,6 +9684,7 @@ mod tests {
                 if original == &target && shifted == &after));
         let remaining_rows = app.items.clone();
         tx.send(Ok(super::super::ClassifiedOpenPath {
+            rar_volume_proof: None,
             kind: super::super::OpenPathKind::File,
             folder_scan: None,
         }))

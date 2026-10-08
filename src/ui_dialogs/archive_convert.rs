@@ -220,11 +220,11 @@ const RAR_NO_IMAGES_MESSAGE: &str =
     "画像が見つかりません。分割RARの場合は最初のファイルを開いてください。";
 
 fn later_rar_volume_message(first: &std::path::Path) -> String {
-    let name = first
-        .file_name()
-        .unwrap_or(first.as_os_str())
-        .to_string_lossy();
-    format!("分割RARの2つ目以降のファイルです。最初のファイル（{name}）を開いてください。")
+    crate::rar_loader::RarVolumeProof::Subsequent {
+        first: first.to_path_buf(),
+    }
+    .rejection_message()
+    .expect("subsequent proof has a message")
 }
 
 fn spawn_archive_scan(
@@ -247,8 +247,8 @@ fn spawn_archive_scan(
         // Refuse header-confirmed subsequent volumes before content scan or cache adoption.
         // Encrypted headers may not expose a volume number: never infer it from the filename.
         if format == ArchiveFormat::Rar {
-            match crate::rar_loader::resolved_volume_path(&src) {
-                Ok((first, crate::rar_loader::RarVolumeKind::Subsequent)) => {
+            match crate::rar_loader::volume_proof(&src) {
+                Ok(crate::rar_loader::RarVolumeProof::Subsequent { first }) => {
                     check_cancel()?;
                     crate::logger::log(format!(
                         "archive_open: reject_subsequent_rar src={} first={}",

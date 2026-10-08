@@ -15580,6 +15580,7 @@ mod startup_open_path_resolve_tests {
 
         assert!(!cancel.load(Ordering::Relaxed));
         tx.send(StartupOpenPathResolveResult {
+            rar_volume_proof: None,
             requested: source.clone(),
             resolved: Some(crate::folder_tree::OpenablePathResolution {
                 path: source.clone(),
@@ -15828,6 +15829,7 @@ mod startup_open_path_resolve_tests {
         app.finish_startup_open_path_resolve(
             StartupOpenPathOwner::Bookmark(owner),
             StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: source.clone(),
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
                     path: source.clone(),
@@ -16197,6 +16199,7 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx.send(StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: PathBuf::from("old.mp4"),
                 resolved: None,
                 bookmark_relative_page_openable: None,
@@ -16245,6 +16248,7 @@ mod startup_open_path_resolve_tests {
         assert!(app.bookmark_view_state.is_none());
         assert!(
             tx.send(StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: PathBuf::from("bookmark.7z"),
                 resolved: None,
                 bookmark_relative_page_openable: None,
@@ -16357,6 +16361,7 @@ mod startup_open_path_resolve_tests {
                 detached_lease: None,
             }),
             StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: target_a,
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
                     path: stale_resolved_folder,
@@ -21961,6 +21966,7 @@ mod phase_c_folder_nav_history_tests {
             app.top_level_grid_view
                 .set_open_path_classification(Some(candidate));
             let mut reply = Some(Ok(super::ClassifiedOpenPath {
+                rar_volume_proof: None,
                 kind: super::OpenPathKind::Directory,
                 folder_scan: Some(scan_directory(&old_destination)),
             }));
@@ -22109,6 +22115,7 @@ mod phase_c_folder_nav_history_tests {
             .set_open_path_classification(Some(candidate));
         assert!(
             tx.send(Ok(super::ClassifiedOpenPath {
+                rar_volume_proof: None,
                 kind: super::OpenPathKind::Directory,
                 folder_scan: Some(scan_directory(&old_destination)),
             }))
@@ -22186,6 +22193,7 @@ mod phase_c_folder_nav_history_tests {
                         .set_open_path_classification(Some(candidate));
                     assert!(
                         tx.send(Ok(super::ClassifiedOpenPath {
+                            rar_volume_proof: None,
                             kind: super::OpenPathKind::Directory,
                             folder_scan: Some(scan_directory(&old_destination)),
                         }))
@@ -31562,6 +31570,7 @@ fn ignored_epub_bookmark_resolver_keeps_refusal_feedback() {
     app.finish_startup_open_path_resolve(
         owner,
         StartupOpenPathResolveResult {
+            rar_volume_proof: None,
             requested: epub.clone(),
             resolved: Some(crate::folder_tree::OpenablePathResolution {
                 path: epub,
@@ -67145,6 +67154,7 @@ mod still_window_mode_key_tests {
         .expect("cancel must retire the exact detached owner, not the main bundle");
         assert!(
             tx.send(StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: media,
                 resolved: None,
                 bookmark_relative_page_openable: None,
@@ -71344,6 +71354,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 held_resolve_for_activation_admission: None,
             });
             let result = || StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: target.clone(),
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
                     path: target.clone(),

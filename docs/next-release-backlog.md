@@ -39,9 +39,10 @@
 - 共通決定: RAR scan workerで、secretなしのheaderが後続巻と示したら画像scan・cache照会・Direct採用・変換前に拒否。「分割RARの2つ目以降のファイルです。最初のファイル（header解決済みの最初のファイル名）を開いてください。」を表示する。通常／Smart／履歴／Rating／Collection／ブックマーク／起動／別ウィンドウ／password retryの共通scan入口に適用し、古い後続巻entryも同じ通知にする。
 - ヘッダー暗号化: 先頭巻をファイル名から推測しない。password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」を表示・logする。part1／単巻のDirect → 有効cache → 変換は維持する。
 - 保存データ: 後続巻keyの読書位置・ページ編集が参照できなくなるまれな制約を利用者が受容。既存cache・保存行を削除／移行せず、互換peek・alias・探索を追加しない。
-- 一覧: 後続巻のサムネイルとthumbnail／pin source owner・失効は既存動作を維持。バーだけ、非同期source解決が先頭巻を指す後続巻セルで非表示にする。描画中I/O・ファイル名推測・新しいeligibility状態は追加しない。
+- 一覧: 後続巻のサムネイルとthumbnail／pin source owner・失効は既存動作を維持。バーだけ、非同期source ownerのtyped header証明がSubsequentの後続巻セルで非表示にする。描画中I/O・ファイル名推測・新しいeligibility状態は追加しない。
 - 維持: 保存失敗loggerの操作・src／tmp／dst・native code、平易な通知、no-clobber、既存ZIP保持を維持。別ウィンドウ本ブックマークの直接cache hit、★固定のcache-only、別ウィンドウDFSの既存policyを入口表の例外として明記する。
-- 回帰: 各handlerの後続巻拒否／変換未開始、実暗号化RARの0画像hint／part1変換、実workerの後続巻メーター非表示とthumbnail維持、先頭／単巻のcache再利用・位置復元、新通知snapshotを検証する。
+- 追加修正 (2026-10-09、8b327fa02レビュー): Remote、別窓bookmark cache hit、固定snapshot entry／grid、DFSも採用前にtyped volume証明で拒否する。大文字RAR／CBRの案内先解決を修正し、パス差によるmeter判定とcache-onlyの拒否例外を撤去。保存データとthumbnailは保持。
+- 回帰: 有効な旧後続巻cacheを置いた各入口、Remote、大文字RAR／CBRのDFS skip／meter非表示／true first案内、各handlerの後続巻拒否／変換未開始、実暗号化RARの0画像hint／part1変換、実workerの後続巻メーター非表示とthumbnail維持、先頭／単巻のcache再利用・位置復元、新通知snapshotを検証する。
 - 設計記録: [読書位置メーター計画 §19](book-resume-meter-plan.md#19-1355-分割rarは最初のファイルから開く2026-10-09利用者決定)。
 
 ### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)

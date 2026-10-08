@@ -594,7 +594,8 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
     assert_eq!(app.thumbnail_book_resume_meter(0), expected);
     assert_eq!(
         app.converted_archive_cache_paths
-            .get(&crate::path_key::normalize_keep_drive(&first)),
+            .get(&crate::path_key::normalize_keep_drive(&first))
+            .map(super::ConvertedArchiveSourceState::read_source),
         Some(&super::ConvertedArchiveSourceState::Unavailable {
             logical_source: Some(first.clone())
         })
@@ -707,6 +708,19 @@ fn later_volume_refused_with_cache(entry: Entry, solid: bool, install_cache: boo
         app.poll_startup_open_path_resolve(&ctx);
         app.poll_bookmark_browser(&ctx);
         app.poll_rar_archive_messages_for_test();
+        if matches!(entry, Entry::Bookmark)
+            && app.startup_open_path_resolve_pending.is_none()
+            && app.bookmark_open_pending.is_none()
+            && let Some((message, _, _)) = app.fs_feedback_toast.as_ref()
+        {
+            assert!(message.contains("最初"));
+            assert!(message.contains(first.file_name().unwrap().to_str().unwrap()));
+            assert!(app.archive_convert.is_none());
+            assert!(app.zip_enumerate_pending.is_none());
+            assert_ne!(app.current_folder.as_deref(), Some(first.as_path()));
+            assert_ne!(app.current_folder.as_deref(), Some(cached.as_path()));
+            break;
+        }
         if let Some(state) = app.archive_convert.as_ref() {
             if let ArchiveConvertPhase::Error { message } = &state.phase {
                 assert!(

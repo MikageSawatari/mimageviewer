@@ -41,6 +41,51 @@ enum SnapshotSubfolderRestoreSlot {
     Expansion,
 }
 
+/// Copied snapshot input, carried by the existing context-owned classification request.
+/// Native generation and entry identity prevent a completion from opening a replacement lock.
+pub(super) struct SnapshotArchiveCacheOpen {
+    source: SnapshotArchiveSourceProof,
+    destination: SnapshotArchiveCacheDestination,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotArchiveSourceProof {
+    generation_id: u64,
+    key: crate::snapshot::SnapshotKey,
+    kind: crate::snapshot::SnapshotEntryKind,
+    target: crate::snapshot::SnapshotTarget,
+}
+
+impl SnapshotArchiveSourceProof {
+    pub(super) fn is_current(&self, app: &App) -> bool {
+        app.snapshot.as_ref().is_some_and(|snapshot| {
+            app.is_snapshot_active()
+                && snapshot.generation_id == self.generation_id
+                && snapshot.membership.get(&self.key).is_some_and(|idx| {
+                    snapshot.items.get(*idx).is_some_and(|entry| {
+                        entry.key == self.key
+                            && entry.kind == self.kind
+                            && entry.target == self.target
+                    })
+                })
+        })
+    }
+}
+
+impl SnapshotArchiveCacheOpen {
+    pub(super) fn source_proof(&self) -> SnapshotArchiveSourceProof {
+        self.source.clone()
+    }
+}
+
+enum SnapshotArchiveCacheDestination {
+    Entry {
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+    },
+    Grid,
+}
+
 impl App {
     #[cfg(windows)]
     fn remap_snapshot_native_pending_indices(&mut self, old_to_new: &HashMap<usize, usize>) {
@@ -1455,6 +1500,107 @@ impl App {
         self.snapshot_open_entry_with_navigation(entry_idx, resume_slideshow, history_trigger, None)
     }
 
+    fn begin_snapshot_archive_cache_open(
+        &mut self,
+        entry_idx: usize,
+        path: PathBuf,
+        destination: SnapshotArchiveCacheDestination,
+    ) -> bool {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(entry) = snapshot.items.get(entry_idx) else {
+            return false;
+        };
+        let request = SnapshotArchiveCacheOpen {
+            source: SnapshotArchiveSourceProof {
+                generation_id: snapshot.generation_id,
+                key: entry.key.clone(),
+                kind: entry.kind,
+                target: entry.target.clone(),
+            },
+            destination,
+        };
+        match self.start_open_path_classification(
+            path,
+            super::ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(request),
+        ) {
+            super::OpenAdmission::Accepted => true,
+            super::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                false
+            }
+            super::OpenAdmission::NotApplicable => false,
+        }
+    }
+
+    pub(super) fn finish_snapshot_archive_cache_open(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        kind: super::OpenPathKind,
+        request: SnapshotArchiveCacheOpen,
+        navigation: Option<super::MainListNavigation>,
+    ) {
+        if !request.source.is_current(self) || kind != super::OpenPathKind::File {
+            return;
+        }
+        // The classification worker has proved this is not a subsequent RAR volume.
+        // This route remains cache-only: a miss never opens a conversion dialog.
+        let Some(cached) = self.try_archive_cache_lookup(&path) else {
+            self.show_feedback_toast(
+                "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)".into(),
+            );
+            return;
+        };
+        if let Some(navigation) = navigation {
+            let dfs = match &request.destination {
+                SnapshotArchiveCacheDestination::Entry {
+                    resume_slideshow,
+                    history_trigger,
+                } if self.fullscreen_idx.is_some() || *resume_slideshow => {
+                    Some(super::PhysicalHistoryDfsContinuation {
+                        queued_steps: 0,
+                        mode: if *resume_slideshow {
+                            super::FolderNavMode::SlideshowNext
+                        } else {
+                            super::FolderNavMode::Fullscreen
+                        },
+                        history_trigger: *history_trigger,
+                        restore_video_tile: false,
+                        resume_slideshow: *resume_slideshow,
+                        fullscreen: true,
+                    })
+                }
+                _ => None,
+            };
+            let reading = dfs.is_some();
+            if self.start_snapshot_archive_cache_transition(path, cached, navigation, dfs)
+                && reading
+            {
+                self.accept_snapshot_navigation(Some(ctx), true);
+            }
+            return;
+        }
+        match request.destination {
+            SnapshotArchiveCacheDestination::Entry {
+                resume_slideshow,
+                history_trigger,
+            } => {
+                self.accept_snapshot_navigation(Some(ctx), true);
+                self.snapshot_load_and_open(cached, resume_slideshow, None, history_trigger);
+            }
+            SnapshotArchiveCacheDestination::Grid => {
+                self.snapshot_internal_nav = true;
+                self.load_folder(cached);
+                self.snapshot_internal_nav = false;
+                if self.rating_filter_suppressed_at.is_some() {
+                    self.rebuild_visible_indices();
+                }
+            }
+        }
+    }
+
     fn accept_snapshot_navigation(&mut self, ctx: Option<&egui::Context>, reload: bool) {
         let (Some(ctx), Some(fs_idx)) = (ctx, self.fullscreen_idx) else {
             return;
@@ -1604,6 +1750,16 @@ impl App {
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                     return false;
+                }
+                if crate::rar_loader::is_rar_path(&path) {
+                    return self.begin_snapshot_archive_cache_open(
+                        entry_idx,
+                        path,
+                        SnapshotArchiveCacheDestination::Entry {
+                            resume_slideshow,
+                            history_trigger,
+                        },
+                    );
                 }
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
                     self.accept_snapshot_navigation(ctx, true);
@@ -2271,7 +2427,8 @@ impl App {
                 return false;
             };
             use crate::snapshot::SnapshotTarget;
-            let target_path = match &entry.target {
+            let entry_target = entry.target.clone();
+            let target_path = match &entry_target {
                 SnapshotTarget::Fs(p) => p.clone(),
                 SnapshotTarget::ConvertibleArchive { path, .. } => {
                     if self.settings.archive_file_handling_ignores_convertible() {
@@ -2279,6 +2436,13 @@ impl App {
                             "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                         );
                         return false;
+                    }
+                    if crate::rar_loader::is_rar_path(path) {
+                        return self.begin_snapshot_archive_cache_open(
+                            next_idx,
+                            path.clone(),
+                            SnapshotArchiveCacheDestination::Grid,
+                        );
                     }
                     if let Some(cached) = self.try_archive_cache_lookup(path) {
                         cached
@@ -2410,6 +2574,313 @@ mod tests {
         app.visible_indices = (0..app.items.len()).collect();
         app.current_folder = Some(PathBuf::from(r"E:\test"));
         app
+    }
+
+    fn legacy_later_rar_cache_fixture(app: &AppTestEnvForTest) -> (PathBuf, PathBuf) {
+        use std::io::Write;
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        let source = app.tmp.path().join("legacy.part2.rar");
+        std::fs::copy(fixture.join("real-split-control.part2.rar"), &source).unwrap();
+        std::fs::copy(
+            fixture.join("real-split-control.part1.rar"),
+            app.tmp.path().join("legacy.part1.rar"),
+        )
+        .unwrap();
+        let cached = app.tmp.path().join("legacy-cache.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&cached).unwrap());
+        zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"legacy converted page").unwrap();
+        zip.finish().unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                crate::archive_converter::ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        assert_eq!(app.try_archive_cache_lookup(&source), Some(cached.clone()));
+        (source, cached)
+    }
+
+    fn drain_snapshot_archive_classification(app: &mut App) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.top_level_grid_view.open_path_classification().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "classification timed out"
+            );
+            app.poll_open_path_classification(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn snapshot_cache_only_entry_rejects_confirmed_later_rar_with_valid_legacy_cache() {
+        let mut app = setup_app_for_test();
+        let (source, cached) = legacy_later_rar_cache_fixture(&app);
+        let origin = app.tmp.path().to_path_buf();
+        app.current_folder = Some(origin.clone());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        let generation = app.items_generation;
+        let _ = app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen);
+        drain_snapshot_archive_classification(&mut app);
+        assert_eq!(app.current_folder, Some(origin));
+        assert_eq!(app.items_generation, generation);
+        assert!(app.zip_enumerate_pending.is_none());
+        assert_ne!(app.current_folder.as_ref(), Some(&cached));
+        assert!(app.archive_convert.is_none());
+        assert!(app.fs_feedback_toast.as_ref().unwrap().0.contains("part1"));
+    }
+
+    #[test]
+    fn snapshot_cache_only_grid_rejects_confirmed_later_rar_with_valid_legacy_cache() {
+        let mut app = setup_app_for_test();
+        let (source, cached) = legacy_later_rar_cache_fixture(&app);
+        let origin = app.tmp.path().to_path_buf();
+        app.current_folder = Some(origin.clone());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        let generation = app.items_generation;
+        let _ = app.snapshot_navigate_grid(true);
+        drain_snapshot_archive_classification(&mut app);
+        assert_eq!(app.current_folder, Some(origin));
+        assert_eq!(app.items_generation, generation);
+        assert!(app.zip_enumerate_pending.is_none());
+        assert_ne!(app.current_folder.as_ref(), Some(&cached));
+        assert!(app.archive_convert.is_none());
+        assert!(app.fs_feedback_toast.as_ref().unwrap().0.contains("part1"));
+    }
+
+    fn legacy_standalone_rar_cache_fixture(app: &AppTestEnvForTest) -> (PathBuf, PathBuf) {
+        let (source, cached) = legacy_later_rar_cache_fixture(app);
+        // The filename looks multipart; only this standalone header has admission authority.
+        std::fs::write(&source, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                crate::archive_converter::ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        (source, cached)
+    }
+
+    fn drain_snapshot_archive_adoption(app: &mut App) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.top_level_grid_view.open_path_classification().is_some()
+            || app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            || app.zip_enumerate_pending.is_some()
+            || app.sidecar_restore_active()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cached ZIP adoption timed out"
+            );
+            app.poll_open_path_classification(&ctx);
+            app.poll_collection_history_transition(&ctx);
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn activate_single_archive_snapshot(app: &mut App, source: PathBuf) {
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+    }
+
+    #[test]
+    fn snapshot_cache_only_grid_adopts_cached_zip_with_logical_archive_owner() {
+        let mut app = setup_app_for_test();
+        let (source, cached) = legacy_standalone_rar_cache_fixture(&app);
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        activate_single_archive_snapshot(&mut app, source.clone());
+        assert!(app.snapshot_navigate_grid(true));
+        drain_snapshot_archive_adoption(&mut app);
+        assert_eq!(app.current_folder, Some(cached.clone()));
+        assert_eq!(app.archive_source_override, Some(source));
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipImage { zip_path, entry_name }]
+                if zip_path == &cached && entry_name == "page.png"
+        ));
+        assert!(app.archive_convert.is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_only_from_open_book_preserves_fullscreen_and_slideshow_modes() {
+        for resume_slideshow in [false, true] {
+            let mut app = setup_app_for_test();
+            let (source, cached) = legacy_standalone_rar_cache_fixture(&app);
+            let origin = app.tmp.path().to_path_buf();
+            app.current_folder = Some(origin.clone());
+            activate_single_archive_snapshot(&mut app, source.clone());
+            // The active book contains pages, while the next archive exists only in the
+            // immutable snapshot. There is no current grid row/index for its source.
+            app.items = vec![GridItem::Image(origin.join("previous.png"))];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.visible_indices = vec![0];
+            app.current_folder = Some(origin.join("previous-book"));
+            app.top_level_grid_view
+                .replace_surface(super::super::top_level_grid_view::TopLevelGridSurface::Folder);
+            app.bump_items_generation();
+            app.fullscreen_idx = Some(0);
+            let ctx = egui::Context::default();
+            assert!(app.snapshot_navigate(
+                &ctx,
+                true,
+                false,
+                resume_slideshow,
+                crate::app::HistoryTrigger::UserChosen,
+            ));
+            // A current-page refresh is unrelated to the native next-snapshot entry.
+            app.bump_items_generation();
+            drain_snapshot_archive_adoption(&mut app);
+            assert_eq!(app.current_folder, Some(cached));
+            assert_eq!(app.archive_source_override, Some(source));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.slideshow_playing, resume_slideshow);
+            assert!(app.archive_convert.is_none());
+        }
+    }
+
+    #[test]
+    fn snapshot_cache_only_replacement_during_cached_preflight_cannot_adopt_old_book() {
+        let mut app = setup_app_for_test();
+        let (source, _) = legacy_standalone_rar_cache_fixture(&app);
+        let origin = app.tmp.path().to_path_buf();
+        app.current_folder = Some(origin.clone());
+        activate_single_archive_snapshot(&mut app, source);
+        let old_snapshot = app.snapshot.as_ref().unwrap().generation_id;
+        assert!(app.snapshot_navigate_grid(true));
+        drain_snapshot_archive_classification(&mut app);
+        assert!(matches!(
+            app.top_level_grid_view.history_navigation_transition(),
+            Some(super::super::HistoryNavigationTransition::Physical(request))
+                if matches!(request.phase, super::super::PhysicalHistoryPhase::ArchivePreflighting { .. })
+        ));
+        app.deactivate_snapshot();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert_ne!(app.snapshot.as_ref().unwrap().generation_id, old_snapshot);
+        drain_snapshot_archive_adoption(&mut app);
+        assert_eq!(app.current_folder, Some(origin));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ConvertibleArchive { .. }]
+        ));
+        assert!(app.archive_source_override.is_none());
+        assert!(app.archive_convert.is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_only_standalone_multipart_name_uses_valid_cache() {
+        let mut app = setup_app_for_test();
+        let (source, cached) = legacy_standalone_rar_cache_fixture(&app);
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
+        drain_snapshot_archive_classification(&mut app);
+        // Classification admits the logical source; the cached ZIP owner adopts its pages.
+        drain_snapshot_archive_adoption(&mut app);
+        assert_eq!(app.current_folder, Some(cached.clone()));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipImage { zip_path, entry_name }]
+                if zip_path == &cached && entry_name == "page.png"
+        ));
+        assert!(app.archive_convert.is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_only_first_rar_miss_never_starts_conversion() {
+        let mut app = setup_app_for_test();
+        let source = app.tmp.path().join("standalone.Vol.2.rar");
+        std::fs::write(&source, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+        let origin = app.tmp.path().to_path_buf();
+        app.current_folder = Some(origin.clone());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        let generation = app.items_generation;
+        assert!(app.snapshot_navigate_grid(true));
+        drain_snapshot_archive_classification(&mut app);
+        assert_eq!(app.current_folder, Some(origin));
+        assert_eq!(app.items_generation, generation);
+        assert!(app.archive_convert.is_none());
+        assert!(app.zip_enumerate_pending.is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_only_completion_cannot_adopt_replacement_snapshot_generation() {
+        let mut app = setup_app_for_test();
+        let (source, _) = legacy_standalone_rar_cache_fixture(&app);
+        let origin = app.tmp.path().to_path_buf();
+        app.current_folder = Some(origin.clone());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        let generation = app.items_generation;
+        assert!(app.snapshot_navigate_grid(true));
+        app.snapshot.as_mut().unwrap().generation_id += 1;
+        drain_snapshot_archive_classification(&mut app);
+        assert_eq!(app.current_folder, Some(origin));
+        assert_eq!(app.items_generation, generation);
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(app.archive_convert.is_none());
     }
 
     #[test]

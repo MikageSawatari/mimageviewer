@@ -90,6 +90,7 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | 同scanのGridFolderCandidate／CurrentViewOrderRefresh | native Collection owner付きcandidateとorder refreshはRow（現row/revision／order snapshot）。通常candidateはSurface（copied path、scan結果でkind決定）。DetachedFolder / DetachedImageは共通main要求を作らずnative window leaseで処理 |
 | `smart_folder.rs::capture_smart_list_navigation`、`begin_smart_physical_navigation_with_navigation`、`begin_smart_history_navigation` | Surface（copied destination/root payloadと安定したowner lease）。同owner PDF verification/Collection revisionは許可。SmartGridの分類で渡されたRowは置換しない |
 | `collection_navigation.rs::enqueue_collection_navigation` | 共通headerはSurface（copied destination）、native requestはrow/entry ID/revision/anchorを厳密に照合。共通headerだけでnative検証を緩めない |
+| Snapshot cache-only分類／採用 | Snapshot row証明（既存snapshot generation + key/kind/target）。viewerの画像metadata世代ではなく、採用時に読むsnapshot自身を検証する。元RARはtyped source、ZIPは既存ArchivePreflightingのbackingとし、成功採用まで同じ証明を保持 |
 | `global_search_ui.rs::capture_search_view_adoption` | Row（search viewのprepare snapshotとsurvivor等）。**prepare要求の送信前**にcaptureし、非同期準備から採用まで保持。結果からのcopied-path openとは別owner |
 | `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | 初回／root-only scanはSurface（copied roots・除去path）。現snapshotの再install/除去/reused metadata・snapshot付きrestoreはRow（現items/cache由来のprepare snapshot）。scan→prepare→installは元証明をmove |
 | `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
@@ -428,8 +429,15 @@ passwordでvolume番号を確認できない場合は名前から推測せず、
 後続巻を先頭巻へ変更して開く／cacheを再利用する879802c44の閲覧経路は撤去する。
 新しいpending・rollback・retryは設けず、モーダルscan／convert ownerのcancelと古い完了破棄を維持する。
 保存失敗loggerの操作・src／tmp／dst・native code、平易な通知は維持する。
-一覧thumbnail／pin sourceの先頭巻解決と失効は変更せず、メーターは解決先とセルpathの純粋比較で
-header確認済み後続巻だけを隠す。P3のcache-only入口例外は[入口表](book-resume-meter-plan.md#入口と維持する例外)に記載する。
+一覧thumbnail／pin sourceの先頭巻解決と失効は変更せず、メーターはsource ownerのtyped header証明で
+header確認済み後続巻だけを隠す。cache-only入口も拒否の例外にはしない。
+RarVolumeProof（First／Subsequent { first }／UnknownEncrypted）を既存のsource／startup resolve／
+OpenPathClassification payloadで運び、Remote／DFSも同じworker-only probeを使う。
+別窓bookmarkはstartup resolve完了で採用前に拒否し、snapshotは既存分類ownerのSnapshot証明と
+snapshot世代／対象検証後にcache-only採用する。元RAR sourceとZIP backingを既存の
+PhysicalHistoryTransition / ArchivePreflightingへ渡し、成功採用でも同じ証明を検証する。
+一時的なsnapshot_internal_nav flagに非同期完了の許可を依存させない。UI callback／paintでheader I/Oをしない。
+[入口表](book-resume-meter-plan.md#入口と採用前の共通証明)を参照。
 
 `converted_archive_cache_paths` は items generation 開始時に全候補を `Pending` 登録するが、
 `ConvertedArchiveCachePathsPending` worker へ渡すのは現在の可視範囲 + thumbnail keep set と、

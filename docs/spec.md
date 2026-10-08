@@ -533,7 +533,9 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   open／保存／復元と同じ実読込path、source確定済みUnavailableだけは現在のdata-dirと
   論理sourceから純粋計算した変換ZIP keyのmapを参照する。同じdata-dirでは変換キャッシュ
   削除後も保存済みのバーを表示し、再変換後は同じkeyから再開する。Pending／論理source未確定は非表示。
-  分割RARはheader-confirmedの先頭volumeを使用し、ファイル名から推測しない。
+  分割RARは最初のファイルから開く。headerで後続volumeと確認したセルはメーターを非表示にし、
+  Remote／別窓bookmark／固定範囲／DFSを含む全閲覧入口で旧cacheがあっても採用しない。
+  巻種別はtyped header証明で保持し、パス差やファイル名から推測しない。
   保存・復元keyを変更せず、描画中のI/Oを追加しない。
   Stack / 個別ページ / 詳細行 / 合成ビューのルート / Remote の一覧は対象外。
   Tag / Smart / Collection から開いた物理子フォルダも通常の物理一覧として対象に含める。

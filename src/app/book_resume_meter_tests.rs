@@ -684,8 +684,15 @@ fn book_resume_meter_split_rar_hides_later_volume_without_changing_thumbnail_sou
             app.converted_archive_cache_paths.clear();
             app.converted_archive_cache_paths
                 .insert(first_key.clone(), state.clone());
-            app.converted_archive_cache_paths
-                .insert(next_key.clone(), state);
+            app.converted_archive_cache_paths.insert(
+                next_key.clone(),
+                Source::Rar {
+                    volume: crate::rar_loader::RarVolumeProof::Subsequent {
+                        first: first.clone(),
+                    },
+                    source: Box::new(state),
+                },
+            );
             let thumbnail_sources = app.converted_archive_cache_paths.clone();
             assert_eq!(app.thumbnail_book_resume_meter(0), first_value);
             assert_eq!(app.thumbnail_book_resume_meter(1), None, "later {ext}");
@@ -1477,7 +1484,8 @@ fn book_resume_meter_multipart_direct_worker_keeps_later_thumbnail_but_hides_met
         refresh_converted_source(&mut app, idx);
         assert_eq!(
             app.converted_archive_cache_paths
-                .get(&crate::path_key::normalize_keep_drive(&paths[idx])),
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx]))
+                .map(super::ConvertedArchiveSourceState::read_source),
             Some(&Source::Direct(first.clone()))
         );
         assert_converted_thumbnail_read_path(&app, idx, Some(first));
@@ -1555,7 +1563,8 @@ fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_meter_only() {
         refresh_converted_source(&mut app, idx);
         assert_eq!(
             app.converted_archive_cache_paths
-                .get(&crate::path_key::normalize_keep_drive(&paths[idx])),
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx]))
+                .map(super::ConvertedArchiveSourceState::read_source),
             Some(&super::ConvertedArchiveSourceState::CachedZip {
                 logical_source: first.clone(),
                 path: cached.clone(),
@@ -1583,7 +1592,8 @@ fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_meter_only() {
         refresh_converted_source(&mut app, idx);
         assert_eq!(
             app.converted_archive_cache_paths
-                .get(&crate::path_key::normalize_keep_drive(&paths[idx])),
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx]))
+                .map(super::ConvertedArchiveSourceState::read_source),
             Some(&super::ConvertedArchiveSourceState::Unavailable {
                 logical_source: Some(first.clone())
             })
@@ -1603,4 +1613,96 @@ fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_meter_only() {
         stored_row(app.tmp.path(), &cached),
         Some((0, Some(1), Some(1)))
     );
+}
+
+#[test]
+fn book_resume_meter_uppercase_later_rar_with_legacy_cache_is_hidden() {
+    use crate::archive_converter::ArchiveFormat;
+    for extension in ["RAR", "cbr", "CBR"] {
+        let mut app = setup_app();
+        settle(&mut app);
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        let first = app.tmp.path().join(format!("renamed.part1.{extension}"));
+        let later = app.tmp.path().join(format!("renamed.part2.{extension}"));
+        for (part, target) in [(1, &first), (2, &later)] {
+            std::fs::copy(
+                fixture.join(format!("real-split-control.part{part}.rar")),
+                target,
+            )
+            .unwrap();
+        }
+        let cached = convert_and_record_cache(&app, &first, ArchiveFormat::Rar);
+        let meta = std::fs::metadata(&later).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &later,
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+                ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.persist_book_resume(cached.clone(), 0, meter(1, 1));
+        settle(&mut app);
+        app.install_new_items(
+            vec![GridItem::ConvertibleArchive {
+                path: later.clone(),
+                format: ArchiveFormat::Rar,
+            }],
+            vec![Some((
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+            ))],
+        );
+        refresh_converted_source(&mut app, 0);
+        assert_eq!(
+            app.thumbnail_book_resume_meter(0),
+            None,
+            "confirmed subsequent {extension} is not openable"
+        );
+        assert!(cached.exists());
+    }
+}
+
+#[test]
+fn book_resume_meter_native_subsequent_proof_hides_even_when_first_path_equals_cell() {
+    use super::ConvertedArchiveSourceState as Source;
+    let mut app = setup_app();
+    settle(&mut app);
+    let clicked = app.tmp.path().join("book.part2.RAR");
+    app.install_new_items(
+        vec![GridItem::ConvertibleArchive {
+            path: clicked.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }],
+        vec![None],
+    );
+    app.persist_book_resume(clicked.clone(), 0, meter(1, 2));
+    settle(&mut app);
+    let key = crate::path_key::normalize_keep_drive(&clicked);
+    app.converted_archive_cache_paths.insert(
+        key.clone(),
+        Source::Rar {
+            volume: crate::rar_loader::RarVolumeProof::Subsequent {
+                first: clicked.clone(),
+            },
+            source: Box::new(Source::Direct(clicked.clone())),
+        },
+    );
+    assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    assert_converted_thumbnail_read_path(&app, 0, Some(&clicked));
+    app.converted_archive_cache_paths.insert(
+        key,
+        Source::Rar {
+            volume: crate::rar_loader::RarVolumeProof::First,
+            source: Box::new(Source::Direct(clicked)),
+        },
+    );
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 2));
 }

@@ -116,6 +116,29 @@ mod tests {
         confirmations: AtomicUsize,
     }
 
+    struct RarPasswordControl {
+        prompts: AtomicUsize,
+    }
+
+    impl RemoteArchiveJobControl for RarPasswordControl {
+        fn update(&self, _state: RemoteArchiveJobState, _progress: Option<RemoteArchiveProgress>) {}
+
+        fn await_confirmation(&self, _summary: RemoteArchiveImageSummary) -> Result<bool, ()> {
+            panic!("Convert setting must not request confirmation")
+        }
+
+        fn await_password(
+            &self,
+            resume: RemoteArchivePasswordResume,
+            bad_password: bool,
+        ) -> Result<String, ()> {
+            assert_eq!(resume, RemoteArchivePasswordResume::Inspect);
+            assert!(!bad_password);
+            assert_eq!(self.prompts.fetch_add(1, Ordering::Relaxed), 0);
+            Ok("public-mimageviewer-rar-test".to_owned())
+        }
+    }
+
     impl RemoteArchiveExecutor for PanicExecutor {
         fn execute(
             &self,
@@ -585,6 +608,286 @@ mod tests {
         );
     }
 
+    fn split_rar_fixture(part: u8) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control")
+            .join(format!("real-split-control.part{part}.rar"))
+    }
+
+    fn record_rar_cache(cache_db: &crate::archive_cache::ArchiveCacheDb, source: &Path) -> PathBuf {
+        use std::io::Write as _;
+
+        let fingerprint = source_fingerprint(source).unwrap();
+        let cached = cache_db.reserve_cache_zip_path(source).unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&cached).unwrap());
+        writer
+            .start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"legacy cached page").unwrap();
+        writer.finish().unwrap();
+        cache_db
+            .record(
+                source,
+                fingerprint.mtime,
+                fingerprint.size,
+                crate::archive_converter::ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            cache_db.lookup(source, fingerprint.mtime, fingerprint.size),
+            Some(cached.clone()),
+            "the legacy later-volume cache must be a valid cache hit"
+        );
+        cached
+    }
+
+    #[test]
+    fn subsequent_rar_is_rejected_before_scan_even_without_first_volume() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let executor = archive_executor(crate::settings::Settings::default(), None);
+        for (extension_index, extension) in ["rar", "RAR", "cbr"].into_iter().enumerate() {
+            let folder = temp.path().join(format!("extension-{extension_index}"));
+            std::fs::create_dir(&folder).unwrap();
+            let source = folder.join(format!("book.part2.{extension}"));
+            std::fs::copy(split_rar_fixture(2), &source).unwrap();
+            let outcome = executor.execute(
+                &RemoteArchiveStartRequest {
+                    request_id: format!("later-{extension}"),
+                    source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+                },
+                &NoInputControl,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    RemoteArchiveExecutionOutcome::Failed(
+                        RemoteArchiveTerminalCode::ExecutionFailed,
+                        message
+                    ) if message.contains("最初") && message.contains("book.part1")
+                ),
+                "subsequent {extension} must be rejected before resolving/scanning its missing first volume"
+            );
+        }
+    }
+
+    #[test]
+    fn subsequent_rar_is_rejected_despite_valid_legacy_later_key_cache() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let executor = archive_executor(
+            crate::settings::Settings::default(),
+            Some(Arc::clone(&cache_db)),
+        );
+        for (extension_index, extension) in ["rar", "RAR", "cbr"].into_iter().enumerate() {
+            for first_present in [false, true] {
+                let folder = temp
+                    .path()
+                    .join(format!("extension-{extension_index}-{first_present}"));
+                std::fs::create_dir(&folder).unwrap();
+                let source = folder.join(format!("book.part2.{extension}"));
+                std::fs::copy(split_rar_fixture(2), &source).unwrap();
+                if first_present {
+                    std::fs::copy(
+                        split_rar_fixture(1),
+                        folder.join(format!("book.part1.{extension}")),
+                    )
+                    .unwrap();
+                }
+                let cached = record_rar_cache(&cache_db, &source);
+                let outcome = executor.execute(
+                    &RemoteArchiveStartRequest {
+                        request_id: format!("legacy-{extension}-{first_present}"),
+                        source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+                    },
+                    &NoInputControl,
+                    &Arc::new(AtomicBool::new(false)),
+                );
+                assert!(
+                    matches!(
+                        outcome,
+                        RemoteArchiveExecutionOutcome::Failed(
+                            RemoteArchiveTerminalCode::ExecutionFailed,
+                            message
+                        ) if message.contains("最初") && message.contains("book.part1")
+                    ),
+                    "legacy cache must not bypass the {extension} subsequent-volume proof"
+                );
+                let fingerprint = source_fingerprint(&source).unwrap();
+                assert_eq!(
+                    cache_db.lookup(&source, fingerprint.mtime, fingerprint.size),
+                    Some(cached),
+                    "rejecting a read-only open must not delete or migrate old cache data"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_rar_with_volume_like_name_still_opens_directly() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let executor = archive_executor(crate::settings::Settings::default(), None);
+        for name in ["Vol.2.rar", "Vol.10.RAR", "book.part123.cbr"] {
+            let source = temp.path().join(name);
+            std::fs::write(&source, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+            let outcome = executor.execute(
+                &RemoteArchiveStartRequest {
+                    request_id: name.to_owned(),
+                    source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+                },
+                &NoInputControl,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+                panic!("single RAR named {name} must not be mistaken for a subsequent volume")
+            };
+            assert_eq!(
+                target.public_result().access,
+                RemoteArchiveAccessMode::DirectRar
+            );
+            assert_eq!(target.source.path, source.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn first_rar_volume_preserves_direct_or_valid_cache_open() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.part1.rar");
+        std::fs::copy(split_rar_fixture(1), &source).unwrap();
+        std::fs::copy(split_rar_fixture(2), temp.path().join("book.part2.rar")).unwrap();
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let cached = record_rar_cache(&cache_db, &source);
+        let executor = archive_executor(crate::settings::Settings::default(), Some(cache_db));
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "first-volume".to_owned(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+            panic!("first RAR volume must preserve existing direct/cache behavior")
+        };
+        assert_eq!(target.source.path, source.to_string_lossy());
+        let canonical = std::fs::canonicalize(&source).unwrap();
+        let backing = target.validated_backing_path().unwrap();
+        assert!(backing == canonical || backing == cached);
+    }
+
+    fn copy_encrypted_rar_fixture(folder: &Path) -> (PathBuf, PathBuf) {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-header-encrypted-multipart-legacy-cache");
+        let first = folder.join("header-encrypted.part1.rar");
+        let later = folder.join("header-encrypted.part2.rar");
+        std::fs::copy(fixture.join("header-encrypted.part1.rar"), &first).unwrap();
+        std::fs::copy(fixture.join("header-encrypted.part2.rar"), &later).unwrap();
+        (first, later)
+    }
+
+    #[test]
+    fn encrypted_rar_unknown_volume_uses_password_scan_and_empty_image_hint() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let (_, source) = copy_encrypted_rar_fixture(temp.path());
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Convert);
+        let executor = archive_executor(settings, Some(Arc::clone(&cache_db)));
+        let control = RarPasswordControl {
+            prompts: AtomicUsize::new(0),
+        };
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "encrypted-later".to_owned(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            &control,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            outcome,
+            RemoteArchiveExecutionOutcome::Failed(RemoteArchiveTerminalCode::NoImages, message)
+                if message == "画像が見つかりません。分割RARの場合は最初のファイルを開いてください。"
+        ));
+        assert_eq!(control.prompts.load(Ordering::Relaxed), 1);
+        let fingerprint = source_fingerprint(&source).unwrap();
+        assert!(
+            cache_db
+                .lookup(&source, fingerprint.mtime, fingerprint.size)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn encrypted_rar_first_volume_password_scan_still_converts() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let (source, _) = copy_encrypted_rar_fixture(temp.path());
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Convert);
+        let executor = archive_executor(settings, Some(Arc::clone(&cache_db)));
+        let control = RarPasswordControl {
+            prompts: AtomicUsize::new(0),
+        };
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "encrypted-first".to_owned(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            &control,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+            panic!("encrypted first volume must still convert after a password retry")
+        };
+        assert_eq!(control.prompts.load(Ordering::Relaxed), 1);
+        assert_eq!(target.source.path, source.to_string_lossy());
+        assert_eq!(
+            target.public_result().access,
+            RemoteArchiveAccessMode::CachedZip
+        );
+        let fingerprint = source_fingerprint(&source).unwrap();
+        assert_eq!(
+            target.validated_backing_path(),
+            cache_db
+                .lookup(&source, fingerprint.mtime, fingerprint.size)
+                .as_deref()
+        );
+    }
+
+    #[test]
+    fn encrypted_rar_unknown_volume_preserves_existing_cache_without_name_inference() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let (_, source) = copy_encrypted_rar_fixture(temp.path());
+        let cache_db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let cached = record_rar_cache(&cache_db, &source);
+        let executor = archive_executor(crate::settings::Settings::default(), Some(cache_db));
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "encrypted-legacy-cache".to_owned(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let RemoteArchiveExecutionOutcome::Completed(target) = outcome else {
+            panic!("unknown encrypted volume must preserve existing cache access")
+        };
+        assert_eq!(target.source.path, source.to_string_lossy());
+        assert_eq!(target.validated_backing_path(), Some(cached.as_path()));
+    }
+
     #[test]
     fn settings_recovery_stops_archive_before_scan_with_retryable_terminal_detail() {
         let _data_dir = crate::settings_db::DataDirOverrideGuard::new();
@@ -734,6 +1037,9 @@ fn scan_with_password_retry(
                 };
             }
             Err(crate::archive_converter::ConvertError::NoImages) => {
+                if format == crate::archive_converter::ArchiveFormat::Rar {
+                    return Err(rar_no_images());
+                }
                 return Err(failed(
                     RemoteArchiveTerminalCode::NoImages,
                     "画像がありません",
@@ -771,11 +1077,10 @@ fn rar_inspection_failed() -> RemoteArchiveExecutionOutcome {
     )
 }
 
-fn rar_first_volume_failed() -> RemoteArchiveExecutionOutcome {
-    failed(
-        RemoteArchiveTerminalCode::ExecutionFailed,
-        "分割 RAR の先頭ボリュームを開けませんでした",
-    )
+fn rar_no_images() -> RemoteArchiveExecutionOutcome {
+    let message = "画像が見つかりません。分割RARの場合は最初のファイルを開いてください。";
+    crate::logger::log(format!("remote_archive: {message}"));
+    failed(RemoteArchiveTerminalCode::NoImages, message)
 }
 
 fn cache_publish_failed() -> RemoteArchiveExecutionOutcome {
@@ -1693,7 +1998,7 @@ impl ContainerRemoteArchiveExecutor {
     ) -> RemoteArchiveExecutionOutcome {
         control.update(RemoteArchiveJobState::Inspecting, None);
         let public_source = request.source.clone();
-        let mut resolved = match super::path_guard::resolve_existing(&request.source.path) {
+        let resolved = match super::path_guard::resolve_existing(&request.source.path) {
             Ok(resolved) => resolved,
             Err(super::path_guard::ResolveError::InvalidPath) => {
                 return failed(
@@ -1741,7 +2046,28 @@ impl ContainerRemoteArchiveExecutor {
                 "設定で変換対象アーカイブを表示しないよう指定されています",
             );
         }
-        let mut fingerprint = match source_fingerprint(&resolved.canonical) {
+        // Header-confirmed subsequent volumes are not viewing sources, including when an old
+        // cache is still keyed by the clicked later volume. Gate before any cache lookup or scan.
+        if format == crate::archive_converter::ArchiveFormat::Rar {
+            if cancel.load(Ordering::Relaxed) {
+                return cancelled_outcome();
+            }
+            let proof = match crate::rar_loader::volume_proof(&resolved.canonical) {
+                Ok(proof) => proof,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    return cancelled_outcome();
+                }
+                Err(_) => return rar_inspection_failed(),
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return cancelled_outcome();
+            }
+            if let Some(message) = proof.rejection_message() {
+                crate::logger::log(format!("remote_archive: {message}"));
+                return failed(RemoteArchiveTerminalCode::ExecutionFailed, message);
+            }
+        }
+        let fingerprint = match source_fingerprint(&resolved.canonical) {
             Ok(fingerprint) => fingerprint,
             Err(_) => {
                 return failed(
@@ -1761,8 +2087,8 @@ impl ContainerRemoteArchiveExecutor {
         let summary = if format == crate::archive_converter::ArchiveFormat::Rar {
             match self.prepare_rar(
                 &public_source,
-                &mut resolved,
-                &mut fingerprint,
+                &resolved,
+                &fingerprint,
                 &mut fallback_cached,
                 cache_db.as_ref(),
                 &mut password,
@@ -1794,6 +2120,9 @@ impl ContainerRemoteArchiveExecutor {
             }
         };
         if summary.image_count == 0 && summary.nested_archive_count == 0 {
+            if format == crate::archive_converter::ArchiveFormat::Rar {
+                return rar_no_images();
+            }
             return failed(
                 RemoteArchiveTerminalCode::NoImages,
                 "このアーカイブには画像ファイルが含まれていません",
@@ -1826,8 +2155,8 @@ impl ContainerRemoteArchiveExecutor {
     fn prepare_rar(
         &self,
         public_source: &RemoteAddress,
-        resolved: &mut super::path_guard::ResolvedPath,
-        fingerprint: &mut SourceFingerprint,
+        resolved: &super::path_guard::ResolvedPath,
+        fingerprint: &SourceFingerprint,
         fallback_cached: &mut Option<PathBuf>,
         cache_db: Option<&Arc<crate::archive_cache::ArchiveCacheDb>>,
         password: &mut Option<String>,
@@ -1855,16 +2184,6 @@ impl ContainerRemoteArchiveExecutor {
             }
             Err(_) => return Err(rar_inspection_failed()),
         };
-        if inspection.resolved_path != resolved.canonical {
-            *resolved = super::path_guard::resolve_existing(
-                inspection.resolved_path.to_string_lossy().as_ref(),
-            )
-            .map_err(|_| rar_first_volume_failed())?;
-            *fingerprint =
-                source_fingerprint(&resolved.canonical).map_err(|_| rar_first_volume_failed())?;
-            *fallback_cached = cache_db
-                .and_then(|db| db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size));
-        }
         if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct {
             return Ok(PreparedArchive::Target(RemoteArchiveOpenTarget {
                 source: public_source.clone(),
@@ -1888,8 +2207,8 @@ impl ContainerRemoteArchiveExecutor {
     fn prepare_password_rar(
         &self,
         public_source: &RemoteAddress,
-        resolved: &mut super::path_guard::ResolvedPath,
-        fingerprint: &mut SourceFingerprint,
+        resolved: &super::path_guard::ResolvedPath,
+        fingerprint: &SourceFingerprint,
         fallback_cached: &mut Option<PathBuf>,
         cache_db: Option<&Arc<crate::archive_cache::ArchiveCacheDb>>,
         password: &mut Option<String>,
@@ -1914,28 +2233,8 @@ impl ContainerRemoteArchiveExecutor {
             control,
             cancel,
         )?;
-        let first_volume = crate::archive_converter::resolve_rar_source_path(
-            &resolved.canonical,
-            password.as_deref(),
-        )
-        .map_err(|_| rar_first_volume_failed())?;
-        if first_volume != resolved.canonical {
-            *resolved =
-                super::path_guard::resolve_existing(first_volume.to_string_lossy().as_ref())
-                    .map_err(|_| rar_first_volume_failed())?;
-            *fingerprint =
-                source_fingerprint(&resolved.canonical).map_err(|_| rar_first_volume_failed())?;
-            *fallback_cached = cache_db
-                .and_then(|db| db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size));
-            if let Some(path) = fallback_cached.take() {
-                return Ok(PreparedArchive::Target(cached_target(
-                    public_source,
-                    &resolved.canonical,
-                    fingerprint.clone(),
-                    path,
-                )));
-            }
-        }
+        // Encrypted headers can leave the volume number unknown. Preserve the clicked source
+        // through password retry; filenames and a later secret must not migrate viewing identity.
         Ok(PreparedArchive::Summary(summary))
     }
 
@@ -2022,6 +2321,9 @@ impl ContainerRemoteArchiveExecutor {
                     return password_unsupported();
                 }
                 Err(crate::archive_converter::ConvertError::NoImages) => {
+                    if format == crate::archive_converter::ArchiveFormat::Rar {
+                        return rar_no_images();
+                    }
                     return failed(RemoteArchiveTerminalCode::NoImages, "画像がありません");
                 }
                 Err(error) => return conversion_failed(error),

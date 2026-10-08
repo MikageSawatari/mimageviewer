@@ -97,7 +97,7 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 | ZIPのroot / 単一wrapper root | 現状記録する範囲を維持。rootにZipDirが混じっていても、記録時に送り得るZipImageだけで数える |
 | 入れ子ZIP内側 | 現状 `record_book_resume` が記録しないため対象外。その閲覧で外側rootの過去記録を消す処理も足さない |
 | Stackセル / Image / ZipImage / PdfPage / ZipDir個別セル | メーターを描かない。flat stack閲覧が従来記録する値はHUDの読み順で補助値も記録でき、後の通常Folderセルに表示される。stack専用keyを新設しない |
-| ConvertibleArchive (直接閲覧RARを含む) | 既存の非同期`converted_archive_cache_paths`を使う。Directは元書庫key、CachedZipは実読込path、論理sourceが確定したUnavailableだけは論理sourceから純粋計算した決定的な変換ZIP keyで同じmapを参照。キャッシュ削除後もバーを表示する。Pending / 未登録 / 論理source未確定では描かない。分割RARはheaderで確認した先頭volumeを使用し、ファイル名による推測や描画中I/Oはしない。保存・復元keyは維持（§18） |
+| ConvertibleArchive (直接閲覧RARを含む) | 既存の非同期`converted_archive_cache_paths`を使う。Directは元書庫key、CachedZipは実読込path、論理sourceが確定したUnavailableだけは論理sourceから純粋計算した決定的な変換ZIP keyで同じmapを参照。キャッシュ削除後もバーを表示する。Pending / 未登録 / 論理source未確定では描かない。分割RARはheader確認済み後続volumeのバーを隠す。開封可能な先頭巻／単巻だけ表示し、ファイル名による巻種別推測や描画中I/Oはしない。保存・復元keyは維持（§18） |
 | PdfFile扱いのEPUB | resume保存keyと当該cell pathが一致して行があれば同じmap参照で表示。変換generation/内容を解き直さず、異なるkeyを推測で結ばない |
 | 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFile/ConvertibleArchiveセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
 
@@ -957,7 +957,10 @@ workerの入口で、secretなしのnative volume headerがクリック巻をSub
 
 > 分割RARの2つ目以降のファイルです。最初のファイル（分割RAR本.part1.rar）を開いてください。
 
-括弧内はheader確認後の既存resolutionが返した最初のファイル名を表示する。
+括弧内はheader確認後のresolutionが返した最初のファイル名を表示する。
+既存unrarの名前解決を大文字.RARと.cbr／.CBRにも対応させ、拡張子の表記を保つ。
+案内先は確認済みSubsequentから解決し、名前を巻種別の根拠にはしない。
+サムネイル用の既存先頭巻source解決も同じresolverを使う。
 名前のsuffixだけで後続巻と判断しない。既存の単巻`*.part2.rar`等もheaderが単巻なら開ける。
 ヘッダー暗号化等でvolume番号を確認できない場合は、ファイル名から先頭巻を推測しない。
 既存password flowを通し、password後のscanで画像も変換対象の入れ子も無ければ、次を通知・logする。
@@ -993,13 +996,19 @@ v4.4.0が後続巻cache keyへ記録した位置・ページ編集は、後続�
 
 一覧サムネイルの後続巻→先頭巻解決と共有source mapは公開済み動作として維持する。
 thumbnail／pinのload、cache削除時の失効、Smart stash／parked contextの通知を変更しない。
-メーターだけ、既存非同期source mapが先頭巻へ解決した後続巻セルを非表示にする。
-Direct source／CachedZip.logical_source／Unavailable.logical_sourceとセルのRAR pathを純粋比較し、
-一致しなければ非表示。新しいeligibility bool、描画中のI/O、ファイル名推測は足さない。
+メーターだけ、非同期source ownerが保持するRarVolumeProof::Subsequent { first }で後続巻セルを非表示にする。
+巻種別をパス差で代用しない。Firstは単巻を含み、ヘッダー暗号化はUnknownEncryptedとする。
+thumbnail用Direct／CachedZip／Unavailableと証明を同じtyped source stateで保持し、stash／parkedも同じ所有境界で運ぶ。
+新しいeligibility bool、別map／pending／epoch、描画中I/O、ファイル名による巻種別推測は足さない。
+固定snapshotの有効cacheも、元RAR sourceとcached ZIP backingを既存のMainGridArchive intent／
+ArchivePreflightingに渡す。現在のitemsに元RAR行が無い本内部からの移動にも同じ契約を使う。
+既存snapshot generation + key/kind/targetを共通要求のSnapshot証明に保持し、分類から成功採用まで検証する。
+元表示の画像metadata世代には依存しない。fullscreen／slideshowの再開は既存の0-step reading continuationを使い、
+一時的なinternal-nav flag延長、別pending owner、変換へのfallbackを追加しない。
 part1／単巻はDirect／実CachedZip／cacheなしの決定的keyを使い、削除後のバー・再変換時の復元を維持する。
 Pending・source未確定・設定OFFは従来どおり非表示。
 
-### 入口と維持する例外
+### 入口と採用前の共通証明
 
 | 入口 | 接続／契約 | 回帰対象 |
 | --- | --- | --- |
@@ -1011,9 +1020,10 @@ Pending・source未確定・設定OFFは従来どおり非表示。
 | 別ウィンドウの通常RAR open | DetachedGridArchive owner → 共通scan | 拒否時にcontextを採用しない |
 | scanのpassword再入力 | apply_archive_password → 同じscan purpose | 暗号化後続巻の0画像hint、暗号化part1の変換成功 |
 | 共通閲覧変換要求／通常Ctrl+↑↓ | owner付きOpen scan purpose | 同じ決定を共有。DFSの後続巻skipも維持 |
-| 別ウィンドウの本ブックマークcache hit（P3例外） | startup_ops.rs: bookmark_detached_descriptorがcacheを直接採用 | 共通scanを通さない既存契約。missは通常openへ戻る |
-| ★固定範囲の移動（P3例外） | snapshot_ops.rs: cache-only照会 | hitだけ採用、missで変換dialogを出さない既存契約 |
-| 別ウィンドウDFS（既存例外） | 既存Direct／cache-only policy | header確認による後続巻skipを維持 |
+| 別ウィンドウの本ブックマークcache hit | startup path resolve workerの巻種別証明 → descriptor | 有効な旧後続巻cacheでも採用前に拒否。missは通常openへ戻る |
+| ★固定範囲のentry／grid移動 | 既存OpenPathClassificationで証明取得 → Snapshot row証明 → cache-only照会 → 既存ArchivePreflightingで採用 | 有効な旧後続巻cacheでも拒否。hitだけ採用、missで変換dialogを出さない契約は維持 |
+| 別ウィンドウDFS | workerで共通証明確認 → 既存Direct／cache-only policy | 大文字RAR／CBRを含め後続巻をheaderでskip。名前による前段の絞り込みを撤去 |
+| Remote archive job | 共通header証明 → fingerprint／cache／Direct／変換 | 旧後続巻cacheでも拒否。閲覧sourceの先頭巻への書換えを撤去 |
 | 明示sibling ZIP作成 | 同じRAR scan worker | headerで後続巻と分かればscan／変換前に拒否 |
 | 明示batch ZIP作成 | converterへ直接 | 閲覧openではなく、今回のscan入口変更対象外 |
 
@@ -1063,3 +1073,30 @@ coordinatorがcommitする際は2巻とREADMEを明示的にforce-addする。�
 英語messageは`target/A-1355-spec-msg.txt`。独立再レビューと利用者の実機確認は未実施。
 利用者はインストール済み／トレイ常駐mIVを閉じ、通常profileの確認用coreで、後続巻の最初のファイル案内、
 暗号化巻のpassword後0画像hint、先頭巻のcache再利用・削除後バー保持・再変換／復元を確認する。
+
+
+### 追加レビュー修正と検証（2026-10-09、ラインA）
+
+上の表は8b327fa02時点の記録。今回の修正ではRarVolumeProofを全閲覧入口へ運び、旧後続巻cacheが
+有効でも別窓ブックマーク、snapshot entry/grid、Remote、DFSで採用しないことを実経路で確認した。
+大文字RAR／CBRはnative headerで後続巻を判定し、その後にだけ先頭名を解決する。
+単巻のpart2風ファイル名は拒否しない。source ownerの証明でバーだけを隠し、thumbnail・保存行を維持する。
+
+修正前のRAR対象実行は92 passed / 9 failed、exit 101（target/A-1355-spec-fix-red-rar.log）。
+fixture準備・コンパイルの失敗はredに数えない。追加の先頭巻snapshot回帰では、実ZIP採用までpollすると
+旧internal-nav flag経路のscope拒否を再現した。元RAR sourceとcache backingを既存typed要求へ渡して修正し、
+本内部からの移動、fullscreen／slideshow、分類・準備中のsnapshot交換も実採用境界まで検証した。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| 対象lib（RAR 103、meter 51、snapshot 48、startup 6、DFS 61、Remote 418） | 687実行、重複除外656件、すべてexit 0。target/A-1355-spec-fix-focused-*.log |
+| 全lib（pipeなし、実exit確認） | exit 0、11,047 passed / 0 failed / 52 ignored、985.01s。target/A-1355-spec-fix-full-lib.log |
+| IPC／Remote別package | exit 0、64 + 134 passed / 1 ignored。target/A-1355-spec-fix-remote-packages.log |
+| patched unrar lib | exit 0、6 passed（uppercase／CBR先頭名解決を含む）。target/A-1355-spec-fix-unrar.log |
+| UI snapshot全体 | exit 0、103 passed。target/A-1355-spec-fix-ui-snapshot.log |
+| 通常／portable core check | 両方exit 0。target/A-1355-spec-fix-check-normal.log／target/A-1355-spec-fix-check-portable.log |
+| cargo fmt／fmt --check、patched crate rustfmt、glyph lint、diff --check | すべてexit 0、危険glyphなし。変更ファイルはCRLFを維持 |
+| build-dev -PreserveRuntime | exit 0、core 9m43s、Remote／EPUB worker配置、VCRT PE check runtime=4 / pe=3成功。target/A-1355-spec-fix-build-dev.log |
+
+対象テスト後のproduct source hashを固定し、全lib／check／snapshotは同じsourceで実施した。
+製品起動・commitは行わない。英語messageはtarget/A-1355-spec-fix-msg.txt。

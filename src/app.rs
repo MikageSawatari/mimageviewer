@@ -938,11 +938,13 @@ enum OpenPathKind {
 }
 
 struct ClassifiedOpenPath {
+    rar_volume_proof: Option<crate::rar_loader::RarVolumeProof>,
     kind: OpenPathKind,
     folder_scan: Option<ScannedDir>,
 }
 
 enum ClassifiedOpenContinuation {
+    SnapshotArchiveCacheOnly(snapshot_ops::SnapshotArchiveCacheOpen),
     DirectNavigation {
         restore_intent: StartupListIntent,
         pre_scan: Option<ScannedDir>,
@@ -1151,6 +1153,8 @@ impl FolderHistoryPlan {
 pub(crate) enum MainListSourceProof {
     /// Existing row-bound physical owners retain their generation/revision validators.
     Row,
+    /// Snapshot entries use their own row identity across cached backing preparation.
+    Snapshot(snapshot_ops::SnapshotArchiveSourceProof),
     /// Copied destinations use stable surface meaning; all proofs also check the switch epoch.
     Surface(smart_folder::SmartFolderSourceLease),
     /// Bookmark resolution belongs to the stable request ID and return target, not its rows.
@@ -4624,6 +4628,7 @@ impl StartupOpenPathSource {
 
 /// `resolve_openable_path_detailed` を UI スレッド外で済ませた結果。
 pub(crate) struct StartupOpenPathResolveResult {
+    rar_volume_proof: Option<crate::rar_loader::RarVolumeProof>,
     requested: PathBuf,
     resolved: Option<crate::folder_tree::OpenablePathResolution>,
     /// 本ブックマークの relative page だけ、open 時点の containment + existence。
@@ -6327,6 +6332,11 @@ enum DetachedPhysicalFolderOpenPoll {
 /// 1 件ずつ終端状態へ遷移する。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConvertedArchiveSourceState {
+    // Native volume evidence belongs to the same owner as thumbnail/cache resolution.
+    Rar {
+        volume: crate::rar_loader::RarVolumeProof,
+        source: Box<ConvertedArchiveSourceState>,
+    },
     Pending,
     Direct(PathBuf),
     CachedZip {
@@ -6341,9 +6351,23 @@ pub(crate) enum ConvertedArchiveSourceState {
 }
 
 impl ConvertedArchiveSourceState {
+    pub(crate) fn read_source(&self) -> &Self {
+        match self {
+            Self::Rar { source, .. } => source.read_source(),
+            source => source,
+        }
+    }
+
+    pub(crate) fn rar_volume_proof(&self) -> Option<&crate::rar_loader::RarVolumeProof> {
+        match self {
+            Self::Rar { volume, .. } => Some(volume),
+            _ => None,
+        }
+    }
+
     fn invalidate_cached_paths(paths: &mut HashMap<String, Self>) {
         for state in paths.values_mut() {
-            if matches!(state, Self::CachedZip { .. }) {
+            if matches!(state.read_source(), Self::CachedZip { .. }) {
                 *state = Self::Pending;
             }
         }
@@ -6351,6 +6375,7 @@ impl ConvertedArchiveSourceState {
 
     pub(crate) fn load_path(&self) -> Option<&Path> {
         match self {
+            Self::Rar { source, .. } => source.load_path(),
             Self::Direct(path) | Self::CachedZip { path, .. } => Some(path),
             Self::Pending | Self::Unavailable { .. } => None,
         }
@@ -6362,6 +6387,7 @@ impl ConvertedArchiveSourceState {
 
     fn perf_label(&self) -> &'static str {
         match self {
+            Self::Rar { source, .. } => source.perf_label(),
             Self::Pending => "pending",
             Self::Direct(_) => "direct",
             Self::CachedZip { .. } => "cached_zip",
@@ -6713,10 +6739,22 @@ fn resolve_converted_archive_candidate(
     cancel: &AtomicBool,
     input_seq: u64,
 ) -> Option<ConvertedArchiveSourceState> {
-    resolve_converted_archive_candidate_with(
+    let mut volume = None;
+    let source = resolve_converted_archive_candidate_with(
         candidate,
         cancel,
-        |path| crate::rar_loader::resolved_volume_path(path).map(|(resolved, _)| resolved),
+        |path| {
+            let proof = crate::rar_loader::volume_proof(path)?;
+            volume = Some(proof.clone());
+            match proof {
+                crate::rar_loader::RarVolumeProof::First => Ok(path.to_path_buf()),
+                crate::rar_loader::RarVolumeProof::Subsequent { first } => Ok(first),
+                crate::rar_loader::RarVolumeProof::UnknownEncrypted => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "encrypted RAR volume header",
+                )),
+            }
+        },
         |path, mtime, file_size| db.and_then(|db| db.peek(path, mtime, file_size)),
         |path, cancel| {
             crate::rar_loader::inspect_for_direct_read_cancelable_traced(
@@ -6727,7 +6765,14 @@ fn resolve_converted_archive_candidate(
             )
             .map(|inspection| (inspection.decision, inspection.resolved_path))
         },
-    )
+    )?;
+    Some(match volume {
+        Some(volume) => ConvertedArchiveSourceState::Rar {
+            volume,
+            source: Box::new(source),
+        },
+        None => source,
+    })
 }
 
 fn resolve_converted_archive_candidate_with(
@@ -22741,6 +22786,13 @@ impl App {
             MainListSourceProof::Surface(lease) => {
                 self.smart_folder_source_lease().as_ref() == Some(lease)
             }
+            MainListSourceProof::Snapshot(proof) => {
+                self.projected_viewer_context_id() == navigation.source_context
+                    && self.top_level_grid_view.generation() == navigation.source_surface_generation
+                    && self.active_quick_folder_slot == navigation.source_slot
+                    && self.folder_nav_current_entry() == navigation.source_location
+                    && proof.is_current(self)
+            }
             MainListSourceProof::Row => {
                 self.projected_viewer_context_id() == navigation.source_context
                     && self.top_level_grid_view.generation() == navigation.source_surface_generation
@@ -25701,6 +25753,9 @@ impl App {
             }
             // These continuations read the original index after classification.
             ClassifiedOpenContinuation::SmartGrid { .. } => Some(MainListSourceProof::Row),
+            ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(request) => {
+                Some(MainListSourceProof::Snapshot(request.source_proof()))
+            }
             #[cfg(windows)]
             ClassifiedOpenContinuation::DetachedGrid { .. } => Some(MainListSourceProof::Row),
         };
@@ -25770,11 +25825,19 @@ impl App {
                             Some(&worker_cancel),
                         )?;
                         Ok(ClassifiedOpenPath {
+                            rar_volume_proof: None,
                             kind: OpenPathKind::Directory,
                             folder_scan: Some(scan),
                         })
                     } else {
                         Ok(ClassifiedOpenPath {
+                            rar_volume_proof: if metadata.is_file()
+                                && crate::rar_loader::is_rar_path(&worker_path)
+                            {
+                                crate::rar_loader::volume_proof(&worker_path).ok()
+                            } else {
+                                None
+                            },
                             kind: if metadata.is_file() {
                                 OpenPathKind::File
                             } else {
@@ -25866,6 +25929,7 @@ impl App {
             return;
         }
         let Ok(ClassifiedOpenPath {
+            rar_volume_proof,
             kind,
             mut folder_scan,
         }) = result
@@ -25874,6 +25938,21 @@ impl App {
             self.show_feedback_toast("移動先を確認できません".into());
             return;
         };
+        if matches!(
+            candidate.continuation.as_deref(),
+            Some(ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(_))
+        ) && let Some(message) = rar_volume_proof
+            .as_ref()
+            .and_then(|proof| proof.rejection_message())
+        {
+            crate::logger::log(format!(
+                "snapshot_open: reject_subsequent_rar src={} message={message}",
+                candidate.path.display()
+            ));
+            self.finish_rejected_open_path_classification(&candidate);
+            self.show_feedback_toast(message);
+            return;
+        }
         if kind == OpenPathKind::Other {
             self.finish_rejected_open_path_classification(&candidate);
             return;
@@ -25898,6 +25977,15 @@ impl App {
         };
         let path = candidate.path.to_path_buf();
         match *continuation {
+            ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(request) => {
+                self.finish_snapshot_archive_cache_open(
+                    ctx,
+                    path,
+                    kind,
+                    request,
+                    candidate.navigation.take(),
+                );
+            }
             ClassifiedOpenContinuation::DirectNavigation {
                 restore_intent,
 
@@ -30927,6 +31015,86 @@ impl App {
             };
             preflight
         };
+        self.admit_physical_history_phase(
+            intent,
+            path,
+            path_owner,
+            classified_kind,
+            PhysicalHistoryPhase::Preflighting {
+                preflight,
+                pdf_password_submission: None,
+            },
+            navigation,
+            dfs_continuation,
+            restore_intent,
+        )
+    }
+
+    /// Reuse the staged archive owner for an already-proven snapshot cache. The source remains
+    /// the pinned RAR identity while only the ZIP backing is prepared; no RAR conversion starts.
+    fn start_snapshot_archive_cache_transition(
+        &mut self,
+        source: PathBuf,
+        backing: PathBuf,
+        navigation: MainListNavigation,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+    ) -> bool {
+        if !self.main_list_navigation_is_current(&navigation) {
+            return false;
+        }
+        let Ok(path_owner) = crate::pdf_loader::LeasedEpubPath::try_new(source.clone()) else {
+            return false;
+        };
+        let Ok(preflight) = self.start_physical_history_preflight(
+            backing.clone(),
+            Some(crate::collection_store::CollectionResolvedKind::Zip),
+        ) else {
+            return false;
+        };
+        let owner = MainGridArchiveTransitionIntent {
+            source_path: source.clone(),
+            reading_history_return_from: None,
+            suppress_rating_filter: false,
+            suppress_facet_filter: false,
+            smart_folder_owner: SmartGridArchiveOwner::None,
+            rating_grid_owner: None,
+            collection_grid_owner: None,
+            collection_navigation_continuation: None,
+        };
+        let restore_intent = if dfs_continuation.is_some() {
+            StartupListIntent::PageContinuation
+        } else {
+            StartupListIntent::ExplicitList
+        };
+        self.admit_physical_history_phase(
+            PhysicalHistoryIntent::MainGridArchive {
+                owner,
+                auto_fullscreen: false,
+            },
+            source,
+            Some(path_owner),
+            Some(OpenPathKind::File),
+            PhysicalHistoryPhase::ArchivePreflighting {
+                backing_path: backing,
+                preflight,
+            },
+            navigation,
+            dfs_continuation,
+            restore_intent,
+        )
+    }
+
+    fn admit_physical_history_phase(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        path_owner: Option<crate::pdf_loader::LeasedEpubPath>,
+        classified_kind: Option<OpenPathKind>,
+        phase: PhysicalHistoryPhase,
+        navigation: MainListNavigation,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+        restore_intent: StartupListIntent,
+    ) -> bool {
         if path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -30958,10 +31126,7 @@ impl App {
             path,
             path_owner,
             classified_kind,
-            phase: PhysicalHistoryPhase::Preflighting {
-                preflight,
-                pdf_password_submission: None,
-            },
+            phase,
             navigation,
             dfs_continuation,
             favsearch_origin: self.favsearch.active,
@@ -91739,17 +91904,22 @@ fn make_load_request(
         }),
         GridItem::ConvertibleArchive { path, format } => {
             let archive_key = crate::path_key::normalize_keep_drive(path);
-            let (load_path, source_policy) =
-                match converted_archive_cache_paths.get(&archive_key)? {
-                    ConvertedArchiveSourceState::Pending => {
-                        (path.as_path(), LoadSourcePolicy::CacheOnly)
-                    }
-                    ConvertedArchiveSourceState::Direct(load_path)
-                    | ConvertedArchiveSourceState::CachedZip {
-                        path: load_path, ..
-                    } => (load_path.as_path(), base.source_policy),
-                    ConvertedArchiveSourceState::Unavailable { .. } => return None,
-                };
+            let (load_path, source_policy) = match converted_archive_cache_paths
+                .get(&archive_key)?
+                .read_source()
+            {
+                ConvertedArchiveSourceState::Pending => {
+                    (path.as_path(), LoadSourcePolicy::CacheOnly)
+                }
+                ConvertedArchiveSourceState::Direct(load_path)
+                | ConvertedArchiveSourceState::CachedZip {
+                    path: load_path, ..
+                } => (load_path.as_path(), base.source_policy),
+                ConvertedArchiveSourceState::Unavailable { .. } => return None,
+                ConvertedArchiveSourceState::Rar { .. } => {
+                    unreachable!("read_source unwraps RAR evidence")
+                }
+            };
             let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
             let req = LoadRequest {
                 path: load_path.to_path_buf(),

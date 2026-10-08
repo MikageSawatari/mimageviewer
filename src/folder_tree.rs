@@ -313,6 +313,9 @@ pub fn resolve_folder_nav_landing(
                     return None;
                 }
                 let inspection = inspection.ok()?;
+                if inspection.volume_kind == crate::rar_loader::RarVolumeKind::Subsequent {
+                    return None;
+                }
                 cache_source = inspection.resolved_path.clone();
                 if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct
                     && inspection.summary.image_count > 0
@@ -390,12 +393,15 @@ fn is_folder_nav_file_candidate(
     }
 }
 
-/// Folder navigation runs on its DFS worker, so it may confirm ambiguous RAR names by opening
-/// the supplied file's header. Name matching only narrows the candidates; unreadable files stay
-/// visible instead of being hidden on a guess.
+/// Folder navigation runs on its DFS worker and checks every RAR/CBR header before admitting
+/// a source. Only a proven subsequent volume is excluded; unreadable or encrypted-header files
+/// retain the existing navigation policy instead of being hidden on a filename guess.
 fn is_confirmed_subsequent_rar_volume(path: &Path) -> bool {
-    crate::archive_converter::looks_like_non_first_rar_part(path)
-        && crate::rar_loader::is_subsequent_volume(path).unwrap_or(false)
+    crate::rar_loader::is_rar_path(path)
+        && matches!(
+            crate::rar_loader::volume_proof(path),
+            Ok(crate::rar_loader::RarVolumeProof::Subsequent { .. })
+        )
 }
 
 // -----------------------------------------------------------------------
@@ -1595,6 +1601,122 @@ mod tests {
             .collect();
         assert!(split_names.contains(&"real-split-control.part1.rar".to_string()));
         assert!(!split_names.contains(&"real-split-control.part2.rar".to_string()));
+    }
+
+    #[test]
+    fn rar_nav_part2_named_standalone_remains_eligible() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/multiwindow-rar-nav/01-direct.rar");
+        for (index, extension) in ["rar", "RAR", "cbr", "CBR"].into_iter().enumerate() {
+            let source = temp
+                .path()
+                .join(format!("standalone-{index}.part2.{extension}"));
+            std::fs::copy(&fixture, &source).unwrap();
+            assert!(sorted_subdirs(temp.path(), FolderTreeOptions::default()).contains(&source));
+            let opts = FolderTreeOptions {
+                archive_policy: NavigationArchivePolicy::DetachedReadable,
+                ..FolderTreeOptions::default()
+            };
+            let landing = resolve_folder_nav_landing(&source, opts, None, None).unwrap();
+            assert_eq!(landing.kind, FolderNavLandingKind::DirectRar);
+            assert_eq!(landing.backing_path, source);
+        }
+    }
+
+    #[test]
+    fn rar_nav_renamed_split_volumes_resolve_first_part_from_header() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        for (index, extension) in ["RAR", "cbr", "CBR"].into_iter().enumerate() {
+            let first = temp.path().join(format!("{index}.part1.{extension}"));
+            let later = temp.path().join(format!("{index}.part2.{extension}"));
+            std::fs::copy(fixtures.join("real-split-control.part1.rar"), &first).unwrap();
+            std::fs::copy(fixtures.join("real-split-control.part2.rar"), &later).unwrap();
+            let (resolved, kind) = crate::rar_loader::resolved_volume_path(&later).unwrap();
+            assert_eq!(kind, crate::rar_loader::RarVolumeKind::Subsequent);
+            assert_eq!(
+                resolved, first,
+                "{extension}: a proven later volume needs its true part1"
+            );
+            let (resolved, kind) = crate::rar_loader::resolved_volume_path(&first).unwrap();
+            assert_eq!(kind, crate::rar_loader::RarVolumeKind::First);
+            assert_eq!(resolved, first);
+        }
+    }
+
+    #[test]
+    fn rar_nav_renamed_split_volumes_skip_valid_legacy_later_cache() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = crate::archive_cache::ArchiveCacheDb::open().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        let valid_zip = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/multiwindow-rar-nav/06-control.zip");
+        let cache_zip = guard.path().join("legacy-cache.zip");
+        std::fs::copy(&valid_zip, &cache_zip).unwrap();
+        assert!(crate::zip_loader::first_image_entry(&cache_zip, None).is_some());
+        for (index, extension) in ["RAR", "cbr", "CBR"].into_iter().enumerate() {
+            let root = guard.path().join(index.to_string());
+            std::fs::create_dir(&root).unwrap();
+            let first = root.join(format!("02-book.part1.{extension}"));
+            let later = root.join(format!("02-book.part2.{extension}"));
+            let before = root.join("01-before.zip");
+            let after = root.join("03-after.zip");
+            std::fs::copy(&valid_zip, &before).unwrap();
+            std::fs::copy(&valid_zip, &after).unwrap();
+            std::fs::copy(fixtures.join("real-split-control.part1.rar"), &first).unwrap();
+            std::fs::copy(fixtures.join("real-split-control.part2.rar"), &later).unwrap();
+            for source in [&first, &later] {
+                let metadata = std::fs::metadata(source).unwrap();
+                db.record(
+                    source,
+                    crate::ui_helpers::mtime_secs(&metadata),
+                    metadata.len() as i64,
+                    crate::archive_converter::ArchiveFormat::Rar,
+                    &cache_zip,
+                    std::fs::metadata(&cache_zip).unwrap().len() as i64,
+                    1,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    db.peek(
+                        source,
+                        crate::ui_helpers::mtime_secs(&metadata),
+                        metadata.len() as i64,
+                    ),
+                    Some(cache_zip.clone()),
+                    "the later-volume cache is valid before the navigation gate",
+                );
+            }
+            for archive_policy in [
+                NavigationArchivePolicy::AllSupported,
+                NavigationArchivePolicy::DetachedReadable,
+            ] {
+                let opts = FolderTreeOptions {
+                    archive_policy,
+                    ..FolderTreeOptions::default()
+                };
+                let memo = FolderNavDecisionMemo::default();
+                assert!(
+                    memo.resolve(&later, opts, None, Some(&db)).is_none(),
+                    "{extension}/{archive_policy:?}: a valid cache cannot admit a later volume",
+                );
+                assert!(memo.resolve(&first, opts, None, Some(&db)).is_some());
+                assert_eq!(
+                    next_folder_dfs_with_memo(&first, opts, None, Some(&db), Some(&memo)),
+                    Some(after.clone()),
+                    "{extension}/{archive_policy:?}: forward DFS must skip part2",
+                );
+                assert_eq!(
+                    prev_folder_dfs_with_memo(&after, opts, None, Some(&db), Some(&memo)),
+                    Some(first.clone()),
+                    "{extension}/{archive_policy:?}: backward DFS must skip part2",
+                );
+            }
+        }
     }
 
     #[test]
