@@ -249,3 +249,49 @@ Start-Process -FilePath .\target\release\musicvideo_lab.exe
 ```powershell
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 ```
+
+## 9. v4.4.0 master の取り込み（2026-10-08）
+
+担当体制は 2026-09-23 決定（CLAUDE.md）に戻った: 設計・指示・検収は ClaudeCode Opus 5.5 / high、
+実装・テストは Codex GPT-6.1 Sol / high、独立レビューは別の GPT-6.1 Sol / xhigh。
+本取り込みは衝突解消と API 追従だけのため、Opus が直接行った。
+
+取り込み元はローカル master `5bc81d20f`（v4.4.0 タグ以降を含む）。取り込み前は `a76cb64f8`、
+マージコミットは `552424b3d`。master への逆マージ・push は行っていない。
+
+衝突は 3 件で、いずれも機械的に解消した。
+
+| ファイル | 解消 |
+| --- | --- |
+| `Cargo.toml` | `mvexport_cli` と master の `similar_book_query_*` bin を両方残す |
+| `docs/README.md` | 両方の行を残す。編集整合性 brief の状態を「実装・独立レビュー完了、実機未確認」に更新 |
+| `src/app/metadata_ops.rs` | master を採用。§7 で入れた pass-2 取消検査テストの CRLF 対策を master も別形で入れていた |
+
+衝突なしで混ざったが、master の API 変更でコンパイルできなくなった箇所を追従させた。
+
+- 音声トラック選択（§1.251）で `decode_audio_file_to_stereo_f32` / `probe_audio_file` が
+  stream index を取るようになった。以前の decoder は内部で `best(Audio)` を選んでいたので、
+  `mvexport::default_audio_stream_index` で同じ stream を解決し、書き出しと CLI の長さ取得の
+  両方がそれを使う（長さと書き出し音声が別トラック由来にならない）。書き出しにトラック選択 UI は無い。
+- EffeTune で `ProcessedChunk::effetune_generation` が増えた。書き出しは EffeTune を通さないので
+  `None`（master の他の未処理経路と同じ）。
+
+worktree の `vendor/` に v3.7.0 以降の依存物が無かったため、本体 worktree から実体コピーした
+（junction 不使用）: `libraw/`、`effetune-mixwright/`、`vst3-host/` の exe と `vcrt/`、
+`raw-samples/`。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo fmt --check` / UI glyph | 成功 / dangerous 0 |
+| `cargo check` core / mvexport_cli（`--locked`） | ともに exit 0 |
+| `cargo test -p mimageviewer --lib mvexport` | 10 件成功 |
+| music-core / musicvideo core / UI / lab | 36 / 73 / 87 / 45 件成功 |
+| `mvexport_cli` 5 秒書き出し（音声 = 既存 `out.mp4`、debug build） | 300 フレーム / 映像 5.000 秒 / 音声 5.013 秒、差 13ms、h264_nvenc |
+| release core / remote / EPUB worker | いずれも build 成功 |
+| `test-full.ps1 -SuppressCrashDialogs`（初回） | 12,530 成功 / 39 失敗 / 58 ignored。失敗はすべて RAW テストで `vendor/raw-samples` 欠落が理由 |
+| `raw-samples` 配置後の再実行 | `libraw-sys` 3 件成功、本体 lib の `raw` 絞り込み 321 件成功（1 ignored） |
+
+RAW 以外の workspace・integration・doctest に失敗は無かった。全体ゲートの通し再実行は行っていない
+（失敗理由が単一の環境欠落で、該当テストを個別に再実行したため）。
+
+実機確認は未実施（エージェントは起動していない）。§3 の H3 と P4 は未着手。
