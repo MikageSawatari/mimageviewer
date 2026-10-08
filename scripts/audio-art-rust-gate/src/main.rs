@@ -1,6 +1,8 @@
 //! Dependency-only gate using the exact product reader. Never launches mIV.
 #[path = "../../../src/audio_album_art.rs"]
 mod audio_album_art;
+#[path = "../../../src/audio_thumbnail/metadata.rs"]
+mod metadata;
 fn main() {
     println!(
         "Run cargo test --manifest-path scripts/audio-art-rust-gate/Cargo.toml --offline -- --nocapture --test-threads=1"
@@ -184,5 +186,152 @@ mod gate {
         );
         assert!(matches!(r, Err(art::Error::Timeout)));
         assert!(checks.load(std::sync::atomic::Ordering::Relaxed) > 3);
+    }
+}
+
+#[cfg(test)]
+mod extended_gate {
+    use super::{
+        allocation::measured,
+        audio_album_art::{self as art, tests::*},
+        metadata,
+    };
+    const SEED: u64 = 0x1347_ca57_742a_1d3b;
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+    fn corpus(seeds: &[Vec<u8>], iterations: usize, mut target: impl FnMut(&[u8], u64)) {
+        let mut state = SEED;
+        let mut buf = [0u8; 2048];
+        let (_, max, peak, _) = measured(|| {
+            for iteration in 0..iterations {
+                let roll = next(&mut state);
+                let mut len;
+                if iteration % 4 == 0 {
+                    len = (roll as usize) % buf.len();
+                    for byte in &mut buf[..len] {
+                        *byte = next(&mut state) as u8;
+                    }
+                } else {
+                    let seed = &seeds[roll as usize % seeds.len()];
+                    len = seed.len().min(buf.len());
+                    buf[..len].copy_from_slice(&seed[..len]);
+                    match iteration % 8 {
+                        1 => {} // Unmutated structural seeds also exercise success/boundaries.
+                        2 => {
+                            len = roll as usize % (len + 1);
+                        }
+                        3 => {
+                            if len < buf.len() {
+                                buf.copy_within(0..len, 1);
+                                buf[0] = roll as u8;
+                                len += 1;
+                            }
+                        }
+                        5 => {
+                            if len > 0 {
+                                let at = roll as usize % len;
+                                buf.copy_within(at + 1..len, at);
+                                len -= 1;
+                            }
+                        }
+                        _ => {
+                            for _ in 0..1 + (roll as usize % 8) {
+                                if len > 0 {
+                                    let at = next(&mut state) as usize % len;
+                                    buf[at] = next(&mut state) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+                target(&buf[..len], next(&mut state));
+            }
+        });
+        assert!(
+            max <= 128 * 1024,
+            "unexpected allocation in small-limits target: {max}"
+        );
+        assert!(
+            peak < 256 * 1024,
+            "unexpected simultaneous allocation: {peak}"
+        );
+        println!(
+            "GATE randomized iterations={iterations} seed={SEED:x} max_request={max} peak_live={peak}"
+        );
+    }
+    #[test]
+    fn arbitrary_input_header_frame_target_500000_cases() {
+        let body = apic(&[1; 128], 3);
+        let seeds = vec![
+            tag(&frame(b"\0PNG\x03\0pic", 2, 0), 2, 0),
+            tag(&frame(&body, 3, 0), 3, 0),
+            tag(&frame(&body, 4, 0), 4, 0),
+            tag(&compressed(&body, 3, body.len()), 3, 0),
+            tag(&compressed(&body, 4, body.len()), 4, 0),
+            tag(&frame(&body, 4, 0).repeat(17), 4, 0x10),
+        ];
+        corpus(&seeds, 500000, art::fuzz::header_frames);
+    }
+    #[test]
+    fn arbitrary_input_capped_inflate_target_500000_cases() {
+        let mut seeds = Vec::new();
+        for body in [
+            apic(b"png", 3),
+            apic(&[42; 400], 4),
+            b"\0PNG\x03\0pic".to_vec(),
+        ] {
+            let f = compressed(&body, 3, body.len());
+            let mut input = (body.len() as u32).to_be_bytes().to_vec();
+            input.push(if body.starts_with(b"\0PNG") { 0 } else { 1 });
+            input.extend(&f[14..]);
+            seeds.push(input);
+        }
+        corpus(&seeds, 500000, art::fuzz::capped_apic_inflate);
+    }
+    #[test]
+    fn arbitrary_input_metadata_target_200000_cases() {
+        let seeds = vec![
+            metadata::tests::jpeg_header(320, 200, &[0x11; 3], true),
+            metadata::tests::jpeg_header(8000, 5000, &[0x11; 3], true),
+            b"\x89PNG\r\n\x1a\n\0\0\0\0eXIf\0\0\0\0".to_vec(),
+        ];
+        corpus(&seeds, 200000, |input, seed| {
+            let _ = metadata::orientation(input, &mut || Ok(()));
+            let _ = metadata::jpeg_budget(input, 1 + (seed % (160 * 1024 * 1024)), &mut || Ok(()));
+        });
+    }
+    #[test]
+    fn exif_offset_bomb_orientation_has_zero_allocations() {
+        let bytes = metadata::tests::offset_bomb(6, true);
+        let (result, max, peak, calls) = measured(|| metadata::orientation(&bytes, &mut || Ok(())));
+        assert_eq!(result.unwrap(), 6);
+        assert_eq!((max, peak, calls), (0, 0, 0));
+    }
+    #[test]
+    fn forty_mp_progressive_jpeg_rejected_without_decoder_allocations() {
+        let bytes = metadata::tests::jpeg_header(8000, 5000, &[0x11; 3], true);
+        let (result, max, peak, calls) =
+            measured(|| metadata::jpeg_budget(&bytes, metadata::DECODE_BUDGET, &mut || Ok(())));
+        assert!(matches!(result, Err(art::Error::Limit)));
+        assert_eq!((max, peak, calls), (0, 0, 0));
+    }
+    #[test]
+    fn real_progressive_40mp_jpeg_fixture_rejected_before_native_or_fallback() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/audio-art-rust-gate/fixtures/progressive-8000x5000-444.jpg");
+        let bytes = std::fs::read(path).expect(
+            "Prepare the valid JPEG fixture with python scripts/audio-art-rust-gate/run.py",
+        );
+        let proof = metadata::jpeg_budget(&bytes, u64::MAX, &mut || Ok(())).unwrap();
+        assert_eq!(proof.dims, (8000, 5000));
+        assert!(proof.required > metadata::DECODE_BUDGET);
+        let (result, max, peak, calls) =
+            measured(|| metadata::jpeg_budget(&bytes, metadata::DECODE_BUDGET, &mut || Ok(())));
+        assert!(matches!(result, Err(art::Error::Limit)));
+        assert_eq!((max, peak, calls), (0, 0, 0));
     }
 }

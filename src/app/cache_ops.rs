@@ -379,6 +379,7 @@ impl App {
         let batch_zip = self.settings.batch_cache_zip_contents;
         let batch_pdf = self.settings.batch_cache_pdf_contents;
 
+        let catalog_work = crate::catalog::CatalogWork::default();
         std::thread::spawn(move || {
             // baseline: worker 冒頭で取得 (UI スレッドブロッキング回避)
             let cache_dir = crate::catalog::default_cache_dir();
@@ -479,7 +480,7 @@ impl App {
                 }
 
                 // カタログを開く（1フォルダ1DB）
-                let Ok(catalog) = crate::catalog::CatalogDb::open(&cache_dir, folder) else {
+                let Ok(catalog) = catalog_work.open(folder) else {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
@@ -534,11 +535,10 @@ impl App {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
-                        let zip_catalog =
-                            match crate::catalog::CatalogDb::open(&cache_dir, zip_path) {
-                                Ok(c) => c,
-                                Err(_) => continue,
-                            };
+                        let zip_catalog = match catalog_work.open(zip_path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
                         let zip_cache_map = zip_catalog.load_all().unwrap_or_default();
                         let entry_count = entries.len();
 
@@ -801,11 +801,10 @@ impl App {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            let pdf_catalog =
-                                match crate::catalog::CatalogDb::open(&cache_dir, pdf_path) {
-                                    Ok(c) => c,
-                                    Err(_) => continue,
-                                };
+                            let pdf_catalog = match catalog_work.open(pdf_path) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
                             let pdf_cache_map = pdf_catalog.load_all().unwrap_or_default();
                             let page_count = pages.len();
 

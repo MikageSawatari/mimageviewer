@@ -84,7 +84,7 @@ pub(crate) fn generate_with_options(
     use crate::audio_album_art::{self, Error};
     let started = Instant::now();
     let source_started = std::cell::Cell::new(None::<Instant>);
-    let mut check = || {
+    let check_source = || {
         if should_cancel() {
             Err(Error::Canceled)
         } else if source_started
@@ -96,6 +96,7 @@ pub(crate) fn generate_with_options(
             Ok(())
         }
     };
+    let mut check = check_source;
     let map_error = |error: Error| match error {
         Error::Canceled => AudioThumbnailError::Canceled,
         Error::Io(e) => AudioThumbnailError::Failed(e.to_string()),
@@ -234,7 +235,7 @@ pub(crate) fn generate_with_options(
         &mut file,
         original.file_size as u64,
         &mut check,
-        &mut |bytes| Ok(decode_picture(bytes, target)),
+        &mut |bytes| decode_picture_checked(bytes, target, &mut { check_source }),
     );
     let decoded = match decoded {
         Ok(result) => result,
@@ -333,45 +334,102 @@ pub(crate) fn generate_with_options(
         Ok(None)
     }
 }
-fn decode_picture(bytes: &[u8], target: u32) -> Option<(image::DynamicImage, (u32, u32))> {
+fn decode_picture_checked(
+    bytes: &[u8],
+    target: u32,
+    check: &mut impl FnMut() -> Result<(), crate::audio_album_art::Error>,
+) -> Result<Option<(image::DynamicImage, (u32, u32))>, crate::audio_album_art::Error> {
+    decode_picture_with_jpeg_decoder(
+        bytes,
+        target,
+        check,
+        crate::thumb_loader::decode_jpeg_turbo_scaled_from_bytes,
+    )
+}
+
+fn decode_picture_with_jpeg_decoder(
+    bytes: &[u8],
+    target: u32,
+    check: &mut impl FnMut() -> Result<(), crate::audio_album_art::Error>,
+    native: impl FnOnce(
+        &[u8],
+        u32,
+    ) -> Result<
+        (image::DynamicImage, crate::thumb_loader::ScaleStats),
+        crate::thumb_loader::DctDecodeError,
+    >,
+) -> Result<Option<(image::DynamicImage, (u32, u32))>, crate::audio_album_art::Error> {
+    use crate::audio_album_art::Error;
     use image::ImageDecoder;
-    let format = image::guess_format(bytes).ok()?;
-    if !matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Png) {
-        return None;
-    }
-    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    check()?;
+    let Some(format) = image::guess_format(bytes)
+        .ok()
+        .filter(|format| matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Png))
+    else {
+        return Ok(None);
+    };
+    let orientation = metadata::orientation(bytes, check)?;
+    let sanitized;
+    let input = if format == image::ImageFormat::Jpeg {
+        let proof = metadata::jpeg_budget(bytes, metadata::DECODE_BUDGET, check)?;
+        debug_assert!(proof.required <= metadata::DECODE_BUDGET);
+        debug_assert!(proof.dims.0 > 0 && proof.dims.1 > 0);
+        sanitized = metadata::jpeg_without_metadata(bytes, check)?;
+        sanitized.as_slice()
+    } else {
+        bytes
+    };
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(input), format);
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(160 * 1024 * 1024);
+    limits.max_alloc = Some(metadata::DECODE_BUDGET);
     reader.limits(limits.clone());
-    let mut decoder = reader.into_decoder().ok()?;
-    let dims = decoder.dimensions();
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return Ok(None);
+    };
+    let mut dims = decoder.dimensions();
     if dims.0 == 0
         || dims.1 == 0
         || u64::from(dims.0) * u64::from(dims.1) > 40_000_000
-        || decoder.total_bytes() > 160 * 1024 * 1024
+        || decoder.total_bytes() > metadata::DECODE_BUDGET
     {
-        return None;
+        return Err(Error::Limit);
     }
-    limits.reserve(decoder.total_bytes()).ok()?;
-    decoder.set_limits(limits).ok()?;
-    let image = if format == image::ImageFormat::Jpeg {
-        match crate::thumb_loader::decode_jpeg_turbo_scaled_from_bytes(bytes, target) {
-            Ok((image, _)) => image,
-            Err(crate::thumb_loader::DctDecodeError::TerminalRejection(_)) => return None,
-            Err(_) => image::DynamicImage::from_decoder(decoder).ok()?,
+    if limits.reserve(decoder.total_bytes()).is_err() || decoder.set_limits(limits).is_err() {
+        return Err(Error::Limit);
+    }
+    check()?;
+    let decoded = if format == image::ImageFormat::Jpeg {
+        // Both decoders received the same complete-file preflight and stripped input.
+        // A limit rejection never reaches the fallback, including TurboJPEG output guards.
+        match native(input, target) {
+            Ok((image, _)) => Ok(image),
+            Err(crate::thumb_loader::DctDecodeError::TerminalRejection(_)) => {
+                return Err(Error::Limit);
+            }
+            Err(_) => image::DynamicImage::from_decoder(decoder),
         }
     } else {
-        image::DynamicImage::from_decoder(decoder).ok()?
+        image::DynamicImage::from_decoder(decoder)
     };
-    let before = (image.width(), image.height());
-    let image = crate::thumb_loader::apply_exif_orientation_from_bytes(image, bytes);
-    let dims = if before.0 != before.1 && (image.width(), image.height()) == (before.1, before.0) {
-        (dims.1, dims.0)
-    } else {
-        dims
+    check()?;
+    let Ok(image) = decoded else {
+        return Ok(None);
     };
-    Some((image, dims))
+    let image = crate::thumb_loader::apply_orientation(image, orientation);
+    if [5, 6, 7, 8].contains(&orientation) {
+        dims = (dims.1, dims.0);
+    }
+    check()?;
+    Ok(Some((image, dims)))
 }
+#[cfg(test)]
+fn decode_picture(bytes: &[u8], target: u32) -> Option<(image::DynamicImage, (u32, u32))> {
+    decode_picture_checked(bytes, target, &mut || Ok(()))
+        .ok()
+        .flatten()
+}
+
+mod metadata;
 
 #[cfg(test)]
 mod tests;

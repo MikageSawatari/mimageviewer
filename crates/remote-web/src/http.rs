@@ -3573,7 +3573,17 @@ fn api_thumb(
     if let Some(source) = source_address.as_ref()
         && let Err(error) = state.library.validate_remote_address(source)
     {
-        return store_error_response(error);
+        // A discovered image can disappear after the listing was prepared. Keep
+        // syntax/network guards, and let the core's shared resolver validate the
+        // parent, stem and extension before falling back to embedded art/Shell.
+        // Other canonicalization failures (including access errors) stay rejected.
+        let missing_file_hint = matches!(error, StoreError::NotFound)
+            && matches!(source.subresource, RemoteSubresource::File)
+            && std::fs::metadata(&source.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if !missing_file_hint {
+            return store_error_response(error);
+        }
     }
     let target_px = match requested_width(query) {
         Ok(width) => width,
@@ -5551,6 +5561,78 @@ mod tests {
             413
         );
         assert!(route_requires_remote_session("/api/raw-prefetch-window"));
+    }
+
+    #[test]
+    fn missing_audio_sidecar_reaches_core_admission_without_endpoint_rediscovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let audio = temp.path().join("song.mp3");
+        let sidecar = temp.path().join("song.jpg");
+        std::fs::write(&audio, b"MP3 source").unwrap();
+        std::fs::write(&sidecar, b"previously discovered sidecar").unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        let query = vec![
+            ("path".to_owned(), audio.to_string_lossy().into_owned()),
+            ("w".to_owned(), "180".to_owned()),
+            (
+                "thumbnail_source_path".to_owned(),
+                sidecar.to_string_lossy().into_owned(),
+            ),
+        ];
+        // Stop before the transport: this handler regression never contacts a running core.
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        let owner = RemoteSessionIdentity {
+            client_id: "sidecar-test".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let response = api_thumb(&state, &query, &owner);
+        assert_eq!(
+            response.status, 503,
+            "the safe missing hint must reach core admission"
+        );
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "admission_busy"
+        );
+        assert!(
+            !sidecar.exists(),
+            "the endpoint must not recreate or rediscover the source"
+        );
+    }
+
+    #[test]
+    fn missing_sidecar_does_not_relax_absolute_path_and_network_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let audio = temp.path().join("song.mp3");
+        std::fs::write(&audio, b"MP3 source").unwrap();
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        let owner = RemoteSessionIdentity {
+            client_id: "sidecar-test".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        for source in [
+            "song.jpg",
+            "bad\0image.jpg",
+            r"\\host-that-must-not-be-contacted\share\song.jpg",
+        ] {
+            let query = vec![
+                ("path".to_owned(), audio.to_string_lossy().into_owned()),
+                ("w".to_owned(), "180".to_owned()),
+                ("thumbnail_source_path".to_owned(), source.to_owned()),
+            ];
+            let response = api_thumb(&state, &query, &owner);
+            assert_ne!(
+                response.status, 503,
+                "unsafe source must not reach IPC admission: {source:?}"
+            );
+            assert!(matches!(response.status, 400 | 403));
+        }
     }
 
     #[test]

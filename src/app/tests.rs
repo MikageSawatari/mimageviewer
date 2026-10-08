@@ -3558,9 +3558,11 @@ fn epub_pdf_meta_worker_replaces_page_count_with_new_generation_stamp() {
     for (id, pages) in [(17, 3), (18, 8)] {
         let catalog = std::sync::Arc::clone(&catalog);
         let folder = tmp.path().to_path_buf();
+        let catalog_work = crate::catalog::CatalogWork::capture(&tmp.path().join("thumbs"));
         std::thread::spawn(move || {
             write_epub_pdf_meta_row(
                 &folder,
+                &catalog_work,
                 Some(catalog),
                 "book.epub",
                 id,
@@ -99310,3 +99312,6 @@ mod audio_favsearch_sidecar_tests;
 
 #[path = "tests/audio_refresh.rs"]
 mod audio_refresh_tests;
+
+#[path = "tests/audio_idle_upgrade.rs"]
+mod audio_idle_upgrade_tests;

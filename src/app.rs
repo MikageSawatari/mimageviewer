@@ -34980,11 +34980,13 @@ impl App {
                 == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
             {
                 let warm = self.peek_warm_catalog(&parent);
+                let catalog_work = crate::catalog::CatalogWork::default();
                 let spawn = std::thread::Builder::new()
                     .name("epub-pdf-meta".into())
                     .spawn(move || {
                         if let Err(error) = write_epub_pdf_meta_row(
                             &parent,
+                            &catalog_work,
                             warm,
                             &filename,
                             page0_mtime,
@@ -49163,6 +49165,9 @@ impl App {
             }) else {
                 continue;
             };
+            // Keep cache revisit and enlargement on the same Audio source/admission dispatch
+            // as first display. Ordinary image upgrades retain their source-only edit behavior.
+            self.attach_audio_thumbnail_source_to_request(&mut req);
             // `--perf-log` の idle-health 検査は、同じ Loaded 状態を入力や世代変更なしに
             // 何度も評価 / 再投入するループを work key 単位で検出する。通常ログだけでは
             // 件数集計が不安定になるため、最終 cache bypass 判定を構造化イベントで残す。
@@ -49197,6 +49202,7 @@ impl App {
             }
             req.relative_page_provenance = self.relative_page_provenance_for_idx(i);
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
+            req.input_seq = self.input_seq;
             req.items_gen = self.items_generation;
             // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
             // idle upgrade も UI 経路なので current epoch を使う。
@@ -63936,6 +63942,7 @@ impl App {
             let _ = priority_tx.send(initial_priority_targets);
         }
         let cache_dir = crate::catalog::default_cache_dir();
+        let catalog_admission = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit();
         let io_sem = self
             .indexer_init
             .as_ref()
@@ -64014,6 +64021,7 @@ impl App {
                     plan.cached_failed,
                     plan.total,
                     cache_dir,
+                    catalog_admission,
                     io_sem,
                     cancel_w,
                     tx,
@@ -64863,7 +64871,7 @@ impl App {
         }
     }
 
-    fn attach_edit_preview_to_request(&mut self, req: &mut LoadRequest) {
+    fn attach_audio_thumbnail_source_to_request(&self, req: &mut LoadRequest) -> bool {
         if matches!(self.items.get(req.idx), Some(GridItem::Audio(_))) {
             let cache_dir = crate::catalog::default_cache_dir();
             req.raw_source = crate::thumb_loader::LoadRequestSource::AudioThumbnail(
@@ -64876,6 +64884,13 @@ impl App {
                     cache_dir,
                 },
             );
+            return true;
+        }
+        false
+    }
+
+    fn attach_edit_preview_to_request(&mut self, req: &mut LoadRequest) {
+        if self.attach_audio_thumbnail_source_to_request(req) {
             return;
         }
         req.relative_page_provenance = self.relative_page_provenance_for_idx(req.idx);
@@ -86649,6 +86664,7 @@ impl App {
 #[allow(clippy::too_many_arguments)]
 fn write_epub_pdf_meta_row(
     parent: &Path,
+    catalog_work: &crate::catalog::CatalogWork,
     warm: Option<Arc<crate::catalog::CatalogDb>>,
     filename: &str,
     generation_id: i64,
@@ -86660,7 +86676,8 @@ fn write_epub_pdf_meta_row(
     let catalog = match warm {
         Some(catalog) => catalog,
         None => Arc::new(
-            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent)
+            catalog_work
+                .open(parent)
                 .map_err(|error| error.to_string())?,
         ),
     };

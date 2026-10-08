@@ -1,8 +1,8 @@
 # 音声サムネイル: 同名 sidecar・MP3 埋め込み画像の計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の §1.347。
-改訂: 2026-10-08 / 84258858a の P2 二件を確認。利用者が先頭タグ限定を決定し、Rust gate から実装再開。
-**製品実装・指定自動検証完了、確認用build完了・先頭 ID3v2 タグ限定は利用者決定・Q1訂正 / Q2〜Q7を保持・実アプリ未起動。**
+改訂: 2026-10-08 / ca57742a1 の実装レビュー8件をコード照合し、根本修正と再検証を実施 (§20)。
+**ca57742a1 の実装レビューは REVISE。8件を根本修正し、自動再検証・検証用build完了、独立再受入待ち (§20)。先頭 ID3v2 タグ限定と既決仕様を維持・実アプリ未起動。**
 利用者から伝達されたレビュー履歴: 前版は **ACCEPT**、R4 の改訂は **ACCEPT WITH CHANGES**。
 R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。
 R7 対応後の独立レビュー受入・全利用者質問決定済みは、2026-10-08 の実装依頼で伝達された。
@@ -173,7 +173,7 @@ notice の完全性を今回の調査だけで保証せず、配布資料への�
    APIC を Tag の重複排除規則で失わない。候補を一枚ずつ完全性検査・画像 decode し、最初の有効画像を返す。
    圧縮候補は prefix 調査と実 decode 時に最大二回 inflate するが、同時に一個の inflater / image だけを持つ。
    JPEG / PNG は必須対応。MIME だけを信用せず signature / dimensions / checked 画素数 / codec Limits を確認し、
-   既存縮小・WebP encode に渡す。EXIF orientation は既存 byte decode と同じ、音声の補正 / AI / 回転を適用しない。
+   既存縮小・WebP encode に渡す。EXIFは音声埋め込み画像専用の無割当readerでIFD0のinline SHORT/count=1 Orientationだけを読む (§20.1)。汎用rexifへ渡さない。向きの画素変換だけ既存helperを使い、音声の補正 / AI / 回転を適用しない。
 9. 保存・公開前 (cache hit も同様) に source を fresh stat し、stamp と context 世代が一致した場合だけ採用。
    MP3 を書き換えない。source_dims はジャケット画素寸法、audio の video_meta.width/height は NULL のまま。
 
@@ -241,6 +241,8 @@ cancel / deadline 検査回数を保存する。private commit だけで割当�
 
 fuzz driver (cargo-fuzz / libFuzzer 等) は開発専用で製品依存に入れない。Windows native の deterministic
 regression / allocation gate と、対応する toolchain での sanitizer fuzz を分けて結果を明記する。
+2026-10-08の利用者指示: stable MSVCでsanitizer/cargo-fuzzを使えない場合は、その制約を記録し、
+任意入力target + 小さいLimits注入 + 大量の決定的randomized corpusを今回の必須gateとする (§20.8)。
 新 gate 不成立ならここで停止し、FFmpeg / 別 crate / 制限緩和を実装者判断で代用しない。
 
 利用者決定による簡素化: 有効タグ集合の置換 / merge / update の状態と、末尾タグ位置探索を作らない。
@@ -1282,3 +1284,161 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 独立実装レビューへ渡し、上記の実機確認を調整する。
 §16の再生/解析時ID3展開割当の観察をbacklog化するかは別途coordinatorが判断する。
 製品binaryの起動、commit、test-full、build-distは行っていない。
+
+
+## 20. ca57742a1 の独立実装レビュー8件への修正 (2026-10-08)
+
+判定 **REVISE** を受領し、各経路と固定版依存sourceを先に確認した。8件とも採用し、異論なし。
+§19はca57742a1までの実施履歴として保持する。本節の再検証を最終差分の証拠とする。
+既決の先頭タグ限定、sidecar優先、3択マーク、IPC67、終端・cache境界は変えない。利用者質問はなし。
+
+### 20.1 P1: EXIF展開を音声埋め込み経路から除外
+
+旧 `audio_thumbnail::decode_picture` → `thumb_loader::apply_exif_orientation_from_bytes` →
+`rexif::parse_buffer` は全IFD/参照先を展開し、入力sizeだけでは出力割当を有界にできなかった。
+`audio_thumbnail/metadata.rs` はJPEG APP1 / PNG eXIfをsliceで検査し、64KiB以下のTIFF内の
+IFD0だけからinline SHORT/count=1、値1..8を読む。Exif/GPS/SubIFD/next-IFD offsetを追わず、
+String / Vec / Tag object / 再帰を作らない。壊れた/対応外Orientationは1。
+JPEGのmarker/entropy walkは64KiB間隔、IFD entryは64件間隔で同じcancel/deadlineを確認する。
+既存の画素回転helperだけを再利用し、decode後にも取消を確認してNoArt/Failed/永続化へ混ぜない。
+5000個の重複ExifOffsetとnext-IFD cycleを含む約60KiBの正常Orientationを、割当0で読める。
+
+**別backlog候補 (今回変更せず): 既存画像の汎用EXIF parser出力増幅。**
+固定版 `rexif 0.7.5` の `tiff.rs::parse_ifds` はsub-IFD entryを集約する。
+`thumb_loader.rs::read_exif_orientation_from_bytes` は直接 `rexif::parse_buffer`、
+同fileの `read_exif_orientation_from_file` → `exif_reader.rs::read_rexif_from_path` (52/76行)も同parser。
+JPEG prefixの16MiB入力上限は存在するが、参照先の繰返し展開・出力entry数の上限とは別である。
+通常/ZIP/verified-sourceサムネイルは `thumb_loader.rs` のbyte orientation分岐、
+fullscreenは `app.rs::start_fs_load` → `decode_canonical_resolved` →
+`canonical_image_loader.rs` のStill bytes/file orientation分岐 (659/662行)から到達する。
+音声・動画の同名sidecarも既存一般画像decodeを再利用し、この既存経路に属する。
+メタデータ/類似画像/book/image-cacheにも同型callerがある。今回はこれらの製品処理を変更しない。
+reviewerの約60KiB→約2500万entry・Vec header約1.8GBは固定版sourceによる増幅見積りで、
+製品binaryを起動してその大割当を測定した結果ではない。coordinatorが横断修正のbacklog化を判断する。
+
+### 20.2 P2: JPEGの内部作業領域を割当前に検査
+
+`image 0.25.10` のJPEG `set_limits/new_zune_decoder` はmax_allocを内部の
+`zune-jpeg 0.5.15` 係数Vecへ伝えていない。TurboJPEG helperも内部max memoryは既定値であり、
+縮小後RGB bufferだけの検査では40MP progressive 4:4:4の係数領域を止められなかった。
+今回の音声経路は、どちらのdecoder構築前にも同じcomplete-file JPEG preflightを必須にする。
+markerをentropy/scan間も走査し、SOFの寸法・component数(1..4)・sample各1..4・精度を検査。
+二つ目SOF / DNL / hierarchyで後から寸法を変える入力を拒否する。
+
+固定版decoder sourceから積算する保守的な予算 (W8/H8は8px単位切上げ、S=Σhᵢvᵢ):
+`W8×H8×S×2 + W×H×4 + W8×S×512 + compressed_bytes×4 + 4MiB <= 160MiB`。
+全JPEGについて全画像i16係数を仮定し、scan組合せ・baseline fallbackも同じ上側境界にする。
+画素40MP上限は別にも維持。row/upsampling、圧縮入力の一時copy、固定tableも予算へ含める。
+これはcodecの予算であり、§19の抽出/回転/縮小/encodeと合算した全RSS160MiBを主張しない。
+安全な上側見積りのため、40MP以下でも係数等が予算を超える画像は不採用となる。
+
+予算を通ったJPEGでもdecoderへ渡す前にAPP1..APP13 / APP15 / COMを除き、
+JFIF(APP0) / Adobe(APP14)とcoding/scan/entropyを保つ。これにより汎用codecのEXIF/XMP/ICC展開を除く。
+Orientationは前段の専用readerで取得済み。縮小TurboJPEGとimage fallbackは同じ検査済みinputを使う。
+preflight / native TerminalRejectionはError::Limitで終端し、fallbackしない。
+本体とRemoteは共通generatorを使い、不採用候補の次候補/最終NoArtは従来の契約を維持する。
+40MP progressive 4:4:4拒否はgateで割当0。native割当自体をRust GlobalAllocで測れたとは扱わない。
+実byte decode、強制fallback、native terminal、EXIF向き、取消保存禁止はlib regressionで確認する。
+
+### 20.3 P2: idle高画質化のAudio dispatch
+
+通常priority/keep投入はtyped AudioThumbnailを作るが、idle投入だけが通常Originalのままだった。
+共通Audio source constructorへ通常投入とidleを集約し、sidecar・admission・source policyを一つに持つ。
+既存SourceOnly高画質化、gen/epoch/input sequenceを維持する。
+正のcatalog cacheを再訪したUpgradeableCache→SourceOnly→SourceGeneratedの収束と、
+sidecar画像の64→256px拡大・旧世代結果拒否をhandler/workerで回帰検証する。
+cache再訪の有効redでは、実idle handlerがAudioThumbnail dispatchを失うassertionで失敗した。
+
+### 20.4 P2: Remote decode取消を終端Failedへ保存しない
+
+`image.decode()`中にDOM破棄でsrcが除去されるとEncodingErrorが発生する。
+catchはbinding/current request/controller abortを検査してからFailedを一覧ownerへ保存する。
+decode中のeviction、binding再利用、controller取消を非終端にし、現bindingの真の生成障害はFailedを保持。
+HTTP NoArtのDOM外所有・明示refreshまでの終端保持は維持する。Nodeで3件の有効redを確認した。
+
+### 20.5 P2: 一般catalog workerの受付証明
+
+`CatalogDb::open`がその場で新epochを取るため、旧details workerの未訪問parentへのcold openが
+削除後DBを再作成できた。`CatalogWork`はcache-dirと受付時admissionを一つに持ち、
+spawn/prepare前にcapture、以後のmutable openは必ずその証明を使う。
+detailsの寸法/メディア/container catalog、batch cache、smart準備、EPUBメタ、Remoteの
+原本/PDF count段階のlate openへ接続する。既存handleはretirement/leaseで閉じる。
+Remote thumbnailはThumbnailEngineが既に受け付けた証明をContainerEngineへ渡し、
+全load-kindに同じ証明を保持する。pageはresolve/settings/RAW pin待ちより前、
+listingはenumerationより前にcaptureし、partner AutoTrim・PDF countにもその証明を渡す。
+削除をまたいだZIP/PDF thumbnailとRAW pin後のpageは原本表示を続けてもDBを再作成しない。
+folder-selectionの既存DB検査は削除lease内にあり、missing DBを作らないため変更不要。
+UIの既存通常一覧openはworkerの遅延openとは別で、この修正で新I/OをUIへ追加しない。
+All/期限削除後の旧worker拒否、新worker許可、DisplayOnly継続、実detailsの未訪問parentを回帰対象にする。
+有効red: first catalogを全削除後、同じdetails ownerがunvisited parentのDBを作成した (0成功/1失敗)。
+
+### 20.6 P2: SourceOnlyのRemote full-pageはcatalog不要
+
+旧ZIP/PDF container loaderはSourceOnlyにもmutable catalog openを必須にしていた。
+catalogをOptionとし、SourceOnlyはopenせず原本decode・編集/composite・表示を継続、永続化はしない。
+Deleting中の実ZIP/PDF full-pageを回帰対象とし、原本表示成功・DB作成0を確認する。
+有効red: Deleting中の実ZIP full-pageが原本decode前にInternalへ落ちた (0成功/1失敗)。
+
+### 20.7 P2: HTTPでも消失sidecarを共通resolverへ渡す
+
+HTTPでsource hintのNotFoundを404としていたため、coreの埋め込みfallbackへ届かなかった。
+構文・network/subresource検査を維持し、本当にNotFoundのFile hintだけをIPCへ渡す。
+canonical parent/stem/画像拡張子の権威は既存core resolverに保ち、endpointで再探索しない。
+その他I/Oエラー・非file・不正hintは拒否。FLACはNoArt、MP3は埋め込み画像へfallbackする。
+有効red: 必須wを含む正常handler要求がIPC admissionへ届かず404 (期待503、0成功/1失敗)。
+消失時の異なるparent/stem/extension/subresourceもcoreで拒否する回帰を追加した。
+
+### 20.8 P2: 任意入力targetと小さいLimitsを注入するgate
+
+`audio_album_art/fuzz.rs`にheader/frame targetとcapped APIC inflate targetを置き、
+製品と同じparserのrequest-local Limitsを縮小して使う (tag最大2057bytes、picture最大511bytes、候補0..16)。
+productionは従来32MiB/16MiB/16候補の定数を使い、注入値はその上限を増やせない。
+入力は完全な任意byte列に加えv2.2/3/4/PIC/APIC/圧縮/複数候補seedを使い、
+無変更・複数byte置換・切詰め・挿入・削除で探索する。prefix/inflateは4096回のcheck上限も持つ。
+JPEG/PNG metadata/preflightにも任意入力と小さいcodec budgetを注入する第三targetを置いた。
+
+利用可能toolchainはstable-x86_64-pc-windows-msvcのみ。`cargo fuzz --help`はcommand不在、
+`rustc -Z help`はnightly専用として拒否された。sanitizer/libFuzzer実行は**未実施**であり成功と記載しない。
+利用者指示に従い、このtoolchainではdeterministic randomized corpusを必須gateとする。
+固定seed `1347ca57742a1d3b`、header/frame50万 + inflate50万 + metadata20万 = **120万入力**。
+最大要求43,296bytes、peak43,698 / 43,475 / 0bytes。panic/OOB/overflow/過大割当/無進捗loopを検出せず。
+全58テストがexit0。正常な8000×5000 progressive 4:4:4 JPEG (Pillow 11.0.0生成、469,711bytes)もdecoder前に割当0で拒否し、fixture SHAを記録した。既存の実32/16MiB境界・24MiB bomb・取消・10秒期限のfixtureも保持する。
+source/lock SHA、allocator記録、toolchain/probe、iteration/seedは`target/audio-art-rust-gate/results.json`。
+これは将来のsanitizer/長時間fuzzの代替証拠ではなく、今回指定されたstable MSVC gateの実施証拠である。
+
+### 状態の簡素化と再検証
+
+EXIF全体/再帰、native/fallback別metadata owner、別Audio queue、取消をFailedへ保存するstate、
+SourceOnly専用DB/retryを作らない。共通source constructor、単一受付証明、optional persistenceへ集約した。
+一覧操作をmodalにするとスクロールを止めるため採用せず、既存取消/binding/世代境界で収束させる。
+未決の利用者質問なし。独立実装レビュー再受入と実機確認はcoordinatorへ引き継ぐ。
+
+2026-10-08 再検証 (すべて実際の終了コードを確認、製品binary未起動・commitなし):
+
+| 検証 | 結果 |
+| --- | --- |
+| `python scripts/audio-art-rust-gate/run.py` | 58成功 / 失敗0、任意入力120万件。source/lock SHA一致、exit0 |
+| `cargo test -p mimageviewer --lib audio_` | 364成功 / 失敗0 / 既存ignore2、exit0 |
+| Remote container / details metadata / catalog 集中検証 | 129 / 25 / 87成功、失敗0 / ignore0、各exit0 |
+| idle-upgrade 集中検証 | 7成功、cache再訪・拡大・旧世代拒否。上記audio群と重複する |
+| `cargo test -p mimageviewer --lib` (pipeなし、`RUST_TEST_THREADS=8`) | 11,068成功 / 失敗0 / 既存ignore52、1,068.86秒、exit0 |
+| `cargo test -p mimageviewer-remote` | 137成功 / 失敗0 / 既存ignore1、exit0 |
+| `cargo test -p mimageviewer-ipc --lib` | 65成功 / 失敗0 / ignore0、exit0 |
+| Nodeの全11 `*.test.mjs` を各 `node <file>` で実行 | 518成功 / 失敗0 / skip0、各exit0 |
+| `cargo test -p mimageviewer --test ui_snapshot` | 105成功 / 失敗0 / ignore0、exit0。既存画像と一致 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` / `--features portable` | 両方exit0 |
+| `cargo fmt` / `cargo fmt --check` / glyph lint / `git diff --check` | すべてexit0、危険glyph0、変更ファイルCRLF維持 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit0。通常core / Remote service / EPUB worker作成、runtime4・PE3検査成功。portable featureなし・未起動 |
+
+Rust buildは `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1` で実行した。
+Nodeのtest runner subprocessはこのsandboxでEPERM、`--test-isolation=none`は利用版で未対応のため、
+各 `node:test` fileの直接実行で同じ全11fileを検証した。sanitizer未実施は§20.8のとおり。
+full libの通常fixtureの60秒通知は失敗とせず、最後の成功集計・exit0まで待った。
+検証結果JSON: `target/audio-review-validation.json`、完全ログ: `target/audio-review-*.log`。
+Remote/Web/Nodeは `target/remote-fix-validation.json`、gateは§20.8の結果を参照する。
+
+利用者確認では、埋め込み表紙のcache再訪・cell拡大後のidle高画質化、Remoteのdecode中scrollと再訪、
+一覧取得後にsidecarを消したMP3の埋め込みfallback、cache全件/期限削除をまたぐZIP/PDF原本表示を確認する。
+通常の検証binaryは `%APPDATA%\mimageviewer` の実設定/データを更新し得る。
+起動前にinstalled/tray-resident mIVを閉じる (single-instance mutex共通)。
+利用者の起動コマンド: `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。

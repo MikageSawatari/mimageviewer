@@ -246,7 +246,7 @@ impl ThumbnailEngine {
         if !matches!(request.address.subresource, RemoteSubresource::File)
             || is_container_path(Path::new(&request.address.path))
         {
-            return container_engine.thumbnail(request, context);
+            return container_engine.thumbnail_admitted(request, context, admission);
         }
         let resolved = match resolve_existing(&request.address.path) {
             Ok(path) => path,
@@ -1501,6 +1501,78 @@ mod tests {
     }
 
     #[test]
+    fn missing_audio_sidecar_falls_back_to_embedded_mp3_and_flac_no_art() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(12, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut picture = b"\0image/png\0\x03\0".to_vec();
+        picture.extend(png.into_inner());
+        let mut tag = b"APIC".to_vec();
+        tag.extend((picture.len() as u32).to_be_bytes());
+        tag.extend([0, 0]);
+        tag.extend(picture);
+        let size = tag.len() as u32;
+        let mut bytes = b"ID3\x03\0\0".to_vec();
+        bytes.extend([
+            (size >> 21) as u8 & 127,
+            (size >> 14) as u8 & 127,
+            (size >> 7) as u8 & 127,
+            size as u8 & 127,
+        ]);
+        bytes.extend(tag);
+        let settings = crate::settings::Settings::default();
+        let engine = ThumbnailEngine::new(settings.clone());
+        let context = WorkerContext::without_databases();
+        let (cancel, _wake) = super::super::session::RemoteOperationCancellation::for_test();
+        let raw_executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let admission =
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit();
+        for extension in ["mp3", "flac"] {
+            let audio = temp.path().join(format!("song.{extension}"));
+            std::fs::write(
+                &audio,
+                if extension == "mp3" {
+                    bytes.as_slice()
+                } else {
+                    b"audio"
+                },
+            )
+            .unwrap();
+            let sidecar = temp.path().join("song.png");
+            std::fs::write(&sidecar, b"previously discovered sidecar").unwrap();
+            std::fs::remove_file(&sidecar).unwrap();
+            let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+            let hint = RemoteAddress::file(sidecar.to_string_lossy().into_owned());
+            let result = engine.generate_audio_resolved(
+                &resolved,
+                Some(&hint),
+                64,
+                &context,
+                &settings,
+                admission,
+                &raw_executor,
+                &cancel,
+            );
+            if extension == "mp3" {
+                let image = image::load_from_memory(&result.unwrap()).unwrap();
+                assert_eq!((image.width(), image.height()), (12, 8));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ThumbnailResponse::Error(ThumbnailError {
+                        code: ThumbnailErrorCode::NoThumbnail,
+                        ..
+                    }))
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn audio_sidecar_rejects_other_stem_without_hiding_path_violation() {
         let temp = tempfile::tempdir().unwrap();
         let audio = temp.path().join("song.mp3");
@@ -1516,6 +1588,42 @@ mod tests {
             result,
             Err(ThumbnailResponse::Error(ThumbnailError {
                 code: ThumbnailErrorCode::PathRejected,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn missing_audio_sidecar_still_rejects_wrong_parent_stem_extension_and_subresource() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.mp3");
+        std::fs::write(&audio, b"audio").unwrap();
+        let other_parent = temp.path().join("other");
+        std::fs::create_dir(&other_parent).unwrap();
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+        for hint in [
+            RemoteAddress::file(other_parent.join("song.jpg").to_string_lossy().into_owned()),
+            RemoteAddress::file(temp.path().join("other.jpg").to_string_lossy().into_owned()),
+            RemoteAddress::file(temp.path().join("song.txt").to_string_lossy().into_owned()),
+        ] {
+            assert!(!Path::new(&hint.path).exists());
+            assert!(matches!(
+                engine.resolve_media_sidecar(&resolved, &hint, &engine.settings),
+                Err(ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::PathRejected,
+                    ..
+                }))
+            ));
+        }
+        let hint = RemoteAddress {
+            path: temp.path().join("song.jpg").to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        assert!(matches!(
+            engine.resolve_media_sidecar(&resolved, &hint, &engine.settings),
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::BadRequest,
                 ..
             }))
         ));

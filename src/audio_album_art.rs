@@ -8,6 +8,21 @@ pub const PICTURE_LIMIT: usize = 16 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 const MAX_PICTURES: usize = 16;
 
+/// Request-local bounds; tests/fuzz can only reduce the production envelope.
+#[derive(Clone, Copy)]
+pub(crate) struct Limits {
+    pub tag_bytes: usize,
+    pub picture_bytes: usize,
+    pub picture_count: usize,
+}
+impl Limits {
+    pub const PRODUCTION: Self = Self {
+        tag_bytes: TAG_LIMIT,
+        picture_bytes: PICTURE_LIMIT,
+        picture_count: MAX_PICTURES,
+    };
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -79,7 +94,23 @@ pub fn extract<T>(
     check: &mut impl FnMut() -> Result<(), Error>,
     accept: &mut impl FnMut(&[u8]) -> Result<Option<T>, Error>,
 ) -> Result<Option<T>, Error> {
+    extract_with_limits(reader, file_size, check, accept, Limits::PRODUCTION)
+}
+
+pub(crate) fn extract_with_limits<T>(
+    reader: &mut impl Read,
+    file_size: u64,
+    check: &mut impl FnMut() -> Result<(), Error>,
+    accept: &mut impl FnMut(&[u8]) -> Result<Option<T>, Error>,
+    limits: Limits,
+) -> Result<Option<T>, Error> {
     check()?;
+    if limits.tag_bytes > TAG_LIMIT
+        || limits.picture_bytes > PICTURE_LIMIT
+        || limits.picture_count > MAX_PICTURES
+    {
+        return Err(Error::Limit);
+    }
     let mut header = [0; 10];
     if file_size < 3 {
         return Ok(None);
@@ -109,7 +140,7 @@ pub fn extract<T>(
     let physical = size
         .checked_add(10 + if footer { 10 } else { 0 })
         .ok_or(Error::Limit)?;
-    if physical > TAG_LIMIT {
+    if physical > limits.tag_bytes {
         return Err(Error::Limit);
     }
     if physical as u64 > file_size {
@@ -219,7 +250,7 @@ pub fn extract<T>(
         let frame_end = range_end(start, len, end)?;
         if art {
             count += 1;
-            if count > MAX_PICTURES {
+            if count > limits.picture_count {
                 return Err(Error::Limit);
             }
             let flags = if version == 2 {
@@ -260,7 +291,7 @@ pub fn extract<T>(
                     }
                     Ok(())
                 })();
-                if fields.is_ok() && declared.is_none_or(|n| n <= TAG_LIMIT) {
+                if fields.is_ok() && declared.is_none_or(|n| n <= limits.tag_bytes) {
                     frames[stored] = Frame {
                         start: body,
                         end: logical_end,
@@ -276,7 +307,7 @@ pub fn extract<T>(
     }
     let mut kinds = [None; MAX_PICTURES];
     for (idx, frame) in frames[..stored].iter().enumerate() {
-        match inspect(&raw[frame.start..frame.end], *frame, check) {
+        match inspect(&raw[frame.start..frame.end], *frame, check, limits) {
             Ok(info) => kinds[idx] = Some(info.0),
             Err(Error::Malformed | Error::Limit) => {}
             Err(e) => return Err(e),
@@ -288,7 +319,7 @@ pub fn extract<T>(
                 continue;
             }
             check()?;
-            match picture(&raw[frame.start..frame.end], *frame, check, accept) {
+            match picture(&raw[frame.start..frame.end], *frame, check, accept, limits) {
                 Ok(Some(value)) => {
                     check()?;
                     return Ok(Some(value));
@@ -396,8 +427,8 @@ struct Inflater<'a> {
     done: bool,
 }
 impl<'a> Inflater<'a> {
-    fn new(input: &'a [u8], declared: usize) -> Result<Self, Error> {
-        if declared > TAG_LIMIT {
+    fn new(input: &'a [u8], declared: usize, limits: Limits) -> Result<Self, Error> {
+        if declared > limits.tag_bytes {
             return Err(Error::Limit);
         }
         Ok(Self {
@@ -453,10 +484,11 @@ fn inspect(
     input: &[u8],
     frame: Frame,
     check: &mut impl FnMut() -> Result<(), Error>,
+    limits: Limits,
 ) -> Result<(u8, usize), Error> {
     let mut prefix = Prefix::new(frame.version);
     if frame.compressed {
-        let mut stream = Inflater::new(input, frame.declared.ok_or(Error::Malformed)?)?;
+        let mut stream = Inflater::new(input, frame.declared.ok_or(Error::Malformed)?, limits)?;
         let mut scratch = [0; CHUNK];
         loop {
             let n = stream.read(&mut scratch, check)?;
@@ -467,7 +499,7 @@ fn inspect(
                         .unwrap()
                         .checked_sub(prefix.length)
                         .ok_or(Error::Malformed)?;
-                    if len > PICTURE_LIMIT {
+                    if len > limits.picture_bytes {
                         return Err(Error::Limit);
                     }
                     return Ok((prefix.kind, prefix.length));
@@ -486,7 +518,7 @@ fn inspect(
                 check()?;
             }
             if prefix.feed(*b)? {
-                if input.len() - prefix.length > PICTURE_LIMIT {
+                if input.len() - prefix.length > limits.picture_bytes {
                     return Err(Error::Limit);
                 }
                 return Ok((prefix.kind, prefix.length));
@@ -501,13 +533,14 @@ fn picture<T>(
     frame: Frame,
     check: &mut impl FnMut() -> Result<(), Error>,
     accept: &mut impl FnMut(&[u8]) -> Result<Option<T>, Error>,
+    limits: Limits,
 ) -> Result<Option<T>, Error> {
     if !frame.compressed {
-        let (_, prefix_len) = inspect(input, frame, check)?;
+        let (_, prefix_len) = inspect(input, frame, check, limits)?;
         return accept(&input[prefix_len..]);
     }
     let mut prefix = Prefix::new(frame.version);
-    let mut stream = Inflater::new(input, frame.declared.ok_or(Error::Malformed)?)?;
+    let mut stream = Inflater::new(input, frame.declared.ok_or(Error::Malformed)?, limits)?;
     let mut scratch = [0; CHUNK];
     let mut pixels = None;
     let mut written = 0;
@@ -523,7 +556,7 @@ fn picture<T>(
                         .declared
                         .checked_sub(prefix.length)
                         .ok_or(Error::Malformed)?;
-                    if len > PICTURE_LIMIT {
+                    if len > limits.picture_bytes {
                         return Err(Error::Limit);
                     }
                     let mut image = Vec::new();
@@ -553,3 +586,7 @@ fn picture<T>(
 #[cfg(test)]
 #[path = "audio_album_art/tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "audio_album_art/fuzz.rs"]
+pub(crate) mod fuzz;

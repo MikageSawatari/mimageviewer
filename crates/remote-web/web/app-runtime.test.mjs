@@ -5599,3 +5599,84 @@ test("intentional audio binding abort does not publish NoArt or Failed", async (
     assert.equal(audioArtRuntimeForTest().owner.terminal(entry),undefined);
   } finally {globalThis.fetch = oldFetch;}
 });
+
+for (const cancellation of ["eviction", "recycled binding", "aborted controller"]) {
+  test(`audio decode ${cancellation} does not persist a terminal failure`, async () => {
+    const entry = {kind:"audio",name:"decoding.mp3",path:testPath("Music/decoding.mp3")};
+    const replacement = {kind:"audio",name:"next.mp3",path:testPath("Music/next.mp3")};
+    const oldFetch = globalThis.fetch;
+    const pending = deferred();
+    const decodeStarted = deferred();
+    let requests = 0;
+    let decodes = 0;
+    globalThis.fetch = async () => {
+      requests += 1;
+      return new Response(new Uint8Array([1,2,3]),{status:200});
+    };
+    FakeElement.decodeHook = () => {
+      if (++decodes !== 1) return Promise.resolve();
+      decodeStarted.resolve();
+      return pending.promise;
+    };
+    const errors = [];
+    setRuntimeTestErrorObserver((error) => errors.push(error));
+    try {
+      applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},
+        {entries:[entry,replacement],page_groups:[]},false);
+      const owner = audioArtRuntimeForTest().owner;
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await decodeStarted.promise;
+      if (cancellation === "recycled binding") {
+        bindThumbnail(image,replacement,null,180);
+      } else {
+        image._thumbnailController.abort();
+        if (cancellation === "eviction") {
+          image._thumbnailGeneration += 1;
+          image.removeAttribute("src");
+        }
+      }
+      pending.reject(new DOMException("source removed while decoding","EncodingError"));
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(owner.terminal(entry),undefined);
+      assert.equal(owner.terminal(replacement),undefined);
+      assert.equal(errors.length,0,"intentional cancellation is not a decode failure");
+      if (cancellation === "recycled binding") {
+        assert.equal(image.classList.contains("thumb-ready"),true);
+        assert.equal(image.classList.contains("thumb-missing"),false);
+      } else {
+        assert.equal(image._thumbnailSettled,false,"canceled binding remains eligible for revisit");
+      }
+      const revisit = new FakeElement("img");
+      bindThumbnail(revisit,entry,null,240);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(revisit.classList.contains("thumb-ready"),true);
+      assert.equal(requests,cancellation === "recycled binding" ? 3 : 2);
+    } finally {
+      FakeElement.decodeHook = null;
+      setRuntimeTestErrorObserver(null);
+      globalThis.fetch = oldFetch;
+    }
+  });
+}
+
+test("current audio decode failure remains terminal for its listing", async () => {
+  const entry = {kind:"audio",name:"corrupt.mp3",path:testPath("Music/corrupt.mp3")};
+  const oldFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {requests += 1; return new Response(new Uint8Array([1]),{status:200});};
+  FakeElement.decodeHook = async () => {throw new DOMException("corrupt image","EncodingError");};
+  try {
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(audioArtRuntimeForTest().owner.terminal(entry),"Failed");
+    assert.equal(image._thumbnailSettled,true);
+    bindThumbnail(new FakeElement("img"),entry,null,180);
+    assert.equal(requests,1);
+  } finally {
+    FakeElement.decodeHook = null;
+    globalThis.fetch = oldFetch;
+  }
+});

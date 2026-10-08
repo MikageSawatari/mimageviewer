@@ -262,6 +262,38 @@ struct CatalogAccessInner {
     audio_art_notice: AudioArtCacheNotice,
 }
 
+/// Captured before handing a general catalog job to a worker. A job may
+/// display source pixels after maintenance, but must never adopt a newer epoch
+/// in order to recreate or populate catalogs deleted since its acceptance.
+#[derive(Clone)]
+pub(crate) struct CatalogWork {
+    cache_dir: PathBuf,
+    admission: CatalogAdmission,
+}
+
+impl CatalogWork {
+    pub(crate) fn capture(cache_dir: &Path) -> Self {
+        Self::with_admission(cache_dir, CatalogAccess::for_cache_dir(cache_dir).admit())
+    }
+
+    pub(crate) fn with_admission(cache_dir: &Path, admission: CatalogAdmission) -> Self {
+        Self {
+            cache_dir: cache_dir.to_path_buf(),
+            admission,
+        }
+    }
+
+    pub(crate) fn open(&self, folder: &Path) -> rusqlite::Result<CatalogDb> {
+        CatalogDb::open_admitted(&self.cache_dir, folder, self.admission)
+    }
+}
+
+impl Default for CatalogWork {
+    fn default() -> Self {
+        Self::capture(&default_cache_dir())
+    }
+}
+
 pub struct CatalogAccess {
     inner: Mutex<CatalogAccessInner>,
     changed: std::sync::Condvar,
@@ -3276,6 +3308,33 @@ mod tests {
             db.load_one("original.jpg").unwrap().unwrap().jpeg_data,
             b"released"
         );
+    }
+
+    #[test]
+    fn general_catalog_work_retains_admission_for_unvisited_folders() {
+        for expiry in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let work = CatalogWork::capture(temp.path());
+            let first = temp.path().join("first");
+            drop(work.open(&first).unwrap());
+            if expiry {
+                assert_eq!(delete_old_cache(temp.path(), 0), 1);
+            } else {
+                assert_eq!(delete_all_cache(temp.path()), 1);
+            }
+            let unvisited = temp.path().join("later");
+            assert!(work.open(&unvisited).is_err());
+            assert!(!db_path_for(temp.path(), &unvisited).exists());
+            let access = CatalogAccess::for_cache_dir(temp.path());
+            let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+            let during = CatalogWork::capture(temp.path());
+            deletion.retire_connections();
+            drop(deletion);
+            assert!(during.open(&unvisited).is_err());
+            assert!(!db_path_for(temp.path(), &unvisited).exists());
+            drop(CatalogWork::capture(temp.path()).open(&unvisited).unwrap());
+            assert!(db_path_for(temp.path(), &unvisited).exists());
+        }
     }
 
     #[test]

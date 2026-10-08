@@ -9098,7 +9098,7 @@ function clearThumbnailServiceNotice() {
 async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
   const bindingKey = thumbnailBindingKey(entry);
   const audioOwner = entry.kind === "audio" ? state.audioArtListState : null;
-  const responseIsCurrent = () => thumbnailResponseIsCurrent(image, generation, bindingKey) &&
+  const responseIsCurrent = () => !signal.aborted && thumbnailResponseIsCurrent(image, generation, bindingKey) &&
     (entry.kind !== "audio" || audioArtOwnerIsCurrent(audioOwner));
   const url = apiUrl(
     "/api/thumb",
@@ -9159,9 +9159,10 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     clearThumbnailServiceNotice();
     tracker?.settled(bindingKey);
   } catch (error) {
-    if (error?.name === "AbortError") return;
+    // Removing src while image.decode() is pending rejects with EncodingError,
+    // not AbortError. Only the still-current binding owns a terminal failure.
+    if (error?.name === "AbortError" || !responseIsCurrent()) return;
     rememberAudioArtTerminal(audioOwner, entry, "Failed");
-    if (!responseIsCurrent()) return;
     image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
     image.classList.toggle("thumb-retry-exhausted", Boolean(error?.retryExhausted));

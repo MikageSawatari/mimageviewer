@@ -490,7 +490,7 @@ fn remote_page_cache_decision(
 fn decode_remote_source(
     mut request: crate::thumb_loader::LoadRequest,
     cache_map: Arc<RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
-    catalog: Arc<crate::catalog::CatalogDb>,
+    catalog: Option<Arc<crate::catalog::CatalogDb>>,
     thumb_px: u32,
     thumb_quality: u8,
     target_px: u32,
@@ -523,7 +523,7 @@ fn decode_remote_source(
             request.cache_key_override.as_deref(),
             request.idx,
             &tx,
-            Some(&catalog),
+            catalog.as_deref(),
             Some(&cache_map),
             request.mtime,
             request.file_size,
@@ -553,7 +553,7 @@ fn decode_remote_source(
             &mut request,
             &cache_map,
             &tx,
-            Some(&catalog),
+            catalog.as_ref(),
             thumb_px,
             thumb_quality,
             target_px,
@@ -2012,30 +2012,43 @@ struct LoadedImage {
     identity: RemoteAddress,
 }
 
+fn current_catalog_admission() -> crate::catalog::CatalogAdmission {
+    crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir()).admit()
+}
+
 #[derive(Clone, Copy)]
 enum RemoteImageLoadKind {
-    Thumbnail,
-    CompositedPage,
-    CompositedPageWithAutoTrim,
-    AutoTrimReference,
+    Thumbnail(crate::catalog::CatalogAdmission),
+    CompositedPage(crate::catalog::CatalogAdmission),
+    CompositedPageWithAutoTrim(crate::catalog::CatalogAdmission),
+    AutoTrimReference(crate::catalog::CatalogAdmission),
 }
 
 impl RemoteImageLoadKind {
+    fn admission(self) -> crate::catalog::CatalogAdmission {
+        match self {
+            Self::Thumbnail(admission)
+            | Self::CompositedPage(admission)
+            | Self::CompositedPageWithAutoTrim(admission)
+            | Self::AutoTrimReference(admission) => admission,
+        }
+    }
+
     fn full_page(self) -> bool {
-        !matches!(self, Self::Thumbnail)
+        !matches!(self, Self::Thumbnail(..))
     }
 
     fn composes_page(self) -> bool {
         matches!(
             self,
-            Self::CompositedPage | Self::CompositedPageWithAutoTrim
+            Self::CompositedPage(..) | Self::CompositedPageWithAutoTrim(..)
         )
     }
 
     fn detects_auto_trim(self) -> bool {
         matches!(
             self,
-            Self::CompositedPageWithAutoTrim | Self::AutoTrimReference
+            Self::CompositedPageWithAutoTrim(..) | Self::AutoTrimReference(..)
         )
     }
 }
@@ -2938,13 +2951,14 @@ impl ContainerEngine {
     }
 
     pub(super) fn container(&self, request: ContainerRequest) -> ContainerResponse {
+        let catalog_admission = current_catalog_admission();
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
         let resolved = match self.resolve(&request.address) {
             Ok(resolved) => resolved,
             Err(error) => return ContainerResponse::Error(error),
         };
-        let response = match self.enumerate(&request, &resolved) {
+        let response = match self.enumerate(&request, &resolved, catalog_admission) {
             Ok(payload) => ContainerResponse::Success(payload),
             Err(error) => ContainerResponse::Error(error),
         };
@@ -3980,10 +3994,20 @@ impl ContainerEngine {
         validated_context(page_number as usize, page_count as usize, true, true, true)
     }
 
+    #[cfg(test)]
     pub(super) fn thumbnail(
         &self,
         request: &mimageviewer_ipc::ThumbnailRequest,
         context: &WorkerContext,
+    ) -> ThumbnailResponse {
+        self.thumbnail_admitted(request, context, current_catalog_admission())
+    }
+
+    pub(super) fn thumbnail_admitted(
+        &self,
+        request: &mimageviewer_ipc::ThumbnailRequest,
+        context: &WorkerContext,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> ThumbnailResponse {
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
@@ -4010,7 +4034,7 @@ impl ContainerEngine {
             &request.address,
             &resolved,
             request.target_px,
-            RemoteImageLoadKind::Thumbnail,
+            RemoteImageLoadKind::Thumbnail(catalog_admission),
             rotation,
             false,
             context,
@@ -4103,6 +4127,7 @@ impl ContainerEngine {
         effective_priority: &dyn Fn() -> PagePriority,
         after_raw_pins: impl FnOnce(),
     ) -> PageResponse {
+        let catalog_admission = current_catalog_admission();
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
         let mut priority;
@@ -4143,9 +4168,9 @@ impl ContainerEngine {
             Err(error) => return PageResponse::Error(error),
         };
         let load_kind = if view_trim_plan.requires_auto_detection() {
-            RemoteImageLoadKind::CompositedPageWithAutoTrim
+            RemoteImageLoadKind::CompositedPageWithAutoTrim(catalog_admission)
         } else {
-            RemoteImageLoadKind::CompositedPage
+            RemoteImageLoadKind::CompositedPage(catalog_admission)
         };
         let raw_settings = if remote_address_may_contain_raw(&request.address, &resolved)
             || view_trim_plan.spread_partner().is_some()
@@ -4305,6 +4330,7 @@ impl ContainerEngine {
                     &partner_cancel,
                     None,
                     raw_pins.as_ref(),
+                    catalog_admission,
                 )
             },
             || {
@@ -4704,6 +4730,7 @@ impl ContainerEngine {
             &AtomicBool,
         ) -> Option<super::session::RemoteAiResources>,
     ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
+        let catalog_admission = current_catalog_admission();
         let operation_settings = self
             .adjustment_render_settings()
             .map_err(RemoteCompositePrepareError::into_ai_error)?;
@@ -5010,6 +5037,7 @@ impl ContainerEngine {
                     cancel,
                     None,
                     Some(&raw_pins),
+                    catalog_admission,
                 )
                 .map_err(remote_ai_media_error)?
             } else {
@@ -5025,6 +5053,7 @@ impl ContainerEngine {
                     cancel,
                     None,
                     Some(&raw_pins),
+                    catalog_admission,
                 )
                 .map_err(remote_ai_media_error)?;
             let (bytes, width, height) =
@@ -5228,6 +5257,7 @@ impl ContainerEngine {
         &self,
         request: &ContainerRequest,
         resolved: &ResolvedPath,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<ContainerPayload, MediaError> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| media_error(MediaErrorCode::NotFound, "コンテナが見つかりません"))?;
@@ -5243,7 +5273,7 @@ impl ContainerEngine {
         if is_archive_container(resolved) {
             self.enumerate_zip(request, resolved)
         } else if crate::folder_tree::is_paged_document_path(&resolved.logical) {
-            self.enumerate_pdf(request, resolved, &metadata)
+            self.enumerate_pdf(request, resolved, &metadata, catalog_admission)
         } else {
             Err(media_error(
                 MediaErrorCode::Unsupported,
@@ -5579,6 +5609,7 @@ impl ContainerEngine {
         request: &ContainerRequest,
         resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<ContainerPayload, MediaError> {
         let address = page_identity_from_resolved(resolved, &request.address.subresource);
         if !matches!(address.subresource, RemoteSubresource::File) {
@@ -5589,7 +5620,14 @@ impl ContainerEngine {
         }
         let read =
             crate::pdf_loader::resolve_read_target(&resolved.logical).map_err(pdf_read_error)?;
-        let page_count = self.pdf_page_count_with_read(resolved, metadata, &read, None, None)?;
+        let page_count = self.pdf_page_count_with_read_admitted(
+            resolved,
+            metadata,
+            &read,
+            None,
+            None,
+            catalog_admission,
+        )?;
         let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut items = Vec::new();
         let mut entries = Vec::new();
@@ -6094,6 +6132,7 @@ impl ContainerEngine {
             cancel,
             None,
             None,
+            current_catalog_admission(),
         )
     }
 
@@ -6108,6 +6147,7 @@ impl ContainerEngine {
         cancel: &Arc<AtomicBool>,
         mut wait_stage: Option<&mut RemotePageStageGuard>,
         raw_pins: Option<&RawDepPins>,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<Option<egui::Rect>, MediaError> {
         let partner = match plan {
             RemoteViewTrimPlan::AutoSpread { partner, .. } => {
@@ -6123,6 +6163,7 @@ impl ContainerEngine {
                     cancel,
                     wait_stage.as_deref_mut(),
                     raw_pins,
+                    catalog_admission,
                 )?;
                 RemotePartnerResult::Resolved(partner_auto_trim_bbox)
             }
@@ -6147,7 +6188,15 @@ impl ContainerEngine {
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<egui::Rect>, MediaError> {
         self.remote_auto_trim_bbox_timed(
-            address, resolved, target_px, foreground, context, cancel, None, None,
+            address,
+            resolved,
+            target_px,
+            foreground,
+            context,
+            cancel,
+            None,
+            None,
+            current_catalog_admission(),
         )
     }
 
@@ -6226,6 +6275,7 @@ impl ContainerEngine {
         cancel: &Arc<AtomicBool>,
         mut wait_stage: Option<&mut RemotePageStageGuard>,
         raw_pins: Option<&RawDepPins>,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<Option<egui::Rect>, MediaError> {
         if let Some(bbox) = self.remote_auto_trim_bbox_cache_lookup_timed(
             address,
@@ -6242,7 +6292,7 @@ impl ContainerEngine {
             address,
             resolved,
             target_px,
-            RemoteImageLoadKind::AutoTrimReference,
+            RemoteImageLoadKind::AutoTrimReference(catalog_admission),
             crate::rotation_db::Rotation::None,
             foreground,
             context,
@@ -6569,6 +6619,10 @@ impl ContainerEngine {
         mut ambient_wait_stage: Option<&mut RemotePageStageGuard>,
         raw_pins: Option<&RawDepPins>,
     ) -> Result<LoadedImage, MediaError> {
+        let catalog_work = crate::catalog::CatalogWork::with_admission(
+            &crate::catalog::default_cache_dir(),
+            load_kind.admission(),
+        );
         let full_page = load_kind.full_page();
         let compose_full_page = load_kind.composes_page();
         let detect_auto_trim = load_kind.detects_auto_trim();
@@ -6665,6 +6719,7 @@ impl ContainerEngine {
                     0,
                     page_timing.as_mut().map(|timing| &mut timing.resolve),
                     ambient_wait_stage.as_deref_mut(),
+                    load_kind.admission(),
                 )?;
                 request.pdf_page = Some(0);
                 request.pdf_password = self.real_pdf_password(&resolved.logical);
@@ -6698,6 +6753,7 @@ impl ContainerEngine {
                     *page_number,
                     page_timing.as_mut().map(|timing| &mut timing.resolve),
                     ambient_wait_stage.as_deref_mut(),
+                    load_kind.admission(),
                 )?;
                 request.pdf_page = Some(*page_number);
                 request.pdf_password = self.real_pdf_password(&resolved.logical);
@@ -6843,21 +6899,37 @@ impl ContainerEngine {
             cached_composite_pixels = Some(pixels);
         }
 
-        let catalog = Arc::new(
-            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), catalog_folder)
-                .map_err(|error| {
-                crate::logger::log(format!(
-                    "remote_ipc: container catalog open failed: {error}"
-                ));
-                media_error(
-                    MediaErrorCode::Internal,
-                    "サムネイルカタログを開けませんでした",
-                )
-            })?,
-        );
+        // SourceOnly is a display request and has no persistent thumbnail phase.
+        // During deletion it must still decode ZIP/PDF source pixels, without
+        // opening (or recreating) a catalog merely to satisfy the loader API.
+        let catalog = if request.source_policy.bypasses_cache() {
+            None
+        } else {
+            match catalog_work.open(catalog_folder) {
+                Ok(catalog) => Some(Arc::new(catalog)),
+                Err(_)
+                    if !crate::catalog::CatalogAccess::for_cache_dir(
+                        &crate::catalog::default_cache_dir(),
+                    )
+                    .is_admitted(load_kind.admission()) =>
+                {
+                    None
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: container catalog open failed: {error}"
+                    ));
+                    return Err(media_error(
+                        MediaErrorCode::Internal,
+                        "サムネイルカタログを開けませんでした",
+                    ));
+                }
+            }
+        };
         let cache_map = Arc::new(RwLock::new(HashMap::new()));
         if !full_page
             && let Some(key) = crate::thumb_loader::cache_key_for_request(&request)
+            && let Some(catalog) = catalog.as_ref()
             && let Ok(Some(entry)) = catalog.load_one(key.as_ref())
             && let Ok(mut map) = cache_map.write()
         {
@@ -7217,10 +7289,18 @@ impl ContainerEngine {
         page_number: u32,
         primary: Option<&mut RemotePageStageGuard>,
         fallback: Option<&mut RemotePageStageGuard>,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<(), MediaError> {
         validate_page_number(
             page_number,
-            self.pdf_page_count_with_read(resolved, metadata, read, primary, fallback)?,
+            self.pdf_page_count_with_read_admitted(
+                resolved,
+                metadata,
+                read,
+                primary,
+                fallback,
+                catalog_admission,
+            )?,
         )
     }
 
@@ -7248,22 +7328,35 @@ impl ContainerEngine {
         primary: Option<&mut RemotePageStageGuard>,
         fallback: Option<&mut RemotePageStageGuard>,
     ) -> Result<u32, MediaError> {
+        let catalog_admission = current_catalog_admission();
         // The resolver pins an EPUB generation. Reuse this target for both the
         // cache identity and PDFium enumeration; the source EPUB's stat is only
         // for display and must not validate converted-page data.
         let read =
             crate::pdf_loader::resolve_read_target(&resolved.logical).map_err(pdf_read_error)?;
-        self.pdf_page_count_with_read(resolved, metadata, &read, primary, fallback)
+        self.pdf_page_count_with_read_admitted(
+            resolved,
+            metadata,
+            &read,
+            primary,
+            fallback,
+            catalog_admission,
+        )
     }
 
-    fn pdf_page_count_with_read(
+    fn pdf_page_count_with_read_admitted(
         &self,
         resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
         read: &crate::pdf_loader::ReadTarget,
         mut primary: Option<&mut RemotePageStageGuard>,
         mut fallback: Option<&mut RemotePageStageGuard>,
+        catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<u32, MediaError> {
+        let catalog_work = crate::catalog::CatalogWork::with_admission(
+            &crate::catalog::default_cache_dir(),
+            catalog_admission,
+        );
         let (mtime, file_size) = match &read.stamp {
             crate::pdf_loader::DocumentStamp::Generation { id, pdf_size } => (*id, *pdf_size),
             crate::pdf_loader::DocumentStamp::File { .. } => {
@@ -7286,7 +7379,7 @@ impl ContainerEngine {
             Some(count) => count,
             None => {
                 let password = self.real_pdf_password(&resolved.logical);
-                let catalog = open_parent_catalog(&resolved.logical);
+                let catalog = open_parent_catalog_admitted(&resolved.logical, &catalog_work);
                 let filename = resolved.logical.file_name().and_then(|name| name.to_str());
                 let persistent = catalog
                     .as_ref()
@@ -7935,9 +8028,17 @@ fn validated_context(
     })
 }
 
+#[cfg(test)]
 fn open_parent_catalog(path: &Path) -> Option<crate::catalog::CatalogDb> {
+    open_parent_catalog_admitted(path, &crate::catalog::CatalogWork::default())
+}
+
+fn open_parent_catalog_admitted(
+    path: &Path,
+    work: &crate::catalog::CatalogWork,
+) -> Option<crate::catalog::CatalogDb> {
     let parent = path.parent()?;
-    crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent)
+    work.open(parent)
         .map_err(|error| {
             crate::logger::log(format!(
                 "remote_ipc: PDF parent catalog open failed: {error}"
@@ -9537,9 +9638,9 @@ mod tests {
                 &resolved,
                 16,
                 if index == 0 {
-                    RemoteImageLoadKind::CompositedPage
+                    RemoteImageLoadKind::CompositedPage(current_catalog_admission())
                 } else {
-                    RemoteImageLoadKind::AutoTrimReference
+                    RemoteImageLoadKind::AutoTrimReference(current_catalog_admission())
                 },
                 crate::rotation_db::Rotation::None,
                 true,
@@ -10953,14 +11054,15 @@ mod tests {
         let identity = RemoteSourceDecodeIdentity::from_load_request(
             &request,
             4096,
-            RemoteImageLoadKind::AutoTrimReference.full_page(),
+            RemoteImageLoadKind::AutoTrimReference(current_catalog_admission()).full_page(),
             None,
         );
         request.priority = true;
         let page_identity = RemoteSourceDecodeIdentity::from_load_request(
             &request,
             4096,
-            RemoteImageLoadKind::CompositedPageWithAutoTrim.full_page(),
+            RemoteImageLoadKind::CompositedPageWithAutoTrim(current_catalog_admission())
+                .full_page(),
             None,
         );
         assert_eq!(identity, page_identity);
@@ -11767,6 +11869,160 @@ mod tests {
     }
 
     #[test]
+    fn remote_container_requests_keep_admission_across_delete_before_decode() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("late-container");
+        std::fs::create_dir_all(&folder).unwrap();
+        let zip_path = folder.join("book.zip");
+        write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(13, 7))]);
+        let pdf_path = folder.join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let cache_dir = crate::catalog::default_cache_dir();
+        let accepted = current_catalog_admission();
+        crate::catalog::delete_all_cache(&cache_dir);
+        let response = engine.thumbnail_admitted(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress {
+                    path: zip_path.to_string_lossy().into_owned(),
+                    subresource: RemoteSubresource::ZipEntry {
+                        entry_name: "page.png".into(),
+                    },
+                },
+                source_address: None,
+                target_px: 64,
+            },
+            &WorkerContext::without_databases(),
+            accepted,
+        );
+        assert!(
+            matches!(response, ThumbnailResponse::Success { .. }),
+            "{response:?}"
+        );
+        assert!(!crate::catalog::db_path_for(&cache_dir, &zip_path).exists());
+        let address = RemoteAddress {
+            path: pdf_path.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        let resolved = engine.resolve(&address).unwrap();
+        let loaded = engine.load_image(
+            &address,
+            &resolved,
+            64,
+            RemoteImageLoadKind::AutoTrimReference(accepted),
+            crate::rotation_db::Rotation::None,
+            true,
+            &WorkerContext::without_databases(),
+            None,
+            None,
+        );
+        assert!(loaded.is_ok(), "stale SourceOnly PDF: {:?}", loaded.err());
+        assert!(!crate::catalog::db_path_for(&cache_dir, &pdf_path).exists());
+        assert!(!crate::catalog::db_path_for(&cache_dir, &folder).exists());
+    }
+
+    #[test]
+    fn remote_page_admission_precedes_after_raw_pin_boundary() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let pdf_path = data_dir.path().join("after-pins.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let context = WorkerContext::open();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let response = engine.page_inner_with_after_raw_pins(
+            PageRequest {
+                job_id: "after-pins".into(),
+                display_request_id: None,
+                address: RemoteAddress {
+                    path: pdf_path.to_string_lossy().into_owned(),
+                    subresource: RemoteSubresource::PdfPage { page_number: 0 },
+                },
+                target_px: 64,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+            &context,
+            Arc::new(AtomicBool::new(false)),
+            &|| PagePriority::Foreground,
+            || {
+                crate::catalog::delete_all_cache(&cache_dir);
+            },
+        );
+        assert!(matches!(response, PageResponse::Success(_)), "{response:?}");
+        assert!(!crate::catalog::db_path_for(&cache_dir, data_dir.path()).exists());
+        assert!(!crate::catalog::db_path_for(&cache_dir, &pdf_path).exists());
+    }
+
+    #[test]
+    fn source_only_remote_zip_and_pdf_pages_do_not_require_catalog_during_delete() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("source-only");
+        std::fs::create_dir_all(&folder).unwrap();
+        let zip_path = folder.join("book.zip");
+        write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(13, 7))]);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let address = RemoteAddress {
+            path: zip_path.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "page.png".into(),
+            },
+        };
+        let resolved = engine.resolve(&address).unwrap();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
+        let deletion = access
+            .begin_delete(crate::catalog::CatalogDeleteOperation::All)
+            .unwrap();
+        deletion.retire_connections();
+        let loaded = engine.load_image(
+            &address,
+            &resolved,
+            64,
+            RemoteImageLoadKind::AutoTrimReference(current_catalog_admission()),
+            crate::rotation_db::Rotation::None,
+            true,
+            &WorkerContext::without_databases(),
+            None,
+            None,
+        );
+        assert!(
+            loaded.is_ok(),
+            "source-only ZIP during deletion: {:?}",
+            loaded.err()
+        );
+        assert!(!crate::catalog::db_path_for(&cache_dir, &zip_path).exists());
+        let pdf_path = folder.join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let pdf_address = RemoteAddress {
+            path: pdf_path.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        let pdf_resolved = engine.resolve(&pdf_address).unwrap();
+        let loaded = engine.load_image(
+            &pdf_address,
+            &pdf_resolved,
+            64,
+            RemoteImageLoadKind::AutoTrimReference(current_catalog_admission()),
+            crate::rotation_db::Rotation::None,
+            true,
+            &WorkerContext::without_databases(),
+            None,
+            None,
+        );
+        assert!(
+            loaded.is_ok(),
+            "source-only PDF during deletion: {:?}",
+            loaded.err()
+        );
+        assert!(!crate::catalog::db_path_for(&cache_dir, &pdf_path).exists());
+    }
+
+    #[test]
     fn page_render_observes_the_registry_job_token() {
         // WorkerContext::open() と CatalogDb::open() は data_dir::get() へ落ちる。
         // ガードが無いと本物の %APPDATA% のカタログを開き、同時に走る他テストの
@@ -12529,7 +12785,7 @@ mod tests {
                     &address,
                     &resolved,
                     1024,
-                    RemoteImageLoadKind::AutoTrimReference,
+                    RemoteImageLoadKind::AutoTrimReference(current_catalog_admission()),
                     crate::rotation_db::Rotation::None,
                     true,
                     &worker,

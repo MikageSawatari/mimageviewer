@@ -520,3 +520,97 @@ fn oversized_png_dimensions_are_rejected_before_pixel_decode() {
     bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
     assert!(decode_picture(&bytes, 64).is_none());
 }
+
+#[test]
+fn album_art_exif_offset_bomb_decodes_with_bounded_orientation_and_without_metadata() {
+    let mut jpeg = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        12,
+        8,
+        image::Rgb([20, 100, 220]),
+    ))
+    .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+    .unwrap();
+    let jpeg = jpeg.into_inner();
+    let mut bytes = metadata::tests::offset_bomb(6, true);
+    bytes.truncate(bytes.len() - 2);
+    bytes.extend(&jpeg[2..]);
+    let calls = Cell::new(0);
+    let result = decode_picture_with_jpeg_decoder(&bytes, 64, &mut || Ok(()), |clean, _| {
+        calls.set(calls.get() + 1);
+        assert!(!clean.windows(6).any(|b| b == b"Exif\0\0"));
+        Err(crate::thumb_loader::DctDecodeError::Fallback(
+            "exercise bounded fallback".into(),
+        ))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(result.1, (8, 12));
+    assert_eq!((result.0.width(), result.0.height()), (8, 12));
+}
+#[test]
+fn album_art_jpeg_memory_limit_is_terminal_before_either_decoder_or_fallback() {
+    let bytes = metadata::tests::jpeg_header(8000, 5000, &[0x11; 3], true);
+    let calls = Cell::new(0);
+    let result = decode_picture_with_jpeg_decoder(&bytes, 64, &mut || Ok(()), |_, _| {
+        calls.set(calls.get() + 1);
+        Err(crate::thumb_loader::DctDecodeError::Fallback(
+            "must not reach fallback".into(),
+        ))
+    });
+    assert!(matches!(result, Err(crate::audio_album_art::Error::Limit)));
+    assert_eq!(calls.get(), 0);
+}
+#[test]
+fn album_art_jpeg_native_limit_rejection_cannot_bypass_into_fallback() {
+    let mut jpeg = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        12,
+        8,
+        image::Rgb([20, 100, 220]),
+    ))
+    .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+    .unwrap();
+    let result =
+        decode_picture_with_jpeg_decoder(&jpeg.into_inner(), 64, &mut || Ok(()), |_, _| {
+            Err(crate::thumb_loader::DctDecodeError::TerminalRejection(
+                "allocation limit".into(),
+            ))
+        });
+    assert!(matches!(result, Err(crate::audio_album_art::Error::Limit)));
+}
+#[test]
+fn album_art_decoder_cancel_never_saves_negative_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("cancel.mp3");
+    let mut jpeg = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        12,
+        8,
+        image::Rgb([20, 100, 220]),
+    ))
+    .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+    .unwrap();
+    let jpeg = jpeg.into_inner();
+    let mut bytes = metadata::tests::offset_bomb(6, true);
+    bytes.truncate(bytes.len() - 2);
+    bytes.extend(&jpeg[2..]);
+    std::fs::write(&path, mp3(&[(&bytes, 3)])).unwrap();
+    let options = options(&tmp.path().join("cache"), CachePolicy::Always);
+    let checks = Cell::new(0);
+    let result = generate_with_options(
+        &path,
+        None,
+        &options,
+        LoadSourcePolicy::SourceOnly,
+        CatalogAccess::for_cache_dir(&options.cache_dir).admit(),
+        32,
+        &|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 20
+        },
+    );
+    assert!(matches!(result, Err(AudioThumbnailError::Canceled)));
+    assert!(matches!(cached(&path, &options), AudioArtCached::Miss));
+}
