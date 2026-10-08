@@ -286,15 +286,16 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 ### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
 
-RAR/CBRを開くときは、パスワード入力後も含む共通のnative workerでvolume headerから
-実際のsource（分割RARなら先頭volume）を確定する。Directなら元RARを開き、変換が必要なら
-そのsourceの有効な変換cacheを照会して、DBが保持する実ZIP pathを採用する。
-cacheが無い場合だけ変換へ進む。後続パートのクリックpathでmissになっても、確定した
-先頭volumeのcache照会を省かない。data-dir移動前から保持された有効cacheも、その実pathを使う。
-通常open・起動復元・履歴・Smartの子openは同じsource決定を使い、UIでRAR headerやcache DBを
-読み直さない。Smartのクリックした行と帰路の意図は、物理先頭volumeへの解決とは別に保持する。
-この修正（§1.355）は§1.350の確認中に発見した公開済みv4.4.0の不具合を扱うもので、
-ページ／読書位置keyの変更や、reader解放待ち・publish再試行を加えない。
+RAR/CBRは最初のファイルから開く（2026-10-09利用者決定、§1.355）。共通RAR scan workerで
+secretなしのvolume headerが後続巻と示したら、scan・Direct・cache・変換前に拒否し、header解決の
+最初のファイル名を案内する。通常・履歴・Smart・Rating・Collection・ブックマーク・起動・別ウィンドウ・
+password retryの共通scan入口に適用する。ヘッダー暗号化で番号を読めない場合はファイル名から推測せず、
+password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」
+と通知・logする。part1／単巻のDirect → 有効cache（DBの実ZIP path）→ 変換は維持する。
+後続巻の公開済み位置・ページ編集が参照できなくなる制約は利用者受容済みで、削除・移行・互換探索はしない。
+後続巻サムネイルの先頭巻解決は維持し、メーターだけ解決先が異なるRARセルでは非表示にする。
+UIスレッドのI/Oや新しい状態は追加せず、既存のモーダルowner・取消・成功時採用境界を維持する。
+別ウィンドウ本ブックマークcache hit／★固定のcache-only等の既存例外は[入口表](book-resume-meter-plan.md#入口と維持する例外)参照。
 
 変換ZIPの保存失敗は、操作・元書庫・一時ZIP・保存先・元OSエラーを既存loggerに記録する。
 Windowsのpublishは捕捉済みHRESULTからWin32 codeを保持し、UIには

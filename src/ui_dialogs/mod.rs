@@ -347,7 +347,9 @@ pub fn draw_startup_dialog_snapshot_fixture(ui: &mut eframe::egui::Ui, kind: &st
         | "archive_scanning"
         | "archive_converting"
         | "archive_error"
-        | "archive_publish_error" => {
+        | "archive_publish_error"
+        | "archive_later_volume_error"
+        | "archive_no_images_error" => {
             archive_convert::draw_archive_startup_snapshot_fixture(ctx, kind)
         }
         "pdf_notice" | "susie_notice" | "trt_notice" => {

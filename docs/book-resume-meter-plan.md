@@ -718,7 +718,7 @@ captionの13pt移動後を計測すると、高さ94ptのSearchContainerの深�
 
 ## 15. §1.350 変換対象書庫の一覧セル（2026-10-07、ラインA）
 
-以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示だけは§18の利用者決定で置き換える。サムネイル／pinの共有source失効は維持する。
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示は§18、後続RARセルの表示・開封は§19の利用者決定が優先する。サムネイル／pinの共有source失効は維持する。
 
 利用者とmIVスレ>>529の報告では、v4.4.0のRARサムネイルにバーが出ない。
 コード上の根因は`thumbnail_book_resume_meter`の対象kindから`ConvertibleArchive`を除いていたこと。
@@ -775,7 +775,7 @@ cache DBのstamp/実体照合をworkerで行い、直読みなら解決済みRAR
 
 ## 16. §1.350 独立レビューr3 — cache削除完了の失効（2026-10-08）
 
-以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示だけは§18の利用者決定で置き換える。サムネイル／pinの共有source失効は維持する。
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示は§18、後続RARセルの表示・開封は§19の利用者決定が優先する。サムネイル／pinの共有source失効は維持する。
 
 利用者提示の独立レビューP2をコードで照合し、採用した。反対意見はない。
 `poll_archive_cache_maint_pending`はDeletedSelected / DeletedMissing / DeletedAllで管理画面の
@@ -812,7 +812,7 @@ BookResumeMeters、DB保存・復元key、既に表示したtextureは変更し�
 
 ## 17. r4 — 退避した解決元ownerへのキャッシュ失効（2026-10-08）
 
-以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示だけは§18の利用者決定で置き換える。サムネイル／pinの共有source失効は維持する。
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示は§18、後続RARセルの表示・開封は§19の利用者決定が優先する。サムネイル／pinの共有source失効は維持する。
 
 指摘の根因は一致した。r3はmounted mapのみ失効させ、SmartFolderPreparedGridの親mapや
 parked ViewerContextBundleを残したため、親→子→cache削除→BSで古いCachedZipが戻る。
@@ -874,6 +874,8 @@ coordinatorはsource-ownerの退避/採用境界とPageIdentity契約を独立�
 [残る利用者質問](file-type-visibility-plan.md#82-残る利用者質問未回答具体例と推奨)への判断を集める。
 
 ## 18. キャッシュ削除後のバー保持（利用者決定 2026-10-08）
+
+以下は2026-10-08時点の仕様と検証記録。後続RARセルの表示・開封は2026-10-09の§19が優先する。
 
 実機確認を受け、solid RAR / 7z / LZH等の変換書庫は、変換キャッシュを削除しても保存済みの読書位置バーを表示する。同じdata-dirでは次回openで再変換し、同じkeyから再開する。Direct RARは従来どおり元書庫のkeyを使う。表示設定OFFでも記録を維持する。
 
@@ -940,119 +942,124 @@ CachedZipのメーターkeyを実読込pathへ揃えた。追加のコピー回�
 
 実機確認は旧profileを残したコピー先を`--data-dir`で開き、変換書庫のバー表示と前回位置への復帰、位置更新後も同じバーを確認する。旧cacheを後で削除するまれなケースの制約は上記の仕様どおりで、保存行の破棄やkey対応付けは追加していない。
 
-## 19. §1.355 分割RAR開封時の読込元決定（2026-10-08、ラインA）
+## 19. §1.355 分割RARは最初のファイルから開く（2026-10-09、利用者決定）
 
-### 観測と原因
+### 原因と決定
 
-利用者が§1.350の確認用binaryを実機で試した際、分割RARの後続パートを開くと、
-有効な変換cacheがあるのに再変換され、ZIPの保存に失敗することを報告した。
-コード照合で同じ開封経路は公開済みv4.4.0とmasterにも残ることを確認した。
-メーター対象を追加したことで生じた新規不具合とは扱わず、別項目§1.355として修正する。
+§1.350の実機確認で、後続巻が有効な先頭巻cacheを見落として再変換し、readerが使用中の
+ZIPへのpublishがアクセス拒否になる公開済み不具合を確認した。879802c44は後続巻を先頭巻へ
+解決してcacheを再利用したが、ヘッダー暗号化RARではvolume情報をpassword前に読めない。
+実RAR5 fixtureで後続巻のpassword後scanが画像0件、直接変換がCRCエラーになることも確認した。
 
-クリックした後続partのcache照会がmissした後、scanでheaderから実sourceを先頭volumeへ
-解決していたが、そのsourceでcacheを再照会せず変換へ進んでいた。
-その結果、サムネイル等が既に開いている有効cache ZIPを再公開しようとして、
-`MoveFileExW`のアクセス拒否に至った。publish側だけを待たせたり再試行したりしても、
-有効cacheがあるのに変換を開始する決定の誤りは残る。
-従来のWindows wrapperはHRESULTを文字列化して`io::Error::other`へ渡し、
-`raw_os_error`も失っていたため、保存失敗の通知と診断を併せて修正する。
+**2026-10-09利用者決定は以前のidentity／互換参照案を置き換える。後続巻の開封はサポートしない。**
+workerの入口で、secretなしのnative volume headerがクリック巻をSubsequentと示した場合、
+画像scan・Direct採用・cache照会・変換に進まず、以下の通知で終了する。
 
-### 所有境界と簡素化
+> 分割RARの2つ目以降のファイルです。最初のファイル（分割RAR本.part1.rar）を開いてください。
 
-RAR閲覧の入口は、パスワード入力後を含め同じnative scan workerへ渡す。
-workerがvolume headerで実sourceを確定した後、以下の順に一度決定する。
+括弧内はheader確認後の既存resolutionが返した最初のファイル名を表示する。
+名前のsuffixだけで後続巻と判断しない。既存の単巻`*.part2.rar`等もheaderが単巻なら開ける。
+ヘッダー暗号化等でvolume番号を確認できない場合は、ファイル名から先頭巻を推測しない。
+既存password flowを通し、password後のscanで画像も変換対象の入れ子も無ければ、次を通知・logする。
 
-1. Directなら、解決済みRAR sourceをそのまま開く。
-2. 変換が必要でも、そのsourceに有効cacheがあれば、DBが返した実際のZIP pathを開く。
-3. 有効cacheが無いときだけ、既存の変換確認／変換へ進む。
+> 画像が見つかりません。分割RARの場合は最初のファイルを開いてください。
 
-通常open・起動復元・履歴・Smartの子openと、RARを閲覧する共通変換要求もこの規則へ揃える。
-利用者が明示的に作るsibling／batch ZIPは、閲覧sourceの選択ではなく変換操作として維持する。
-Smartでクリックした後続partの行と帰路・open intentは、readerが使う先頭volumeとは別に保持する。
-物理sourceの解決で親一覧の選択・復帰対象を先頭partへ置き換えない。
+画像が直下に無くても入れ子の展開対象がある本は、既存の変換確認を維持する。
+暗号化part1のpassword入力・変換、part1／単巻のDirect → 有効cache → 変換は維持する。
+CachedZipはDBが保持する実ZIP pathを使い、data-dir移動前から残る有効cacheを読み替えない。
+header暗号化で番号未確認のまま既存cacheがhitした場合は、従来どおりpassword scanを経ずに採用する。
+その場合は後続巻かを判別できない。今回のheader拒否・password後0画像hintは各判定が得られた場合に適用し、
+cache hitへ新たなpassword検証やfilename判定は追加しない。
 
-状態の組み合わせを減らす選択として、有効なread sourceの決定をworkerの既存終端結果へ集約する。
-新しいpublish retry、reader解放待ち、専用の復旧状態、UIでのheader／DB再照会は追加しない。
-scan／convertの取消・古い完了の破棄は既存ownerに従う。
-Directを優先し、DBが返した実ZIP pathを使うため、data-dir移動前から残る有効cacheを
-現在のdata-dirの決定的pathへ勝手に読み替えない。
+### 所有境界・終了と状態削減
 
-§1.350の契約は変更しない。Directの元書庫key、CachedZipの実読込path、source確定済み
-Unavailableの決定的変換ZIP keyで既存BookResumeMetersを参照する。
-読書位置の保存／復元keyの統合・移行・二重記録、描画中I/Oは足さない。
+RAR scan workerの単一決定点で拒否し、既存typed scan outcomeのRejectedをUIの既存Error phaseへ
+渡す。新しいpending／rollback／retry／移行状態は作らない。モーダルscan／password／変換、
+取消token、owner証明、古いreply破棄、Errorの閉じる処理・historyの成功時採用境界を維持する。
+拒否前後のcancel確認も既存worker境界に置く。UIスレッドのheader／DB照会は追加しない。
+通常physical historyのpreflightはRARをtyped RarOpenとして渡し、先行content scanを行わない。
+Collectionの順次候補選択もheaderで後続巻と分かればRarOpenで共通workerへ渡す。
+先頭巻・単巻の空候補を飛ばす既存Collection policyは維持し、拒否の決定・通知は共通workerが所有する。
 
-### 保存失敗の扱いと検証範囲
+879802c44の開封用「後続巻→先頭巻へsourceを変更してDirect／cache／変換」経路と、password後の
+開封source再解決を撤去する。公開済み後続巻cacheの互換peek・DB探索・aliasは追加しない。
+passwordは既存scan／展開に渡す。converter内部の読込・明示batch変換は今回の開封決定とは別で、
+そのreaderを改修して暗号化後続巻を読めるようにする範囲へは広げない。
 
-保存失敗は既存loggerへ操作名、src／tmp／dst、元エラーとnative codeを残してから、
-既存`ConvertError::Archive(String)`で平易な日本語へ翻訳する。
-Windowsはwrapperが捕捉済みのFACILITY_WIN32 HRESULTからWin32 codeを保持し、
-wrapper後の`GetLastError`を再読しない。通知は以下とする。
+### 保存データ・サムネイル・読書位置バー
 
-> 変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。
+v4.4.0が後続巻cache keyへ記録した位置・ページ編集は、後続巻の開封拒否により参照できなくなる
+場合がある。利用者はこのまれな制約を受容した。既存ZIP・DB行・位置・編集は削除せず、移行しない。
 
-閲覧cacheだけでなく明示sibling／batchも通る処理なので、文言は一般のZIP保存にする。
-既存保存先を先に削除せず、失敗時は中間ZIPを掃除する。
-no-clobberの「同名の ZIP が既に存在するため上書きしませんでした」は維持する。
-取消とパスワード再入力は通常フローとして失敗診断から除く。
-再試行や失敗分類を増やさず、ログと利用者通知で扱う利用者決定に従う。
+一覧サムネイルの後続巻→先頭巻解決と共有source mapは公開済み動作として維持する。
+thumbnail／pinのload、cache削除時の失効、Smart stash／parked contextの通知を変更しない。
+メーターだけ、既存非同期source mapが先頭巻へ解決した後続巻セルを非表示にする。
+Direct source／CachedZip.logical_source／Unavailable.logical_sourceとセルのRAR pathを純粋比較し、
+一致しなければ非表示。新しいeligibility bool、描画中のI/O、ファイル名推測は足さない。
+part1／単巻はDirect／実CachedZip／cacheなしの決定的keyを使い、削除後のバー・再変換時の復元を維持する。
+Pending・source未確定・設定OFFは従来どおり非表示。
 
-回帰は使い捨ての実分割RAR fixtureと実ZIP変換を用い、先頭／後続volume、Direct／solid、
-cache hit／miss、実cache pathの維持、通常／起動／履歴／Smartとpassword継続を確認する。
-別途WindowsでZIPを開いたままpublishを拒否させ、native code保持、既存ZIP保持、
-中間ZIP掃除、平易な通知と既存loggerの対象path、no-clobber、handle解放後の通常成功を検証する。
-新しい修正の自動gate・独立レビュー・確認用build・利用者の実機確認は、今回の結果を記録する。
-§15〜§18の成功記録を本修正の検証証跡として流用しない。
+### 入口と維持する例外
 
-### 入口の照合と今回の回帰
-
-| 入口 | 共通決定への接続 | 今回の直接回帰 |
+| 入口 | 接続／契約 | 回帰対象 |
 | --- | --- | --- |
-| 通常open／アドレス指定 | classified open → request_rar_open_owned | 公開handlerから分類・worker・ZIP採用まで、有効な実cache pathを再利用 |
-| 履歴の戻る／進む・BSのtyped遷移 | start_staged_archive_conversion_with_format → request_rar_open_owned | Back handlerから先頭volume cacheへ採用 |
-| Smartの子open | start_smart_archive_conversion_current → request_rar_open_owned | Smart一覧のクリックした後続巻を維持してcache採用 |
-| 評価一覧 | MainGridArchive intent → classified open | 評価一覧の実open handlerからcache採用 |
-| Collection | MainGridArchive intent → classified open | Collectionの実open handlerからcache採用 |
-| scanでのパスワード再入力 | apply_archive_password → 同じOpen scan purpose | 実retry workerでheader解決、cache採用。暗号化fixtureではなく非暗号化RARへpasswordを渡し、PasswordRequired phaseだけをテストで用意 |
-| 起動復元・ブックマーク・閲覧履歴一覧・別ウィンドウ | 既存owner付きclassified open → 同じRAR要求 | 接続をコード照合。今回追加の実RAR入口回帰とは別に、既存owner／lifecycleテストをfull libで確認 |
-| 共通の閲覧変換要求 | request_archive_convert_owned → Open scan purpose | 同じ決定を使用。実RARの入口ごとの列挙は上記 |
-| Ctrl+↑↓の通常横断 | FullFeature landing → owner付きclassified open | 共通入口をコード照合。別ウィンドウDFSは既存の直読／cacheのみの別policyで、header解決とDirect優先・後続巻skipを既に実施し、今回変更しない |
-| 明示sibling／batch ZIP作成 | SiblingZip scan／converterへ直接 | 明示siblingはクリックした巻の出力名を維持しcacheを上書きしない。batchは共有converterの保存失敗・no-clobberを検証 |
+| 通常open／アドレス指定 | classified open → request_rar_open_owned → 共通scan | 実handlerで後続巻を拒否、先頭巻cache再利用 |
+| 履歴の戻る／進む・BS | typed history → staged archive conversion → 共通scan | 旧後続巻targetを拒否し、成功採用しない |
+| Smartの子open | smart archive conversion → 共通scan | 行・帰路を保ったまま拒否、先頭巻採用を維持 |
+| Rating／Collection | owner付きMainGridArchive → 共通scan | 各実handlerで拒否、先頭巻のcache採用 |
+| 通常ブックマーク／閲覧履歴／起動復元 | owner付きclassified open → 共通scan | 旧後続巻entryも同じ通知 |
+| 別ウィンドウの通常RAR open | DetachedGridArchive owner → 共通scan | 拒否時にcontextを採用しない |
+| scanのpassword再入力 | apply_archive_password → 同じscan purpose | 暗号化後続巻の0画像hint、暗号化part1の変換成功 |
+| 共通閲覧変換要求／通常Ctrl+↑↓ | owner付きOpen scan purpose | 同じ決定を共有。DFSの後続巻skipも維持 |
+| 別ウィンドウの本ブックマークcache hit（P3例外） | startup_ops.rs: bookmark_detached_descriptorがcacheを直接採用 | 共通scanを通さない既存契約。missは通常openへ戻る |
+| ★固定範囲の移動（P3例外） | snapshot_ops.rs: cache-only照会 | hitだけ採用、missで変換dialogを出さない既存契約 |
+| 別ウィンドウDFS（既存例外） | 既存Direct／cache-only policy | header確認による後続巻skipを維持 |
+| 明示sibling ZIP作成 | 同じRAR scan worker | headerで後続巻と分かればscan／変換前に拒否 |
+| 明示batch ZIP作成 | converterへ直接 | 閲覧openではなく、今回のscan入口変更対象外 |
 
-今回の回帰では実thumbnail readerとopen readerを保持した本来のcache出力先も開き、
-CachedZip結果の再利用で中間ZIP作成・置換が発生しないことを確認する。
-cache削除後の再変換は実maintenance完了経路を通し、同じ先頭volume keyの保存位置／バーを確認する。
+### 保存失敗の診断は維持
 
-履歴のZip-kind preflightは、共通workerがDirectと決めたRARを再び変換cacheへ振り替えない。
-ZIPの入れ子展開cacheは従来どおり照会し、RARだけは既存native readerで確定済みbackingを準備する。
-背景の一覧用source owner（thumbnail／pin／§1.350メーター）はこの閲覧open要求とは別で、
-既存のcache-firstの軽いheader／peek解決・失効・parked contextの契約を維持する。
+§1.355で追加した既存loggerへの操作・src／tmp／dst・元OSエラー・native codeの記録を維持する。
+Windows wrapperは捕捉済みHRESULTからWin32 codeを保持し、後からGetLastErrorを再読しない。
+通知「変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。」、
+既存保存先の保持、中間ZIP掃除、no-clobberの専用通知も維持する。reader待ち・publish再試行を追加しない。
 
-### 今回の自動検証（2026-10-08）
+### 検証
+
+実分割RARで通常／履歴／Smart／Rating／Collection／ブックマーク／起動／別ウィンドウの入口、
+password retry、後続巻拒否前にDirect・cache・convertを採用しないことを確認する。
+実RAR5暗号化fixtureで0画像hintとpart1変換を検証する。実一覧workerのDirect／CachedZip／
+cache削除後Unavailableで後続巻のバーを隠し、thumbnail読込元・保存行を維持する。
+part1／単巻のDirect優先、実cache path、cache削除・再変換・位置復元・設定OFFを再検証する。
+新しい通知は100%／200%のsnapshotで折返しと閉じる操作を確認する。
+以前のidentity検討の準備assert失敗や旧仕様のgateは、新仕様の成功証跡に流用しない。
+
+### 実装と検証（2026-10-09、ラインA）
+
+後続巻拒否の実Normal handler回帰は修正前にfirst cacheを採用して失敗（exit 101、0 passed / 1 failed、
+`target/A-1355-spec-red.log`）。新仕様へ修正後、同じhandlerを含むRAR回帰25件が成功した。
+旧仕様の後続巻バー期待が残った初回対象実行（24 passed / 1 failed）は、先頭巻の削除・再変換・復元を
+検証する形へ訂正して再実行した。fixture準備の失敗は有効redに数えない。
 
 | 検証 | 結果 / 証跡 |
 | --- | --- |
-| 修正前の有効red | 通常handlerが後続巻の既存cacheを再利用せず別ZIPへ再変換し、期待cacheへの採用assertが失敗。exit 101、`target/A-1355-red2.log` |
-| 実RAR入口・reader保持・取消・再変換 | 11 passed、`target/A-1355-focused-cache3.log` |
-| dialog / converter / meter / open lifecycle / detached | 各11 / 38 / 48 / 55 / 9 passed、`target/A-1355-focused-{dialog,converter,meter,lifecycle,detached}.log`。重複を含む対象libの計172実行（168 test名） |
-| Windows保存失敗の実logger統合 | 1 passed、`target/A-1355-focused-diagnostics.log` |
-| `cargo test -p mimageviewer --lib` | exit 0、11011 passed / 52 ignored / 0 failed、1241.89s。`target/A-1355-lib.log` |
-| `ui_snapshot` | exit 0、103 passed。新しい通知の通常／200%のPNGのみ追加、文字と閉じるボタンを目視確認。`target/A-1355-ui-snapshot.log` |
-| 通常 / portable core check | 各exit 0、`target/A-1355-check.log` / `target/A-1355-portable.log` |
-| fmt / glyph lint / EOL | `cargo fmt`、`cargo fmt --check`、`git diff --check`成功。dangerous glyph 0、UTF-8・CRLF維持とnumstat確認。`target/A-1355-glyphs.log` |
+| RAR handler／native worker／password／保存行 | exit 0、25 passed。`target/A-1355-spec-focused-rar.log` |
+| 読書位置meter・source owner・削除／再変換 | exit 0、49 passed。`target/A-1355-spec-focused-meter.log` |
+| dialog採用・hydration | exit 0、8 passed。`target/A-1355-spec-focused-dialog.log` |
+| preflight | exit 0、34 passed。`target/A-1355-spec-focused-preflight.log` |
+| 全lib（pipeなし、実exit確認） | exit 0、11,026 passed / 0 failed / 52 ignored、1185.75s。`target/A-1355-spec-full-lib.log` |
+| UI snapshot全体 | exit 0、103 passed。`target/A-1355-spec-ui-snapshot.log`。新通知4PNGを目視確認 |
+| 通常／portable core check | 両方exit 0。`target/A-1355-spec-check-normal.log`／`target/A-1355-spec-check-portable.log` |
+| cargo fmt／fmt --check、glyph lint、diff --check | すべてexit 0、UI危険glyphなし。`target/A-1355-spec-fmt.log`／`target/A-1355-spec-glyph.log` |
+| build-dev -PreserveRuntime | exit 0、core 9m31s、Remote／EPUB worker配置、VCRT PE check runtime=4 / pe=3成功。`target/A-1355-spec-build-dev.log` |
 
-今回の暗号化についての直接回帰は、上記の通り非暗号化RARへpasswordを渡す実scan再試行である。
-利用者の4分割solid sample（part1〜4）での新binaryの確認と、今回の独立レビューは別途引き継ぐ。
-元sample・他worktreeの変更、製品起動、コミットは行わない。
+後続巻の8入口に加え、Direct可能な後続巻、明示sibling、実暗号化password retryを検証した。
+単巻をpart2風の名前に変えても開けること、後続巻の旧cache・読書位置・ページ回転が残ることも確認した。
+暗号化fixtureは公開passwordと人工PNGのみを含み、testsは一時ディレクトリへコピーする。
+新fixtureの`testdata/archives/rar-header-encrypted-multipart-legacy-cache`は既存ignore対象のため、
+coordinatorがcommitする際は2巻とREADMEを明示的にforce-addする。実行にWinRARは不要。
 
-`.\scripts\build-dev.ps1 -PreserveRuntime`もexit 0で完了した。通常featureのcore（10m26s）、
-Remote／EPUB workerをstageし、runtime=4 / pe=3のPE検査が成功した。
-証跡は`target/A-1355-build-dev.log`。英語コミットメッセージは`target/A-1355-msg.txt`。
-製品binaryは起動していない。
-
-実機ではインストール版／トレイ常駐版を閉じてから
-`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。
-通常の`%APPDATA%\mimageviewer`を使うため、実際の設定・読書位置等を更新し得る。
-part1を開いて読書位置を保存し、親一覧へ戻ってpart2〜4を順に開く。
-有効cacheがある間は再変換・保存失敗が起きず、同じ位置から再開することを確認する。
-続いてcache管理からその本のcacheを削除し、後続partのバーが残り、再open時の再変換後も
-保存位置へ復帰することを確認する。原sampleの書換えは不要である。
+確認用binaryは`target/dev-runtime/mimageviewer-core.exe`。製品起動・commitは行っていない。
+英語messageは`target/A-1355-spec-msg.txt`。独立再レビューと利用者の実機確認は未実施。
+利用者はインストール済み／トレイ常駐mIVを閉じ、通常profileの確認用coreで、後続巻の最初のファイル案内、
+暗号化巻のpassword後0画像hint、先頭巻のcache再利用・削除後バー保持・再変換／復元を確認する。

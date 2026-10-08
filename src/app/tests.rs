@@ -67735,8 +67735,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_archive_direct_read_completion_opens_detached_without_main_navigation() {
         let mut app = setup_app();
-        let source = app.tmp.path().join("selected.part2.rar");
-        let backing = app.tmp.path().join("resolved.part1.rar");
+        let source = app.tmp.path().join("selected.part1.rar");
+        let backing = source.clone();
         std::fs::write(&source, b"source").unwrap();
         std::fs::write(&backing, b"backing").unwrap();
         let (main_folder, items_generation) =

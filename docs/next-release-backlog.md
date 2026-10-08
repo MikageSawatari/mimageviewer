@@ -32,16 +32,17 @@
 
 ## 1. 優先候補
 
-### 1.355 分割RARの後続パートを開くと、有効な変換キャッシュを再変換して保存に失敗する — 利用者実機報告 (2026-10-08)
+### 1.355 分割RARは最初のファイルから開き、後続巻の誤変換を防ぐ — 利用者実機報告 (2026-10-08)
 
-- **対応中 (ラインA)**: §1.350の実機確認中に利用者が発見した、公開済みv4.4.0にも存在する開封経路の不具合。masterにも同じ経路が残っており、読書位置バーの追加に起因する新規不具合とは扱わない。
-- 観測: 分割RARの後続パートを開いたとき、既に有効な変換ZIPがあるのに再変換へ進み、使用中のZIPを置き換える`MoveFileExW`がアクセス拒否で失敗した。OSエラーが文字列化され、保存先・一時ファイル・元書庫とnative codeの診断も不足していた。
-- コード上の根因: クリックした後続パートのkeyでcache missになった後、RAR headerが確定した先頭volumeのkeyで有効なcacheを再照会せず、その先頭volumeを変換した。サムネイル等が開いている同じZIPへの不要なpublishを作ったのは、この読込元の決定経路である。
-- 方針: RARはパスワード入力後を含む共通のnative workerでheaderから実sourceを確定し、Directなら直読み、有効cacheがあれば保持された実ZIP pathを採用、どちらもなければ変換する。通常open・起動復元・履歴・Smartの子openを同じ決定へ揃える。Smartのクリックした行・帰路の意図は物理先頭volumeとは別に維持する。reader解放待ち・publish再試行は追加しない。
-- 保存失敗: 既存loggerへ操作名、元書庫・一時ZIP・保存先、元エラーとWin32 codeを残す。通知は「変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。」とし、閲覧cache・明示sibling・batchを共通に扱う。no-clobberの同名ZIP拒否と既存保存先の保持は維持する。
-- §1.350との境界: Directは元書庫key、CachedZipは実読込path、source確定済みUnavailableは決定的変換ZIP keyというメーターの契約を変更しない。cacheの再照会を開封workerへ置き、描画中のI/O・保存key移行・二重記録を足さない。
-- 回帰: 実分割RAR fixtureの先頭／後続volume、Direct／solid、有効cache／cacheなし、パスワード経路、通常／起動／履歴／Smart、開いたZIPへのpublish拒否とnative診断、no-clobber、既存読書位置の復元を自動検証する。今回修正後のgate・独立レビュー・確認用build・実機確認は完了時に別途記録し、§1.350の旧成功記録は流用しない。
-- 設計記録: [読書位置メーター計画 §19](book-resume-meter-plan.md#19-1355-分割rar開封時の読込元決定2026-10-08ラインa)。
+- **次の版の決定 (利用者 2026-10-09)**: ラインA。後続巻を開く機能はサポートしない。以前の先頭巻解決・旧cache互換・identity維持案を置き換える。
+- 発見: §1.350の利用者実機確認で、後続巻から有効cacheを見落として再変換し、使用中ZIPのpublishがアクセス拒否になる公開済みv4.4.0の不具合を確認。実RAR5ヘッダー暗号化fixtureではpassword後の後続巻scanが画像0件、直接変換がCRCエラーになることも確認した。
+- 共通決定: RAR scan workerで、secretなしのheaderが後続巻と示したら画像scan・cache照会・Direct採用・変換前に拒否。「分割RARの2つ目以降のファイルです。最初のファイル（header解決済みの最初のファイル名）を開いてください。」を表示する。通常／Smart／履歴／Rating／Collection／ブックマーク／起動／別ウィンドウ／password retryの共通scan入口に適用し、古い後続巻entryも同じ通知にする。
+- ヘッダー暗号化: 先頭巻をファイル名から推測しない。password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」を表示・logする。part1／単巻のDirect → 有効cache → 変換は維持する。
+- 保存データ: 後続巻keyの読書位置・ページ編集が参照できなくなるまれな制約を利用者が受容。既存cache・保存行を削除／移行せず、互換peek・alias・探索を追加しない。
+- 一覧: 後続巻のサムネイルとthumbnail／pin source owner・失効は既存動作を維持。バーだけ、非同期source解決が先頭巻を指す後続巻セルで非表示にする。描画中I/O・ファイル名推測・新しいeligibility状態は追加しない。
+- 維持: 保存失敗loggerの操作・src／tmp／dst・native code、平易な通知、no-clobber、既存ZIP保持を維持。別ウィンドウ本ブックマークの直接cache hit、★固定のcache-only、別ウィンドウDFSの既存policyを入口表の例外として明記する。
+- 回帰: 各handlerの後続巻拒否／変換未開始、実暗号化RARの0画像hint／part1変換、実workerの後続巻メーター非表示とthumbnail維持、先頭／単巻のcache再利用・位置復元、新通知snapshotを検証する。
+- 設計記録: [読書位置メーター計画 §19](book-resume-meter-plan.md#19-1355-分割rarは最初のファイルから開く2026-10-09利用者決定)。
 
 ### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。最初に実装する。
@@ -51,7 +52,7 @@
 - 報告: v4.4.0 の読書位置バーが RAR の一覧サムネイルに出ない。利用者の手元でも再現。次のバージョンでの対応を目標にする。
 - 原因: `thumbnail_book_resume_meter` は `Folder` / `ZipFile` / `PdfFile` だけを対象にし、RAR/CBR/7z/LZH の一覧セル `ConvertibleArchive` を除外している。`docs/book-resume-meter-plan.md` §2 でも初版の対象外と明記され、既存テストも非表示を期待している。単なる保存失敗ではない。
 - 保存キー: 直読みRARは `current_folder` が元書庫なので元RARのキーへ記録する。変換が必要なRAR/7z/LZHは `current_folder` がキャッシュZIP、`archive_source_override` が元書庫なので、位置はキャッシュZIPのキーへ記録する。元書庫キーだけを一律に参照しても直らない。
-- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` の実読込元、またはsource確定済み `Unavailable` だけは現在のdata-dirと論理sourceから計算した変換ZIP keyを使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・論理source未確定・保存行無しでは表示を捏造しない。キャッシュの有無だけでは非表示にしない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。分割RARの後続パートは、既存の読込元解決に従い先頭パートと同じ本を参照する。読書位置の保存・復元キー自体は変更しない。
+- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` の実読込元、またはsource確定済み `Unavailable` だけは現在のdata-dirと論理sourceから計算した変換ZIP keyを使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・論理source未確定・保存行無しでは表示を捏造しない。キャッシュの有無だけでは非表示にしない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。2026-10-09の§1.355決定により、headerで後続パートと確定したセルのバーは非表示とする。サムネイルの先頭パート参照は維持する。読書位置の保存・復元キー自体は変更しない。
 - 回帰: 直読みRAR/CBR、変換RAR/CBR・7z/CB7・LZH/LHA、分割RAR、未変換/キャッシュ失効、一覧からの再読込、既存ZIP/PDF/フォルダのバーを確認する。既存の「ConvertibleArchiveは非表示」というテストを新仕様へ更新する。
 - 規模 / 優先度: Small〜Medium / P2 (次版目標)。
 

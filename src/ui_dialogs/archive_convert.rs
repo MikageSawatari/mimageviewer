@@ -55,6 +55,9 @@ pub(crate) enum ArchiveScanOutcome {
         source: PathBuf,
         summary: ArchiveImageSummary,
     },
+    Rejected {
+        message: String,
+    },
 }
 
 enum ArchiveScanPurpose {
@@ -213,6 +216,17 @@ impl Drop for ArchiveConvertState {
     }
 }
 
+const RAR_NO_IMAGES_MESSAGE: &str =
+    "画像が見つかりません。分割RARの場合は最初のファイルを開いてください。";
+
+fn later_rar_volume_message(first: &std::path::Path) -> String {
+    let name = first
+        .file_name()
+        .unwrap_or(first.as_os_str())
+        .to_string_lossy();
+    format!("分割RARの2つ目以降のファイルです。最初のファイル（{name}）を開いてください。")
+}
+
 fn spawn_archive_scan(
     src: PathBuf,
     format: ArchiveFormat,
@@ -230,20 +244,40 @@ fn spawn_archive_scan(
             }
         };
         check_cancel()?;
-        let mut source = src.clone();
+        // Refuse header-confirmed subsequent volumes before content scan or cache adoption.
+        // Encrypted headers may not expose a volume number: never infer it from the filename.
+        if format == ArchiveFormat::Rar {
+            match crate::rar_loader::resolved_volume_path(&src) {
+                Ok((first, crate::rar_loader::RarVolumeKind::Subsequent)) => {
+                    check_cancel()?;
+                    crate::logger::log(format!(
+                        "archive_open: reject_subsequent_rar src={} first={}",
+                        src.display(),
+                        first.display(),
+                    ));
+                    return Ok(ArchiveScanOutcome::Rejected {
+                        message: later_rar_volume_message(&first),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => return Err(ConvertError::Archive(error.to_string())),
+            }
+        }
+        check_cancel()?;
+        let source = src;
         let mut inspected_summary = None;
         if format == ArchiveFormat::Rar
             && let ArchiveScanPurpose::Open { cache_db } = purpose
         {
             if password.is_none() {
                 match crate::rar_loader::inspect_for_direct_read_cancelable_traced(
-                    &src,
+                    &source,
                     cancel,
                     crate::rar_loader::RarInspectionOrigin::ExplicitOpen,
                     input_seq,
                 ) {
                     Ok(inspection) => {
-                        source = inspection.resolved_path;
                         check_cancel()?;
                         if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct {
                             return Ok(ArchiveScanOutcome::Direct { source });
@@ -253,18 +287,13 @@ fn spawn_archive_scan(
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                         return Err(ConvertError::Cancelled);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                        source = crate::archive_converter::resolve_rar_source_path(&src, None)?;
-                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
                     Err(error) => return Err(ConvertError::Archive(error.to_string())),
                 }
-            } else {
-                source =
-                    crate::archive_converter::resolve_rar_source_path(&src, password.as_deref())?;
             }
             check_cancel()?;
-            // The first volume is the conversion/cache/save identity. Preserve the DB's actual
-            // path (including caches retained in a previous data directory), never recompute it.
+            // Keep first/single-archive cache hits at the DB's actual saved ZIP path.
+            // No subsequent-volume source substitution or compatibility cache lookup.
             if let Some(db) = cache_db
                 && let Ok(meta) = std::fs::metadata(&source)
                 && let Some(path) = db.lookup(
@@ -284,6 +313,19 @@ fn spawn_archive_scan(
             }
         };
         check_cancel()?;
+        if format == ArchiveFormat::Rar
+            && password.is_some()
+            && summary.image_count == 0
+            && summary.nested_archive_count == 0
+        {
+            crate::logger::log(format!(
+                "archive_open: rar_scan_no_images_after_password src={} images=0 nested=0",
+                source.display(),
+            ));
+            return Ok(ArchiveScanOutcome::Rejected {
+                message: RAR_NO_IMAGES_MESSAGE.to_string(),
+            });
+        }
         Ok(ArchiveScanOutcome::NeedsConversion { source, summary })
     })
 }
@@ -1659,6 +1701,11 @@ impl App {
         let mut clear_deferred_fullscreen = false;
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::Rejected { message })) => {
+                    state.allow_direct_read = false;
+                    state.phase = ArchiveConvertPhase::Error { message };
+                    clear_deferred_fullscreen = true;
+                }
                 ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::Direct { source })) => {
                     state.src_path = source;
                     state.pending_direct_nav = Some(state.src_path.clone());
@@ -2505,7 +2552,10 @@ pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &
     let title = match kind {
         "archive_scanning" => "7z を読み込み中...",
         "archive_converting" => "7z を ZIP に変換中",
-        "archive_error" | "archive_publish_error" => "変換エラー",
+        "archive_error"
+        | "archive_publish_error"
+        | "archive_later_volume_error"
+        | "archive_no_images_error" => "変換エラー",
         _ => "7z を ZIP に変換",
     };
     egui::Window::new(title)
@@ -2548,6 +2598,16 @@ pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &
                             bytes: 2_000_000,
                         },
                     );
+                }
+                "archive_later_volume_error" => {
+                    draw_archive_status_content(
+                        ui,
+                        "分割RAR本.part2.rar",
+                        ArchiveStatus::Error(&later_rar_volume_message(std::path::Path::new("分割RAR本.part1.rar"))),
+                    );
+                }
+                "archive_no_images_error" => {
+                    draw_archive_status_content(ui, "分割RAR本.part2.rar", ArchiveStatus::Error(RAR_NO_IMAGES_MESSAGE));
                 }
                 "archive_publish_error" => {
                     draw_archive_status_content(ui, "分割RAR本.part1.rar", ArchiveStatus::Error("変換失敗: 変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。"));

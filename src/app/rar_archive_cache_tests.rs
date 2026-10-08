@@ -1,4 +1,4 @@
-//! Multipart RAR opens must resolve the cache identity before deciding to convert.
+//! Later multipart RAR opens are refused; first-volume cache and resume keys stay valid.
 //! These are headless handler/worker tests; no application or native window is launched.
 #![cfg(windows)]
 
@@ -195,11 +195,68 @@ enum Entry {
     History,
     Rating,
     Collection,
+    Startup,
+    Bookmark,
+    Detached,
 }
 
 fn open_entry(app: &mut App, source: &Path, entry: Entry) {
     match entry {
         Entry::Normal => open_normal(app, source),
+        Entry::Startup => {
+            app.settings.startup_list_restore = Some(crate::settings::StartupListRestore::V1 {
+                target: crate::settings::StartupListTarget::PhysicalList {
+                    logical_path: source.to_path_buf(),
+                    zip_prefix: None,
+                },
+                cursor: None,
+            });
+            app.open_previous_startup_list();
+        }
+        Entry::Bookmark => {
+            let row = crate::bookmark_browser::BookmarkBrowserRow {
+                source: crate::bookmark_browser::BookmarkRowSource::Book(
+                    crate::book_bookmarks::BookBookmark {
+                        id: 1,
+                        container_key: crate::book_bookmarks::container_key(source),
+                        container_path: source.to_path_buf(),
+                        container_kind: crate::book_bookmarks::BookContainerKind::OtherArchive,
+                        page_identity: crate::book_bookmarks::PageIdentity::ArchiveEntry(
+                            "page.png".into(),
+                        ),
+                        page_index_hint: 0,
+                        created_at_ms: 1,
+                        title: None,
+                    },
+                ),
+                item: GridItem::ConvertibleArchive {
+                    path: source.to_path_buf(),
+                    format: ArchiveFormat::Rar,
+                },
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 1,
+                missing: false,
+            };
+            app.bookmark_browser_rows = vec![row.clone()];
+            app.open_bookmark_browser_row(&egui::Context::default(), &row);
+        }
+        Entry::Detached => {
+            app.settings.detached_viewer_open_images_in_window = true;
+            let idx = app
+                .items
+                .iter()
+                .position(|item| item.drag_source_path() == Some(source))
+                .unwrap();
+            assert!(
+                app.open_grid_container_in_detached_book_context_with_auto_fullscreen(
+                    &egui::Context::default(),
+                    idx,
+                    false
+                )
+            );
+        }
         Entry::History => {
             app.folder_nav_back_stack =
                 vec![FolderNavHistoryTarget::Path(source.to_path_buf()).into()];
@@ -379,7 +436,7 @@ fn retained_reader_cache_hit(entry: Entry) {
     // Cache reuse must not create a .part writer or replace the existing ZIP.
     std::fs::create_dir(cached.with_extension("zip.part")).unwrap();
     app.load_folder(first.parent().unwrap().to_path_buf());
-    open_entry(&mut app, &later, entry);
+    open_entry(&mut app, &first, entry);
     wait_for_book(&mut app, &cached);
     assert_eq!(
         std::fs::read(&cached).unwrap(),
@@ -400,20 +457,20 @@ fn retained_reader_cache_hit(entry: Entry) {
             assert!(
                 matches!(&state.position,
                 super::top_level_grid_view::SmartFolderPosition::Container { root_entry, current }
-                    if root_entry == &later && current == &later),
+                    if root_entry == &first && current == &first),
                 "Smart root archive must preserve its exact logical row: {state:?}"
             );
             assert!(state.navigation_entries.iter().any(|entry| {
-                entry.logical_path == later
+                entry.logical_path == first
                     && entry.kind == super::smart_folder::SmartChildKind::ConvertibleArchive
             }));
             assert_eq!(
                 app.archive_source_override.as_deref(),
-                Some(later.as_path())
+                Some(first.as_path())
             );
         }
         Entry::Rating => assert!(
-            matches!(app.folder_nav_current_target(), Some(FolderNavHistoryTarget::RatingPhysical(restore)) if restore.visible_path == later)
+            matches!(app.folder_nav_current_target(), Some(FolderNavHistoryTarget::RatingPhysical(restore)) if restore.visible_path == first)
         ),
         Entry::Collection => assert!(matches!(
             app.folder_nav_current_target(),
@@ -421,31 +478,34 @@ fn retained_reader_cache_hit(entry: Entry) {
         )),
         Entry::History => assert!(app.folder_nav_back_stack.is_empty()),
         Entry::Normal => {}
+        Entry::Startup | Entry::Bookmark | Entry::Detached => {
+            unreachable!("first cache-sharing helper uses the original five routes")
+        }
     }
 }
 
 #[test]
-fn rar_archive_cache_later_volume_normal_open_reuses_live_cached_zip() {
+fn rar_archive_cache_first_volume_normal_open_reuses_live_cached_zip() {
     retained_reader_cache_hit(Entry::Normal);
 }
 
 #[test]
-fn rar_archive_cache_later_volume_smart_open_reuses_live_cached_zip() {
+fn rar_archive_cache_first_volume_smart_open_reuses_live_cached_zip() {
     retained_reader_cache_hit(Entry::Smart);
 }
 
 #[test]
-fn rar_archive_cache_later_volume_history_open_reuses_live_cached_zip() {
+fn rar_archive_cache_first_volume_history_open_reuses_live_cached_zip() {
     retained_reader_cache_hit(Entry::History);
 }
 
 #[test]
-fn rar_archive_cache_later_volume_rating_open_reuses_live_cached_zip() {
+fn rar_archive_cache_first_volume_rating_open_reuses_live_cached_zip() {
     retained_reader_cache_hit(Entry::Rating);
 }
 
 #[test]
-fn rar_archive_cache_later_volume_collection_open_reuses_live_cached_zip() {
+fn rar_archive_cache_first_volume_collection_open_reuses_live_cached_zip() {
     retained_reader_cache_hit(Entry::Collection);
 }
 
@@ -498,7 +558,7 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
     let cached = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &first);
     assert!(!cached.exists());
     app.load_folder(first.parent().unwrap().to_path_buf());
-    open_normal(&mut app, &later);
+    open_normal(&mut app, &first);
     wait_for_book(&mut app, &cached);
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached.clone()));
     assert!(app.try_archive_cache_lookup(&later).is_none());
@@ -513,7 +573,7 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
     settle_resume(&mut app);
     let expected = crate::book_resume_db::ReadingMeterValue::new(1, 1);
     app.load_folder(first.parent().unwrap().to_path_buf());
-    refresh_meter(&mut app, &later);
+    refresh_meter(&mut app, &first);
     assert_eq!(app.thumbnail_book_resume_meter(0), expected);
 
     app.archive_cache_manager_result = None;
@@ -530,30 +590,30 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
         std::thread::yield_now();
     }
     assert!(!cached.exists());
-    refresh_meter(&mut app, &later);
+    refresh_meter(&mut app, &first);
     assert_eq!(app.thumbnail_book_resume_meter(0), expected);
     assert_eq!(
         app.converted_archive_cache_paths
-            .get(&crate::path_key::normalize_keep_drive(&later)),
+            .get(&crate::path_key::normalize_keep_drive(&first)),
         Some(&super::ConvertedArchiveSourceState::Unavailable {
             logical_source: Some(first.clone())
         })
     );
-    open_normal(&mut app, &later);
+    open_normal(&mut app, &first);
     wait_for_book(&mut app, &cached);
     assert_eq!(app.resume_page_for_container(), Some(0));
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached.clone()));
     assert!(app.try_archive_cache_lookup(&later).is_none());
     app.load_folder(first.parent().unwrap().to_path_buf());
-    refresh_meter(&mut app, &later);
+    refresh_meter(&mut app, &first);
     assert_eq!(app.thumbnail_book_resume_meter(0), expected);
 }
 
 #[test]
-fn rar_archive_cache_direct_later_volume_has_priority_over_old_conversion_cache() {
+fn rar_archive_cache_direct_first_volume_has_priority_over_old_conversion_cache() {
     let mut app = setup_app();
     configure(&mut app);
-    let (first, later) = fixture(&app, false);
+    let (first, _later) = fixture(&app, false);
     let cached = app
         .archive_cache_db
         .as_ref()
@@ -562,12 +622,12 @@ fn rar_archive_cache_direct_later_volume_has_priority_over_old_conversion_cache(
         .unwrap();
     record_cache(&app, &first, &cached);
     app.load_folder(first.parent().unwrap().to_path_buf());
-    open_normal(&mut app, &later);
+    open_normal(&mut app, &first);
     wait_for_book(&mut app, &first);
-    // Typed history preserves the clicked logical row while Direct reads/saves at first RAR.
+    // Direct reads and saves at the opened first RAR despite an old conversion cache.
     assert_eq!(
         app.archive_source_override.as_deref(),
-        Some(later.as_path())
+        Some(first.as_path())
     );
     app.record_book_resume(0);
     assert_eq!(
@@ -581,7 +641,7 @@ fn rar_archive_cache_direct_later_volume_has_priority_over_old_conversion_cache(
 fn rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder() {
     let mut app = setup_app();
     configure(&mut app);
-    let (first, later) = fixture(&app, true);
+    let (first, _later) = fixture(&app, true);
     let cached = app
         .archive_cache_db
         .as_ref()
@@ -590,7 +650,7 @@ fn rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder(
         .unwrap();
     record_cache(&app, &first, &cached);
     app.load_folder(first.parent().unwrap().to_path_buf());
-    open_normal(&mut app, &later);
+    open_normal(&mut app, &first);
     // Hold the actual worker result between completion and UI adoption. Requeue that exact
     // message so the test does not construct a synthetic summary/cache outcome.
     let ctx = egui::Context::default();
@@ -618,4 +678,163 @@ fn rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder(
     assert!(app.archive_source_override.is_none());
     assert!(app.zip_enumerate_pending.is_none());
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached));
+}
+
+fn later_volume_refused_with_cache(entry: Entry, solid: bool, install_cache: bool) {
+    let mut app = setup_app();
+    configure(&mut app);
+    let (first, later) = fixture(&app, solid);
+    let cached = app
+        .archive_cache_db
+        .as_ref()
+        .unwrap()
+        .reserve_cache_zip_path(&first)
+        .unwrap();
+    let before = if install_cache {
+        record_cache(&app, &first, &cached);
+        Some(std::fs::read(&cached).unwrap())
+    } else {
+        None
+    };
+    let _reader = install_cache.then(|| crate::zip_loader::open_archive(&cached).unwrap());
+    app.load_folder(first.parent().unwrap().to_path_buf());
+    open_entry(&mut app, &later, entry);
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    loop {
+        app.poll_rar_archive_navigation_for_test(&ctx);
+        app.poll_smart_folder(&ctx);
+        app.poll_startup_open_path_resolve(&ctx);
+        app.poll_bookmark_browser(&ctx);
+        app.poll_rar_archive_messages_for_test();
+        if let Some(state) = app.archive_convert.as_ref() {
+            if let ArchiveConvertPhase::Error { message } = &state.phase {
+                assert!(
+                    message.contains(first.file_name().unwrap().to_str().unwrap()),
+                    "rejection must name header-resolved first volume: {message}"
+                );
+                assert!(
+                    message.contains("最初"),
+                    "rejection must explain first-volume requirement: {message}"
+                );
+                assert_eq!(state.src_path, later);
+                assert!(state.pending_nav.is_none());
+                assert!(state.pending_direct_nav.is_none());
+                assert!(state.pending_sibling_output.is_none());
+                break;
+            }
+            assert!(
+                state.pending_nav.is_none(),
+                "{entry:?} later volume wrongly selected first-volume cache"
+            );
+            assert!(
+                state.pending_direct_nav.is_none(),
+                "{entry:?} later volume wrongly selected Direct first-volume navigation"
+            );
+            assert!(
+                matches!(state.phase, ArchiveConvertPhase::Scanning),
+                "{entry:?} later volume entered a non-rejection phase"
+            );
+        }
+        assert_ne!(
+            app.current_folder.as_deref(),
+            Some(cached.as_path()),
+            "{entry:?} later volume wrongly adopted first-volume cache instead of rejecting"
+        );
+        assert_ne!(
+            app.current_folder.as_deref(),
+            Some(first.as_path()),
+            "{entry:?} later volume wrongly opened first volume instead of rejecting"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{entry:?} later volume did not reach rejection"
+        );
+        std::thread::yield_now();
+    }
+    if let Some(before) = before {
+        assert_eq!(std::fs::read(&cached).unwrap(), before);
+        assert_eq!(app.try_archive_cache_lookup(&first), Some(cached.clone()));
+    } else {
+        assert!(!cached.exists());
+        assert!(app.try_archive_cache_lookup(&first).is_none());
+    }
+    assert!(!cached.with_extension("zip.part").exists());
+    assert!(app.try_archive_cache_lookup(&later).is_none());
+}
+
+#[test]
+fn rar_archive_cache_later_volume_normal_open_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Normal, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_smart_open_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Smart, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_history_open_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::History, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_rating_open_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Rating, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_collection_open_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Collection, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_startup_restore_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Startup, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_bookmark_handler_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Bookmark, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_detached_grid_handler_refuses_first_cache() {
+    later_volume_refused_with_cache(Entry::Detached, true, true);
+}
+
+#[test]
+fn rar_archive_cache_later_volume_direct_without_cache_is_refused() {
+    later_volume_refused_with_cache(Entry::Normal, false, false);
+}
+
+#[test]
+fn rar_archive_cache_single_volume_with_later_looking_filename_still_opens_direct() {
+    let mut app = setup_app();
+    configure(&mut app);
+    let root = app.tmp.path().join("single-source");
+    std::fs::create_dir(&root).unwrap();
+    let single = root.join("independent.part2.rar");
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/archives/rar-multipart-filename-regression");
+    let fixture = std::fs::read_dir(&fixture_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("Vol.2.rar")
+        })
+        .unwrap();
+    std::fs::copy(fixture, &single).unwrap();
+    app.load_folder(root);
+    open_normal(&mut app, &single);
+    wait_for_book(&mut app, &single);
+    assert!(app.try_archive_cache_lookup(&single).is_none());
+    app.record_book_resume(0);
+    assert_eq!(
+        app.last_book_resume.as_ref().map(|(key, _, _)| key),
+        Some(&single)
+    );
 }

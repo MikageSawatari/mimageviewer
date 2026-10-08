@@ -607,60 +607,117 @@ fn book_resume_meter_converted_archives_use_only_resolved_read_source() {
     }
 }
 
+fn assert_converted_thumbnail_read_path(app: &AppTestEnv, idx: usize, expected: Option<&Path>) {
+    let request = super::make_load_request(
+        &app.items[idx],
+        idx,
+        0,
+        0,
+        false,
+        None,
+        None,
+        app.settings.folder_thumb_depth,
+        &Default::default(),
+        &app.converted_archive_cache_paths,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        request.as_ref().map(|request| request.path.as_path()),
+        expected
+    );
+}
+
 #[test]
-fn book_resume_meter_split_rar_uses_first_volume_for_direct_and_cached_reads() {
+fn book_resume_meter_split_rar_hides_later_volume_without_changing_thumbnail_sources() {
     use super::ConvertedArchiveSourceState as Source;
     let mut app = setup_app();
     settle(&mut app);
-    let first = app.tmp.path().join("book.part1.rar");
-    let next = app.tmp.path().join("book.part2.rar");
-    let cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &first);
-    let value = meter(3, 5);
-    app.persist_book_resume(first.clone(), 2, value);
-    app.persist_book_resume(next.clone(), 0, meter(1, 5));
-    app.persist_book_resume(cache.clone(), 3, meter(4, 5));
-    set_pages(
-        &mut app,
-        vec![GridItem::ConvertibleArchive {
-            path: next.clone(),
-            format: crate::archive_converter::ArchiveFormat::Rar,
-        }],
-    );
-    let key = crate::path_key::normalize_keep_drive(&next);
-    app.converted_archive_cache_paths
-        .insert(key.clone(), Source::Direct(first.clone()));
-    assert_eq!(app.thumbnail_book_resume_meter(0), value);
-    app.converted_archive_cache_paths.insert(
-        key.clone(),
-        Source::CachedZip {
-            logical_source: first.clone(),
-            path: cache,
-        },
-    );
-    assert_eq!(app.thumbnail_book_resume_meter(0), meter(4, 5));
-    let other = app.tmp.path().join("other.zip");
-    let other_source = app.tmp.path().join("other.7z");
-    app.converted_archive_cache_paths.insert(
-        key.clone(),
-        Source::CachedZip {
-            logical_source: other_source,
-            path: other,
-        },
-    );
-    assert_eq!(
-        app.thumbnail_book_resume_meter(0),
-        None,
-        "no row for resolved source"
-    );
-    app.converted_archive_cache_paths.insert(
-        key,
-        Source::Unavailable {
-            logical_source: Some(first.clone()),
-        },
-    );
-    assert_eq!(app.thumbnail_book_resume_meter(0), meter(4, 5));
-    app.settings.thumb_show_resume_meter = false;
-    assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    for ext in ["rar", "cbr"] {
+        let first = app.tmp.path().join(format!("book.part1.{ext}"));
+        let next = app.tmp.path().join(format!("book.part2.{ext}"));
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &first);
+        let next_cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &next);
+        let direct_value = meter(3, 5);
+        let cached_value = meter(4, 5);
+        app.persist_book_resume(first.clone(), 2, direct_value);
+        app.persist_book_resume(next.clone(), 0, meter(1, 5));
+        app.persist_book_resume(cache.clone(), 3, cached_value);
+        app.persist_book_resume(next_cache, 1, meter(2, 5));
+        set_pages(
+            &mut app,
+            [&first, &next]
+                .into_iter()
+                .map(|path| GridItem::ConvertibleArchive {
+                    path: path.clone(),
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                })
+                .collect(),
+        );
+        let first_key = crate::path_key::normalize_keep_drive(&first);
+        let next_key = crate::path_key::normalize_keep_drive(&next);
+        for (state, first_value, thumbnail_path) in [
+            (
+                Source::Direct(first.clone()),
+                direct_value,
+                Some(first.as_path()),
+            ),
+            (
+                Source::CachedZip {
+                    logical_source: first.clone(),
+                    path: cache.clone(),
+                },
+                cached_value,
+                Some(cache.as_path()),
+            ),
+            (
+                Source::Unavailable {
+                    logical_source: Some(first.clone()),
+                },
+                cached_value,
+                None,
+            ),
+        ] {
+            app.converted_archive_cache_paths.clear();
+            app.converted_archive_cache_paths
+                .insert(first_key.clone(), state.clone());
+            app.converted_archive_cache_paths
+                .insert(next_key.clone(), state);
+            let thumbnail_sources = app.converted_archive_cache_paths.clone();
+            assert_eq!(app.thumbnail_book_resume_meter(0), first_value);
+            assert_eq!(app.thumbnail_book_resume_meter(1), None, "later {ext}");
+            assert_eq!(app.thumbnail_resume_meter(1), None);
+            for idx in [0, 1] {
+                assert_converted_thumbnail_read_path(&app, idx, thumbnail_path);
+            }
+            app.settings.thumb_show_resume_meter = false;
+            assert_eq!(app.thumbnail_book_resume_meter(0), None);
+            assert_eq!(app.thumbnail_book_resume_meter(1), None);
+            app.settings.thumb_show_resume_meter = true;
+            assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+        }
+        for state in [
+            Source::Pending,
+            Source::Unavailable {
+                logical_source: None,
+            },
+        ] {
+            app.converted_archive_cache_paths
+                .insert(first_key.clone(), state.clone());
+            app.converted_archive_cache_paths
+                .insert(next_key.clone(), state);
+            assert_eq!(app.thumbnail_book_resume_meter(0), None);
+            assert_eq!(app.thumbnail_book_resume_meter(1), None);
+        }
+        // A filename alone does not prove a later volume: retain its own released row
+        // when the worker's logical source equals the cell path.
+        app.converted_archive_cache_paths
+            .insert(next_key, Source::Direct(next.clone()));
+        assert_eq!(app.thumbnail_book_resume_meter(1), meter(1, 5));
+    }
 }
 
 #[test]
@@ -1362,7 +1419,81 @@ fn book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_ke
 }
 
 #[test]
-fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_volume_key() {
+fn book_resume_meter_multipart_direct_worker_keeps_later_thumbnail_but_hides_meter() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::archive_converter::ArchiveFormat;
+    let mut app = setup_app();
+    settle(&mut app);
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+    let paths: Vec<_> = [1, 2]
+        .into_iter()
+        .map(|part| {
+            let name = format!("real-split-control.part{part}.rar");
+            let path = app.tmp.path().join(&name);
+            std::fs::copy(fixture.join(name), &path).unwrap();
+            path
+        })
+        .collect();
+    let first = &paths[0];
+    let next = &paths[1];
+    let inspection = crate::rar_loader::inspect_for_direct_read(next).unwrap();
+    assert_eq!(inspection.resolved_path, *first);
+    assert_eq!(
+        inspection.decision,
+        crate::rar_loader::RarDirectReadDecision::Direct
+    );
+    app.persist_book_resume(first.clone(), 0, meter(1, 1));
+    app.persist_book_resume(next.clone(), 0, meter(1, 5));
+    let next_cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), next);
+    app.persist_book_resume(next_cache, 0, meter(1, 5));
+    app.install_new_items(
+        paths
+            .iter()
+            .map(|path| GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Rar,
+            })
+            .collect(),
+        paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path).unwrap();
+                Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
+            })
+            .collect(),
+    );
+    assert_eq!(
+        app.thumbnail_book_resume_meter(0),
+        None,
+        "Pending is hidden"
+    );
+    assert_eq!(
+        app.thumbnail_book_resume_meter(1),
+        None,
+        "Pending is hidden"
+    );
+    for idx in [0, 1] {
+        refresh_converted_source(&mut app, idx);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx])),
+            Some(&Source::Direct(first.clone()))
+        );
+        assert_converted_thumbnail_read_path(&app, idx, Some(first));
+    }
+    let thumbnail_sources = app.converted_archive_cache_paths.clone();
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 1));
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.thumbnail_resume_meter(1), None);
+    app.settings.thumb_show_resume_meter = false;
+    assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+}
+
+#[test]
+fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_meter_only() {
     use crate::archive_converter::ArchiveFormat;
     let mut app = setup_app();
     settle(&mut app);
@@ -1404,19 +1535,38 @@ fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_volume_key() {
     // An unrelated row at the subsequent-volume would-be cache key must not win.
     let next_cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), next);
     app.persist_book_resume(next_cache, 0, meter(1, 5));
-    let meta = std::fs::metadata(next).unwrap();
     app.install_new_items(
-        vec![GridItem::ConvertibleArchive {
-            path: next.clone(),
-            format: ArchiveFormat::Rar,
-        }],
-        vec![Some((
-            crate::ui_helpers::mtime_secs(&meta),
-            meta.len() as i64,
-        ))],
+        paths
+            .iter()
+            .map(|path| GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Rar,
+            })
+            .collect(),
+        paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path).unwrap();
+                Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
+            })
+            .collect(),
     );
-    refresh_converted_source(&mut app, 0);
+    for idx in [0, 1] {
+        refresh_converted_source(&mut app, idx);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx])),
+            Some(&super::ConvertedArchiveSourceState::CachedZip {
+                logical_source: first.clone(),
+                path: cached.clone(),
+            })
+        );
+        assert_converted_thumbnail_read_path(&app, idx, Some(&cached));
+    }
+    let thumbnail_sources = app.converted_archive_cache_paths.clone();
     assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 1));
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
     delete_converted_cache(&mut app, first);
     assert!(!cached.exists());
     assert_eq!(
@@ -1424,15 +1574,33 @@ fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_volume_key() {
         None,
         "Pending is hidden"
     );
-    refresh_converted_source(&mut app, 0);
     assert_eq!(
-        app.converted_archive_cache_paths
-            .get(&crate::path_key::normalize_keep_drive(next)),
-        Some(&super::ConvertedArchiveSourceState::Unavailable {
-            logical_source: Some(first.clone())
-        })
+        app.thumbnail_book_resume_meter(1),
+        None,
+        "Pending is hidden"
     );
+    for idx in [0, 1] {
+        refresh_converted_source(&mut app, idx);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx])),
+            Some(&super::ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(first.clone())
+            })
+        );
+        assert_converted_thumbnail_read_path(&app, idx, None);
+    }
+    let thumbnail_sources = app.converted_archive_cache_paths.clone();
     assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 1));
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.thumbnail_resume_meter(1), None);
     app.settings.thumb_show_resume_meter = false;
     assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+    settle(&mut app);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((0, Some(1), Some(1)))
+    );
 }

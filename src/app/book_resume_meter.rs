@@ -240,10 +240,28 @@ impl App {
             | crate::grid_item::GridItem::ZipFile(path)
             | crate::grid_item::GridItem::PdfFile(path) => path,
             crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
-                match self
+                let source = self
                     .converted_archive_cache_paths
-                    .get(&crate::path_key::normalize_keep_drive(path))?
+                    .get(&crate::path_key::normalize_keep_drive(path))?;
+                // Header-confirmed later volumes retain thumbnail resolution, but cannot open.
+                // Use only the worker's existing source proof; no paint-time I/O/name inference.
+                let resolved = match source {
+                    super::ConvertedArchiveSourceState::Direct(resolved)
+                    | super::ConvertedArchiveSourceState::CachedZip {
+                        logical_source: resolved,
+                        ..
+                    }
+                    | super::ConvertedArchiveSourceState::Unavailable {
+                        logical_source: Some(resolved),
+                    } => Some(resolved),
+                    _ => None,
+                };
+                if crate::rar_loader::is_rar_path(path)
+                    && resolved.is_some_and(|resolved| !crate::folder_tree::path_eq(path, resolved))
                 {
+                    return None;
+                }
+                match source {
                     super::ConvertedArchiveSourceState::Direct(path)
                     | super::ConvertedArchiveSourceState::CachedZip { path, .. } => path,
                     super::ConvertedArchiveSourceState::Unavailable {

@@ -31468,6 +31468,7 @@ impl App {
                         if matches!(payload,
                             collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_)
                                 | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+                                | collection_navigation::PhysicalHistoryPreflightPayload::RarOpen
                         ) {
                             let CollectionHistoryPhase::ChildPreflighting { prepared, target, .. } =
                                 std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
@@ -31776,7 +31777,8 @@ impl App {
                         ctx.request_repaint();
                     } else {
                         if matches!(payload, collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_)
-                            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired) {
+                            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+                                | collection_navigation::PhysicalHistoryPreflightPayload::RarOpen) {
                             if self.start_staged_archive_conversion(request.request_id, &request.path,
         request.restore_intent.clone(),
     ) {

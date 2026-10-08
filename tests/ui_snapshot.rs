@@ -72,6 +72,8 @@ const STARTUP_DIALOG_CASES: &[(&str, &[&str])] = &[
     ("archive_converting", &["キャンセル"]),
     ("archive_error", &["閉じる"]),
     ("archive_publish_error", &["閉じる"]),
+    ("archive_later_volume_error", &["閉じる"]),
+    ("archive_no_images_error", &["閉じる"]),
 ];
 
 #[test]
@@ -262,11 +264,15 @@ fn startup_dialogs_small_viewport() {
                 harness.hover_at(egui::Pos2::ZERO);
                 harness.run_steps(3);
                 // Geometry and pointer assertions cover every case. Keep PNGs
-                // for representative views, the publish error, and settled highlights.
+                // for representative views, archive errors, and settled highlights.
                 let snapshot = ((width, height) == (1093, 614)
                     && matches!(
                         kind,
-                        "first_setup" | "archive_confirm" | "archive_publish_error"
+                        "first_setup"
+                            | "archive_confirm"
+                            | "archive_publish_error"
+                            | "archive_later_volume_error"
+                            | "archive_no_images_error"
                     ))
                     || (kind == "whats_new" && scale == 1.0);
                 if snapshot {
