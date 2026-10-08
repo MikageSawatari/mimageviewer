@@ -133,6 +133,8 @@
 - 実装レビューの5指摘を修正 (2026-10-08): Collection拒否時のfullscreen終端、toolbarの仮cursor投影、検索更新をまたぐコピー済み移動、Smart分類のrow/path証明、ZIP再読込の準備済みprefix整合。追加のrollback/stateを持たず、実handler・非同期交差の回帰で検証する。
 - 同根の通常ZIP openも修正 (2026-10-08): 検索結果・アドレスバー等でコピー済みpath/effectsを持つNavigationはSurface証明へ統一し、検索更新と分類／準備の交差を検証する。SmartGrid／Rating／Collectionの行依存検証は維持。選択箇所の棚卸しは[async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
 
+- proof第4回修正 (2026-10-08): コピー済み宛先はSurface、現行行／prepare snapshot依存はRowへ全受付・採用adapterを監査して統一。既存switch sequenceを全証明で照合し、Quick Folder再選択／往復・検索owner切替で未採用要求を退役。実ペインEnterと同queryの実検索refresh交差は許可。履歴／fullscreen scanは元証明を保持。監査表は [async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
+
 - 出典: 利用者が v4.4.0 リリース前の master 確認ビルド (2e84ee67f) で観測。手順:
   1. 一覧で拡張子の絞り込みをかける
   2. ZIP を開く (本はページを直接表示する設定)

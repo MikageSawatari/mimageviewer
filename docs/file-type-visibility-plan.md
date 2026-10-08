@@ -504,8 +504,15 @@ reload/ページ一覧復帰でcursor/route不変とする。BSをReplayと混�
 **`SourceProof`は行/prepare snapshot依存と、安定したsurface依存を区別する排他enum**とする。
 共通headerにitems generationやCollection revisionの一律一致条件を別途置かない。
 context/request、main採用資格、slot等の検証も、その要求が既存ownerから引き継ぐ証明を使う。
-slot-switch sequenceを使う既存要求では維持するが、Smartのleaseにない追加の失効規則を
-共通化の名目で導入しない。以下の分類はorigin名だけで決めず、入力が何を参照したかに基づく。
+2026-10-08 の第4回proof監査の決定: 後続の分類continuation／準備／採用がコピー済み宛先・effectsだけを
+読む要求はSurface、現在の行/index・sourceのprepare snapshotを読む要求はRowとする。
+拡張子・origin名・移動先の種類で選ばない。native row/revision validatorは別に維持する。
+既存`quick_folder_switch_sequence`をすべての証明が照合する共通switch epochとして使い、
+Quick Folderの同slot再選択／同target A→B→Aと検索owner/query/drill切替で進める。
+同queryの結果追加、PDF verification、Collection revisionでは進めず、Surfaceを無通知で取消さない。
+新しいepoch fieldやSmart lease fieldを増やす案と、待ち中のrow更新を凍結する案を比較し、
+既存sequence＋切替受理時の既存取消終端を選んだ。追加pending/rollbackや閲覧制限は不要である。
+全producer/consumerと退役境界のcode監査は [async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08) に記録する。
 
 | sourceの証明 | 保持・再検証するもの | 許容しない共通化 |
 | --- | --- | --- |
@@ -671,7 +678,7 @@ facet修正のためにratingの意味や永続値を変更せず、同じ採用
 | --- | --- |
 | open受理・分類・scan・列挙pending | source proofとtyped targetを一つの要求へcapture。要求自体はsourceの表示owner/current/active facet/stash/committed stackを書き換えない。同ownerの既存verification/revisionによるrow更新を凍結する意味ではなく、継続可否はSourceProofで判断。address/loading表示は要求からのpreviewで、採用した現在地と混同しない |
 | 成功 | §9.3.3を一回実行。同じZIPへの初回・history再入場・BS、Direct/CachedZip、warm/coldで結果が一致する |
-| 別open/連続Replay・A/B切替 | 通常pendingは取消・置換できる。Replay連打は同じplanをmove、別intentは表示中sourceから作り直す。slot切替の成功時だけtarget slot/routeを採用。切替前の遅延replyは各SourceProofの既存slot/sequenceまたはSmart leaseで棄却。slot別stashは作らない |
+| 別open/連続Replay・A/B切替 | 通常pendingは取消・置換できる。Replay連打は同じplanをmove、別intentは表示中sourceから作り直す。slot切替の成功時だけtarget slot/routeを採用。切替受理時に旧要求を退役させ、遅延replyは全SourceProofの共通switch epochとnative ownerで棄却。slot別stashは作らない |
 | conversion/password待ち | 未採用の同じ要求phaseとして既存モーダルの操作受付規則を維持。成功payloadまでfacet/履歴を変更しない |
 | sourceのsidecar待ち / destinationのsidecar hydration | sourceの既存hydration中は現行admission/input gateを維持。宛先ではstep 4までに移動・facet・履歴を採用してからsidecarを開始し、既存の待機表示/first-display/deferred fullscreenを仕上げる。sidecar結果で移動をrollbackしない |
 | 採用前のcancel・scan/列挙エラー・worker disconnect・refusal・stale | 要求とそのworker/cancel/leaseだけを退役し、表示中owner・facet・committed cursorを保つ。同ownerの既存metadata更新をundoしない。既存toast等の通知を使い、履歴snapshotの書戻し、retry、delayによる救済をしない |
@@ -712,6 +719,12 @@ sidecar import/quiescence/cache復元、input gate/holdoverも残せる。
 SourceProofのnative validatorを再利用し、共通のitems/revision guardで上書きしない。
 
 公開済み動作へのリスクと必須回帰:
+
+- **proof規則とswitch epoch**: Quick Folderの同slot再選択／同target A→B→Aに分類reply待ちを交差させ、
+  旧要求の取消と旧証明の失効の両方を検証。実ペインEnter→scan待ち→同queryの実検索worker更新では採用を維持。
+  コピー済み履歴宛先・RequiredFullscreen scanと同surface内のrow publicationの交差、query re-entryでの退役、SmartGrid等の行依存失効も検証する。
+  Search prepareのRowは送信前captureから保持し、採用直前に取り直さない。同じreader再選択では
+  採用済みBookmark AwaitingPage/帰路を保持し、未採用Resolvingだけを退役する。
 
 - **cursor記録時期/連打**: 通常folder←/→、toolbar、Alt+左右、mouse、ring/gamepadが同じhandlerに着地する。
   prescan/workerの双方で成功後だけcursor変更、同place dedup/MAX上限/forward消去、BSはDirect、

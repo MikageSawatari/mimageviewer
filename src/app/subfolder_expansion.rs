@@ -1775,6 +1775,7 @@ impl App {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
             HashSet::new(),
+            self.copied_destination_source_proof(),
         );
         self.start_subfolder_expansion_scan_roots_owned(root, roots, navigation);
     }
@@ -1783,10 +1784,11 @@ impl App {
         &mut self,
         history: MainHistoryOperation,
         removed_paths: HashSet<String>,
+        proof: MainListSourceProof,
     ) -> Option<SubfolderExpansionAdoption> {
         self.main_folder_history_available()
             .then(|| SubfolderExpansionAdoption {
-                navigation: self.capture_main_list_navigation(history, MainListSourceProof::Row),
+                navigation: self.capture_main_list_navigation(history, proof),
                 removed_paths,
             })
     }
@@ -1798,6 +1800,7 @@ impl App {
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
         let roots = normalize_expansion_roots(&root, roots);
+        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
         self.cancel_subfolder_expansion_pending();
         self.cancel_pending_folder_nav();
         self.subfolder_expansion_progress = Some(SubfolderExpansionProgress::default());
@@ -2043,6 +2046,7 @@ impl App {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
             HashSet::new(),
+            MainListSourceProof::Row,
         );
         self.apply_subfolder_expansion_result_owned(result, ctx, navigation);
     }
@@ -2086,6 +2090,7 @@ impl App {
         let navigation = self.capture_subfolder_expansion_adoption(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
             HashSet::new(),
+            MainListSourceProof::Row,
         );
         self.queue_or_install_subfolder_expansion_snapshot_owned(
             snapshot, show_toast, ctx, navigation,
@@ -2143,6 +2148,7 @@ impl App {
         let navigation = self.capture_subfolder_expansion_adoption(
             operation,
             self.subfolder_expansion_removed_paths.clone(),
+            MainListSourceProof::Row,
         );
         self.start_subfolder_expansion_prepare_owned(
             snapshot,
@@ -2159,6 +2165,7 @@ impl App {
         reused_metadata: Option<ReusedSubfolderMetadata>,
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
+        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
         if let Some(pending) = self.subfolder_expansion_install_pending.take() {
             pending.cancel();
         }
@@ -2404,6 +2411,11 @@ impl App {
             let owned = self.capture_subfolder_expansion_adoption(
                 MainHistoryOperation::Restore { route: None },
                 state.removed_paths,
+                if state.snapshot.is_some() {
+                    MainListSourceProof::Row
+                } else {
+                    self.copied_destination_source_proof()
+                },
             );
             if let Some(snapshot) = state.snapshot {
                 self.start_subfolder_expansion_prepare_owned(snapshot, false, None, owned);
@@ -2442,6 +2454,7 @@ impl App {
             let navigation = self.capture_subfolder_expansion_adoption(
                 MainHistoryOperation::Restore { route: None },
                 self.subfolder_expansion_removed_paths.clone(),
+                self.copied_destination_source_proof(),
             );
             self.start_subfolder_expansion_scan_roots_owned(root, roots, navigation);
             return true;

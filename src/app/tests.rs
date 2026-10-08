@@ -25562,6 +25562,276 @@ mod phase_c_folder_nav_history_tests {
         );
     }
 
+    #[test]
+    fn section1339_quick_folder_reselect_roundtrip_and_forget_retire_classification() {
+        for switch in [0, 1, 2] {
+            let mut app = setup_app();
+            let folder = app.tmp.path().to_path_buf();
+            let archive = folder.join("pending.7z");
+            std::fs::write(
+                &archive,
+                b"classification must not open conversion after switch",
+            )
+            .unwrap();
+            app.current_folder = Some(folder.clone());
+            app.set_quick_folder_slot_target(QuickFolderSlotId::B, folder.clone());
+            app.set_quick_folder_slot_target(QuickFolderSlotId::A, folder.clone());
+            app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                archive,
+                false,
+                super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            );
+            let pending = app.top_level_grid_view.open_path_classification().unwrap();
+            let navigation = pending.navigation.as_ref().unwrap().clone();
+            let cancel = pending.cancel.clone();
+            let history = app.folder_nav_history_snapshot();
+            // The real classification worker can reply, but completion polling is held until
+            // the actual quick-folder switch boundary has run, including its Current branch.
+            if switch == 1 {
+                assert_eq!(
+                    app.activate_quick_folder_slot(QuickFolderSlotId::B),
+                    QuickFolderSwitchTarget::Current
+                );
+            }
+            if switch == 2 {
+                app.execute_clear_quick_folder_slots();
+            } else {
+                assert_eq!(
+                    app.activate_quick_folder_slot(QuickFolderSlotId::A),
+                    QuickFolderSwitchTarget::Current
+                );
+            }
+            assert!(
+                !app.main_list_navigation_is_current(&navigation),
+                "same semantic path cannot resurrect an older switch epoch"
+            );
+            assert!(
+                app.top_level_grid_view.open_path_classification().is_none(),
+                "switch admission must retire its worker owner"
+            );
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            app.settle_open_path_classification_for_test();
+            assert!(app.archive_convert.is_none());
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+            assert_eq!(
+                app.folder_nav_history_snapshot().back_stack,
+                history.back_stack
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_pane_enter_scan_crosses_real_search_refresh() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let origin = app.tmp.path().join("pane-search-origin");
+        let directory = app.tmp.path().join("pane-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        let ctx = egui::Context::default();
+        app.settings.folder_tree_pane_visible = true;
+        app.sync_folder_pane_state(&ctx);
+        app.folder_pane.set_cursor(directory.clone());
+        app.folder_pane.set_focus_tree();
+        // Real pane keyboard gate consumes Enter and starts the real directory scan.
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(app.handle_folder_pane_keyboard(ctx).is_none());
+            },
+        );
+        assert!(app.folder_pane_open_pending.is_some());
+        refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                break ready;
+            }
+            assert!(
+                app.folder_pane_open_pending.is_some(),
+                "same-query result publication cannot cancel pane navigation"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane scan must complete"
+            );
+            std::thread::yield_now();
+        };
+        let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
+        app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+            ready.path,
+            Some(ready.scan),
+            super::OpenRequestOwner::Navigation,
+            None,
+            None,
+            ready.restore_intent,
+            ready.navigation,
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&directory));
+        assert_eq!(app.favsearch.nav_stack.last(), Some(&directory));
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(book.as_path()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_copied_history_destination_crosses_source_row_publication() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let directory = app.tmp.path().join("history-search-source");
+        let destination = app.tmp.path().join("history-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        app.current_folder = Some(directory.clone());
+        app.install_new_items(vec![GridItem::ZipFile(book.clone())], vec![None]);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(destination.clone()).into()];
+        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        // A source presentation publication changes rows, not the mounted Folder owner.
+        app.install_new_items(
+            vec![
+                GridItem::ZipFile(directory.join("earlier.zip")),
+                GridItem::ZipFile(book),
+            ],
+            vec![None, None],
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(app.folder_nav_back_stack.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_search_query_reentry_retires_pending_copied_open() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let folder = app.tmp.path().to_path_buf();
+        let book = folder.join("pending.zip");
+        write_1328_zip(&book);
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Global,
+            folder,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.global_search.query = "book".into();
+        app.global_search.last_executed = "book".into();
+        app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            book,
+            false,
+            super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        let navigation = match app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .unwrap()
+        {
+            super::HistoryNavigationTransition::Physical(request) => request.navigation.clone(),
+            _ => panic!("copied ZIP must own a Physical request"),
+        };
+        let ctx = egui::Context::default();
+        // The actual query-change/reset boundary owns re-entry even with the same text.
+        app.reset_global_search_for_query_change(&ctx);
+        app.global_search.last_executed = "book".into();
+        assert!(!app.main_list_navigation_is_current(&navigation));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.global_search.active);
+        assert_eq!(
+            app.current_folder,
+            Some(crate::app::search_results_synthetic_path())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_required_fullscreen_scan_keeps_original_proof_across_source_row_publication() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let directory = app.tmp.path().join("required-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        let image = directory.join("page.jpg");
+        write_1328_zip(&book);
+        std::fs::write(&image, b"destination image").unwrap();
+        let origin = app.tmp.path().join("required-source");
+        app.current_folder = Some(origin.clone());
+        app.install_new_items(vec![GridItem::Image(origin.join("old.jpg"))], vec![None]);
+        app.fullscreen_idx = Some(0);
+        app.start_folder_open_scan(
+            directory.clone(),
+            super::FolderOpenScanPurpose::RequiredFullscreenTarget {
+                target: crate::snapshot::SnapshotTarget::Fs(image.clone()),
+                history_trigger: super::HistoryTrigger::UserChosen,
+                navigation_purpose: super::FsNavigationPurpose::Ordinary,
+            },
+        );
+        app.install_new_items(
+            vec![GridItem::Image(origin.join("updated.jpg"))],
+            vec![None],
+        );
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                break ready;
+            }
+            assert!(app.folder_pane_open_pending.is_some());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        assert_eq!(app.current_folder.as_ref(), Some(&directory));
+        let idx = app
+            .fullscreen_idx
+            .expect("exact copied leaf must open after adoption");
+        assert_eq!(app.items[idx].drag_source_path(), Some(image.as_path()));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn section1339_search_result_zip_open_crosses_real_refresh_in_preflight() {

@@ -2290,6 +2290,9 @@ impl App {
             self.global_search.reject_message = Some("検索の準備中".to_string());
             return;
         }
+        if self.global_search.query != self.global_search.last_executed {
+            self.retire_main_list_requests_for_surface_switch();
+        }
         self.global_search.reset_for_new_query();
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
@@ -3075,7 +3078,7 @@ impl App {
     /// 実フォルダ全体ではなく「検索にヒットしたものだけ (+ ヒットを含む子フォルダ)」
     /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         // ドリルインはユーザーの明示操作 → 自動ビュー切替を止める (§4.3.2 (c))。
         self.global_search.aggregate_auto = false;
         self.global_search.drill = Some(DrillState {
@@ -3090,7 +3093,7 @@ impl App {
     /// container_root と is_zip は不変、current_path だけ更新する。
     pub(crate) fn drill_into_subfolder(&mut self, sub_path: PathBuf) {
         if let Some(d) = self.global_search.drill.clone() {
-            self.cancel_pending_folder_nav();
+            self.retire_main_list_requests_for_surface_switch();
             self.global_search.drill = Some(DrillState {
                 current_path: sub_path,
                 ..d
@@ -3155,7 +3158,7 @@ impl App {
     /// トップレベル (一覧 or 集約) に戻る (drill-down 状態から)。
     /// 戻り先は `aggregate` の値で決まる (§4.3.2 の導出モデル)。
     pub(crate) fn drill_back_to_top(&mut self) {
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
@@ -3187,7 +3190,7 @@ impl App {
                 // 経路でだけ復元する。
                 // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
                 self.global_search.restore_select_path = Some(d.current_path.clone());
-                self.cancel_pending_folder_nav();
+                self.retire_main_list_requests_for_surface_switch();
                 self.global_search.drill = Some(DrillState {
                     current_path: parent_pb,
                     ..d
@@ -3298,7 +3301,7 @@ impl App {
                 None
             };
             if let Some(next_path) = within {
-                self.cancel_pending_folder_nav();
+                self.retire_main_list_requests_for_surface_switch();
                 self.global_search.drill = Some(DrillState {
                     container_root: container_root.clone(),
                     current_path: next_path,
@@ -3326,7 +3329,7 @@ impl App {
             current_path: next.path.clone(),
             is_zip: matches!(next.kind, SearchContainerKind::Zip),
         });
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         self.rebuild_items_from_global_search();
     }
 
@@ -3758,7 +3761,7 @@ impl App {
 
     pub(crate) fn reset_global_search_for_query_change(&mut self, ctx: &egui::Context) {
         self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         self.global_search.last_change_at = Some(Instant::now());
         // Codex P3 対応: クエリが変わったら drill state を即リセットし、
         // 旧検索の pending / containers / all_hits も直ちに破棄してから空の

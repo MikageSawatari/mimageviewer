@@ -1455,6 +1455,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-08 §1.339 proof第4回監査・main切替要求の退役**
+
+mainのQuick Folder再選択／往復と検索owner切替を、既存sequence＋共通の未採用要求終了へ接続する。
+`main_folder_history_available`でmainだけを対象とし、main Bookmark resolver/Resolvingはnative IDで
+終了する。既存の`detached_lease`付きresolverは対象外。同じreaderの採用後AwaitingPage/帰路と
+committed warm PDF verificationは保持する。mainのsequenceをwindow bundleへ移さない。
+コピー前に元indexを読むDetachedGrid分類はRow、コピー後の読込は既存window lease/request IDで
+所有を証明する。detachedのmount/viewport/native reducer/placement/公開所有契約は変更しない。
+§9の単一main採用・要求別validator保持は8ca300171の独立構造レビューと利用者の実装指示に基づく。
+今回の実装担当の判断は、所有する受付境界で旧要求を終える構造修正であり、症状guardや追加stateではない。
+この修正版の設計担当検収・独立再レビューは待ちで、合意済みとは記録しない。
+全producer/consumer、scopeとphaseの監査は[async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)を参照。
+
 **2026-10-08 §1.350 r4 共有変換cache削除のsource-owner失効**
 
 利用者の独立レビュー指摘を受け、削除完了時の失効をmounted mapから全AtRest/Retiring

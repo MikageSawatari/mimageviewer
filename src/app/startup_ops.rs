@@ -897,6 +897,39 @@ impl App {
         self.finish_replaced_startup_open_pending(pending, reason);
     }
 
+    /// A main surface switch owns only its mounted bookmark request, never a reader lease.
+    pub(super) fn retire_main_bookmark_open_for_surface_switch(&mut self) {
+        let request_id = match self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .map(|pending| &pending.owner)
+        {
+            Some(StartupOpenPathOwner::Bookmark(owner)) => {
+                #[cfg(windows)]
+                if owner.detached_lease.is_some() {
+                    return;
+                }
+                Some(owner.request_id)
+            }
+            // AwaitingPage and media waits belong to the already mounted viewer. A Current
+            // reselect keeps that reader and its return target, just like sidecar hydration.
+            _ => self
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+                .filter(|pending| {
+                    matches!(
+                        pending.stage,
+                        crate::bookmark_browser::PendingBookOpenStage::Resolving
+                    )
+                })
+                .map(|pending| pending.request_id),
+        };
+        if let Some(request_id) = request_id {
+            self.cancel_bookmark_open_request(request_id, "main_surface_switch");
+        }
+    }
+
     /// Once resolution has completed, page enumeration/player setup may still be pending. A
     /// navigation to another container supersedes that remainder of the request as well.
     pub(crate) fn cancel_conflicting_bookmark_open_for_navigation(&mut self, path: &Path) {
@@ -1867,6 +1900,31 @@ mod tests {
             .unwrap();
         archive.write_all(b"image metadata fixture").unwrap();
         archive.finish().unwrap();
+    }
+
+    #[test]
+    fn section1339_quick_reselect_retires_unadopted_bookmark_but_keeps_adopted_hydration() {
+        for adopted in [false, true] {
+            let mut app = setup_app_for_test();
+            let path = app.tmp.path().join("reader.zip");
+            write_section1339_bookmark_zip(&path);
+            app.current_folder = Some(path.clone());
+            app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::A, path.clone());
+            let owner = arm_section1339_bookmark(&mut app, 303, &path);
+            if adopted {
+                assert!(app.begin_bookmark_page_wait(&owner));
+            }
+            assert_eq!(
+                app.activate_quick_folder_slot(super::super::QuickFolderSlotId::A),
+                super::super::QuickFolderSwitchTarget::Current
+            );
+            assert_eq!(
+                app.bookmark_open_pending.is_some(),
+                adopted,
+                "same visible reader retains post-adoption hydration and its return target"
+            );
+            assert_eq!(app.bookmark_view_target().is_some(), adopted);
+        }
     }
 
     #[test]

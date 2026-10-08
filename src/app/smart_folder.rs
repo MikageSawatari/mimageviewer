@@ -2109,7 +2109,7 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(super::MainListRequestOwner::Smart);
+        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2169,7 +2169,7 @@ impl App {
         )?;
         transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(super::MainListRequestOwner::Smart);
+        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2334,7 +2334,7 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(super::MainListRequestOwner::Smart);
+        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );

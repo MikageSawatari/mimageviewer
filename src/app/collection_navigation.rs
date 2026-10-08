@@ -1539,7 +1539,7 @@ impl App {
             navigation,
         };
         if request.navigation.is_some() {
-            self.retire_replaced_main_list_requests(super::MainListRequestOwner::Collection);
+            self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Collection));
         }
         self.top_level_grid_view
             .set_collection_navigation_pending(None);

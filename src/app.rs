@@ -1150,7 +1150,7 @@ impl FolderHistoryPlan {
 pub(crate) enum MainListSourceProof {
     /// Existing row-bound physical owners retain their generation/revision validators.
     Row,
-    /// Smart navigation uses the stable surface meaning, including owner generation.
+    /// Copied destinations use stable surface meaning; all proofs also check the switch epoch.
     Surface(smart_folder::SmartFolderSourceLease),
     /// Bookmark resolution belongs to the stable request ID and return target, not its rows.
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
@@ -1174,6 +1174,7 @@ pub(super) enum MainListRequestOwner {
     Smart,
     Collection,
     Pane,
+    Subfolder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1185,7 +1186,7 @@ pub(crate) enum MainHistoryOperation {
 }
 
 /// The only navigation value owns the return entry, native source proof and cursor intent.
-/// Native row fields are captured once and are deliberately not used for a Surface proof.
+/// Native row fields are captured once; Surface ignores row generation, never the switch epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MainListNavigation {
     history_before: Box<FolderNavHistorySnapshot>,
@@ -15531,6 +15532,7 @@ pub struct App {
     /// 現在ナビゲーション履歴を受け持つクイックフォルダスロット。
     pub(crate) active_quick_folder_slot: Option<QuickFolderSlotId>,
     /// Monotonic switch intent identity; even a same-path Current shortcut retires older replay.
+    /// Shared main surface-switch epoch; row publication and phase handoff never advance it.
     pub(crate) quick_folder_switch_sequence: u64,
     /// 検索クローズで検索前フォルダへ復帰する `load_folder` を履歴に積まないための
     /// ワンショット。検索中は `global_search.active` / `favsearch.active` で判定できるが、
@@ -22191,9 +22193,10 @@ impl App {
         fullscreen_close_origin: bool,
     ) {
         let collection_id = restore.identity.collection_id;
+        self.retire_replaced_main_list_requests(None);
         let navigation = self.capture_main_list_navigation(
             MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
-            MainListSourceProof::Row,
+            self.copied_destination_source_proof(),
         );
         self.adopt_direct_collection_shell(
             collection_id,
@@ -22709,7 +22712,9 @@ impl App {
     }
 
     pub(crate) fn main_list_navigation_is_current(&self, navigation: &MainListNavigation) -> bool {
-        if !self.main_folder_history_available() {
+        if !self.main_folder_history_available()
+            || self.quick_folder_switch_sequence != navigation.source_slot_switch_sequence
+        {
             return false;
         }
         let source_current = match &navigation.source_proof {
@@ -22722,7 +22727,6 @@ impl App {
                     && self.top_level_grid_view.generation() == navigation.source_surface_generation
                     && self.items_generation == navigation.source_items_generation
                     && self.active_quick_folder_slot == navigation.source_slot
-                    && self.quick_folder_switch_sequence == navigation.source_slot_switch_sequence
                     && self.folder_nav_current_entry() == navigation.source_location
             }
         };
@@ -23028,6 +23032,7 @@ impl App {
     }
 
     pub(crate) fn clear_quick_folder_slots(&mut self) {
+        self.retire_main_list_requests_for_surface_switch();
         for workspace in &mut self.quick_folder_workspaces {
             *workspace = QuickFolderWorkspace::default();
         }
@@ -23064,15 +23069,7 @@ impl App {
         &mut self,
         slot: QuickFolderSlotId,
     ) -> QuickFolderSwitchTarget {
-        self.quick_folder_switch_sequence = self.quick_folder_switch_sequence.wrapping_add(1);
-        self.replace_history_navigation_transition(None);
-        if let Some(pending) = self.rating_view_pending.as_ref()
-            && pending.navigation.is_some()
-        {
-            if let Some(pending) = self.rating_view_pending.take() {
-                pending.cancel();
-            }
-        }
+        self.retire_main_list_requests_for_surface_switch();
         let target = self.quick_folder_target(slot).cloned();
         self.cancel_pending_folder_nav();
         match target {
@@ -23809,7 +23806,7 @@ impl App {
                     target,
                     self.capture_main_list_navigation(
                         MainHistoryOperation::Replay(Box::new(plan)),
-                        MainListSourceProof::Row,
+                        self.copied_destination_source_proof(),
                     ),
                 )
             }
@@ -23820,12 +23817,7 @@ impl App {
             }?
             .clone();
             let plan = FolderHistoryPlan::capture(self, direction, target.clone())?;
-            let proof = if matches!(target.location, FolderNavHistoryTarget::SmartFolder(_)) {
-                self.smart_folder_source_lease()
-                    .map_or(MainListSourceProof::Row, MainListSourceProof::Surface)
-            } else {
-                MainListSourceProof::Row
-            };
+            let proof = self.copied_destination_source_proof();
             (
                 target,
                 self.capture_main_list_navigation(
@@ -23997,7 +23989,7 @@ impl App {
                     MainHistoryOperation::Restore {
                         route: Some(entry.route.clone()),
                     },
-                    MainListSourceProof::Row,
+                    self.copied_destination_source_proof(),
                 );
                 if self.dispatch_folder_history_entry(entry, nav) {
                     SyntheticFolderHistoryDispatch::Restored
@@ -24030,7 +24022,9 @@ impl App {
         } else {
             BookmarkSurfaceEntrance::Restore
         };
-        let navigation = self.capture_main_list_navigation(history, MainListSourceProof::Row);
+        self.retire_replaced_main_list_requests(None);
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
         let Some(prepared) = self.prepare_synthetic_surface(&target, drive_origin, entrance) else {
             return;
         };
@@ -25672,9 +25666,19 @@ impl App {
             | ClassifiedOpenContinuation::DirectScan { owner, .. } => {
                 Some(self.copied_open_source_proof(owner))
             }
-            // SmartGrid retains an index and derives kind after classification. Other
-            // native row/snapshot continuations also keep their strict source contract.
-            _ => Some(MainListSourceProof::Row),
+            ClassifiedOpenContinuation::BookmarkRow(_) => {
+                Some(self.copied_destination_source_proof())
+            }
+            ClassifiedOpenContinuation::Physical { intent, .. } => {
+                Some(self.physical_navigation_source_proof(intent))
+            }
+            ClassifiedOpenContinuation::Collection { .. } => {
+                Some(self.copied_destination_source_proof())
+            }
+            // These continuations read the original index after classification.
+            ClassifiedOpenContinuation::SmartGrid { .. } => Some(MainListSourceProof::Row),
+            #[cfg(windows)]
+            ClassifiedOpenContinuation::DetachedGrid { .. } => Some(MainListSourceProof::Row),
         };
         let navigation = if self.main_folder_history_available() {
             proof.map(|proof| {
@@ -25780,7 +25784,7 @@ impl App {
             _ => false,
         };
         if navigation.is_some() && !detached_destination && self.main_folder_history_available() {
-            self.retire_replaced_main_list_requests(MainListRequestOwner::Classification);
+            self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Classification));
         }
         let candidate = OpenPathClassification {
             request_id: NEXT_OPEN_PATH_CLASSIFICATION_ID.fetch_add(1, Ordering::Relaxed),
@@ -27276,11 +27280,23 @@ impl App {
         match owner {
             // These requests own the destination path/effects and never read a source index
             // after admission. Keep their semantic owner across same-query/folder row refreshes.
-            OpenRequestOwner::Navigation => self.copied_destination_source_proof(),
+            OpenRequestOwner::Navigation | OpenRequestOwner::QuickFolderSwitch(_) => {
+                self.copied_destination_source_proof()
+            }
+            OpenRequestOwner::MainGridArchive(intent)
+                if matches!(intent.smart_folder_owner, SmartGridArchiveOwner::None)
+                    && intent.rating_grid_owner.is_none()
+                    && intent.collection_grid_owner.is_none() =>
+            {
+                self.copied_destination_source_proof()
+            }
             OpenRequestOwner::Bookmark(owner) => MainListSourceProof::Bookmark(owner.clone()),
-            // Rating, Collection and grid-archive requests retain native row/snapshot owners.
+            // Requests with native row/snapshot owners retain their strict validators.
             // Their items/revision/index checks must remain strict, regardless of file suffix.
-            _ => MainListSourceProof::Row,
+            OpenRequestOwner::RatingPhysical(_)
+            | OpenRequestOwner::CollectionGridPhysical(_)
+            | OpenRequestOwner::MainGridArchive(_)
+            | OpenRequestOwner::DetachedGridArchive(_) => MainListSourceProof::Row,
         }
     }
 
@@ -29434,7 +29450,7 @@ impl App {
         if let Some(origin) = self.take_smart_folder_origin_for_search_entry() {
             transferred = Some(origin);
         }
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         if matches!(keep, SearchMode::LocalMeta) {
             return transferred;
         }
@@ -29708,6 +29724,11 @@ impl App {
     }
 
     pub(crate) fn execute_tag_view(&mut self) {
+        if self.tag_view.query != self.tag_view.last_executed
+            || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter
+        {
+            self.retire_main_list_requests_for_surface_switch();
+        }
         self.tag_view.last_executed = self.tag_view.query.clone();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
@@ -30003,6 +30024,9 @@ impl App {
     /// SQLite FTS クエリは通常数 ms だが、インデックスが大きいと数十〜数百 ms に
     /// 達し UI を止め得る。結果は `poll_favsearch` で受信する。
     pub(crate) fn execute_favsearch(&mut self) {
+        if self.favsearch.query != self.favsearch.last_executed {
+            self.retire_main_list_requests_for_surface_switch();
+        }
         self.favsearch.last_executed = self.favsearch.query.clone();
         let query = self.favsearch.query.trim().to_string();
         self.favsearch.nav_stack.clear();
@@ -30472,7 +30496,8 @@ impl App {
                 MainHistoryOperation::Replay(Box::new(plan))
             }
         };
-        let navigation = self.capture_main_list_navigation(history, MainListSourceProof::Row);
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
         self.start_collection_history_transition_owned(target, intent, return_to, navigation)
     }
 
@@ -30583,7 +30608,7 @@ impl App {
         {
             pending.cancel();
         }
-        self.retire_replaced_main_list_requests(MainListRequestOwner::Physical);
+        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Physical));
         let transition = CollectionHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
@@ -30653,17 +30678,20 @@ impl App {
 
     /// Retire unadopted sibling requests after admission succeeds. A phase handoff retains its
     /// native owner; the mounted source, committed cursor and warm verifier remain unchanged.
-    pub(super) fn retire_replaced_main_list_requests(&mut self, retained: MainListRequestOwner) {
+    pub(super) fn retire_replaced_main_list_requests(
+        &mut self,
+        retained: Option<MainListRequestOwner>,
+    ) {
         if !self.main_folder_history_available() {
             return;
         }
-        if retained != MainListRequestOwner::Classification {
+        if retained != Some(MainListRequestOwner::Classification) {
             self.top_level_grid_view.set_open_path_classification(None);
         }
-        if retained != MainListRequestOwner::Physical {
+        if retained != Some(MainListRequestOwner::Physical) {
             self.replace_history_navigation_transition(None);
         }
-        if retained != MainListRequestOwner::Rating
+        if retained != Some(MainListRequestOwner::Rating)
             && self
                 .rating_view_pending
                 .as_ref()
@@ -30672,22 +30700,39 @@ impl App {
         {
             pending.cancel();
         }
-        if retained != MainListRequestOwner::Pane {
+        if retained != Some(MainListRequestOwner::Pane) {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
         }
-        if retained != MainListRequestOwner::Smart {
+        if retained != Some(MainListRequestOwner::Smart) {
             self.retire_staged_smart_navigation_for_independent_intent();
         }
-        if retained != MainListRequestOwner::Collection
+        if retained != Some(MainListRequestOwner::Collection)
             && self.top_level_grid_view.collection_navigation_pending()
         {
             self.cancel_collection_navigation_intent();
         }
-        if retained != MainListRequestOwner::Classification {
+        if retained != Some(MainListRequestOwner::Subfolder) {
+            self.cancel_subfolder_expansion_pending();
+        }
+        if retained.is_none() {
+            self.retire_main_bookmark_open_for_surface_switch();
+        }
+        if retained != Some(MainListRequestOwner::Classification) {
             // A suffix classification is not yet file admission: Ignore may reject it, or
             // metadata may prove a directory. Its accepted continuation retires cold PDF.
             self.retire_direct_document_open_for_history_admission();
         }
+    }
+
+    /// Existing quick-folder sequence is the common switch epoch. Same-owner row publication
+    /// never calls this boundary; a reselect/query switch does, even if its path is unchanged.
+    pub(crate) fn retire_main_list_requests_for_surface_switch(&mut self) {
+        if !self.main_folder_history_available() {
+            return;
+        }
+        self.quick_folder_switch_sequence = self.quick_folder_switch_sequence.wrapping_add(1);
+        self.retire_replaced_main_list_requests(None);
+        self.cancel_pending_folder_nav();
     }
 
     fn replace_history_navigation_transition(&mut self, next: Option<HistoryNavigationTransition>) {
@@ -30728,6 +30773,27 @@ impl App {
         self.resume_retained_pdf_source(phase);
     }
 
+    fn physical_navigation_source_proof(
+        &self,
+        intent: &PhysicalHistoryIntent,
+    ) -> MainListSourceProof {
+        match intent {
+            PhysicalHistoryIntent::MainGridArchive { owner, .. } => {
+                self.copied_open_source_proof(&OpenRequestOwner::MainGridArchive(owner.clone()))
+            }
+            PhysicalHistoryIntent::Bookmark { owner, .. } => {
+                MainListSourceProof::Bookmark(owner.clone())
+            }
+            PhysicalHistoryIntent::Rating { .. } | PhysicalHistoryIntent::CollectionGrid { .. } => {
+                MainListSourceProof::Row
+            }
+            PhysicalHistoryIntent::Navigation { .. }
+            | PhysicalHistoryIntent::RequiredFullscreen { .. }
+            | PhysicalHistoryIntent::CollectionNavigation { .. }
+            | PhysicalHistoryIntent::QuickFolder { .. } => self.copied_destination_source_proof(),
+        }
+    }
+
     fn start_physical_history_transition_with_dfs(
         &mut self,
         intent: PhysicalHistoryIntent,
@@ -30759,7 +30825,8 @@ impl App {
         let Some(history) = self.physical_navigation_operation(&intent) else {
             return false;
         };
-        let navigation = self.capture_main_list_navigation(history, MainListSourceProof::Row);
+        let proof = self.physical_navigation_source_proof(&intent);
+        let navigation = self.capture_main_list_navigation(history, proof);
         if Self::path_needs_open_classification(&path) {
             return match self.start_open_path_classification_with_navigation(
                 path.clone(),
@@ -30856,7 +30923,7 @@ impl App {
         {
             pending.cancel();
         }
-        self.retire_replaced_main_list_requests(MainListRequestOwner::Physical);
+        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Physical));
         let request = PhysicalHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
@@ -33195,7 +33262,8 @@ impl App {
                 MainHistoryOperation::Replay(Box::new(plan))
             }
         };
-        let navigation = self.capture_main_list_navigation(history, MainListSourceProof::Row);
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
         self.start_rating_navigation_owned(
             stars,
             intent,
@@ -33217,7 +33285,7 @@ impl App {
             return;
         }
         self.cancel_replaced_staged_archive_conversion();
-        self.retire_replaced_main_list_requests(MainListRequestOwner::Rating);
+        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Rating));
         let select_opened_path = matches!(&navigation.history, MainHistoryOperation::Replay(_))
             .then(|| self.effective_folder())
             .flatten();
@@ -34434,7 +34502,7 @@ impl App {
         if self.main_folder_history_available() {
             let navigation = self.capture_main_list_navigation(
                 MainHistoryOperation::SameLocation,
-                MainListSourceProof::Row,
+                self.copied_destination_source_proof(),
             );
             let owner = self.current_folder_reload_owner(zip_path);
             let Some(intent) = Self::physical_open_intent(&owner, auto_fullscreen) else {
@@ -46374,7 +46442,7 @@ impl App {
         let navigation = self.main_folder_history_available().then(|| {
             self.capture_main_list_navigation(
                 MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
-                MainListSourceProof::Row,
+                self.copied_destination_source_proof(),
             )
         });
         self.open_bookmark_browser_row_classified_with_navigation(ctx, row, navigation);
@@ -52394,7 +52462,7 @@ impl App {
                     | FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
             )
         {
-            self.retire_replaced_main_list_requests(MainListRequestOwner::Pane);
+            self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Pane));
             if let Some(request_id) =
                 self.startup_open_path_resolve_pending
                     .as_ref()
@@ -52439,7 +52507,14 @@ impl App {
             } else {
                 MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
             };
-            let proof = if matches!(purpose, FolderOpenScanPurpose::JumpToPhysicalFolder { .. }) {
+            let proof = if !matches!(
+                purpose,
+                FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                    | FolderOpenScanPurpose::GridFolderCandidate {
+                        collection_owner: Some(_),
+                        ..
+                    }
+            ) {
                 self.copied_destination_source_proof()
             } else {
                 MainListSourceProof::Row
@@ -52907,6 +52982,7 @@ impl App {
                     target,
                     history_trigger,
                     navigation_purpose,
+                    ready.navigation,
                 );
                 None
             }
@@ -53079,6 +53155,7 @@ impl App {
                     target,
                     history_trigger,
                     navigation_purpose,
+                    ready.navigation,
                 );
                 DetachedPhysicalFolderOpenPoll::Applied
             }

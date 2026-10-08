@@ -1905,7 +1905,31 @@ impl App {
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
         navigation_purpose: crate::app::FsNavigationPurpose,
+        navigation: Option<super::MainListNavigation>,
     ) {
+        if let Some(navigation) = navigation {
+            // Transfer the scan's proof to the existing prepared Physical owner. Its adoption
+            // validates the source BEFORE fullscreen preparation dismisses a snapshot.
+            self.snapshot_internal_nav = true;
+            let started = self.start_physical_history_transition_classified(
+                super::PhysicalHistoryIntent::RequiredFullscreen {
+                    target,
+                    history_trigger,
+                    navigation_purpose,
+                },
+                folder_path,
+                None,
+                Some(super::OpenPathKind::Directory),
+                super::StartupListIntent::PageContinuation,
+                navigation,
+                Some(scan),
+            );
+            if started {
+                self.poll_collection_history_transition(ctx);
+            }
+            self.snapshot_internal_nav = false;
+            return;
+        }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;

@@ -1904,10 +1904,11 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return;
         }
+        self.retire_replaced_main_list_requests(None);
         let origin = self.collection_open_return_origin(collection_id, false);
         let nav = self.capture_main_list_navigation(
             super::MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
-            super::MainListSourceProof::Row,
+            self.copied_destination_source_proof(),
         );
         self.adopt_direct_collection_shell(collection_id, None, origin, nav, false);
     }
