@@ -608,9 +608,9 @@ pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
-    draw_cell, draw_cut_badge, draw_spread_pair_cursor, grid_tag_badge_hit_rect,
-    layout_cell_overlays, paint_thumbnail_resume_meter, primary_grid_tag_for_badge,
-    tq_draw_preview,
+    ThumbnailHitAreas, draw_cell, draw_cell_with_hit_areas, draw_cut_badge,
+    draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
+    paint_thumbnail_resume_meter, primary_grid_tag_for_badge, tq_draw_preview,
 };
 use metadata_ops::{
     DetailsSortPrimary, DetailsSortRow, cmp_option_last, ctrl_f_progress_total,
@@ -13783,11 +13783,17 @@ struct PendingGridClick {
     at: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridPressTarget {
+    Cell(usize),
+    Background,
+}
+
 /// セル／背景のクリック対の単一 owner。セルの既存条件を保ち、背景だけ距離・入力種別を照合する。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct GridClickPairingState {
     pending: Option<PendingGridClick>,
-    background_press: Option<(GridBackgroundClickContext, u64)>,
+    primary_press: Option<(GridBackgroundClickContext, u64, GridPressTarget)>,
 }
 
 impl GridClickPairingState {
@@ -13822,13 +13828,13 @@ impl GridClickPairingState {
 
     pub(crate) fn validate_background(&mut self, context: GridBackgroundClickContext, frame: u64) {
         // A missing grid frame means the surface was closed/hidden. Do not carry a pair back.
-        if self.background_press.is_some_and(|(press, last_frame)| {
+        if self.primary_press.is_some_and(|(press, last_frame, _)| {
             press.items_generation != context.items_generation
                 || press.view_mode != context.view_mode
                 || press.viewport != context.viewport
                 || frame.saturating_sub(last_frame) > 1
         }) {
-            self.background_press = None;
+            self.primary_press = None;
         }
         if self.pending.is_some_and(|pending| match pending.target {
             GridClickTarget::Background {
@@ -13846,7 +13852,7 @@ impl GridClickPairingState {
             self.pending = None;
         }
         // Keep the live background identity current through ordinary idle frames.
-        if let Some((_, last_frame)) = &mut self.background_press {
+        if let Some((_, last_frame, _)) = &mut self.primary_press {
             *last_frame = frame;
         }
         if let Some(PendingGridClick {
@@ -13862,7 +13868,12 @@ impl GridClickPairingState {
     }
 
     pub(crate) fn end_background_run(&mut self) {
-        self.background_press = None;
+        if self
+            .primary_press
+            .is_some_and(|(_, _, target)| target == GridPressTarget::Background)
+        {
+            self.primary_press = None;
+        }
         if self
             .pending
             .is_some_and(|pending| matches!(pending.target, GridClickTarget::Background { .. }))
@@ -13872,7 +13883,7 @@ impl GridClickPairingState {
     }
 
     pub(crate) fn background_press_cancel(&mut self) {
-        self.background_press = None;
+        self.primary_press = None;
     }
 
     pub(crate) fn begin_background_press(
@@ -13880,7 +13891,30 @@ impl GridClickPairingState {
         context: GridBackgroundClickContext,
         frame: u64,
     ) {
-        self.background_press = Some((context, frame));
+        self.primary_press = Some((context, frame, GridPressTarget::Background));
+    }
+
+    pub(crate) fn begin_cell_press(
+        &mut self,
+        context: GridBackgroundClickContext,
+        frame: u64,
+        index: usize,
+    ) {
+        self.primary_press = Some((context, frame, GridPressTarget::Cell(index)));
+    }
+
+    pub(crate) fn take_cell_press(
+        &mut self,
+        previous: Self,
+        context: GridBackgroundClickContext,
+        index: usize,
+    ) -> bool {
+        self.primary_press
+            .take()
+            .or(previous.primary_press)
+            .is_some_and(|(press, _, target)| {
+                press == context && target == GridPressTarget::Cell(index)
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13894,8 +13928,10 @@ impl GridClickPairingState {
         max_delay: f64,
         max_dist: f32,
     ) -> bool {
-        let press = self.background_press.take().or(previous.background_press);
-        if !press.is_some_and(|(press_context, _)| press_context == context) {
+        let press = self.primary_press.take().or(previous.primary_press);
+        if !press.is_some_and(|(press_context, _, target)| {
+            press_context == context && target == GridPressTarget::Background
+        }) {
             self.pending = None;
             return false;
         }

@@ -26,8 +26,7 @@ pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
 #[doc(hidden)]
 pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings::default();
-    settings.grid_background_double_click_action =
-        crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+    settings.grid_background_double_click_parent = true;
     pages::draw_grid_background_double_click_setting(ui, &mut settings);
 }
 

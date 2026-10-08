@@ -99353,8 +99353,7 @@ mod background_click_scroll_regression_tests {
             app.settings.grid_view_mode = view;
             // Ctrl+wheel is still accepted at the column limit, without saving a change.
             app.settings.grid_cols = crate::settings::MAX_GRID_COLS;
-            app.settings.grid_background_double_click_action =
-                crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+            app.settings.grid_background_double_click_parent = true;
             let mut harness = harness(app);
             harness
                 .ctx
@@ -99397,8 +99396,7 @@ mod background_click_scroll_regression_tests {
         install_items(&mut app, &origin.join("child"), 41);
         app.settings.grid_view_mode = view;
         app.settings.grid_cols = 4;
-        app.settings.grid_background_double_click_action =
-            crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+        app.settings.grid_background_double_click_parent = true;
         app.scroll_offset_y = 100_000.0;
         let mut harness = harness(app);
         harness
@@ -99456,5 +99454,530 @@ mod background_click_scroll_regression_tests {
     #[test]
     fn background_scroll_snapshot_return_details_keeps_new_offset() {
         snapshot_return_keeps_new_scroll(crate::settings::GridViewMode::Details);
+    }
+
+    fn letterbox_harness(size: [usize; 2]) -> Harness<'static, State> {
+        let mut app = setup_app_for_test();
+        let child = app.tmp.path().join("child");
+        install_items(&mut app, &child, 1);
+        app.settings.grid_cols = 4;
+        app.settings.grid_background_double_click_parent = true;
+        app.selected = Some(0);
+        let mut harness = harness(app);
+        harness.run_steps(6);
+        let tex = harness.ctx.load_texture(
+            "letterbox-test",
+            egui::ColorImage::filled(size, egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Loaded {
+            tex,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            rendered_at_px: size[0].max(size[1]) as u32,
+            source_dims: None,
+            layout_dims: None,
+        };
+        harness.run_steps(6);
+        harness
+    }
+
+    #[test]
+    fn letterbox_real_grid_portrait_single_click_clears_selection() {
+        let mut harness = letterbox_harness([40, 120]);
+        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.selected, None);
+    }
+
+    #[test]
+    fn letterbox_real_grid_portrait_double_click_requests_parent() {
+        let mut harness = letterbox_harness([40, 120]);
+        let parent = harness.state().app.tmp.path().to_path_buf();
+        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        click(&mut harness, pos);
+        click(&mut harness, pos);
+        assert_eq!(harness.state().navs.len(), 1);
+        assert!(
+            matches!(&harness.state().navs[0], crate::ui_main::AddressBarNav::Direct(path, _) if path == &parent)
+        );
+    }
+
+    fn cell_rect(harness: &Harness<'_, State>) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(8.0, 8.0),
+            egui::vec2(
+                harness.state().app.last_cell_size,
+                harness.state().app.last_cell_h,
+            ),
+        )
+    }
+
+    #[test]
+    fn letterbox_real_grid_landscape_and_cell_padding_are_background() {
+        for padding in [false, true] {
+            let mut harness = letterbox_harness([120, 40]);
+            let rect = cell_rect(&harness);
+            let pos = if padding {
+                rect.min + egui::vec2(1.0, rect.height() * 0.5)
+            } else {
+                rect.min + egui::vec2(rect.width() * 0.5, 5.0)
+            };
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, pos);
+            assert!(matches!(
+                harness.state().navs.as_slice(),
+                [crate::ui_main::AddressBarNav::Direct(_, _)]
+            ));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_image_and_filename_remain_item_areas() {
+        for filename in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let painter = harness.ctx.layer_painter(egui::LayerId::background());
+            let app = &harness.state().app;
+            let layout = crate::app::layout_cell_overlays(
+                &painter,
+                rect,
+                Default::default(),
+                0,
+                &app.items[0],
+                &app.thumbnails[0],
+                &[],
+                None,
+                false,
+                app.settings.video_thumbnail_indicator,
+                false,
+                None,
+                None,
+                app.settings.thumb_show_resume_meter,
+            );
+            let pos = if filename {
+                layout
+                    .bottom_left
+                    .filename
+                    .as_ref()
+                    .expect("filename plate")
+                    .rect
+                    .center()
+            } else {
+                rect.center()
+            };
+            harness.state_mut().app.selected = None;
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, Some(0));
+            click(&mut harness, pos);
+            assert!(matches!(
+                harness.state().navs.as_slice(),
+                [crate::ui_main::AddressBarNav::GridVirtual(_)]
+            ));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_disabled_preserves_whole_cell_open() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .grid_background_double_click_parent = false;
+        harness.state_mut().app.selected = None;
+        let pos = cell_rect(&harness).min + egui::vec2(5.0, cell_rect(&harness).height() * 0.5);
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.selected, Some(0));
+        click(&mut harness, pos);
+        assert!(matches!(
+            harness.state().navs.as_slice(),
+            [crate::ui_main::AddressBarNav::GridVirtual(_)]
+        ));
+    }
+
+    #[test]
+    fn letterbox_real_grid_mixed_clicks_in_same_cell_do_not_pair() {
+        for image_first in [true, false] {
+            let mut harness = letterbox_harness([40, 120]);
+            let image = cell_rect(&harness).center();
+            let background =
+                cell_rect(&harness).min + egui::vec2(5.0, cell_rect(&harness).height() * 0.5);
+            let (first, second) = if image_first {
+                (image, background)
+            } else {
+                (background, image)
+            };
+            click(&mut harness, first);
+            click(&mut harness, second);
+            assert!(harness.state().navs.is_empty());
+            click(&mut harness, second);
+            assert_eq!(harness.state().navs.len(), 1);
+            assert_eq!(
+                matches!(
+                    harness.state().navs[0],
+                    crate::ui_main::AddressBarNav::Direct(_, _)
+                ),
+                image_first
+            );
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_press_release_targets_and_separate_frames() {
+        for image_first in [true, false] {
+            let mut harness = letterbox_harness([40, 120]);
+            // Cross a boundary by less than egui's max_click_dist so the release is a click.
+            let cell = cell_rect(&harness);
+            let image_left = cell.center().x - (cell.height() - 8.0) / 6.0;
+            let inside = egui::pos2(image_left + 1.0, cell.center().y);
+            let outside = egui::pos2(image_left - 1.0, cell.center().y);
+            let (press, release) = if image_first {
+                (inside, outside)
+            } else {
+                (outside, inside)
+            };
+            harness.state_mut().app.selected = None;
+            harness.hover_at(press);
+            harness.event(egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            harness.hover_at(release);
+            harness.event(egui::Event::PointerButton {
+                pos: release,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, release);
+            assert!(harness.state().navs.is_empty());
+            click(&mut harness, release);
+            assert_eq!(harness.state().navs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_rotation_and_dpi_follow_drawn_image() {
+        for ppp in [1.0, 1.25, 2.0] {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.ctx.set_pixels_per_point(ppp);
+            harness
+                .state_mut()
+                .app
+                .rotation_cache
+                .insert(0, crate::rotation_db::Rotation::Cw90);
+            harness.run_steps(6);
+            let rect = cell_rect(&harness);
+            // Rotated landscape texture leaves a top letterbox rather than a side letterbox.
+            let background = rect.min + egui::vec2(rect.width() * 0.5, 5.0);
+            click(&mut harness, background);
+            assert_eq!(harness.state().app.selected, None, "DPI {ppp}");
+            click(&mut harness, rect.center());
+            assert_eq!(harness.state().app.selected, Some(0), "DPI {ppp}");
+            assert!(harness.state().navs.is_empty());
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_loaded_media_and_folder_variants() {
+        let kinds: Vec<GridItem> = vec![
+            GridItem::Image("picture.png".into()),
+            GridItem::Video("movie.mp4".into()),
+            GridItem::Folder("folder".into()),
+            GridItem::PdfFile("book.pdf".into()),
+            GridItem::ConvertibleArchive {
+                path: "book.rar".into(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::ZipImage {
+                zip_path: "book.zip".into(),
+                entry_name: "page.png".into(),
+            },
+            GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: Some("chapter/page.png".into()),
+            },
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "nested.zip/".into(),
+                is_archive: true,
+                representative: Some("nested.zip/page.png".into()),
+            },
+            GridItem::Stack {
+                key: "page".into(),
+                representative: "page01.png".into(),
+                count: 3,
+            },
+        ];
+        for item in kinds {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.state_mut().app.items[0] = item.clone();
+            harness.state_mut().app.selected = None;
+            harness.run_steps(4);
+            let rect = cell_rect(&harness);
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            click(&mut harness, background);
+            assert_eq!(harness.state().app.selected, None, "{item:?}");
+            click(&mut harness, rect.center());
+            assert_eq!(harness.state().app.selected, Some(0), "{item:?}");
+            assert!(harness.state().navs.is_empty(), "{item:?}");
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_no_letterbox_for_audio_or_placeholder_plates() {
+        for state in [
+            ThumbnailState::Pending,
+            ThumbnailState::Evicted,
+            ThumbnailState::Failed,
+        ] {
+            for audio in [false, true] {
+                let mut harness = letterbox_harness([40, 120]);
+                harness.state_mut().app.thumbnails[0] = state.clone();
+                if audio {
+                    harness.state_mut().app.items[0] = GridItem::Audio("song.mp3".into());
+                }
+                harness.state_mut().app.selected = None;
+                harness.run_steps(4);
+                let rect = cell_rect(&harness);
+                click(
+                    &mut harness,
+                    rect.min + egui::vec2(5.0, rect.height() * 0.5),
+                );
+                assert_eq!(harness.state().app.selected, Some(0));
+                click(
+                    &mut harness,
+                    rect.min + egui::vec2(1.0, rect.height() * 0.5),
+                );
+                assert_eq!(harness.state().app.selected, None);
+                assert!(harness.state().navs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_and_drive_icons_protect_only_drawn_area() {
+        for drive in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+            harness.state_mut().app.items[0] = GridItem::Folder("C:\\".into());
+            harness.state_mut().app.items_are_drive_list = drive;
+            harness.state_mut().app.selected = None;
+            harness.run_steps(4);
+            let rect = cell_rect(&harness);
+            click(
+                &mut harness,
+                rect.min + egui::vec2(5.0, rect.height() * 0.5),
+            );
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, rect.center() - egui::vec2(0.0, 14.0));
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().navs.is_empty());
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_check_mode_preserves_background_checks() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.state_mut().app.settings.grid_click_selection_mode =
+            crate::settings::GridClickSelectionMode::Check;
+        harness.state_mut().app.checked.insert(0);
+        let rect = cell_rect(&harness);
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.5),
+        );
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().app.checked.contains(&0));
+        assert!(harness.state().navs.is_empty());
+    }
+
+    fn touch_event(harness: &mut Harness<'_, State>, phase: egui::TouchPhase, pos: egui::Pos2) {
+        harness.event(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            phase,
+            pos,
+            force: None,
+        });
+        match phase {
+            egui::TouchPhase::Start => {
+                harness.event(egui::Event::PointerMoved(pos));
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            egui::TouchPhase::End => {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.event(egui::Event::PointerGone);
+            }
+            egui::TouchPhase::Move => harness.event(egui::Event::PointerMoved(pos)),
+            egui::TouchPhase::Cancel => harness.event(egui::Event::PointerGone),
+        }
+        harness.step();
+    }
+
+    #[test]
+    fn letterbox_real_grid_touch_double_tap_and_image_mixing() {
+        for image_first in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            let first = if image_first {
+                rect.center()
+            } else {
+                background
+            };
+            for pos in [first, background] {
+                touch_event(&mut harness, egui::TouchPhase::Start, pos);
+                touch_event(&mut harness, egui::TouchPhase::End, pos);
+            }
+            assert_eq!(harness.state().navs.len(), usize::from(!image_first));
+            if image_first {
+                touch_event(&mut harness, egui::TouchPhase::Start, background);
+                touch_event(&mut harness, egui::TouchPhase::End, background);
+                assert_eq!(harness.state().navs.len(), 1);
+            }
+            assert!(matches!(
+                harness.state().navs[0],
+                crate::ui_main::AddressBarNav::Direct(_, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_touch_scroll_ends_pair() {
+        let mut harness = letterbox_harness([40, 120]);
+        let rect = cell_rect(&harness);
+        let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        touch_event(&mut harness, egui::TouchPhase::Start, pos);
+        let moved = pos + egui::vec2(0.0, 40.0);
+        touch_event(&mut harness, egui::TouchPhase::Move, moved);
+        touch_event(&mut harness, egui::TouchPhase::End, moved);
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_adjusted_texture_owns_its_actual_fit() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.state_mut().app.items[0] = GridItem::Image("adjusted.png".into());
+        let tex = harness.ctx.load_texture(
+            "letterbox-adjusted",
+            egui::ColorImage::filled([120, 40], egui::Color32::RED),
+            Default::default(),
+        );
+        harness.state_mut().app.thumb_adjust_tex.insert(0, tex);
+        harness.run_steps(4);
+        let rect = cell_rect(&harness);
+        let top = rect.min + egui::vec2(rect.width() * 0.5, 5.0);
+        click(&mut harness, top);
+        assert_eq!(harness.state().app.selected, None);
+        // The replacement landscape image occupies the side that the source portrait did not.
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.5),
+        );
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_search_representative_and_label_plate() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.state_mut().app.items[0] = GridItem::SearchContainer {
+            path: "parent/child".into(),
+            kind: crate::grid_item::SearchContainerKind::Folder,
+            hit_count: 3,
+            representative: Some(crate::grid_item::ContainerRepresentative {
+                path: "page.png".into(),
+                zip_entry: None,
+                pdf_page: None,
+            }),
+        };
+        harness.run_steps(4);
+        let rect = cell_rect(&harness);
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.3),
+        );
+        assert_eq!(harness.state().app.selected, None);
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.8),
+        );
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_format_and_check_badges_remain_item_areas() {
+        for check in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            if check {
+                harness.state_mut().app.checked.insert(0);
+            }
+            let painter = harness.ctx.layer_painter(egui::LayerId::background());
+            let app = &harness.state().app;
+            let layout = crate::app::layout_cell_overlays(
+                &painter,
+                rect,
+                Default::default(),
+                0,
+                &app.items[0],
+                &app.thumbnails[0],
+                &[],
+                None,
+                false,
+                app.settings.video_thumbnail_indicator,
+                check,
+                None,
+                None,
+                app.settings.thumb_show_resume_meter,
+            );
+            let pos = if check {
+                layout.check.expect("check badge").center()
+            } else {
+                layout
+                    .bottom_left
+                    .container
+                    .as_ref()
+                    .expect("ZIP badge")
+                    .rect
+                    .center()
+            };
+            harness.state_mut().app.selected = None;
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().navs.is_empty());
+        }
     }
 }

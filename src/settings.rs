@@ -610,37 +610,6 @@ impl GridClickSelectionMode {
     }
 }
 
-/// 一覧背景のダブルクリック／ダブルタップへの割り当て。未知 ID は無操作へ正規化する。
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum GridBackgroundDoubleClickAction {
-    #[default]
-    None,
-    ParentFolder,
-    #[serde(other)]
-    Unknown,
-}
-
-impl GridBackgroundDoubleClickAction {
-    pub fn normalized(self) -> Self {
-        match self {
-            Self::Unknown => Self::None,
-            action => action,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self.normalized() {
-            Self::ParentFolder => "親フォルダへ",
-            _ => "なし",
-        }
-    }
-
-    pub fn all() -> &'static [Self] {
-        &[Self::None, Self::ParentFolder]
-    }
-}
-
 // -----------------------------------------------------------------------
 // 動画サムネイルの目印
 // -----------------------------------------------------------------------
@@ -4225,7 +4194,7 @@ pub struct Settings {
     #[serde(default)]
     pub grid_open_selected_item_on_click: bool,
     #[serde(default)]
-    pub grid_background_double_click_action: GridBackgroundDoubleClickAction,
+    pub grid_background_double_click_parent: bool,
     #[serde(default)]
     pub grid_cursor_wrap: bool,
     #[serde(default)]
@@ -7331,7 +7300,7 @@ impl Default for Settings {
             grid_view_mode: GridViewMode::default(),
             grid_click_selection_mode: GridClickSelectionMode::default(),
             grid_open_selected_item_on_click: false,
-            grid_background_double_click_action: GridBackgroundDoubleClickAction::None,
+            grid_background_double_click_parent: false,
             grid_cursor_wrap: false,
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
@@ -9902,9 +9871,8 @@ impl Settings {
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
-        self.grid_background_double_click_action =
-            self.grid_background_double_click_action.normalized();
-        // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
+        // grid_open_selected_item_on_click / grid_background_double_click_parent /
+        // grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
@@ -11981,31 +11949,25 @@ mod tests {
     }
 
     #[test]
-    fn grid_background_double_click_settings_default_unknown_and_roundtrip() {
-        assert_eq!(
-            Settings::default().grid_background_double_click_action,
-            GridBackgroundDoubleClickAction::None
-        );
-        let old: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(
-            old.grid_background_double_click_action,
-            GridBackgroundDoubleClickAction::None
-        );
-        for id in ["parent_folder", "future_action"] {
-            let mut settings: Settings = serde_json::from_value(
-                serde_json::json!({"grid_background_double_click_action": id}),
-            )
+    fn grid_background_double_click_settings_default_and_roundtrip() {
+        assert!(!Settings::default().grid_background_double_click_parent);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.grid_background_double_click_parent);
+        // The enum was never released. Its old field is ignored, with no migration.
+        let old: Settings = serde_json::from_value(serde_json::json!({
+            "grid_background_double_click_action": "parent_folder"
+        }))
+        .unwrap();
+        assert!(!old.grid_background_double_click_parent);
+        for enabled in [false, true] {
+            let mut settings: Settings = serde_json::from_value(serde_json::json!({
+                "grid_background_double_click_parent": enabled
+            }))
             .unwrap();
             settings.sanitize();
-            let expected = if id == "parent_folder" {
-                GridBackgroundDoubleClickAction::ParentFolder
-            } else {
-                GridBackgroundDoubleClickAction::None
-            };
-            assert_eq!(settings.grid_background_double_click_action, expected);
             let roundtrip: Settings =
                 serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
-            assert_eq!(roundtrip.grid_background_double_click_action, expected);
+            assert_eq!(roundtrip.grid_background_double_click_parent, enabled);
         }
     }
 

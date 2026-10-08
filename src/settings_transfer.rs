@@ -263,7 +263,7 @@ preferences_policy! {
         startup_window_state: StartupWindowState => ("起動時のウィンドウ状態", |_, _| true, plain, plain);
         grid_click_selection_mode: GridClickSelectionMode => ("サムネイルのクリック選択", |v, _raw| !matches!(v, GridClickSelectionMode::Unknown), plain, plain);
         grid_open_selected_item_on_click: bool => ("選択中の項目をクリックで開く", |_, _| true, plain, plain);
-        grid_background_double_click_action: GridBackgroundDoubleClickAction => ("一覧の余白ダブルクリック", |v, _raw| !matches!(v, GridBackgroundDoubleClickAction::Unknown), plain, plain);
+        grid_background_double_click_parent: bool => ("サムネイルの余白ダブルクリック", |_, _| true, plain, plain);
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
@@ -904,8 +904,7 @@ mod tests {
                 GridClickSelectionMode::Explorer,
             ],
         );
-        settings.grid_background_double_click_action =
-            crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+        settings.grid_background_double_click_parent = true;
         settings.grid_open_selected_item_on_click = !settings.grid_open_selected_item_on_click;
         settings.grid_cursor_wrap = !settings.grid_cursor_wrap;
         settings.remember_favorite_view_state = !settings.remember_favorite_view_state;
@@ -1578,17 +1577,14 @@ mod tests {
     }
 
     #[test]
-    fn grid_background_double_click_transfer_preserves_valid_and_rejects_unknown() {
+    fn grid_background_double_click_transfer_preserves_boolean_and_rejects_wrong_type() {
         let mut settings = Settings::default();
         let parsed = parse_preferences(&document(
-            json!({"grid_background_double_click_action": "parent_folder"}),
+            json!({"grid_background_double_click_parent": true}),
         ))
         .unwrap();
         assert!(parsed.apply_to(&mut settings).issues.is_empty());
-        assert_eq!(
-            settings.grid_background_double_click_action,
-            GridBackgroundDoubleClickAction::ParentFolder
-        );
+        assert_eq!(settings.grid_background_double_click_parent, true);
         let exported = export_preferences(&settings).unwrap();
         let mut restored = Settings::default();
         assert!(
@@ -1598,19 +1594,13 @@ mod tests {
                 .issues
                 .is_empty()
         );
-        assert_eq!(
-            restored.grid_background_double_click_action,
-            GridBackgroundDoubleClickAction::ParentFolder
-        );
+        assert_eq!(restored.grid_background_double_click_parent, true);
         let parsed = parse_preferences(&document(
-            json!({"grid_background_double_click_action": "future_action"}),
+            json!({"grid_background_double_click_parent": "invalid_boolean"}),
         ))
         .unwrap();
         assert_eq!(parsed.apply_to(&mut settings).issues.len(), 1);
-        assert_eq!(
-            settings.grid_background_double_click_action,
-            GridBackgroundDoubleClickAction::ParentFolder
-        );
+        assert_eq!(settings.grid_background_double_click_parent, true);
     }
 
     #[test]

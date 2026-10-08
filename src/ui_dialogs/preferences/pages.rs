@@ -9627,21 +9627,11 @@ pub(super) fn draw_still_seek_strip_settings(
 }
 
 pub(super) fn draw_grid_background_double_click_setting(ui: &mut egui::Ui, s: &mut Settings) {
-    ui.horizontal(|ui| {
-        ui.label("一覧の余白ダブルクリック:");
-        egui::ComboBox::from_id_salt("grid_background_double_click_action")
-            .selected_text(s.grid_background_double_click_action.label())
-            .show_ui(ui, |ui| {
-                for &action in crate::settings::GridBackgroundDoubleClickAction::all() {
-                    ui.selectable_value(
-                        &mut s.grid_background_double_click_action,
-                        action,
-                        action.label(),
-                    );
-                }
-            });
-    });
-    ui.small("サムネイル・詳細一覧のセル外の余白に適用します。タッチ／ペンのダブルタップも同じ設定です。");
+    ui.checkbox(
+        &mut s.grid_background_double_click_parent,
+        "サムネイルの余白部分のダブルクリックで親フォルダへ移動",
+    );
+    ui.small("画像・ファイル名・バッジを除く余白と、詳細一覧の最終行より下に適用します。タッチ／ペンのダブルタップも同じ設定です。");
 }
 
 pub(super) fn draw_fullscreen_fit_cycle_settings(

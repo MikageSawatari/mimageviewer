@@ -15689,6 +15689,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         touch_derived_pointer_activity: bool,
         suppress_primary_pointer: bool,
         previous_grid_click_pairing: GridClickPairingState,
+        primary_hit_areas: Option<&crate::app::ThumbnailHitAreas>,
     ) -> Option<AddressBarNav> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
@@ -15722,7 +15723,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 );
             }
         }
-        self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
+        // Diagnostics follow the same press owner as the enabled thumbnail hit test.
+        if primary_hit_areas.is_none_or(|areas| {
+            ctx.input(grid_primary_press_pos)
+                .is_some_and(|pos| areas.contains(pos))
+        }) {
+            self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
+        }
         let (
             time_since_last_click,
             max_double_click_delay,
@@ -15784,10 +15791,44 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 | crate::ring_shortcut::RightDragMode::Unknown(_) => {}
             }
         }
-        let primary_clicked =
-            !suppress_primary_pointer && response.clicked_by(egui::PointerButton::Primary);
-        let primary_double_clicked =
-            !suppress_primary_pointer && response.double_clicked_by(egui::PointerButton::Primary);
+        let cell_context = crate::app::GridBackgroundClickContext {
+            items_generation: self.items_generation,
+            view_mode: self.settings.grid_view_mode,
+            viewport: ctx.viewport_id(),
+            source: crate::app::GridClickSource::Mouse,
+        };
+        if let Some(areas) = primary_hit_areas {
+            self.grid_click_pairing
+                .validate_background(cell_context, ctx.cumulative_frame_nr());
+            if !suppress_primary_pointer
+                && ctx
+                    .input(grid_primary_press_pos)
+                    .is_some_and(|pos| areas.contains(pos))
+            {
+                self.grid_click_pairing.begin_cell_press(
+                    cell_context,
+                    ctx.cumulative_frame_nr(),
+                    idx,
+                );
+            }
+        }
+        let released_on_item = primary_hit_areas.is_none_or(|areas| {
+            response
+                .interact_pointer_pos()
+                .is_some_and(|pos| areas.contains(pos))
+        });
+        let primary_clicked = !suppress_primary_pointer
+            && response.clicked_by(egui::PointerButton::Primary)
+            && released_on_item
+            && (primary_hit_areas.is_none()
+                || self.grid_click_pairing.take_cell_press(
+                    previous_grid_click_pairing,
+                    cell_context,
+                    idx,
+                ));
+        let primary_double_clicked = !suppress_primary_pointer
+            && response.double_clicked_by(egui::PointerButton::Primary)
+            && (primary_hit_areas.is_none() || primary_clicked);
         if primary_clicked || primary_double_clicked || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
@@ -15867,8 +15908,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if activate {
             self.grid_click_pairing.end_activation();
         }
-        let drag_started =
-            !suppress_primary_pointer && response.drag_started_by(egui::PointerButton::Primary);
+        let drag_started = !suppress_primary_pointer
+            && response.drag_started_by(egui::PointerButton::Primary)
+            && primary_hit_areas.is_none_or(|areas| {
+                ctx.input(|input| input.pointer.press_origin())
+                    .is_some_and(|pos| areas.contains(pos))
+            });
         let native_drag_started = native_grid_drag_start_allowed(
             self.items_are_drive_list,
             self.native_drag_just_finished,
@@ -16452,11 +16497,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ctx.input(|input| input.time),
             max_delay,
             max_dist,
-        ) && self
-            .settings
-            .grid_background_double_click_action
-            .normalized()
-            == crate::settings::GridBackgroundDoubleClickAction::ParentFolder
+        ) && self.settings.grid_background_double_click_parent
         {
             return self.handle_grid_parent_folder_action();
         }
@@ -16744,6 +16785,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 false,
                                 suppress_primary_pointer,
                                 previous_grid_click_pairing,
+                                None,
                             ) {
                                 nav = Some(n);
                             }
@@ -17101,10 +17143,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         idx: usize,
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
         content_opacity: f32,
-    ) {
-        let Some(row) = self.bookmark_view_row(idx) else {
-            return;
-        };
+    ) -> Option<egui::Rect> {
+        let row = self.bookmark_view_row(idx)?;
+        let mut title_area = None;
         let mut content_painter = ui.painter().clone();
         content_painter.multiply_opacity(content_opacity);
         if let Some(placement) = overlay_layout.top_left.bookmark_time.as_ref() {
@@ -17151,6 +17192,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         (min_title_y - centered_rect.min.y).max(0.0),
                     ));
                     if plate_rect.max.y <= rect.max.y - 4.0 {
+                        title_area = Some(plate_rect.intersect(rect).intersect(ui.clip_rect()));
                         content_painter.rect_filled(
                             plate_rect,
                             4.0,
@@ -17184,6 +17226,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.label(format!("位置 {position}"));
             ui.label(format!("登録日時 {registered}"));
         });
+        title_area
     }
 
     /// 現在のビューでその列に出す名前。ブックマーク / 閲覧履歴では同じ列が別の意味を
@@ -19153,7 +19196,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.visible_end_shared
                             .store(vis_end_idx, Ordering::Relaxed);
 
-                        for row in first_row..last_row {
+                        'visible_rows: for row in first_row..last_row {
                             for col in 0..cols {
                                 let vis_pos = row * cols + col;
                                 if vis_pos >= self.visible_indices.len() {
@@ -19216,9 +19259,65 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.settings.thumb_show_resume_meter,
                                 );
 
-                                primary_press_hit_cell |= press_pos.is_some_and(|pos| cell_rect.contains(pos));
-                                primary_click_hit_cell |=
-                                    primary_click_pos.is_some_and(|pos| cell_rect.contains(pos));
+                                let selected_before = self.selected == Some(idx);
+                                let painted_generation = self.items_generation;
+                                let hit_areas = if self.settings.grid_background_double_click_parent {
+                                    let rot = self.get_rotation(idx);
+                                    let resume = self.thumbnail_resume_meter(idx);
+                                    if !self.adjustment_dragging {
+                                        self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
+                                    }
+                                    let adjusted = if self.adjustment_dragging {
+                                        None
+                                    } else {
+                                        self.thumb_adjust_tex.get(&idx)
+                                    };
+                                    let is_cut = self.items[idx]
+                                        .drag_source_path()
+                                        .is_some_and(|path| self.cut_clipboard.contains(path));
+                                    let mut areas = crate::app::draw_cell_with_hit_areas(
+                                        ui,
+                                        cell_rect,
+                                        selected_before,
+                                        is_checked,
+                                        spread_pair_cursor_idx == Some(idx),
+                                        &overlay_layout,
+                                        &self.items[idx],
+                                        &self.thumbnails[idx],
+                                        rot,
+                                        adjusted,
+                                        self.items_are_drive_list,
+                                        self.settings.video_thumbnail_indicator,
+                                        is_cut,
+                                        resume,
+                                    );
+                                    if let Some(title) = self.draw_bookmark_view_overlay(
+                                        ui,
+                                        cell_rect,
+                                        idx,
+                                        &overlay_layout,
+                                        if is_cut {
+                                            crate::cut_clipboard::CUT_CONTENT_OPACITY
+                                        } else {
+                                            1.0
+                                        },
+                                    ) {
+                                        areas.include(title);
+                                    }
+                                    Some(areas)
+                                } else {
+                                    None
+                                };
+                                primary_press_hit_cell |= press_pos.is_some_and(|pos| {
+                                    hit_areas
+                                        .as_ref()
+                                        .map_or_else(|| cell_rect.contains(pos), |areas| areas.contains(pos))
+                                });
+                                primary_click_hit_cell |= primary_click_pos.is_some_and(|pos| {
+                                    hit_areas
+                                        .as_ref()
+                                        .map_or_else(|| cell_rect.contains(pos), |areas| areas.contains(pos))
+                                });
                                 if let Some(n) = self.handle_cell_interaction(
                                     ui,
                                     ctx,
@@ -19228,8 +19327,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     touch_derived_pointer_activity,
                                     suppress_primary_pointer,
                                     previous_grid_click_pairing,
+                                    hit_areas.as_ref(),
                                 ) {
                                     nav = Some(n);
+                                }
+                                // A synchronous item activation ends painting of the old generation.
+                                if hit_areas.is_some() && self.items_generation != painted_generation {
+                                    break 'visible_rows;
                                 }
                                 // handle_cell_interaction 内で同期的に items が差し替わる
                                 // 経路がある (SearchContainer ダブルクリック →
@@ -19263,56 +19367,62 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     );
                                 }
 
-                                let book_resume_meter = self.thumbnail_resume_meter(idx);
-                                let rot = self.get_rotation(idx);
-                                // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
-                                // process_thumb_adjust_budget が逐次処理する。
-                                // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
-                                // (70 枚毎フレーム再生成は ~200ms のフリーズになるため)。
-                                if !self.adjustment_dragging {
-                                    self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
-                                }
-                                let adjusted_tex = if self.adjustment_dragging {
-                                    None
-                                } else {
-                                    self.thumb_adjust_tex.get(&idx)
-                                };
-                                // 📌 バッジ (金色) — ユーザーが Pin 操作した対象アイテムの
-                                // 目印。「現在表示中のコンテナの pin source = この item」
-                                // (= ユーザーがこのアイテムを選択して P / 📌 を押した) のとき
-                                // のみ出す。
-                                //
-                                // **「コンテナ自身が pin 済み」の表示は出さない** (= ユーザーから
-                                // 「pin で表示されているサムネ」と「auto-pick で選ばれたサムネ」を
-                                // 区別させないことで、「badge = 自分が Pin 操作した対象」を 1 対 1
-                                // で対応させる)。
-                                // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
-                                // (ルート = zip_path / 本の中 = 実効 prefix)。
                                 let is_cut = self.items[idx]
                                     .drag_source_path()
                                     .is_some_and(|path| self.cut_clipboard.contains(path));
-                                crate::app::draw_cell(
-                                    ui,
-                                    cell_rect,
-                                    self.selected == Some(idx),
-                                    self.checked.contains(&idx),
-                                    spread_pair_cursor_idx == Some(idx),
-                                    &overlay_layout,
-                                    &self.items[idx],
-                                    &self.thumbnails[idx],
-                                    rot,
-                                    adjusted_tex,
-                                    self.items_are_drive_list,
-                                    self.settings.video_thumbnail_indicator,
-                                    is_cut,
-                                    book_resume_meter,
-                                );
+                                // Enabled cells were painted to obtain exact hit areas. Repaint only
+                                // a cell whose selection/check changed; OFF keeps its released order.
+                                let repaint_cell = hit_areas.is_none()
+                                    || selected_before != (self.selected == Some(idx))
+                                    || is_checked != self.checked.contains(&idx);
+                                if repaint_cell {
+                                    let book_resume_meter = self.thumbnail_resume_meter(idx);
+                                    let rot = self.get_rotation(idx);
+                                    // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
+                                    // process_thumb_adjust_budget が逐次処理する。
+                                    // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
+                                    // (70 枚毎フレーム再生成は ~200ms のフリーズになるため)。
+                                    if hit_areas.is_none() && !self.adjustment_dragging {
+                                        self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
+                                    }
+                                    let adjusted_tex = if self.adjustment_dragging {
+                                        None
+                                    } else {
+                                        self.thumb_adjust_tex.get(&idx)
+                                    };
+                                    // 📌 バッジ (金色) — ユーザーが Pin 操作した対象アイテムの
+                                    // 目印。「現在表示中のコンテナの pin source = この item」
+                                    // (= ユーザーがこのアイテムを選択して P / 📌 を押した) のとき
+                                    // のみ出す。
+                                    //
+                                    // **「コンテナ自身が pin 済み」の表示は出さない** (= ユーザーから
+                                    // 「pin で表示されているサムネ」と「auto-pick で選ばれたサムネ」を
+                                    // 区別させないことで、「badge = 自分が Pin 操作した対象」を 1 対 1
+                                    // で対応させる)。
+                                    // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
+                                    // (ルート = zip_path / 本の中 = 実効 prefix)。
+                                    crate::app::draw_cell(
+                                        ui,
+                                        cell_rect,
+                                        self.selected == Some(idx),
+                                        self.checked.contains(&idx),
+                                        spread_pair_cursor_idx == Some(idx),
+                                        &overlay_layout,
+                                        &self.items[idx],
+                                        &self.thumbnails[idx],
+                                        rot,
+                                        adjusted_tex,
+                                        self.items_are_drive_list,
+                                        self.settings.video_thumbnail_indicator,
+                                        is_cut,
+                                        book_resume_meter,
+                                    );
+                                }
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {
                                     let hover_id = egui::Id::new(("folder_rating_badge", idx));
-                                    let resp =
-                                        ui.interact(cell_rect, hover_id, egui::Sense::hover());
+                                    let resp = ui.interact(cell_rect, hover_id, egui::Sense::hover());
                                     if resp.hovered() {
                                         resp.on_hover_ui_at_pointer(|ui| {
                                             ui.vertical(|ui| {
@@ -19320,11 +19430,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                 for s in (1..=5usize).rev() {
                                                     let c = per_star[s - 1];
                                                     if c > 0 {
-                                                        ui.label(format!(
-                                                            "{} : {} 件",
-                                                            "★".repeat(s),
-                                                            c
-                                                        ));
+                                                        ui.label(format!("{} : {} 件", "★".repeat(s), c));
                                                     }
                                                 }
                                             });
@@ -19333,17 +19439,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
 
                                 self.draw_reading_history_tooltip(ui, cell_rect, idx);
-                                self.draw_bookmark_view_overlay(
-                                    ui,
-                                    cell_rect,
-                                    idx,
-                                    &overlay_layout,
-                                    if is_cut {
-                                        crate::cut_clipboard::CUT_CONTENT_OPACITY
-                                    } else {
-                                        1.0
-                                    },
-                                );
+                                if repaint_cell {
+                                    self.draw_bookmark_view_overlay(
+                                        ui,
+                                        cell_rect,
+                                        idx,
+                                        &overlay_layout,
+                                        if is_cut {
+                                            crate::cut_clipboard::CUT_CONTENT_OPACITY
+                                        } else {
+                                            1.0
+                                        },
+                                    );
+                                }
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
                                 if self.selected == Some(idx) {
@@ -25830,6 +25938,7 @@ mod grid_reclick_open_tests {
                                         || touch_frame.has_touch_derived_pointer_activity(),
                                     suppress_primary_pointer,
                                     previous_grid_click_pairing,
+                                    None,
                                 )
                                 .is_some()
                             {
@@ -25919,8 +26028,7 @@ mod grid_reclick_open_tests {
             .state_mut()
             .app
             .settings
-            .grid_background_double_click_action =
-            crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+            .grid_background_double_click_parent = true;
         harness
     }
 
@@ -25979,14 +26087,14 @@ mod grid_reclick_open_tests {
             .state_mut()
             .app
             .settings
-            .grid_background_double_click_action = Default::default();
+            .grid_background_double_click_parent = Default::default();
         background_pair(&mut harness);
         assert!(harness.state().background_navs.is_empty());
         assert!(harness.state().app.selected.is_none());
     }
 
     #[test]
-    fn background_double_click_rejects_cell_mixing_and_internal_cell_padding() {
+    fn background_double_click_whole_row_mixing_and_unowned_gaps() {
         for cell_first in [true, false] {
             let mut harness = background_harness(GridClickSelectionMode::Explorer);
             if cell_first {
@@ -26292,8 +26400,7 @@ mod grid_reclick_open_tests {
             let mut app = setup_app_for_test();
             app.current_folder = Some(app.tmp.path().join("child"));
             app.settings.grid_view_mode = view;
-            app.settings.grid_background_double_click_action =
-                crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+            app.settings.grid_background_double_click_parent = true;
             app.items = vec![GridItem::ZipFile(app.tmp.path().join("book.zip"))];
             app.visible_indices = vec![0];
             app.thumbnails = vec![ThumbnailState::Pending];
@@ -26338,8 +26445,7 @@ mod grid_reclick_open_tests {
     fn background_excluded_press_info_bar_same_frame_release_never_pairs() {
         let mut app = setup_app_for_test();
         app.current_folder = Some(app.tmp.path().join("child"));
-        app.settings.grid_background_double_click_action =
-            crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+        app.settings.grid_background_double_click_parent = true;
         let ctx = egui::Context::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
         let release = egui::pos2(30.0, 171.0);
@@ -26407,8 +26513,7 @@ mod grid_reclick_open_tests {
     fn background_double_click_replayed_pass_consumes_each_click_once() {
         let mut app = setup_app_for_test();
         app.current_folder = Some(app.tmp.path().join("child"));
-        app.settings.grid_background_double_click_action =
-            crate::settings::GridBackgroundDoubleClickAction::ParentFolder;
+        app.settings.grid_background_double_click_parent = true;
         let ctx = egui::Context::default();
         let pos = egui::pos2(30.0, 170.0);
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
