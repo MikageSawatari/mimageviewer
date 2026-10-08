@@ -13917,6 +13917,16 @@ impl GridClickPairingState {
             })
     }
 
+    pub(crate) fn owns_cell_press(
+        &self,
+        context: GridBackgroundClickContext,
+        index: usize,
+    ) -> bool {
+        self.primary_press.is_some_and(|(press, _, target)| {
+            press == context && target == GridPressTarget::Cell(index)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_background_click(
         &mut self,

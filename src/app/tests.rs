@@ -99980,4 +99980,238 @@ mod background_click_scroll_regression_tests {
             assert!(harness.state().navs.is_empty());
         }
     }
+
+    fn press(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn letterbox_real_grid_drag_keeps_item_press_when_thumbnail_loads() {
+        let mut harness = letterbox_harness([40, 120]);
+        let loaded = harness.state().app.thumbnails[0].clone();
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+        harness.run_steps(4);
+        let rect = cell_rect(&harness);
+        let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+        press(&mut harness, pos);
+        assert!(matches!(
+            harness.state().app.grid_click_pairing.primary_press,
+            Some((_, _, GridPressTarget::Cell(0)))
+        ));
+        harness.state_mut().app.thumbnails[0] = loaded;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        // render_grid only queues native D&D; App::update's shell dispatch is never run.
+        let drag = harness
+            .state()
+            .app
+            .pending_native_drag
+            .as_ref()
+            .expect("loading must not revoke the item press's drag ownership");
+        assert_eq!(
+            drag.paths,
+            vec![
+                harness.state().app.items[0]
+                    .drag_source_path()
+                    .unwrap()
+                    .to_path_buf()
+            ]
+        );
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_drag_does_not_acquire_item_when_plate_replaces_letterbox() {
+        let mut harness = letterbox_harness([40, 120]);
+        let rect = cell_rect(&harness);
+        let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+        press(&mut harness, pos);
+        assert!(matches!(
+            harness.state().app.grid_click_pairing.primary_press,
+            Some((_, _, GridPressTarget::Background))
+        ));
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert!(
+            harness.state().app.pending_native_drag.is_none(),
+            "a later plate must not turn a background press into native D&D"
+        );
+        assert!(harness.state().navs.is_empty());
+    }
+
+    fn small_cell_harness(item: GridItem, thumb: ThumbnailState) -> Harness<'static, State> {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.set_size(egui::vec2(640.0, 480.0));
+        let app = &mut harness.state_mut().app;
+        app.settings.grid_cols = crate::settings::MAX_GRID_COLS;
+        app.settings.thumb_show_resume_meter = false;
+        app.items[0] = item;
+        app.thumbnails[0] = thumb;
+        harness.run_steps(4);
+        assert!(cell_rect(&harness).width() < 40.0);
+        harness
+    }
+
+    fn painted_text_in_padding(harness: &Harness<'_, State>, label: &str) -> egui::Pos2 {
+        use egui::emath::GuiRounding;
+        let cell = cell_rect(harness);
+        let inner = cell.shrink(4.0);
+        let padding = [
+            egui::Rect::from_min_max(cell.min, egui::pos2(inner.min.x, cell.max.y)),
+            egui::Rect::from_min_max(egui::pos2(inner.max.x, cell.min.y), cell.max),
+            egui::Rect::from_min_max(cell.min, egui::pos2(cell.max.x, inner.min.y)),
+            egui::Rect::from_min_max(egui::pos2(cell.min.x, inner.max.y), cell.max),
+        ];
+        harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                if text.galley.text() != label {
+                    return None;
+                }
+                let ink = text
+                    .galley
+                    .mesh_bounds
+                    .translate(
+                        text.pos
+                            .round_to_pixels(harness.ctx.pixels_per_point())
+                            .to_vec2(),
+                    )
+                    .intersect(clipped.clip_rect)
+                    .intersect(cell);
+                padding.iter().find_map(|padding| {
+                    let visible = ink.intersect(*padding);
+                    visible.is_positive().then(|| visible.center())
+                })
+            })
+            .unwrap_or_else(|| panic!("{label:?} must really paint into the cell padding"))
+    }
+
+    fn assert_padding_text_is_item(harness: &mut Harness<'_, State>, label: &str) {
+        let pos = painted_text_in_padding(harness, label);
+        harness.state_mut().app.selected = None;
+        click(harness, pos);
+        assert_eq!(
+            harness.state().app.selected,
+            Some(0),
+            "visible {label:?} is item content"
+        );
+        click(harness, pos);
+        assert!(
+            !harness
+                .state()
+                .navs
+                .iter()
+                .any(|nav| matches!(nav, crate::ui_main::AddressBarNav::Direct(_, _))),
+            "visible {label:?} must not invoke the background parent action"
+        );
+    }
+
+    #[test]
+    fn letterbox_real_grid_missing_caption_and_reason_own_painted_padding() {
+        let name = "very-long-missing-collection-file-name.png";
+        for label in [name, "見つかりません", "?"] {
+            let item = GridItem::CollectionPlaceholder {
+                path: name.into(),
+                last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+            };
+            let mut harness = small_cell_harness(item, ThumbnailState::Failed);
+            assert_padding_text_is_item(&mut harness, label);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_plate_text_and_icons_own_painted_padding() {
+        for (item, thumb, label) in [
+            (
+                GridItem::Image("pending.png".into()),
+                ThumbnailState::Pending,
+                "読込中",
+            ),
+            (
+                GridItem::Image("failed.png".into()),
+                ThumbnailState::Failed,
+                "読込失敗",
+            ),
+            (
+                GridItem::ZipFile("book.zip".into()),
+                ThumbnailState::Pending,
+                "📦",
+            ),
+            (
+                GridItem::PdfFile("book.pdf".into()),
+                ThumbnailState::Pending,
+                "📄",
+            ),
+        ] {
+            let mut harness = small_cell_harness(item, thumb);
+            assert_padding_text_is_item(&mut harness, label);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_small_audio_icon_owns_painted_padding() {
+        let mut harness =
+            small_cell_harness(GridItem::Audio("music.mp3".into()), ThumbnailState::Pending);
+        let cell = cell_rect(&harness);
+        let inner = cell.shrink(4.0);
+        let top = egui::Rect::from_min_max(cell.min, egui::pos2(cell.max.x, inner.min.y));
+        let pos = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::LineSegment { points, .. } = &clipped.shape else {
+                    return None;
+                };
+                if points[0].x != points[1].x {
+                    return None;
+                }
+                let visible = clipped
+                    .shape
+                    .visual_bounding_rect()
+                    .intersect(clipped.clip_rect)
+                    .intersect(top);
+                visible.is_positive().then(|| visible.center())
+            })
+            .expect("the minimum-size music stem must really paint above the inner plate");
+        harness.state_mut().app.selected = None;
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.selected, Some(0));
+        click(&mut harness, pos);
+        assert!(
+            !harness
+                .state()
+                .navs
+                .iter()
+                .any(|nav| matches!(nav, crate::ui_main::AddressBarNav::Direct(_, _)))
+        );
+    }
+
+    #[test]
+    fn letterbox_real_grid_drag_cannot_transfer_press_to_new_generation() {
+        let mut harness = letterbox_harness([40, 120]);
+        let pos = cell_rect(&harness).center();
+        press(&mut harness, pos);
+        harness.state_mut().app.items_generation += 1;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert!(harness.state().app.pending_native_drag.is_none());
+    }
 }

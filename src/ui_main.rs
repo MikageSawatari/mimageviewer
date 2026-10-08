@@ -15910,10 +15910,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         let drag_started = !suppress_primary_pointer
             && response.drag_started_by(egui::PointerButton::Primary)
-            && primary_hit_areas.is_none_or(|areas| {
-                ctx.input(|input| input.pointer.press_origin())
-                    .is_some_and(|pos| areas.contains(pos))
-            });
+            // Loading may change the painted shape while held. Only the press owner
+            // can authorize D&D; the new shape must neither revoke nor acquire it.
+            && (primary_hit_areas.is_none()
+                || self.grid_click_pairing.owns_cell_press(cell_context, idx));
         let native_drag_started = native_grid_drag_start_allowed(
             self.items_are_drive_list,
             self.native_drag_just_finished,

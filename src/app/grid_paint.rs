@@ -58,11 +58,12 @@ fn draw_thumb(
     rotation: crate::rotation_db::Rotation,
     dark: bool,
     adjusted_tex: Option<&egui::TextureHandle>,
-) -> egui::Rect {
+    record: &mut impl FnMut(egui::Rect),
+) {
     match thumb {
         ThumbnailState::Loaded { tex, .. } => {
             let use_tex = adjusted_tex.unwrap_or(tex);
-            draw_thumb_texture(painter, inner, use_tex, rotation)
+            record(draw_thumb_texture(painter, inner, use_tex, rotation));
         }
         ThumbnailState::Pending | ThumbnailState::Evicted => {
             let bg = if dark {
@@ -71,14 +72,17 @@ fn draw_thumb(
                 egui::Color32::from_gray(220)
             };
             painter.rect_filled(inner, 2.0, bg);
-            painter.text(
+            record(inner);
+            record(paint_lower_caption(
+                painter,
                 inner.center(),
                 egui::Align2::CENTER_CENTER,
                 "読込中",
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_gray(140),
-            );
-            inner
+                None,
+                None,
+            ));
         }
         ThumbnailState::Failed => {
             let bg = if dark {
@@ -92,14 +96,17 @@ fn draw_thumb(
                 egui::Color32::DARK_RED
             };
             painter.rect_filled(inner, 2.0, bg);
-            painter.text(
+            record(inner);
+            record(paint_lower_caption(
+                painter,
                 inner.center(),
                 egui::Align2::CENTER_CENTER,
                 "読込失敗",
                 egui::FontId::proportional(12.0),
                 fg,
-            );
-            inner
+                None,
+                None,
+            ));
         }
     }
 }
@@ -356,7 +363,6 @@ fn thumbnail_resume_meter_rect(
     (rect.width() >= 1.0 / ppp && rect.height() >= 1.0 / ppp).then_some(rect)
 }
 
-#[cfg(test)]
 fn thumbnail_badge_ink_rect(
     painter: &egui::Painter,
     placement: &crate::thumb_overlay_layout::BadgePlacement,
@@ -724,25 +730,29 @@ fn paint_cell(
                 if is_drive_list {
                     record(draw_drive_icon(painter, inner, dark));
                 } else {
-                    record(painter.text(
+                    record(paint_lower_caption(
+                        painter,
                         inner.center() - egui::vec2(0.0, 14.0),
                         egui::Align2::CENTER_CENTER,
                         "📁",
                         egui::FontId::proportional(42.0),
                         egui::Color32::from_rgb(220, 170, 30),
+                        None,
+                        None,
                     ));
                 }
             }
         },
         GridItem::Image(_) => {
-            record(draw_thumb(
+            draw_thumb(
                 painter,
                 inner,
                 thumb,
                 rotation,
                 dark,
                 adjusted_tex,
-            ));
+                &mut record,
+            );
         }
         GridItem::Video(_) => {
             match thumb {
@@ -753,13 +763,16 @@ fn paint_cell(
                 ThumbnailState::Pending | ThumbnailState::Evicted => {
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
                     record(inner);
-                    painter.text(
+                    record(paint_lower_caption(
+                        painter,
                         inner.center(),
                         egui::Align2::CENTER_CENTER,
                         "動画",
                         egui::FontId::proportional(12.0),
                         egui::Color32::from_gray(160),
-                    );
+                        None,
+                        None,
+                    ));
                 }
                 ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
@@ -784,18 +797,19 @@ fn paint_cell(
             painter.rect_filled(inner, 2.0, pending_placeholder_bg);
             record(inner);
             if !defer_primary_markers {
-                crate::ui_helpers::draw_music_icon(painter, inner, dark);
+                record(crate::ui_helpers::draw_music_icon(painter, inner, dark));
             }
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-            record(draw_thumb(
+            draw_thumb(
                 painter,
                 inner,
                 thumb,
                 rotation,
                 dark,
                 adjusted_tex,
-            ));
+                &mut record,
+            );
         }
         GridItem::ZipFile(_) | GridItem::PdfFile(_) => {
             let icon = if matches!(item, GridItem::ZipFile(_)) {
@@ -811,13 +825,16 @@ fn paint_cell(
                 ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                     record(inner);
-                    painter.text(
+                    record(paint_lower_caption(
+                        painter,
                         inner.center(),
                         egui::Align2::CENTER_CENTER,
                         icon,
                         egui::FontId::proportional(32.0),
                         egui::Color32::from_gray(120),
-                    );
+                        None,
+                        None,
+                    ));
                 }
             }
         }
@@ -831,13 +848,16 @@ fn paint_cell(
                 ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                     record(inner);
-                    painter.text(
+                    record(paint_lower_caption(
+                        painter,
                         inner.center(),
                         egui::Align2::CENTER_CENTER,
                         "🗜",
                         egui::FontId::proportional(32.0),
                         egui::Color32::from_gray(120),
-                    );
+                        None,
+                        None,
+                    ));
                 }
             }
         }
@@ -853,13 +873,16 @@ fn paint_cell(
                     ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
                         painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                         record(inner);
-                        painter.text(
+                        record(paint_lower_caption(
+                            painter,
                             inner.center(),
                             egui::Align2::CENTER_CENTER,
                             "📦",
                             egui::FontId::proportional(32.0),
                             egui::Color32::from_gray(120),
-                        );
+                            None,
+                            None,
+                        ));
                     }
                 }
             } else {
@@ -868,12 +891,15 @@ fn paint_cell(
                         record(draw_thumb_texture(painter, inner, tex, rotation));
                     }
                     ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
-                        record(painter.text(
+                        record(paint_lower_caption(
+                            painter,
                             inner.center() - egui::vec2(0.0, 14.0),
                             egui::Align2::CENTER_CENTER,
                             "📁",
                             egui::FontId::proportional(42.0),
                             egui::Color32::from_rgb(220, 170, 30),
+                            None,
+                            None,
                         ));
                     }
                 }
@@ -1049,14 +1075,15 @@ fn paint_cell(
             // ファイル名スタックの集約セル: 代表画像を通常サムネと同様に描き、
             // 右上に枚数バッジ (= スタックの目印)。単独グループは GridItem::Image で
             // 描かれるのでここには来ない (= count は常に 2 以上)。
-            record(draw_thumb(
+            draw_thumb(
                 painter,
                 inner,
                 thumb,
                 rotation,
                 dark,
                 adjusted_tex,
-            ));
+                &mut record,
+            );
         }
         GridItem::CollectionPlaceholder { path, reason, .. } => {
             let bg = if dark {
@@ -1081,7 +1108,8 @@ fn paint_cell(
                 None,
                 None,
             );
-            paint_lower_caption(
+            record(marker);
+            record(paint_lower_caption(
                 painter,
                 egui::pos2(inner.center().x, inner.max.y - 18.0) + caption_shift,
                 egui::Align2::CENTER_BOTTOM,
@@ -1092,8 +1120,8 @@ fn paint_cell(
                 fg,
                 Some(marker),
                 overlay_layout.book_resume_meter.map(|band| (band, rect)),
-            );
-            paint_lower_caption(
+            ));
+            record(paint_lower_caption(
                 painter,
                 egui::pos2(inner.center().x, inner.max.y - 3.0) + caption_shift,
                 egui::Align2::CENTER_BOTTOM,
@@ -1102,7 +1130,7 @@ fn paint_cell(
                 fg,
                 Some(marker),
                 overlay_layout.book_resume_meter.map(|band| (band, rect)),
-            );
+            ));
         }
     }
 
@@ -1115,6 +1143,9 @@ fn paint_cell(
     }
     for badge in overlay_layout.badge_placements() {
         record(badge.rect);
+        if collect_hit_areas {
+            record(thumbnail_badge_ink_rect(painter, badge));
+        }
     }
     if let Some(check) = overlay_layout.check {
         record(check);
@@ -1134,7 +1165,7 @@ fn paint_cell(
         ));
     }
     if defer_primary_markers && matches!(item, GridItem::Audio(_)) {
-        crate::ui_helpers::draw_music_icon(painter, inner, dark);
+        record(crate::ui_helpers::draw_music_icon(painter, inner, dark));
     }
     let painter = base_painter;
     if is_cut {

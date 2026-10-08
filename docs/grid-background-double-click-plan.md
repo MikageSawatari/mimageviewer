@@ -179,7 +179,7 @@ filename、形式・評価・タグ・編集・bookmark時刻・stack数・動�
 | 読込済みフォルダ、ZIP／PDF／変換書庫、ZIP内directory／archive | 代表画像も同じaspect fit。画像外・ラベル外の余白が背景 |
 | 読込済みSearchContainer代表画像 | 上部62%枠でfitした画像外がletterbox。下部label plate・種別marker・件数は項目 |
 | フォルダ／ドライブ／ZIP内directoryのアイコン表示、代表画像なしSearchContainer | bitmapのaspect-fit letterboxはない。描いたアイコン・ラベル・件数以外の空白が背景 |
-| 音声、画像／動画／archiveの読込中・Evicted・失敗plate、CollectionPlaceholder | 内側plateを塗りつぶすためaspect-fit letterboxはない。内側全体が項目で、外周余白だけ背景 |
+| 音声、画像／動画／archiveの読込中・Evicted・失敗plate、CollectionPlaceholder | 内側plateを塗りつぶすためaspect-fit letterboxはない。内側全体と描いたアイコン・caption・理由が項目で、それらに覆われない外周余白だけ背景 |
 | 詳細一覧 | 行内は従来どおり項目。最終行より下の空白だけ背景 |
 
 ### 入力所有と状態の簡素化
@@ -205,3 +205,20 @@ OFFの従来選択／open、Explorer／Check差、touch mirror・scrollと既存
 設定の既定OFF・保存往復・転送分類／型不一致、チェックボックスのsnapshotも確認する。
 有効なredを残し、focused、全lib、normal／portable core check、ui_snapshot、fmt、glyphを実行し、
 build-devで利用者確認用binaryを作る。製品binaryは起動しない。新しい利用者質問はない。
+
+### 押下中の描画変更とcaption外周の回帰修正（2026-10-08）
+
+native D&Dの開始可否は、押下時に保存した`GridPressTarget::Cell(index)`と一覧contextを照合する。
+ドラッグ開始frameの画像矩形で`press_origin`を再判定しない。Pending plateで押した後に
+縦長画像が届いても項目の所有を保ち、逆に背景で押した後にplateへ変わっても項目へ移さない。
+世代・表示面変更や入力取消は既存ownerで終了する。読込みを止める／遅らせる案は採用せず、
+既存の押下所属だけを使うことで、新しい保留状態やhit cacheを追加しない。
+
+CollectionPlaceholderは、描いたmarker・ファイル名・理由の実際のglyph矩形も登録する。
+resume帯OFF・小さいセルでは内側plateから文字がはみ出しても、セル／一覧clip内の可視部分は項目とする。
+読込中・失敗文字、書庫plateのアイコン、音声アイコン、共通badgeの文字も同じ境界で確認する。
+省略されたcaptionは登録せず、描画位置・clip・OFF時の操作は変えない。
+
+回帰検証は`process_scroll`→`render_grid`で、押下→読込み完了→ドラッグ開始のnative要求を検査する
+（shell実行はしない）。逆方向の描画変更と、小さいセル・resume帯OFFで実際に描いたcaption／理由／
+plate文字の外周クリックも検査する。利用者決定・保存形式への変更や新しい利用者質問はない。
