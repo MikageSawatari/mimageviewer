@@ -179,7 +179,8 @@ filename、形式・評価・タグ・編集・bookmark時刻・stack数・動�
 | 読込済みフォルダ、ZIP／PDF／変換書庫、ZIP内directory／archive | 代表画像も同じaspect fit。画像外・ラベル外の余白が背景 |
 | 読込済みSearchContainer代表画像 | 上部62%枠でfitした画像外がletterbox。下部label plate・種別marker・件数は項目 |
 | フォルダ／ドライブ／ZIP内directoryのアイコン表示、代表画像なしSearchContainer | bitmapのaspect-fit letterboxはない。描いたアイコン・ラベル・件数以外の空白が背景 |
-| 音声、画像／動画／archiveの読込中・Evicted・失敗plate、CollectionPlaceholder | 内側plateを塗りつぶすためaspect-fit letterboxはない。内側全体と描いたアイコン・caption・理由が項目で、それらに覆われない外周余白だけ背景 |
+| アルバムアート読込済み音声 | aspect fitしたアート画像の外がletterbox。設定に従って実際に描いた音声マーク・音声badge・ファイル名は項目。§1.347との結合時（2026-10-08）に同じ描画ownerへ統合 |
+| アートなし（NoArt）／読込中・Evicted・失敗の音声、画像／動画／archiveの読込中・Evicted・失敗plate、CollectionPlaceholder | 内側plateを塗りつぶすためaspect-fit letterboxはない。内側全体と描いたアイコン・caption・理由が項目で、それらに覆われない外周余白だけ背景 |
 | 詳細一覧 | 行内は従来どおり項目。最終行より下の空白だけ背景 |
 
 ### 入力所有と状態の簡素化

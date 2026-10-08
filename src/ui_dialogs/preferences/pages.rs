@@ -1001,18 +1001,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("{files}").strong());
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(concat!(
-                    "渡すファイルのパスに置き換わります。「1 件ずつ」なら 1 つ、",
-                    "「まとめて渡す」なら選んだ数だけ並びます。",
-                    "何も書かないときは {files} が 1 つ付きます。",
-                ))
-                .weak(),
-            )
-            .wrap(),
-        );
+        crate::external_tool::draw_external_tool_placeholder_help(ui);
     }
     ui.add_space(6.0);
     // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
@@ -1487,9 +1476,18 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "video/sidecar-thumbnail", |ui, state| {
+        draw_media_sidecar_thumbnail_settings(ui, &mut state.settings);
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/video-indicator", |ui, state| {
         draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
     });
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/audio-indicator", |ui, state| {
+        draw_audio_thumbnail_indicator_settings(ui, &mut state.settings);
+    });
+    draw_media_duration_settings(ui, &mut state.settings);
 
     ui.add_space(8.0);
     anchored(ui, state, "thumbnail/resume-meter", |ui, state| {
@@ -1579,6 +1577,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "サムネイル表示では一覧と同じ列設定を使います。詳細表示では、一覧と同じ設定・専用の設定・表示しないを選べます。",
     );
     });
+    ui.add_space(12.0);
+    ui.separator();
+    anchored(ui, state, "thumbnail/details-name-colors", |ui, state| {
+        super::name_colors::draw_settings(ui, &mut state.settings);
+    });
+    ui.add_space(12.0);
+    ui.separator();
     anchored(ui, state, "thumbnail/tooltip-items", |ui, state| {
         let s = &mut state.settings;
         ui.label("ツールチップに表示する項目:");
@@ -1641,6 +1646,51 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
     );
+}
+
+pub(super) fn draw_media_sidecar_thumbnail_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("動画・音声のサムネイル").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut settings.video_thumb_use_sidecar_image,
+        "同名の画像をサムネイルに使う（動画・音声）",
+    )
+    .on_hover_text(
+        "例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダに置きます。\n\
+         「同名の動画・音声がある画像を省略」も ON にする必要があります。\n\
+         OFF の場合、動画は Windows 標準サムネイル、MP3 は埋め込み画像を使います。\n\
+         画像行の省略は別設定です。省略が ON なら、この項目を OFF にしても画像行は表示されません。\n\
+         既存設定の OFF は音声にも引き継ぎます。動画のピン留めフレームは常に最優先。",
+    );
+    ui.small("同名画像の表示・省略は「ファイル処理 → 同名ファイル」で設定します。");
+}
+
+pub(super) fn draw_audio_thumbnail_indicator_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("音声サムネイルの目印").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示:");
+        egui::ComboBox::from_id_salt("audio_thumbnail_indicator")
+            .selected_text(settings.audio_thumbnail_indicator.label())
+            .show_ui(ui, |ui| {
+                for &indicator in crate::settings::AudioThumbnailIndicator::all() {
+                    ui.selectable_value(
+                        &mut settings.audio_thumbnail_indicator,
+                        indicator,
+                        indicator.label(),
+                    );
+                }
+            });
+    });
+    ui.small("同名画像・埋め込み画像に重ねる音楽アイコンを、左下の文字バッジへ替えるか、非表示にできます。画像がない場合の音楽アイコンは常に表示します。");
+}
+
+pub(super) fn draw_media_duration_settings(ui: &mut egui::Ui, settings: &mut settings::Settings) {
     ui.add_space(6.0);
     ui.checkbox(
         &mut settings.thumb_show_media_duration,
@@ -8086,6 +8136,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_effetune_input_limit_settings(ui, &mut state.settings);
     });
     #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-auto-open", |ui, state| {
+        draw_effetune_auto_open_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-minimized", |ui, state| {
         draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
@@ -8096,27 +8150,6 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "video/normalize-cache", |ui, state| {
         draw_audio_normalize_cache_controls(ui, state);
     });
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-
-    {
-        anchored(ui, state, "video/sidecar-thumbnail", |ui, state| {
-            let s = &mut state.settings;
-            ui.label(egui::RichText::new("グリッドサムネイル").strong());
-            ui.add_space(4.0);
-            ui.checkbox(
-                &mut s.video_thumb_use_sidecar_image,
-                "同名ファイル名の画像があれば動画サムネに優先採用",
-            )
-            .on_hover_text(
-                "例: movie.mp4 の隣に movie.jpg があれば、それをサムネに使う。\n\
-         OFF にすると Windows 標準のサムネのみ採用 (= 既定動作)。\n\
-         ピン留めしたフレーム (今後実装予定) は本設定に関わらず常に最優先。",
-            );
-        });
-    }
 
     // VST3 プラグイン処理は専用ページ "VST3 プラグイン" に分離した (= ユーザー要望
     // 「環境設定の中に新しい項目」)。動画タブには出さない。
@@ -8230,6 +8263,22 @@ pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &m
              OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
         );
     }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_auto_open_on_video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+    )
+    .on_hover_text(
+        "初期値は OFF です。再生が始まったときに、この起動で一度だけ、キー操作を奪わずに開きます。\n\
+         全画面・最小化・トレイ格納・リモート閲覧中は開きません。復帰しただけでは開きません。\n\
+         音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
+         未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
+    );
     #[cfg(feature = "portable")]
     let _ = (ui, settings);
 }
@@ -9069,7 +9118,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_image_if_video_exists,
-            "同名の動画と画像がある場合、画像をスキップ",
+            "同名の動画・音声がある画像を省略",
         );
     });
     ui.add_space(4.0);
@@ -9658,6 +9707,13 @@ pub(super) fn draw_fullscreen_fit_cycle_settings(
 }
 
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "spread/chrome-suppression", |ui, state| {
+        crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
+            ui,
+            &mut state.settings.fullscreen_chrome_suppression,
+        );
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "spread/side-panels", |ui, state| {
         let s = &mut state.settings;
         egui::ComboBox::from_label("左右パネルの表示")

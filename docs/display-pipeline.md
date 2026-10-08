@@ -5,6 +5,13 @@
 
 ---
 
+### 音声セルの代表画像 (§1.347、2026-10-08)
+
+Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先頭 ID3v2 の前面表紙優先 → 音楽アイコンの順で表示する。`ThumbnailState::NoArt` は正常終端で、Failed とともに一覧世代内では再投入・hover repaint を続けない。Loaded の画像寸法を Auto 比率へ使い、画像のない音声を分母から除く。全音声が終端なら Auto 未確定も現在の比率で終わる。
+
+`ThumbMsgPayload` が Pixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に一通知を送り、既存の他媒体の Finalized 通知は維持する。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
+
+
 ## 1. サムネイル表示パイプライン
 
 ### 1.1 状態機械
@@ -2837,3 +2844,11 @@ fullscreen の canonical decode は `AnimationPolicy` を正本にする。現�
 - `keep_range` (自分の idx が範囲外なら結果を捨てる)
 
 新しいワーカーを追加するときは同じパターンに従う。詳細は [async-architecture.md](async-architecture.md)。
+
+### F11での固定表示の実効値 (§1.344)
+
+保存値からの予約とHUD描画は `ResolvedViewerChrome` を共通に使用する。`ViewerChromeSurface` は
+projected contextのwindow bindingとexact active hostのapplied borderlessから導出し、mainやsiblingへ転用しない。
+通常content・holdover・navigation gapは同じresolverで上・下・右の予約を解放する。
+strip表示選択とresource ownerは変更せず、一時表示のrectだけをhit / sinkへ渡す。
+[設計](fullscreen-locked-chrome-suppression-plan.md) §4・5を参照。

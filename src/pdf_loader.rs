@@ -5362,6 +5362,13 @@ pub fn analyze_page_content_type(
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<PdfPageAnalysis> {
     let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    #[cfg(test)]
+    if remote_pdf_test_capture(read.read_path.as_path()).is_some() {
+        let bytes = remote_pdf_test_run(|cache| {
+            ipc_analyze_page(cache, read.read_path.as_path(), page_num, password)
+        })?;
+        return PdfWorkerPool::parse_analyze_page_response(&bytes);
+    }
     let pool = get_pool();
     let req = encode_analyze_page_request(&read.read_path, page_num, password);
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);

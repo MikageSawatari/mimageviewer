@@ -263,6 +263,7 @@ impl GridItem {
         matches!(
             self,
             Self::Folder(_)
+                | Self::Audio(_)
                 | Self::ZipFile(_)
                 | Self::ConvertibleArchive { .. }
                 | Self::ZipDir { .. }
@@ -530,11 +531,22 @@ pub enum ThumbnailState {
         source_dims: Option<(u32, u32)>,
         layout_dims: Option<(u32, u32)>,
     },
+    /// 調査済みで表紙がない。再読込まで再要求しない。
+    NoArt,
     /// 読み込みに失敗した（再試行しない）
     Failed,
     /// 段階 B: 先読み範囲外に出て GPU テクスチャを破棄済み
     /// 再び範囲内に入ったら再ロードされる
     Evicted,
+}
+
+impl ThumbnailState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Loaded { .. } | Self::NoArt | Self::Failed)
+    }
+    pub fn has_pixels(&self) -> bool {
+        matches!(self, Self::Loaded { .. })
+    }
 }
 
 /// グリッド上段のフォルダ系ブロック (Folder / ZipFile / PdfFile / ConvertibleArchive 等)
@@ -860,7 +872,7 @@ mod tests {
         assert!(item.accepts_rating());
         assert!(!item.has_page_data());
         assert!(!item.is_container_ratable());
-        assert!(!item.is_heavy_io());
+        assert!(item.is_heavy_io());
         assert!(item.is_checkable());
         assert!(item.file_operation_path().is_some());
         assert!(item.drag_source_path().is_some());

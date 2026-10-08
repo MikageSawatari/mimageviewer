@@ -256,6 +256,7 @@ enum SearchPrepareOutput {
 struct SearchPreparedItems {
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: HashMap<String, std::path::PathBuf>,
     drilled_counts: HashMap<String, [u32; 6]>,
     page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
     ratings: Option<(HashMap<usize, u8>, u64)>,
@@ -304,6 +305,7 @@ impl SearchPageEditPrepare {
     fn spawn(
         ctx: &egui::Context,
         available: crate::app::page_edit_snapshot::PageEditAvailability,
+        settings: crate::settings::Settings,
     ) -> Result<Self, String> {
         let (tx, command_rx) = mpsc::channel();
         let (output_tx, rx) = mpsc::channel();
@@ -318,7 +320,14 @@ impl SearchPageEditPrepare {
                 #[cfg(test)]
                 let _test_epoch_scope =
                     test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
-                search_prepare_worker(command_rx, output_tx, worker_cancel, repaint, available);
+                search_prepare_worker(
+                    command_rx,
+                    output_tx,
+                    worker_cancel,
+                    repaint,
+                    available,
+                    settings,
+                );
             })
             .map_err(|error| format!("検索結果の準備 worker を起動できません: {error}"))?;
         Ok(Self {
@@ -1433,6 +1442,7 @@ fn search_prepare_worker(
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
     available: crate::app::page_edit_snapshot::PageEditAvailability,
+    sidecar_settings: crate::settings::Settings,
 ) {
     let mut state = GlobalSearchState::default();
     let rating_db =
@@ -1646,12 +1656,43 @@ fn search_prepare_worker(
                         projection,
                     )
                 {
+                    let media_paths = items
+                        .iter()
+                        .filter_map(|item| match item {
+                            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let Some(sidecars) =
+                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                            &sidecar_settings,
+                            &media_paths,
+                            64,
+                            || !cancel.load(Ordering::Relaxed),
+                        )
+                    else {
+                        break;
+                    };
+                    if sidecars.skipped_parents > 0 {
+                        crate::logger::log(format!(
+                            "search sidecar discovery capped: scanned={} skipped={}",
+                            sidecars.scanned_parents, sidecars.skipped_parents
+                        ));
+                    }
+                    for (parent, error) in &sidecars.scan_errors {
+                        crate::logger::log(format!(
+                            "search sidecar discovery failed {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                    let video_thumb_overrides = sidecars.by_video_path;
                     cache_completion = after.completed_writes;
                     let _ = tx.send(SearchPrepareOutput::Ready(
                         wish,
                         SearchPreparedItems {
                             items,
                             image_metas,
+                            video_thumb_overrides,
                             drilled_counts,
                             page_edits,
                             ratings,
@@ -1978,11 +2019,8 @@ impl App {
     ///    破棄されない。
     ///
     /// 2. **同名 stem の sidecar 画像 leak 回避**:
-    ///    `App::video_thumb_overrides` は前フォルダの sidecar を stem キーで保持する
-    ///    (src/app.rs:`hydrate_video_thumb_overrides_from_current_folder`)。Ctrl+G の
-    ///    結果は複数フォルダにまたがるため、これを渡すと別フォルダの同 stem 動画に
-    ///    sidecar 画像が誤って当たる。よって empty map を渡す (sidecar は Ctrl+G では
-    ///    使わない)。Codex P1 #2 指摘。
+    ///    The accepted prepared-list worker supplies a full-path source map shared by video/audio.
+    ///    Only that generation's map is passed; identical stems in unrelated parents cannot leak.
     ///
     /// 3. **重複 Shell 呼び出し抑制**:
     ///    既存の per-search cancel (`search_video_thread_cancel`) を毎回上書きする
@@ -2078,13 +2116,12 @@ impl App {
         // 新 cancel を作成して保存。
         let new_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.search_video_thread_cancel = Some(std::sync::Arc::clone(&new_cancel));
-        // empty thumb_overrides で sidecar leak を回避 (`respawn_search_video_thread`
-        // doc 内 #2 参照)。
+        // Full paths come from this accepted search-list preparation, not the previous physical folder.
         self.spawn_video_thread(
             self.tx.clone(),
             new_cancel,
             candidates,
-            std::collections::HashMap::new(),
+            self.video_thumb_overrides.clone(),
             std::sync::Arc::new(pin_blobs),
         );
     }
@@ -2239,6 +2276,7 @@ impl App {
         match SearchPageEditPrepare::spawn(
             ctx,
             crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+            self.settings.thumbnail_source_discovery_snapshot(),
         ) {
             Ok(prepare) => self.global_search.page_edit_prepare = Some(prepare),
             Err(error) => {
@@ -2589,6 +2627,20 @@ impl App {
                         }
                         writes_after_read =
                             self.rating_session_writes_after(wish.rating_write_generation);
+                        // Source selection belongs to this accepted prepared list; unchanged contexts are untouched.
+                        for (idx, item) in self.items.iter().enumerate() {
+                            if let GridItem::Video(path) | GridItem::Audio(path) = item {
+                                let key = crate::path_key::normalize_keep_drive(path);
+                                if self.video_thumb_overrides.get(&key)
+                                    != prepared.video_thumb_overrides.get(&key)
+                                {
+                                    if let Some(thumbnail) = self.thumbnails.get_mut(idx) {
+                                        *thumbnail = ThumbnailState::Pending;
+                                    }
+                                }
+                            }
+                        }
+                        self.video_thumb_overrides = prepared.video_thumb_overrides;
                         self.search_drilled_folder_counts = prepared.drilled_counts;
                         self.replace_search_view_items_with_ratings(
                             prepared.items,
@@ -2702,6 +2754,7 @@ impl App {
             SearchPageEditPrepare::spawn(
                 ctx,
                 crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+                self.settings.thumbnail_source_discovery_snapshot(),
             )
             .unwrap(),
         );
@@ -3829,6 +3882,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 egui::Context::default(),
                 crate::app::page_edit_snapshot::PageEditAvailability::default(),
+                crate::settings::Settings::default(),
             );
         });
         command_tx

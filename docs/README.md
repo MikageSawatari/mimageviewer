@@ -8,11 +8,13 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
+| [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 利用者実機確認の成功記録、共有設定を「表示 → サムネイル」へ移設・動画と音声の画像省略一致を確認 (§22)、Remote受付証明/ZIP RAW継続の修正・検証と取消保証の文書訂正 (§21)、bounded Rust gateの受入証拠 (§20)、前実装検証 (§19)、FFmpeg gate失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する仕様・実装と検証記録。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |
 | [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240端近くの実ページ単独表示。旧設定移行、白い空き slot の描画、Remote・多窓検証、将来の本構成との境界 |
@@ -84,11 +86,12 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全441フィールドの分類 (131対象 / 310除外)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全452フィールドの分類 (139対象 / 313除外、§1.298とmasterの結合後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
+| [fullscreen-locked-chrome-suppression-plan.md](fullscreen-locked-chrome-suppression-plan.md) | §1.344 の決定仕様と実装記録。F11 の正確な表示先から導く実効ロック、native 動画・F12・描画/予約/hit の共通契約。2026-10-08に利用者判断・構造合意済み |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
 | [book-resume-meter-plan.md](book-resume-meter-plan.md) | 本・動画・音声のサムネイルの前回位置。記録時のHUD位置/総数と既存再生位置/長さ、常に左→右、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |
@@ -135,6 +138,7 @@
 | [nested-zip-tree-plan.md](nested-zip-tree-plan.md) | **実装済み**。`ZipTree` / `ZipDir` によるネスト ZIP のツリーナビ、階層 materialize、サムネイルとナビゲーションの設計契約 |
 | [rar-direct-read-plan.md](rar-direct-read-plan.md) | **実装済み (実 RAR の最終 smoke 対象)**。非ソリッド RAR/CBR の直読みと、ソリッド・入れ子・他形式を ZIP cache 変換へ委譲する routing 仕様 |
 | [external-tool-launch-plan.md](external-tool-launch-plan.md) | **P0/P1/P2a/P2b/P2c/P3 実装済み (2026-09-01、P3 は実機確認待ち)、P4 以降は未実装**。backlog §1.117 の正本。導線は登録した全ツールを平坦に出す右クリックと、既定キーなしの Grid 専用固定スロット / ピッカーの 2 つ。ツールバーとメニューバーの直接起動は一度実装後に撤去した。フォルダー背景・コンテナー項目から現在のフォルダー / 本 1 件を渡す入口を持ち、複数対象は既定 `Each`、ツール別の確認 5 件 / 上限 10 件で扱う。変換アーカイブは元パスを使い、1 コンテナーに定まらない集約ビュー背景と仮想ページは拒否する。外部ツール起動を引数テンプレート / 作業フォルダー / 複数選択 / **ZIP・PDF 内ページの一時実体化** / **動画の現在フレーム**まで広げる設計で、**仮想パスをそのまま渡す方針は採らない**。一時ファイルは NeeView 同型のプロセス単位ディレクトリ + 終了時削除 + 起動時の孤児回収 |
+| [external-tool-file-list-plan.md](external-tool-file-list-plan.md) | §1.329 の決定済み仕様。起動ごとの UTF-8 BOM なし / CRLF リスト、実体化 worker と一時成果物の所有、index を保持したフレーム分割準備、取消・限界・検証 |
 | [sns-split-export-plan.md](sns-split-export-plan.md) | **P1〜P6 実装済み (2026-09-01)**。1 枚の絵を X / Instagram のカルーセル投稿用に 2〜4 枚へ切り分けて書き出す。`CropSettings` / `export_crop.db` には保存しない**一度きりのモード**として分離し、グループ矩形の操作だけを既存の `CropRect` と共有する。比率固定リサイズは反対辺 / 反対角を固定する共通挙動。**X の隙間を実測** (PC ブラウザ 1.588% / iOS アプリ 1.869% / モバイル Web 2.652%、隙間の絶対値は環境ごとに違う) し、枠幅比 **1.7% 固定**を採用。投稿先は X (3:4 / 1.7%) と Instagram (4:5 / 0%) の 2 択のみ。書き出しはパネルボタンから `ExportEntry` に crop を足し、既存の 1 スナップショット→N ファイル経路へ載せる。2x2 グリッドと縦並びは非対象 |
 
 ## 設計メモ (特定領域の詳細)

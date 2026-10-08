@@ -3194,7 +3194,7 @@ fn blend_details_row_color(
     )
 }
 
-fn details_alternating_row_fill(visuals: &egui::Visuals) -> egui::Color32 {
+pub(crate) fn details_alternating_row_fill(visuals: &egui::Visuals) -> egui::Color32 {
     if visuals.dark_mode {
         blend_details_row_color(visuals.panel_fill, egui::Color32::WHITE, 0.055)
     } else {
@@ -4575,7 +4575,7 @@ mod details_text_clip_tests {
     }
 
     #[test]
-    fn cut_details_text_uses_content_opacity_but_selection_bar_stays_opaque() {
+    fn cut_details_other_text_uses_content_opacity_but_selection_bar_stays_opaque() {
         assert_eq!(details_item_content_opacity(false, true), 0.5);
         assert_eq!(details_item_content_opacity(true, true), 1.0);
         assert_eq!(details_item_content_opacity(false, false), 1.0);
@@ -4617,6 +4617,67 @@ mod details_text_clip_tests {
         assert!(
             alpha.iter().any(|alpha| (127..=128).contains(alpha)),
             "details content text must be painted at 0.5 opacity: {alpha:?}"
+        );
+    }
+
+    #[test]
+    fn details_name_cut_paint_is_opaque_while_other_columns_remain_dimmed() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let painter = ui.painter().clone();
+                        let mut content = painter.clone();
+                        content.multiply_opacity(details_item_content_opacity(false, true));
+                        draw_details_name_text(
+                            ui,
+                            &painter,
+                            egui::Rect::from_min_size(
+                                egui::pos2(10.0, 10.0),
+                                egui::vec2(300.0, 32.0),
+                            ),
+                            "cut.jpg",
+                            Some(crate::details_name_colors::DetailsNameCategory::Image),
+                            &crate::details_name_colors::DetailsNameColors::default(),
+                            DetailsRowVisualState {
+                                selected: false,
+                                checked: false,
+                                hovered: false,
+                            },
+                            false,
+                        );
+                        draw_details_text_with_painter(
+                            ui,
+                            &content,
+                            egui::Rect::from_min_size(
+                                egui::pos2(10.0, 45.0),
+                                egui::vec2(300.0, 32.0),
+                            ),
+                            "JPEG",
+                            egui::Align2::LEFT_CENTER,
+                            ui.visuals().text_color(),
+                            false,
+                        );
+                    });
+            },
+        );
+        let mut alpha = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_alpha(&clipped.shape, &mut alpha);
+        }
+        assert!(alpha.contains(&255), "name must remain opaque: {alpha:?}");
+        assert!(
+            alpha.iter().any(|a| (127..=128).contains(a)),
+            "other columns retain cut opacity: {alpha:?}"
         );
     }
 }
@@ -4678,6 +4739,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
+                crate::settings::AudioThumbnailIndicator::default(),
                 true,
                 None,
                 None,
@@ -4696,6 +4758,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
+                crate::settings::AudioThumbnailIndicator::default(),
                 is_cut,
                 None,
             );
@@ -4733,17 +4796,23 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
             strong_text,
             false,
         );
-        draw_details_text_with_painter(
+        let name_painter = ui.painter().clone();
+        draw_details_name_text(
             ui,
-            &content_painter,
+            &name_painter,
             egui::Rect::from_min_max(
                 egui::pos2(icon_rect.right() + 4.0, rect.top()),
                 egui::pos2(rect.left() + 282.0, rect.bottom()),
             ),
             "holiday-photo.jpg",
-            egui::Align2::LEFT_CENTER,
-            strong_text,
-            true,
+            Some(crate::details_name_colors::DetailsNameCategory::Image),
+            &crate::details_name_colors::DetailsNameColors::default(),
+            DetailsRowVisualState {
+                selected: true,
+                checked: false,
+                hovered: false,
+            },
+            false,
         );
         draw_details_text_with_painter(
             ui,
@@ -5025,6 +5094,243 @@ fn details_row_text_color(visuals: &egui::Visuals, selected: bool) -> egui::Colo
         // ラベル、ツールバー、メニューとまとめて反映する。
         visuals.text_color()
     }
+}
+
+/// Only the Details name column is opaque during cut; previews and other columns keep their painter.
+fn draw_details_name_text(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    category: Option<crate::details_name_colors::DetailsNameCategory>,
+    colors: &crate::details_name_colors::DetailsNameColors,
+    visual_state: DetailsRowVisualState,
+    display_only: bool,
+) {
+    let color = crate::details_name_colors::name_color(
+        colors,
+        category,
+        ui.visuals(),
+        crate::os_theme::current_text_contrast(ui.ctx()),
+        visual_state.selected,
+        visual_state.checked,
+        display_only,
+    );
+    draw_details_text_with_painter(
+        ui,
+        painter,
+        rect,
+        text,
+        egui::Align2::LEFT_CENTER,
+        color,
+        false,
+    );
+}
+
+/// Fixed rows share the production name renderer, backgrounds, and cut painter boundary.
+#[doc(hidden)]
+pub fn draw_details_name_colors_snapshot_fixture(ui: &mut egui::Ui) {
+    use crate::details_name_colors::{
+        DetailsNameCategory as C, DetailsNameColor, DetailsNameColors,
+    };
+    fn row(
+        ui: &mut egui::Ui,
+        label: &str,
+        category: C,
+        colors: &DetailsNameColors,
+        row_index: usize,
+        selected: bool,
+        checked: bool,
+        hovered: bool,
+        cut: bool,
+        display_only: bool,
+    ) {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+        let visual = DetailsRowVisualState {
+            selected,
+            checked,
+            hovered,
+        };
+        let text_color = details_row_text_color(ui.visuals(), selected);
+        let painter = ui.painter().clone();
+        painter.rect_filled(
+            rect,
+            0.0,
+            details_row_background(
+                ui.visuals(),
+                DetailsRowStyle::Stripe,
+                row_index,
+                selected,
+                checked,
+                hovered,
+            ),
+        );
+        let mut content = painter.clone();
+        content.multiply_opacity(details_item_content_opacity(display_only, cut));
+        let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(28.0, 28.0)).shrink(4.0);
+        draw_details_preview_icon(
+            &content,
+            icon_rect,
+            if category == C::Folder {
+                DetailsIconKind::Folder
+            } else {
+                DetailsIconKind::Image
+            },
+            text_color,
+            false,
+        );
+        draw_details_name_text(
+            ui,
+            &painter,
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 30.0, rect.top()),
+                egui::pos2(rect.right() - 80.0, rect.bottom()),
+            ),
+            label,
+            Some(category),
+            colors,
+            visual,
+            display_only,
+        );
+        draw_details_text_with_painter(
+            ui,
+            &content,
+            egui::Rect::from_min_max(
+                egui::pos2(rect.right() - 80.0, rect.top()),
+                rect.right_bottom(),
+            ),
+            category.label(),
+            egui::Align2::RIGHT_CENTER,
+            text_color,
+            false,
+        );
+        if cut {
+            crate::app::draw_cut_badge(ui.painter(), icon_rect);
+        }
+    }
+    ui.heading("詳細一覧の名前色");
+    let defaults = DetailsNameColors::default();
+    for (index, (category, label)) in [
+        (C::Folder, "写真フォルダ・長い日本語の名前"),
+        (C::Book, "旅行の本.zip / PDF / RAR / EPUB"),
+        (C::Image, "写真.jpg"),
+        (C::Raw, "写真.NEF"),
+        (C::Video, "旅行.mp4"),
+        (C::Audio, "音楽.flac"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        row(
+            ui, label, category, &defaults, index, false, false, false, false, false,
+        );
+    }
+    ui.separator();
+    for (label, selected, checked, hovered, cut, display) in [
+        ("hover・フォルダ", false, false, true, false, false),
+        (
+            "チェック＋hover・共通文字色",
+            false,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "選択＋チェック・共通選択文字色",
+            true,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "切り取り・名前は不透明、他列とアイコンは薄い",
+            false,
+            false,
+            false,
+            true,
+            false,
+        ),
+        (
+            "選択情報バー・従来の共通文字色",
+            false,
+            false,
+            false,
+            false,
+            true,
+        ),
+    ] {
+        row(
+            ui,
+            label,
+            C::Folder,
+            &defaults,
+            0,
+            selected,
+            checked,
+            hovered,
+            cut,
+            display,
+        );
+    }
+    ui.separator();
+    ui.label("カスタム（強い配色では既定、設定OFFでも保存）");
+    let mut custom = defaults.clone();
+    custom.colors[C::Book.index()] = DetailsNameColor::Custom {
+        light: [0x55, 0x41, 0x92],
+        dark: [0xD0, 0xBB, 0xF5],
+    };
+    row(
+        ui,
+        "カスタムの本・通常",
+        C::Book,
+        &custom,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    row(
+        ui,
+        "カスタムの本・hover",
+        C::Book,
+        &custom,
+        0,
+        false,
+        false,
+        true,
+        false,
+        false,
+    );
+    row(
+        ui,
+        "カスタムの本・チェック",
+        C::Book,
+        &custom,
+        0,
+        false,
+        true,
+        false,
+        false,
+        false,
+    );
+    custom.enabled = false;
+    row(
+        ui,
+        "色分けOFF・フォルダ",
+        C::Folder,
+        &custom,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 }
 
 fn selection_info_popup_y(cell_rect: egui::Rect, viewport: egui::Rect, popup_height: f32) -> f32 {
@@ -16934,7 +17240,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
             _ => None,
         };
-        let failed = matches!(self.thumbnails.get(idx), Some(ThumbnailState::Failed));
+        let failed = matches!(
+            self.thumbnails.get(idx),
+            Some(ThumbnailState::NoArt | ThumbnailState::Failed)
+        );
+        let is_audio = matches!(self.items.get(idx), Some(GridItem::Audio(_)));
+        let audio_parts = self
+            .items
+            .get(idx)
+            .zip(self.thumbnails.get(idx))
+            .map(|(item, thumb)| {
+                crate::app::audio_thumbnail_indicator_parts(
+                    item,
+                    thumb,
+                    self.settings.audio_thumbnail_indicator,
+                )
+            });
         let image_size = texture
             .as_ref()
             .map(|tex| {
@@ -16994,6 +17315,28 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             img_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
+                        );
+                        if is_audio && let Some(parts) = audio_parts {
+                            let marker_rect = if parts.music_icon {
+                                egui::Rect::from_center_size(
+                                    img_rect.center(),
+                                    egui::vec2(48.0, 48.0).min(img_rect.size()),
+                                )
+                            } else {
+                                img_rect
+                            };
+                            crate::app::paint_audio_thumbnail_indicator(
+                                ui.painter(),
+                                marker_rect,
+                                ui.visuals().dark_mode,
+                                parts,
+                            );
+                        }
+                    } else if is_audio {
+                        crate::ui_helpers::draw_music_icon(
+                            ui.painter(),
+                            rect,
+                            ui.visuals().dark_mode,
                         );
                     } else {
                         ui.centered_and_justified(|ui| {
@@ -18209,6 +18552,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             return None;
         };
         let icon_kind = details_icon_kind(item);
+        let name_category = crate::details_name_colors::category(item);
         let is_cut = !display_only
             && item
                 .drag_source_path()
@@ -18272,6 +18616,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         content_painter.multiply_opacity(content_opacity);
 
         let name = row_data.text(DetailsColumn::Name);
+        let name_painter = painter.clone();
         let rating_text = row_data.text(DetailsColumn::Rating);
         let tags_text = row_data.text(DetailsColumn::Tags);
         let kind_text = row_data.text(DetailsColumn::Kind);
@@ -18310,14 +18655,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         cut_badge_rect = Some(col_rect.shrink2(egui::vec2(6.0, 5.0)));
                     }
                 }
-                DetailsColumn::Name => draw_details_text_with_painter(
+                DetailsColumn::Name => draw_details_name_text(
                     ui,
-                    &content_painter,
+                    &name_painter,
                     col_rect,
                     &name,
-                    egui::Align2::LEFT_CENTER,
-                    text_color,
-                    false,
+                    name_category,
+                    &self.settings.details_name_colors,
+                    visual_state,
+                    display_only,
                 ),
                 DetailsColumn::Rating => draw_details_text_with_painter(
                     ui,
@@ -19253,6 +19599,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     bookmark_time.as_deref(),
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
+                                    self.settings.audio_thumbnail_indicator,
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
@@ -19288,6 +19635,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         adjusted,
                                         self.items_are_drive_list,
                                         self.settings.video_thumbnail_indicator,
+                                        self.settings.audio_thumbnail_indicator,
                                         is_cut,
                                         resume,
                                     );
@@ -19360,6 +19708,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         bookmark_time.as_deref(),
                                         self.items_are_drive_list,
                                         self.settings.video_thumbnail_indicator,
+                                        self.settings.audio_thumbnail_indicator,
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
@@ -19414,6 +19763,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         adjusted_tex,
                                         self.items_are_drive_list,
                                         self.settings.video_thumbnail_indicator,
+                                        self.settings.audio_thumbnail_indicator,
                                         is_cut,
                                         book_resume_meter,
                                     );

@@ -1,5 +1,12 @@
 # サムネイルカタログ 設計書
 
+### 音声アルバムアート (§1.347、2026-10-08)
+
+MP3 の埋め込み画像の成功行は既存 `thumbnails` に保存し、`audio_art_absence` は保存対象の確定 NoArt だけを持つ。キーは `audioart:` namespace・drive を保持した実親 scope・版・basename、stamp は worker の fresh mtime 秒 / size。通常 `load_all` と `delete_missing` は SQL 段階でこの namespace を除外し、完全な物理 inventory を得た親だけ worker が成功・absence を prune する。旧 DB の hash / 既存行を維持し、absence schema は worker が保存するときだけ追加する。
+
+`CatalogAccess` が cache-dir 単位の admission epoch・SQL lease・接続 retirement を所有する。削除受付で新規 SQL を失効させ、worker が既存 SQL と全 Local / Remote 接続を排出・close してから全件 / 期限 / 指定フォルダ削除を行う。旧 source 要求は表示を完了できるが DB を再作成しない。CacheOnly は一回だけ新 epoch の短命 read-only 接続で読取を続行する。既存 Loaded を保持し、削除 scope の Audio NoArt / Failed だけを memory 上で再要求可能にする。詳しくは [音声画像計画 §5](audio-album-art-plan.md)。
+
+
 ## 1. 目的・背景
 
 画像ファイルからサムネイルをリアルタイム生成する場合、ファイルサイズによっては

@@ -584,7 +584,7 @@ fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
     assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 2);
     assert!(!app.requested.contains_key(&0) && !app.requested.contains_key(&1));
     let mut canceled = [app.rx.try_recv().unwrap(), app.rx.try_recv().unwrap()].map(|msg| {
-        assert!(msg.canceled && !msg.finalized);
+        assert!(msg.is_canceled() && !msg.is_finalized());
         assert_eq!((msg.input_seq, msg.items_gen), (42, 7));
         msg.idx
     });
@@ -613,7 +613,7 @@ fn grid_queue_prune_counts_queued_raw_followup() {
     assert!(!app.requested.contains_key(&1));
     let msg = app.rx.try_recv().unwrap();
     assert_eq!((msg.idx, msg.input_seq, msg.items_gen), (1, 42, 7));
-    assert!(msg.canceled && !msg.finalized);
+    assert!(msg.is_canceled() && !msg.is_finalized());
 }
 
 #[cfg(windows)]
@@ -759,6 +759,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
         .rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap()
+        .0
         .unwrap();
     assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
     let mut result = terminal.contexts.into_iter().next().unwrap();
@@ -982,6 +983,7 @@ fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
         .rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap()
+        .0
         .unwrap();
     assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
     let result = terminal.contexts.into_iter().next().unwrap();
@@ -1243,21 +1245,21 @@ fn mutation_refresh_global_video_cancels_old_producer_and_keeps_streaming_policy
     // The prior producer's receiver is retired, even in a lightweight search grid.
     assert!(
         old_tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 320
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: true,
-                finalized: false,
-                input_seq: app.input_seq,
-                items_gen: app.items_generation
-            })
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                app.input_seq,
+                app.items_generation
+            ))
             .is_err()
     );
     assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
@@ -1834,7 +1836,7 @@ fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
             .rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let terminal = result.as_ref().expect("pin worker was cancelled");
+        let terminal = result.0.as_ref().expect("pin worker was cancelled");
         assert!(
             terminal.errors.is_empty(),
             "pin worker errors: {:?}",
@@ -3556,9 +3558,11 @@ fn epub_pdf_meta_worker_replaces_page_count_with_new_generation_stamp() {
     for (id, pages) in [(17, 3), (18, 8)] {
         let catalog = std::sync::Arc::clone(&catalog);
         let folder = tmp.path().to_path_buf();
+        let catalog_work = crate::catalog::CatalogWork::capture(&tmp.path().join("thumbs"));
         std::thread::spawn(move || {
             write_epub_pdf_meta_row(
                 &folder,
+                &catalog_work,
                 Some(catalog),
                 "book.epub",
                 id,
@@ -17183,16 +17187,19 @@ mod phase_c_key_tests {
         let validated = events.next().unwrap();
         assert!(events.next().is_none());
         assert_eq!(
-            seed.origin,
+            seed.pixels().unwrap().origin,
             crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
         );
-        assert!(seed.image.is_some());
-        assert_eq!(seed.source_dims, Some((80, 60)));
+        assert!(seed.pixels().is_some());
+        assert_eq!(
+            seed.pixels().and_then(|pixels| pixels.source_dims),
+            Some((80, 60))
+        );
         assert!(
-            validated.finalized,
+            validated.is_finalized(),
             "identical current row needs no second image"
         );
-        assert!(validated.image.is_none());
+        assert!(validated.pixels().is_none());
 
         app.thumbnails = vec![ThumbnailState::Pending];
         app.keep_set.insert(0);
@@ -17342,7 +17349,10 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 32);
+        assert_eq!(
+            rx.try_recv().unwrap().into_pixels().unwrap().image.pixels[0].r(),
+            32
+        );
     }
 
     #[test]
@@ -17409,7 +17419,7 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert!(writer_rx.try_iter().any(|msg| msg.image.is_some()));
+        assert!(writer_rx.try_iter().any(|msg| msg.pixels().is_some()));
         let row = parent.load_one(&base_key).unwrap().unwrap();
         assert_eq!(
             row.folder_provenance,
@@ -17457,15 +17467,18 @@ mod phase_c_key_tests {
             );
             rx.try_iter().collect::<Vec<_>>()
         };
-        assert!(load()[0].image.is_some(), "valid auto row must be shown");
+        assert!(load()[0].pixels().is_some(), "valid auto row must be shown");
         std::fs::remove_file(&winner).unwrap();
         let stale = load();
-        assert!(stale.iter().all(|msg| msg.image.is_none()));
-        assert!(
-            stale.iter().any(|msg| {
-                msg.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss
-            })
-        );
+        assert!(stale.iter().all(|msg| msg.pixels().is_none()));
+        assert!(stale.iter().any(|msg| {
+            matches!(
+                msg.payload,
+                crate::thumb_loader::ThumbMsgPayload::Failed {
+                    origin: crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss
+                }
+            )
+        }));
     }
 
     #[test]
@@ -17478,18 +17491,20 @@ mod phase_c_key_tests {
         app.keep_set = (0..9).collect();
         app.keep_range = (0, 9);
         app.requested.insert(8, false);
-        let message = |idx, image, origin| crate::thumb_loader::ThumbMsg {
-            idx,
-            image,
-            origin,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: 0,
-            items_gen: app.items_generation,
+        let message = |idx, image, origin| {
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                idx,
+                image,
+                origin,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
+                0,
+                app.items_generation,
+            )
         };
         for idx in 0..8 {
             app.tx
@@ -17683,12 +17698,17 @@ mod phase_c_key_tests {
             let mut finalized = false;
             let messages = rx.try_iter().collect::<Vec<_>>();
             for msg in &messages {
-                if msg.finalized {
+                if msg.is_finalized() {
                     finalized = true;
                     continue;
                 }
-                let red = msg.image.as_ref().map(|image| image.pixels[0].r());
-                if msg.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed {
+                let red = msg
+                    .pixels()
+                    .map(|pixels| &pixels.image)
+                    .map(|image| image.pixels[0].r());
+                if msg.pixels().is_some_and(|pixels| {
+                    pixels.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
+                }) {
                     seed = red;
                 }
                 displayed = Some(red);
@@ -18157,7 +18177,10 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 40);
+        assert_eq!(
+            rx.try_recv().unwrap().into_pixels().unwrap().image.pixels[0].r(),
+            40
+        );
     }
 
     #[test]
@@ -18225,7 +18248,7 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert!(rx.try_recv().unwrap().image.is_some());
+        assert!(rx.try_recv().unwrap().pixels().is_some());
     }
 
     #[test]
@@ -18328,8 +18351,11 @@ mod phase_c_key_tests {
             None,
         );
         let shown = rx.try_recv().unwrap();
-        assert!(shown.image.is_some());
-        assert_eq!(shown.source_dims, Some((100, 50)));
+        assert!(shown.pixels().is_some());
+        assert_eq!(
+            shown.pixels().and_then(|pixels| pixels.source_dims),
+            Some((100, 50))
+        );
     }
 
     #[test]
@@ -18480,6 +18506,7 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: Vec::new(),
             omitted: crate::app::folder_scan::OmittedFolderEntryCounts::default(),
@@ -26943,6 +26970,7 @@ mod phase_c_drill_nav_tests {
                 file_size: 20,
             }],
             truncated: false,
+            video_thumb_overrides: Default::default(),
         });
         assert!(app.items_are_tag_view);
         assert!(
@@ -26989,6 +27017,7 @@ mod phase_c_drill_nav_tests {
                 file_size: 5,
             }],
             truncated: false,
+            video_thumb_overrides: Default::default(),
         });
 
         assert!(matches!(
@@ -28620,7 +28649,11 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
     let generation_before = app.items_generation;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(Ok(vec![row])).expect("send bookmark rows");
+    tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
+        rows: vec![row],
+        video_thumb_overrides: app.video_thumb_overrides.clone(),
+    }))
+    .expect("send bookmark rows");
     app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rx,
@@ -33426,19 +33459,19 @@ mod favorite_adjustment_defaults_tests {
         let ctx = egui::Context::default();
         let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: Some(color),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((2, 2)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: cur_gen,
-            })
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                Some(color),
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                None,
+                Some((2, 2)),
+                None,
+                false,
+                false,
+                0,
+                cur_gen,
+            ))
             .unwrap();
 
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
@@ -33472,22 +33505,22 @@ mod favorite_adjustment_defaults_tests {
         app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         app.display_px_shared.store(1024, Ordering::Relaxed);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                Some(egui::ColorImage::filled(
                     [64, 64],
                     egui::Color32::LIGHT_BLUE,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((64, 64)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: app.items_generation,
-            })
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                None,
+                Some((64, 64)),
+                None,
+                false,
+                false,
+                0,
+                app.items_generation,
+            ))
             .unwrap();
 
         app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
@@ -33964,55 +33997,55 @@ mod favorite_adjustment_defaults_tests {
         let items_gen = app.items_generation;
         for idx in 0..8 {
             app.tx
-                .send(crate::thumb_loader::ThumbMsg {
+                .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
                     idx,
-                    image: Some(egui::ColorImage::filled([1, 1], egui::Color32::DARK_GRAY)),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: 0,
+                    Some(egui::ColorImage::filled([1, 1], egui::Color32::DARK_GRAY)),
+                    crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                    false,
+                    None,
+                    Some((1, 1)),
+                    None,
+                    false,
+                    false,
+                    0,
                     items_gen,
-                })
+                ))
                 .unwrap();
         }
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 8,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                8,
+                Some(egui::ColorImage::filled(
                     [247, 124],
                     egui::Color32::LIGHT_BLUE,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 374,
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((884, 444)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
+                false,
+                None,
+                Some((884, 444)),
+                None,
+                false,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 8,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: true,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                8,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                true,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
 
         let ctx = egui::Context::default();
@@ -34020,7 +34053,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(matches!(app.thumbnails[8], ThumbnailState::Pending));
         assert_eq!(app.texture_backlog.len(), 1);
         assert!(matches!(
-            app.texture_backlog[0].origin,
+            app.texture_backlog[0].pixels().unwrap().origin,
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 374
             }
@@ -34032,24 +34065,24 @@ mod favorite_adjustment_defaults_tests {
         );
 
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 8,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                8,
+                Some(egui::ColorImage::filled(
                     [400, 201],
                     egui::Color32::LIGHT_RED,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 400,
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((884, 444)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: items_gen.wrapping_add(1),
-            })
+                false,
+                None,
+                Some((884, 444)),
+                None,
+                false,
+                false,
+                0,
+                items_gen.wrapping_add(1),
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
 
@@ -34117,39 +34150,39 @@ mod favorite_adjustment_defaults_tests {
         // the previous 400px coverage when its image lands after the cell grows again.
         app.requested.insert(0, true);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                Some(egui::ColorImage::filled(
                     [247, 124],
                     egui::Color32::LIGHT_BLUE,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 374,
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((884, 444)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
+                false,
+                None,
+                Some((884, 444)),
+                None,
+                false,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: true,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                true,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(
@@ -34175,19 +34208,19 @@ mod favorite_adjustment_defaults_tests {
 
         // Cancellation has no replacement image, so it must keep the resident coverage intact.
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: true,
-                finalized: false,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(
@@ -34205,19 +34238,19 @@ mod favorite_adjustment_defaults_tests {
         // A real load error is terminal for the resident image and therefore drops its coverage.
         app.requested.insert(0, true);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Failed));
@@ -39602,8 +39635,8 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let message = rx.recv().expect("cache-only hit should emit thumbnail");
-        assert!(message.image.is_some());
-        assert!(message.origin.from_cache());
+        assert!(message.pixels().is_some());
+        assert!(message.pixels().unwrap().origin.from_cache());
     }
 
     #[test]
@@ -40891,7 +40924,7 @@ mod favorite_adjustment_defaults_tests {
             None,
         );
 
-        assert!(rx.recv().unwrap().image.is_some());
+        assert!(rx.recv().unwrap().pixels().is_some());
     }
 
     #[test]
@@ -44832,22 +44865,22 @@ mod favorite_adjustment_defaults_tests {
         };
         let send = |app: &mut App, red: u8| {
             app.tx
-                .send(crate::thumb_loader::ThumbMsg {
-                    idx: 0,
-                    image: Some(egui::ColorImage::new(
+                .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                    0,
+                    Some(egui::ColorImage::new(
                         [2, 2],
                         vec![egui::Color32::from_rgb(red, 10, 20); 4],
                     )),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: Some((2, 2)),
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: 0,
-                    items_gen: app.items_generation,
-                })
+                    crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                    false,
+                    None,
+                    Some((2, 2)),
+                    None,
+                    false,
+                    false,
+                    0,
+                    app.items_generation,
+                ))
                 .unwrap();
         };
         prepare(&mut app, first);
@@ -44964,7 +44997,7 @@ mod favorite_adjustment_defaults_tests {
             );
             let image = rx
                 .try_iter()
-                .find_map(|message| message.image)
+                .find_map(|message| message.into_pixels().map(|pixels| pixels.image))
                 .unwrap_or_else(|| panic!("{name} did not resolve archive WebP"));
             let pixel = image.pixels[0].to_srgba_unmultiplied();
             assert!(pixel[2] > pixel[0], "{name} should use the cached archive");
@@ -56947,7 +56980,11 @@ mod native_video_rating_key_tests {
         // main の rating cache は共有 path 世代から更新済みで、grid install は不要。
         let generation_before = app.items_generation;
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(vec![row])).unwrap();
+        tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
+            rows: vec![row],
+            video_thumb_overrides: app.video_thumb_overrides.clone(),
+        }))
+        .unwrap();
         app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
@@ -57786,6 +57823,7 @@ mod still_window_mode_key_tests {
             idx: target_idx,
             path: target_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -59910,22 +59948,22 @@ mod still_window_mode_key_tests {
         size: [usize; 2],
         source_dims: Option<(u32, u32)>,
     ) -> crate::thumb_loader::ThumbMsg {
-        crate::thumb_loader::ThumbMsg {
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             idx,
-            image: Some(egui::ColorImage::filled(
+            Some(egui::ColorImage::filled(
                 size,
                 egui::Color32::from_rgb(32, 96, 160),
             )),
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            None,
             source_dims,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: 0,
+            None,
+            false,
+            false,
+            0,
             items_gen,
-        }
+        )
     }
 
     fn keep_detached_transition_gap_open(app: &mut App) {
@@ -67412,7 +67450,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 (
                     msg.idx,
                     msg.items_gen,
-                    msg.image.as_ref().map(|image| image.size),
+                    msg.pixels()
+                        .map(|pixels| &pixels.image)
+                        .map(|image| image.size),
                 )
             })
             .collect::<Vec<_>>();
@@ -67467,7 +67507,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 (
                     msg.idx,
                     msg.items_gen,
-                    msg.image.as_ref().map(|image| image.size),
+                    msg.pixels()
+                        .map(|pixels| &pixels.image)
+                        .map(|image| image.size),
                 )
             })
             .collect::<Vec<_>>();
@@ -69996,19 +70038,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             parked_live_window_id: None,
         });
         let items_gen = app.items_generation;
-        app.texture_backlog.push(crate::thumb_loader::ThumbMsg {
-            idx: video,
-            image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: 0,
-            items_gen,
-        });
+        app.texture_backlog
+            .push(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                video,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
+                0,
+                items_gen,
+            ));
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test"));
 
@@ -70874,6 +70917,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: video,
             path: video_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -80626,6 +80670,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: 0,
             path,
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: true,
@@ -98187,7 +98232,13 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             0,
             crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
             [17, 34, 201],
-            bar_lock,
+            crate::video::NativeChromeSnapshot {
+                policy: crate::video::NativeChromePolicy {
+                    bars: bar_lock,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             audio_only,
         )
         .expect("presenter config")
@@ -98231,7 +98282,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
-        assert_eq!(config_for(requested, false).bar_lock, requested);
+        assert_eq!(config_for(requested, false).chrome.policy.bars, requested);
     }
 
     #[test]
@@ -98327,10 +98378,17 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
-            config_for(requested, false).bar_lock.fixed_bar_gap_px,
+            config_for(requested, false)
+                .chrome
+                .policy
+                .bars
+                .fixed_bar_gap_px,
             crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX
         );
-        assert_eq!(requested.clamped(), config_for(requested, false).bar_lock);
+        assert_eq!(
+            requested.clamped(),
+            config_for(requested, false).chrome.policy.bars
+        );
     }
 
     /// 設定を読む場所は 1 つ。config へ渡す値と、生成後の同期が送る値がずれない。
@@ -99551,6 +99609,7 @@ mod background_click_scroll_regression_tests {
                 None,
                 false,
                 app.settings.video_thumbnail_indicator,
+                app.settings.audio_thumbnail_indicator,
                 false,
                 None,
                 None,
@@ -99738,11 +99797,185 @@ mod background_click_scroll_regression_tests {
         }
     }
 
+    fn audio_art_harness(
+        indicator: crate::settings::AudioThumbnailIndicator,
+    ) -> Harness<'static, State> {
+        // Deliberately narrow: some of the drawn music mark is outside the art.
+        let mut harness = letterbox_harness([4, 120]);
+        harness.state_mut().app.items[0] = GridItem::Audio("song.mp3".into());
+        harness.state_mut().app.settings.audio_thumbnail_indicator = indicator;
+        harness.run_steps(4);
+        harness
+    }
+
+    fn audio_art_layout(
+        harness: &Harness<'_, State>,
+    ) -> crate::thumb_overlay_layout::ThumbnailOverlayLayout {
+        let app = &harness.state().app;
+        crate::app::layout_cell_overlays(
+            &harness.ctx.layer_painter(egui::LayerId::background()),
+            cell_rect(harness),
+            Default::default(),
+            0,
+            &app.items[0],
+            &app.thumbnails[0],
+            &[],
+            None,
+            false,
+            app.settings.video_thumbnail_indicator,
+            app.settings.audio_thumbnail_indicator,
+            false,
+            None,
+            None,
+            app.settings.thumb_show_resume_meter,
+        )
+    }
+
+    fn assert_audio_item_clicks(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.state_mut().app.selected = None;
+        click(harness, pos);
+        assert_eq!(harness.state().app.selected, Some(0));
+        click(harness, pos);
+        assert!(
+            harness.state().navs.is_empty(),
+            "audio item must never invoke parent navigation"
+        );
+        assert_eq!(
+            harness.state().app.fullscreen_idx,
+            Some(0),
+            "item double click still opens audio"
+        );
+    }
+
     #[test]
-    fn letterbox_real_grid_no_letterbox_for_audio_or_placeholder_plates() {
+    fn letterbox_real_grid_audio_art_letterbox_is_background_for_every_indicator_and_dpi() {
+        for &indicator in crate::settings::AudioThumbnailIndicator::all() {
+            for ppp in [1.0, 1.25, 2.0] {
+                let mut harness = audio_art_harness(indicator);
+                harness.ctx.set_pixels_per_point(ppp);
+                harness.run_steps(4);
+                let cell = cell_rect(&harness);
+                let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
+                click(&mut harness, pos);
+                assert_eq!(
+                    harness.state().app.selected,
+                    None,
+                    "{indicator:?}, DPI {ppp}"
+                );
+                click(&mut harness, pos);
+                assert!(matches!(
+                    harness.state().navs.as_slice(),
+                    [crate::ui_main::AddressBarNav::Direct(_, _)]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_art_and_filename_remain_item_areas() {
+        for filename in [false, true] {
+            let mut harness = audio_art_harness(crate::settings::AudioThumbnailIndicator::Hidden);
+            let cell = cell_rect(&harness);
+            let pos = if filename {
+                audio_art_layout(&harness)
+                    .bottom_left
+                    .filename
+                    .expect("drawn filename plate")
+                    .rect
+                    .center()
+            } else {
+                // Above the marker, on the actual portrait art.
+                egui::pos2(cell.center().x, cell.min.y + cell.height() * 0.25)
+            };
+            assert_audio_item_clicks(&mut harness, pos);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_music_mark_outside_art_remains_item_area() {
+        let mut harness =
+            audio_art_harness(crate::settings::AudioThumbnailIndicator::MusicNoteIcon);
+        let cell = cell_rect(&harness);
+        let art_right = cell.center().x + (cell.height() - 8.0) * (4.0 / 120.0) * 0.5;
+        let pos = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::Circle(circle) = &clipped.shape else {
+                    return None;
+                };
+                let color = circle.fill;
+                if color != egui::Color32::from_rgb(150, 182, 222)
+                    && color != egui::Color32::from_rgb(70, 112, 162)
+                {
+                    return None;
+                }
+                let visible = clipped
+                    .shape
+                    .visual_bounding_rect()
+                    .intersect(clipped.clip_rect)
+                    .intersect(egui::Rect::from_min_max(
+                        egui::pos2(art_right + 0.25, cell.min.y),
+                        cell.max,
+                    ));
+                visible.is_positive().then(|| visible.center())
+            })
+            .expect("the actual music note paints into the narrow art's letterbox");
+        assert_audio_item_clicks(&mut harness, pos);
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_badge_outside_art_remains_item_area() {
+        let mut harness =
+            audio_art_harness(crate::settings::AudioThumbnailIndicator::BottomLeftBadge);
+        let pos = audio_art_layout(&harness)
+            .bottom_left
+            .container
+            .expect("drawn audio badge")
+            .rect
+            .center();
+        assert!(
+            pos.x < cell_rect(&harness).center().x - 20.0,
+            "badge is outside art"
+        );
+        assert_audio_item_clicks(&mut harness, pos);
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_art_disabled_preserves_whole_cell_open_and_pair_ownership() {
+        let mut harness = audio_art_harness(crate::settings::AudioThumbnailIndicator::Hidden);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .grid_background_double_click_parent = false;
+        let cell = cell_rect(&harness);
+        let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
+        assert_audio_item_clicks(&mut harness, pos);
+        drop(harness); // Release the serialized App/settings fixture before creating the next one.
+
+        let mut harness = audio_art_harness(crate::settings::AudioThumbnailIndicator::Hidden);
+        let cell = cell_rect(&harness);
+        let image = egui::pos2(cell.center().x, cell.min.y + cell.height() * 0.25);
+        let letterbox = cell.min + egui::vec2(5.0, cell.height() * 0.5);
+        click(&mut harness, image);
+        click(&mut harness, letterbox);
+        assert!(harness.state().navs.is_empty());
+        assert_eq!(harness.state().app.fullscreen_idx, None);
+        click(&mut harness, letterbox);
+        assert!(matches!(
+            harness.state().navs.as_slice(),
+            [crate::ui_main::AddressBarNav::Direct(_, _)]
+        ));
+    }
+
+    #[test]
+    fn letterbox_real_grid_no_letterbox_for_missing_audio_or_placeholder_plates() {
         for state in [
             ThumbnailState::Pending,
             ThumbnailState::Evicted,
+            ThumbnailState::NoArt,
             ThumbnailState::Failed,
         ] {
             for audio in [false, true] {
@@ -99958,6 +100191,7 @@ mod background_click_scroll_regression_tests {
                 None,
                 false,
                 app.settings.video_thumbnail_indicator,
+                app.settings.audio_thumbnail_indicator,
                 check,
                 None,
                 None,
@@ -100215,3 +100449,16 @@ mod background_click_scroll_regression_tests {
         assert!(harness.state().app.pending_native_drag.is_none());
     }
 }
+
+#[path = "tests/audio_favsearch_sidecars.rs"]
+mod audio_favsearch_sidecar_tests;
+
+#[path = "tests/audio_refresh.rs"]
+mod audio_refresh_tests;
+
+#[path = "tests/audio_idle_upgrade.rs"]
+mod audio_idle_upgrade_tests;
+
+#[cfg(all(windows, not(feature = "portable")))]
+#[path = "tests/effetune_auto_open.rs"]
+mod effetune_auto_open_tests;

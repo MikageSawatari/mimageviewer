@@ -3359,7 +3359,7 @@ impl App {
                 && let Some(super::FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }
@@ -5123,6 +5123,7 @@ mod tests {
                 crate::grid_item::ThumbnailState::Pending => "pending",
                 crate::grid_item::ThumbnailState::Loaded { .. } => "loaded",
                 crate::grid_item::ThumbnailState::Failed => "failed",
+                crate::grid_item::ThumbnailState::NoArt => "no-art",
                 crate::grid_item::ThumbnailState::Evicted => "evicted",
             })
             .collect()

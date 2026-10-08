@@ -465,3 +465,10 @@ Windows native presenterの実表示、HUD fade、decoderの実寿命はunit tes
 21.33 GiB peakの解消をこのsuiteだけで断定しない。必要なら同じtimestamp上へWorking Set、Private
 Bytes、strip session/worker/decoder identityとopen/close countを追加し、以前のpeakとの比較を別の
 計測chunkとして行う。
+
+### F11固定表示の一時抑制 (§1.344)
+
+F11の抑制でも同じfinal-presentのHidden / VisibleとSuspended契約を使う。
+raw lock・stripの表示選択・session / decoder / worker / LRUは保持し、抑制をcloseやsource resetへ変換しない。
+同coreの開始済みdragは一時可視性を保持する。通常F11のcore再生成時の入力寿命は
+[chrome設計](fullscreen-locked-chrome-suppression-plan.md) §6.2の既存境界に従う。

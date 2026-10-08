@@ -19,7 +19,7 @@ mIV の音声経路へ組み込み、エフェクト処理とビジュアライ�
 - **リモート配信にも適用する** (「リモートだと聴こえ方が違う」を防ぐ)。
 - **「一度起動したら終了まで常に経由」**。起動するのは次のどちらかのとき:
   - 起動時: 保存済みの状態が「有効」(§5.3) または「読めない」のとき
-  - 実行中: 利用者がツールバーのボタンを押したとき
+  - 実行中: 利用者がツールバーのボタンを押したとき、または動画の自動表示設定が ON で最初の適格なローカル動画再生に成功したとき (§16)
   起動後は、エフェクトを全部オフにしても終了までは素通しで経由し続ける。
   経路へ出入りするのは「起動」の 1 回と、§3.4 の失敗時の 1 回だけ。
 - ON/OFF の正本は **Mixwright の状態 1 か所**。mIV 側に独立した ON/OFF 設定を持たない。
@@ -1428,3 +1428,23 @@ Remote 全体テストの旧 OFF 遅延期待値を固定 lookahead に合わせ
 EffeTune の効果を OFF にして meter を出し、動画／音楽の再生中に前段設定 ON→OFF→ON を OK で確定する。
 メイン／全画面／別窓／動画の音声表示モードで、開き直し不要・切替音や同期ずれがないことを確認する。
 Remote は配信を再開せず、先読み済み音声を待ってから入力ピークの変化を確認する。
+
+## 16. 動画再生成功時の自動表示 (§1.337、利用者決定 2026-10-08)
+
+詳細契約は [自動表示設計](effetune-auto-open-plan.md)。設定 `effetune_auto_open_on_video` は既定 OFF。
+環境設定「動画・音声 → 動画 → 音響調整」で確定した値だけを共有 gate に公開し、portable の UI・検索・実行は除外する。
+released settings の JSON field / DB key 欠落は serde default false として読み、既存 `settings_kv` に加算保存する。
+環境設定のファイル移行では、既存 EffeTune の設定と同じく移行先の導入状態・窓の運用に依存する項目として除外する。
+
+EngineActor の単一 PlaybackStart が明示的な NewSource / UserPlay / ContinuousAdvance を所有し、唯一の Playing 確定で成功を作る。
+normalize の pause／全復帰、seek／DSP handoff／loop はその start の内部継続。成功は App::poll_video で適格性に関係なく一度だけ drain する。
+設定 ON・root 可視・全ローカル閲覧窓が非全画面・非最小化・Remote 非占有の5要因を一つの atomic projection とし、
+成功時の allowed / revision を AutoPermit にそのまま継承する。各 owner は自分の bit だけを CAS 更新し、抑止往復でも revision は戻らない。
+成功から poll までの最小化／Remote 往復も棄却し、復帰時に遅延 popup を出さない。
+
+controller の起動内 Armed / Spent が全 viewer の機会を集約し、適格な要求の前に Spent とする。
+Manual / AutoVideo は既存 Loading／host queue に合流し、手動意図を優先する。成功した手動表示も機会を消費する。
+自動失敗／途中取消は再試行しない。OFF・tray 格納・全画面・最小化・Remote で未表示 AutoVideo を取消し、
+worker の hidden attach 前後と host GUI の表示直前でも成功時 revision を検査する。取消 ACK は表示希望を作らない。
+自動表示は foreground 許可と activate を要求せず、既存の ownerless・非 TOPMOST 表示を維持する。
+手動表示・表示済み窓の最小化設定・tray 保持・Remote 復帰の扱いは変えない。

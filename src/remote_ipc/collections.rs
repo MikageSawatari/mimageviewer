@@ -743,6 +743,7 @@ fn collection_payload(
 ) -> CollectionPayload {
     let spread = collection_spread_payload(&entries, spread_request);
     CollectionPayload {
+        thumbnail_presentation: super::thumbnail_presentation(settings),
         title: title.to_owned(),
         thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
         sort_state,

@@ -492,9 +492,14 @@ pub fn sort_and_materialize_rows(
     )
 }
 
+pub struct BookmarkBrowserBuildResult {
+    pub rows: Vec<BookmarkBrowserRow>,
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+}
+
 pub struct BookmarkBrowserPending {
     pub cancel: Arc<AtomicBool>,
-    pub rx: mpsc::Receiver<Result<Vec<BookmarkBrowserRow>, String>>,
+    pub rx: mpsc::Receiver<Result<BookmarkBrowserBuildResult, String>>,
 }
 
 impl BookmarkBrowserPending {
@@ -503,14 +508,49 @@ impl BookmarkBrowserPending {
     }
 }
 
-pub fn spawn_build() -> BookmarkBrowserPending {
+pub fn spawn_build(settings: crate::settings::Settings) -> BookmarkBrowserPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("bookmark-browser-build".to_string())
         .spawn(move || {
-            let result = build_rows(&cancel_worker).map_err(|err| err.to_string());
+            let result = build_rows(&cancel_worker)
+                .map_err(|err| err.to_string())
+                .and_then(|rows| {
+                    let media_paths = rows
+                        .iter()
+                        .filter(|row| !row.missing && row.marker_thumbnail.is_none())
+                        .filter_map(|row| match &row.item {
+                            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let sidecars =
+                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                            &settings,
+                            &media_paths,
+                            64,
+                            || !cancel_worker.load(Ordering::Relaxed),
+                        )
+                        .ok_or_else(|| "cancelled".to_string())?;
+                    if sidecars.skipped_parents > 0 {
+                        crate::logger::log(format!(
+                            "bookmark sidecar discovery capped: scanned={} skipped={}",
+                            sidecars.scanned_parents, sidecars.skipped_parents
+                        ));
+                    }
+                    for (parent, error) in &sidecars.scan_errors {
+                        crate::logger::log(format!(
+                            "bookmark sidecar discovery failed {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                    Ok(BookmarkBrowserBuildResult {
+                        rows,
+                        video_thumb_overrides: sidecars.by_video_path,
+                    })
+                });
             let _ = tx.send(result);
         })
         .ok();
