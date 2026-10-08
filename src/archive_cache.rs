@@ -35,7 +35,7 @@ pub fn cache_root() -> PathBuf {
 /// キャッシュ ZIP 自身を開いたときに「入れ子アーカイブ検出 → 再変換提案」の
 /// ループに入らないためのガードに使う (v1.3.0)。
 pub fn is_under_cache_root(path: &Path) -> bool {
-    path.starts_with(cache_root())
+    crate::path_key::physical_path_is_within(path, &cache_root())
 }
 
 /// DB ファイルのパス。
@@ -205,10 +205,22 @@ impl ArchiveCacheDb {
         &self,
         cached: &Path,
     ) -> Option<ConvertedArchiveSnapshot> {
-        self.read_projection_snapshot(
-            "replace(cached_zip_path, char(92), '/')",
-            &crate::path_key::normalize_keep_drive(cached),
-        )
+        let normal = crate::path_key::physical_path_spelling(cached)?;
+        let snapshot =
+            self.read_projection_snapshot("replace(cached_zip_path, char(92), '/')", &normal);
+        if snapshot.is_some() {
+            return snapshot;
+        }
+        // Match the other safe Windows spelling with a bounded lookup. Persisted
+        // source keys and stored paths remain unchanged; do not list the database.
+        let verbatim = if let Some(unc) = normal.strip_prefix("//") {
+            format!("//?/unc/{unc}")
+        } else if normal.as_bytes().get(1) == Some(&b':') {
+            format!("//?/{normal}")
+        } else {
+            return None;
+        };
+        self.read_projection_snapshot("replace(cached_zip_path, char(92), '/')", &verbatim)
     }
 
     fn read_projection_snapshot(
@@ -788,6 +800,46 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_cache_root_and_projection_lookup_accept_physical_spellings() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let (_source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
+        let canonical = std::fs::canonicalize(&cached).unwrap();
+        let root = cache_root();
+        assert!(is_under_cache_root(&cached));
+        assert!(is_under_cache_root(&canonical));
+        let upper_slash = PathBuf::from(cached.to_string_lossy().to_uppercase().replace('\\', "/"));
+        assert!(is_under_cache_root(&upper_slash));
+        assert!(!is_under_cache_root(
+            &root.with_file_name("archive_cache_other").join("book.zip")
+        ));
+        assert!(!is_under_cache_root(&root.join("..").join("outside.zip")));
+        let db = ArchiveCacheDb::open_readonly().unwrap();
+        for spelling in [&cached, &canonical, &upper_slash] {
+            let snapshot = db.snapshot_for_cached_zip(spelling).unwrap();
+            assert_eq!(snapshot.cached_zip_path, cached);
+        }
+        let conn = rusqlite::Connection::open(db_path()).unwrap();
+        conn.execute(
+            "UPDATE converted_archives SET cached_zip_path=?1",
+            [canonical.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        for spelling in [&cached, &canonical, &upper_slash] {
+            let snapshot = db.snapshot_for_cached_zip(spelling).unwrap();
+            assert_eq!(snapshot.cached_zip_path, canonical);
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT cached_zip_path FROM converted_archives",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            canonical.to_string_lossy()
+        );
+    }
 
     #[test]
     fn schema_and_roundtrip() {

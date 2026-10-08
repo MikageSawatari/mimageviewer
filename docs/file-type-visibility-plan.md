@@ -105,6 +105,12 @@ Remoteの逐次candidate列挙にも実entry descentの同じownerを接続す�
 実際に欠落した項目の従来の削除経路も保持する。自動再変換や復旧要求の機構は追加しない。
 既存の本を開く変換経路、またはキャッシュ管理での再生成後に一覧を再読込すると、
 新しい来歴に従って表示を復元する。外側の元形式を内部書庫の来歴として推測しない。
+**2026-10-09 再レビュー #5 の確認:** 元書庫への登録と、受入済みcache内の実在ページへの
+参照は区別する。後者の可視性は実cacheのmanifest、またはmanifest欠落時の上記旧cache
+規則で判定する。元書庫の削除・更新、DBに記録したcache size/versionの古さを理由に、
+実在ページを来歴不明として許可しない。前者で元書庫が欠落・更新している場合と、
+cache内でも実際に欠落したmemberは、従来の欠落登録の表示・削除経路を維持する。
+投影はworkerで実cacheを読み、自動再変換・再試行・新しい復旧状態を追加しない。
 来歴をpaintで再走査する案と、全ZipDirを常に残す案は、誤除外/適用漏れになるため不採用。
 
 ### 3.2 共通の投影順序
@@ -1028,3 +1034,55 @@ protocol 68のRemote、EPUB workerを配置した（266.0秒、PE検査成功）
 再現せず、8-threadでの全lib再実行は不要だった。初回gateの失敗と修正・再実行の経緯、
 独立した所有境界レビュー、各logは `target/A-1345-fix-verification.md` に記録した。
 製品は起動せず、commitも行っていない。実機確認手順は `target/A-1345-fix-manual.md`。
+
+### 再レビューの残存2件への修正（2026-10-09、97bf8c653後）
+
+- #5: `ConvertedArchiveReference::{CachedZip,Source}`で参照の所有を分ける。
+  元書庫の欠落・更新を検証するのはSource参照のみ。CachedZip参照は実cacheの列挙／
+  manifestまたはLegacyの実在memberを証拠とし、元書庫の状態や記録size/versionで
+  Unknown（許可）へ戻さない。OtherArchive bookmarkもSource参照の共通ownerへ通す。
+  Legacy／manifest × 元書庫欠落／更新、実在／欠落member・prefix、cache欠落、
+  DB記録size不一致・旧versionにある実manifest、再変換後の復帰と登録保持を検査する。
+- #8とRemote代表: `archive_cache::is_under_cache_root`は`path_key`のpure物理パス
+  比較を使う。normal／verbatim drive・UNCのcase/slashとcomponent境界を同じhelperで
+  照合し、root外の`..`・別drive/share・device/volume namespaceを拒否する。
+  cache対応表のreadonly照合も同じ表記を最大2候補で使い、DBキー・schemaは変えない。
+  RAW識別・代表選択・Remote File／ZipDirectoryサムネイルは既存producerとこのownerを
+  共有し、入口ごとのguardは追加しない。実7z→converter→Remote archive jobの
+  result activation→canonical backing→実identify／thumbnail handlerで回帰を検査する。
+  RAW識別はpayload読出し0・入れ子展開なし・取消・manifest欠落を確認し、サムネイルは
+  File／ZipDirectoryで設定を除外→解除→除外と変え、返されたWebP寸法で来歴除外を確認する。
+
+独立Sol/xhighは参照の所有、共通パス比較、handler回帰の凍結差分を確認し、
+構造修正に合意した。自動検証は実装側が担当する。今回の結果・各log・先行失敗は
+`target/A-1345-fix2-verification.md`、英語commit messageは`target/A-1345-fix2-msg.txt`、
+実機確認手順は`target/A-1345-fix2-manual.md`。製品起動・commitは行わない。
+
+**一時停止の経緯:** 新しい実handler回帰で、Fileのforeground/prefetchとRAW識別は通過したが、
+`/api/page`のZipDirectoryは既存`remote_view_trim_keys`により代表選定より前に
+「コンテナ自体は表示トリム対象ではありません」で拒否されると確認した。
+render_contextありにもZipDirectory pageの受入分岐がない。依頼の実/page ZipDirectory
+成功前提との矛盾として、利用者指示に従いAPI動作を追加せず停止する。
+独立レビュアーは公開HTTPの`validate_page_address`もZipDirectoryと書庫Fileを拒否し、
+ZipDirectoryには編集page identityがないと確認した。core File/pageテストの成功は、
+公開HTTPで書庫File/pageが提供される証拠にはならない。現行の代表画像は/thumb経路を使う。
+選択肢(a)は現行APIを維持し、ZipDirectoryは実際の代表／サムネイル経路と/page拒否を
+検査する。選択肢(b)はZipDirectory/page対応の設計・レビュー範囲を拡大する。
+停止時の重点検証は111成功・上記1失敗だった。
+
+**2026-10-09 coordinator決定(a):** 現行APIを維持する。公開`/api/page`は書庫File／
+ZipDirectoryを拒否し、HTTPの実routeでその拒否を回帰に固定する。代表選択は
+実`/api/thumb`入口で検証する。HTTP認証・admissionの実routeと、実converter／書庫jobが
+解決したcanonical verbatim backingを読む本体thumbnail handlerをそれぞれ検査する。
+テスト用の新しいIPC server／callbackや製品起動は追加しない。公開addressは通常表記を
+保ち、内部canonical pathで共通cache-root判定へ到達する。page APIの拡張は行わない。
+
+残存2件修正の最終検証は、重点visibility 112件、RAW-window 6件、新HTTP route 2件、
+全lib既定並列11131件（52 skip、800.00秒）、Remote Rust 137件（1 skip）、IPC 66件、
+UI snapshot 105件が成功した。変更していないWeb DOM/PWA 192件の既存結果は再利用した。
+fmt・glyph lint（危険文字0）・通常/portable core checkが成功し、
+`build-dev.ps1 -PreserveRuntime`で通常featureのcore・Remote・EPUB workerを配置した
+（162.8秒、VCRT PE runtime=4 / pe=3成功）。今回AVとsimilar-index flakeは再発せず、
+8-threadの全lib再実行は不要だった。これは先行AVの原因解明・解消の証明ではない。
+API前提の停止、テストfixtureの隔離修正と先行失敗も今回の検証記録に保存した。
+製品起動・commit・build-dist・test-fullは実施していない。実機確認は手動手順へ引き継ぐ。

@@ -182,10 +182,120 @@ mod tests {
         std::fs::remove_file(&source).unwrap();
         let mut projection = ArchiveVisibilityProjection::new(&policy, &cancel);
         assert!(
-            projection.allows_member(&cached, "chapter.zip/page.jpg"),
-            "stale/missing source retains deletion route"
+            !projection.allows_member(&cached, "chapter.zip/page.jpg"),
+            "the existing cache retains its actual ancestry without the original source"
         );
+        assert!(projection.allows_member(&cached, "missing.jpg"));
+        assert!(projection.allows_member(&source, "chapter.zip/page.jpg"));
         assert_eq!(projection.notice(), None);
+    }
+
+    #[test]
+    fn visibility_direct_cache_proof_survives_missing_or_changed_source() {
+        for manifest in [false, true] {
+            for missing_source in [false, true] {
+                let guard = crate::data_dir::TestDataDirGuard::new();
+                let (source, cached) = legacy_conversion_fixture(guard.path());
+                let source_bytes = std::fs::read(&source).unwrap();
+                if manifest {
+                    regenerate_conversion_fixture(&source, &cached);
+                }
+                if missing_source {
+                    std::fs::remove_file(&source).unwrap();
+                } else {
+                    std::fs::write(&source, b"changed original archive").unwrap();
+                }
+                let policy = FileTypeVisibility {
+                    excluded_extensions: ["zip".into()].into_iter().collect(),
+                    ..Default::default()
+                };
+                let cancel = AtomicBool::new(false);
+                let mut source_reference = ArchiveVisibilityProjection::new(&policy, &cancel);
+                assert!(source_reference.allows_member(&source, "chapter.zip/page.jpg"));
+                assert_eq!(source_reference.notice(), None);
+
+                let canonical_cached = std::fs::canonicalize(&cached).unwrap();
+                for cache_reference in [&cached, &canonical_cached] {
+                    let mut direct = ArchiveVisibilityProjection::new(&policy, &cancel);
+                    assert!(!direct.allows_member(cache_reference, "chapter.zip/page.jpg"));
+                    assert_eq!(direct.allows_member(cache_reference, "root.jpg"), manifest);
+                    assert_eq!(
+                        direct.allows_member(cache_reference, "notes.zip/page.jpg"),
+                        manifest
+                    );
+                    assert!(direct.allows_member(cache_reference, "missing.jpg"));
+                    let directory = |prefix: &str| GridItem::ZipDir {
+                        zip_path: cache_reference.clone(),
+                        dir_prefix: prefix.into(),
+                        is_archive: true,
+                        representative: None,
+                    };
+                    assert!(!direct.allows_item(&directory("chapter.zip/")));
+                    assert_eq!(direct.allows_item(&directory("notes.zip/")), manifest);
+                    assert!(direct.allows_item(&directory("missing.zip/")));
+                    assert_eq!(
+                        direct.notice(),
+                        (!manifest).then_some(ArchiveVisibilityNotice::LegacyConvertedCache)
+                    );
+                }
+
+                std::fs::write(&source, &source_bytes).unwrap();
+                regenerate_conversion_fixture(&source, &cached);
+                let mut regenerated = ArchiveVisibilityProjection::new(&policy, &cancel);
+                assert!(!regenerated.allows_member(&cached, "chapter.zip/page.jpg"));
+                assert!(regenerated.allows_member(&cached, "root.jpg"));
+                assert!(regenerated.allows_member(&cached, "notes.zip/page.jpg"));
+                assert_eq!(regenerated.notice(), None);
+
+                std::fs::remove_file(&cached).unwrap();
+                let mut missing = ArchiveVisibilityProjection::new(&policy, &cancel);
+                assert!(missing.allows_member(&cached, "chapter.zip/page.jpg"));
+                assert!(missing.allows_item(&GridItem::ZipDir {
+                    zip_path: cached.clone(),
+                    dir_prefix: "chapter.zip/".into(),
+                    is_archive: true,
+                    representative: None,
+                }));
+                assert_eq!(missing.notice(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn visibility_direct_cache_reads_actual_proof_with_stale_database_metadata() {
+        for manifest in [false, true] {
+            let guard = crate::data_dir::TestDataDirGuard::new();
+            let (source, cached) = legacy_conversion_fixture(guard.path());
+            if manifest {
+                regenerate_conversion_fixture(&source, &cached);
+            }
+            let conn = rusqlite::Connection::open(crate::archive_cache::db_path()).unwrap();
+            conn.execute(
+                "UPDATE converted_archives SET origin_manifest_version=0, cached_zip_size=cached_zip_size+1",
+                [],
+            )
+            .unwrap();
+            let policy = FileTypeVisibility {
+                excluded_extensions: ["zip".into()].into_iter().collect(),
+                ..Default::default()
+            };
+            let cancel = AtomicBool::new(false);
+            let mut direct = ArchiveVisibilityProjection::new(&policy, &cancel);
+            assert!(!direct.allows_member(&cached, "chapter.zip/page.jpg"));
+            assert_eq!(direct.allows_member(&cached, "root.jpg"), manifest);
+            assert_eq!(
+                direct.allows_member(&cached, "notes.zip/page.jpg"),
+                manifest
+            );
+            assert!(direct.allows_member(&cached, "missing.jpg"));
+            assert_eq!(
+                direct.notice(),
+                (!manifest).then_some(ArchiveVisibilityNotice::LegacyConvertedCache)
+            );
+            let mut source_reference = ArchiveVisibilityProjection::new(&policy, &cancel);
+            assert!(source_reference.allows_member(&source, "chapter.zip/page.jpg"));
+            assert_eq!(source_reference.notice(), None);
+        }
     }
 
     #[test]
@@ -270,6 +380,30 @@ enum ArchiveProjectionStatus {
     Unknown,
 }
 
+/// A source address can borrow only its current conversion, while a direct cache
+/// reference owns the existing ZIP independently of the original archive.
+enum ConvertedArchiveReference {
+    CachedZip(crate::archive_cache::ConvertedArchiveSnapshot),
+    Source(crate::archive_cache::ConvertedArchiveSnapshot),
+}
+
+impl ConvertedArchiveReference {
+    fn snapshot(&self) -> &crate::archive_cache::ConvertedArchiveSnapshot {
+        match self {
+            Self::CachedZip(snapshot) | Self::Source(snapshot) => snapshot,
+        }
+    }
+
+    fn source_mapping_is_current(&self) -> bool {
+        match self {
+            // The direct ZIP's successful enumeration proves its members and origins.
+            // Original-source and recorded-cache stamps do not own that reference.
+            Self::CachedZip(_) => true,
+            Self::Source(snapshot) => snapshot.is_current(),
+        }
+    }
+}
+
 /// One immutable policy and enumeration per distinct container for a single worker build.
 pub(crate) struct ArchiveVisibilityProjection<'a> {
     policy: &'a FileTypeVisibility,
@@ -306,32 +440,30 @@ impl<'a> ArchiveVisibilityProjection<'a> {
     }
 
     fn build_projection(&self, path: &Path) -> ArchiveProjectionStatus {
-        let snapshot = self.cache.as_ref().and_then(|db| {
+        let reference = self.cache.as_ref().and_then(|db| {
             db.snapshot_for_cached_zip(path)
-                .or_else(|| db.snapshot_for_source(path))
+                .map(ConvertedArchiveReference::CachedZip)
+                .or_else(|| {
+                    db.snapshot_for_source(path)
+                        .map(ConvertedArchiveReference::Source)
+                })
         });
-        let path = snapshot
+        let path = reference.as_ref().map_or(path, |reference| {
+            reference.snapshot().cached_zip_path.as_path()
+        });
+        if reference
             .as_ref()
-            .map_or(path, |snapshot| snapshot.cached_zip_path.as_path());
-        if snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.is_current())
+            .is_some_and(|reference| !reference.source_mapping_is_current())
         {
             return ArchiveProjectionStatus::Unknown;
         }
         if self.cancel.load(Ordering::Relaxed) {
             return ArchiveProjectionStatus::Unknown;
         }
-        // The DB is the conversion evidence. A modern cache reads its manifest once,
-        // through the existing cancellable enumeration owner. Legacy/invalid origins
+        // The DB proves conversion identity; the existing cache proves its ancestry.
+        // Read the actual manifest even if the DB predates it. Missing/invalid origins
         // only inspect literal metadata and never fabricate container ancestry.
-        if snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.origin_manifest_version != 1)
-        {
-            return self.legacy_projection(path, snapshot.as_ref().unwrap());
-        }
-        let enumeration = if snapshot.is_some() {
+        let enumeration = if reference.is_some() {
             crate::zip_loader::enumerate_converted_image_entries_detailed_readonly_with_cancel(
                 path,
                 Some(self.cancel),
@@ -348,17 +480,17 @@ impl<'a> ArchiveVisibilityProjection<'a> {
                 if error.kind() == std::io::ErrorKind::InvalidData
                     && !self.cancel.load(Ordering::Relaxed) =>
             {
-                return snapshot
+                return reference
                     .as_ref()
-                    .map_or(ArchiveProjectionStatus::Unknown, |snapshot| {
-                        self.legacy_projection(path, snapshot)
+                    .map_or(ArchiveProjectionStatus::Unknown, |reference| {
+                        self.legacy_projection(path, reference)
                     });
             }
             Err(_) => return ArchiveProjectionStatus::Unknown,
         };
-        if snapshot
+        if reference
             .as_ref()
-            .is_some_and(|snapshot| !snapshot.is_current())
+            .is_some_and(|reference| !reference.source_mapping_is_current())
         {
             return ArchiveProjectionStatus::Unknown;
         }
@@ -393,7 +525,7 @@ impl<'a> ArchiveVisibilityProjection<'a> {
     fn legacy_projection(
         &self,
         path: &Path,
-        snapshot: &crate::archive_cache::ConvertedArchiveSnapshot,
+        reference: &ConvertedArchiveReference,
     ) -> ArchiveProjectionStatus {
         if self.cancel.load(Ordering::Relaxed) {
             return ArchiveProjectionStatus::Unknown;
@@ -415,7 +547,7 @@ impl<'a> ArchiveVisibilityProjection<'a> {
                 known_prefixes.insert(member[..=offset].to_owned());
             }
         }
-        if self.cancel.load(Ordering::Relaxed) || !snapshot.is_current() {
+        if self.cancel.load(Ordering::Relaxed) || !reference.source_mapping_is_current() {
             return ArchiveProjectionStatus::Unknown;
         }
         ArchiveProjectionStatus::Legacy {
@@ -458,21 +590,10 @@ impl<'a> ArchiveVisibilityProjection<'a> {
         }
         use crate::book_bookmarks::{BookContainerKind, PageIdentity};
         match (&bookmark.container_kind, &bookmark.page_identity) {
-            (BookContainerKind::Zip, PageIdentity::ArchiveEntry(member)) => {
-                self.allows_member(&bookmark.container_path, member)
-            }
-            (BookContainerKind::OtherArchive, PageIdentity::ArchiveEntry(member))
-                if self.policy.requires_archive_origins() =>
-            {
-                let snapshot = self
-                    .cache
-                    .as_ref()
-                    .and_then(|db| db.snapshot_for_source(&bookmark.container_path));
-                match snapshot.filter(|snapshot| snapshot.is_current()) {
-                    Some(snapshot) => self.allows_member(&snapshot.cached_zip_path, member),
-                    None => true,
-                }
-            }
+            (
+                BookContainerKind::Zip | BookContainerKind::OtherArchive,
+                PageIdentity::ArchiveEntry(member),
+            ) => self.allows_member(&bookmark.container_path, member),
             _ => true,
         }
     }

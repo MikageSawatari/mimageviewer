@@ -8802,7 +8802,7 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 mod tests {
     use super::*;
 
-    fn initialize_remote_page_edit_databases() {
+    pub(super) fn initialize_remote_page_edit_databases() {
         drop(crate::adjustment_db::AdjustmentDb::open().unwrap());
         drop(crate::mask_db::MaskDb::open().unwrap());
         drop(crate::local_adjust_db::LocalAdjustDb::open().unwrap());
@@ -12050,7 +12050,7 @@ mod tests {
         bytes
     }
 
-    fn remote_ai_test_jpeg(width: u32, height: u32) -> Vec<u8> {
+    pub(super) fn remote_ai_test_jpeg(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut bytes)
             .encode_image(&image::DynamicImage::new_rgb8(width, height))
@@ -15662,6 +15662,297 @@ mod raw_window_tests {
         }
         writer.finish().unwrap();
         cursor.into_inner()
+    }
+
+    /// Use the real archive job's result activation: public addresses name the 7z,
+    /// while all reads receive its canonical converted ZIP backing (verbatim on Windows).
+    #[cfg(windows)]
+    fn visibility_open_converted_remote_archive(
+        folder: &Path,
+        entries: &[(&str, &[u8])],
+    ) -> (
+        Arc<ContainerEngine>,
+        Arc<super::super::archive_job::RemoteArchiveJobRegistry>,
+        PathBuf,
+        PathBuf,
+    ) {
+        use super::super::archive_job::{ContainerRemoteArchiveExecutor, RemoteArchiveJobRegistry};
+        use crate::settings::FavoriteEntry;
+        use mimageviewer_ipc::{
+            RemoteArchiveJobState, RemoteArchiveResultResponse, RemoteArchiveStartRequest,
+            RemoteArchiveStartResponse, RemoteArchiveStateResponse, SessionAcquireRequest,
+            SessionConnectionKind, SessionPeerInfo, SessionStatus,
+        };
+
+        std::fs::create_dir_all(folder).unwrap();
+        let source = folder.join("source.7z");
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&source).unwrap();
+        for (name, data) in entries {
+            writer
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file(name),
+                    Some(std::io::Cursor::new(data.to_vec())),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let cached = db.reserve_cache_zip_path(&source).unwrap();
+        let summary = crate::archive_converter::convert_to_zip(
+            &source,
+            &cached,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        db.record(
+            &source,
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &cached,
+            std::fs::metadata(&cached).unwrap().len() as i64,
+            summary.image_count,
+            false,
+        )
+        .unwrap();
+        let mut settings = crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("canonical cache".into(), folder.into())],
+            ..Default::default()
+        };
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("zip".into());
+        crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_archive_cache_db(Some(db));
+        let engine = Arc::new(ContainerEngine::new_with_session(settings, session.clone()));
+        let jobs = RemoteArchiveJobRegistry::new(Arc::new(ContainerRemoteArchiveExecutor::new(
+            Arc::clone(&engine),
+            session.clone(),
+        )));
+        session.install_archive_jobs(&jobs);
+        assert_eq!(
+            session
+                .acquire(SessionAcquireRequest {
+                    client_id: "visibility".into(),
+                    peer: SessionPeerInfo {
+                        connection_kind: SessionConnectionKind::Direct,
+                        device_name: Some("canonical cache test".into()),
+                    },
+                })
+                .status,
+            SessionStatus::Active
+        );
+        assert!(session.finish_acquire(session.snapshot().generation));
+        let operation = session
+            .begin_operation(
+                &session.owner_for_test("visibility"),
+                "open canonical cache".into(),
+            )
+            .unwrap();
+        let RemoteArchiveStartResponse::Accepted(snapshot) = jobs.start(
+            "visibility".into(),
+            RemoteArchiveStartRequest {
+                request_id: "canonical-cache".into(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            u64::MAX,
+            operation,
+        ) else {
+            panic!("archive job was not admitted")
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let RemoteArchiveStateResponse::Success(current) =
+                jobs.state("visibility", &snapshot.job_id)
+            else {
+                panic!("archive job disappeared")
+            };
+            if current.state == RemoteArchiveJobState::Ready {
+                break;
+            }
+            assert!(!current.state.is_terminal(), "{current:?}");
+            assert!(Instant::now() < deadline, "{current:?}");
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            jobs.result("visibility", &snapshot.job_id),
+            RemoteArchiveResultResponse::Success(_)
+        ));
+        let resolved = engine
+            .resolve_source(&RemoteAddress::file(source.to_string_lossy().into_owned()))
+            .unwrap();
+        let canonical = std::fs::canonicalize(&cached).unwrap();
+        assert_eq!(resolved.readable_canonical(), canonical);
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        (engine, jobs, source, cached)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn visibility_raw_identification_checks_canonical_converted_cache_without_nested_reads() {
+        use super::super::raw_prefetch::PrefetchIdentifier;
+        let data = crate::settings_db::DataDirOverrideGuard::new();
+        let nested = zip_bytes(&[("nested.dng", b"NESTED RAW")]);
+        let (engine, _jobs, source, cached) = visibility_open_converted_remote_archive(
+            &data.path().join("raw-canonical"),
+            &[
+                ("root.dng", b"ROOT RAW"),
+                ("notes.zip/direct.dng", b"DIRECT RAW"),
+                ("inner.zip", &nested),
+            ],
+        );
+        let canonical = std::fs::canonicalize(&cached).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let address = |name: &str| RemoteAddress {
+            path: source.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: name.into(),
+            },
+        };
+        for member in ["root.dng", "notes.zip/direct.dng"] {
+            assert!(
+                engine.identify(&address(member), &cancel).is_some(),
+                "{member}"
+            );
+        }
+        assert!(
+            engine
+                .identify(&address("inner.zip/nested.dng"), &cancel)
+                .is_none()
+        );
+        for path in [&cached, &canonical] {
+            assert!(!crate::zip_loader::nested_cache_contains(path, "inner.zip"));
+            for member in ["root.dng", "notes.zip/direct.dng", "inner.zip/nested.dng"] {
+                assert_eq!(crate::zip_loader::raw_payload_read_count(path, member), 0);
+            }
+        }
+        cancel.store(true, Ordering::Release);
+        assert!(engine.identify(&address("root.dng"), &cancel).is_none());
+        cancel.store(false, Ordering::Release);
+        // Legacy caches cannot prove the direct entry's ancestry either.
+        std::fs::write(
+            &cached,
+            zip_bytes(&[
+                ("root.dng", b"ROOT RAW"),
+                ("inner.zip/nested.dng", b"NESTED RAW"),
+            ]),
+        )
+        .unwrap();
+        for member in ["root.dng", "inner.zip/nested.dng"] {
+            assert!(engine.identify(&address(member), &cancel).is_none());
+            assert_eq!(
+                crate::zip_loader::raw_payload_read_count(&canonical, member),
+                0
+            );
+        }
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &canonical,
+            "inner.zip"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn visibility_thumbnail_representatives_check_canonical_converted_cache_and_keep_page_contract()
+    {
+        use super::tests::{initialize_remote_page_edit_databases, remote_ai_test_jpeg};
+        let data = crate::settings_db::DataDirOverrideGuard::new();
+        initialize_remote_page_edit_databases();
+        let hidden = zip_bytes(&[("page.jpg", &remote_ai_test_jpeg(10, 4))]);
+        let allowed = remote_ai_test_jpeg(7, 5);
+        let (engine, _jobs, source, _) = visibility_open_converted_remote_archive(
+            &data.path().join("page-canonical"),
+            &[
+                ("chapter.zip", &hidden),
+                ("pages/chapter.zip", &hidden),
+                ("pages/notes.zip/page.jpg", &allowed),
+            ],
+        );
+        for subresource in [
+            RemoteSubresource::File,
+            RemoteSubresource::ZipDirectory {
+                prefix: "pages/".into(),
+            },
+        ] {
+            let address = RemoteAddress {
+                path: source.to_string_lossy().into_owned(),
+                subresource: subresource.clone(),
+            };
+            let mut settings = engine.settings_for_listing().unwrap();
+            for excluded in [true, false, true] {
+                settings.file_type_visibility.excluded_extensions.clear();
+                if excluded {
+                    settings
+                        .file_type_visibility
+                        .excluded_extensions
+                        .insert("zip".into());
+                }
+                crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+                let response = engine.thumbnail(
+                    &mimageviewer_ipc::ThumbnailRequest {
+                        address: address.clone(),
+                        source_address: None,
+                        target_px: 256,
+                    },
+                    &WorkerContext::open(),
+                );
+                let ThumbnailResponse::Success { webp_bytes } = response else {
+                    panic!("{subresource:?} excluded={excluded}: {response:?}")
+                };
+                let image = image::load_from_memory(&webp_bytes).unwrap();
+                let expected = if excluded { (7, 5) } else { (10, 4) };
+                assert_eq!(
+                    (image.width(), image.height()),
+                    expected,
+                    "{subresource:?} excluded={excluded}"
+                );
+            }
+            for priority in [PagePriority::Foreground, PagePriority::Prefetch] {
+                let response = engine.page_with_job_cancel_and_priority(
+                    PageRequest {
+                        job_id: format!("canonical-{subresource:?}-{priority:?}"),
+                        display_request_id: None,
+                        address: address.clone(),
+                        target_px: 256,
+                        priority,
+                        render_context: None,
+                        adjustment_preview: None,
+                    },
+                    &WorkerContext::open(),
+                    Arc::new(AtomicBool::new(false)),
+                    &|| priority,
+                );
+                // Public HTTP rejects archive File and ZipDirectory pages. The
+                // core still accepts File representatives; ZipDirectory has no
+                // page trim/edit identity and must retain its existing refusal.
+                if matches!(subresource, RemoteSubresource::ZipDirectory { .. }) {
+                    assert!(
+                        matches!(
+                            response,
+                            PageResponse::Error(MediaError {
+                                code: MediaErrorCode::BadRequest,
+                                ..
+                            })
+                        ),
+                        "{priority:?}: {response:?}"
+                    );
+                    continue;
+                }
+                let PageResponse::Success(payload) = response else {
+                    panic!("{subresource:?} {priority:?}: {response:?}")
+                };
+                assert_eq!(
+                    (payload.width, payload.height),
+                    (7, 5),
+                    "{subresource:?} {priority:?}"
+                );
+            }
+        }
     }
 
     #[test]

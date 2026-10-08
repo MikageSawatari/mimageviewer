@@ -697,56 +697,88 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn visibility_rating_worker_hides_legacy_pages_and_preserves_ratings_after_regeneration() {
-        let _epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
-        let guard = crate::data_dir::TestDataDirGuard::new();
-        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
-        let db_path = guard.path().join("rating.db");
-        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
-        for member in ["root.jpg", "chapter.zip/page.jpg", "notes.zip/page.jpg"] {
-            let mut meta =
-                crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
-                    .with_source_path(&cached);
-            meta.entry_name = Some(member.into());
-            db.set_user_rating(
-                &format!("{}::{member}", cached.to_string_lossy()),
-                4,
-                Some(&meta),
-            )
-            .unwrap();
+    fn visibility_rating_worker_preserves_cache_proof_and_ratings_without_current_source() {
+        for missing_source in [false, true] {
+            let _epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let guard = crate::data_dir::TestDataDirGuard::new();
+            let (source, cached) =
+                crate::archive_visibility::legacy_conversion_fixture(guard.path());
+            let source_bytes = std::fs::read(&source).unwrap();
+            let db_path = guard.path().join("rating.db");
+            let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+            for member in [
+                "root.jpg",
+                "chapter.zip/page.jpg",
+                "notes.zip/page.jpg",
+                "missing.jpg",
+            ] {
+                let mut meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
+                        .with_source_path(&cached);
+                meta.entry_name = Some(member.into());
+                db.set_user_rating(
+                    &format!("{}::{member}", cached.to_string_lossy()),
+                    4,
+                    Some(&meta),
+                )
+                .unwrap();
+            }
+            let stored = db.list_by_stars(4).unwrap();
+            let invalidate_source = || {
+                if missing_source {
+                    std::fs::remove_file(&source).unwrap();
+                } else {
+                    std::fs::write(&source, b"changed original archive").unwrap();
+                }
+            };
+            let options = || RatingViewPrepareOptions {
+                sort: RatingViewSort::default(),
+                include_epub: true,
+                intent: RatingViewBuildIntent::Reorder,
+                visibility: crate::file_type_visibility::FileTypeVisibility {
+                    excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                display_order: Default::default(),
+                pin_db: None,
+                folder_thumb_sort: crate::settings::SortOrder::FileName,
+                folder_thumb_depth: 0,
+                edits: Default::default(),
+                tags_db_path: None,
+            };
+            invalidate_source();
+            let legacy =
+                prepare_rating_view(db_path.clone(), 4, options(), &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(legacy.rows.len(), 1);
+            assert!(
+                matches!(&legacy.rows[0].item, GridItem::ZipImage { entry_name, .. } if entry_name == "missing.jpg")
+            );
+            assert_eq!(legacy.prepared.unwrap().items.len(), 1);
+            assert_eq!(
+                legacy.visibility_notice,
+                Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
+            );
+            assert_eq!(stored, db.list_by_stars(4).unwrap());
+            std::fs::write(&source, &source_bytes).unwrap();
+            crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+            let restored =
+                prepare_rating_view(db_path.clone(), 4, options(), &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(restored.rows.len(), 3);
+            assert_eq!(restored.prepared.unwrap().items.len(), 3);
+            assert_eq!(restored.visibility_notice, None);
+            invalidate_source();
+            let direct =
+                prepare_rating_view(db_path, 4, options(), &AtomicBool::new(false)).unwrap();
+            assert_eq!(direct.rows.len(), 3);
+            assert!(direct.rows.iter().all(|row| !matches!(&row.item, GridItem::ZipImage { entry_name, .. } if entry_name == "chapter.zip/page.jpg")));
+            assert_eq!(direct.prepared.unwrap().items.len(), 3);
+            assert_eq!(direct.visibility_notice, None);
+            assert_eq!(stored, db.list_by_stars(4).unwrap());
         }
-        let stored = db.list_by_stars(4).unwrap();
-        let options = || RatingViewPrepareOptions {
-            sort: RatingViewSort::default(),
-            include_epub: true,
-            intent: RatingViewBuildIntent::Reorder,
-            visibility: crate::file_type_visibility::FileTypeVisibility {
-                excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
-                    .into_iter()
-                    .collect(),
-                ..Default::default()
-            },
-            display_order: Default::default(),
-            pin_db: None,
-            folder_thumb_sort: crate::settings::SortOrder::FileName,
-            folder_thumb_depth: 0,
-            edits: Default::default(),
-            tags_db_path: None,
-        };
-        let legacy =
-            prepare_rating_view(db_path.clone(), 4, options(), &AtomicBool::new(false)).unwrap();
-        assert!(legacy.rows.is_empty());
-        assert!(legacy.prepared.unwrap().items.is_empty());
-        assert_eq!(
-            legacy.visibility_notice,
-            Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
-        );
-        crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
-        let restored = prepare_rating_view(db_path, 4, options(), &AtomicBool::new(false)).unwrap();
-        assert_eq!(restored.rows.len(), 2);
-        assert_eq!(restored.prepared.unwrap().items.len(), 2);
-        assert_eq!(restored.visibility_notice, None);
-        assert_eq!(stored, db.list_by_stars(4).unwrap());
     }
 
     #[test]

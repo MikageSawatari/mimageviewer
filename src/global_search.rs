@@ -522,63 +522,114 @@ mod tests {
     }
 
     #[test]
-    fn visibility_search_worker_hides_legacy_hits_with_notice_and_restores_after_regeneration() {
-        let guard = crate::data_dir::TestDataDirGuard::new();
-        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
-        let (_tmp, meta, fts) = setup();
-        let fav = Uuid::new_v4();
-        let key = format!(
-            "{}{}root.jpg",
-            cached.to_string_lossy(),
-            crate::search_norm::ZIP_ENTRY_SEP
-        );
-        ingest(&meta, &fts, fav, &key, "visibilitylegacy");
-        let scope = SearchScope {
-            visibility: crate::file_type_visibility::FileTypeVisibility {
-                excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
-                    .into_iter()
-                    .collect(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let collect = || {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            run(
-                "visibilitylegacy",
-                &[fav],
-                &scope,
-                &fts,
-                &AtomicBool::new(false),
-                &tx,
-                None,
-            );
-            drop(tx);
-            let mut hits = Vec::new();
-            let mut notice = None;
-            for event in rx.try_iter() {
-                if let SearchStreamEvent::Batch {
-                    hits: batch,
-                    visibility_notice,
-                    ..
-                } = event
-                {
-                    hits.extend(batch);
-                    notice = notice.or(visibility_notice);
-                }
+    fn visibility_search_worker_preserves_cache_proof_and_index_without_current_source() {
+        for missing_source in [false, true] {
+            let guard = crate::data_dir::TestDataDirGuard::new();
+            let (source, cached) =
+                crate::archive_visibility::legacy_conversion_fixture(guard.path());
+            let source_bytes = std::fs::read(&source).unwrap();
+            let (_tmp, meta, fts) = setup();
+            let fav = Uuid::new_v4();
+            let keys = [
+                "root.jpg",
+                "chapter.zip/page.jpg",
+                "notes.zip/page.jpg",
+                "missing.jpg",
+            ]
+            .map(|member| {
+                format!(
+                    "{}{}{member}",
+                    cached.to_string_lossy(),
+                    crate::search_norm::ZIP_ENTRY_SEP
+                )
+            });
+            for key in &keys {
+                ingest(&meta, &fts, fav, key, "visibilitylegacy");
             }
-            (hits, notice)
-        };
-        let (hits, notice) = collect();
-        assert!(hits.is_empty());
-        assert_eq!(
-            notice,
-            Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
-        );
-        crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
-        let (hits, notice) = collect();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(notice, None);
+            let stored = fts.searcher().num_docs();
+            assert_eq!(stored, 4);
+            let invalidate_source = || {
+                if missing_source {
+                    std::fs::remove_file(&source).unwrap();
+                } else {
+                    std::fs::write(&source, b"changed original archive").unwrap();
+                }
+            };
+            let scope = SearchScope {
+                visibility: crate::file_type_visibility::FileTypeVisibility {
+                    excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let collect = || {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                run(
+                    "visibilitylegacy",
+                    &[fav],
+                    &scope,
+                    &fts,
+                    &AtomicBool::new(false),
+                    &tx,
+                    None,
+                );
+                drop(tx);
+                let mut hits = Vec::new();
+                let mut notice = None;
+                for event in rx.try_iter() {
+                    if let SearchStreamEvent::Batch {
+                        hits: batch,
+                        visibility_notice,
+                        ..
+                    } = event
+                    {
+                        hits.extend(batch);
+                        notice = notice.or(visibility_notice);
+                    }
+                }
+                (hits, notice)
+            };
+            invalidate_source();
+            let (hits, notice) = collect();
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].path.ends_with("missing.jpg"));
+            assert_eq!(
+                notice,
+                Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
+            );
+            assert_eq!(fts.searcher().num_docs(), stored);
+            std::fs::write(&source, &source_bytes).unwrap();
+            crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+            let (hits, notice) = collect();
+            assert_eq!(hits.len(), 3);
+            assert!(
+                hits.iter()
+                    .all(|hit| !hit.path.ends_with("chapter.zip/page.jpg"))
+            );
+            assert_eq!(notice, None);
+            invalidate_source();
+            let (hits, notice) = collect();
+            assert_eq!(hits.len(), 3);
+            assert!(
+                hits.iter()
+                    .all(|hit| !hit.path.ends_with("chapter.zip/page.jpg"))
+            );
+            assert_eq!(notice, None);
+            assert_eq!(fts.searcher().num_docs(), stored);
+            for key in &keys {
+                assert!(
+                    crate::fts_index::find_doc_by_path(
+                        &fts.searcher(),
+                        fts.fields(),
+                        &normalize_path(&PathBuf::from(key))
+                    )
+                    .unwrap()
+                    .is_some()
+                );
+            }
+        }
     }
 
     #[test]

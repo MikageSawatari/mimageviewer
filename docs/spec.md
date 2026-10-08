@@ -122,6 +122,14 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   代用しない。旧 raw-only 記録は除外適用時に自動復元を見送り通知する。
   同じ書庫内の実 directory `book.zip/` とネスト書庫 `book.zip` の同名衝突は非対応
   （2026-10-08 利用者決定）。既存 reader のネスト書庫としての扱いを維持する。
+  評価・検索・登録一覧が変換cache内の実在ページを参照するときは、元書庫が削除・更新
+  されてもそのcache自身の来歴で内部形式を判定する。来歴のない旧cacheの実在項目は、
+  内部形式の除外に来歴が必要な場合だけ一時的に隠して再生成を案内する。登録は保持し、
+  元書庫への欠落登録・cache内でも欠落したmemberの従来の削除経路は維持する。
+  cache-root所属判定は通常／Windows canonical verbatimのdrive・UNC表記と大小文字を
+  共通helperで照合する。RAW先読みとRemoteのFile／ZipDirectory代表選定も同じ判定を
+  通り、RAW識別では直接memberの中央directoryと取消可能なmanifestだけを読み、
+  入れ子の器を展開しない。保存済みDBキーと公開Remote addressは変更しない。
 - 環境設定「ファイル処理 → RAW 現像」（「Susie プラグイン」の直後）に「同時現像数」(`raw_develop_parallelism`: 1〜10、既定 3) と「明るさ」(`raw_brightness: RawBrightness`: `MatchPreview` = プレビューに合わせる / `None` = 補正しない、既定 MatchPreview) を置く。「並列読み込み」には通常画像と PDF の設定を置く。検索は RAW・現像・同時現像数・明るさ・プレビューなどから専用ページへ移動する。現像数は executor の変更が成功したときだけ設定へ反映し、途中の worker 起動失敗では以前の上限を維持して画面へエラーを返す。明るさ変更は全 viewer context の RAW 入力を再現像し、サムネイルと非 RAW ページは保持する。未リリース設定なので migration は作らない。
 - v2.7.0では「メタ情報をエクスポート / インポート」を安定化のため一時非表示にしたが、
   v2.8.0の継続開発で再表示する。実フォルダ表示中だけ使用できる。既存の自動

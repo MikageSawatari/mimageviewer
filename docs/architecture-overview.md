@@ -18,6 +18,11 @@ Remoteは次の一覧・読出し要求から最新設定を使う。読書位�
 return ownerを保持する。共有open admissionの種類判定だけは、同じcontextが保持する
 current_folderと元書庫overrideの対応から論理sourceを使う。元書庫がなくても既存のF5
 cache再読込を維持し、別のpathや兄弟contextへaliasを適用しない。
+集約一覧の`ArchiveVisibilityProjection`は元書庫参照と物理cache参照を型で区別する。
+元書庫のcurrentnessを確認するのは前者だけで、後者の実在memberは実cacheのmanifest／
+legacy規則が可視性を所有する。物理パスの通常／Windows verbatim表記は`path_key`の
+I/Oなしhelperで比較し、`archive_cache::is_under_cache_root`とcache対応表の照合で共有する。
+代表ページとRAW先読みはこのcache-root判定を使い、既存DBキーと公開addressは保持する。
 来歴と状態遷移の正本は [表示するファイル種類](file-type-visibility-plan.md)。
 
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は

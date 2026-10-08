@@ -6053,6 +6053,123 @@ mod tests {
     }
 
     #[test]
+    fn visibility_page_route_rejects_archive_files_and_zip_directories_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let generation = state
+            .library
+            .remote_state()
+            .unwrap()
+            .remote_state_generation;
+        // Saturating IPC proves that these responses come from the page-kind guard,
+        // rather than a request being dispatched or rejected by the core.
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Heavy).unwrap())
+            .collect::<Vec<_>>();
+        for (name, prefix) in [
+            ("book.zip", None),
+            ("book.7z", None),
+            ("book.zip", Some("chapter.zip/")),
+        ] {
+            let archive = temp.path().join(name);
+            std::fs::write(&archive, b"archive fixture").unwrap();
+            let mut url = format!(
+                "/api/page?path={}&generation={generation}&job=page-1&display=display-1&w=256",
+                utf8_percent_encode(&archive.to_string_lossy(), NON_ALPHANUMERIC)
+            );
+            if let Some(prefix) = prefix {
+                url.push_str(&format!(
+                    "&prefix={}",
+                    utf8_percent_encode(prefix, NON_ALPHANUMERIC)
+                ));
+            }
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(&url)
+                .with_header(cookie_header(&state))
+                .with_header(Header::from_bytes("X-mIV-Remote-Client", "archive-client").unwrap())
+                .with_header(
+                    Header::from_bytes("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef")
+                        .unwrap(),
+                )
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 400, "{name}: {prefix:?}");
+            assert_eq!(response.body, b"Bad Request");
+            assert_eq!(
+                state.ipc_admission.heavy.in_flight(),
+                MAX_CONCURRENT_HEAVY_IPC
+            );
+        }
+    }
+
+    #[test]
+    fn visibility_thumb_route_admits_archive_files_and_zip_directories_to_thumbnail_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        // Exercise the real HTTP route without connecting to a running core. The
+        // existing admission boundary returns a distinctive response after validation.
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        for (name, prefix, source_kind) in [
+            ("book.zip", None, "zip"),
+            ("book.7z", None, "file"),
+            ("book.zip", Some("chapter.zip/"), "zip"),
+        ] {
+            let archive = temp.path().join(name);
+            std::fs::write(&archive, b"archive fixture").unwrap();
+            let path = archive.to_string_lossy().into_owned();
+            let mut url = format!(
+                "/api/thumb?path={}&w=256",
+                utf8_percent_encode(&path, NON_ALPHANUMERIC)
+            );
+            if let Some(prefix) = prefix {
+                url.push_str(&format!(
+                    "&prefix={}",
+                    utf8_percent_encode(prefix, NON_ALPHANUMERIC)
+                ));
+            }
+            let address =
+                remote_address_from_query(&parse_query(split_url(&url).1).unwrap()).unwrap();
+            assert_eq!(
+                address,
+                RemoteAddress {
+                    path,
+                    subresource: prefix.map_or(RemoteSubresource::File, |prefix| {
+                        RemoteSubresource::ZipDirectory {
+                            prefix: prefix.to_owned(),
+                        }
+                    }),
+                }
+            );
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(&url)
+                .with_header(cookie_header(&state))
+                .with_header(Header::from_bytes("X-mIV-Remote-Client", "archive-client").unwrap())
+                .with_header(
+                    Header::from_bytes("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef")
+                        .unwrap(),
+                )
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 503, "{name}: {prefix:?}");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], "ipc_busy");
+            let details = response.log_details.unwrap();
+            assert_eq!(details["thumb"]["ipc_status"], "admission_busy");
+            assert_eq!(details["thumb"]["source_kind"], source_kind);
+            assert_eq!(details["thumb"]["target_px"], 256);
+            assert_eq!(details["thumb"]["ipc_retry_count"], 0);
+            assert_eq!(
+                state.ipc_admission.heavy.in_flight(),
+                MAX_CONCURRENT_HEAVY_IPC - 1
+            );
+        }
+    }
+
+    #[test]
     fn persistent_post_validation_reanchors_a_spread_to_its_surviving_page() {
         let temp = tempfile::tempdir().unwrap();
         let survivor_path = temp.path().join("survivor.jpg");
