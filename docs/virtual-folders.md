@@ -14,6 +14,8 @@ EPUBのSave PDFは元要求の帰路を保持したDirect移動に切り替え�
 親から子へ入るとlive親facetを退避して子を無条件にし、親へ戻ると退避値を戻す。
 履歴から同じ子へ再入場しても、その時点の親条件を退避する。履歴entryにfilter値は保存しない。
 手動復元はframeを消費し、同じrouteのreload/rebuildはframeを作り直さない。
+ZIPの全再読込で準備済みprefixが変わる場合はSameLocationでもrouteを合わせ、実際の親frameを復元する。
+同階層の再読込は手動復元済みの値を維持し、外側の履歴cursorはどちらも進めない。
 場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
 sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
 failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。

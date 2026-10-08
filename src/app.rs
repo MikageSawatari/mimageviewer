@@ -22658,13 +22658,14 @@ impl App {
             MainHistoryOperation::Restore { route: Some(route) } => {
                 self.reconcile_main_list_saved_destination(location, route.clone(), prefix)
             }
-            MainHistoryOperation::SameLocation => FolderNavHistoryEntry::new(
+            MainHistoryOperation::SameLocation => self.reconcile_main_list_saved_destination(
                 location,
                 navigation
                     .source_location
                     .as_ref()
                     .map(|source| source.route.clone())
                     .unwrap_or_default(),
+                prefix,
             ),
             _ => self.main_list_destination_entry(
                 location,
@@ -23653,9 +23654,48 @@ impl App {
         self.prune_collection_folder_history_from_ready_catalog();
     }
 
+    /// Presentation/input availability uses the uncommitted cursor; capture and validation
+    /// keep reading the committed entry getters and active history vectors below.
+    fn provisional_folder_history_plan(&self) -> Option<&FolderHistoryPlan> {
+        let physical = self
+            .top_level_grid_view
+            .history_navigation_transition()
+            .map(|request| match request {
+                HistoryNavigationTransition::Physical(request) => &request.navigation,
+                HistoryNavigationTransition::Collection(request) => &request.navigation,
+            });
+        let rating = self
+            .rating_view_pending
+            .as_ref()
+            .and_then(|request| request.navigation.as_deref());
+        let classification = self
+            .top_level_grid_view
+            .open_path_classification()
+            .and_then(|request| request.navigation.as_ref());
+        [
+            self.staged_smart_history_navigation(),
+            physical,
+            rating,
+            classification,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|navigation| match &navigation.history {
+            MainHistoryOperation::Replay(plan)
+                if self.main_list_navigation_is_current(navigation) =>
+            {
+                Some(plan.as_ref())
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn folder_history_back_target(&self) -> Option<&FolderNavHistoryTarget> {
-        self.folder_history_back_entry()
-            .map(|entry| &entry.location)
+        let entry = match self.provisional_folder_history_plan() {
+            Some(plan) => plan.virtual_back.last(),
+            None => self.folder_history_back_entry(),
+        };
+        entry.map(|entry| &entry.location)
     }
 
     pub(crate) fn folder_history_back_entry(&self) -> Option<&FolderNavHistoryEntry> {
@@ -23674,8 +23714,11 @@ impl App {
     }
 
     pub(crate) fn folder_history_forward_target(&self) -> Option<&FolderNavHistoryTarget> {
-        self.folder_history_forward_entry()
-            .map(|entry| &entry.location)
+        let entry = match self.provisional_folder_history_plan() {
+            Some(plan) => plan.virtual_forward.last(),
+            None => self.folder_history_forward_entry(),
+        };
+        entry.map(|entry| &entry.location)
     }
 
     pub(crate) fn folder_history_forward_entry(&self) -> Option<&FolderNavHistoryEntry> {
@@ -23691,6 +23734,14 @@ impl App {
                     self.folder_nav_forward_stack.last()
                 }
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_folder_history_input_for_test(
+        &mut self,
+        direction: FolderHistoryDirection,
+    ) {
+        self.dispatch_main_folder_history_input(direction);
     }
 
     /// All merged Back/Forward input routes land here. A transient search or Snapshot surface
@@ -25628,9 +25679,9 @@ impl App {
                 owner: OpenRequestOwner::Bookmark(owner),
                 ..
             } => Some(MainListSourceProof::Bookmark(owner.clone())),
-            ClassifiedOpenContinuation::SmartGrid { .. } => self
-                .smart_folder_source_lease()
-                .map(MainListSourceProof::Surface),
+            // This continuation retains a row index and derives kind after classification.
+            // Unlike path-based Smart moves, a row refresh must invalidate its authority.
+            ClassifiedOpenContinuation::SmartGrid { .. } => Some(MainListSourceProof::Row),
             ClassifiedOpenContinuation::Direct {
                 owner: OpenRequestOwner::Navigation,
                 ..
@@ -30392,9 +30443,10 @@ impl App {
     ) -> bool {
         let target = FolderNavHistoryTarget::Rating { stars };
         let head = match direction {
-            FolderHistoryDirection::Back => self.folder_history_back_target(),
-            FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-        };
+            FolderHistoryDirection::Back => self.folder_history_back_entry(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+        }
+        .map(|entry| &entry.location);
         if head != Some(&target) {
             return false;
         }
@@ -31025,9 +31077,10 @@ impl App {
         };
         if let Some((direction, target)) = replay.as_ref() {
             let head = match direction {
-                FolderHistoryDirection::Back => self.folder_history_back_target(),
-                FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-            };
+                FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+            }
+            .map(|entry| &entry.location);
             if head != Some(target) {
                 return false;
             }
@@ -31053,9 +31106,10 @@ impl App {
             return false;
         };
         let head = match direction {
-            FolderHistoryDirection::Back => self.folder_history_back_target(),
-            FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-        };
+            FolderHistoryDirection::Back => self.folder_history_back_entry(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+        }
+        .map(|entry| &entry.location);
         if head != Some(&target)
             || !(crate::folder_tree::is_virtual_folder(path)
                 || crate::folder_tree::is_convertible_archive_path(path))
@@ -52121,7 +52175,7 @@ impl App {
                         MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
                             selection: request.selection,
                         }),
-                        MainListSourceProof::Row,
+                        self.copied_destination_source_proof(),
                     );
                     self.open_direct_navigation_target(
                         path,
@@ -52187,7 +52241,7 @@ impl App {
                     MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
                         selection: selection.clone(),
                     }),
-                    MainListSourceProof::Row,
+                    self.copied_destination_source_proof(),
                 )
             })
         });
@@ -52327,6 +52381,13 @@ impl App {
         );
     }
 
+    fn copied_destination_source_proof(&self) -> MainListSourceProof {
+        // The destination and exact selection are owned paths. Same-query result refreshes
+        // may replace rows; another surface/query/context still loses this native lease.
+        self.smart_folder_source_lease()
+            .map_or(MainListSourceProof::Row, MainListSourceProof::Surface)
+    }
+
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
         self.start_folder_open_scan_with_restore(path, purpose, None);
     }
@@ -52401,7 +52462,12 @@ impl App {
             } else {
                 MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
             };
-            Some(self.capture_main_list_navigation(operation, MainListSourceProof::Row))
+            let proof = if matches!(purpose, FolderOpenScanPurpose::JumpToPhysicalFolder { .. }) {
+                self.copied_destination_source_proof()
+            } else {
+                MainListSourceProof::Row
+            };
+            Some(self.capture_main_list_navigation(operation, proof))
         } else {
             None
         };

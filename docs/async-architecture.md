@@ -26,6 +26,7 @@ spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同�
 classification / Physical / Rating / Collection / Smartの要求owner間で引き継ぐ。
 履歴entryは場所と`FacetRoute`だけを持ち、地点別filter値は保存しない。
 待機中の←←/←→は同じ`FolderHistoryPlan`の仮cursorを進め、確定stackは変更しない。
+toolbarの有効状態と宛先もこの仮cursorを投影する。採用・baseline検証は確定stackだけを参照する。
 取消・失敗・staleは未採用要求を破棄するだけで、移動のrollback snapshotを復元しない。
 独立したmain移動の受理時には、同じownerの旧分類・仮履歴・Rating要求等を退役させる。
 要求を取り消しても旧replyへ採用権限を戻さず、別windowの読取要求にはこの退役を及ぼさない。
@@ -43,6 +44,9 @@ row依存要求は既存items世代・revision証明を維持し、Smartのsurfa
 PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
 ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の
 行再読込をitems世代だけで失効させない。要求を置換した旧取消は新requestに届かない。
+検索の「フォルダへ移動」は宛先と選択pathをコピー済みのsurface要求で、同queryの結果追加を許す。
+SmartGridの分類はrow要求で、items世代と要求時pathの一致を検証してからrowのkindを読む。
+Collectionの採用拒否・native取消完了も既存の要求終端を通し、所有するfullscreen lock/holdoverを解除する。
 Collectionの自動再生・本をまたぐページ継続はRestoreとして同じ採用境界へ渡し、
 外側の履歴cursorを進めない。payloadと元要求の準備後にだけroot/physical表示を交換する。
 既存のinput gate・holdoverとwarm PDFの即時placeholder表示は維持する。

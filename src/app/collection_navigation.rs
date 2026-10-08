@@ -2549,7 +2549,9 @@ impl App {
                         );
                     }
                     Ok(Ok(_)) => self.restart_collection_navigation(ctx, request),
-                    Ok(Err(CollectionPrepareError::Cancelled)) => {}
+                    Ok(Err(CollectionPrepareError::Cancelled)) => {
+                        self.finish_collection_navigation_without_target_no_context(&request.action)
+                    }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.finish_collection_navigation_without_target(ctx, &request.action)
                     }
@@ -2656,7 +2658,9 @@ impl App {
                             self.finish_collection_navigation_without_target(ctx, &request.action)
                         }
                     }
-                    Ok(Err(CollectionPrepareError::Cancelled)) => {}
+                    Ok(Err(CollectionPrepareError::Cancelled)) => {
+                        self.finish_collection_navigation_without_target_no_context(&request.action)
+                    }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.finish_collection_navigation_without_target(ctx, &request.action)
                     }
@@ -3632,6 +3636,7 @@ impl App {
             .as_ref()
             .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
         {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
             return;
         }
 
@@ -3663,6 +3668,7 @@ impl App {
             return;
         }
         if !self.collection_navigation_exact_target_is_current(&request, &prepared, &ready.target) {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
             return;
         }
         let loops_current_media = request
@@ -3690,6 +3696,7 @@ impl App {
                     Ok(request) => request,
                     Err(reason) => {
                         self.show_open_admission_refusal(reason);
+                        self.finish_collection_navigation_without_target(ctx, &request.action);
                         return;
                     }
                 };
@@ -4517,6 +4524,239 @@ mod tests {
                 PhysicalHistoryPreflightPoll::Failed(error) => panic!("{error}"),
             }
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section1339_collection_history_prune_rejects_fullscreen_move_and_releases_only_its_owner() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("source.jpg");
+        let next = temp.path().join("next-book");
+        std::fs::write(&image, b"source").unwrap();
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(next.join("page.jpg"), b"next").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("pruned-fullscreen.db"));
+        app.active_quick_folder_slot = None;
+        let created = recv(
+            client
+                .create_collection("source collection".into())
+                .unwrap(),
+        );
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &next,
+                            CollectionResolvedKind::Folder,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let unrelated = recv(
+            client
+                .create_collection("history-only collection".into())
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(prepared.collection_id)
+            || !app.collection_catalog_contains(unrelated.collection_id())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "created collections must reach the native catalogue"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.adopt_main_facet_route(super::super::FacetRoute::root(
+            super::super::FacetScope::Collection {
+                id: prepared.collection_id.to_string(),
+                entry: None,
+            },
+        ));
+        app.settings.facet_filter.exts.insert("jpg".into());
+        app.folder_nav_back_stack.push(
+            super::super::FolderNavHistoryTarget::Collection(
+                super::super::top_level_grid_view::CollectionGridRestore {
+                    identity: CollectionGridIdentity {
+                        collection_id: unrelated.collection_id(),
+                    },
+                    revision_at_open: unrelated.revision(),
+                    viewport_anchor: None,
+                },
+            )
+            .into(),
+        );
+        let sibling = app.push_window_context_for_test(&ctx, 133902, |owner| {
+            owner.fs_nav_locked_gen = Some(owner.items_generation);
+            owner.fs_holdover_tex = Some(super::super::FsHoldover::FolderNavigation(None));
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.items_generation,
+                    owner.fs_nav_locked_gen,
+                    owner.fs_holdover_tex.is_some(),
+                )
+            })
+            .unwrap();
+        let pixels = egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]);
+        let tex = ctx.load_texture(
+            "collection-prune-source",
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Static {
+                tex,
+                pixels: Arc::new(pixels),
+                source_dims: Some([2, 1]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        let source_items = app.items.clone();
+        let source_folder = app.current_folder.clone();
+        let source_generation = app.items_generation;
+        let source_facet = app.facet_navigation.clone();
+        let source_filter = app.settings.facet_filter.clone();
+        assert!(app.start_collection_outer_fullscreen_navigation(&ctx, 0, true, false, false));
+        assert!(app.fs_nav_is_locked());
+        assert!(app.fs_holdover_tex.is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (request, watch, prepared, target_kind, cancel, ready) = loop {
+            assert!(
+                Instant::now() < deadline,
+                "fullscreen move must reach its real preflight worker"
+            );
+            let pending = app
+                .top_level_grid_view
+                .take_collection_navigation_pending()
+                .expect("unadopted fullscreen request retains its native owner");
+            if let CollectionNavigationPending::Preflighting {
+                request,
+                watch,
+                prepared,
+                target_kind,
+                cancel,
+                receiver,
+            } = pending
+            {
+                let ready = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("physical preflight worker reply")
+                    .expect("physical preflight succeeds")
+                    .expect("the next folder is a real eligible container");
+                assert_eq!(ready.target.source_path, next);
+                assert!(matches!(
+                    ready.payload,
+                    CollectionNavigationPreflightPayload::Folder(_)
+                ));
+                break (request, watch, prepared, target_kind, cancel, ready);
+            }
+            app.top_level_grid_view
+                .set_collection_navigation_pending(Some(pending));
+            app.poll_collection_navigation(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(app.collection_navigation_request_is_current(&request));
+        assert!(app.main_list_navigation_is_current(request.navigation.as_ref().unwrap()));
+        recv(
+            client
+                .delete_collection(unrelated.collection_id(), unrelated.revision())
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.collection_catalog_contains(unrelated.collection_id()) {
+            assert!(
+                Instant::now() < deadline,
+                "delete notice must prune the real history owner"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.folder_nav_back_stack.is_empty(),
+            "real catalogue deletion prunes Back"
+        );
+        assert!(
+            app.collection_navigation_request_is_current(&request),
+            "the source Collection remains the same native surface owner"
+        );
+        assert!(
+            !app.main_list_navigation_is_current(request.navigation.as_ref().unwrap()),
+            "history prune invalidates only the captured cursor baseline"
+        );
+        assert!(app.fs_nav_is_locked());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok(Some(ready))).unwrap();
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::Preflighting {
+                request,
+                watch,
+                prepared,
+                target_kind,
+                cancel,
+                receiver,
+            }));
+        app.poll_collection_navigation(&ctx);
+        assert!(!app.top_level_grid_view.collection_navigation_pending());
+        assert!(
+            !app.fs_nav_is_locked(),
+            "rejected adoption terminates its fullscreen navigation"
+        );
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "the rejected request releases its display holdover"
+        );
+        assert!(
+            matches!(
+                app.fs_boundary_hint,
+                Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
+            ),
+            "the request follows the existing terminal notification"
+        );
+        assert_eq!(app.items, source_items);
+        assert_eq!(app.current_folder, source_folder);
+        assert_eq!(app.items_generation, source_generation);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.facet_navigation, source_facet);
+        assert_eq!(app.settings.facet_filter, source_filter);
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.with_viewer_context(sibling, |owner| (
+                owner.items_generation,
+                owner.fs_nav_locked_gen,
+                owner.fs_holdover_tex.is_some(),
+            ))
+            .unwrap(),
+            sibling_before,
+            "main rejection does not release a parked sibling's lock"
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]

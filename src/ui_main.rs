@@ -27568,6 +27568,129 @@ mod section207_tests {
     }
 
     #[test]
+    fn section1339_toolbar_projects_pending_cursor_and_allows_reverse_cancel() {
+        use crate::app::{FolderHistoryDirection, FolderNavHistoryTarget};
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        env.settings.show_address_bar_history_nav = true;
+        env.active_quick_folder_slot = None;
+        env.settings.sidecar_backup_enabled = false;
+        let source = env.tmp.path().join("toolbar-source");
+        let middle = env.tmp.path().join("toolbar-middle");
+        let oldest = env.tmp.path().join("toolbar-oldest");
+        for path in [&source, &middle, &oldest] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        env.load_folder(source.clone());
+        env.folder_nav_back_stack = vec![
+            FolderNavHistoryTarget::Path(oldest.clone()).into(),
+            FolderNavHistoryTarget::Path(middle.clone()).into(),
+        ];
+        env.folder_nav_forward_stack.clear();
+        let baseline = env.folder_nav_back_stack.clone();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                match app.render_toolbar(ctx).1 {
+                    Some(AddressBarNav::HistoryBack) => {
+                        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back)
+                    }
+                    Some(AddressBarNav::HistoryForward) => {
+                        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Forward)
+                    }
+                    _ => {}
+                }
+            });
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("\u{2192}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("\u{2190}").click();
+        harness.run();
+        assert_eq!(app.borrow().current_folder.as_ref(), Some(&source));
+        assert_eq!(app.borrow().folder_nav_back_stack, baseline);
+        assert!(app.borrow().folder_nav_forward_stack.is_empty());
+        assert!(
+            !harness
+                .get_by_label("\u{2192}")
+                .accesskit_node()
+                .is_disabled(),
+            "the pending Back must expose Forward through the actual toolbar gate"
+        );
+        assert_eq!(
+            app.borrow().folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(oldest.clone()))
+        );
+        assert_eq!(
+            app.borrow().folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(source.clone()))
+        );
+        harness.get_by_label("\u{2190}").click();
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("\u{2190}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert_eq!(
+            app.borrow().folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(middle.clone()))
+        );
+        harness.get_by_label("\u{2192}").click();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label("\u{2190}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert_eq!(
+            app.borrow().folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(source.clone()))
+        );
+        harness.get_by_label("\u{2192}").click();
+        harness.run();
+        assert!(
+            app.borrow()
+                .top_level_grid_view
+                .open_path_classification()
+                .is_none()
+        );
+        assert!(
+            app.borrow()
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.borrow().current_folder.as_ref(), Some(&source));
+        assert_eq!(app.borrow().folder_nav_back_stack, baseline);
+        assert!(app.borrow().folder_nav_forward_stack.is_empty());
+        assert_eq!(
+            app.borrow().folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(middle))
+        );
+        assert!(
+            harness
+                .get_by_label("\u{2192}")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
     fn section207_address_enter_focus_reorder_escape_and_hidden_lifecycle() {
         let mut env = crate::app::setup_app_for_test();
         only_folder_and_tree(&mut env);

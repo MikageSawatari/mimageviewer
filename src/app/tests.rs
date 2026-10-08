@@ -22691,6 +22691,80 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn section1339_zip_same_location_reload_reconciles_prepared_prefix_and_manual_restore() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("nested-reload-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        for entry in ["A/1.jpg", "B/2.jpg"] {
+            zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+        app.load_folder(parent);
+        app.settings.facet_filter.exts.insert("zip".into());
+        assert!(
+            app.start_grid_virtual_open(crate::app::GridVirtualOpenIntent {
+                path: book.clone(),
+                source: crate::app::GridVirtualOpenSource::Direct,
+                effects: crate::app::GridVirtualOpenEffects {
+                    auto_fullscreen: false,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: true,
+                    reading_history_return_from: None,
+                },
+            })
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        let root = app.facet_navigation.route().clone();
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Folder);
+        let root_filter = app.settings.facet_filter.clone();
+        app.zip_nav_enter("A/");
+        app.settings.facet_filter.exts.insert("jpg".into());
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        // F5 / "Update to latest information" uses the real full-refresh handler.
+        app.reload_current_folder_preserving_override();
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(
+            app.facet_navigation.route(),
+            &root,
+            "SameLocation must still describe the actually prepared ZIP level"
+        );
+        assert_eq!(app.settings.facet_filter, root_filter);
+        assert_eq!(
+            app.visible_indices.len(),
+            2,
+            "both root folder rows remain visible"
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+        // Consuming the remaining root frame manually, then reloading the same level,
+        // must preserve its value and must not invent another frame.
+        assert!(app.restore_facet_filter_suppression());
+        let manual = app.settings.facet_filter.clone();
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        app.reload_current_folder_preserving_override();
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(app.facet_navigation.route(), &root);
+        assert_eq!(app.settings.facet_filter, manual);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+    }
+
+    #[test]
     fn section1339_zip_nested_level_history_reentry_uses_the_prepared_fresh_root_route() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
@@ -25338,6 +25412,106 @@ mod phase_c_folder_nav_history_tests {
             })
         }));
         assert!(app.scroll_to_selected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_search_refresh_crossing_pending_folder_scan_keeps_copied_destination() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let origin = app.tmp.path().join("search-origin");
+        let destination = app.tmp.path().join("search-destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        let exact = destination.join("z-book.zip");
+        std::fs::write(&exact, b"target").unwrap();
+        let addition = destination.join("a-book.zip");
+        std::fs::write(&addition, b"addition").unwrap();
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin.clone(),
+            GridItem::ZipFile(exact.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        assert!(
+            app.begin_context_jump_to_folder(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
+                selection: JumpToFolderSelection::ExactPath(exact.clone()),
+                origin: None,
+            })
+            .is_none()
+        );
+        // Hold the actual pane completion channel, preserving its admitted owner/purpose.
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let pending = app.folder_pane_open_pending.as_mut().unwrap();
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        pending.rx = scan_rx;
+        let generation = app.items_generation;
+        // Refresh through the actual SQLite search worker and result-install poll.
+        let db = crate::search_index_db::SearchIndexDb::open_at(
+            &app.tmp.path().join("refresh-index.db"),
+        )
+        .unwrap();
+        let indexed = [addition, exact.clone()]
+            .into_iter()
+            .map(|path| crate::search_index_db::IndexEntry {
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            })
+            .collect::<Vec<_>>();
+        db.upsert_children(&destination, &destination, &indexed)
+            .unwrap();
+        app.search_index_db = Some(std::sync::Arc::new(db));
+        let mut favorite = crate::settings::FavoriteEntry::new("books".into(), destination.clone());
+        favorite.auto_index_structure = true;
+        app.settings.favorites.push(favorite);
+        app.execute_favsearch();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.favsearch_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search refresh worker must finish"
+            );
+            app.poll_favsearch();
+            std::thread::yield_now();
+        }
+        assert!(app.items_generation > generation);
+        assert_eq!(app.items.len(), 2);
+        assert!(app.favsearch.active);
+        let ctx = egui::Context::default();
+        assert!(app.poll_folder_pane_open(&ctx).is_none());
+        assert!(
+            app.context_folder_jump_pending(),
+            "a same-query result refresh cannot cancel a path-based jump"
+        );
+        scan_tx.send(Ok(scan_directory(&destination))).unwrap();
+        let ready = app
+            .poll_folder_pane_open(&ctx)
+            .expect("the original scan still owns adoption");
+        app.resolve_main_folder_open_ready(&ctx, ready);
+        finish_context_jump_hydration(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(!app.favsearch.active);
+        assert!(
+            app.selected
+                .is_some_and(|index| app.items[index].drag_source_path() == Some(exact.as_path()))
+        );
+        assert_eq!(
+            app.folder_nav_back_stack,
+            vec![crate::app::FolderNavHistoryEntry::from(
+                FolderNavHistoryTarget::Path(origin)
+            )]
+        );
     }
 
     #[cfg(windows)]

@@ -2503,11 +2503,22 @@ impl App {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
         }
-        let kind = match self.items.get(index) {
-            Some(GridItem::Folder(_)) => SmartChildKind::Folder,
-            Some(GridItem::PdfFile(_)) => SmartChildKind::Pdf,
-            Some(GridItem::ZipFile(_)) => SmartChildKind::Zip,
-            Some(GridItem::ConvertibleArchive { .. }) => SmartChildKind::ConvertibleArchive,
+        let Some(item) = self.items.get(index) else {
+            return false;
+        };
+        // The classified request captured this row's path before the worker ran. Never read
+        // a shifted successor's kind or source effects from the old index during handoff.
+        if !item
+            .container_path()
+            .is_some_and(|source| crate::folder_tree::path_eq(source, &path))
+        {
+            return false;
+        }
+        let kind = match item {
+            GridItem::Folder(_) => SmartChildKind::Folder,
+            GridItem::PdfFile(_) => SmartChildKind::Pdf,
+            GridItem::ZipFile(_) => SmartChildKind::Zip,
+            GridItem::ConvertibleArchive { .. } => SmartChildKind::ConvertibleArchive,
             _ => return false,
         };
         let kind = if classified_kind == super::OpenPathKind::Directory {
@@ -2928,6 +2939,13 @@ impl App {
             SmartTransitionIntent::History,
             Some(navigation),
         )
+    }
+
+    /// Borrow the existing request for read-only history button projection.
+    pub(crate) fn staged_smart_history_navigation(&self) -> Option<&super::MainListNavigation> {
+        self.smart_folder_transition
+            .as_ref()
+            .map(|transition| &transition.navigation)
     }
 
     /// Rapid input advances the one request's virtual cursor. A cross-kind
@@ -9589,6 +9607,117 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1339_smart_grid_classification_row_removal_cannot_reinterpret_original_path() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.skip_epub_if_pdf_exists = false;
+        let source = app.tmp.path().join("smart-classification-row-owner");
+        std::fs::create_dir_all(&source).unwrap();
+        let before = source.join("00-before.zip");
+        let target = source.join("01-target.epub");
+        let after = source.join("02-after.zip");
+        for path in [&before, &after] {
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            writer
+                .start_file("page.jpg", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, b"page").unwrap();
+            writer.finish().unwrap();
+        }
+        std::fs::write(&target, b"EPUB classification candidate").unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("Row owner");
+        definition.rules.push(crate::settings::SmartFolderRule::new(
+            source,
+            true,
+            Default::default(),
+        ));
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.items_are_smart_folder_view || app.smart_folder_transition.is_some() {
+            assert!(Instant::now() < deadline, "Smart root did not become ready");
+            app.poll_smart_folder(&ctx);
+            app.poll_search(&ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(app.items.as_slice(),
+            [GridItem::ZipFile(first), GridItem::PdfFile(middle), GridItem::ZipFile(last)]
+                if first == &before && middle == &target && last == &after));
+        let source_folder = app.current_folder.clone();
+        let facet = app.facet_navigation.clone();
+        let history = app.folder_nav_history_snapshot();
+        app.selected = Some(1);
+        assert!(
+            app.open_grid_container_with_mode(
+                &ctx,
+                1,
+                super::super::GridContainerOpenMode::PageList,
+                "section1339-row-classification",
+            )
+            .is_none()
+        );
+        let mut candidate = app
+            .top_level_grid_view
+            .take_open_path_classification()
+            .expect("real Smart grid classification request");
+        assert_eq!(candidate.path.as_path(), target.as_path());
+        assert!(matches!(
+            candidate.continuation.as_deref(),
+            Some(super::super::ClassifiedOpenContinuation::SmartGrid { index: 1, .. })
+        ));
+        let (tx, rx) = mpsc::channel();
+        candidate.rx = rx;
+        app.top_level_grid_view
+            .set_open_path_classification(Some(candidate));
+
+        app.remove_items_batch(&[0]);
+        assert!(matches!(app.items.as_slice(),
+            [GridItem::PdfFile(original), GridItem::ZipFile(shifted)]
+                if original == &target && shifted == &after));
+        let remaining_rows = app.items.clone();
+        tx.send(Ok(super::super::ClassifiedOpenPath {
+            kind: super::super::OpenPathKind::File,
+            folder_scan: None,
+        }))
+        .unwrap();
+        app.poll_open_path_classification(&ctx);
+
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert!(
+            app.smart_folder_transition.is_none(),
+            "a removed preceding row must not lend its successor's ZIP kind to the original EPUB"
+        );
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder, source_folder);
+        assert_eq!(app.items, remaining_rows);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            history.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            history.forward_stack
+        );
+        assert!(
+            !app.begin_smart_grid_container_navigation_classified(
+                1,
+                target,
+                false,
+                super::super::OpenPathKind::File,
+                None,
+                super::super::StartupListIntent::ExplicitList,
+                None,
+            ),
+            "the native classified adapter must validate the captured row identity too"
+        );
+        assert!(app.smart_folder_transition.is_none());
+    }
 
     fn stage_smart_epub_conversion(app: &mut App) -> (PathBuf, crate::app::OpenRequestOwner) {
         use crate::app::{
