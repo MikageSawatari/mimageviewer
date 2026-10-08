@@ -246,7 +246,12 @@ impl ThumbnailEngine {
         if !matches!(request.address.subresource, RemoteSubresource::File)
             || is_container_path(Path::new(&request.address.path))
         {
-            return container_engine.thumbnail_admitted(request, context, admission);
+            return container_engine.thumbnail_admitted(
+                request,
+                context,
+                admission,
+                &cancellation.flag(),
+            );
         }
         let resolved = match resolve_existing(&request.address.path) {
             Ok(path) => path,

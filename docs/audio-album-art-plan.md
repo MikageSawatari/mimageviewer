@@ -1,8 +1,8 @@
 # 音声サムネイル: 同名 sidecar・MP3 埋め込み画像の計画 (§1.347)
 
 作成: 2026-10-07 / Line D (`next-audio-art`)。v4.4.0 後の §1.347。
-改訂: 2026-10-08 / ca57742a1 の実装レビュー8件をコード照合し、根本修正と再検証を実施 (§20)。
-**ca57742a1 の実装レビューは REVISE。8件を根本修正し、自動再検証・検証用build完了、独立再受入待ち (§20)。先頭 ID3v2 タグ限定と既決仕様を維持・実アプリ未起動。**
+改訂: 2026-10-08 / 921f1e457 の再レビュー2件とRemote全catalog入口をコード照合し、受付証明とCacheOnly継続を根本修正 (§21)。
+**921f1e457 の再レビューは REVISE。前回8件の解消とfuzz代替の受入が伝達され、今回のRemote P2二件を根本修正し、自動再検証・確認build完了、独立再受入待ち (§21)。先頭 ID3v2 タグ限定と既決仕様を維持・実アプリ未起動。**
 利用者から伝達されたレビュー履歴: 前版は **ACCEPT**、R4 の改訂は **ACCEPT WITH CHANGES**。
 R6 (4fe5979e0) の再レビューは **REVISE** (永続コレクションの出所伝達 1 件)。
 R7 対応後の独立レビュー受入・全利用者質問決定済みは、2026-10-08 の実装依頼で伝達された。
@@ -1441,4 +1441,118 @@ Remote/Web/Nodeは `target/remote-fix-validation.json`、gateは§20.8の結果�
 一覧取得後にsidecarを消したMP3の埋め込みfallback、cache全件/期限削除をまたぐZIP/PDF原本表示を確認する。
 通常の検証binaryは `%APPDATA%\mimageviewer` の実設定/データを更新し得る。
 起動前にinstalled/tray-resident mIVを閉じる (single-instance mutex共通)。
+利用者の起動コマンド: `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+
+
+## 21. 921f1e457 再レビュー: Remoteの受付証明とCacheOnly継続 (2026-10-08)
+
+利用者から伝達された独立再レビューでは、§20の8件は解消、stable MSVCの任意入力120万件は
+今回のgateとして受入可能とされた。sanitizer/libFuzzer未実施との区別を維持する。
+以下の新しいP2二件をコードで再現し、両方を所有境界で修正した。指摘への異議なし。
+音声抽出・codec・EXIF・設定・UI・IPC wire formatは変更しない (IPC v67を維持)。
+
+### 21.1 PDF AI source callbackと共通PDF検証の受付証明
+
+AI操作入口は削除中にDisplayOnlyを捕捉していたが、source callbackに証明がなく、
+`decode_remote_ai_source` → `ensure_pdf_page_in_range` → page countが削除完了後の新世代を取得した。
+未取得のPDFページ数をparent catalogに書き、削除したDBを再作成できた。
+
+callbackと原本readerの必須引数に同じCatalogAdmissionを加え、PDF検証・stamp解決・page count・
+parent CatalogWorkまで引き継ぐ。原本の解析/render自体はcatalogを開かない。
+途中でadmitし直すplain/timed helperを削除し、同じproofを下位helperの必須引数にする。
+page countのメモリcacheは継続利用できるが、旧世代/DisplayOnlyからmutable DBを開けない。
+
+共通のplain PDF検証を使うrating/item-state/adjustment、読書位置・しおり・view trimの検証と
+本のしおり一覧にも同じ漏れがあったため、public worker入口で一度だけ捕捉し、
+resolve/準備/ページ数検証に渡す。本のしおり一覧からwrite検証を呼ぶときも再取得しない。
+新世代を取るAutoTrim便利wrapperはtest-onlyにし、製品callerは必須proof版だけに限定する。
+
+AI回帰は実source callbackを呼び、Deleting中の受付後に削除を完了させ、
+未取得PDFのページ数/Vector判定を読めてもparent/PDF DBが作られないことを検証する。
+既存のtest-only PDFium backendをanalysisにも接続し、logical/canonical両方の読取pathを登録する。
+製品binaryは起動せず、テスト内のPDFium処理で元の失敗経路を通す。
+write検証も旧世代証明で原本ページ検証を続け、DBを作らない回帰を追加した。
+
+### 21.2 ZIP内RAWのCacheOnlyを一回の読取専用継続へ
+
+プレビューのないZIP内RAWはCacheOnlyだが、旧世代/Deletingでcatalog openが拒否されると
+Noneのまま空cache mapを読み、期限削除で行が残っていてもNoThumbnailになった。
+通常RAWと同じ既存CatalogAccessの取消可能な再受付待ちをworker上で使う。
+Deleting終了後、一回だけ`open_existing_read_only_admitted`と対象keyの`load_one`を行う。
+再探索・原本RAW decode・DB新規作成・schema移行・書込・無期限再試行は許可しない。
+次の削除がその一回のlookupに重なって拒否された場合は再試行しない。
+全件削除でDBがなければ通常のNoThumbnailとなり、DBを再作成しない。
+
+ThumbnailEngineが持つ既存RemoteOperationCancellationのflagをContainerEngineへそのまま渡し、
+load/source/waitで共有する。切断・スクロール等の取消は待機中でもCancelled→Busyで終了する。
+別cancel ownerやpending stateは追加しない。元の要求のwrite用proofを新世代へ更新しない。
+ZIPの代表・entry・directoryについて残存cacheを読むこと、DB内容が不変であることを検証する。
+実ThumbnailEngine.handleでDeleting中の待機、完了後の読取、完了前の取消も検証する。
+
+### 21.3 Remote全catalog入口の監査
+
+`src/remote_ipc`全体とRemote HTTP側のCatalogDb/CatalogWork/CatalogAccess呼出を検索し、
+以下の製品入口から下位open/read/writeと取消まで追跡した。HTTP側に直接catalog openはない。
+write workerの実caller (`pipe.rs:1335/1338`) は本のしおり一覧と通常write検証を別branchで呼び、
+各public入口から処理が一度だけ始まることも確認した。
+コード参照: [container.rs](../src/remote_ipc/container.rs)、[thumbnail.rs](../src/remote_ipc/thumbnail.rs)、
+[collections.rs](../src/remote_ipc/collections.rs)。行番号は今回の修正後のもの。
+
+| 入口 / 下位境界 | 照合結果・今回の対応 |
+| --- | --- |
+| `container.rs:4736/5202/7328/7367` AI入口 → source callback / reader → PDF検証/count | 今回必須proofを接続。AIのAutoTrim/partnerにも同じ受付証明を維持 |
+| `container.rs:3058/3065/3603/3666/3982` write入口 → rating/item/adjustment・page/context/PDF検証 | 今回入口で一度captureし、全共有PDF helperへ渡す |
+| `container.rs:3355/3539/3497` 本のしおり入口 → 準備/write検証 → PDF page count | 今回同じproofを全段階へ渡し、下位でのcaptureを除去 |
+| `thumbnail.rs:153/352/441/768` handle → image/folder/通常RAW、Audio、video/audio sidecar | 既存proofをflight keyと全mutable openに保持。通常RAWの読取専用継続も既存で適合 |
+| `thumbnail.rs:249` → `container.rs:4031/6650/6983` ZIP/PDF/container loader | proofは既存で適合。今回cancel flagの伝達とZIP RAW CacheOnlyの一回読取継続を追加 |
+| `container.rs:2953/5297/5648` container入口 → enumerate / enumerate_pdf / count | resolve/enumeration前のproofを既存で保持。今回のplain PDF helper修正と合流 |
+| `container.rs:4156/6182/6311/6650` page入口 → typed load / PDF検証 / partner AutoTrim | resolve/settings/RAW pin準備前のproofを既存で保持。SourceOnlyはcatalog不要を維持 |
+| `container.rs:6494/6502` cached_landscape_flags_with_read | 既存DBのread-onlyのみ。missing/Deleting時は原本寸法へ進み、DB作成/移行/書込なし |
+| `collections.rs:955` landscape grouping | 同じく`open_existing_read_only`だけ。原本dimsへ進みmutable openなし |
+| `persistent_collections.rs` snapshot/navigation replacement | 共通一覧/source準備へ合流し、独自catalog openなし |
+| `container.rs:8077/6157/6220`、`thumbnail.rs:331/747` test-only便利wrapper | test-only。製品はproof必須版を使用 |
+
+video pin/Shellはcatalogを開かない。上記のread-only入口はその場の読取受付を使っても
+削除後DBを再作成できず、今回のmutable受付証明漏れに該当しない。
+未訪問parentへのlate openも必ずCatalogWorkの元のproofを使うことを確認した。
+
+### 21.4 状態の簡素化・検証記録
+
+Remote modalを根拠に削除との重なりをなくす案は不成立。キャッシュ管理画面を閉じても
+既存background削除は続くため、PCの新しい入力の排他とは別である。
+削除の中断、Remote全要求の禁止、新queue/owner/再試行stateは作らず、
+単一の必須proofと既存cancel/Condvarによる一回のread-only継続へ集約した。
+未決の利用者質問なし。独立再レビューと実機確認はcoordinatorへ引き継ぐ。
+
+修正前の有効red: `cargo test -p mimageviewer --lib review2_`、0成功 / 2失敗、exit101。
+AIは実source callbackのVector判定後にparent catalog再作成assertionが失敗、
+ZIP RAWは残存cacheがあるのにNoThumbnailとなった。fixture初期調整時のcompile/worker未初期化失敗は
+この有効redに含めない。修正後は上記二件に取消・Deleting待機・全件削除・write検証を追加した。
+
+2026-10-08 再検証 (終了コードを確認、製品binary未起動・commitなし):
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib review2_` | 6成功 / 失敗0 / ignore0、exit0。修正前red二件と取消・待機・全件削除・共通write検証 |
+| `cargo test -p mimageviewer --lib remote_ipc::` | 428成功 / 失敗0 / ignore0、53.24秒、exit0。上記6件を含む |
+| `cargo test -p mimageviewer --lib` (pipeなし、`RUST_TEST_THREADS=8`) | 11,074成功 / 失敗0 / 既存ignore52、1,189.62秒、exit0 |
+| `cargo test -p mimageviewer-remote` | 137成功 / 失敗0 / 既存ignore1、exit0 |
+| `cargo test -p mimageviewer-ipc --lib` | 65成功 / 失敗0 / ignore0、exit0 |
+| normal / portable core check | 両方exit0 (`cargo check -p mimageviewer --bin mimageviewer-core`、同 `--features portable`) |
+| `cargo fmt` / `cargo fmt --check` / glyph lint / `git diff --check` | exit0、危険glyph0、変更ファイルCRLF維持 |
+| bounded Rust gate | 今回は再実行せず。§20.8の58件・120万入力の受入証拠を再利用。対象source/lock 7ファイルのSHA一致 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit0、core 6分27秒。通常core / Remote service / EPUB worker作成、runtime4・PE3検査成功。portable featureなし・未起動 |
+
+Rust buildは `CARGO_BUILD_JOBS=1` / `MSBUILDDISABLENODEREUSE=1`。
+今回UI/Web JS/IPC wireの変更がないため、Node/ui_snapshotは§20の有効な結果を保持し、再実行しない。
+今回の完全ログ・結果JSONは `target/audio-review2-*.log` / `target/audio-review2-validation.json`、
+gate再利用のSHA照合は `target/audio-review2-gate-reuse.json`。
+
+利用者確認: キャッシュ管理で削除を開始し、画面を閉じてRemoteで未取得PDFのAIを要求する。
+削除をまたいでも原本判定/表示を継続し、旧要求がcatalog DBを再作成しない (自動回帰で確認)。
+プレビューなしRAWを含むZIPの既存cacheが期限削除で残る場合、削除完了後も表紙/entry/directoryを
+Remoteで再表示できる。削除中に画面を離れる/接続解除する場合は待機を取り消せる。
+全件削除でcacheが消えた場合は通常のNoThumbnailとなる。
+起動前にinstalled/tray-resident mIVを閉じる (single-instance mutex共通)。
+通常の検証binaryは `%APPDATA%\mimageviewer` の実設定/データを更新し得る。
 利用者の起動コマンド: `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。

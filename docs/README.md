@@ -13,7 +13,7 @@
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
-| [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 ca57742a1 実装レビューREVISE・8件根本修正/自動再検証・確認build完了、独立再受入待ち (§20)、新Rust gate 58件・任意入力120万成功、前実装検証 (§19)、FFmpeg gate 失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する仕様・実装と検証記録。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
+| [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 921f1e457 再レビューREVISE・Remote受付証明/ZIP RAW CacheOnlyの2件根本修正・全入口監査・再検証/確認build完了、独立再受入待ち (§21)、前8件解消・fuzz代替受入 (§20)、新Rust gate 58件・任意入力120万成功、前実装検証 (§19)、FFmpeg gate 失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する仕様・実装と検証記録。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |
 | [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240端近くの実ページ単独表示。旧設定移行、白い空き slot の描画、Remote・多窓検証、将来の本構成との境界 |
