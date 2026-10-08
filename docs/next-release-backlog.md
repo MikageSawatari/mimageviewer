@@ -40,7 +40,7 @@
 - リリース済み範囲: v4.4.0タグとのコード比較でlogger／perf／stallに差分がなく、同じUI発行経路がある。同版の実機再現ではない。OS側のwrite停止原因は未確定で、並行build/test負荷との因果も未確定。1.337のGuiGate／host変更による停止と断定しない。
 - 設計案: 通常／perfファイルのopen・write・flush・rotation・retentionを一つの専用writerへ移す。producerは自身の時刻・tid付きレコードを非blockingで有界queueへ渡す。欠落件数を記録し、UIのperf::flushは要求だけ、通常終了のdrainは上限付き。panic.log／UI watchdog／常時startup JSONL／Remote専用logの独立境界を保持し、allocラインのstartup `.lock` sidecar修正も維持する。
 - Store関連の初回「起動中…」の描画前にも、perf有効時の同期write／flushと常時の通常logがある。これを非同期化するが、Storeの起動問題の原因確定・解消とは扱わない。
-- 残り: 設計レビュー、利用者質問C356-1〜5の決定、alloc側のsidecar修正取り込み確認、startup側terminal保護／flush完了ACKの共有境界合意、実装、故意に停止させたsinkを使う実配送経路の回帰、共用変更の検証gate。規模 / 優先度: Medium / P2。
+- 残り: r2設計レビュー、利用者質問C356-1〜5の決定（C356-3は診断ZIPの完了確認／性能検証の判定不能を追加）、alloc側のsidecar修正取り込み確認、startup側terminal保護／flush完了ACKの共有境界合意、実装、故意に停止させたsinkを使う実配送経路とZIP／解析偽PASSの回帰、共用変更の検証gate。規模 / 優先度: Medium / P2。
 
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
