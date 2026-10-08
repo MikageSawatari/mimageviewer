@@ -1,6 +1,6 @@
 # §1.356 通常ログ・perfログの非同期writer 設計案
 
-2026-10-09、ライン C。**設計のみ。独立レビューREVISEの3指摘をコード照合して反映したr2。製品コード未変更、再レビューと下記の利用者回答待ち。**
+2026-10-09、ライン C。**設計のみ。r3再レビューのP2とcoordinator決定を反映。過去の欠落は警告付きZIP保存とし、性能gateの判定不能は維持。製品コード未変更、再レビューと下記の利用者回答待ち。**
 基準: master `70cf4de4e`。本文のコード行番号はこのworktreeの当該HEADで確認した値。
 正本: [バックログ §1.356](next-release-backlog.md)、関連: [UI応答性 §4](ui-responsiveness.md#4-新機能追加時のチェックリスト)、[非同期構成 §7](async-architecture.md#7-パフォーマンス計装-perfrs)、[起動診断](startup-diagnostics-plan.md)、[idle health](idle-health-check.md)。
 
@@ -67,15 +67,16 @@ writerが採用したwatermarkはそのflushが終わるまで固定し、追加
 producerはfacade入口で、timestamp採取より先にmemory-onlyのpublication ticketを登録し、受付またはdrop確定まで同じ所有を保持する。barrierはその境界のticket cutoffと、cutoff取得**前**のmonotonic coverage時刻を採る。writerはcutoff以前の発行中ticketが確定し、採用レコード（取り出し済みbatchを含む）が書かれ、drop集計まで保存されてからACKする。「queueが一度空になった」「後発イベントのtが大きい」だけではACKしない。遅いproducerが古いtimestampを後からenqueueする穴を閉じる。登録・受付・drop・settleは同じjournal所有の契約にし、producerはI/Oもbarrierも待たない。保留metadataはqueue上限と生存producer数で有界にし、cutoffの未完了発行はworker側のdeadlineで不成立にできる。
 `session.start` に追加field `log_delivery_schema=1` とprocess内session IDを付け、writerは `cat=log, kind=drain_checkpoint` をqueue外から出す。checkpointの項目はschema、session ID／pid／process_start_unix_ms、request ID（nonce）、purpose、coverage_t、ticket cutoff／settled・written watermark、normal／perf sink状態、session累計のnormal／perf／診断drop数。**checkpoint自体もflushしてからACK**する。完了ACKは同じ項目を返し、writer受付の時点では返さない。通常／perfの両方を要求したbarrierは片方だけ成功しても完了成功にしない。perf OFFは明示Disabledで、ZIPの通常log barrierは成立できるがperf測定gateは成立しない。
 ACKにはfile identityとcheckpoint末尾の確定byte offsetも含める。live analyzerは同じfileのそのprefixだけを読んでcheckpointを照合し、後続write途中のJSONや次sessionのファイルを混ぜない。後続appendを待ってから全ファイルを読み直す方式は採らない。offset／file照合ができない場合も判定不能にする。
-dropを時間区間へ細かく再配分する履歴は追加せず、**該当sessionの累計欠落が一件でもあれば保守的に証拠不完全**とする。測定開始前の欠落でも「判定不能」になり得ることを明示する。summaryの受信時刻を欠落発生時刻と誤解しない。診断dropもcheckpointに含め、hitchesの原因照合には不完全の印を付ける。timeout／Busy／writer failure／sink error／不一致／checkpoint未保存は単純な不成立。非shutdown barrierの待機も要求受付から最大2秒、再要求しない。
+dropを時間区間へ細かく再配分する履歴は追加せず、**該当sessionの累計欠落が一件でもあれば保守的に証拠不完全**とする。これはbarrierの保存完了とは別の判定であり、ACKは保存できたprefixと欠落counterを返す。ZIPは今回の要求印が保存できていれば警告付きで保存し（§3.5）、性能gateは過去の欠落でも「判定不能」にする（§3.6）。summaryの受信時刻を欠落発生時刻と誤解しない。診断dropもcheckpointに含め、hitchesの原因照合には不完全の印を付ける。timeout／Busy／writer failure／sink error／不一致／checkpoint未保存は単純な不成立。非shutdown barrierの待機も要求受付から最大2秒、再要求しない。
 
 ### 3.5 診断ZIPのworker化と完了契約（r2追加、P2-1）
 
 現行 `src/diagnostics.rs:22–36` はexport_requestedを打ち、両flushを終えてから `:53` の収集へ進む。`:197–232` のtestは独立BufWriterを直接flushするfixtureなので、新facadeが要求だけになる退行を検出しない。指摘を採用する。
 UI handlerは要求の開始／進捗／結果のpollだけを行い、DesktopのShell解決、stat、ログ読取り、圧縮、ZIP write／closeとbarrier待機はすべて診断export workerへ移す。App側に一つの `Idle / Running(request, receiver) / Finished(result)` ownerを置き、PreferencesStateの結果だけに別pending boolを足さない。Running中の重複ボタンは無効、通常の閲覧は継続。「保存中…」を表示し、保存完了後だけ既存のpath／「保存先フォルダを開く」を出す。worker開始失敗／disconnectは既存の失敗表示へ渡す。
-workerはexport_requestedにrequest IDを付け、通常logにも要求印を入れて、同じ要求を含む両sink barrierを取得する。要求印のticketがdropした場合やsession累計normal／perf dropが非zeroなら通知して作成失敗とする。perf OFFの場合だけperf witness不要と明記する。timeout等でも**ログ読取り・ZIP作成に進まず**「ログの保存完了を確認できないため、書き出しに失敗しました」と通知し、自動retryしない。
+workerはexport_requestedにrequest IDを付け、通常logにも要求印を入れて、同じ要求を含む両sink barrierを取得する。**今回の要求印のticketがdropした場合は通知して作成失敗とするが、session累計normal／perf dropが非zeroという理由だけでは失敗にしない。** 今回の要求印・採用済みtail・checkpointを保存できたら、過去の欠落があっても残ったログとpanic.log等をZIPへ収集する。要求印以外の欠落は時期を問わず証拠不完全として知らせ、次回起動までZIP機能を禁止しない。perf OFFの場合だけperf witness不要と明記する。barrier timeout等の未完了時は**ログ読取り・ZIP作成に進まず**「ログの保存完了を確認できないため、書き出しに失敗しました」と通知し、自動retryしない。必須snapshotの読取り失敗も作成失敗を維持する。通常のZIP入出力・worker開始の失敗は従来どおり失敗とし、欠落counterだけでこれらの失敗状態を作らない。
 barrier完了後のrotationと読取りの競合を避けるため、writerがflush後・後続write／rotation前に対象normal／perfの読取専用handleと確定byte長を取得し、immutableなprefix snapshotとcheckpointをworkerへ返す。workerはその長さまでだけ読む。ファイルownerはwriterのまま、workerに渡すのはread handleだけで、producerやwriterをZIP圧縮終了まで待たせない。active perfの実pathをownerから得て、旧世代・stale sessionのperfを代用しない。保存中にappend／renameされても要求印とcutoff以前のtailを含む。snapshot対象の必須ログ読取り失敗を現行のbest-effort skipで成功扱いしない。他の既存補助ログの収集範囲は維持し、panic／startupの未終了thread全体の停止・drainまで保証するZIPにはしない。
-ZIPにはcheckpointとsnapshot byte長を示すmanifestを入れる。ZIPのfinishと出力buffer flushまで成功してから結果を返し、未完成ZIPを成功表示しない。partialはworker内でbest-effort削除し、再回復処理を作らない。設定画面を閉じてもApp ownerが結果をpollできる。App終了はexportを待ってUIを止めず、requestを退役し、workerは公開前の退役検査で未完成成果物を成功通知しない。worker完了前の強制終了ではpartialが残り得る。新しい他操作禁止／終了禁止のモーダルは導入しない。
+ZIPにはcheckpointとsnapshot byte長を示すmanifestを入れる。manifestはnormal／perf／診断dropの累計・理由別件数と、そこから導出する `evidence_status=complete/incomplete`、不完全理由も記録する。非zeroなら画面で **「保存しました: <path>」に加えて「証拠不完全: 一部のログが欠けています。残っているログを保存しました」** を表示し、保存先フォルダを開く操作も維持する。結果は `Saved(path, checkpointの完全性情報)` として一つのexport ownerが保持し、失敗結果に変換したり、別の警告pending boolを作ったりしない。ZIPのfinishと出力buffer flushまで成功してから結果を返し、未完成ZIPを成功表示しない。partialはworker内でbest-effort削除し、再回復処理を作らない。設定画面を閉じてもApp ownerが結果をpollできる。App終了はexportを待ってUIを止めず、requestを退役し、workerは公開前の退役検査で未完成成果物を成功通知しない。worker完了前の強制終了ではpartialが残り得る。新しい他操作禁止／終了禁止のモーダルは導入しない。
+根拠再確認（r3）: `src/diagnostics.rs:13` はbest-effortと明記し、`:87–96` の補助ログ読取り／ZIP entry失敗はskipして残りを収集する。残った診断情報を渡す既存機能を保つため、累計dropで以後のZIP作成を禁止するr2案を撤回する。**ZIPが保存できたことは、ログが完全で性能gateを通せることを意味しない。** manifestがincompleteなら解析側は§3.6どおり判定不能を維持する。
 
 ### 3.6 perf消費側の完全性契約（r2追加、P2-2）
 
@@ -121,11 +122,11 @@ open／write／rotation失敗はaffected sinkをそのprocess中Unavailableに�
 ## 6. 状態の簡素化と互換性
 
 - ログ記録中をモーダルにする案は不採用。観測処理が閲覧／IPCを禁止する機能変更になり、disk stallをUIへ戻す。一つの一般writer、固定上限、drop-new、終了時の一回だけのsealにより組合せを減らす。
-- per-thread writer、sinkごとの一般writer、無制限queue、優先度別queue、古い記録の退避、再試行／disk spool、panicから一般queueをdrainする案は不採用。通常／perfの片方が止まると両方の保存は遅れるが、producerが止まらず、重要診断は独立経路なので、一つのownerで足りる。r2で追加したZIPは一つのworker要求、barrierは一件だけ、欠落判定はsession累計で保守的に失敗とし、export retry・測定区間ごとのdrop履歴・画面を止めるモーダルを増やさない。
+- per-thread writer、sinkごとの一般writer、無制限queue、優先度別queue、古い記録の退避、再試行／disk spool、panicから一般queueをdrainする案は不採用。通常／perfの片方が止まると両方の保存は遅れるが、producerが止まらず、重要診断は独立経路なので、一つのownerで足りる。ZIPは一つのworker要求、barrierは一件だけ。累計欠落のmetadataをそのまま使い、ZIPでは警告、性能gateでは判定不能とする。時期別のdrop履歴、欠落の埋め直し、export retry、画面を止めるモーダルを増やさない。
 - released-data: 通常／perfログはv4.4.0以前から存在する**リリース済み診断形式**。設定・タグ・collection等の利用者データではないが、解析toolの入力なので既存書式を維持する。DB schema／設定migration／既存データ削除は無い。
 - 通常prefix `[elapsed s][tID]`、perfのt／tid／cat／kind／key／seq／extras、session.startのpid／wall anchor、時刻基準、UTF-8、改行、pathを維持。writer受信時刻でstampしない。新kind／delivery schemaは追加だけ。`scripts/analyze_perf.py:62–80` のJSONL readerと、`scripts/check-idle-health.ps1:228–250/:299–319` のpath／session証明にfixtureで照合する。**書式が読めることと、測定が完全なことは別**。§3.6の共通validatorとCannotJudge契約も互換性gateに含め、旧fixtureの参考値を保ちつつ、完全性不明をPASSしない。
 - 通常は現行16MiB・1 rotated generation、debug retentionは256MiB・4 generation、起動時.prev保存（`src/logger.rs:13–22/:120–134`）を維持。perfはcurrent＋過去4世代、override pathはrotation無し（`src/perf.rs:42/:56–93`）を維持。新workerが既存ログ以外をretention対象にしない。panicは4MiB＋.bak、startup／Remoteの独立retentionも維持。
-- 実装時のdoc co-update: `async-architecture.md` §worker一覧／§7、`ui-responsiveness.md` のログ診断境界、`idle-health-check.md` の完了証明と判定不能、manualの診断ZIPの保存中／失敗説明。既存ログの保存先と外部通信先は変えず、local logging-controlとZIP manifestについても製品ページ・privacyの説明を整合させる。ZIP進捗／重複禁止／失敗UIのsnapshotを追加する。
+- 実装時のdoc co-update: `async-architecture.md` §worker一覧／§7、`ui-responsiveness.md` のログ診断境界、`idle-health-check.md` の完了証明と判定不能、manualの診断ZIPの保存中／証拠不完全での保存／失敗説明。既存ログの保存先と外部通信先は変えず、local logging-controlとZIP manifestについても製品ページ・privacyの説明を整合させる。ZIP進捗／重複禁止／警告付き保存／失敗UIのsnapshotを追加する。
 
 ## 7. 検証計画（実装時、実アプリ起動無し）
 
@@ -136,7 +137,7 @@ open／write／rotation失敗はaffected sinkをそのprocess中Unavailableに�
 | timestamp／ordering | 複数threadから既知stamp／tid／連番を投入。各threadの採用済み順序を維持、writer tidで置換無し、同threadの正常系を無欠落で検証。別threadのwall-time sortは要求しない |
 | init／session／flush | 通常のみ／perfのみ／後発perf／override／重複initでwriter一つ。open中にも受付可能。session.startが先頭かつ満杯で消えない。UI flushがfull queueでも戻り、watermark前をflushして後続無限流入で飢餓にならない |
 | barrier／publication | timestamp前に登録したproducerをlatchで途中停止し、queueが空でもcutoffのACKが出ないことを実APIで検査。確定後だけrecord／dropを含むcheckpointとflush ACKが出る。後発publicationで飢餓にならず、full queueでもcontrolが捨てられない。Busy／Closing／timeout／write失敗は成功ACK無し。通常・perf・checkpoint自身のflushをそれぞれ止めてもUI役は待たない |
-| 診断ZIPの実配送 | 独立BufWriterだけの旧testでは代替しない。注入可能な同じLogWriter owner／logger・perf facade→worker barrier→snapshot→ZIP収集を通し、64KiB未満の両tailとexport_requestedがZIPにあることを検査。barrier未完了ではFile::create／ログread／成功表示が0回、解除後だけ成功。perf OFF／要求印drop／既存drop／timeout／Busy／sink failure／partial cleanup／画面close／App終了／snapshot後rotationも検査。UI handler開始・poll、重複禁止、成功・失敗のsnapshotを固定 |
+| 診断ZIPの実配送 | 独立BufWriterだけの旧testでは代替しない。注入可能な同じLogWriter owner／logger・perf facade→worker barrier→snapshot→ZIP収集を通し、64KiB未満の両tailとexport_requestedがZIPにあることを検査。barrier未完了ではFile::create／ログread／成功表示が0回、解除後だけ成功。短いqueue競合でdropを作ってから復帰させ、今回の要求印／tail／checkpointと残ったログ・panic.logを収集でき、manifestがincomplete＋drop件数、画面がpath付き保存＋証拠不完全になることを固定。同じfixtureの性能gateはCannotJudge／exit 2。perf OFF／今回の要求印drop／timeout／必須snapshot読取り失敗／Busy／sink failure／partial cleanup／画面close／App終了／snapshot後rotationも検査。UI handler開始・poll、重複禁止、完全な保存・警告付き保存・失敗のsnapshotを固定 |
 | rotation／retention | disposable dirと小さいtest上限で.prev／.bakN／perf世代／overrideを実ファイルで検査。unrelated files・設定等のhash不変、起動中read共有、rotation後も順序／完整JSON行を検査 |
 | shutdown | 採用tail／取り出し済みbatch／drop summaryまでflush後ACK。Close／tray Quit／早期exit／scripted／worker exitが同じhelper、hideは停止無し。fake clock／completion channelで最大2秒を検証し、未完了threadにjoinせず、timeout後producerがI/Oへfallbackしない |
 | 重要診断 | writer永久stall＋queue fullでpanic／watchdogのfake direct sinkへ先に記録できる。catch_unwind後にprocess状態を壊さず、native経路へ新待ち無し。startup publisher／watchdogは一般writerから独立、terminalはfull／競合／pending>64件／ファイル上限でも予約した最終行を一度だけ排出してACK。startup sink自身のstall時は合計deadlineを超えず、allocの.lock retention testは維持。Remote secret-redaction／request logは維持 |
@@ -148,11 +149,11 @@ open／write／rotation失敗はaffected sinkをそのprocess中Unavailableに�
 focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`cargo test -p mimageviewer --lib`（pipe無し・実exit）、normal／portable `cargo check -p mimageviewer --bin mimageviewer-core`（portableは `--features portable`）、`python scripts/check_ui_glyphs.py`。startup crateも単体testし、UI失敗通知を変更するならui_snapshot。共用loggerの横断変更なので最終 `scripts/test-full.ps1` はcoordinatorと担当を決め実施し、valid evidenceを共有する。依頼された実装時にはbuild-devを作るが起動しない。現在のroundは文書のみなのでbuild／test／実機検証は行わない。
 利用者の実機確認は、coordinatorがbuild後に手順を渡す。起動・VST復元中の操作、perf ON/OFF、tray Quit、診断の保存と欠落summaryを確認する。重い並行build/testは観測条件だが、負荷を掛けた実機確認は別途利用者と計画し、こちらでは実行しない。
 
-## 8. 利用者への質問（未回答。r2でC356-3を変更、ほかは変更なし）
+## 8. 利用者への質問（未回答。r3でC356-3を変更、ほかは変更なし）
 
 1. **C356-1 容量**: 通常ログとperfを合わせ、最大8,192件・本文合計8MiB・1件256KiBでよいですか。**推奨: はい。** メモリが増え続けない上限です。256KiBを超える通常記録は捨て、panic全文は独立panic.logへ残します。
 2. **C356-2 捨て方**: 満杯やqueue競合時は新しい通常／perf記録を捨て、保存が再開したときに欠落件数を記録してよいですか。**推奨: はい。** 起動直後の採用済み記録を残し、画面やstderr読取りを待たせません。panic／watchdog／常時起動診断はこのqueueへ移しません。
-3. **C356-3 保存完了と終了（r2変更）**: 通常は250msごとに保存し、終了時は通常／perfと起動診断を合わせて最大2秒待ち、間に合わなければ残りを諦めて終了してよいですか。診断ZIPは画面を止めず背景で作り、ログの保存完了を最大2秒待って確認し、間に合わない・必要な記録が欠けている場合は通知して作成失敗にします。性能の検証も、測定終了までの保存と欠落なしを確認できなければ「判定不能」として通しません。**推奨: はい。** 自動再試行は増やしません。通常の画面からの保存要求は完了を待たず、ZIPは保存完了確認後にだけ成功表示します。同じ起動中の過去の欠落でも、検証は保守的に判定不能になり得ます。
+3. **C356-3 保存完了と終了（r3変更）**: 通常は250msごとに保存し、終了時は通常／perfと起動診断を合わせて最大2秒待ち、間に合わなければ残りを諦めて終了してよいですか。診断ZIPは画面を止めず背景で作り、ログの保存完了を最大2秒待って確認します。過去にログが欠けていてもZIPを保存し、ZIP内の説明と画面で「証拠不完全」と知らせます。今回の要求印が欠けた・保存確認が時間切れ・必要なログを読めない場合は通知して作成失敗にします。性能の検証は、測定終了までの保存と欠落なしを確認できなければ「判定不能」として通しません。**推奨: はい。** 自動再試行は増やしません。ZIPを保存できても、性能の検証に使える完全な記録とは限りません。
 4. **C356-4 crash時**: panic／UI hangは独立panic.logへ直接書く一方、crash時に通常／perfの未保存queue全体を書き切る保証は設けない方針でよいですか。**推奨: はい。** 止まったwriterをpanic処理から待つ危険を避けます。panic.log自体もディスク故障や強制killでは保存を保証できません。
 5. **C356-5 まれな保存失敗**: ログ保存に失敗したら一度通知し、その保存先は次回起動まで使わず、再試行を増やさない扱いでよいですか。**推奨: はい。** 閲覧と他の診断先は継続し、利用者が作った設定やタグには触れません。
 
@@ -160,6 +161,12 @@ focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`carg
 
 ## 9. r2レビュー指摘への対応記録（2026-10-09）
 
-- **P2-1採用**: `src/diagnostics.rs:22–36` の両flush完了契約とUI handler `preferences/pages.rs:10655–10659` を照合。§3.4／§3.5にworker・完了barrier・要求印／tailの固定prefix・timeout／drop時の通知と失敗を追加。§7に同じfacade／writerを通す回帰を追加し、C356-3を変更。旧独立BufWriter fixtureだけでは代替しない。
+- **P2-1採用**: `src/diagnostics.rs:22–36` の両flush完了契約とUI handler `preferences/pages.rs:10655–10659` を照合。r2で§3.4／§3.5にworker・完了barrier・要求印／tailの固定prefix・timeout／drop時の通知と失敗を追加。§7に同じfacade／writerを通す回帰を追加し、C356-3を変更。**累計dropをZIP失敗とする部分はr3で警告付き保存へ訂正（§10）**。旧独立BufWriter fixtureだけでは代替しない。
 - **P2-2採用**: `check-idle-health.ps1:409–425`、`analyze_perf.py:2073–2088/:2381–2385` を照合。§3.4／§3.6／§6／§7に保存済みcheckpoint・欠落counter・完全性validator・CannotJudge／exit 2を追加。既存sleep許可test（`scripts/test_analyze_perf.py:1182–1186`）と診断欠落test（`:1830–1838`）だけでは新経路を証明できないため、未保存tail／records_droppedを含む実配送・headless回帰を追加する。レビュー担当による偽PASS報告はコード上の分岐と整合するが、この文書改訂ではtestを再実行していない。
 - **P3採用**: PDF分岐を `src/lib.rs:1093–1101`、perf FILEを `src/perf.rs:37`、世代定数を `src/perf.rs:42` に訂正。logger初期化前のPDF分岐という前提は維持。r2照合HEAD `d3a125c10` は基準HEADから文書のみの変更で、製品コードの基準は同じ。
+
+## 10. r3レビュー指摘とcoordinator決定（2026-10-09）
+
+- **P2採用、coordinator決定を反映**: `src/diagnostics.rs:13/:87–96` のbest-effort収集と既存UIの保存path表示（`src/ui_dialogs/preferences/pages.rs:10662–10675`）を再照合。過去の欠落だけで以後の診断ZIPを禁止する必要はなく、残ったログ／panic.logを渡す既存機能を維持する。
+- §3.4／§3.5／§6／§7／C356-3を統一し、barrier保存完了と証拠完全性を分けた。過去の累計dropはmanifest・画面で証拠不完全を表示してZIPを保存。今回の要求印drop、barrier timeout、必須snapshotの読取り失敗は作成失敗を維持。性能gateは証拠不完全なら判定不能のまま。
+- この取扱いはcoordinatorの決定済み仕様。C356-3にはその説明を含め、保存周期／待機上限などの残る利用者回答を求める。製品コード・テスト・アプリ起動は変更／実行していない。
