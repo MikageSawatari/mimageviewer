@@ -1,6 +1,6 @@
 ﻿# 表示するファイル種類 — §1.345 / 履歴再入場のfacet退避 — §1.339
 
-作成: 2026-10-07、改訂: 2026-10-09（実装・検証記録、利用者決定は2026-10-08）、ラインA。
+作成: 2026-10-07、改訂: 2026-10-09（実装・検証記録、利用者決定は2026-10-08/09）、ラインA。
 状態: **仕様確定。§1.339はnext-navで実装済み、§1.345は実装・確認用ビルド済み。検収・実機確認待ち。先行lib実行のnative AVは未解明（§13）**。
 利用者決定とbf509352dの独立レビュー承認は§12に記録。本文の設計時点のコード事実と
 提案表記は設計の記録として残し、今回の実装・検証結果は§13に記録する。
@@ -97,6 +97,14 @@ Remoteの逐次candidate列挙にも実entry descentの同じownerを接続す�
 旧cacheにmanifestがなければsuffixから捏造せず、来歴が必要なときは再変換を求める
 確定仕様（Q16、2026-10-08）。内部書庫の形式除外を明示的に対象外にする案は採らず、
 未知来歴のまま「全対応」とは出荷しない。
+
+**2026-10-09 利用者決定（独立レビュー #5、選択肢(a)）:** 評価・検索・登録一覧で、
+内部形式の除外に来歴が必要なのに来歴のない旧変換ZIPを使う場合は、そのcacheに実在する
+項目を一時的に非表示にし、「古い変換キャッシュのため表示できない項目があります。
+本を開くか、キャッシュを作り直すと表示されます。」と通知する。評価・タグ・登録を保持し、
+実際に欠落した項目の従来の削除経路も保持する。自動再変換や復旧要求の機構は追加しない。
+既存の本を開く変換経路、またはキャッシュ管理での再生成後に一覧を再読込すると、
+新しい来歴に従って表示を復元する。外側の元形式を内部書庫の来歴として推測しない。
 来歴をpaintで再走査する案と、全ZipDirを常に残す案は、誤除外/適用漏れになるため不採用。
 
 ### 3.2 共通の投影順序
@@ -959,3 +967,64 @@ fault stack/dumpは得られていない。RAW・metadata関連73件の単独実
 製品起動、commit、build-dist、test-fullは実施していない。
 実UI、Windows native presenter、実IME、多窓の操作結果はエージェントの観測ではない。
 利用者の手動確認項目をhandoffに記載する。
+
+### 独立レビュー8件への修正（2026-10-09）
+
+- Q11/Q12: 閲覧中の設定OKは採用済みページ列を保持する。終了後の pending reload は
+  採用済みpolicyとの差を同じ設定適用ownerへ渡し、★固定を解除して元場所を読み直す。
+  同policyの通常Snapshot reloadは従来どおり。設定変更は旧スタック準備ownerを取消し、
+  Extracting/Groupingのpolicy不一致も同じWorkerScan入口へ戻す。
+- 本内ブックマーク: 各ViewerContextBundleが投影cache・typed requestを所有し、cacheは
+  container・採用済みpolicyで識別する。要求の採用は所有context・accepted items generationも
+  照合する。共有DB actorの応答は既存ContextRef/registryで要求元へ配送し、格納中の別窓も
+  そのownerだけで投影完了を採用する。通常のmount/depositでcacheや要求を取消さない。
+  DB actorの軽い読出し後、来歴投影は別workerで実行する。
+  既存pendingを ReadingRows/Projecting の単一ownerへ置換し、取消・source交換・書込時の
+  失効は所有containerに限定する。動画・音声や別本の登録変更で現在のcacheを消さない。
+  PC/Remote、全体登録一覧は同じ実書庫来歴を使い、除外された実在ページを欠落行にしない。
+- 旧変換cache: §3.1の利用者決定(a)に従う。通知は評価の初回採用・再読込、検索stream、
+  登録一覧、本内ブックマーク、Remoteにも伝える。検索の通知はquery拒否状態と分離し、
+  検索中の進捗を保つ。実再変換manifestによる復帰と登録・評価保持を検査する。
+  再変換の実publishだけが宛先の共有目次templateを退役し、Windowsの保持read handleに
+  よるatomic replace拒否を防ぐ。読取・画面切替と他書庫は保持し、no-clobber拒否時は
+  退役しない。既存active readerの終了は既存modal/lifecycleに従い、retryや待機は追加しない。
+- Remote: protocol 68、旧画像APIと動画・音声開始を最新policyの共通read-source境界へ通す。
+  RAW先読みではsource判定とmember判定を分け、直接項目だけを取消可能な中央directory/
+  manifestで照合する。先読み窓で入れ子の器を展開しない契約を維持する。
+
+設定OK→閲覧終了→再入場、準備中の同期scan回数、投影完了のsource交換・取消・登録更新、
+PC/Remoteの実来歴、旧cache通知→実再変換→復帰、旧HTTP sibling入口、media開始、
+RAWの取消・サイズ上限・入れ子展開なしをhandler/worker回帰で検査する。
+今回の検証証跡は `target/A-1345-fix-verification.md`、英語commit messageは
+`target/A-1345-fix-msg.txt` に集約する。製品起動・commitは行わない。
+
+**2026-10-09 一時中断とcoordinator決定(a):** 本内ブックマークの単一App-global cache/requestは、
+同じ本を異なる採用済みpolicyで表示するMain embedded readerと格納・復帰した別窓が
+同一frameでpanelを描く既存経路に対応できない。container+policyの正しいkeyを入れると
+要求を互いに置換・取消し、両panelの読込が完了しなくなる。要求元をreadonly ContextRefで
+照合する修正だけでは、複数の有効なconsumerを保持する問題を解消しない。
+独立Sol/xhighがmedia handoffによるlinked stillの格納、ZIP/PDF descriptorの独立contextへの
+復帰、Main側F12・設定変更・新policyでの同一本open、旧別窓の再有効化の経路を確認した。
+coordinatorは既存ViewerContextBundleに本内投影ownerを所属させる案(a)を選択した。
+各viewerのcreate/mutate/drain/invalidate/dropを同じownerへ揃え、同じ本・異なるpolicyの
+兄弟contextが互いに取消・上書きしない回帰を追加する。App-global投影や新しいregistryは作らない。
+中央共有投影の案(b)は採用しない。別窓リワーク§2との構造合意と変更範囲は同plan§11へ記録する。
+
+関連して、Full reloadは元書庫overrideを保持する一方、分類・admissionの対象にcache ZIPを
+渡すため、ZIP除外時に表示可能な元RAR/7zの再読込が拒否される。元書庫を開き直す案は、
+元書庫が欠落・変換不能になっていても受入済みcacheをF5で再列挙できる既存動作を失うため
+不採用とした。読出し・分類・scope・Collection/Rating physical ownerのtarget_pathは物理cache
+のまま保持し、共有open admissionの種類判定だけを論理sourceで行う。requested pathが
+同じcontextのcurrent_folderと一致する時に限り、そのownerのarchive_source_overrideを使い、
+別pathや兄弟contextへaliasを流用しない。既存SameLocation adoptionがcursor・canonical
+history・return・Refresh intentを保つ。独立Sol/xhighがこの所有境界と既存producerを確認した。
+停止時の履歴は `target/A-1345-fix-checkpoint.md`、再開後の結果は検証記録に記録する。
+
+本8件修正の最終自動検証（2026-10-09）は、重点 `visibility_` 105件、既存mutation refresh
+27件、全lib既定並列11124件（52 skip）、Remote 135件（1 skip）、IPC 66件、UI snapshot
+105件が成功した。Web DOM/PWA 192件の有効な結果も再利用した。fmt・glyph lint（危険文字0）・
+通常/portable core checkが成功し、`build-dev.ps1 -PreserveRuntime`で通常profileのcoreと
+protocol 68のRemote、EPUB workerを配置した（266.0秒、PE検査成功）。今回の全libではAVは
+再現せず、8-threadでの全lib再実行は不要だった。初回gateの失敗と修正・再実行の経緯、
+独立した所有境界レビュー、各logは `target/A-1345-fix-verification.md` に記録した。
+製品は起動せず、commitも行っていない。実機確認手順は `target/A-1345-fix-manual.md`。

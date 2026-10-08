@@ -141,10 +141,12 @@ const {
   ViewerAdjustmentPanel,
   ViewerImageUpdateExitReason,
   ViewerViewTrimPanel,
+  ViewerBookmarkPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
   applyContainerData,
+  applyCollectionData,
   applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
@@ -1183,6 +1185,7 @@ test("book bookmark rows preserve DB order and keep hint separate from resolved 
   };
   const list = normalizeRemoteBookBookmarkList({
     supported: true,
+    visibility_notice: "再変換後に表示できます",
     rows: [
       {
         id: 20,
@@ -1206,6 +1209,8 @@ test("book bookmark rows preserve DB order and keep hint separate from resolved 
   });
 
   assert.equal(list.supported, true);
+  assert.equal(list.visibilityNotice, "再変換後に表示できます");
+  assert.equal(normalizeRemoteBookBookmarkList({ supported: true, rows: [] }).visibilityNotice, null);
   assert.deepEqual(list.rows.map((row) => row.id), [20, 10]);
   assert.equal(remoteBookBookmarkDisplayPage(list.rows[0]), 5);
   assert.equal(remoteBookBookmarkDisplayPage(list.rows[1]), 8);
@@ -4749,6 +4754,38 @@ test("visibility resume refusals remain on the grid with a visible selection not
     }
   } finally {
     globalThis.ResizeObserver = previousResizeObserver;
+    globalThis.history = previousHistory;
+  }
+});
+
+test("archive visibility notices are visible in aggregate grid and in-book bookmarks", () => {
+  const noticeText = "古い変換キャッシュのため表示できない項目があります。本を開くか、キャッシュを作り直すと表示されます。";
+  const previousHistory = globalThis.history;
+  globalThis.history = { state: {} };
+  const find = (node, className) => {
+    if (node.classList?.contains(className) || String(node.className ?? "").split(/\s+/).includes(className)) return node;
+    for (const child of node.children ?? []) {
+      const found = find(child, className);
+      if (found) return found;
+    }
+    return null;
+  };
+  try {
+    for (const collectionKind of ["rating", "bookmarks"]) {
+      applyCollectionData({ collectionKind, value: "4" }, {
+        entries: [], visibility_notice: noticeText,
+      }, false);
+      renderFolder();
+      const notice = find(app, "grid-action-notice");
+      assert.ok(notice);
+      assert.equal(notice.hidden, false);
+      assert.equal(notice.textContent, noticeText);
+    }
+    const panel = new ViewerBookmarkPanel();
+    panel.list = normalizeRemoteBookBookmarkList({ supported: true, rows: [], visibility_notice: noticeText });
+    panel.render();
+    assert.ok(panel.content.children.some((node) => node.textContent === noticeText));
+  } finally {
     globalThis.history = previousHistory;
   }
 });

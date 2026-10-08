@@ -945,6 +945,7 @@ impl crate::app::App {
         }
         if !self.stack_group_config_current(&pending.source) {
             self.rebase_stack_group_source(
+                ctx,
                 &pending.source,
                 pending.existing_keys,
                 pending.folder_signature,
@@ -990,12 +991,13 @@ impl crate::app::App {
 
     fn rebase_stack_group_source(
         &mut self,
+        ctx: &egui::Context,
         source: &StackGroupingSource,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     ) {
         if source.visibility != self.settings.file_type_visibility {
-            self.reload_current_folder_preserving_override();
+            self.apply_file_type_visibility_change(ctx);
             return;
         }
         // Separator, script and display-order changes re-group the same listing. Its captured
@@ -1038,6 +1040,7 @@ impl crate::app::App {
         if !self.stack_group_config_current(&pending.source) {
             pending.cancel.store(true, Ordering::Relaxed);
             self.rebase_stack_group_source(
+                ctx,
                 &pending.source,
                 pending.existing_keys,
                 pending.folder_signature,
@@ -1540,7 +1543,7 @@ impl crate::app::App {
                         pending.retry_attempt,
                     );
                 } else {
-                    self.rebase_stack_group_source(&source, existing_keys, folder_signature);
+                    self.rebase_stack_group_source(ctx, &source, existing_keys, folder_signature);
                 }
             }
             StackRetrySource::GroupReady(
@@ -1565,7 +1568,7 @@ impl crate::app::App {
                         pending.retry_attempt,
                     );
                 } else {
-                    self.rebase_stack_group_source(&source, existing_keys, folder_signature);
+                    self.rebase_stack_group_source(ctx, &source, existing_keys, folder_signature);
                 }
             }
             StackRetrySource::SwitchReady(view, target, order, retained)
@@ -1990,6 +1993,73 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path() {
+        for grouping in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("preparing-policy");
+            std::fs::create_dir(&folder).unwrap();
+            image::RgbImage::new(1, 1)
+                .save(folder.join("a_1.png"))
+                .unwrap();
+            image::RgbImage::new(1, 1)
+                .save(folder.join("b_1.jpg"))
+                .unwrap();
+            app.load_folder(folder.clone());
+            app.finish_page_identity_preparation_for_test();
+            app.stack_mode_requested = true;
+            app.spawn_stack_script_worker(
+                folder,
+                StackListingSource::Normal(Arc::new(Vec::new()), StackRatingSource::Standard),
+                '_',
+                crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName),
+                Default::default(),
+                None,
+                false,
+                false,
+            );
+            let Some(StackPreparePending::Extracting(extracting)) = app.stack_script_pending.take()
+            else {
+                panic!("extracting owner expected");
+            };
+            let cancel = Arc::clone(&extracting.cancel);
+            // A held channel models a worker still preparing when settings OK arrives.
+            let (_held_tx, rx) = std::sync::mpsc::channel();
+            app.stack_script_pending = Some(if grouping {
+                StackPreparePending::Grouping(StackScriptPending {
+                    cancel: extracting.cancel,
+                    rx,
+                    source: Arc::new(extracting.source),
+                    context_id: extracting.context_id,
+                    items_generation: extracting.items_generation,
+                    item_count: extracting.item_count,
+                    sequence: extracting.sequence,
+                    existing_keys: extracting.existing_keys,
+                    folder_signature: extracting.folder_signature,
+                    retry_attempt: 0,
+                })
+            } else {
+                StackPreparePending::Extracting(extracting)
+            });
+            let before = crate::app::folder_scan::caller_scan_count_for_test();
+            let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+            policy.excluded_extensions.insert("png".into());
+            app.set_visibility_preferences_for_test(policy);
+            let ctx = egui::Context::default();
+            app.apply_preferences_dialog(&ctx);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.stack_script_pending.is_none());
+            assert!(app.folder_order_refresh_pending_for_test());
+            app.poll_stack_script(&ctx); // Frame order: stack poll precedes scan collection.
+            assert!(app.folder_order_refresh_pending_for_test());
+            assert_eq!(
+                crate::app::folder_scan::caller_scan_count_for_test(),
+                before,
+                "settings OK and the next stack poll must not scan on this thread"
+            );
+        }
+    }
 
     fn finish_list_hydration_for_test(app: &mut crate::app::App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

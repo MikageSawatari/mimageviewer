@@ -615,10 +615,22 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static CALLER_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn caller_scan_count_for_test() -> usize {
+    CALLER_SCAN_COUNT.with(std::cell::Cell::get)
+}
+
 pub(crate) fn scan_directory_with_settings(
     path: &std::path::Path,
     settings: &crate::settings::Settings,
 ) -> std::io::Result<ScannedDir> {
+    #[cfg(test)]
+    CALLER_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     scan_directory_with_visibility_cancel(
         path,
         !settings.archive_file_handling_ignores_convertible(),

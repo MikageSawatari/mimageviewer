@@ -739,6 +739,10 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
+    current_book_bookmarks_request: Option<CurrentBookBookmarksRequest>,
+    book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
     bookmark_view_registered_total: usize,
     items_generation: u64,
     visible_indices: Vec<usize>,
@@ -1459,6 +1463,34 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn book_bookmarks_request(self) -> Option<&'a CurrentBookBookmarksRequest> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.current_book_bookmarks_request.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.current_book_bookmarks_request.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn book_bookmarks_key(self) -> Option<&'a BookBookmarkProjectionKey> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.current_book_bookmarks_key.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.current_book_bookmarks_key.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn book_bookmarks(self) -> &'a [crate::book_bookmarks::BookBookmark] {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.current_book_bookmarks,
+            ContextRefSource::AtRest(bundle) => &bundle.current_book_bookmarks,
+        }
+    }
+
+    pub(in crate::app) fn book_bookmark_title_editing(self) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.book_bookmark_title_edit.is_some(),
+            ContextRefSource::AtRest(bundle) => bundle.book_bookmark_title_edit.is_some(),
+        }
+    }
+
     pub(in crate::app) fn video_audio_mode(self) -> Option<usize> {
         match self.source {
             ContextRefSource::Mounted(app) => app.video_audio_mode,
@@ -1613,6 +1645,7 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        self.current_book_bookmarks_request = None;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.cancel_token.store(true, Ordering::Relaxed);
         if let Some(q) = &self.reload_queue {
@@ -1738,6 +1771,10 @@ impl ViewerContextBundle {
             stack_selection_target: None,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            current_book_bookmarks: Vec::new(),
+            current_book_bookmarks_key: None,
+            current_book_bookmarks_request: None,
+            book_bookmark_title_edit: None,
             bookmark_view_registered_total: 0,
             items_generation: 0,
             visible_indices: Vec::new(),
@@ -2109,6 +2146,10 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            current_book_bookmarks,
+            current_book_bookmarks_key,
+            current_book_bookmarks_request,
+            book_bookmark_title_edit,
             bookmark_view_registered_total,
             items_generation,
             visible_indices,
@@ -2381,6 +2422,10 @@ impl App {
         swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(page_identity_index);
+        swap_field!(current_book_bookmarks);
+        swap_field!(current_book_bookmarks_key);
+        swap_field!(current_book_bookmarks_request);
+        swap_field!(book_bookmark_title_edit);
         swap_field!(bookmark_view_registered_total);
         swap_field!(items_generation);
         swap_field!(visible_indices);
@@ -2722,6 +2767,10 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            current_book_bookmarks,
+            current_book_bookmarks_key,
+            current_book_bookmarks_request,
+            book_bookmark_title_edit,
             bookmark_view_registered_total,
             items_generation,
             visible_indices,
@@ -3051,6 +3100,10 @@ impl App {
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
         move_to_parked!(
+            current_book_bookmarks,
+            current_book_bookmarks_key,
+            current_book_bookmarks_request,
+            book_bookmark_title_edit,
             stack_return_state,
             vst3_deferred_media_open,
             fullscreen_idx,

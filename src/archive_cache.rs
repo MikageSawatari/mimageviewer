@@ -166,7 +166,91 @@ pub struct ArchiveCacheDb {
     convert_lock: Mutex<()>,
 }
 
+/// Read-only mapping evidence for an aggregate worker. File existence alone never proves
+/// that a ZIP is a converted cache, or that its recorded source snapshot is still current.
+pub(crate) struct ConvertedArchiveSnapshot {
+    pub(crate) source_path: PathBuf,
+    pub(crate) cached_zip_path: PathBuf,
+    pub(crate) origin_manifest_version: i64,
+    source_mtime: i64,
+    source_size: i64,
+    cached_size: i64,
+    cached_modified: Option<std::time::SystemTime>,
+}
+
+impl ConvertedArchiveSnapshot {
+    pub(crate) fn is_current(&self) -> bool {
+        let Ok(source) = std::fs::metadata(&self.source_path) else {
+            return false;
+        };
+        let Ok(cached) = std::fs::metadata(&self.cached_zip_path) else {
+            return false;
+        };
+        source.is_file()
+            && cached.is_file()
+            && crate::ui_helpers::mtime_secs(&source) == self.source_mtime
+            && source.len() as i64 == self.source_size
+            && cached.len() as i64 == self.cached_size
+            && cached.modified().ok() == self.cached_modified
+    }
+}
+
 impl ArchiveCacheDb {
+    /// Worker-only lookup; no access-time updates, invalidation or cache deletion.
+    pub(crate) fn snapshot_for_source(&self, source: &Path) -> Option<ConvertedArchiveSnapshot> {
+        self.read_projection_snapshot("src_path_key", &crate::path_key::normalize(source))
+    }
+
+    pub(crate) fn snapshot_for_cached_zip(
+        &self,
+        cached: &Path,
+    ) -> Option<ConvertedArchiveSnapshot> {
+        self.read_projection_snapshot(
+            "replace(cached_zip_path, char(92), '/')",
+            &crate::path_key::normalize_keep_drive(cached),
+        )
+    }
+
+    fn read_projection_snapshot(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Option<ConvertedArchiveSnapshot> {
+        let conn = self.conn.lock().ok()?;
+        // Only the two fixed column expressions above reach this query. Old readonly databases
+        // may predate the origin column; their recorded conversions are legacy evidence.
+        let read = |version: &str| {
+            conn.query_row(
+                &format!("SELECT src_path, src_mtime, src_size, cached_zip_path, cached_zip_size, {version} FROM converted_archives WHERE {column}=?1 COLLATE NOCASE"),
+                [value],
+                |row| Ok(ConvertedArchiveSnapshot {
+                    source_path: PathBuf::from(row.get::<_, String>(0)?),
+                    source_mtime: row.get(1)?, source_size: row.get(2)?,
+                    cached_zip_path: PathBuf::from(row.get::<_, String>(3)?),
+                    cached_size: row.get(4)?, origin_manifest_version: row.get(5)?,
+                    cached_modified: None,
+                }),
+            )
+        };
+        let mut snapshot = read("origin_manifest_version")
+            .or_else(|error| {
+                if error
+                    .to_string()
+                    .contains("no such column: origin_manifest_version")
+                {
+                    read("0")
+                } else {
+                    Err(error)
+                }
+            })
+            .ok()?;
+        drop(conn);
+        snapshot.cached_modified = std::fs::metadata(&snapshot.cached_zip_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        Some(snapshot)
+    }
+
     /// DB を開く (なければ作成)。`<data_dir>` 配下に書き込む。
     pub fn open() -> rusqlite::Result<Self> {
         let path = db_path();

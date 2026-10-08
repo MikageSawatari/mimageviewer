@@ -654,6 +654,12 @@ impl ArchiveDirectoryCache {
             .retain(|entry| entry.key != *key || !Arc::ptr_eq(&entry.slot, slot));
     }
 
+    fn retire_mutated_path(&self, path: &Path) {
+        lock_unpoisoned(&self.inner)
+            .entries
+            .retain(|entry| !crate::path_key::eq_keep_drive(&entry.key.path, path));
+    }
+
     #[cfg(feature = "dev-tools")]
     fn clear(&self) {
         lock_unpoisoned(&self.inner).entries.clear();
@@ -914,6 +920,13 @@ pub fn clear_nested_cache() {
     NESTED_CACHE.clear();
 }
 
+/// Only a writer replacing this file may retire its shared parsed directory. Read-only
+/// navigation keeps templates alive across contexts; on Windows their retained file
+/// handles otherwise prevent atomic replacement even with delete sharing enabled.
+pub(crate) fn retire_archive_directory_for_mutation(path: &Path) {
+    ARCHIVE_DIRECTORY_CACHE.retire_mutated_path(path);
+}
+
 /// ベンチマークで cold miss を再現するためだけに、共有目次 cache を明示的に破棄する。
 /// 通常の navigation / reload から呼んではならない。
 #[cfg(feature = "dev-tools")]
@@ -1118,6 +1131,36 @@ pub fn enumerate_image_entries_detailed_with_cancels(
     cancel: Option<&AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner(zip_path, cancel, stop, false, false)
+}
+
+/// Aggregate read-only consumers must not mutate cache mappings on a missing manifest.
+pub(crate) fn enumerate_image_entries_detailed_readonly_with_cancel(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner(zip_path, cancel, None, true, false)
+}
+
+/// DB-confirmed converted caches may live outside the current cache root. Their literal
+/// member names require the same cancellable manifest read as ordinary converted caches.
+pub(crate) fn enumerate_converted_image_entries_detailed_readonly_with_cancel(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner(zip_path, cancel, None, true, true)
+}
+
+fn enumerate_image_entries_detailed_inner(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+    readonly: bool,
+    require_origins: bool,
+) -> std::io::Result<ZipEnumeration> {
+    if cancelled_by(cancel, stop) {
+        return Err(interrupted_error());
+    }
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::enumerate_image_entries_detailed_with_cancel(zip_path, cancel);
     }
@@ -1145,10 +1188,11 @@ pub fn enumerate_image_entries_detailed_with_cancels(
         &[],
     )?;
     // Converted caches have literal names; only their manifest recovers real boundaries.
-    if crate::archive_cache::is_under_cache_root(zip_path) {
-        let manifest = read_archive_origin_manifest(&mut archive)?;
+    if require_origins || crate::archive_cache::is_under_cache_root(zip_path) {
+        let manifest = read_archive_origin_manifest_with_cancel(&mut archive, cancel)?;
         if manifest.is_none()
-            && crate::archive_cache::mark_missing_origin_manifest_for_reconversion(zip_path)
+            && (readonly
+                || crate::archive_cache::mark_missing_origin_manifest_for_reconversion(zip_path))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1180,13 +1224,23 @@ pub fn enumerate_image_entries_detailed_with_cancels(
 fn read_archive_origin_manifest<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> std::io::Result<Option<crate::archive_origin::ArchiveOriginManifest>> {
+    read_archive_origin_manifest_with_cancel(archive, None)
+}
+
+fn read_archive_origin_manifest_with_cancel<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<Option<crate::archive_origin::ArchiveOriginManifest>> {
+    if cancelled_by(cancel, None) {
+        return Err(interrupted_error());
+    }
     let mut member = match archive.by_name(crate::archive_origin::MANIFEST_ENTRY) {
         Ok(member) => member,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
         Err(error) => return Err(std::io::Error::other(error)),
     };
     let mut bytes = Vec::new();
-    member.read_to_end(&mut bytes)?;
+    read_to_end_with_cancel(&mut member, &mut bytes, cancel, None)?;
     let manifest: crate::archive_origin::ArchiveOriginManifest = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if manifest.version != 1 {
@@ -1806,7 +1860,11 @@ pub(crate) fn resolve_direct_raw_prefetch_candidate(
     zip_path: &Path,
     entry_name: &str,
     cancel: &Arc<AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
 ) -> std::io::Result<Option<(RemoteImageCandidate, u64)>> {
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
+    }
     if crate::rar_loader::is_rar_path(zip_path) {
         return Ok(None);
     }
@@ -1825,19 +1883,39 @@ pub(crate) fn resolve_direct_raw_prefetch_candidate(
         .by_index_raw(index)
         .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
     let name = normalized_zip_entry_name(&entry);
+    let size = entry.size();
     if !entry.is_file()
         || !remote_readable_zip_metadata(&entry)
         || !crate::raw_format::is_raw_path(Path::new(&name))
-        || entry.size() > 256 * 1024 * 1024
+        || size > 256 * 1024 * 1024
+        || !policy.allows_physical_file(Path::new(&name))
     {
         return Ok(None);
+    }
+    drop(entry);
+    // A direct literal name proves there are no physical nested boundaries. A
+    // converted cache instead carries those boundaries in its origin manifest.
+    if policy.requires_archive_origins() && crate::archive_cache::is_under_cache_root(zip_path) {
+        let Some(manifest) = read_archive_origin_manifest_with_cancel(&mut archive, Some(cancel))?
+        else {
+            return Ok(None);
+        };
+        let Some(ancestry) = manifest.images.get(&name) else {
+            return Ok(None);
+        };
+        if !ancestry.iter().all(|origin| origin.allows(policy)) {
+            return Ok(None);
+        }
+    }
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
     }
     Ok(Some((
         RemoteImageCandidate {
             entry_name: name,
             cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
         },
-        entry.size(),
+        size,
     )))
 }
 
@@ -3266,21 +3344,35 @@ mod tests {
             ],
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let (candidate, size) =
-            resolve_direct_raw_prefetch_candidate(&outer, "direct.dng", &cancel)
-                .unwrap()
-                .unwrap();
+        let (candidate, size) = resolve_direct_raw_prefetch_candidate(
+            &outer,
+            "direct.dng",
+            &cancel,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(candidate.cursor, RemoteArchiveCandidateCursor::Zip(vec![0]));
         assert_eq!(size, 3);
         assert!(
-            resolve_direct_raw_prefetch_candidate(&outer, "plain.jpg", &cancel)
-                .unwrap()
-                .is_none()
+            resolve_direct_raw_prefetch_candidate(
+                &outer,
+                "plain.jpg",
+                &cancel,
+                &Default::default()
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            resolve_direct_raw_prefetch_candidate(&outer, "inner.zip/nested.dng", &cancel)
-                .unwrap()
-                .is_none()
+            resolve_direct_raw_prefetch_candidate(
+                &outer,
+                "inner.zip/nested.dng",
+                &cancel,
+                &Default::default()
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(raw_payload_read_count(&outer, "direct.dng"), 0);
         assert!(!nested_cache_contains(&outer, "inner.zip"));
@@ -3307,7 +3399,8 @@ mod tests {
             resolve_direct_raw_prefetch_candidate(
                 &path,
                 "large.dng",
-                &Arc::new(AtomicBool::new(false))
+                &Arc::new(AtomicBool::new(false)),
+                &Default::default()
             )
             .unwrap()
             .is_none()
@@ -3354,9 +3447,10 @@ mod tests {
         bytes[central + 24..central + 28].copy_from_slice(&4_u32.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let (candidate, size) = resolve_direct_raw_prefetch_candidate(&path, "page.dng", &cancel)
-            .unwrap()
-            .unwrap();
+        let (candidate, size) =
+            resolve_direct_raw_prefetch_candidate(&path, "page.dng", &cancel, &Default::default())
+                .unwrap()
+                .unwrap();
         assert_eq!(size, 4);
         let error =
             read_direct_raw_prefetch_candidate(&path, &candidate, size, &cancel).unwrap_err();
@@ -3810,6 +3904,32 @@ mod tests {
         }
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.parse_count(), 3);
+    }
+
+    #[test]
+    fn visibility_directory_mutation_retirement_preserves_unrelated_parse_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("Changed.zip");
+        let sibling = dir.path().join("Sibling.zip");
+        write_test_zip(&changed, &[("page.jpg", b"CHANGED")]);
+        write_test_zip(&sibling, &[("page.jpg", b"SIBLING")]);
+        let cache = ArchiveDirectoryCache::new(2);
+        read_with_directory_cache(&cache, &changed, "page.jpg", None).unwrap();
+        read_with_directory_cache(&cache, &sibling, "page.jpg", None).unwrap();
+        let sibling_slot = cache.slot_for_path_for_test(&sibling).unwrap();
+        let sibling_parse_count = cache.parse_count();
+        cache.retire_mutated_path(Path::new(&crate::path_key::normalize_keep_drive(&changed)));
+        assert!(cache.slot_for_path_for_test(&changed).is_none());
+        assert!(Arc::ptr_eq(
+            &sibling_slot,
+            &cache.slot_for_path_for_test(&sibling).unwrap()
+        ));
+        assert_eq!(
+            read_with_directory_cache(&cache, &sibling, "page.jpg", None).unwrap(),
+            b"SIBLING"
+        );
+        assert_eq!(cache.parse_count(), sibling_parse_count);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

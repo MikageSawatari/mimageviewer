@@ -546,14 +546,18 @@ impl CollectionEngine {
             .into_iter()
             .filter_map(|row| candidate_from_grid_item(row.item, None, Some(stars)))
             .collect();
-        self.payload_from_projected(
+        let mut payload = self.payload_from_projected(
             settings,
             &format!("レーティング ★{stars}"),
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
             spread_request,
-        )
+        )?;
+        payload.visibility_notice = visibility
+            .notice()
+            .map(|notice| notice.message().to_owned());
+        Ok(payload)
     }
 
     fn bookmarks(
@@ -619,6 +623,9 @@ impl CollectionEngine {
             spread_request,
         )?;
         payload.registered_total = Some(built.registered_total);
+        payload.visibility_notice = built
+            .visibility_notice
+            .map(|notice| notice.message().to_owned());
         Ok(payload)
     }
 
@@ -796,6 +803,7 @@ fn collection_payload(
 ) -> CollectionPayload {
     let spread = collection_spread_payload(&entries, spread_request);
     CollectionPayload {
+        visibility_notice: None,
         title: title.to_owned(),
         thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
         sort_state,
@@ -1729,6 +1737,65 @@ mod tests {
         assert_eq!(payload.entries.len(), 1);
         assert_eq!(payload.entries[0].path, directory_path.to_string_lossy());
         assert_eq!(db.list_by_stars(4).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn remote_registration_lists_publish_legacy_cache_notice_and_restore_after_conversion() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(data.path());
+        let db =
+            crate::rating_db::RatingDb::open_at(&crate::rating_db::RatingDb::db_path()).unwrap();
+        let mut meta =
+            crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
+                .with_source_path(&cached);
+        meta.entry_name = Some("root.jpg".into());
+        db.set_user_rating(&format!("{}::root.jpg", cached.display()), 4, Some(&meta))
+            .unwrap();
+        crate::book_bookmarks::load_all_from_disk().unwrap();
+        let conn = rusqlite::Connection::open(crate::book_bookmarks::db_path()).unwrap();
+        conn.execute("INSERT INTO book_bookmarks (id, container_key, container_path, container_kind, page_kind, page_value, page_key, page_index_hint, created_at_ms) VALUES (1, ?1, ?2, 'other_archive', 'archive_entry', 'root.jpg', 'root.jpg', 0, 1)", rusqlite::params![crate::book_bookmarks::container_key(&source), source.to_string_lossy()]).unwrap();
+        let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("cbz".into());
+        let engine = CollectionEngine::new(settings.clone());
+        let expected =
+            crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache.message();
+        for restored in [false, true] {
+            if restored {
+                crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+            }
+            let rating = engine
+                .rating(
+                    &settings,
+                    4,
+                    crate::settings::SortOrder::Numeric,
+                    CollectionSpreadRequest::default(),
+                )
+                .unwrap();
+            let bookmarks = engine
+                .bookmarks(
+                    &settings,
+                    crate::settings::SortOrder::Numeric,
+                    CollectionSpreadRequest::default(),
+                )
+                .unwrap();
+            for payload in [rating, bookmarks] {
+                assert_eq!(payload.entries.len(), usize::from(restored));
+                assert_eq!(
+                    payload.visibility_notice.as_deref(),
+                    (!restored).then_some(expected)
+                );
+            }
+            assert_eq!(db.list_by_stars(4).unwrap().len(), 1);
+            assert_eq!(
+                crate::book_bookmarks::load_all_from_disk_readonly()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]

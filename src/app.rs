@@ -4999,8 +4999,41 @@ pub(crate) struct StampEmbedPending {
 #[derive(Clone, Debug)]
 pub(crate) struct BookBookmarkTitleEdit {
     pub(crate) id: i64,
+    pub(crate) focus_viewport: egui::ViewportId,
     pub(crate) title: String,
     pub(crate) request_focus: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BookBookmarkProjectionKey {
+    pub(crate) container_key: String,
+    pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
+    pub(crate) context_id: ViewerContextId,
+    pub(crate) items_generation: u64,
+}
+
+impl BookBookmarkProjectionKey {
+    fn same_projection(&self, other: &Self) -> bool {
+        self.container_key == other.container_key && self.visibility == other.visibility
+    }
+}
+
+pub(crate) enum CurrentBookBookmarksStage {
+    ReadingRows(u64),
+    Projecting(mpsc::Receiver<crate::bookmark_browser::BookBookmarkProjection>),
+}
+
+pub(crate) struct CurrentBookBookmarksRequest {
+    key: BookBookmarkProjectionKey,
+    stage: CurrentBookBookmarksStage,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CurrentBookBookmarksRequest {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16053,8 +16086,8 @@ pub struct App {
     pub(crate) book_resume_meters: Box<book_resume_meter::BookResumeMeters>,
     /// 左パネル用の現在コンテナの本ブックマーク cache。
     pub(crate) current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
-    pub(crate) current_book_bookmarks_key: Option<String>,
-    pub(crate) current_book_bookmarks_request: Option<(u64, String)>,
+    pub(crate) current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
+    pub(crate) current_book_bookmarks_request: Option<CurrentBookBookmarksRequest>,
     /// 左パネルで編集中の本ブックマーク名称。
     pub(crate) book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
     /// `request_focus` 発行後、対象 viewport の次 pass だけを所有する focus claim。
@@ -21368,8 +21401,15 @@ impl App {
     }
 
     pub(crate) fn clear_book_bookmark_title_edit(&mut self) {
-        self.book_bookmark_title_edit = None;
-        self.clear_pending_text_input_focus();
+        if let Some(edit) = self.book_bookmark_title_edit.take()
+            && self.pending_text_input_focus.get().is_some_and(|claim| {
+                claim.viewport == edit.focus_viewport
+                    && claim.widget_id
+                        == crate::ui_adjustment_panel::book_bookmark_title_edit_widget_id(edit.id)
+            })
+        {
+            self.clear_pending_text_input_focus();
+        }
     }
 
     /// ダイアログ確定用の Enter が押されたか。IME 変換中は常に false を返す。
@@ -24956,11 +24996,31 @@ impl App {
     /// - **通常フォルダ**: スクロール履歴を捨てて先頭から再ロード。
     /// Apply the committed policy once through the existing source owners. Active readers keep
     /// their accepted page order until close; their policy snapshot is then compared on return.
+    pub(crate) fn poll_pending_reload(&mut self, ctx: &egui::Context) {
+        let policy_changed = self.page_identity_index.policy != self.settings.file_type_visibility;
+        if !self.pending_reload
+            || self.sidecar_restore_active()
+            || (self.fullscreen_idx.is_some() && policy_changed)
+        {
+            return;
+        }
+        self.pending_reload = false;
+        if policy_changed {
+            // Deferred settings apply has the same source/return owner as settings OK.
+            self.apply_file_type_visibility_change(ctx);
+        } else if self.current_folder.is_some() {
+            self.reload_current_folder_preserving_override();
+        }
+        ctx.request_repaint();
+    }
+
     pub(crate) fn apply_file_type_visibility_change(&mut self, ctx: &egui::Context) {
         if self.fullscreen_idx.is_some() {
             self.pending_reload = true;
             return;
         }
+        // A new listing supersedes preparation captured under the previous policy.
+        self.cancel_stack_script_pending();
         if let Some(mut origin) = if self.is_snapshot_active() {
             self.dismiss_snapshot_with_origin()
         } else if self.global_search.active {
@@ -26544,6 +26604,21 @@ impl App {
         )
     }
 
+    /// The adopted source/cache pair belongs to the mounted viewer. A refresh reads its
+    /// accepted backing even if the original is missing, but visibility describes the source.
+    /// Other targets and sibling viewers must never borrow this alias.
+    fn physical_open_visibility_source<'a>(&'a self, path: &'a Path) -> &'a Path {
+        if self
+            .current_folder
+            .as_deref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, path))
+        {
+            self.archive_source_override.as_deref().unwrap_or(path)
+        } else {
+            path
+        }
+    }
+
     fn load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
         &mut self,
         path: PathBuf,
@@ -26555,10 +26630,12 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<MainListNavigation>,
     ) -> FolderOpenOutcome {
+        let visibility_source = self.physical_open_visibility_source(&path);
         // Direct media opens keep their released behavior; container/page targets use the list policy.
         if classified_kind != Some(OpenPathKind::Directory)
             && crate::file_type_visibility::category_for_extension(
-                path.extension()
+                visibility_source
+                    .extension()
                     .and_then(|value| value.to_str())
                     .unwrap_or(""),
             )
@@ -26574,7 +26651,7 @@ impl App {
             && !self
                 .settings
                 .file_type_visibility
-                .allows_physical_file(&path)
+                .allows_physical_file(visibility_source)
         {
             self.show_open_admission_refusal(OpenAdmissionRefusal::FileTypeExcluded);
             return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(
@@ -33255,6 +33332,9 @@ impl App {
             app.pending_rating_view_zipdir_open = None;
             app.reset_details_sort_to_toolbar();
             app.persist_pending_view_trim_state();
+            if let Some(notice) = result.visibility_notice {
+                app.show_feedback_toast(notice.message().into());
+            }
             app.rating_view_rows = result.rows;
             app.rating_view_skipped = result.skipped;
             let hydration = match (result.prepared, token) {
@@ -33530,6 +33610,9 @@ impl App {
     }
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
+        if let Some(notice) = result.visibility_notice {
+            self.show_feedback_toast(notice.message().into());
+        }
         self.rating_view_rows = result.rows;
         self.rating_view_skipped = result.skipped;
         if let Some(prepared) = result.prepared {
@@ -43658,10 +43741,7 @@ impl App {
             }
         }
         if changed.book_bookmarks {
-            self.current_book_bookmarks.clear();
-            self.current_book_bookmarks_key = None;
-            self.current_book_bookmarks_request = None;
-            self.clear_book_bookmark_title_edit();
+            self.invalidate_all_book_bookmark_projections();
         }
         if changed.timed_bookmarks {
             self.fullscreen_video_marker_cache = None;
@@ -45944,30 +46024,66 @@ impl App {
             self.clear_book_bookmark_title_edit();
             return;
         };
-        let key = crate::book_bookmarks::container_key(&entry.container_path);
-        if self.current_book_bookmarks_key.as_deref() == Some(key.as_str())
-            || self
-                .current_book_bookmarks_request
-                .as_ref()
-                .is_some_and(|(_, pending_key)| pending_key == &key)
+        let key = BookBookmarkProjectionKey {
+            container_key: crate::book_bookmarks::container_key(&entry.container_path),
+            visibility: self.listing_file_type_visibility().clone(),
+            context_id: self.virtual_list_context_id(),
+            items_generation: self.items_generation,
+        };
+        // This projection belongs to the mounted viewer payload. An ordinary mount/deposit
+        // retains it, while a new listing generation or adopted policy requires a new read.
+        if self
+            .current_book_bookmarks_key
+            .as_ref()
+            .is_some_and(|loaded| {
+                loaded.same_projection(&key) && self.book_bookmark_projection_current(loaded)
+            })
+        {
+            self.current_book_bookmarks_key = Some(key);
+            return;
+        }
+        if self
+            .current_book_bookmarks_request
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.key.same_projection(&key)
+                    && self.book_bookmark_projection_current(&pending.key)
+            })
         {
             return;
         }
-        // 別の本へ移動した直後に、旧コンテナの行を新しい本の行として一瞬表示しない。
         self.current_book_bookmarks.clear();
         self.current_book_bookmarks_key = None;
+        self.current_book_bookmarks_request = None;
         self.clear_book_bookmark_title_edit();
         let request_id = self.next_book_bookmark_request_id();
         if let Some(service) = self.book_bookmark_service.as_ref() {
             service.list_for_container(request_id, entry.container_path);
-            self.current_book_bookmarks_request = Some((request_id, key));
+            self.current_book_bookmarks_request = Some(CurrentBookBookmarksRequest {
+                key,
+                stage: CurrentBookBookmarksStage::ReadingRows(request_id),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
             self.book_bookmark_pending_requests.insert(request_id);
+        }
+    }
+
+    fn invalidate_current_book_bookmark_edit(&mut self, id: i64) {
+        if let Some(path) = self
+            .current_book_bookmarks
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.container_path.clone())
+        {
+            self.invalidate_current_book_bookmarks_for_container(&path);
         }
     }
 
     pub(crate) fn remove_book_bookmark(&mut self, id: i64) {
         let request_id = self.next_book_bookmark_request_id();
-        if let Some(service) = self.book_bookmark_service.as_ref() {
+        if self.book_bookmark_service.is_some() {
+            self.invalidate_current_book_bookmark_edit(id);
+            let service = self.book_bookmark_service.as_ref().unwrap();
             service.remove(request_id, id);
             self.book_bookmark_pending_requests.insert(request_id);
         }
@@ -45975,10 +46091,12 @@ impl App {
 
     pub(crate) fn set_book_bookmark_title(&mut self, id: i64, title: String) {
         let request_id = self.next_book_bookmark_request_id();
-        let Some(service) = self.book_bookmark_service.as_ref() else {
+        if self.book_bookmark_service.is_none() {
             self.show_feedback_toast("ブックマークDBを利用できません".to_string());
             return;
-        };
+        }
+        self.invalidate_current_book_bookmark_edit(id);
+        let service = self.book_bookmark_service.as_ref().unwrap();
         service.set_title(request_id, id, title);
         self.book_bookmark_pending_requests.insert(request_id);
     }
@@ -45996,8 +46114,17 @@ impl App {
                     self.fail_remote_bookmark_writes();
                     self.book_bookmark_service = None;
                     self.book_bookmark_pending_requests.clear();
-                    self.current_book_bookmarks_request = None;
-                    self.clear_book_bookmark_title_edit();
+                    for owner in self.viewer_context_ids() {
+                        if self
+                            .book_bookmark_context_matches(owner, |_, _, request| request.is_some())
+                            || self.book_bookmark_context_title_editing(owner)
+                        {
+                            self.with_book_bookmark_context(owner, |app| {
+                                app.current_book_bookmarks_request = None;
+                                app.clear_book_bookmark_title_edit();
+                            });
+                        }
+                    }
                     self.show_feedback_toast("ブックマークDBとの接続が終了しました".to_string());
                     break;
                 }
@@ -46010,18 +46137,9 @@ impl App {
                     self.book_bookmark_pending_requests.remove(&request_id);
                     match result {
                         Ok((bookmark, inserted)) => {
-                            if self.current_book_bookmarks_key.as_deref()
-                                == Some(bookmark.container_key.as_str())
-                                && !self
-                                    .current_book_bookmarks
-                                    .iter()
-                                    .any(|entry| entry.id == bookmark.id)
-                            {
-                                self.current_book_bookmarks.push(bookmark);
-                                self.current_book_bookmarks.sort_by_key(|entry| {
-                                    (entry.page_index_hint, entry.created_at_ms)
-                                });
-                            }
+                            self.invalidate_current_book_bookmarks_for_container(
+                                &bookmark.container_path,
+                            );
                             self.show_feedback_toast(if inserted {
                                 "ブックマークを追加しました".to_string()
                             } else {
@@ -46039,12 +46157,7 @@ impl App {
                     self.book_bookmark_pending_requests.remove(&request_id);
                     match result {
                         Ok(id) => {
-                            self.current_book_bookmarks.retain(|entry| entry.id != id);
-                            if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
-                                == Some(id)
-                            {
-                                self.clear_book_bookmark_title_edit();
-                            }
+                            self.invalidate_book_bookmark_projections_for_row(id);
                             self.notify_bookmarks_changed();
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
                         }
@@ -46055,19 +46168,8 @@ impl App {
                 crate::book_bookmarks::BookBookmarkEvent::TitleUpdated { request_id, result } => {
                     self.book_bookmark_pending_requests.remove(&request_id);
                     match result {
-                        Ok((id, title)) => {
-                            if let Some(bookmark) = self
-                                .current_book_bookmarks
-                                .iter_mut()
-                                .find(|bookmark| bookmark.id == id)
-                            {
-                                bookmark.title = title;
-                            }
-                            if self.book_bookmark_title_edit.as_ref().map(|edit| edit.id)
-                                == Some(id)
-                            {
-                                self.clear_book_bookmark_title_edit();
-                            }
+                        Ok((id, _title)) => {
+                            self.invalidate_book_bookmark_projections_for_row(id);
                             if self.items_are_bookmark_view {
                                 self.refresh_bookmark_browser();
                             }
@@ -46084,36 +46186,25 @@ impl App {
                     result,
                 } => {
                     self.book_bookmark_pending_requests.remove(&request_id);
-                    if self.current_book_bookmarks_request.as_ref().is_some_and(
-                        |(pending_id, pending_key)| {
-                            *pending_id == request_id && pending_key == &container_key
-                        },
-                    ) {
-                        self.current_book_bookmarks_request = None;
-                        match result {
-                            Ok(rows) => {
-                                self.current_book_bookmarks = rows
-                                    .into_iter()
-                                    .filter(|bookmark| {
-                                        crate::bookmark_browser::book_bookmark_is_visible(
-                                            &self.settings.file_type_visibility,
-                                            bookmark,
-                                        )
-                                    })
-                                    .collect();
-                                self.current_book_bookmarks_key = Some(container_key);
-                            }
-                            Err(err) => {
-                                // 同じ失敗要求を毎フレーム再送して toast を繰り返さない。
-                                // 別コンテナへ移動して戻れば再試行される。
-                                self.current_book_bookmarks_key = Some(container_key);
-                                self.show_feedback_toast(format!(
-                                    "ブックマーク一覧を読み込めませんでした: {err}"
-                                ));
-                            }
-                        }
+                    let owner = self.viewer_context_ids().into_iter().find(|id| {
+                        self.book_bookmark_context_matches(*id, |_, _, request| {
+                            request.is_some_and(|pending| {
+                                matches!(pending.stage, CurrentBookBookmarksStage::ReadingRows(id) if id == request_id)
+                                    && pending.key.container_key == container_key
+                            })
+                        })
+                    });
+                    if let Some(owner) = owner {
+                        self.with_book_bookmark_context(owner, |app| {
+                            app.apply_current_book_bookmark_rows(
+                                request_id,
+                                &container_key,
+                                result,
+                            );
+                        });
                     }
                 }
+
                 crate::book_bookmarks::BookBookmarkEvent::AllListed { request_id, .. } => {
                     self.book_bookmark_pending_requests.remove(&request_id);
                 }
@@ -46141,23 +46232,245 @@ impl App {
                 }
             }
         }
+        for owner in self.viewer_context_ids() {
+            if self.book_bookmark_context_matches(owner, |_, _, request| request.is_some()) {
+                self.with_book_bookmark_context(owner, |app| {
+                    app.poll_current_book_bookmark_projection()
+                });
+            }
+        }
+    }
+
+    fn apply_current_book_bookmark_rows(
+        &mut self,
+        request_id: u64,
+        container_key: &str,
+        result: Result<Vec<crate::book_bookmarks::BookBookmark>, String>,
+    ) {
+        let matching = self.current_book_bookmarks_request.as_ref().is_some_and(|pending| {
+                        matches!(pending.stage, CurrentBookBookmarksStage::ReadingRows(id) if id == request_id)
+                            && pending.key.container_key == container_key
+                    });
+        if matching {
+            let mut pending = self.current_book_bookmarks_request.take().unwrap();
+            if !self.book_bookmark_projection_current(&pending.key) {
+                return;
+            }
+            match result {
+                Ok(rows) => {
+                    let visibility = pending.key.visibility.clone();
+                    let cancel = Arc::clone(&pending.cancel);
+                    let (tx, rx) = mpsc::channel();
+                    #[cfg(test)]
+                    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
+                    let spawn = std::thread::Builder::new()
+                        .name("book-bookmark-projection".into())
+                        .spawn(move || {
+                            #[cfg(test)]
+                            let _test_epoch_guard = test_epoch_scope
+                                .map(crate::page_edit_write_epoch::TestEpochScope::enter);
+                            let projection = crate::bookmark_browser::project_book_bookmarks(
+                                rows,
+                                &visibility,
+                                &cancel,
+                            );
+                            let _ = tx.send(projection);
+                        });
+                    if spawn.is_ok() {
+                        pending.stage = CurrentBookBookmarksStage::Projecting(rx);
+                        self.current_book_bookmarks_request = Some(pending);
+                    } else {
+                        self.current_book_bookmarks_key = Some(pending.key.clone());
+                        self.show_feedback_toast(
+                            "ブックマーク一覧ワーカーを開始できませんでした".into(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    self.current_book_bookmarks_key = Some(pending.key.clone());
+                    self.show_feedback_toast(format!(
+                        "ブックマーク一覧を読み込めませんでした: {err}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn book_bookmark_projection_current(&self, key: &BookBookmarkProjectionKey) -> bool {
+        key.context_id == self.virtual_list_context_id()
+            && key.items_generation == self.items_generation
+            && key.visibility == *self.listing_file_type_visibility()
+    }
+
+    // The shared DB actor routes replies through the existing context table. Projection state
+    // stays in each payload; there is no secondary routing registry or shared result cache.
+    fn book_bookmark_context_matches(
+        &self,
+        id: ViewerContextId,
+        predicate: impl FnOnce(
+            &[crate::book_bookmarks::BookBookmark],
+            Option<&BookBookmarkProjectionKey>,
+            Option<&CurrentBookBookmarksRequest>,
+        ) -> bool,
+    ) -> bool {
+        if id == self.virtual_list_context_id() {
+            return predicate(
+                &self.current_book_bookmarks,
+                self.current_book_bookmarks_key.as_ref(),
+                self.current_book_bookmarks_request.as_ref(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            self.with_viewer_context_ref(id, |context| {
+                predicate(
+                    context.book_bookmarks(),
+                    context.book_bookmarks_key(),
+                    context.book_bookmarks_request(),
+                )
+            })
+            .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn with_book_bookmark_context<R>(
+        &mut self,
+        id: ViewerContextId,
+        apply: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        if id == self.virtual_list_context_id() {
+            return Some(apply(self));
+        }
+        #[cfg(windows)]
+        {
+            self.with_viewer_context(id, apply).ok()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn book_bookmark_projections_pending(&self) -> bool {
+        self.viewer_context_ids()
+            .into_iter()
+            .any(|id| self.book_bookmark_context_matches(id, |_, _, request| request.is_some()))
+    }
+
+    fn book_bookmark_context_title_editing(&self, id: ViewerContextId) -> bool {
+        if id == self.virtual_list_context_id() {
+            return self.book_bookmark_title_edit.is_some();
+        }
+        #[cfg(windows)]
+        {
+            self.with_viewer_context_ref(id, |context| context.book_bookmark_title_editing())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn invalidate_book_bookmark_projections_for_row(&mut self, id: i64) {
+        let containers = self
+            .viewer_context_ids()
+            .into_iter()
+            .filter_map(|owner| {
+                let mut container = None;
+                self.book_bookmark_context_matches(owner, |rows, _, _| {
+                    container = rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.container_path.clone());
+                    container.is_some()
+                });
+                container
+            })
+            .collect::<HashSet<_>>();
+        for container in containers {
+            self.invalidate_current_book_bookmarks_for_container(&container);
+        }
+    }
+
+    fn poll_current_book_bookmark_projection(&mut self) {
+        let Some(pending) = self.current_book_bookmarks_request.as_ref() else {
+            return;
+        };
+        let current = self.book_bookmark_projection_current(&pending.key);
+        if !current {
+            self.current_book_bookmarks_request = None;
+            return;
+        }
+        let CurrentBookBookmarksStage::Projecting(rx) = &pending.stage else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(projected) => {
+                let pending = self.current_book_bookmarks_request.take().unwrap();
+                self.current_book_bookmarks = projected.bookmarks;
+                self.current_book_bookmarks_key = Some(pending.key.clone());
+                if let Some(notice) = projected.notice {
+                    self.show_feedback_toast(notice.message().into());
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let pending = self.current_book_bookmarks_request.take().unwrap();
+                self.current_book_bookmarks_key = Some(pending.key.clone());
+                self.show_feedback_toast("ブックマーク一覧ワーカーが終了しました".into());
+            }
+        }
     }
 
     fn invalidate_book_bookmarks_after_path_migration(&mut self) {
-        self.current_book_bookmarks.clear();
-        self.current_book_bookmarks_key = None;
-        self.current_book_bookmarks_request = None;
-        self.clear_book_bookmark_title_edit();
+        self.invalidate_all_book_bookmark_projections();
         self.notify_bookmarks_changed();
+    }
+
+    fn invalidate_all_book_bookmark_projections(&mut self) {
+        for owner in self.viewer_context_ids() {
+            if self.book_bookmark_context_matches(owner, |rows, key, request| {
+                !rows.is_empty() || key.is_some() || request.is_some()
+            }) || self.book_bookmark_context_title_editing(owner)
+            {
+                self.with_book_bookmark_context(owner, |app| {
+                    app.current_book_bookmarks.clear();
+                    app.current_book_bookmarks_key = None;
+                    app.current_book_bookmarks_request = None;
+                    app.clear_book_bookmark_title_edit();
+                });
+            }
+        }
     }
 
     pub(crate) fn invalidate_current_book_bookmarks_for_container(&mut self, path: &Path) {
         let key = crate::book_bookmarks::container_key(path);
-        let mounted = self.current_book_bookmarks_key.as_deref() == Some(key.as_str());
+        for owner in self.viewer_context_ids() {
+            if self.book_bookmark_context_matches(owner, |_, loaded, request| {
+                loaded.is_some_and(|loaded| loaded.container_key == key)
+                    || request.is_some_and(|pending| pending.key.container_key == key)
+            }) {
+                self.with_book_bookmark_context(owner, |app| {
+                    app.invalidate_current_book_bookmark_projection(&key)
+                });
+            }
+        }
+    }
+
+    fn invalidate_current_book_bookmark_projection(&mut self, key: &str) {
+        let mounted = self
+            .current_book_bookmarks_key
+            .as_ref()
+            .is_some_and(|loaded| loaded.container_key == key);
         let loading = self
             .current_book_bookmarks_request
             .as_ref()
-            .is_some_and(|(_, pending_key)| pending_key == &key);
+            .is_some_and(|pending| pending.key.container_key == key);
         if mounted || loading {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
@@ -46347,7 +46660,11 @@ impl App {
             return Vec::new();
         };
         let container_key = crate::book_bookmarks::container_key(&draft.container_path);
-        if self.current_book_bookmarks_key.as_deref() != Some(container_key.as_str()) {
+        if !self.current_book_bookmarks_key.as_ref().is_some_and(|key| {
+            key.container_key == container_key
+                && key.context_id == self.virtual_list_context_id()
+                && self.book_bookmark_projection_current(key)
+        }) {
             return Vec::new();
         }
 
@@ -47047,6 +47364,9 @@ impl App {
             self.bookmark_browser_pending = None;
             match result {
                 Ok(built) => {
+                    if let Some(notice) = built.visibility_notice {
+                        self.show_feedback_toast(notice.message().into());
+                    }
                     let previous_registered_total = self.bookmark_view_registered_total;
                     self.bookmark_view_registered_total = built.registered_total;
                     let mut rows = built.rows;
@@ -47120,9 +47440,12 @@ impl App {
                 )),
             });
         if let Some((keys, result)) = delete_result {
-            self.bookmark_delete_pending = None;
+            let pending = self.bookmark_delete_pending.take().unwrap();
             match result {
                 Ok(()) => {
+                    for container in pending.book_containers {
+                        self.invalidate_current_book_bookmarks_for_container(&container);
+                    }
                     let key_set: std::collections::HashSet<_> = keys.iter().copied().collect();
                     self.bookmark_browser_rows
                         .retain(|row| !key_set.contains(&row.stable_key()));
@@ -89113,7 +89436,7 @@ impl App {
         self.poll_book_bookmarks();
         self.poll_bookmark_presence(ctx);
         self.poll_bookmark_browser(ctx);
-        if self.current_book_bookmarks_request.is_some() {
+        if self.book_bookmark_projections_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.poll_metadata_load();
@@ -90355,18 +90678,7 @@ impl App {
         self.handle_delete_key(ctx);
 
         // ── 非同期ファイル操作後のフォルダ再読み込み ──────────────
-        if self.pending_reload
-            && !self.sidecar_restore_active()
-            && (self.fullscreen_idx.is_none()
-                || self.page_identity_index.policy == self.settings.file_type_visibility)
-        {
-            self.pending_reload = false;
-            if self.current_folder.is_some() {
-                ctx.request_repaint();
-                // 変換済みアーカイブ閲覧中は元パス文脈を保持して再読み込みする。
-                self.reload_current_folder_preserving_override();
-            }
-        }
+        self.poll_pending_reload(ctx);
 
         mark_update_perf(&mut update_perf, UpdatePerfStage::PostGrid);
 

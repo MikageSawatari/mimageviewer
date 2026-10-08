@@ -3,6 +3,16 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 
 impl App {
+    pub(crate) fn folder_order_refresh_pending_for_test(&self) -> bool {
+        self.folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                )
+            })
+    }
     /// Fixtures that require an admitted, usable listing wait for its real worker owner.
     pub(crate) fn finish_page_identity_preparation_for_test(&mut self) {
         let ctx = egui::Context::default();
@@ -5635,6 +5645,7 @@ fn phase_b_search_batch(
         }],
         scanned_candidates: valid_hits,
         valid_hits,
+        visibility_notice: None,
     }
 }
 
@@ -29707,6 +29718,7 @@ mod phase_c_drill_nav_tests {
         app.rating_view_saved_folder = Some(subfolder_expansion_synthetic_path());
 
         app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
+            visibility_notice: None,
             stars: 3,
             rows: vec![crate::rating_view::RatingViewRow {
                 key: "rating-hit".to_string(),
@@ -31293,6 +31305,7 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(Ok(crate::bookmark_browser::BookmarkBrowserRows {
+        visibility_notice: None,
         rows: vec![row],
         registered_total: 1,
     }))
@@ -33031,6 +33044,7 @@ mod phase_c_drill_address_tests {
             hits,
             scanned_candidates: 412_000,
             valid_hits: 3,
+            visibility_notice: None,
         })
         .unwrap();
 
@@ -33099,6 +33113,7 @@ mod phase_c_drill_address_tests {
                 .collect(),
             scanned_candidates: 412_000,
             valid_hits: 3,
+            visibility_notice: None,
         })
         .unwrap();
 
@@ -33174,6 +33189,7 @@ mod phase_c_drill_address_tests {
                 hits: Vec::new(),
                 scanned_candidates: page * crate::global_search::PAGE_SIZE,
                 valid_hits: 0,
+                visibility_notice: None,
             })
             .unwrap();
         }
@@ -49716,6 +49732,7 @@ mod favorite_adjustment_defaults_tests {
     fn keyboard_owner_ignores_bookmark_title_draft_without_a_live_claim() {
         let mut app = setup_app();
         app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+            focus_viewport: egui::ViewportId::ROOT,
             id: 7,
             title: "draft".to_owned(),
             request_focus: false,
@@ -59757,6 +59774,7 @@ mod native_video_rating_key_tests {
         let generation_before = app.items_generation;
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(crate::bookmark_browser::BookmarkBrowserRows {
+            visibility_notice: None,
             rows: vec![row],
             registered_total: 1,
         }))
@@ -96378,6 +96396,7 @@ fn start_bookmark_title_edit_after_handler(app: &mut App, ctx: &egui::Context, f
         ctx.cumulative_pass_nr(),
     );
     app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        focus_viewport: ctx.viewport_id(),
         id: bookmark_id,
         title: String::from("editing"),
         request_focus: true,
@@ -96540,6 +96559,7 @@ fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
     let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        focus_viewport: egui::ViewportId::ROOT,
         id: 42,
         title: String::from("draft only"),
         request_focus: false,
@@ -103051,3 +103071,6 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
     );
     assert!(parent_db.load_one(&scoped).unwrap().is_some());
 }
+
+#[path = "tests/file_type_visibility_fixes.rs"]
+mod file_type_visibility_fixes;

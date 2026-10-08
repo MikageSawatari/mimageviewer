@@ -1455,6 +1455,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-09、§1.345 独立レビュー #1–#4 の修正では、閲覧中に延期した種類設定の再読込を
+既存 `apply_file_type_visibility_change` の source/return owner に戻す。Snapshot の通常reloadを
+変えず、閲覧終了後の設定適用が Q11 の元場所reloadを通る。新しい detached predicate、
+viewport 操作、待機flag、再描画guardは追加しない。旧スタック要求の取消も同じ設定適用ownerで行う。
+本内ブックマークの rows・container/採用済みpolicy key・ReadingRows/Projecting要求・編集draftを
+既存ViewerContextBundleへ所属させる（2026-10-09 coordinator決定(a)）。App上のfieldはmounted
+payloadの投影だけであり、App-global cacheや新しいcross-context registryは作らない。
+共有DB actorの応答は既存ContextRefでrequest id/containerを照合し、要求元だけ既存mountで
+処理する。workerのdrain/adoptもそのownerのitems generationと採用済みpolicyを照合する。
+通常のmount/depositはrows・要求・編集draftを保持し、退役はそのbundleのtyped requestをdropする。
+登録変更の失効は同じcontainerを投影するownerだけで行い、別本・別viewportの編集focus claimは保つ。
+格納中も完了できるcache workerなので、document-openのpark時に一括取消するowner群には追加しない。
+panelを閉じる簡素化は検討したが、既存の同時表示と採用済み読順を削減するため採用しない。
+同じ本を異なるpolicyで表示するMain/Detachedは各bundleのrowsと取消tokenを独立に保つ。
+利用者の独立レビュー修正指示と確定済み Q11/Q12 を実装範囲とし、Sol/xhigh の構造レビューも
+症状パッチでないことに事前合意した。投影resourceをitems/policyと同じ既存ownerへ移す変更であり、
+viewport述語・geometry・待機flag・delay・新しいrouting mapは追加しない。実機操作は未実施。
+
 **2026-10-08 §1.345 表示種類と一時 reader の所有者**
 
 合意済みの [表示種類 plan](file-type-visibility-plan.md) に従い、採用した一覧の

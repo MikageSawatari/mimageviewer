@@ -511,6 +511,29 @@ pub struct BookmarkBrowserRows {
     pub rows: Vec<BookmarkBrowserRow>,
     /// Full stored registration count, captured before any display policy projection.
     pub registered_total: usize,
+    pub(crate) visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
+}
+
+pub(crate) struct BookBookmarkProjection {
+    pub(crate) bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    pub(crate) notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
+}
+
+/// Worker projection shared by PC, Remote and the global bookmark producer. Stored
+/// registrations remain untouched, including missing/unknown rows' delete routes.
+pub(crate) fn project_book_bookmarks(
+    mut bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    cancel: &AtomicBool,
+) -> BookBookmarkProjection {
+    let mut projection =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(visibility, cancel);
+    bookmarks
+        .retain(|bookmark| !cancel.load(Ordering::Relaxed) && projection.allows_bookmark(bookmark));
+    BookBookmarkProjection {
+        bookmarks,
+        notice: projection.notice(),
+    }
 }
 
 pub struct BookmarkBrowserPending {
@@ -588,6 +611,7 @@ fn build_rows_with_access(
             return Ok(BookmarkBrowserRows {
                 rows: Vec::new(),
                 registered_total,
+                visibility_notice: None,
             });
         }
         let ext = bookmark
@@ -638,23 +662,17 @@ fn build_rows_with_access(
         crate::archive_cache::ArchiveCacheDb::open().ok()
     };
     let mut book_missing_cache = HashMap::new();
-    let mut archive_visibility =
-        crate::archive_visibility::ArchiveVisibilityProjection::new(visibility, cancel);
-    for bookmark in book_bookmarks {
+    let projected = project_book_bookmarks(book_bookmarks, visibility, cancel);
+    for bookmark in projected.bookmarks {
         if cancel.load(Ordering::Relaxed) {
             return Ok(BookmarkBrowserRows {
                 rows: Vec::new(),
                 registered_total,
+                visibility_notice: None,
             });
-        }
-        if !book_bookmark_is_visible(visibility, &bookmark) {
-            continue;
         }
         let (mut item, relative_page_missing, mut relative_page_provenance) =
             book_grid_item_with_visibility(&bookmark, archive_cache.as_ref(), visibility);
-        if !archive_visibility.allows_item(&item) {
-            continue;
-        }
         // Filesystem relative page は materialize と存在判定を1回の containment check で
         // 行う。unsafe/missing path を GridItem::Image にせず、後段の metadata / thumb
         // I/O に渡さない。
@@ -688,6 +706,7 @@ fn build_rows_with_access(
     Ok(BookmarkBrowserRows {
         rows,
         registered_total,
+        visibility_notice: projected.notice,
     })
 }
 
@@ -950,11 +969,19 @@ fn book_page_missing(
 
 pub struct BookmarkDeletePending {
     pub keys: Vec<(u8, i64)>,
+    pub book_containers: Vec<PathBuf>,
     pub rx: mpsc::Receiver<Result<(), String>>,
 }
 
 pub fn spawn_delete(rows: &[BookmarkBrowserRow]) -> BookmarkDeletePending {
     let keys = rows.iter().map(BookmarkBrowserRow::stable_key).collect();
+    let book_containers = rows
+        .iter()
+        .filter_map(|row| match &row.source {
+            BookmarkRowSource::Book(bookmark) => Some(bookmark.container_path.clone()),
+            BookmarkRowSource::Media { .. } => None,
+        })
+        .collect();
     let sources: Vec<_> = rows.iter().map(|row| row.source.clone()).collect();
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -985,7 +1012,11 @@ pub fn spawn_delete(rows: &[BookmarkBrowserRow]) -> BookmarkDeletePending {
             let _ = tx.send(result);
         })
         .ok();
-    BookmarkDeletePending { keys, rx }
+    BookmarkDeletePending {
+        keys,
+        book_containers,
+        rx,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1136,6 +1167,99 @@ impl BookmarkViewReturnTarget {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn visibility_bookmark_worker_uses_ancestry_and_preserves_legacy_registrations() {
+        use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
+        crate::book_bookmarks::load_all_from_disk().unwrap();
+        let conn = rusqlite::Connection::open(crate::book_bookmarks::db_path()).unwrap();
+        for (id, member) in [
+            (1, "root.jpg"),
+            (2, "chapter.zip/page.jpg"),
+            (3, "notes.zip/page.jpg"),
+            (4, "missing.jpg"),
+        ] {
+            conn.execute("INSERT INTO book_bookmarks (id, container_key, container_path, container_kind, page_kind, page_value, page_key, page_index_hint, created_at_ms) VALUES (?1, ?2, ?3, 'other_archive', 'archive_entry', ?4, ?4, 0, ?1)", rusqlite::params![id, crate::book_bookmarks::container_key(&source), source.to_string_lossy(), member]).unwrap();
+        }
+        let stored = crate::book_bookmarks::load_all_from_disk_readonly().unwrap();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let legacy = project_book_bookmarks(stored.clone(), &policy, &cancel);
+        assert_eq!(
+            legacy
+                .bookmarks
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(legacy.notice.is_some());
+        let global = build_rows_readonly_with_visibility_and_total(&policy).unwrap();
+        assert_eq!(global.registered_total, 4);
+        assert_eq!(global.rows.len(), 1);
+        assert!(
+            matches!(&global.rows[0].source, BookmarkRowSource::Book(bookmark) if bookmark.id == 4)
+        );
+        assert!(
+            !global.rows[0].missing,
+            "unverified OtherArchive members retain the existing open/delete route without declaring them missing"
+        );
+        assert_eq!(global.visibility_notice, legacy.notice);
+        crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+        let restored = project_book_bookmarks(stored.clone(), &policy, &cancel);
+        assert_eq!(
+            restored
+                .bookmarks
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 1]
+        );
+        assert_eq!(restored.notice, None);
+        let global = build_rows_readonly_with_visibility_and_total(&policy).unwrap();
+        assert_eq!(global.rows.len(), 3);
+        assert_eq!(global.registered_total, 4);
+        assert_eq!(global.visibility_notice, None);
+        assert_eq!(
+            stored,
+            crate::book_bookmarks::load_all_from_disk_readonly().unwrap()
+        );
+        let mut native = stored[1].clone();
+        native.container_kind = BookContainerKind::Zip;
+        native.page_identity = PageIdentity::ArchiveEntry("chapter.zip/page.jpg".into());
+        assert!(
+            project_book_bookmarks(vec![native.clone()], &policy, &cancel)
+                .bookmarks
+                .is_empty()
+        );
+        native.page_identity = PageIdentity::ArchiveEntry("notes.zip/page.jpg".into());
+        assert_eq!(
+            project_book_bookmarks(vec![native], &policy, &cancel)
+                .bookmarks
+                .len(),
+            1
+        );
+        std::fs::remove_file(&source).unwrap();
+        let missing = build_rows_readonly_with_visibility_and_total(&policy).unwrap();
+        assert_eq!(missing.rows.len(), 4);
+        assert!(missing.rows.iter().all(|row| row.missing));
+        assert_eq!(missing.registered_total, 4);
+        assert_eq!(missing.visibility_notice, None);
+        crate::book_bookmarks::remove_from_disk(4).unwrap();
+        assert_eq!(
+            crate::book_bookmarks::load_all_from_disk_readonly()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
 
     #[test]
     fn bookmark_projection_uses_member_and_logical_document_identity_even_when_missing() {

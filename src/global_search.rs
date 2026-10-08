@@ -51,6 +51,7 @@ pub enum SearchStreamEvent {
         scanned_candidates: usize,
         /// 累計で post-filter を通った数
         valid_hits: usize,
+        visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
     },
     /// 正常終了
     Done { truncated: bool, reason: DoneReason },
@@ -262,6 +263,7 @@ fn run_with_hit_limit(
 
     // 5. ページングループ
     let mut offset = 0usize;
+    let mut notice_emitted = false;
     let mut scanned = 0usize;
     let mut valid = 0usize;
     let mut archive_visibility =
@@ -307,13 +309,7 @@ fn run_with_hit_limit(
             if scope.ignore_epub && is_epub_search_path(&path) {
                 continue;
             }
-            if !search_hit_type_is_visible(&scope.visibility, &path)
-                || path
-                    .split_once(crate::search_norm::ZIP_ENTRY_SEP)
-                    .is_some_and(|(container, member)| {
-                        !archive_visibility.allows_member(std::path::Path::new(container), member)
-                    })
-            {
+            if !search_hit_type_is_visible(&scope.visibility, &path) {
                 continue;
             }
             let text = match fts_index::doc_text_for_target(
@@ -326,6 +322,16 @@ fn run_with_hit_limit(
                 Err(_) => continue,
             };
             if search_query::matches_with_mode(&tokens, &text, scope.mode) {
+                // Only matching omitted rows produce an origin warning. Keep this before
+                // accepted-hit counting and metadata materialization.
+                if path
+                    .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+                    .is_some_and(|(container, member)| {
+                        !archive_visibility.allows_member(std::path::Path::new(container), member)
+                    })
+                {
+                    continue;
+                }
                 // STORED mtime を取り出す (日付ソート用 §5.2)。post-filter を通った
                 // ヒットだけに対して呼ぶので、走査候補全件への doc fetch は発生しない。
                 let (mtime, file_size) =
@@ -348,6 +354,8 @@ fn run_with_hit_limit(
 
         // 1 ページごとに累計を通知する。除外語の post-filter で全滅する検索でも
         // PAGE_SIZE 件ずつ進捗が見え、UI 側は 1 frame の drain 上限で負荷を抑える。
+        let visibility_notice = archive_visibility.notice().filter(|_| !notice_emitted);
+        notice_emitted |= visibility_notice.is_some();
         if !send_event(
             tx,
             wake,
@@ -355,6 +363,7 @@ fn run_with_hit_limit(
                 hits: batch,
                 scanned_candidates: scanned,
                 valid_hits: valid,
+                visibility_notice,
             },
         ) {
             return;
@@ -510,6 +519,66 @@ mod tests {
                 result => return result,
             }
         }
+    }
+
+    #[test]
+    fn visibility_search_worker_hides_legacy_hits_with_notice_and_restores_after_regeneration() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
+        let (_tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let key = format!(
+            "{}{}root.jpg",
+            cached.to_string_lossy(),
+            crate::search_norm::ZIP_ENTRY_SEP
+        );
+        ingest(&meta, &fts, fav, &key, "visibilitylegacy");
+        let scope = SearchScope {
+            visibility: crate::file_type_visibility::FileTypeVisibility {
+                excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let collect = || {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            run(
+                "visibilitylegacy",
+                &[fav],
+                &scope,
+                &fts,
+                &AtomicBool::new(false),
+                &tx,
+                None,
+            );
+            drop(tx);
+            let mut hits = Vec::new();
+            let mut notice = None;
+            for event in rx.try_iter() {
+                if let SearchStreamEvent::Batch {
+                    hits: batch,
+                    visibility_notice,
+                    ..
+                } = event
+                {
+                    hits.extend(batch);
+                    notice = notice.or(visibility_notice);
+                }
+            }
+            (hits, notice)
+        };
+        let (hits, notice) = collect();
+        assert!(hits.is_empty());
+        assert_eq!(
+            notice,
+            Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
+        );
+        crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+        let (hits, notice) = collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(notice, None);
     }
 
     #[test]
@@ -742,6 +811,7 @@ mod tests {
                     hits,
                     scanned_candidates,
                     valid_hits,
+                    ..
                 } => Some((hits.len(), scanned_candidates, valid_hits)),
                 _ => None,
             })
@@ -769,6 +839,7 @@ mod tests {
                 hits: Vec::new(),
                 scanned_candidates: PAGE_SIZE,
                 valid_hits: 0,
+                visibility_notice: None,
             },
         ));
         assert!(matches!(

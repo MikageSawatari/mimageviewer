@@ -621,6 +621,13 @@ pub fn convert_to_zip_with_password(
         return Err(ConvertError::Cancelled);
     }
 
+    // The completed conversion owns this file mutation. Retire only the destination's
+    // shared directory template before Windows atomic replacement; a retained read
+    // handle prevents replacement. Ordinary read-only opens and navigation retain it.
+    // Existing active readers keep their own handles; no waits or retries are introduced.
+    if !options.no_clobber {
+        crate::zip_loader::retire_archive_directory_for_mutation(dst);
+    }
     if let Err(e) = replace_file_atomic(&tmp_path, dst, options.no_clobber) {
         // no_clobber の非置換 move が「既存 dst」で失敗した場合は、汎用 Io ではなく
         // 意味の分かるメッセージで返す (publish 直前に同名 zip が現れたレース)。

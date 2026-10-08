@@ -10,6 +10,14 @@ Remoteは次の一覧・読出し要求から最新設定を使う。読書位�
 既存sidecar hydration ownerまたは各一覧producerのworkerで最終行順と対で準備し、
 各viewer contextで所有する。退避した親一覧・Collection root・固定一覧にも同じimmutable
 対応表を保持し、行削除は共有する論理identityを再探索せず整数slotだけを変換する。
+本内ブックマークの投影rows・container/採用済みpolicy key・typed request・編集draftも
+既存ViewerContextBundleが所有する。共有DB actorの応答は既存context tableで要求元へ
+配送し、worker結果はそのcontextの世代と採用済みpolicyで採用する。通常のmount/depositは
+保持し、登録変更は同じ本を投影するownerを失効させる。異なるpolicyの兄弟reader間で
+要求を共有・置換しない。変換書庫の再読込は受入済みの物理cacheと既存Collection/Rating
+return ownerを保持する。共有open admissionの種類判定だけは、同じcontextが保持する
+current_folderと元書庫overrideの対応から論理sourceを使う。元書庫がなくても既存のF5
+cache再読込を維持し、別のpathや兄弟contextへaliasを適用しない。
 来歴と状態遷移の正本は [表示するファイル種類](file-type-visibility-plan.md)。
 
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は

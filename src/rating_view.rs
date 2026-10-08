@@ -70,6 +70,7 @@ pub struct RatingViewBuildResult {
     pub stars: u8,
     pub rows: Vec<RatingViewRow>,
     pub skipped: usize,
+    pub(crate) visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
     pub(crate) prepared: Option<RatingViewPreparedItems>,
 }
 
@@ -195,6 +196,7 @@ fn build_rating_view_rows(
         stars,
         rows: out,
         skipped,
+        visibility_notice: None,
         prepared: None,
     })
 }
@@ -220,6 +222,7 @@ fn prepare_rating_view(
     let mut visibility =
         crate::archive_visibility::ArchiveVisibilityProjection::new(&options.visibility, cancel);
     result.rows.retain(|row| visibility.allows_item(&row.item));
+    result.visibility_notice = visibility.notice();
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -692,6 +695,59 @@ mod tests {
     use super::*;
     use crate::rating_db::{RatingItemKind, RatingRow};
     use std::io::Write;
+
+    #[test]
+    fn visibility_rating_worker_hides_legacy_pages_and_preserves_ratings_after_regeneration() {
+        let _epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
+        let db_path = guard.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        for member in ["root.jpg", "chapter.zip/page.jpg", "notes.zip/page.jpg"] {
+            let mut meta =
+                crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
+                    .with_source_path(&cached);
+            meta.entry_name = Some(member.into());
+            db.set_user_rating(
+                &format!("{}::{member}", cached.to_string_lossy()),
+                4,
+                Some(&meta),
+            )
+            .unwrap();
+        }
+        let stored = db.list_by_stars(4).unwrap();
+        let options = || RatingViewPrepareOptions {
+            sort: RatingViewSort::default(),
+            include_epub: true,
+            intent: RatingViewBuildIntent::Reorder,
+            visibility: crate::file_type_visibility::FileTypeVisibility {
+                excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            display_order: Default::default(),
+            pin_db: None,
+            folder_thumb_sort: crate::settings::SortOrder::FileName,
+            folder_thumb_depth: 0,
+            edits: Default::default(),
+            tags_db_path: None,
+        };
+        let legacy =
+            prepare_rating_view(db_path.clone(), 4, options(), &AtomicBool::new(false)).unwrap();
+        assert!(legacy.rows.is_empty());
+        assert!(legacy.prepared.unwrap().items.is_empty());
+        assert_eq!(
+            legacy.visibility_notice,
+            Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
+        );
+        crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+        let restored = prepare_rating_view(db_path, 4, options(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(restored.rows.len(), 2);
+        assert_eq!(restored.prepared.unwrap().items.len(), 2);
+        assert_eq!(restored.visibility_notice, None);
+        assert_eq!(stored, db.list_by_stars(4).unwrap());
+    }
 
     #[test]
     fn rating_view_normalizes_its_selected_rating_sort_only() {

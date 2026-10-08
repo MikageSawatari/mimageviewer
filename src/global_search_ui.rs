@@ -2464,7 +2464,11 @@ impl App {
                     hits,
                     scanned_candidates,
                     valid_hits,
+                    visibility_notice,
                 }) => {
+                    if let Some(notice) = visibility_notice {
+                        self.show_feedback_toast(notice.message().into());
+                    }
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
                     if let Some(prepare) = self.global_search.page_edit_prepare.as_mut() {
@@ -4169,6 +4173,7 @@ mod tests {
                     hits,
                     scanned_candidates: (batch + 1) * 500,
                     valid_hits: (batch + 1) * 500,
+                    visibility_notice: None,
                 })
                 .unwrap();
         }

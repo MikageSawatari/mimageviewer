@@ -793,6 +793,16 @@ raw index を検証できない場合は `legacy_position_unverified` を返す�
 列挙に使った種類ポリシーの snapshot を使う。保存位置なし・全種類表示時の旧 raw の範囲外位置・
 UI reader の Busy / Timeout / Stopped は従来どおり先頭ページへの fallback を保つ。
 
+2026-10-09 の §1.345 レビュー修正で protocol 68 とする。旧 `/api/image-info` と
+`/api/image` は認証済み Home worker の stateless `SourceReadEligibility` を共有し、
+最新の種類設定と source 解決を照合してから既存 Library の寸法取得・画像描画へ進む。
+判定は File 専用で、復号・入れ子列挙・許可cacheの保存を行わない。動画・音声の開始も
+同じ source owner を通り、UI が player を所有する直前にも最新設定を照合する。
+評価・ブックマーク一覧と本内ブックマークの任意 `visibility_notice` は、来歴のない旧変換cacheの
+項目を一時非表示にしたことを伝える。登録は保持し、再生成後の再読込で再投影する。
+RAW 先読みは取消可能な direct member の central directory / manifest の照合だけを行い、
+全入れ子列挙を追加しない（§14.24 の負荷・取消契約を維持）。
+
 スマートフォルダの定義一覧と、ドライブ一覧・読書履歴・レーティング・本棚・ブックマーク・
 スマートフォルダの評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を
 再実装しない。

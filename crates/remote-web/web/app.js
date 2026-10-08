@@ -4316,7 +4316,7 @@ async function loadCollection(route, options = {}) {
   return true;
 }
 
-function applyCollectionData(route, data, forceSinglePage, options = {}) {
+export function applyCollectionData(route, data, forceSinglePage, options = {}) {
   const baseHash = collectionHash(route.collectionKind, route.value);
   if (state.pagePrefetchContextIdentity !== baseHash) {
     state.pagePrefetchContextIdentity = baseHash;
@@ -4324,6 +4324,7 @@ function applyCollectionData(route, data, forceSinglePage, options = {}) {
   }
   state.collection = {
     kind: route.collectionKind,
+    visibilityNotice: typeof data.visibility_notice === "string" ? data.visibility_notice : null,
     registeredTotal: Number.isSafeInteger(data.registered_total) ? data.registered_total : null,
     value: route.value,
     title: data.title ?? "一覧",
@@ -6787,7 +6788,7 @@ export function renderFolder(listMetrics = null, preserveRequestController = nul
   gridActionNotice.setAttribute("role", "status");
   gridActionNotice.setAttribute("aria-live", "polite");
   const resumeNotice = containerResumeRefusalNotice(state.container?.resumeRefusal);
-  const actionNotice = resumeNotice ||
+  const actionNotice = resumeNotice || state.collection?.visibilityNotice ||
     (!state.collection && !state.container ? state.gridSortNotice : "");
   if (actionNotice) {
     gridActionNotice.textContent = actionNotice;
@@ -9989,6 +9990,7 @@ export function normalizeRemoteBookBookmarkList(value) {
   const rows = Array.isArray(value?.rows) ? value.rows : [];
   return {
     supported: Boolean(value?.supported),
+    visibilityNotice: typeof value?.visibility_notice === "string" ? value.visibility_notice : null,
     rows: rows.flatMap((row) => {
       const id = Number(row?.id);
       if (!Number.isSafeInteger(id)) return [];
@@ -12184,7 +12186,7 @@ export class ViewerAdjustmentPanel {
   }
 }
 
-class ViewerBookmarkPanel {
+export class ViewerBookmarkPanel {
   constructor() {
     this.root = element("div", "viewer-bookmark-panel");
     this.content = element("div", "viewer-bookmark-content");
@@ -12304,7 +12306,12 @@ class ViewerBookmarkPanel {
     } else {
       for (const row of list.rows) rows.append(this.buildRow(row));
     }
-    this.content.replaceChildren(header, rows);
+    const content = [header];
+    if (list.visibilityNotice) {
+      content.push(textElement("p", list.visibilityNotice, "viewer-bookmark-hint"));
+    }
+    content.push(rows);
+    this.content.replaceChildren(...content);
   }
 
   buildRow(row) {
