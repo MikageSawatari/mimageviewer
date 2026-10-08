@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断の独立性、終了flushと既存形式の互換性。設計のみ・利用者質問あり |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |

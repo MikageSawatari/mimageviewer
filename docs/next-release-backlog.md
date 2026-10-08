@@ -32,6 +32,16 @@
 
 ## 1. 優先候補
 
+### 1.356 同期ログのディスク書込みが起動中のUIとstderr排出を止める — 利用者報告・perfログ解析 (2026-10-09)
+
+- **次の版の決定 (利用者 2026-10-09)**: ライン Cで修正する。今回は設計のみ。設計の正本は [async-log-writer-plan.md](async-log-writer-plan.md)。実装前の独立レビューと、同文書の容量・欠落・終了方針の回答待ち。
+- 観測者・条件: 利用者がnext-inputのdev build（master取り込み済み）を、重いbuild/testが複数worktreeで並行している間に起動し、しばらく「応答なし」を観測した（2026-10-08夜）。調査担当による製品起動・実機再現は行っていない。
+- 同セッションのperfログから: UIの同期perf writeが16,072.72ms停止。通常logのbridge reader writeも14,243.44ms停止し、EffeTune readerは通常log mutexを14,213.69ms待った。stderr callbackがloggerへ同期writeするため、childのstderr排出まで止まった。UIの16,112.2ms frame gapと一致。起動時のplugin loadの終了logと同時刻でも、UIがpluginのIPC応答を直接待った証拠ではない。
+- リリース済み範囲: v4.4.0タグとのコード比較でlogger／perf／stallに差分がなく、同じUI発行経路がある。同版の実機再現ではない。OS側のwrite停止原因は未確定で、並行build/test負荷との因果も未確定。1.337のGuiGate／host変更による停止と断定しない。
+- 設計案: 通常／perfファイルのopen・write・flush・rotation・retentionを一つの専用writerへ移す。producerは自身の時刻・tid付きレコードを非blockingで有界queueへ渡す。欠落件数を記録し、UIのperf::flushは要求だけ、通常終了のdrainは上限付き。panic.log／UI watchdog／常時startup JSONL／Remote専用logの独立境界を保持し、allocラインのstartup `.lock` sidecar修正も維持する。
+- Store関連の初回「起動中…」の描画前にも、perf有効時の同期write／flushと常時の通常logがある。これを非同期化するが、Storeの起動問題の原因確定・解消とは扱わない。
+- 残り: 設計レビュー、利用者質問C356-1〜5の決定、alloc側のsidecar修正取り込み確認、startup側terminal保護／flush完了ACKの共有境界合意、実装、故意に停止させたsinkを使う実配送経路の回帰、共用変更の検証gate。規模 / 優先度: Medium / P2。
+
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
 - 出典: §1.347 (音楽のジャケット画像) の独立実装レビュー P1。音声の埋め込み画像の経路は、専用の有界な Orientation 読み取りに置き換えて対処済み (next-audio-art、`docs/audio-album-art-plan.md` §20.1)。既存の画像経路は同じ parser を使ったまま残っている。
