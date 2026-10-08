@@ -65,6 +65,7 @@
 - 実装 (2026-10-08): Q1〜Q3を実装し、進捗パネル内の前後ボタンを撤去。実CPU描画 / native touch Endと音楽HUDのhandler回帰、snapshot、全lib・通常 / portable checkを確認し、利用者確認用buildも作成した。製品起動・commitはしていない。[検証・実機手順](video-architecture.md#1351-測定中の移動を既存hudへ集約2026-10-08)。
 - 実装レビュー追補: 狭いF12音楽窓で後から登録するvolume / speed UIがHUD↑↓の入力を奪うP2を確認。scan中のdisabled登録と共通HUD矢印の最前面描画へ修正し、実HUDの360pt / 400pt / 548pt click・touch回帰を追加。[原因・修正・検証](video-architecture.md#1351-実装レビュー追補-狭い音楽hudの入力所有)。
 - 実機・再レビュー追補 (2026-10-09): 利用者画像で音楽HUD↑↓と時間の重なりを確認。測定中の全下段項目を単一配置計算で予約し、矢印・時間を優先して非操作部品を省略する。ParkedLiveの描画区分をcallsiteが渡し、同じidxの別contextのscanで矢印が消えるP3も修正。通常配置は保持。[配置・表示対象・検証](video-architecture.md#1351-実機再レビュー追補-音楽hudの配置と表示対象)。
+- 再レビュー追補 (2026-10-09、fix3): 極小幅で固定12ptの矢印が縮小した入力矩形からはみ出すP3を確認。scan中だけ同じ入力矩形へ描画をclipし、実HUD出力の三角・軸線を極小幅で検査する回帰と10pt snapshotを追加。通常再生・配置・入力ownerは維持する。
 - 規模 / 優先度: Small / P3。
 
 ### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)

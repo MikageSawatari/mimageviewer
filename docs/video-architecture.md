@@ -3504,6 +3504,27 @@ build記録は `target/E-1351-fix2-build-dev.log`。
 ログは `target/E-1351-fix2-{red-layout,red-context,focused,focused-music,full-lib,snapshot-update,snapshot,check,portable-check,fmt,glyph}.log`。
 製品起動・commitは行っていない。実機での修正後確認は利用者へ引き継ぐ。
 
+#### §1.351 再レビュー追補: 極小幅の矢印描画
+
+2026-10-09のP3を確認。音楽scan rowは矢印矩形を縮めるが、共通アイコンは幅12pt固定で
+描画clipが矩形に揃っていなかった。scan中だけ同じ入力矩形をPainterのclipへ渡し、
+背景・三角・軸線が隣のslotへはみ出さないようにした。
+[音楽HUDのclip契約](music-integration-plan.md#1351-測定中の移動を音楽hudへ集約2026-10-08)に記録。
+通常再生、配置・入力owner、native動画、detached述語 / viewport経路は変更しない。
+
+検証（HEAD `b6809decd` 上のfix3差分、2026-10-09）:
+実scan HUDの三角・軸線を検査する回帰は、修正前に1pt幅の出力clipが入力矩形を超えて失敗
+（終了101、`target/E-1351-fix3-red.log`）。修正後は1 / 2 / 5 / 10 / 16 / 24 / 40 / 80 / 2000ptで成功。
+`--lib normalize_hud_navigation` は13件成功。全libは10,978成功・52 ignored・失敗0
+（終了0、826.67秒）。`--test ui_snapshot -- --test-threads=1` は115件成功
+（終了0、86.71秒）。追加10pt画像は目視と描画ピクセルを確認し、矢印間に空きがある。
+既存の音楽HUD 4枚は変更なし。fmt / glyph lint（危険glyph 0）/ 通常・portable core checkは終了0。
+`scripts/build-dev.ps1 -PreserveRuntime` は終了0。通常featureのcore（1分56秒）・remote・
+EPUB PDF workerを作成し、PE確認も成功（runtime=4 / pe=3）。製品は起動していない。
+ログは `target/E-1351-fix3-{red,focused,full-lib,fmt,glyph,check,portable-check,snapshot-update,snapshot,build-dev}.log`。
+手動確認は音楽の測定中にF12窓を縮め、↑↓が互いにはみ出さずclick / touchで一度だけ移動すること、
+取消× / Escと通常再生のHUD表示・操作が維持されること。1.342文書は変更せず、commitは行っていない。
+
 ### P キー perf overlay 拡張
 
 フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/

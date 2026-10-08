@@ -732,14 +732,20 @@ fn draw_music_file_navigation(
         let response = ui
             .interact(rect, ui.id().with((name, fs_idx)), sense)
             .hover_tip_dark(label_with_shortcut(label, shortcuts[index]));
+        // Scan layout can allocate less than the icon's fixed 12pt width.
+        // Paint and input must stay within the same slot at every HUD width.
+        let painter = if scan_overlay {
+            ui.painter().with_clip_rect(rect)
+        } else {
+            ui.painter().clone()
+        };
         if scan_overlay {
             // Keep navigation legible above the dimmed progress backdrop. Its
             // reserved slot does not overlap any other bottom-row item.
-            ui.painter()
-                .rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+            painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
         }
-        draw_overlay_button_bg(ui.painter(), rect, response.hovered(), false);
-        draw_overlay_arrow_icon(ui.painter(), rect, delta);
+        draw_overlay_button_bg(&painter, rect, response.hovered(), false);
+        draw_overlay_arrow_icon(&painter, rect, delta);
         if response.clicked() {
             navigation = Some(delta);
         }
@@ -2546,6 +2552,85 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_hud_navigation_music_scan_icons_clip_to_real_hit_rects() {
+        for width in [1.0, 2.0, 5.0, 10.0, 16.0, 24.0, 40.0, 80.0, 2000.0] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let mut navigation = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 360.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            draw_music_normalize_snapshot_fixture(ui);
+                            navigation = Some([
+                                ctx.read_response(ui.id().with(("music_hud_prevfile", 0usize)))
+                                    .unwrap()
+                                    .rect,
+                                ctx.read_response(ui.id().with(("music_hud_nextfile", 0usize)))
+                                    .unwrap()
+                                    .rect,
+                            ]);
+                        });
+                },
+            );
+            let navigation = navigation.unwrap();
+            let mut visible_icons = Vec::new();
+            for (index, rect) in navigation.into_iter().enumerate() {
+                let sign = if index == 0 { -1.0 } else { 1.0 };
+                let tip = rect.center() + egui::vec2(0.0, sign * 7.0);
+                let triangle = output
+                    .shapes
+                    .iter()
+                    .find(|shape| {
+                        matches!(&shape.shape, egui::epaint::Shape::Path(path)
+                        if path.closed && path.fill == egui::Color32::from_gray(238)
+                            && path.points.len() == 3 && path.points[0] == tip)
+                    })
+                    .expect("real HUD arrow triangle");
+                let stem = output
+                    .shapes
+                    .iter()
+                    .find(|shape| {
+                        matches!(&shape.shape, egui::epaint::Shape::LineSegment { points, stroke }
+                        if stroke.color == egui::Color32::from_gray(238)
+                            && points[0] == rect.center() - egui::vec2(0.0, sign * 4.0)
+                            && points[1] == rect.center() - egui::vec2(0.0, sign * 8.0))
+                    })
+                    .expect("real HUD arrow stem");
+                for shape in [triangle, stem] {
+                    assert_eq!(
+                        shape.clip_rect, rect,
+                        "scan icon paint must use its real hit rect at {width}pt"
+                    );
+                    visible_icons.push(
+                        shape
+                            .shape
+                            .visual_bounding_rect()
+                            .intersect(shape.clip_rect),
+                    );
+                }
+            }
+            for first in &visible_icons[..2] {
+                for second in &visible_icons[2..] {
+                    assert!(
+                        !first.intersects(*second),
+                        "painted arrows overlap at {width}pt"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[cfg(windows)]
